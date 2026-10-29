@@ -1,7 +1,10 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as path from "path";
 import type { ProjectsConfig } from "@/common/types/project";
 import { Err, Ok, type Result } from "@/common/types/result";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import {
   createMemoryHost,
   MEMORY_XUM_HOME,
@@ -18,14 +21,19 @@ const SESSIONS_DIR = path.join(MEMORY_XUM_HOME, "sessions");
 const WORKSPACE_ID = "ws1";
 const MARKER_PATH = path.join(SESSIONS_DIR, WORKSPACE_ID, "external-editor-opened");
 
-function createEditors() {
+function createEditors(runtimeConfig?: RuntimeConfig) {
   const host = createMemoryHost();
   const gates = new WorkspaceLifecycleGates();
   const released = mock(() => Promise.resolve());
   const hold = mock(() => Promise.resolve({ release: released }));
   const projects: ProjectsConfig = {
     projects: new Map([
-      ["/repo", { workspaces: [{ id: WORKSPACE_ID, name: WORKSPACE_ID, path: "/repo/ws1" }] }],
+      [
+        "/repo",
+        {
+          workspaces: [{ id: WORKSPACE_ID, name: WORKSPACE_ID, path: "/repo/ws1", runtimeConfig }],
+        },
+      ],
     ]),
   };
   const editors = new WorkspaceExternalEditors({
@@ -88,5 +96,48 @@ describe("WorkspaceExternalEditors", () => {
     expect(launch).not.toHaveBeenCalled();
     expect(hold).not.toHaveBeenCalled();
     expect(await markerExists()).toBe(false);
+  });
+
+  describe("an SSH checkout path under ~", () => {
+    const sshConfig: RuntimeConfig = { type: "ssh", host: "dev-box", srcBaseDir: "~/mux" };
+
+    function mockHostResolve(resolvePath: (remotePath: string) => Promise<string>) {
+      return spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+        resolvePath,
+      } as unknown as Runtime);
+    }
+
+    test("comes back resolved on the host", async () => {
+      const createRuntime = mockHostResolve((remotePath) =>
+        Promise.resolve(remotePath.replace("~", "/home/dev"))
+      );
+      try {
+        const { editors, markerExists } = createEditors(sshConfig);
+
+        const result = await editors.recordExternalEditorOpen(WORKSPACE_ID, "tok", "~/mux/ws1");
+
+        expect(result).toEqual(Ok({ remotePath: "/home/dev/mux/ws1" }));
+        expect(await markerExists()).toBe(true);
+      } finally {
+        createRuntime.mockRestore();
+      }
+    });
+
+    test("refuses the open and leaves no marker when the host cannot resolve it", async () => {
+      const createRuntime = mockHostResolve(() => Promise.reject(new Error("host unreachable")));
+      try {
+        const { editors, markerExists } = createEditors(sshConfig);
+
+        const result = await editors.recordExternalEditorOpen(WORKSPACE_ID, "tok", "~/mux/ws1");
+
+        expect(result).toEqual(
+          Err("Could not resolve ~/mux/ws1 on the workspace's host: host unreachable")
+        );
+        expect(await markerExists()).toBe(false);
+        expect(await editors.hasExternalEditorOpen(WORKSPACE_ID)).toBe(false);
+      } finally {
+        createRuntime.mockRestore();
+      }
+    });
   });
 });

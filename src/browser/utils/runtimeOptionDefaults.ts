@@ -5,7 +5,7 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
-import { isManagedSshPlaceholder, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
+import { CODER_RUNTIME_PLACEHOLDER, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
 
 export type RuntimeOptionDefaults = Partial<Record<RuntimeMode, unknown>>;
 
@@ -142,7 +142,7 @@ export function writeSshOptionDefaults(
 ): RuntimeOptionDefaults {
   let updated = writeOptionValue(prev, RUNTIME_MODE.SSH, "coderEnabled", next.coderEnabled);
 
-  if (next.host.trim().length > 0 && !isManagedSshPlaceholder(next.host)) {
+  if (next.host.trim().length > 0 && next.host !== CODER_RUNTIME_PLACEHOLDER) {
     updated = writeOptionField(updated, RUNTIME_MODE.SSH, "host", next.host);
   }
 

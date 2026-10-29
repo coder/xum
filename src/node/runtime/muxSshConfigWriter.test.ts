@@ -8,7 +8,7 @@ import {
   MUX_CODER_SSH_BLOCK_END,
   MUX_CODER_SSH_BLOCK_START,
 } from "@/constants/coder";
-import { ensureManagedSSHConfigBlock, ensureMuxCoderSSHConfigFile } from "./muxSshConfigWriter";
+import { ensureMuxCoderSSHConfigFile } from "./muxSshConfigWriter";
 
 function renderExpectedMuxBlock(coderBinaryPath: string): string {
   const quotedPath = `"${coderBinaryPath.replaceAll('"', String.raw`\"`)}"`;
@@ -47,27 +47,6 @@ describe("ensureMuxCoderSSHConfigFile", () => {
   afterEach(async () => {
     await Promise.all(tempDirs.map((tempDir) => fs.rm(tempDir, { recursive: true, force: true })));
     tempDirs = [];
-  });
-
-  it("keeps both blocks when two providers write the same config at the same time", async () => {
-    const sshConfigPath = await makeSSHConfigPath();
-    await writeSSHConfig(sshConfigPath, "Host work\n  User me\n");
-    const block = (label: string) => ({
-      markers: { start: `# >>> ${label} >>>`, end: `# <<< ${label} <<<`, label },
-      block: [`# >>> ${label} >>>`, `Host *.${label}`, `# <<< ${label} <<<`].join("\n"),
-      sshConfigPath,
-    });
-
-    // Coder and Daytona setups started together, each a read-modify-rename of the file.
-    await Promise.all([
-      ensureManagedSSHConfigBlock(block("first")),
-      ensureManagedSSHConfigBlock(block("second")),
-    ]);
-
-    const content = await readSSHConfig(sshConfigPath);
-    expect(content).toContain("Host *.first");
-    expect(content).toContain("Host *.second");
-    expect(content).toContain("Host work");
   });
 
   it("creates block from an empty config", async () => {
@@ -266,28 +245,6 @@ describe("ensureMuxCoderSSHConfigFile", () => {
     expect(content).toBe(expected);
   });
 
-  it("moves a top-placed block from anywhere in the file to its first line", async () => {
-    const sshConfigPath = await makeSSHConfigPath();
-    const markers = { start: "# >>> top >>>", end: "# <<< top <<<", label: "Top" };
-    const render = (host: string) => [markers.start, `Host ${host}`, markers.end].join("\n");
-    const writeTop = (host: string) =>
-      ensureManagedSSHConfigBlock({
-        markers,
-        block: render(host),
-        sshConfigPath,
-        placement: "top",
-      });
-
-    await writeTop("first");
-    expect(await readSSHConfig(sshConfigPath)).toBe(`${render("first")}\n`);
-
-    const userBefore = "Host github.com\n  User git\n";
-    const userAfter = "Host internal\n  User dev";
-    await writeSSHConfig(sshConfigPath, `${userBefore}${render("old")}\n${userAfter}`);
-    await writeTop("new");
-    expect(await readSSHConfig(sshConfigPath)).toBe(`${render("new")}\n${userBefore}${userAfter}`);
-  });
-
   it("replaces mux block when it is at the very start of the file", async () => {
     const sshConfigPath = await makeSSHConfigPath();
     const originalBinaryPath = "/opt/coder-old";
@@ -483,10 +440,9 @@ describe("ensureMuxCoderSSHConfigFile", () => {
     const writeFileSpy = spyOn(fs, "writeFile");
 
     try {
-      // Different binaries, so the second call changes the block: an unchanged one is not written.
       await Promise.all([
         ensureMuxCoderSSHConfigFile({ coderBinaryPath, sshConfigPath }),
-        ensureMuxCoderSSHConfigFile({ coderBinaryPath: "/opt/coder/bin/coder", sshConfigPath }),
+        ensureMuxCoderSSHConfigFile({ coderBinaryPath, sshConfigPath }),
       ]);
 
       const tempPaths = writeFileSpy.mock.calls

@@ -14,10 +14,7 @@ import { isSSHRuntime } from "@/common/types/runtime";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
-import {
-  createRuntimeForWorkspace,
-  ensureDaytonaSandboxReady,
-} from "@/node/runtime/runtimeHelpers";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { log } from "@/node/services/log";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -188,10 +185,10 @@ export class WorkspaceExternalEditors {
   }
 
   /**
-   * SSH workspaces whose runtime is provisioned after creation (Daytona, Coder) keep the
-   * unresolved default srcBaseDir (`~/mux`), so their checkout path starts with `~`. An
-   * editor's ssh deep link needs it absolute: resolve it on the host, which the admission
-   * above has made ready. Older records keep working, since nothing is rewritten.
+   * SSH workspaces whose runtime is provisioned after creation (Coder) keep the unresolved
+   * default srcBaseDir (`~/mux`), so their checkout path starts with `~`. An editor's ssh deep
+   * link needs it absolute: resolve it on the host. Older records keep working, since nothing
+   * is rewritten.
    */
   private async resolveEditorRemotePath(
     workspaceId: string,
@@ -392,24 +389,6 @@ export class WorkspaceExternalEditors {
     ) {
       await lease.release();
       return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
-    }
-    // The editor connects to a Daytona sandbox's ssh alias on its own, so start a stopped
-    // sandbox and refresh its token first. Only under the lease, as for a native terminal: an
-    // archive cannot run meanwhile, so it cannot see the sandbox stopped and leave it running.
-    // Before the durable marker write, so a refused open cannot gate future snapshot archives.
-    const { workspace } = workspaceEntry;
-    if (workspace.runtimeConfig != null) {
-      const ready = await ensureDaytonaSandboxReady({
-        id: workspaceId,
-        runtimeConfig: workspace.runtimeConfig,
-        projectPath: workspaceEntry.projectPath,
-        name: workspace.name ?? workspaceId,
-        namedWorkspacePath: workspace.path,
-      });
-      if (!ready.success) {
-        await lease.release();
-        return Err(ready.error);
-      }
     }
     // Before any durable effect: one share per workspace is kept, after a failed launch too
     // (fail closed).

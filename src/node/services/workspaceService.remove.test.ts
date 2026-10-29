@@ -742,65 +742,6 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
-  describe("on a Daytona sandbox", () => {
-    const daytonaRuntime = {
-      type: "ssh" as const,
-      host: "sb-1.xum--daytona",
-      srcBaseDir: "/home/daytona/xum",
-      daytona: { sandboxName: "sb-1" },
-    };
-
-    async function createDaytonaHarness(borrowers: string[]): Promise<WorkspaceServiceHarness> {
-      const harness = await createWorkspaceServiceHarness();
-      await saveWorkspaces(harness.config, projectPath, [
-        projectWorkspace(projectPath, "parent-ws", "parent-ws-id", {
-          runtimeConfig: daytonaRuntime,
-        }),
-        ...borrowers.map((id) =>
-          projectWorkspace(projectPath, "parent-ws", id, {
-            name: `agent_explore_${id}`,
-            runtimeConfig: daytonaRuntime,
-            parentWorkspaceId: "parent-ws-id",
-            taskIsolation: "none",
-            taskStatus: "running",
-          })
-        ),
-      ]);
-      return harness;
-    }
-
-    test("a borrower leaves the sandbox alone while another workspace still uses it", async () => {
-      const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
-      try {
-        await using harness = await createDaytonaHarness([workspaceId, "sibling-shared"]);
-
-        // The owner remains.
-        expect((await harness.service.remove("sibling-shared", true)).success).toBe(true);
-        expect(deleteWorkspace).not.toHaveBeenCalled();
-
-        // The owner is gone, but a sibling borrower still works in the sandbox.
-        await harness.config.editConfig((config) => {
-          const project = config.projects.get(projectPath);
-          if (project) {
-            project.workspaces = project.workspaces.filter((ws) => ws.id !== "parent-ws-id");
-            project.workspaces.push(
-              projectWorkspace(projectPath, "parent-ws", "sibling-shared", {
-                runtimeConfig: daytonaRuntime,
-                taskIsolation: "none",
-                taskStatus: "running",
-              })
-            );
-          }
-          return config;
-        });
-        expect((await harness.service.remove(workspaceId, true)).success).toBe(true);
-        expect(deleteWorkspace).not.toHaveBeenCalled();
-      } finally {
-        createRuntimeSpy.mockRestore();
-      }
-    });
-  });
-
   test("deletes a parent checkout when its shared child already reported", async () => {
     const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
