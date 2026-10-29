@@ -21,11 +21,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
-import {
-  createMuxMessage,
-  isPostCompactionAttachmentsMessage,
-  type MuxMessage,
-} from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   anthropicRejectsDisabledThinking,
   anthropicThinksUnlessDisabled,
@@ -134,12 +130,6 @@ function formatMessageForBranchTranscript(message: MuxMessage): string {
   return `${role}: ${segments.join("\n")}`;
 }
 
-// The post-compaction attachments row is carried context (an edit may even restore it), not
-// conversation or work.
-function isTranscriptMessage(message: MuxMessage): boolean {
-  return !isModelHiddenMessage(message) && !isPostCompactionAttachmentsMessage(message);
-}
-
 /**
  * Build the thinking-stripped transcript of the abandoned segment, trimming
  * oldest messages first when over the input cap (the newest abandoned work
@@ -149,7 +139,7 @@ export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   assert(Array.isArray(messages), "buildAbandonedBranchTranscript requires a message array");
   // Both /refine and abandoned-branch summaries must exclude hidden state before the char cap.
   const formatted = messages
-    .filter(isTranscriptMessage)
+    .filter((message) => !isModelHiddenMessage(message))
     .map(formatMessageForBranchTranscript)
     .filter((s) => s.length > 0);
 
@@ -737,7 +727,7 @@ export async function maybeAppendAbandonedBranchSummary(
     // Hidden records also cannot make a tiny visible segment eligible for a model call.
     const abandonedMessages = input.abandonedMessages.filter(
       (message) =>
-        isTranscriptMessage(message) &&
+        !isModelHiddenMessage(message) &&
         message.metadata?.rlmPreservedTailCopy !== true &&
         (message.metadata?.compacted === undefined || message.metadata.compacted === false)
     );

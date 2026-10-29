@@ -2,7 +2,6 @@ import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import { MockAiStreamPlayer } from "./mockAiStreamPlayer";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { Ok } from "@/common/types/result";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
@@ -758,48 +757,6 @@ describe("MockAiStreamPlayer", () => {
       status: "failed",
       streamError: { error: "Context length exceeded in mock stream." },
     });
-  });
-
-  test.each([
-    [
-      "post-compaction attachments",
-      { synthetic: true },
-      `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
-    ],
-    [
-      "Token Budget warning",
-      {
-        synthetic: true,
-        muxMetadata: {
-          type: "context-budget-warning" as const,
-          contextTokens: 1,
-          maxTokens: 2,
-          budgetTokens: 1,
-        },
-      },
-      "budget-warning-1",
-    ],
-  ])("answers the prompt, not a %s row appended after it", async (_label, metadata, id) => {
-    const player = new MockAiStreamPlayer({
-      historyService,
-      aiService: new EventEmitter() as unknown as AIService,
-    });
-    const workspaceId = `workspace-appended-${id}`;
-    const prompt = createMuxMessage("user-prompt", "user", "water the herbs", {
-      timestamp: Date.now(),
-    });
-    const notice = createMuxMessage(id, "user", "<system-update>notice</system-update>", {
-      timestamp: Date.now(),
-      ...metadata,
-    });
-
-    const playResult = await player.play([prompt, notice], workspaceId);
-    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
-    expect(await playResult.data.completion).toMatchObject({ status: "completed" });
-
-    const history = await historyService.getLastMessages(workspaceId, 10);
-    const reply = (history.success ? history.data : []).find((m) => m.role === "assistant");
-    expect(extractText(reply)).toBe("Mock response: water the herbs");
   });
 
   test("passes the mock rate limit's Retry-After to the turn completion", async () => {

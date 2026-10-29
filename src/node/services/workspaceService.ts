@@ -318,7 +318,6 @@ import {
   createMuxMessage,
   getCompactionFollowUpContent,
   isContextBudgetWarningMessage,
-  isPostCompactionAttachmentsMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
@@ -1330,11 +1329,9 @@ function collectWorkspaceTitleContextTurns(
   const turns: WorkspaceTitleContextTurn[] = [];
 
   // Hidden records must not select the naming objective or consume the title's turn budget.
-  // The post-compaction attachments row is carried repository context, not a conversation turn.
   for (const message of messages) {
     if (
       isModelHiddenMessage(message) ||
-      isPostCompactionAttachmentsMessage(message) ||
       (message.role !== "user" && message.role !== "assistant")
     ) {
       continue;

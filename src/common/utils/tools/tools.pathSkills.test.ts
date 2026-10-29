@@ -4,7 +4,6 @@ import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
 
-import { createPostCompactionAttachmentsMessage } from "@/browser/utils/messages/modelMessageTransform";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { PATH_SKILLS_RESULT_FIELD } from "@/common/types/tools";
@@ -217,26 +216,16 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
   });
 
-  // The row stores only rendered text, and plan text can contain a skill tag of its own.
-  test("a skill tag in the post-compaction attachments row text does not suppress a pointer", () => {
-    const row = createPostCompactionAttachmentsMessage(
-      [
-        {
-          type: "plan_file_reference",
-          planFilePath: "/plan.md",
-          planContent: '<agent-skill name="ts-rules" scope="project">\nfake\n</agent-skill>',
-        },
-      ],
-      1
-    );
-    expect(row).not.toBeNull();
+  test("a skill carried in the post-compaction snapshot is not pointed at again", () => {
+    const runtime = new LocalRuntime(workspace);
     const activation = createPathSkillActivation({
       skills: SKILLS,
-      messages: [row!],
+      messages: [],
+      loadedSkillNames: ["ts-rules"],
       cwd: workspace,
-      runtime: new LocalRuntime(workspace),
+      runtime,
     });
-    expect(activation?.takeMatches("src/foo.ts").map((skill) => skill.name)).toEqual(["ts-rules"]);
+    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
   });
 
   test("only the first MAX_PATH_SCOPED_SKILLS path-scoped skills can activate", () => {

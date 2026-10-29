@@ -1,5 +1,4 @@
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
-import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import type {
   MuxMessage,
   MuxMetadata,
@@ -12,7 +11,6 @@ import {
   getMcpPromptReferenceKey,
   isCompactionSummaryMetadata,
   isContextBudgetWarningMessage,
-  isPostCompactionAttachmentsMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -120,19 +118,13 @@ function isTranscriptVisibleUserRow(message: MuxMessage): boolean {
 
 /**
  * Hidden notices AgentSession.streamWithHistory persists INSIDE a turn that already started: the
- * `<system-file-update>` row (createFileChangeNotificationMessage, `file-change-` id), the
- * post-compaction attachments row (createPostCompactionAttachmentsMessage, `post-compaction-` id)
- * and the `[CONTINUE]` sentinel for a trailing completed assistant. The backend publishes them so the
+ * `<system-file-update>` row (createFileChangeNotificationMessage, `file-change-` id) and the
+ * `[CONTINUE]` sentinel for a trailing completed assistant. The backend publishes them so the
  * client holds the same rows as history (an edit fences its range with them), but they arrive
  * after the turn's real user row and must not restart that turn's pending state. Matched by the
  * exact markers the backend writes, not by `synthetic` alone: hidden synthetic rows such as
  * context-budget continuations do start turns.
  */
-const IN_TURN_NOTICE_PREFIXES = [
-  { id: "file-change-", text: "<system-file-update>" },
-  { id: POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX, text: "<system-update>" },
-] as const;
-
 function isInTurnHiddenNoticeRow(message: MuxMessage): boolean {
   const metadata = message.metadata;
   if (
@@ -146,12 +138,9 @@ function isInTurnHiddenNoticeRow(message: MuxMessage): boolean {
   }
   const part = message.parts[0];
   if (part.type !== "text") return false;
-  const text = part.text;
   return (
-    text === "[CONTINUE]" ||
-    IN_TURN_NOTICE_PREFIXES.some(
-      (prefix) => message.id.startsWith(prefix.id) && text.startsWith(prefix.text)
-    )
+    part.text === "[CONTINUE]" ||
+    (message.id.startsWith("file-change-") && part.text.startsWith("<system-file-update>"))
   );
 }
 
@@ -178,12 +167,6 @@ function startsUserTurn(message: MuxMessage): boolean {
     !isContextBudgetWarningMessage(message) &&
     !isDisplayOnlyCompletedSubagentReport(message)
   );
-}
-
-// A hidden plan-review record can sit between the compaction summary and its follow-up row, and
-// the post-compaction attachments row lands after the follow-up row.
-function isPostCompactionHiddenRow(message: MuxMessage): boolean {
-  return isPlanReviewRecordMessage(message) || isPostCompactionAttachmentsMessage(message);
 }
 
 // Maximum number of messages to display in the DOM for performance
@@ -1870,7 +1853,8 @@ export class StreamingMessageAggregator {
   }
 
   private isDefaultPostCompactionContinueTurn(): boolean {
-    const messages = this.getAllMessages().filter((message) => !isPostCompactionHiddenRow(message));
+    // A hidden plan-review record can sit between the summary and its follow-up row.
+    const messages = this.getAllMessages().filter((message) => !isPlanReviewRecordMessage(message));
     const latestMessage = messages.at(-1);
     const previousMessage = messages.at(-2);
     if (latestMessage?.role !== "user" || previousMessage?.role !== "assistant") {

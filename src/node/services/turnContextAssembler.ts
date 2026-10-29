@@ -10,7 +10,6 @@ import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
 import {
-  isPostCompactionAttachmentsMessage,
   isTokenBudgetInternalMessage,
   type MuxMessage,
   type SystemSectionRecords,
@@ -377,8 +376,7 @@ export interface AssemblePromptPayloadOptions {
  * the refused output), `context` goes before the user request that partial answers: placed
  * after the partial, it would read as a new context-only user turn, and the model would answer
  * it instead of continuing the partial. Runs before addInterruptedSentinel, so the partial
- * still gets its continuation sentinel. The post-compaction attachments row stored after the
- * request is not the request: the provider transform moves it before the request's user rows.
+ * still gets its continuation sentinel.
  */
 export function insertRequestContextMessage(
   history: MuxMessage[],
@@ -389,29 +387,12 @@ export function insertRequestContextMessage(
   const last = history.at(-1);
   let index = history.length;
   if (last?.role === "user") {
-    index = requestEnd(history);
+    index = history.length - 1;
   } else if (last?.role === "assistant" && last.metadata?.partial === true) {
-    const request = history.findLastIndex(isRequestRow);
+    const request = history.findLastIndex((message) => message.role === "user");
     index = request === -1 ? history.length - 1 : request;
   }
   return [...history.slice(0, index), context, ...history.slice(index)];
-}
-
-function isRequestRow(message: MuxMessage): boolean {
-  return message.role === "user" && !isPostCompactionAttachmentsMessage(message);
-}
-
-/** The index of the last request row when history ends in user rows. */
-function requestEnd(history: MuxMessage[]): number {
-  let index = history.length - 1;
-  while (
-    index > 0 &&
-    isPostCompactionAttachmentsMessage(history[index]) &&
-    history[index - 1].role === "user"
-  ) {
-    index--;
-  }
-  return index;
 }
 
 /**

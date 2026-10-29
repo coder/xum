@@ -3,7 +3,6 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
-import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -549,32 +548,6 @@ describe("assemblePromptPayload", () => {
     const afterPartial = wire.slice(wire.indexOf("PARTIAL"));
     expect(afterPartial).not.toContain("VIEW-CONTEXT");
     expect(afterPartial).toContain("[CONTINUE]");
-  });
-
-  test("puts request context right before the prompt, not before its attachments row", async () => {
-    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
-    const attachments = createMuxMessage(
-      `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
-      "user",
-      "<system-update>ATTACHED</system-update>",
-      { synthetic: true }
-    );
-    const prompt = createMuxMessage("u1", "user", "NEWEST");
-    const partial = createMuxMessage("a1", "assistant", "PARTIAL", { partial: true });
-    const order = async (history: MuxMessage[]) => {
-      const payload = await assemble({ history, requestContextMessage: context });
-      const wire = JSON.stringify(payload.messages);
-      return ["ATTACHED", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]
-        .filter((text) => wire.includes(text))
-        .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
-    };
-    expect(await order([prompt, attachments])).toEqual(["ATTACHED", "VIEW-CONTEXT", "NEWEST"]);
-    expect(await order([prompt, attachments, partial])).toEqual([
-      "ATTACHED",
-      "VIEW-CONTEXT",
-      "NEWEST",
-      "PARTIAL",
-    ]);
   });
 
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {

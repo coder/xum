@@ -75,7 +75,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
-  isAppendedTurnNoticeMessage,
+  isContextBudgetWarningMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
@@ -3545,12 +3545,11 @@ export class WorkspaceTurnManager {
         });
       }
       // Model-hidden user rows (plan-review snapshot/resolve/reopen records) are UI state, not
-      // prompts: they must not read as a newer, superseding prompt that disables revival. The
-      // post-compaction attachments row is context sent with the prompt, not a prompt either.
+      // prompts: they must not read as a newer, superseding prompt that disables revival.
       if (
         message.role !== "user" ||
         isModelHiddenMessage(message) ||
-        isAppendedTurnNoticeMessage(message)
+        isContextBudgetWarningMessage(message)
       ) {
         continue;
       }

@@ -9,10 +9,7 @@ import {
   injectPostCompactionAttachments,
   stripOrphanedToolCalls,
 } from "./modelMessageTransform";
-import {
-  MAX_POST_COMPACTION_INJECTION_CHARS,
-  POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX,
-} from "@/common/constants/attachments";
+import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import type { MuxMessage } from "@/common/types/message";
 
 describe("modelMessageTransform", () => {
@@ -1391,9 +1388,20 @@ describe("injectAgentTransition", () => {
     expect(result[3]).toEqual(messages[2]); // Last user message shifted
   });
 
-  it.each<[string, MuxMessage]>([
-    [
-      "Token Budget warning",
+  it("injects the transition before the user prompt, not before a trailing Token Budget warning", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here's the plan..." }],
+        metadata: { timestamp: 1000, agentId: "plan" },
+      },
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Now execute it" }],
+        metadata: { timestamp: 2000 },
+      },
       {
         id: "warning-1",
         role: "user",
@@ -1410,46 +1418,18 @@ describe("injectAgentTransition", () => {
           },
         },
       },
-    ],
-    [
-      "post-compaction attachments row",
-      {
-        id: `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
-        role: "user",
-        parts: [{ type: "text", text: "<system-update>plan</system-update>" }],
-        metadata: { timestamp: 3000, synthetic: true },
-      },
-    ],
-  ])(
-    "injects the transition before the user prompt, not before a trailing %s",
-    (_label, notice) => {
-      const messages: MuxMessage[] = [
-        {
-          id: "assistant-1",
-          role: "assistant",
-          parts: [{ type: "text", text: "Here's the plan..." }],
-          metadata: { timestamp: 1000, agentId: "plan" },
-        },
-        {
-          id: "user-1",
-          role: "user",
-          parts: [{ type: "text", text: "Now execute it" }],
-          metadata: { timestamp: 2000 },
-        },
-        notice,
-      ];
+    ];
 
-      const result = injectAgentTransition(messages, "exec");
+    const result = injectAgentTransition(messages, "exec");
 
-      expect(result.map((message) => message.id)).toEqual([
-        "assistant-1",
-        result[1].id,
-        "user-1",
-        notice.id,
-      ]);
-      expect(result[1].metadata?.synthetic).toBe(true);
-    }
-  );
+    expect(result.map((message) => message.id)).toEqual([
+      "assistant-1",
+      result[1].id,
+      "user-1",
+      "warning-1",
+    ]);
+    expect(result[1].metadata?.synthetic).toBe(true);
+  });
 
   it("should not inject transition when agent is the same", () => {
     const messages: MuxMessage[] = [

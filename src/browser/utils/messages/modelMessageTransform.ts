@@ -5,17 +5,12 @@
 
 import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMessage } from "ai";
 import {
-  isAppendedTurnNoticeMessage,
   isContextBudgetWarningMessage,
-  isPostCompactionAttachmentsMessage,
   type MuxMessage,
   type MuxReasoningPart,
 } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import {
-  MAX_POST_COMPACTION_INJECTION_CHARS,
-  POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX,
-} from "@/common/constants/attachments";
+import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
 import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
 
@@ -145,7 +140,7 @@ export function injectAgentTransition(
   // Find the index of the last user message
   let lastUserIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && !isAppendedTurnNoticeMessage(messages[i])) {
+    if (messages[i].role === "user" && !isContextBudgetWarningMessage(messages[i])) {
       lastUserIndex = i;
       break;
     }
@@ -213,72 +208,25 @@ ${planContent}
   return result;
 }
 
-// NOTE: File-change notifications and post-compaction attachments are no longer
-// injected at request time for live turns. AgentSession appends both rows durably
-// to chat.jsonl at turn start (see createFileChangeNotificationMessage in
-// fileChangeTracker.ts and createPostCompactionAttachmentsMessage below), keeping
-// the provider request a pure function of the session log. A request-only row
-// changed the cached prefix on the turn it appeared and again on the next turn,
-// when it was gone, and that change dropped the replayed thinking blocks.
+// NOTE: File-change notifications are no longer injected at request time.
+// AgentSession appends the <system-file-update> row durably to chat.jsonl at
+// turn start (see createFileChangeNotificationMessage in fileChangeTracker.ts),
+// keeping the provider request a pure function of the session log.
 
 /**
- * Build the synthetic user row that carries post-compaction attachments (plan file,
- * loaded skills, edited files, report index) to preserve context lost to compaction.
- * Returns null when nothing renders.
- */
-export function createPostCompactionAttachmentsMessage(
-  attachments: PostCompactionAttachment[],
-  timestamp: number
-): MuxMessage | null {
-  const text = renderAttachmentsToContentWithBudget(attachments, {
-    maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
-  });
-  if (text.trim().length === 0) {
-    return null;
-  }
-  return {
-    id: `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}${Date.now()}`,
-    role: "user",
-    parts: [{ type: "text", text }],
-    metadata: { timestamp, synthetic: true },
-  };
-}
-
-/**
- * Move each durable post-compaction attachments row before the run of user rows it follows.
- * AgentSession appends the row after the turn's prompt, but the attachments carry repository
- * bytes (plan, skills, diffs) that must not be the last text the model reads: the operator's
- * request comes last, as it did when the row was injected per request. The new position
- * depends only on earlier rows, so later turns replay the same prefix.
- */
-export function placePostCompactionAttachmentsBeforePrompt(messages: MuxMessage[]): MuxMessage[] {
-  if (!messages.some(isPostCompactionAttachmentsMessage)) {
-    return messages;
-  }
-  const result: MuxMessage[] = [];
-  for (const message of messages) {
-    if (!isPostCompactionAttachmentsMessage(message)) {
-      result.push(message);
-      continue;
-    }
-    let index = result.length;
-    while (index > 0 && result[index - 1].role === "user") {
-      index--;
-    }
-    result.splice(index, 0, message);
-  }
-  return result;
-}
-
-/**
- * Inject post-compaction attachments as a synthetic user message. Live turns persist the
- * row instead (see the NOTE above); this path rebuilds older recorded request envelopes and
- * swaps the prefix of an in-flight stream after mid-stream compaction.
+ * Inject post-compaction attachments as a synthetic user message.
+ * When compaction occurs, this injects a message containing plan file content
+ * and/or edited files to preserve context that would otherwise be lost.
  *
  * The message goes right before the newest user message (Token Budget warning rows
- * excepted, as in injectAgentTransition), or last without one, so every row before the
- * current turn's request stays byte-identical. The model sees the attachments, then the
- * user's request (provider transforms merge the two user messages, attachments first).
+ * excepted, as in injectAgentTransition), or last without one. It is request-only and comes
+ * back every TURNS_BETWEEN_ATTACHMENTS turns for the whole segment, so it must not sit
+ * early in the history: placed after the compaction summary, it rewrote the cached history
+ * after the summary on the turn it appeared and again on the next turn, when it was gone.
+ * Here every row before the current turn's request stays byte-identical, and every step of
+ * the turn rebuilds the same position (the tool loop appends after the request). The model
+ * sees the same shape as before: the attachments, then the user's request (provider
+ * transforms merge the two user messages, attachments first).
  *
  * @param messages The conversation history
  * @param attachments Post-compaction attachments (plan file, loaded skills, edited files)
@@ -296,13 +244,22 @@ export function injectPostCompactionAttachments(
     (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
   );
   const index = newestUserIndex === -1 ? messages.length : newestUserIndex;
-  const syntheticMessage = createPostCompactionAttachmentsMessage(
-    attachments,
-    messages[index]?.metadata?.timestamp ?? Date.now()
-  );
-  if (syntheticMessage == null) {
-    return messages;
-  }
+  const syntheticMessage: MuxMessage = {
+    id: `post-compaction-${Date.now()}`,
+    role: "user",
+    parts: [
+      {
+        type: "text",
+        text: renderAttachmentsToContentWithBudget(attachments, {
+          maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
+        }),
+      },
+    ],
+    metadata: {
+      timestamp: messages[index]?.metadata?.timestamp ?? Date.now(),
+      synthetic: true,
+    },
+  };
   return [...messages.slice(0, index), syntheticMessage, ...messages.slice(index)];
 }
 

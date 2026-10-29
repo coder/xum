@@ -1,8 +1,4 @@
-import {
-  isPostCompactionAttachmentsMessage,
-  isSyntheticSnapshotUserMessage,
-  type MuxMessage,
-} from "@/common/types/message";
+import { isSyntheticSnapshotUserMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import {
@@ -31,24 +27,6 @@ export interface RollingCut {
   headTokens: number;
   tailTokens: number;
   stepCut?: { messageId: string; partIndex: number; firstTailToolCallId?: string };
-}
-
-// A synthetic snapshot joins the prompt after it, and the post-compaction attachments row follows
-// its turn's prompt: neither starts a turn.
-function startsTurn(row: MuxMessage): boolean {
-  return (
-    row.role === "user" &&
-    !isSyntheticSnapshotUserMessage(row) &&
-    !isPostCompactionAttachmentsMessage(row)
-  );
-}
-
-/**
- * The boundary drops the old window's post-compaction attachments row (the next turn writes a
- * fresh one), and the attachment budget already counts that fresh row.
- */
-export function estimateRetainedRowTokens(row: MuxMessage): number {
-  return isPostCompactionAttachmentsMessage(row) ? 0 : estimateMuxMessageTokens(row);
 }
 
 function exactStepStarts(indices: readonly number[] | undefined, partCount: number): number[] {
@@ -120,7 +98,7 @@ export function selectRollingCut(
   const minHead = Math.min(MIN_HEAD_TOKENS, 0.1 * budget.contextWindowTokens);
   const prefixTokens = [0];
   for (const row of rows) {
-    prefixTokens.push(prefixTokens[prefixTokens.length - 1] + estimateRetainedRowTokens(row));
+    prefixTokens.push(prefixTokens[prefixTokens.length - 1] + estimateMuxMessageTokens(row));
   }
   const totalTokens = prefixTokens[rows.length];
   let best: RollingCut | null = null;
@@ -140,7 +118,7 @@ export function selectRollingCut(
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
     const row = rows[rowIndex];
-    if (startsTurn(row)) {
+    if (row.role === "user" && !isSyntheticSnapshotUserMessage(row)) {
       userIndex = rowIndex;
       clusterStart = rowIndex;
       while (clusterStart > 0 && isSyntheticSnapshotUserMessage(rows[clusterStart - 1])) {

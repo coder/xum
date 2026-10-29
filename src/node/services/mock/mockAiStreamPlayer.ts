@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "@/common/utils/assert";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
-import { createMuxMessage, isAppendedTurnNoticeMessage } from "@/common/types/message";
+import { createMuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -211,20 +211,6 @@ interface ActiveStream {
   lastEventTimestamp: number;
   /** Set when a tool-start holds the stream; released by the test or by cancellation. */
   toolCallRelease?: ReturnType<typeof Promise.withResolvers<void>>;
-}
-
-// A request that ends with a partial assistant continues an interrupted or errored turn:
-// stream-error now keeps that partial, as StreamManager does (#5700). Real requests get a
-// [CONTINUE] row at transform time (addInterruptedSentinel), which this mock never sees, so
-// answer the user message that started the turn, as a provider would. commitPartial keeps
-// `partial: true` on errored partials, so repeated retries leave several in a row.
-// Rows appended after the prompt (attachments, budget warnings) are context, not the prompt.
-function findPromptMessage(messages: MuxMessage[]): MuxMessage | undefined {
-  return messages.findLast(
-    (message) =>
-      !(message.role === "assistant" && message.metadata?.partial === true) &&
-      !isAppendedTurnNoticeMessage(message)
-  );
 }
 
 export class MockAiStreamPlayer {
@@ -439,8 +425,21 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    const latest = findPromptMessage(messages);
-    if (latest?.role !== "user") {
+    // A request that ends with a partial assistant continues an interrupted or errored turn:
+    // stream-error now keeps that partial, as StreamManager does (#5700). Real requests get a
+    // [CONTINUE] row at transform time (addInterruptedSentinel), which this mock never sees, so
+    // answer the user message that started the turn, as a provider would. commitPartial keeps
+    // `partial: true` on errored partials, so repeated retries leave several in a row.
+    let latestIndex = messages.length - 1;
+    while (
+      latestIndex >= 0 &&
+      messages[latestIndex].role === "assistant" &&
+      messages[latestIndex].metadata?.partial === true
+    ) {
+      latestIndex -= 1;
+    }
+    const latest = latestIndex >= 0 ? messages[latestIndex] : undefined;
+    if (!latest || latest.role !== "user") {
       return Err({ type: "unknown", raw: "Mock AI expected a user message" });
     }
 

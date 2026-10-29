@@ -1993,24 +1993,9 @@ describe("CompactionHandler", () => {
       });
     });
 
-    // Record rows are UI state that no provider request ever contains; a copy behind the
-    // boundary would only duplicate hidden state (and the projection ignores copies anyway).
-    // The next turn writes a fresh attachments row, so a copy would send that context twice.
-    it.each([
-      [
-        "model-hidden plan-review record rows",
-        createMuxMessage("plan-review-1", "user", "<mux_plan_review>…", {
-          synthetic: true,
-          muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
-        }),
-      ],
-      [
-        "the old window's post-compaction attachments row",
-        createMuxMessage("post-compaction-1", "user", "<system-update>\nPlan\n</system-update>", {
-          synthetic: true,
-        }),
-      ],
-    ])("never copies %s into the preserved tail", async (_name, record) => {
+    it("never copies model-hidden plan-review record rows into the preserved tail", async () => {
+      // Record rows are UI state that no provider request ever contains; a copy behind the
+      // boundary would only duplicate hidden state (and the projection ignores copies anyway).
       handler = new CompactionHandler({
         workspaceId,
         historyService,
@@ -2019,6 +2004,10 @@ describe("CompactionHandler", () => {
         emitter: mockEmitter,
       });
 
+      const record = createMuxMessage("plan-review-1", "user", "<mux_plan_review>…", {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+      });
       await seedHistory(
         createMuxMessage("u0", "user", "old head question"),
         createMuxMessage("a0", "assistant", "old head answer"),
@@ -2035,10 +2024,7 @@ describe("CompactionHandler", () => {
       if (!epochResult.success) throw new Error(epochResult.error);
       const copies = epochResult.data.filter((row) => row.metadata?.rlmPreservedTailCopy === true);
       expect(copies.map((copy) => copy.role)).toEqual(["user", "assistant"]);
-      expect(copies.map((copy) => copy.parts)).toMatchObject([
-        [{ type: "text", text: "tail question" }],
-        [{ type: "text", text: "tail answer" }],
-      ]);
+      expect(copies.some((copy) => copy.metadata?.muxMetadata?.type === "plan-review")).toBe(false);
     });
 
     it("keeps a tail user row's prompt-hook context on its copy", async () => {

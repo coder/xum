@@ -211,7 +211,10 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
@@ -309,6 +312,7 @@ export function resolveXumToolScope(
   };
 }
 
+import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
 import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
@@ -363,6 +367,7 @@ export interface StreamMessageOptions {
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** See ToolConfiguration.recordProposedPlan. */
   recordProposedPlan?: (toolCallId: string, content: string) => void;
+  postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
    * index snapshot for the memory tool description.
@@ -1676,6 +1681,7 @@ export class TurnRequestBuilder {
       delegatedToolNames,
       recordFileState,
       recordProposedPlan,
+      postCompactionAttachments,
       resolveMemoryContext,
       workspaceGoalService,
       goalTurnKind,
@@ -3147,6 +3153,9 @@ export class TurnRequestBuilder {
       pathSkillActivation: createPathSkillActivation({
         skills: availableSkills,
         messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
         cwd: workspacePath,
         runtime,
       }),
@@ -3567,6 +3576,7 @@ export class TurnRequestBuilder {
               toolNamesForSentinel: loadedToolNames,
               planContentForTransition,
               planFilePath,
+              postCompactionAttachments,
               providersConfig: seed.providersConfig,
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
@@ -3621,6 +3631,7 @@ export class TurnRequestBuilder {
             anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,
             planFilePath,
+            postCompactionAttachments,
             partialContinuationMessage: options.partialContinuationMessage,
             mcpAppModelContextMessage: mcpAppContextMessage,
           });

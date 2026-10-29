@@ -3,16 +3,11 @@ import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
-import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { Err } from "@/common/types/result";
-import assert from "@/common/utils/assert";
 
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
-import { AttachmentService } from "./attachmentService";
-import type { CompactionHandler } from "./compactionHandler";
-import type { TurnStreamHandle } from "./turnEngine/types";
 import {
   createAgentSessionHarness,
   createFailedTurnHandle,
@@ -40,47 +35,6 @@ function createPersistedPostCompactionState(options: {
   };
 
   return fsPromises.writeFile(options.filePath, JSON.stringify(payload));
-}
-
-/** Publish a continuous compaction boundary for a window that edited `/<id>.ts`. */
-async function publishEditWindow(
-  h: Awaited<ReturnType<typeof createAgentSessionHarness>>,
-  workspaceId: string,
-  id: string,
-  model: string
-): Promise<void> {
-  const handler = (
-    h.session as unknown as { contextController: { compactionHandler: CompactionHandler } }
-  ).contextController.compactionHandler;
-  const edit = createMuxMessage(id, "assistant", "");
-  edit.parts = [
-    {
-      type: "dynamic-tool",
-      toolCallId: id,
-      toolName: "file_edit_replace_string",
-      state: "output-available",
-      input: { path: `/${id}.ts` },
-      output: { success: true, diff: `change ${id}` },
-    },
-  ];
-  const published = await handler.persistContinuousCompaction({
-    preparation: handler.beginPreparation(() => true),
-    publication: {
-      generation: await h.historyService
-        .getContinuousCompactionJournal(workspaceId)
-        .captureGeneration(),
-    },
-    attachmentMessages: [edit],
-    messages: [edit],
-    boundaryMessageId: id,
-    text: `${id} summary`,
-    model,
-    tail: [],
-    systemMessageTokens: 0,
-    attachmentTokens: 0,
-    shouldPersist: () => true,
-  });
-  expect(published).toBe(true);
 }
 
 describe("AgentSession post-compaction context retry", () => {
@@ -199,18 +153,18 @@ describe("AgentSession post-compaction context retry", () => {
       "retry-started"
     );
 
-    // The first request carried the durable attachments row; the retry runs without it.
-    const hasAttachmentsRow = (messages: MuxMessage[]) =>
-      messages.some((message) =>
-        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
-      );
-    const requestMessages = (call: number) =>
-      ((streamMessage as ReturnType<typeof mock>).mock.calls[call][0] as { messages: MuxMessage[] })
-        .messages;
-    expect(hasAttachmentsRow(requestMessages(0))).toBe(true);
-    expect(hasAttachmentsRow(requestMessages(1))).toBe(false);
-    const historyAfterRetry = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(historyAfterRetry.success && hasAttachmentsRow(historyAfterRetry.data)).toBe(false);
+    // With the options bag, arg[0] is the StreamMessageOptions object.
+    const firstOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[0][0] as Record<
+      string,
+      unknown
+    >;
+    expect(Array.isArray(firstOpts.postCompactionAttachments)).toBe(true);
+
+    const secondOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[1][0] as Record<
+      string,
+      unknown
+    >;
+    expect(secondOpts.postCompactionAttachments).toBeNull();
 
     expect((historyService.deleteMessage as ReturnType<typeof mock>).mock.calls[0][1]).toBe(
       "assistant-ctx-exceeded"
@@ -224,72 +178,6 @@ describe("AgentSession post-compaction context retry", () => {
       exists = false;
     }
     expect(exists).toBe(false);
-
-    await session.dispose();
-  });
-
-  // The retry must not discard the snapshot while its row stays in history: no later turn
-  // could then find the row to reuse or delete, and every request would carry it.
-  test("a failed row delete keeps the pending snapshot and skips the retry", async () => {
-    const workspaceId = "ws-delete-fails";
-    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
-    const postCompactionPath = path.join(sessionDir, "post-compaction.json");
-    await createPersistedPostCompactionState({
-      filePath: postCompactionPath,
-      diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
-    });
-    await historyService.appendToHistory(workspaceId, {
-      id: "user-1",
-      role: "user",
-      parts: [{ type: "text", text: "Continue" }],
-      metadata: { timestamp: 1100 },
-    });
-    const isRow = (id: string) => id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX);
-    const deleteMessage = historyService.deleteMessage.bind(historyService);
-    spyOn(historyService, "deleteMessage").mockImplementation((ws, id) =>
-      isRow(id) ? Promise.resolve(Err("disk full")) : deleteMessage(ws, id)
-    );
-    const deleteUnderAdmission = historyService.deleteMessageUnderAdmission.bind(historyService);
-    spyOn(historyService, "deleteMessageUnderAdmission").mockImplementation((ws, capture, id) =>
-      isRow(id) ? Promise.resolve(Err("disk full")) : deleteUnderAdmission(ws, capture, id)
-    );
-
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((..._args: unknown[]) => {
-      aiEmitter.emit("error", {
-        workspaceId,
-        messageId: "assistant-ctx-exceeded",
-        error: "Context length exceeded",
-        errorType: "context_exceeded",
-      });
-      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
-    });
-    const { session } = await createAgentSessionHarness({
-      workspaceId,
-      config,
-      historyService,
-      aiEmitter,
-      aiServiceOverrides: {
-        streamMessage,
-        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
-      },
-    });
-
-    await session.resumeStream({
-      model: "openai:gpt-4o",
-      agentId: "exec",
-    } as unknown as SendMessageOptions);
-    expect(
-      await Promise.race([
-        session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded"),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("decision timeout")), 1000)),
-      ])
-    ).toBe("terminal");
-
-    expect(streamMessage).toHaveBeenCalledTimes(1);
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(history.success && history.data.some((message) => isRow(message.id))).toBe(true);
-    expect(await fsPromises.stat(postCompactionPath).then(() => true)).toBe(true);
 
     await session.dispose();
   });
@@ -494,313 +382,5 @@ describe("AgentSession post-compaction context retry", () => {
     expect(callCount).toBe(2);
 
     await session.dispose();
-  });
-
-  // The row is durable: a turn that fails before the ack must not append a second copy.
-  test("a failed turn keeps its attachments row and the next turn reuses it", async () => {
-    const workspaceId = "ws-reuse";
-    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
-    await createPersistedPostCompactionState({
-      filePath: path.join(sessionDir, "post-compaction.json"),
-      diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
-    });
-    await historyService.appendToHistory(workspaceId, {
-      id: "user-1",
-      role: "user",
-      parts: [{ type: "text", text: "Continue" }],
-      metadata: { timestamp: 1100 },
-    });
-
-    let callCount = 0;
-    const streamMessage = mock((..._args: unknown[]) => {
-      callCount += 1;
-      if (callCount === 1) {
-        return Promise.resolve({
-          success: false as const,
-          error: { type: "unknown" as const, raw: "startup failed before stream" },
-        });
-      }
-      return Promise.resolve({
-        success: true as const,
-        data: createStartedTurnHandle(session.closingSignal, "assistant-next"),
-      });
-    });
-    const { session } = await createAgentSessionHarness({
-      workspaceId,
-      config,
-      historyService,
-      aiServiceOverrides: {
-        streamMessage,
-        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
-      },
-    });
-    const options = { model: "openai:gpt-4o", agentId: "exec" } as unknown as SendMessageOptions;
-
-    await session.resumeStream(options);
-    // The manual Retry resumes the request past the failed turn's attachments row.
-    expect(await session.resumeStream(options)).toEqual({ success: true, data: { started: true } });
-
-    expect(callCount).toBe(2);
-    const attachmentRowIds = (messages: MuxMessage[]) =>
-      messages
-        .filter((message) => message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX))
-        .map((message) => message.id);
-    const requestRowIds = (call: number) =>
-      attachmentRowIds(
-        (
-          (streamMessage as ReturnType<typeof mock>).mock.calls[call][0] as {
-            messages: MuxMessage[];
-          }
-        ).messages
-      );
-    const firstRowIds = requestRowIds(0);
-    expect(firstRowIds).toHaveLength(1);
-    expect(requestRowIds(1)).toEqual(firstRowIds);
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(history.success && attachmentRowIds(history.data)).toEqual(firstRowIds);
-
-    await session.dispose();
-  });
-
-  // A publication that lands while a turn builds its row must not leave that row in the new
-  // window: the next turn would reuse it and send the older snapshot's attachments.
-  test("a publication while a turn builds its row skips the row, so the next turn sends the new snapshot", async () => {
-    const workspaceId = "ws-publication-race";
-    const model = "openai:gpt-4o";
-    const firstCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
-    const settled = Promise.withResolvers<void>();
-    const streamMessage = mock((..._args: unknown[]) =>
-      Promise.resolve({
-        success: true as const,
-        data:
-          streamMessage.mock.calls.length === 1
-            ? { messageId: "assistant-first", completion: firstCompletion.promise }
-            : createStartedTurnHandle(h.session.closingSignal, "assistant-next"),
-      })
-    );
-    const h = await createAgentSessionHarness({
-      workspaceId,
-      onTurnSettled: () => settled.resolve(),
-      aiServiceOverrides: { streamMessage },
-    });
-    const publish = (id: string) => publishEditWindow(h, workspaceId, id, model);
-    // Publication B lands after the first turn read snapshot A and before it appends A's row.
-    let publishedB = false;
-    const reports = spyOn(AttachmentService, "generateCompletedReportsAttachment");
-    reports.mockImplementation(async () => {
-      if (!publishedB) {
-        publishedB = true;
-        await publish("b");
-      }
-      return null;
-    });
-    const attachmentRows = (messages: MuxMessage[]) =>
-      messages.filter((message) =>
-        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
-      );
-    const sentRows = (call: number) =>
-      attachmentRows((streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages);
-    const started = { success: true as const, data: { started: true } };
-
-    try {
-      await publish("a");
-      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
-
-      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
-      expect(publishedB).toBe(true);
-      expect(sentRows(0)).toHaveLength(0);
-      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success && attachmentRows(history.data)).toEqual([]);
-
-      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
-      await settled.promise;
-      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
-      const sent = sentRows(1);
-      expect(sent).toHaveLength(1);
-      expect(JSON.stringify(sent[0].parts)).toContain("/b.ts");
-    } finally {
-      reports.mockRestore();
-      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
-      await h.cleanup();
-    }
-  });
-
-  /**
-   * Run a first turn after a compaction (it sends and acknowledges the attachments row), then
-   * edit `editMessageId`. History: user-0, compaction boundary, user-1, row, reply, and with
-   * `laterWindow` one more compaction boundary.
-   * @returns the attachments row IDs that the first turn and the edit turn sent
-   */
-  async function editAfterAttachmentsTurn(
-    workspaceId: string,
-    editMessageId: string,
-    laterWindow = false
-  ) {
-    const model = "openai:gpt-4o";
-    const firstCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
-    const streamMessage = mock((..._args: unknown[]) =>
-      Promise.resolve({
-        success: true as const,
-        data:
-          streamMessage.mock.calls.length === 1
-            ? { messageId: "assistant-first", completion: firstCompletion.promise }
-            : createStartedTurnHandle(h.session.closingSignal, "assistant-edit"),
-      })
-    );
-    const h = await createAgentSessionHarness({
-      workspaceId,
-      aiServiceOverrides: { streamMessage },
-    });
-    const consumer = spyOn(
-      (h.session as unknown as { coordinator: { consumeCompletion: () => Promise<void> } })
-        .coordinator,
-      "consumeCompletion"
-    );
-    const sentRowIds = (call: number) =>
-      (streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages
-        .filter((message) => message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX))
-        .map((message) => message.id);
-
-    try {
-      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-0", "user", "hi"));
-      await publishEditWindow(h, workspaceId, "a", model);
-      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
-      await h.session.resumeStream({ model, agentId: "exec" });
-      const policy = consumer.mock.results.at(-1);
-      assert(policy?.type === "return", "Expected the first turn's completion consumer");
-      firstCompletion.resolve({
-        status: "completed",
-        streamEnd: {
-          type: "stream-end",
-          workspaceId,
-          metadata: { model },
-          parts: [{ type: "text", text: "done" }],
-        },
-      });
-      await policy.value;
-      if (laterWindow) {
-        await publishEditWindow(h, workspaceId, "b", model);
-      }
-
-      const edited = await h.session.sendMessage("edited", {
-        model,
-        agentId: "exec",
-        editMessageId,
-      });
-      expect(edited.success).toBe(true);
-      // An edit starts its stream in the background.
-      for (let i = 0; i < 100 && streamMessage.mock.calls.length < 2; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      return { first: sentRowIds(0), edit: sentRowIds(1) };
-    } finally {
-      consumer.mockRestore();
-      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
-      await h.cleanup();
-    }
-  }
-
-  // An edit cuts from its prompt, so it also cuts the row stored after that prompt. The first
-  // turn acknowledged the snapshot, so no later turn writes the row again.
-  test("an edit of the prompt before the attachments row keeps the row", async () => {
-    const sent = await editAfterAttachmentsTurn("ws-edit-keeps-row", "user-1");
-    expect(sent.first).toHaveLength(1);
-    expect(sent.edit).toEqual(sent.first);
-  });
-
-  test("an edit that also cuts a later compaction boundary keeps the row", async () => {
-    const sent = await editAfterAttachmentsTurn("ws-edit-later-boundary", "user-1", true);
-    expect(sent.first).toHaveLength(1);
-    expect(sent.edit).toContain(sent.first[0]);
-  });
-
-  test("an edit before the compaction boundary drops the row with its window", async () => {
-    const sent = await editAfterAttachmentsTurn("ws-edit-drops-row", "user-0");
-    expect(sent.first).toHaveLength(1);
-    expect(sent.edit).toEqual([]);
-  });
-
-  // A turn that reuses a failed turn's row must not acknowledge a snapshot published after its
-  // history read: that row carries the older snapshot, so the newer diffs would never be sent.
-  test("a publication before a turn reuses its row keeps the new snapshot pending", async () => {
-    const workspaceId = "ws-publication-reuse-race";
-    const model = "openai:gpt-4o";
-    const secondCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
-    const streamMessage = mock((..._args: unknown[]) => {
-      const call = streamMessage.mock.calls.length;
-      if (call === 1) {
-        return Promise.resolve({
-          success: false as const,
-          error: { type: "unknown" as const, raw: "startup failed before stream" },
-        });
-      }
-      return Promise.resolve({
-        success: true as const,
-        data:
-          call === 2
-            ? { messageId: "assistant-second", completion: secondCompletion.promise }
-            : createStartedTurnHandle(h.session.closingSignal, "assistant-next"),
-      });
-    });
-    const h = await createAgentSessionHarness({
-      workspaceId,
-      aiServiceOverrides: { streamMessage },
-    });
-    const session = h.session as unknown as {
-      coordinator: { consumeCompletion: (...args: never[]) => Promise<void> };
-      getPostCompactionAttachmentsIfNeeded: (includeReadFiles: boolean) => Promise<unknown>;
-    };
-    const publish = (id: string) => publishEditWindow(h, workspaceId, id, model);
-    // Publication B lands after the second turn read window A and before it captures the
-    // pending state, so that turn captures B while its request still holds A's row.
-    let publishB = false;
-    const captureAttachments = session.getPostCompactionAttachmentsIfNeeded.bind(session);
-    const capture = spyOn(session, "getPostCompactionAttachmentsIfNeeded");
-    const consumer = spyOn(session.coordinator, "consumeCompletion");
-    capture.mockImplementation(async (includeReadFiles) => {
-      if (publishB) {
-        publishB = false;
-        await publish("b");
-      }
-      return captureAttachments(includeReadFiles);
-    });
-    const sentRows = (call: number) =>
-      (streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages.filter((message) =>
-        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
-      );
-    const started = { success: true as const, data: { started: true } };
-
-    try {
-      await publish("a");
-      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
-      await h.session.resumeStream({ model, agentId: "exec" });
-      expect(sentRows(0)).toHaveLength(1);
-
-      publishB = true;
-      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
-      expect(publishB).toBe(false);
-      const policy = consumer.mock.results.at(-1);
-      assert(policy?.type === "return", "Expected the second turn's completion consumer");
-      secondCompletion.resolve({
-        status: "completed",
-        streamEnd: {
-          type: "stream-end",
-          workspaceId,
-          metadata: { model },
-          parts: [{ type: "text", text: "done" }],
-        },
-      });
-      await policy.value;
-
-      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
-      const sent = sentRows(2);
-      expect(sent).toHaveLength(1);
-      expect(JSON.stringify(sent[0].parts)).toContain("/b.ts");
-    } finally {
-      capture.mockRestore();
-      consumer.mockRestore();
-      secondCompletion.resolve({ status: "aborted", abortReason: "user" });
-      await h.cleanup();
-    }
   });
 });

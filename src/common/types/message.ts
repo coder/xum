@@ -21,7 +21,6 @@ import type { ThinkingLevel } from "./thinking";
 import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
-import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import type { PlanReviewRecordKind } from "@/common/utils/planReview/planReviewRecord";
 import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
@@ -902,22 +901,6 @@ export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
 /** Token Budget warning rows are advisory notices, never a turn's trigger or request. */
 export function isContextBudgetWarningMessage(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === "context-budget-warning";
-}
-
-/** The post-compaction attachments row is context sent with a turn, never its request. */
-export function isPostCompactionAttachmentsMessage(message: MuxMessage): boolean {
-  return (
-    message.metadata?.synthetic === true &&
-    message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
-  );
-}
-
-/**
- * A synthetic user row appended after a turn's prompt: a Token Budget warning or the
- * post-compaction attachments row. It is a notice or context, never a newer prompt.
- */
-export function isAppendedTurnNoticeMessage(message: MuxMessage): boolean {
-  return isContextBudgetWarningMessage(message) || isPostCompactionAttachmentsMessage(message);
 }
 
 export function isRolloverBoundary(message: MuxMessage): boolean {
