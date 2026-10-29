@@ -25,6 +25,21 @@ def codex_without_help:
 
 def codex_summary_marker: "<!-- codex-pull-request-review-summary -->";
 
+# The clean security-review receipt (after codex_without_help). Codex sometimes omits the
+# Reviewed commit line (coder/xum#7302). The rest is fixed text that reports no finding.
+def codex_clean_security_receipt:
+  "^Security review completed\\. No security issues were found in this pull request\\."
+  + "(\n+\\*\\*Reviewed commit:\\*\\* `(?<commit>[0-9a-f]{7,40})`)?"
+  + "\n+\\[View security finding report\\]\\(https://chatgpt\\.com/codex/cloud/tasks/[A-Za-z0-9_-]+\\)"
+  + "\n+_Only the user who started this review can view the report in Codex\\._$";
+
+# Input: PR comment nodes. Output: whether an unminimized Codex receipt says the security review
+# of $head found no issues. Only a receipt that names its reviewed commit counts.
+def codex_clean_security_receipt_for($bot; $head):
+  any(.[]; .author.login == $bot and .isMinimized == false
+    and ([.body | codex_without_help | capture(codex_clean_security_receipt) | .commit // empty]
+      | any(. as $commit | $head | startswith($commit))));
+
 # Input: review thread nodes. Output: the root comment IDs of resolved Codex
 # threads, the IDs that board advisory links use (#discussion_r<id>).
 def codex_resolved_discussions($bot):
@@ -89,6 +104,15 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           | ([$all[0]] + $all[(1 + ($state | length)):]) as $lines
           | ($lines[1] | capture("^<!-- codex-security-review:v1 (?<payload>.*) -->$").payload | fromjson) as $security
           | ([$state[] | .code_review, .security_review]) as $reviews
+          # Since 2026-10-28 Codex can finish a security review with null findings flags
+          # (coder/xum#7727). That counts as clean only for the current head, beside a
+          # completed security line with the merge gate off, no advisory section, a clean
+          # receipt for this head and no open Codex thread ($cleared.clean_security_receipt,
+          # set by check_codex_comments.sh). Any other null stays unknown, so it blocks.
+          | ($security.status == "completed" and $security.headSha == $head
+            and $security.mergeGateEnabled == false
+            and ($lines | any(. == "### Security findings" or test("^#### Advisory findings")) | not)
+            and $cleared.clean_security_receipt == true) as $null_security_ok
           | if $lines[0] == codex_summary_marker
             # Unknown state fields or statuses could be findings. has_any_findings
             # stays true after findings are resolved, so it is not used.
@@ -103,6 +127,9 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
                 # Codex sends null only while a review runs; a completed one must say false.
                 and (.has_unresolved_findings == false
                   or (.has_unresolved_findings == null and .status == "running")
+                  or ($kind == "security_review" and $null_security_ok and .commit_sha == $head
+                    and .status == "completed" and .has_unresolved_findings == null
+                    and .has_any_findings == null)
                   # Codex keeps true after its threads are resolved, until it reviews
                   # again (coder/xum#6786). Codex posts its threads before it updates
                   # the board, so this review's resolved threads clear it.
@@ -198,12 +225,7 @@ def codex_comment_is_informational($bot; $head; $resolved; $cleared):
         or $body == "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors)."
         # codex_without_help removed at most one known heading; a second or
         # unknown heading must not hide finding-bearing text.
-        # Codex sometimes omits the Reviewed commit line (coder/xum#7302). The
-        # rest of the receipt is fixed text that reports no finding.
-        or ($body | test("^Security review completed\\. No security issues were found in this pull request\\."
-          + "(\n+\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`)?"
-          + "\n+\\[View security finding report\\]\\(https://chatgpt\\.com/codex/cloud/tasks/[A-Za-z0-9_-]+\\)"
-          + "\n+_Only the user who started this review can view the report in Codex\\._$"))
+        or ($body | test(codex_clean_security_receipt))
       end
   end;
 

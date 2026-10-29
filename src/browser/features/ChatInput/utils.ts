@@ -18,7 +18,6 @@ import {
   isMcpPromptCommandKey,
 } from "@/common/utils/tools/mcpPromptCommandKey";
 import type { ParsedRuntime } from "@/common/types/runtime";
-import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import {
   buildAgentSkillMetadata,
   dedupeAgentSkillRefs,
@@ -448,28 +447,6 @@ export function hasProjectScopedSkillRef(refs: AgentSkillReference[]): boolean {
   return refs.some((ref) => ref.scope === "project");
 }
 
-function isBlank(value: string | undefined): boolean {
-  return !(value ?? "").trim();
-}
-
-/** Existing mode needs the workspace name; New mode needs a template (and a preset when 2+ exist). */
-function validateCoderRuntime(
-  coder: CoderWorkspaceConfig,
-  coderPresetCount: number
-): CreationRuntimeValidationError | null {
-  if (coder.existingWorkspace) {
-    return isBlank(coder.workspaceName) ? { mode: "ssh", kind: "missingCoderWorkspace" } : null;
-  }
-  if (isBlank(coder.template)) {
-    return { mode: "ssh", kind: "missingCoderTemplate" };
-  }
-  const requiresPreset = coderPresetCount >= 2;
-  if (requiresPreset && isBlank(coder.preset)) {
-    return { mode: "ssh", kind: "missingCoderPreset" };
-  }
-  return null;
-}
-
 export function validateCreationRuntime(
   runtime: ParsedRuntime,
   coderPresetCount: number
@@ -479,9 +456,26 @@ export function validateCreationRuntime(
   }
 
   if (runtime.mode === "ssh") {
-    // Xum creates the sandbox, and snapshot and size have defaults.
-    if (runtime.daytona) return null;
-    if (runtime.coder) return validateCoderRuntime(runtime.coder, coderPresetCount);
+    if (runtime.coder) {
+      if (runtime.coder.existingWorkspace) {
+        // Existing mode: workspace name is required
+        if (!(runtime.coder.workspaceName ?? "").trim()) {
+          return { mode: "ssh", kind: "missingCoderWorkspace" };
+        }
+      } else {
+        // New mode: template is required
+        if (!(runtime.coder.template ?? "").trim()) {
+          return { mode: "ssh", kind: "missingCoderTemplate" };
+        }
+        // Preset required when 2+ presets exist
+        const requiresPreset = coderPresetCount >= 2;
+        if (requiresPreset && !(runtime.coder.preset ?? "").trim()) {
+          return { mode: "ssh", kind: "missingCoderPreset" };
+        }
+      }
+      return null;
+    }
+
     return runtime.host.trim() ? null : { mode: "ssh", kind: "missingHost" };
   }
 

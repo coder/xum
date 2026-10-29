@@ -6,7 +6,6 @@ import {
   isSSHRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
-import { Err, Ok, type Result } from "@/common/types/result";
 import type { Runtime } from "./Runtime";
 import { createRuntime } from "./runtimeFactory";
 
@@ -162,20 +161,4 @@ export function createRuntimeForWorkspace(metadata: WorkspaceMetadataForRuntime)
     workspacePath: metadata.namedWorkspacePath,
     workspaceId: metadata.id,
   });
-}
-
-/**
- * A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh: bring it
- * up before something outside Xum (a native terminal, an external editor) connects to its ssh
- * alias. Only explicit user actions call this, so starting a stopped sandbox is fine. A no-op
- * for every other runtime.
- */
-export async function ensureDaytonaSandboxReady(
-  metadata: WorkspaceMetadataForRuntime
-): Promise<Result<void>> {
-  if (!isSSHRuntime(metadata.runtimeConfig) || !metadata.runtimeConfig.daytona) {
-    return Ok(undefined);
-  }
-  const ready = await createRuntimeForWorkspace(metadata).ensureReady({ externalSshClient: true });
-  return ready.ready ? Ok(undefined) : Err(ready.error);
 }

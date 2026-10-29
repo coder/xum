@@ -10,7 +10,6 @@ import {
   resolveCoderAvailability,
 } from "@/browser/features/Runtime/CoderControls";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
-import { DaytonaRuntimeSettings } from "./DaytonaSettingsForms";
 import {
   Select,
   SelectContent,
@@ -40,11 +39,7 @@ import {
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { cn } from "@/common/lib/utils";
 import type { ProjectConfig } from "@/common/types/project";
-import {
-  normalizeRuntimeEnablement,
-  RUNTIME_MODE,
-  RUNTIME_MODE_FOR_ENABLEMENT_ID,
-} from "@/common/types/runtime";
+import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import type {
   RuntimeAvailabilityStatus,
   RuntimeEnablement,
@@ -76,7 +71,6 @@ const RUNTIME_ROWS: RuntimeRow[] = [
   { id: "worktree", ...RUNTIME_CHOICE_UI.worktree },
   { id: "ssh", ...RUNTIME_CHOICE_UI.ssh },
   { id: "coder", ...RUNTIME_CHOICE_UI.coder },
-  { id: "daytona", ...RUNTIME_CHOICE_UI.daytona },
   { id: "docker", ...RUNTIME_CHOICE_UI.docker },
   { id: "devcontainer", ...RUNTIME_CHOICE_UI.devcontainer },
 ];
@@ -670,7 +664,8 @@ export function RuntimesSection() {
             const isLastEnabled = effectiveEnablement[runtime.id] && enabledRuntimeCount <= 1;
             const switchDisabled = rowDisabled || isLastEnabled;
             const optionSpec = getRuntimeOptionField(runtime.id);
-            const optionRuntimeMode = RUNTIME_MODE_FOR_ENABLEMENT_ID[runtime.id];
+            const optionRuntimeMode: RuntimeMode =
+              runtime.id === "coder" ? RUNTIME_MODE.SSH : runtime.id;
             const switchControl = (
               <Switch
                 checked={effectiveEnablement[runtime.id]}
@@ -772,9 +767,6 @@ export function RuntimesSection() {
                         }
                         disabled={rowDisabled || coderAvailability.state !== "available"}
                       />
-                    ) : null}
-                    {runtime.id === "daytona" ? (
-                      <DaytonaRuntimeSettings projectPath={selectedProjectPath} />
                     ) : null}
                   </div>
                 </div>

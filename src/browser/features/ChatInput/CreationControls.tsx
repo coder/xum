@@ -7,10 +7,7 @@ import {
   type ParsedRuntime,
   type RuntimeEnablement,
   CODER_RUNTIME_PLACEHOLDER,
-  DAYTONA_RUNTIME_PLACEHOLDER,
-  isManagedSshPlaceholder,
 } from "@/common/types/runtime";
-import { DaytonaCreationForm } from "../Runtime/DaytonaControls";
 import type { RuntimeAvailabilityMap, RuntimeAvailabilityState } from "./useCreationWorkspace";
 import {
   resolveDevcontainerSelection,
@@ -163,7 +160,6 @@ const RUNTIME_CHOICE_ORDER: RuntimeChoice[] = [
   RUNTIME_MODE.WORKTREE,
   RUNTIME_MODE.SSH,
   "coder",
-  "daytona",
   RUNTIME_MODE.DOCKER,
   RUNTIME_MODE.DEVCONTAINER,
 ];
@@ -173,7 +169,6 @@ const RUNTIME_FALLBACK_ORDER: RuntimeChoice[] = [
   RUNTIME_MODE.LOCAL,
   RUNTIME_MODE.SSH,
   "coder",
-  "daytona",
   RUNTIME_MODE.DOCKER,
   RUNTIME_MODE.DEVCONTAINER,
 ];
@@ -205,12 +200,6 @@ const RUNTIME_CHOICE_ACCENTS: Record<
     accentColor: "var(--color-runtime-ssh)",
   },
   coder: {
-    triggerClass:
-      "border-[var(--color-runtime-ssh)]/60 bg-[var(--color-runtime-ssh)]/15 text-[var(--color-runtime-ssh-text)]",
-    iconClass: "text-[var(--color-runtime-ssh-text)]",
-    accentColor: "var(--color-runtime-ssh)",
-  },
-  daytona: {
     triggerClass:
       "border-[var(--color-runtime-ssh)]/60 bg-[var(--color-runtime-ssh)]/15 text-[var(--color-runtime-ssh-text)]",
     iconClass: "text-[var(--color-runtime-ssh-text)]",
@@ -276,8 +265,7 @@ const resolveRuntimeButtonState = (
     };
   }
 
-  // Coder is SSH under the hood; Daytona has its own availability entry; all other
-  // RuntimeChoice values are RuntimeMode identity.
+  // Coder is SSH under the hood; all other RuntimeChoice values are RuntimeMode identity.
   const availabilityKey = value === "coder" ? RUNTIME_MODE.SSH : value;
   const availability = availabilityMap?.[availabilityKey];
   // Disable only if availability is explicitly known and unavailable.
@@ -512,11 +500,10 @@ const RUNTIME_FOR_CHOICE: Record<RuntimeChoice, (context: RuntimeChoiceContext) 
       host: CODER_RUNTIME_PLACEHOLDER,
       coder: context.coderConfigFallback,
     }),
-    daytona: () => ({ mode: "ssh", host: DAYTONA_RUNTIME_PLACEHOLDER, daytona: {} }),
     [RUNTIME_MODE.SSH]: ({ selectedRuntime: current, sshHostFallback }) => ({
       mode: "ssh",
       host:
-        current.mode === "ssh" && !isManagedSshPlaceholder(current.host)
+        current.mode === "ssh" && current.host !== CODER_RUNTIME_PLACEHOLDER
           ? current.host
           : sshHostFallback,
     }),
@@ -561,16 +548,10 @@ function CreationControlsContent(props: CreationControlsProps) {
   // Extract mode from discriminated union for convenience
   const runtimeMode = props.selectedRuntime.mode;
   const { selectedRuntime, onSelectedRuntimeChange } = props;
-  // Coder and Daytona are surfaced as separate runtime options while keeping SSH as the config mode.
+  // Coder is surfaced as a separate runtime option while keeping SSH as the config mode.
   const isCoderSelected =
     selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.coder != null;
-  const isDaytonaSelected =
-    selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.daytona != null;
-  const runtimeChoice: RuntimeChoice = isDaytonaSelected
-    ? "daytona"
-    : isCoderSelected
-      ? "coder"
-      : runtimeMode;
+  const runtimeChoice: RuntimeChoice = isCoderSelected ? "coder" : runtimeMode;
   const runtimeChoiceContext: RuntimeChoiceContext = {
     selectedRuntime,
     sshHostFallback: props.sshHostFallback,
@@ -864,7 +845,6 @@ function CreationControlsContent(props: CreationControlsProps) {
 
           {selectedRuntime.mode === "ssh" &&
             !isCoderSelected &&
-            !isDaytonaSelected &&
             !props.coderProps?.enabled &&
             // Also hide when Coder is still checking but has saved config (will enable after check)
             !(props.coderProps?.coderInfo === null && props.coderProps?.coderConfig) && (
@@ -999,25 +979,6 @@ function CreationControlsContent(props: CreationControlsProps) {
           />
         )}
 
-        {isDaytonaSelected && (
-          <div className="flex flex-col gap-1.5" data-testid="daytona-controls">
-            {availabilityMap?.daytona?.available === false && (
-              <p className="text-xs text-yellow-500">{availabilityMap.daytona.reason}</p>
-            )}
-            <DaytonaCreationForm
-              config={selectedRuntime.daytona ?? {}}
-              onConfigChange={(daytona) =>
-                onSelectedRuntimeChange({
-                  mode: "ssh",
-                  host: DAYTONA_RUNTIME_PLACEHOLDER,
-                  daytona,
-                })
-              }
-              disabled={props.disabled}
-            />
-          </div>
-        )}
-
         {/* Coder Controls - shown when Coder runtime is selected */}
         {isCoderSelected && props.coderProps && (
           <div className="flex flex-col gap-1.5" data-testid="coder-controls">
@@ -1094,7 +1055,6 @@ export function CreationControls(props: CreationControlsProps) {
   const runtimeWorktree = props.runtimeEnablement?.worktree;
   const runtimeSsh = props.runtimeEnablement?.ssh;
   const runtimeCoder = props.runtimeEnablement?.coder;
-  const runtimeDaytona = props.runtimeEnablement?.daytona;
   const runtimeDocker = props.runtimeEnablement?.docker;
   const runtimeDevcontainer = props.runtimeEnablement?.devcontainer;
   const hasRuntimeEnablement = props.runtimeEnablement != null;
@@ -1107,7 +1067,6 @@ export function CreationControls(props: CreationControlsProps) {
         worktree: runtimeWorktree,
         ssh: runtimeSsh,
         coder: runtimeCoder,
-        daytona: runtimeDaytona,
         docker: runtimeDocker,
         devcontainer: runtimeDevcontainer,
       });
