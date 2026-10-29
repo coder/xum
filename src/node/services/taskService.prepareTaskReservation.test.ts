@@ -50,13 +50,19 @@ describe("TaskService.createMany preparation paths before the split", () => {
   // Background inits of launches. The host mock's registerExternalBackgroundInit is a no-op, so
   // nothing else waits for them: a running init would race the root's removal.
   let backgroundInits: Array<Promise<void>>;
+  // The waits that recordLaunches returns. Teardown runs them too, so a test that fails before
+  // its own wait still settles its launches before the root is removed.
+  let launchWaits: Array<() => Promise<number>>;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
     config = await createTestConfig(rootDir);
     stubStableIds(config, [TASK_ID], "bbbbbbbbbb");
     backgroundInits = [];
+    launchWaits = [];
   });
   afterEach(async () => {
+    // allSettled: a failed launch must not hide the test's own failure.
+    await Promise.allSettled(launchWaits.splice(0).map((wait) => wait()));
     await Promise.all(backgroundInits.splice(0));
     mock.restore();
     await removeTaskServiceTestRoot(rootDir);
@@ -95,12 +101,14 @@ describe("TaskService.createMany preparation paths before the split", () => {
    */
   function recordLaunches(taskService: TaskService): () => Promise<number> {
     const launch = spyOn(internals(taskService), "enqueueReservedTaskLaunch");
-    return async () => {
+    const wait = async () => {
       await Promise.all(launch.mock.results.map((result) => result.value));
       const inits = backgroundInits.splice(0);
       await Promise.all(inits);
       return inits.length;
     };
+    launchWaits.push(wait);
+    return wait;
   }
 
   /** Another writer's edit of the parent's project and row. */
