@@ -5,6 +5,9 @@
 // of them may write a workspace row.
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Config, ProjectConfig } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -28,6 +31,7 @@ type CreateManyArgs = Parameters<TaskService["createMany"]>[0][number];
 
 interface Internals {
   resolveTaskAISettings: (...args: unknown[]) => Promise<unknown>;
+  enqueueReservedTaskLaunch: (...args: unknown[]) => Promise<void>;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -82,6 +86,21 @@ describe("TaskService.createMany preparation paths before the split", () => {
         },
       ]);
     return { ...parent, host, taskService, aiService, createOne };
+  }
+
+  /**
+   * Records the launches that createMany schedules (it does not await them). The returned
+   * function waits for every recorded launch and then for their background inits, and returns
+   * how many inits there were.
+   */
+  function recordLaunches(taskService: TaskService): () => Promise<number> {
+    const launch = spyOn(internals(taskService), "enqueueReservedTaskLaunch");
+    return async () => {
+      await Promise.all(launch.mock.results.map((result) => result.value));
+      const inits = backgroundInits.splice(0);
+      await Promise.all(inits);
+      return inits.length;
+    };
   }
 
   /** Another writer's edit of the parent's project and row. */
@@ -155,6 +174,76 @@ describe("TaskService.createMany preparation paths before the split", () => {
     expect(workspaceIds(config)).toEqual([parentId]);
     expect(host.sendMessage).not.toHaveBeenCalled();
   });
+
+  test("a child exactly at maxTaskNestingDepth is created, and its own child is refused", async () => {
+    const { parentId, taskService, createOne } = await setup();
+    const launchesSettled = recordLaunches(taskService);
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 1 },
+    }));
+    // The parent is a root (depth 0), so its child sits exactly at the limit.
+    const child = await createOne();
+    expect(child.success).toBe(true);
+    expect(findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace).toMatchObject({
+      parentWorkspaceId: parentId,
+    });
+    // One level deeper than the limit: refused before any row is written.
+    const grandchild = await createOne({ parentWorkspaceId: TASK_ID });
+    expect(grandchild.success).toBe(false);
+    if (grandchild.success) return;
+    expect(grandchild.error).toContain("requestedDepth=2, max=1");
+    expect(workspaceIds(config).sort()).toEqual([parentId, TASK_ID].sort());
+    await taskService.queueDrainSettled();
+    await launchesSettled();
+  });
+
+  test('isolation "none" on a local parent, which cannot share its checkout, forks instead', async () => {
+    const { parentId, taskService, createOne } = await setup();
+    const launchesSettled = recordLaunches(taskService);
+    const created = await createOne({ isolation: "none" });
+    expect(created.success).toBe(true);
+    const row = findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace;
+    expect(row?.parentWorkspaceId).toBe(parentId);
+    // A shared checkout would persist taskIsolation "none" on the row.
+    expect(row?.taskIsolation).toBeUndefined();
+    await taskService.queueDrainSettled();
+    await launchesSettled();
+  });
+
+  // The built-in explore agent's definition sets subagent.skip_init_hook: true; exec's does not.
+  test.each([
+    ["explore", false],
+    ["exec", true],
+  ] as const)(
+    "a createMany %s task runs the project's init hook: %p",
+    async (agentId, runsHook) => {
+      // The project-automation kill switch skips every hook, so clear it (and its legacy alias)
+      // for this test: only skip_init_hook may decide whether the hook runs.
+      const killSwitchNames = ["XUM_DISABLE_PROJECT_AUTOMATION", "MUX_DISABLE_PROJECT_AUTOMATION"];
+      const savedKillSwitch = killSwitchNames.map((name) => [name, process.env[name]] as const);
+      for (const name of killSwitchNames) delete process.env[name];
+      try {
+        const { projectPath, taskService, createOne } = await setup();
+        const launchesSettled = recordLaunches(taskService);
+        const marker = path.join(rootDir, "init-hook-ran");
+        await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+        const hookPath = path.join(projectPath, ".xum", "init");
+        await fs.writeFile(hookPath, `#!/usr/bin/env bash\necho ran > ${JSON.stringify(marker)}\n`);
+        await fs.chmod(hookPath, 0o755);
+        const created = await createOne({ agentId });
+        expect(created.success).toBe(true);
+        await taskService.queueDrainSettled();
+        expect(await launchesSettled()).toBe(1);
+        expect(existsSync(marker)).toBe(runsHook);
+      } finally {
+        for (const [name, value] of savedKillSwitch) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    }
+  );
 
   test("a disabled agent is refused with a hint that lists only runnable, readable agents", async () => {
     const { parentId, createOne } = await setup({
