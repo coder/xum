@@ -84,7 +84,8 @@ describe("Composer decorations across workspace switches", () => {
       expect(dockDecorationStacks(app)).toHaveLength(1);
 
       // Keep the warning and the duplicated key only; the component stack runs to thousands of lines.
-      const duplicateKeyErrors = consoleErrorSpy.mock.calls
+      const consoleErrorCalls: unknown[][] = consoleErrorSpy.mock.calls;
+      const duplicateKeyErrors = consoleErrorCalls
         .filter((args) =>
           args.some((arg) => typeof arg === "string" && arg.includes(DUPLICATE_KEY_WARNING))
         )
