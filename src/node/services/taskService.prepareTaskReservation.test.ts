@@ -32,6 +32,7 @@ type CreateManyArgs = Parameters<TaskService["createMany"]>[0][number];
 interface Internals {
   resolveTaskAISettings: (...args: unknown[]) => Promise<unknown>;
   enqueueReservedTaskLaunch: (...args: unknown[]) => Promise<void>;
+  markTaskLaunchFailed: (...args: unknown[]) => Promise<void>;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -50,8 +51,8 @@ describe("TaskService.createMany preparation paths before the split", () => {
   // Background inits of launches. The host mock's registerExternalBackgroundInit is a no-op, so
   // nothing else waits for them: a running init would race the root's removal.
   let backgroundInits: Array<Promise<void>>;
-  // The waits that recordLaunches returns. Teardown runs them too, so a test that fails before
-  // its own wait still settles its launches before the root is removed.
+  // One launch wait per setup. Teardown runs them too, so a test that fails before its own wait
+  // (or never expected a launch) still settles its launches before the root is removed.
   let launchWaits: Array<() => Promise<number>>;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
@@ -80,6 +81,8 @@ describe("TaskService.createMany preparation paths before the split", () => {
     const { taskService, aiService } = createTaskServiceHarness(config, {
       workspaceService: host.workspaceService,
     });
+    const launchesSettled = trackLaunches(taskService);
+    launchWaits.push(launchesSettled);
     const createOne = (overrides: Partial<CreateManyArgs> = {}) =>
       taskService.createMany([
         {
@@ -91,24 +94,29 @@ describe("TaskService.createMany preparation paths before the split", () => {
           ...overrides,
         },
       ]);
-    return { ...parent, host, taskService, aiService, createOne };
+    return { ...parent, host, taskService, aiService, createOne, launchesSettled };
   }
 
   /**
-   * Records the launches that createMany schedules (it does not await them). The returned
-   * function waits for every recorded launch and then for their background inits, and returns
-   * how many inits there were.
+   * Tracks the launches that createMany schedules (it does not await them) and the failure
+   * handler that scheduleReservedTaskLaunch starts, without awaiting, when a launch rejects. The
+   * returned function waits until no new launch or failure handler appears, then for the
+   * background inits, and returns how many inits there were.
    */
-  function recordLaunches(taskService: TaskService): () => Promise<number> {
+  function trackLaunches(taskService: TaskService): () => Promise<number> {
     const launch = spyOn(internals(taskService), "enqueueReservedTaskLaunch");
-    const wait = async () => {
-      await Promise.all(launch.mock.results.map((result) => result.value));
+    const markFailed = spyOn(internals(taskService), "markTaskLaunchFailed");
+    const pending = () => [...launch.mock.results, ...markFailed.mock.results];
+    return async () => {
+      let settled = -1;
+      while (settled !== pending().length) {
+        settled = pending().length;
+        await Promise.allSettled(pending().map((result) => result.value));
+      }
       const inits = backgroundInits.splice(0);
       await Promise.all(inits);
       return inits.length;
     };
-    launchWaits.push(wait);
-    return wait;
   }
 
   /** Another writer's edit of the parent's project and row. */
@@ -142,8 +150,7 @@ describe("TaskService.createMany preparation paths before the split", () => {
   });
 
   test("a valid bestOf is persisted on the task row", async () => {
-    const { parentId, taskService, createOne } = await setup();
-    const launchesSettled = recordLaunches(taskService);
+    const { parentId, taskService, createOne, launchesSettled } = await setup();
     const created = await createOne({ bestOf: { groupId: "group", index: 1, total: 3 } });
     expect(created.success).toBe(true);
     const row = findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace;
@@ -186,8 +193,7 @@ describe("TaskService.createMany preparation paths before the split", () => {
   });
 
   test("a child exactly at maxTaskNestingDepth is created, and its own child is refused", async () => {
-    const { parentId, taskService, createOne } = await setup();
-    const launchesSettled = recordLaunches(taskService);
+    const { parentId, taskService, createOne, launchesSettled } = await setup();
     await config.editConfig((cfg) => ({
       ...cfg,
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 1 },
@@ -209,8 +215,7 @@ describe("TaskService.createMany preparation paths before the split", () => {
   });
 
   test('isolation "none" on a local parent, which cannot share its checkout, forks instead', async () => {
-    const { parentId, taskService, createOne } = await setup();
-    const launchesSettled = recordLaunches(taskService);
+    const { parentId, taskService, createOne, launchesSettled } = await setup();
     const created = await createOne({ isolation: "none" });
     expect(created.success).toBe(true);
     const row = findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace;
@@ -234,8 +239,7 @@ describe("TaskService.createMany preparation paths before the split", () => {
       const savedKillSwitch = killSwitchNames.map((name) => [name, process.env[name]] as const);
       for (const name of killSwitchNames) delete process.env[name];
       try {
-        const { projectPath, taskService, createOne } = await setup();
-        const launchesSettled = recordLaunches(taskService);
+        const { projectPath, taskService, createOne, launchesSettled } = await setup();
         const marker = path.join(rootDir, "init-hook-ran");
         await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
         const hookPath = path.join(projectPath, ".xum", "init");
