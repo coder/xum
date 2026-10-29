@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect } from "react";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import {
+  normalizeRuntimeEnablement,
   RUNTIME_MODE,
   type CoderWorkspaceConfig,
   type ParsedRuntime,
@@ -483,6 +484,63 @@ function SourceBranchPicker(props: {
   );
 }
 
+interface RuntimeChoiceContext {
+  selectedRuntime: ParsedRuntime;
+  sshHostFallback: string;
+  coderConfigFallback: CoderWorkspaceConfig;
+  runtimeAvailabilityState: RuntimeAvailabilityState;
+}
+
+/** The runtime each workspace-type pick switches to, keeping what was entered for that type. */
+const RUNTIME_FOR_CHOICE: Record<RuntimeChoice, (context: RuntimeChoiceContext) => ParsedRuntime> =
+  {
+    // Switch to SSH mode with the last known Coder config so prior selections restore.
+    coder: (context) => ({
+      mode: "ssh",
+      host: CODER_RUNTIME_PLACEHOLDER,
+      coder: context.coderConfigFallback,
+    }),
+    [RUNTIME_MODE.SSH]: ({ selectedRuntime: current, sshHostFallback }) => ({
+      mode: "ssh",
+      host:
+        current.mode === "ssh" && current.host !== CODER_RUNTIME_PLACEHOLDER
+          ? current.host
+          : sshHostFallback,
+    }),
+    [RUNTIME_MODE.DOCKER]: ({ selectedRuntime: current }) => ({
+      mode: "docker",
+      image: current.mode === "docker" ? current.image : "",
+    }),
+    [RUNTIME_MODE.DEVCONTAINER]: ({ selectedRuntime: current, runtimeAvailabilityState }) => {
+      if (current.mode === "devcontainer") {
+        return {
+          mode: "devcontainer",
+          configPath: current.configPath,
+          shareCredentials: current.shareCredentials,
+        };
+      }
+      // Use resolver to get initial config path (prefers first available config)
+      const initialSelection = resolveDevcontainerSelection({
+        selectedRuntime: { mode: "devcontainer", configPath: "" },
+        availabilityState: runtimeAvailabilityState,
+      });
+      return {
+        mode: "devcontainer",
+        configPath: initialSelection.configPath,
+        shareCredentials: false,
+      };
+    },
+    [RUNTIME_MODE.LOCAL]: () => ({ mode: "local" }),
+    [RUNTIME_MODE.WORKTREE]: () => ({ mode: "worktree" }),
+  };
+
+function buildRuntimeForChoice(
+  choice: RuntimeChoice,
+  context: RuntimeChoiceContext
+): ParsedRuntime {
+  return RUNTIME_FOR_CHOICE[choice](context);
+}
+
 function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
@@ -494,6 +552,12 @@ function CreationControlsContent(props: CreationControlsProps) {
   const isCoderSelected =
     selectedRuntime.mode === RUNTIME_MODE.SSH && selectedRuntime.coder != null;
   const runtimeChoice: RuntimeChoice = isCoderSelected ? "coder" : runtimeMode;
+  const runtimeChoiceContext: RuntimeChoiceContext = {
+    selectedRuntime,
+    sshHostFallback: props.sshHostFallback,
+    coderConfigFallback: props.coderConfigFallback,
+    runtimeAvailabilityState,
+  };
   const coderInfo = props.coderInfo ?? props.coderProps?.coderInfo ?? null;
   const coderAvailability = resolveCoderAvailability(coderInfo);
   const isCoderAvailable = coderAvailability.state === "available";
@@ -577,71 +641,25 @@ function CreationControlsContent(props: CreationControlsProps) {
     }
 
     // User request: auto-switch away from Settings-disabled runtimes.
-    if (firstEnabled === "coder") {
-      if (!props.coderProps || !isCoderAvailable) {
-        return;
-      }
-      onSelectedRuntimeChange({
-        mode: "ssh",
-        host: CODER_RUNTIME_PLACEHOLDER,
-        coder: props.coderConfigFallback,
-      });
-      return;
-    }
-
-    switch (firstEnabled) {
-      case RUNTIME_MODE.SSH: {
-        const sshHost =
-          selectedRuntime.mode === RUNTIME_MODE.SSH &&
-          selectedRuntime.host !== CODER_RUNTIME_PLACEHOLDER
-            ? selectedRuntime.host
-            : props.sshHostFallback;
-        onSelectedRuntimeChange({
-          mode: "ssh",
-          host: sshHost,
-        });
-        return;
-      }
-      case RUNTIME_MODE.DOCKER:
-        onSelectedRuntimeChange({
-          mode: "docker",
-          image: selectedRuntime.mode === "docker" ? selectedRuntime.image : "",
-        });
-        return;
-      case RUNTIME_MODE.DEVCONTAINER: {
-        const initialSelection = resolveDevcontainerSelection({
-          selectedRuntime: { mode: "devcontainer", configPath: "" },
-          availabilityState: runtimeAvailabilityState,
-        });
-        onSelectedRuntimeChange({
-          mode: "devcontainer",
-          configPath:
-            selectedRuntime.mode === "devcontainer"
-              ? selectedRuntime.configPath
-              : initialSelection.configPath,
-          shareCredentials:
-            selectedRuntime.mode === "devcontainer" ? selectedRuntime.shareCredentials : false,
-        });
-        return;
-      }
-      case RUNTIME_MODE.LOCAL:
-        onSelectedRuntimeChange({ mode: "local" });
-        return;
-      case RUNTIME_MODE.WORKTREE:
-      default:
-        onSelectedRuntimeChange({ mode: "worktree" });
-        return;
-    }
+    // The context is rebuilt here so the effect depends on its fields, not a per-render object.
+    onSelectedRuntimeChange(
+      buildRuntimeForChoice(firstEnabled, {
+        selectedRuntime,
+        sshHostFallback: props.sshHostFallback,
+        coderConfigFallback: props.coderConfigFallback,
+        runtimeAvailabilityState,
+      })
+    );
   }, [
     isDevcontainerMissing,
     isNonGitRepo,
     onSelectedRuntimeChange,
-    props.coderConfigFallback,
     props.coderProps,
     props.runtimeEnablement,
     props.sshHostFallback,
-    availabilityMap,
+    props.coderConfigFallback,
     runtimeAvailabilityState,
+    availabilityMap,
     runtimeChoice,
     selectedRuntime,
     isCoderAvailable,
@@ -790,65 +808,10 @@ function CreationControlsContent(props: CreationControlsProps) {
               <RuntimeButtonGroup
                 value={runtimeChoice}
                 onChange={(mode) => {
-                  if (mode === "coder") {
-                    if (!props.coderProps) {
-                      return;
-                    }
-                    // Switch to SSH mode with the last known Coder config so prior selections restore.
-                    onSelectedRuntimeChange({
-                      mode: "ssh",
-                      host: CODER_RUNTIME_PLACEHOLDER,
-                      coder: props.coderConfigFallback,
-                    });
+                  if (mode === "coder" && !props.coderProps) {
                     return;
                   }
-                  // Convert mode to ParsedRuntime with appropriate defaults
-                  switch (mode) {
-                    case RUNTIME_MODE.SSH: {
-                      const sshHost =
-                        selectedRuntime.mode === "ssh" &&
-                        selectedRuntime.host !== CODER_RUNTIME_PLACEHOLDER
-                          ? selectedRuntime.host
-                          : props.sshHostFallback;
-                      onSelectedRuntimeChange({
-                        mode: "ssh",
-                        host: sshHost,
-                      });
-                      break;
-                    }
-                    case RUNTIME_MODE.DOCKER:
-                      onSelectedRuntimeChange({
-                        mode: "docker",
-                        image: selectedRuntime.mode === "docker" ? selectedRuntime.image : "",
-                      });
-                      break;
-                    case RUNTIME_MODE.DEVCONTAINER: {
-                      // Use resolver to get initial config path (prefers first available config)
-                      const initialSelection = resolveDevcontainerSelection({
-                        selectedRuntime: { mode: "devcontainer", configPath: "" },
-                        availabilityState: runtimeAvailabilityState,
-                      });
-                      onSelectedRuntimeChange({
-                        mode: "devcontainer",
-                        configPath:
-                          selectedRuntime.mode === "devcontainer"
-                            ? selectedRuntime.configPath
-                            : initialSelection.configPath,
-                        shareCredentials:
-                          selectedRuntime.mode === "devcontainer"
-                            ? selectedRuntime.shareCredentials
-                            : false,
-                      });
-                      break;
-                    }
-                    case RUNTIME_MODE.LOCAL:
-                      onSelectedRuntimeChange({ mode: "local" });
-                      break;
-                    case RUNTIME_MODE.WORKTREE:
-                    default:
-                      onSelectedRuntimeChange({ mode: "worktree" });
-                      break;
-                  }
+                  onSelectedRuntimeChange(buildRuntimeForChoice(mode, runtimeChoiceContext));
                 }}
                 defaultMode={props.defaultRuntimeMode}
                 disabled={props.disabled}
@@ -1097,14 +1060,16 @@ export function CreationControls(props: CreationControlsProps) {
   const hasRuntimeEnablement = props.runtimeEnablement != null;
   const runtimeEnablement = !hasRuntimeEnablement
     ? undefined
-    : {
-        local: runtimeLocal ?? true,
-        worktree: runtimeWorktree ?? true,
-        ssh: runtimeSsh ?? true,
-        coder: runtimeCoder ?? true,
-        docker: runtimeDocker ?? true,
-        devcontainer: runtimeDevcontainer ?? true,
-      };
+    : // Rebuilt from primitives so a fresh-but-equal prop object keeps the memoized value;
+      // missing keys default to enabled.
+      normalizeRuntimeEnablement({
+        local: runtimeLocal,
+        worktree: runtimeWorktree,
+        ssh: runtimeSsh,
+        coder: runtimeCoder,
+        docker: runtimeDocker,
+        devcontainer: runtimeDevcontainer,
+      });
   const nameState = {
     name: props.nameState.name,
     title: props.nameState.title,

@@ -160,6 +160,13 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
+/** The default runtime-type button: Coder is an SSH sub-choice. */
+const resolveDefaultRuntimeChoice = (
+  defaultRuntimeMode: RuntimeMode,
+  coderDefaultFromString: boolean
+): RuntimeChoice =>
+  defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString ? "coder" : defaultRuntimeMode;
+
 const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
   if (
     value === "coder" ||
@@ -348,12 +355,6 @@ export function useDraftWorkspaceSettings(
 
   const coderDefaultFromString =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
-  // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-  const defaultRuntimeChoice: RuntimeChoice =
-    defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
-      ? "coder"
-      : defaultRuntimeMode;
-
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -484,7 +485,8 @@ export function useDraftWorkspaceSettings(
       reasoningMode,
       agentId,
       selectedRuntime,
-      defaultRuntimeMode: defaultRuntimeChoice,
+      // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
+      defaultRuntimeMode: resolveDefaultRuntimeChoice(defaultRuntimeMode, coderDefaultFromString),
       trunkBranch,
     },
     coderConfigFallback,

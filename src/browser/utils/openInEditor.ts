@@ -370,12 +370,13 @@ async function openInEditorWithLaunch(
     // else: localhost access to local workspace → no SSH needed
 
     // VS Code/Cursor SSH deep links treat the path as a folder unless a line/column is present.
+    const position = args.isFile && sshHost ? 1 : undefined;
     const deepLink = getEditorDeepLink({
       editor: editorConfig.editor as DeepLinkEditor,
       path: args.targetPath,
       sshHost,
-      line: args.isFile && sshHost ? 1 : undefined,
-      column: args.isFile && sshHost ? 1 : undefined,
+      line: position,
+      column: position,
     });
 
     if (!deepLink) {
