@@ -78,16 +78,21 @@ describe("AgentSession change detection", () => {
       expect(attachments[0].snippet).toContain("New step");
     });
 
-    it("recordIfUntracked keeps an existing baseline, so its unreported edit is still detected", async () => {
+    it("prepareRecordIfUntracked keeps a baseline that exists when it writes, so its unreported edit is still detected", async () => {
       const tracker = new FileChangeTracker();
       const testFile = join(tmpDir, "plan.md");
       await writeFile(testFile, "v1");
-      await tracker.record(testFile, { content: "v1", timestamp: await getMtime(testFile) });
+      const v1 = { content: "v1", timestamp: await getMtime(testFile) };
 
       await writeFile(testFile, "v2");
       const newMtime = Date.now() + 1000;
       await utimes(testFile, newMtime / 1000, newMtime / 1000);
-      await tracker.recordIfUntracked(testFile, { content: "v2", timestamp: newMtime });
+      const recordV2 = await tracker.prepareRecordIfUntracked(testFile, {
+        content: "v2",
+        timestamp: newMtime,
+      });
+      await tracker.record(testFile, v1);
+      recordV2();
 
       const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(1);

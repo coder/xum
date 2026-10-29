@@ -16,6 +16,7 @@ import {
   type CompactionPendingBoundaryWrite,
 } from "./compactionPendingState";
 import {
+  estimatePostCompactionContextTokens,
   splitPostCompactionContext,
   withPostCompactionContext,
   type PostCompactionContextInput,
@@ -273,6 +274,35 @@ function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetad
   ) as Partial<RowMetadata>;
 }
 
+/** Whether a boundary publication builds the header, and adds it to the boundary's contextUsage. */
+interface HeaderOptions {
+  buildHeader: boolean;
+  countHeader: boolean;
+}
+
+/**
+ * Add the header's tokens to the boundary's estimate: the context meter and the compaction check
+ * of the next send read it, and every request of the window carries the header.
+ */
+function withHeaderInContextUsage(boundary: MuxMessage): MuxMessage {
+  const usage = boundary.metadata?.contextUsage;
+  if (!usage) return boundary;
+  const headerTokens = estimatePostCompactionContextTokens(
+    boundary.metadata?.postCompactionContext
+  );
+  return {
+    ...boundary,
+    metadata: {
+      ...boundary.metadata,
+      contextUsage: {
+        ...usage,
+        inputTokens: (usage.inputTokens ?? 0) + headerTokens,
+        totalTokens: (usage.totalTokens ?? 0) + headerTokens,
+      },
+    },
+  };
+}
+
 export class CompactionHandler {
   private readonly workspaceId: string;
   private readonly historyService: HistoryService;
@@ -349,7 +379,7 @@ export class CompactionHandler {
     preparation: CompactionPreparation,
     messages: MuxMessage[],
     boundary: CompactionPendingBoundaryWrite,
-    options: { buildHeader: boolean } = { buildHeader: true }
+    options: HeaderOptions = { buildHeader: true, countHeader: true }
   ) {
     messages = structuredClone(messages);
     boundary = {
@@ -386,7 +416,7 @@ export class CompactionHandler {
       summaryMessage: await this.addPostCompactionContext(
         boundary.summaryMessage,
         attachments,
-        options.buildHeader
+        options
       ),
       attachments,
     });
@@ -395,9 +425,9 @@ export class CompactionHandler {
   private async addPostCompactionContext(
     summary: MuxMessage,
     attachments: CompactionPendingAttachments,
-    buildHeader: boolean
+    options: HeaderOptions
   ): Promise<MuxMessage> {
-    if (!buildHeader || !this.buildPostCompactionContext) return summary;
+    if (!options.buildHeader || !this.buildPostCompactionContext) return summary;
     try {
       const built = await this.buildPostCompactionContext({
         diffs: attachments.diffs,
@@ -408,7 +438,10 @@ export class CompactionHandler {
         // times come from Date.now() (#7282).
         reportsCompletedBeforeMs: nodeClock.nowMs(),
       });
-      return withPostCompactionContext(summary, built, this.workspaceId);
+      const withContext = withPostCompactionContext(summary, built, this.workspaceId);
+      return options.countHeader && withContext !== summary
+        ? withHeaderInContextUsage(withContext)
+        : withContext;
     } catch (error) {
       // The header only restores context; it must never block the compaction itself.
       log.warn("Failed to build post-compaction context; publishing the boundary without it", {
@@ -766,13 +799,13 @@ export class CompactionHandler {
           }
         : event
     );
-    if (truncated) {
-      const { contextUsage: _fullSummaryEstimate, ...rest } = streamEnd.metadata;
-      streamEnd.metadata = {
-        ...rest,
-        ...(result.data.summaryContextUsage && { contextUsage: result.data.summaryContextUsage }),
-      };
-    }
+    // The renderer merges this metadata over the persisted row's, so carry the row's estimate: it
+    // counts only the kept summary text, plus the header.
+    const { contextUsage: _summaryEstimate, ...rest } = streamEnd.metadata;
+    streamEnd.metadata = {
+      ...rest,
+      ...(result.data.summaryContextUsage && { contextUsage: result.data.summaryContextUsage }),
+    };
     this.emitChatEvent(streamEnd);
     return true;
   }
@@ -1019,8 +1052,9 @@ export class CompactionHandler {
         shouldPersist: (messages, partial) => !partial && shouldPersist(messages),
       },
       // The swapped prefix already rendered the journaled header, or none. A new header here
-      // would change that prefix after the stream sent it.
-      { buildHeader: !params.prepared }
+      // would change that prefix after the stream sent it. inputTokens already counts
+      // attachmentTokens, so the header is not counted again.
+      { buildHeader: !params.prepared, countHeader: false }
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

@@ -112,12 +112,13 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     const runtime = new LocalRuntime(repoPath);
     const legacyPlanPath = expandTilde(getLegacyPlanFilePath(workspaceId, runtime.getXumHome()));
     const generate = () =>
-      AttachmentService.generatePlanFileReference(
+      AttachmentService.readPlan(
         {
           planPath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
           legacyIdPath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
         },
-        runtime
+        runtime,
+        { statFirst: true }
       );
     await fs.rm(planPath, { force: true });
     await fs.rm(legacyPlanPath, { force: true });
@@ -128,11 +129,7 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     let drains: Awaited<ReturnType<typeof drainFifoReaders>>[] | undefined;
     try {
       await settleWithin(fs.stat(env.config.rootDir), 2000, "unrelated fs.stat");
-      const results = await settleWithin(
-        Promise.all(attempts),
-        5000,
-        "6 x generatePlanFileReference"
-      );
+      const results = await settleWithin(Promise.all(attempts), 5000, "6 x readPlan");
       for (const r of results) expect(r).toBeNull();
     } finally {
       // A reader released from the canonical FIFO falls through to the legacy FIFO, so both are

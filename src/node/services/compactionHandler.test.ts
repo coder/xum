@@ -16,7 +16,10 @@ import {
   type MuxMessage,
   type PostCompactionContext,
 } from "@/common/types/message";
-import type { PostCompactionContextInput } from "./postCompactionContext";
+import {
+  estimatePostCompactionContextTokens,
+  type PostCompactionContextInput,
+} from "./postCompactionContext";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
@@ -2335,6 +2338,22 @@ describe("CompactionHandler", () => {
 
       const boundary = await latestBoundary();
       expect(boundary?.metadata?.postCompactionContext).toBeUndefined();
+    });
+
+    // The context meter and the compaction check of the next send read the boundary's estimate.
+    it("counts the header in the boundary's context estimate", async () => {
+      installBuilder(() => Promise.resolve(header));
+      await seedHistory(createMuxMessage("u0", "user", "hello"), createCompactionRequest());
+
+      expect(
+        await handler.handleCompletion(createStreamEndEvent("Summary", { systemMessageTokens: 10 }))
+      ).toBe(true);
+
+      // System prompt (10) plus the summary's output tokens (50), plus the header.
+      const inputTokens = 60 + estimatePostCompactionContextTokens(header);
+      const expected = { inputTokens, outputTokens: 0, totalTokens: inputTokens };
+      expect((await latestBoundary())?.metadata?.contextUsage).toEqual(expected);
+      expect(getEmittedStreamEndEvent(emittedEvents)?.metadata.contextUsage).toEqual(expected);
     });
 
     async function persistJournaledBoundary(

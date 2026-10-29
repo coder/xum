@@ -287,7 +287,7 @@ import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
-import { AttachmentService } from "./attachmentService";
+import { AttachmentService, type PlanFileRead } from "./attachmentService";
 import { generateArtifactsIndexAttachment } from "./artifactVersionsOperations";
 import type { TodoItem } from "@/common/types/tools";
 import type {
@@ -363,7 +363,7 @@ import {
 } from "@/node/services/branchSummary";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
@@ -553,6 +553,21 @@ class FollowUpReadError extends Error {}
  */
 function overflowedModel(request: { modelString: string }, failedModel: string | undefined) {
   return failedModel ?? request.modelString;
+}
+
+/** A plan's path and state for the file-change tracker. */
+interface TrackedPlanState {
+  path: string;
+  state: FileState;
+}
+
+/** The tracker state of a plan read with a stat first; null without one. */
+function trackedPlanState(runtime: Runtime, plan: PlanFileRead | null): TrackedPlanState | null {
+  if (plan?.modifiedTimeMs == null) return null;
+  return {
+    path: runtime.normalizePath(plan.planFilePath, "/"),
+    state: { content: plan.planContent, timestamp: plan.modifiedTimeMs },
+  };
 }
 
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
@@ -13495,26 +13510,22 @@ export class AgentSession {
    * The plan file's path and current state for the file-change tracker. The tracker reads the
    * host filesystem, so only local runtimes qualify; null also when the plan cannot be read.
    */
-  private async readLocalPlanFileState(): Promise<{ path: string; state: FileState } | null> {
+  private async readLocalPlanFileState(): Promise<TrackedPlanState | null> {
     try {
       const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
       if (!metadataResult.success) return null;
       const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
       if (runtime.location !== "local") return null;
-      const { planPath } = await resolvePlanFileLocation(
+      const location = await resolvePlanFileLocation(
         this.config,
         runtime,
         { ...metadataResult.data, id: this.workspaceId },
         this.historyService.locks
       );
-      const content = await readFileString(runtime, planPath, undefined, {
-        requireRegularFile: true,
-      });
-      const fileStat = await runtime.stat(planPath);
-      return {
-        path: runtime.normalizePath(planPath, "/"),
-        state: { content, timestamp: fileStat.modifiedTime.getTime() },
-      };
+      return trackedPlanState(
+        runtime,
+        await AttachmentService.readPlan(location, runtime, { statFirst: true })
+      );
     } catch (error) {
       log.debug("Skipping plan file tracking", { error: getErrorMessage(error) });
       return null;
@@ -13537,33 +13548,38 @@ export class AgentSession {
       });
       return null;
     }
-    const { context, plan } = built.value;
+    const { context, recordPlan } = built.value;
     // The first turn after the boundary detects file edits before it tracks the plan again, so
-    // baseline an untracked plan with the state read before the header read it: that turn then
-    // reports an edit made after this snapshot. Estimates and unpublished builds only start
-    // tracking it sooner. Only a build that wins the time box writes the baseline: a late build
-    // must not touch the tracker after the next window started.
-    if (plan) await this.fileChangeTracker.recordIfUntracked(plan.path, plan.state);
+    // baseline an untracked plan with the state the header rendered: that turn then reports an
+    // edit made after this snapshot. Estimates and unpublished builds only start tracking it
+    // sooner. Only a build that wins the time box writes the baseline, and the write does not
+    // await: a late build must not touch the tracker after the next window started.
+    recordPlan?.();
     return context;
   }
 
-  /** The unbounded header build. It reads the plan state but leaves the tracker to the caller. */
+  /**
+   * The unbounded header build. It resolves the plan baseline but leaves the write to the caller,
+   * as recordPlan.
+   */
   private async renderPostCompactionContextHeader(input: PostCompactionContextInput): Promise<{
     context: PostCompactionContext | null;
-    plan: { path: string; state: FileState } | null;
+    recordPlan: (() => void) | null;
   }> {
     const excludedItems = await this.loadExcludedItems();
-    const plan = excludedItems.has("plan") ? null : await this.readLocalPlanFileState();
-    const context = renderPostCompactionContext(
-      await this.buildAttachmentsFromContext({
-        ...input,
-        excludedItems,
-        // Read tracking is internal bookkeeping in both modes but only ever
-        // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
-        readFilePaths: this.isRlmCompactionEnabled() ? input.readFilePaths : [],
-      })
-    );
-    return { context, plan };
+    const { attachments, plan } = await this.buildAttachmentsFromContext({
+      ...input,
+      excludedItems,
+      // Read tracking is internal bookkeeping in both modes but only ever
+      // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
+      readFilePaths: this.isRlmCompactionEnabled() ? input.readFilePaths : [],
+    });
+    return {
+      context: renderPostCompactionContext(attachments),
+      recordPlan: plan
+        ? await this.fileChangeTracker.prepareRecordIfUntracked(plan.path, plan.state)
+        : null,
+    };
   }
 
   /**
@@ -13579,7 +13595,11 @@ export class AgentSession {
     /** Cutoff for the completed-reports index: reports completed before this were summarized away. */
     reportsCompletedBeforeMs: number;
     excludedItems: Set<string>;
-  }): Promise<PostCompactionAttachment[]> {
+  }): Promise<{
+    attachments: PostCompactionAttachment[];
+    /** The plan the attachments carry, for the file-change tracker; local runtimes only. */
+    plan: TrackedPlanState | null;
+  }> {
     const { excludedItems } = context;
     const todoAttachment = await this.loadTodoListAttachment(excludedItems);
 
@@ -13638,17 +13658,17 @@ export class AgentSession {
         attachments.push(editedFilesRef);
       }
 
-      return attachments;
+      return { attachments, plan: null };
     }
     const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
-
-    const attachments = await AttachmentService.generatePostCompactionAttachments(
-      await resolvePlanFileLocation(
-        this.config,
-        runtime,
-        { ...metadataResult.data, id: this.workspaceId },
-        this.historyService.locks
-      ),
+    const planLocation = await resolvePlanFileLocation(
+      this.config,
+      runtime,
+      { ...metadataResult.data, id: this.workspaceId },
+      this.historyService.locks
+    );
+    const { attachments, plan } = await AttachmentService.generatePostCompactionAttachments(
+      planLocation,
       context.diffs,
       context.loadedSkills,
       runtime,
@@ -13675,7 +13695,7 @@ export class AgentSession {
       attachments.push(artifactsIndexAttachment);
     }
 
-    return attachments;
+    return { attachments, plan: trackedPlanState(runtime, plan) };
   }
 
   /**

@@ -8,9 +8,11 @@ import { createMuxMessage } from "@/common/types/message";
 import type { MuxMessage, PostCompactionContext } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { AgentSession } from "./agentSession";
+import { AttachmentService } from "./attachmentService";
 import type { StreamMessageOptions } from "./aiService";
 import type { HistoryService } from "./historyService";
 import type { PostCompactionContextInput } from "./postCompactionContext";
+import type { FileChangeTracker } from "./utils/fileChangeTracker";
 import {
   compactSessionForTest,
   createAgentSessionHarness,
@@ -125,14 +127,23 @@ describe("AgentSession file-change notification (turn start)", () => {
     expect(notificationRows).toHaveLength(1);
   });
 
-  /** Run `body` with XUM_ROOT in a temp dir that holds the plan "plan v1" of workspace "ws". */
-  async function withPlanFile(body: (planFile: string) => Promise<void>): Promise<void> {
+  /**
+   * Run `body` with XUM_ROOT in a temp dir that holds the plan "plan v1" of workspace "ws", at
+   * its plan path or at its legacy path.
+   */
+  async function withPlanFile(
+    body: (planFile: string) => Promise<void>,
+    location: "plan" | "legacy" = "plan"
+  ): Promise<void> {
     tmpDir = await mkdtemp(join(tmpdir(), "mux-file-change-notification-"));
     const previousRoot = process.env.XUM_ROOT;
     process.env.XUM_ROOT = tmpDir;
     try {
       // The harness metadata is local workspace "ws" in project "project".
-      const planFile = join(tmpDir, "plans", "project", "ws.md");
+      const planFile =
+        location === "plan"
+          ? join(tmpDir, "plans", "project", "ws.md")
+          : join(tmpDir, "plans", "ws.md");
       await mkdir(dirname(planFile), { recursive: true });
       await writeFile(planFile, "plan v1");
       await body(planFile);
@@ -142,8 +153,8 @@ describe("AgentSession file-change notification (turn start)", () => {
     }
   }
 
-  async function editPlanExternally(planFile: string): Promise<void> {
-    await writeFile(planFile, "plan v2");
+  async function editPlanExternally(planFile: string, content = "plan v2"): Promise<void> {
+    await writeFile(planFile, content);
     const futureMtime = Date.now() + 1000;
     await utimes(planFile, futureMtime / 1000, futureMtime / 1000);
   }
@@ -234,6 +245,102 @@ describe("AgentSession file-change notification (turn start)", () => {
       await writeExclusions(config, []);
       await resume(session);
 
+      await editPlanExternally(planFile);
+      await resume(session);
+      expect(await countNotifications(historyService)).toBe(0);
+    });
+  });
+
+  test("a plan at the legacy path gets a baseline and is tracked again after the boundary", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      await compact(session, historyService);
+
+      await editPlanExternally(planFile);
+      await resume(session);
+      await expectOnePlanNotification(historyService);
+
+      // That turn consumed the pending state and tracked the legacy plan again.
+      // A resume after a notification row starts a turn only after a new user row.
+      await historyService.appendToHistory(
+        "ws",
+        createMuxMessage("user-3", "user", "go on", { timestamp: Date.now() })
+      );
+      await editPlanExternally(planFile, "plan v3");
+      await resume(session);
+      expect(await countNotifications(historyService)).toBe(2);
+    }, "legacy");
+  });
+
+  test("the plan baseline is the content the boundary header holds", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      const readPlan = AttachmentService.readPlan.bind(AttachmentService);
+      // An edit right after the header build reads the plan: a second read would see "plan v2".
+      const readSpy = spyOn(AttachmentService, "readPlan").mockImplementationOnce(
+        async (...args) => {
+          const plan = await readPlan(...args);
+          await editPlanExternally(planFile);
+          return plan;
+        }
+      );
+      try {
+        await compact(session, historyService);
+      } finally {
+        readSpy.mockRestore();
+      }
+      const history = await historyService.getHistoryFromLatestBoundary("ws");
+      if (!history.success) throw new Error(history.error);
+      const boundary = history.data.find((message) => message.id === "boundary");
+      expect(boundary?.metadata?.postCompactionContext?.text).toContain("plan v1");
+
+      await resume(session);
+      await expectOnePlanNotification(historyService);
+    });
+  });
+
+  test("a plan baseline resolved after the time box is not written", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      const internals = session as unknown as {
+        buildPostCompactionContext(
+          input: PostCompactionContextInput
+        ): Promise<PostCompactionContext | null>;
+        fileChangeTracker: FileChangeTracker;
+      };
+      const tracker = internals.fileChangeTracker;
+      const prepare = tracker.prepareRecordIfUntracked.bind(tracker);
+      let reachPrepare!: () => void;
+      const prepareReached = new Promise<void>((resolve) => (reachPrepare = resolve));
+      let releasePrepare!: () => void;
+      const prepareReleased = new Promise<void>((resolve) => (releasePrepare = resolve));
+      let latePrepare: Promise<() => void> | undefined;
+      spyOn(tracker, "prepareRecordIfUntracked").mockImplementationOnce((path, state) => {
+        reachPrepare();
+        latePrepare = prepareReleased.then(() => prepare(path, state));
+        return latePrepare;
+      });
+      const input = {
+        diffs: [],
+        loadedSkills: [],
+        readFilePaths: [],
+        reportsCompletedBeforeMs: Date.now(),
+      };
+
+      fakeTimers.useFakeTimers();
+      let built: Promise<PostCompactionContext | null>;
+      try {
+        built = internals.buildPostCompactionContext(input);
+        // The header read the plan; resolving its path outlives the time box.
+        await prepareReached;
+        fakeTimers.advanceTimersByTime(POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS);
+      } finally {
+        fakeTimers.useRealTimers();
+      }
+      releasePrepare();
+      expect(await built).toBeNull();
+
+      await latePrepare;
       await editPlanExternally(planFile);
       await resume(session);
       expect(await countNotifications(historyService)).toBe(0);

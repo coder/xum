@@ -127,7 +127,9 @@ async function createSessionForHistory(
 
 interface PrivateSessionAccess {
   contextController: { compactionHandler: CompactionHandler };
-  buildAttachmentsFromContext: (context: unknown) => Promise<PostCompactionAttachment[]>;
+  buildAttachmentsFromContext: (
+    context: unknown
+  ) => Promise<{ attachments: PostCompactionAttachment[] }>;
 }
 
 /**
@@ -164,7 +166,9 @@ async function compact(
       })
     ).toBe(true);
     expect(build).toHaveBeenCalledTimes(1);
-    const attachments = await (build.mock.results[0].value as Promise<PostCompactionAttachment[]>);
+    const { attachments } = await (build.mock.results[0].value as Promise<{
+      attachments: PostCompactionAttachment[];
+    }>);
     const history = await historyService.getHistoryFromLatestBoundary(WORKSPACE_ID);
     assert(history.success, "Expected readable history");
     const boundary = history.data.find((message) => message.id === boundaryMessageId);
