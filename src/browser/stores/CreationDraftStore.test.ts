@@ -85,6 +85,8 @@ async function createHarness(
     failDeletes: 0,
     deleteCalls: 0,
     deletesDone: 0,
+    /** Delete requests that returned or threw. */
+    deletesSettled: 0,
   };
   const drafts = {
     listCreation: async () => {
@@ -119,12 +121,16 @@ async function createHarness(
     },
     deleteCreation: async ({ scope }: { scope: CreationDraftScope }) => {
       control.deleteCalls++;
-      if (control.failDeletes > 0) {
-        control.failDeletes--;
-        throw new Error("connection lost");
+      try {
+        if (control.failDeletes > 0) {
+          control.failDeletes--;
+          throw new Error("connection lost");
+        }
+        await service.delete(scope.draftId);
+        control.deletesDone++;
+      } finally {
+        control.deletesSettled++;
       }
-      await service.delete(scope.draftId);
-      control.deletesDone++;
     },
     importLegacyCreation: async (input: CreationDraftImportLegacyInput) => {
       if (input.legacyDraftId === options?.failLegacyImport) throw new Error("connection lost");
@@ -560,6 +566,37 @@ describe("CreationDraftStore", () => {
     fakeTimers.advanceTimersByTime(retryDelayMs(10));
     await settle();
     expect(control.deleteCalls).toBe(3);
+  });
+
+  test("a delete retry does not remove text another window saved after the failed delete", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-retry-other-window");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "sent" });
+    await windowA.flush(id);
+    const windowB = await reopen(harness, id, PROJECT_A);
+    const settle = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+    // bun-types lacks advanceTimersByTime; bun implements it.
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    jest.useFakeTimers();
+
+    // Window A's Send succeeded, but its delete of the sent draft fails once.
+    control.failDeletes = 1;
+    await windowA.delete(id);
+    expect(control.deleteCalls).toBe(1);
+    // The record is still there, so window B's edit saves and is confirmed.
+    windowB.update(id, { text: "typed in B" });
+    await windowB.flush(id);
+    expect((await service.get(id))?.text).toBe("typed in B");
+
+    // Window A's backoff retry fires after B's confirmed save.
+    fakeTimers.advanceTimersByTime(retryDelayMs(0));
+    await settle();
+    jest.useRealTimers();
+    await waitFor(() => control.deletesSettled === control.deleteCalls);
+    expect((await service.get(id))?.text).toBe("typed in B");
   });
 
   test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
