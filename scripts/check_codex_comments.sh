@@ -129,12 +129,19 @@ compute_codex_sets_from_arrays() {
   local cleared_commits
   cleared_commits=$(printf '%s' "$threads_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; codex_resolved_finding_commits($bot)')
 
-  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" --argjson cleared "$cleared_commits" 'include "codex_comments"; codex_blocking_comments($bot; $head; $resolved; $cleared)')
-
   UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
     .[]
     | select(.isResolved == false and .comments.nodes[0].author.login == $bot)
   ]')
+
+  # A completed security review with null findings flags counts as clean only with a clean
+  # receipt for this head and no open Codex thread (codex_summary_status, coder/xum#7727).
+  local clean_receipt
+  clean_receipt=$(printf '%s' "$comments_json" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments"; codex_clean_security_receipt_for($bot; $head)')
+  cleared_commits=$(printf '%s' "$UNRESOLVED_THREADS" | jq -c --argjson cleared "$cleared_commits" --argjson receipt "$clean_receipt" \
+    '$cleared + {clean_security_receipt: ($receipt and length == 0)}')
+
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" --argjson cleared "$cleared_commits" 'include "codex_comments"; codex_blocking_comments($bot; $head; $resolved; $cleared)')
 
   REGULAR_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq 'length')
   UNRESOLVED_COUNT=$(printf '%s' "$UNRESOLVED_THREADS" | jq 'length')
