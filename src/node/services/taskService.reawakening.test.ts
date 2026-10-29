@@ -1102,70 +1102,98 @@ describe("TaskService", () => {
 
   // F203 (drift scan of F54): the user archives the child while a deferred parent message waits
   // for its stream to end. The archive is the later user decision, so the redelivery must not
-  // unarchive the child.
-  test("a deferred parent message does not unarchive a child the user archived during the wait", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-deferred-archived";
-    const childTaskId = "child-deferred-archived";
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          runtimeConfig: { type: "local" },
-          parentWorkspaceId,
-          taskStatus: "reported",
-        }),
-      ],
-      testTaskSettings()
-    );
-    let streaming = true;
-    let releaseIdle: () => void = () => undefined;
-    const idle = new Promise<void>((resolve) => {
-      releaseIdle = resolve;
-    });
-    const setChildField = (field: "archivedAt" | "unarchivedAt", value: string) =>
-      config.editConfig((cfg) => {
-        const workspace = Array.from(cfg.projects.values())
-          .flatMap((project) => project.workspaces)
-          .find((candidate) => candidate.id === childTaskId);
-        if (workspace) workspace[field] = value;
-        return cfg;
+  // unarchive the child. A send to an already archived child still restores it on purpose.
+  const f203Cases = [
+    {
+      name: "does not unarchive a child the user archived during the wait",
+      archivedAtSend: undefined,
+      duringWait: { archivedAt: "2026-08-09T00:00:00.000Z" },
+      archivedAfter: true,
+    },
+    {
+      name: "does not unarchive a child the user unarchived and archived again during the wait",
+      archivedAtSend: "2026-08-01T00:00:00.000Z",
+      duringWait: {
+        unarchivedAt: "2026-08-05T00:00:00.000Z",
+        archivedAt: "2026-08-09T00:00:00.000Z",
+      },
+      archivedAfter: true,
+    },
+    {
+      name: "still unarchives a child that was archived at the send",
+      archivedAtSend: "2026-08-01T00:00:00.000Z",
+      duringWait: {},
+      archivedAfter: false,
+    },
+  ] as const;
+  for (const f203 of f203Cases) {
+    test(`a deferred parent message ${f203.name}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-deferred-archived";
+      const childTaskId = "child-deferred-archived";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId),
+          projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId,
+            taskStatus: "reported",
+            ...(f203.archivedAtSend != null ? { archivedAt: f203.archivedAtSend } : {}),
+          }),
+        ],
+        testTaskSettings()
+      );
+      let streaming = true;
+      let releaseIdle: () => void = () => undefined;
+      const idle = new Promise<void>((resolve) => {
+        releaseIdle = resolve;
       });
-    const unarchive = mock(async (workspaceId: string): Promise<Result<void>> => {
-      if (workspaceId === childTaskId)
-        await setChildField("unarchivedAt", "2026-08-10T00:00:00.000Z");
-      return Ok(undefined);
-    });
-    const { workspaceService } = createWorkspaceServiceMocks({
-      waitForIdleAndNoQueuedMessages: mock(() => idle),
-      unarchiveWhileTaskTreeLocked: unarchive,
-    });
-    const { aiService } = createAIServiceMocks(config, {
-      isStreaming: mock((workspaceId: string) => streaming && workspaceId === childTaskId),
-    });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+      const setChildField = (field: "archivedAt" | "unarchivedAt", value: string) =>
+        config.editConfig((cfg) => {
+          const workspace = Array.from(cfg.projects.values())
+            .flatMap((project) => project.workspaces)
+            .find((candidate) => candidate.id === childTaskId);
+          if (workspace) workspace[field] = value;
+          return cfg;
+        });
+      const unarchive = mock(async (workspaceId: string): Promise<Result<void>> => {
+        if (workspaceId === childTaskId)
+          await setChildField("unarchivedAt", "2026-08-10T00:00:00.000Z");
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({
+        waitForIdleAndNoQueuedMessages: mock(() => idle),
+        unarchiveWhileTaskTreeLocked: unarchive,
+      });
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock((workspaceId: string) => streaming && workspaceId === childTaskId),
+      });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
 
-    const sent = await taskService.sendMessageToDescendantAgentTask(
-      parentWorkspaceId,
-      childTaskId,
-      "Late decision",
-      "tool-end"
-    );
-    expect(sent.success ? sent.data.delivery : sent.error).toBe("queued");
+      const sent = await taskService.sendMessageToDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        "Late decision",
+        "tool-end"
+      );
+      expect(sent.success ? sent.data.delivery : sent.error).toBe("queued");
 
-    // The user archives the child while the message waits.
-    await setChildField("archivedAt", "2026-08-09T00:00:00.000Z");
-    streaming = false;
-    releaseIdle();
-    await flushTerminalAttentionDrains(taskService);
+      // What the user does while the message waits.
+      for (const [field, value] of Object.entries(f203.duringWait)) {
+        await setChildField(field as "archivedAt" | "unarchivedAt", value);
+      }
+      streaming = false;
+      releaseIdle();
+      await flushTerminalAttentionDrains(taskService);
 
-    const child = findWorkspaceInConfig(config, childTaskId);
-    expect(isWorkspaceArchived(child?.archivedAt, child?.unarchivedAt)).toBe(true);
-    expect(unarchive).not.toHaveBeenCalled();
-  });
+      const child = findWorkspaceInConfig(config, childTaskId);
+      expect(isWorkspaceArchived(child?.archivedAt, child?.unarchivedAt)).toBe(f203.archivedAfter);
+      expect(unarchive.mock.calls.length > 0).toBe(!f203.archivedAfter);
+    });
+  }
 
   test("sendMessageToDescendantAgentTask reawakens an inactive child of a scratch parent", async () => {
     // Scratch (project-less) chats spawn scratch children in the SCRATCH config bucket; a

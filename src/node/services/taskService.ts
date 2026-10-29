@@ -1295,8 +1295,8 @@ interface DeferredDescendantRedelivery {
   attempt: number;
   /** Set by the dispatch when the target is still streaming without a task execution. */
   deferAgain: boolean;
-  /** Whether the target was archived at the original send (see DeferredDescendantMessage). */
-  archivedAtSend: boolean;
+  /** The target's archive at the original send (see DeferredDescendantMessage). */
+  archivedAtSend: string | null;
 }
 
 /** A trusted descendant message whose delivery waits for an idle target (F54). */
@@ -1309,10 +1309,12 @@ interface DeferredDescendantMessage {
   options: TrustedDescendantMessageOptions | undefined;
   stopFence: ReadonlyMap<string, number>;
   /**
-   * F203: a send to an archived task unarchives it on purpose. An archive that lands during the
-   * wait is a later user decision than the message, so, like a Stop, it wins over the redelivery.
+   * F203: the target's archivedAt at the original send, or null when it was not archived. A send
+   * to an archived task unarchives it on purpose. An archive that lands during the wait (also a
+   * re-archive after an unarchive) is a later user decision than the message, so, like a Stop, it
+   * wins over the redelivery.
    */
-  archivedAtSend: boolean;
+  archivedAtSend: string | null;
 }
 
 function resolveDescendantMessageStopFence(
@@ -1330,15 +1332,19 @@ function isInactiveAgentTaskStatus(
 }
 
 /**
- * Whether the target was archived at the original send, or null when the user archived it during
- * the wait (F203): that archive is a later user decision than the message and wins, like a Stop.
+ * The target's archive at the original send (F203), or null when the user archived it during the
+ * wait: that archive is a later user decision than the message and wins, like a Stop. An archive
+ * is identified by its archivedAt, so a re-archive after an unarchive also counts as new.
  */
 function resolveDeferralArchivedAtSend(
   redelivery: DeferredDescendantRedelivery | undefined,
-  target: { archived: boolean }
-): boolean | null {
-  if (redelivery == null) return target.archived;
-  return target.archived && !redelivery.archivedAtSend ? null : redelivery.archivedAtSend;
+  target: { archived: boolean; archivedAt: string | undefined }
+): { archivedAtSend: string | null } | null {
+  const current = target.archived ? (target.archivedAt ?? null) : null;
+  if (redelivery == null) return { archivedAtSend: current };
+  return current != null && current !== redelivery.archivedAtSend
+    ? null
+    : { archivedAtSend: redelivery.archivedAtSend };
 }
 
 /** After this many idle waits, a deferred message falls back to plain live delivery. */
@@ -9037,6 +9043,7 @@ export class TaskService implements AgentTaskIntegration {
         const deferred = this.deferDescendantMessage(deferral, {
           inactive,
           archived: legacyArchived,
+          archivedAt: entry.workspace.archivedAt,
           taskStatus: entry.workspace.taskStatus,
         });
         if (deferred != null) return deferred;
@@ -9185,17 +9192,22 @@ export class TaskService implements AgentTaskIntegration {
    */
   private deferDescendantMessage(
     deferral: Omit<DeferredDescendantMessage, "archivedAtSend">,
-    target: { inactive: boolean; archived: boolean; taskStatus: AgentTaskStatus | undefined }
+    target: {
+      inactive: boolean;
+      archived: boolean;
+      archivedAt: string | undefined;
+      taskStatus: AgentTaskStatus | undefined;
+    }
   ): Result<SendAgentTaskMessageResult, SendAgentTaskMessageError> | null {
-    const archivedAtSend = resolveDeferralArchivedAtSend(deferral.options?.redelivery, target);
-    if (archivedAtSend == null) {
+    const archive = resolveDeferralArchivedAtSend(deferral.options?.redelivery, target);
+    if (archive == null) {
       return Err({
         code: "not_active" as const,
         taskStatus: target.taskStatus ?? "unknown",
         message: "Task workspace was archived while the message waited for its stream to end.",
       });
     }
-    const params = { ...deferral, archivedAtSend };
+    const params = { ...deferral, archivedAtSend: archive.archivedAtSend };
     const queued = Ok({ delivery: "queued" as const, queueDispatchMode: params.queueDispatchMode });
     if (
       params.options?.redelivery == null &&
