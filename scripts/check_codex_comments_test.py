@@ -40,10 +40,11 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
-def comment(body, author=BOT, created_at=AFTER, minimized=False):
+def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
         "author": {"login": author},
+        "authorAssociation": association,
         "body": body,
         "createdAt": created_at,
         "isMinimized": minimized,
@@ -377,6 +378,9 @@ else:
             ("request for an older head", [review, comment(posted.replace(head, "c" * 40), "maintainer"),
                                            comment(board)], 1, 10),
             ("request names the head", [review, comment(posted, "maintainer"), comment(board)], 0, 10),
+            # Anyone can comment on a public PR: only a member's request counts.
+            ("outsider's request names the head",
+             [review, comment(posted, "outsider", association="NONE"), comment(board)], 1, 10),
             ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
             ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
         ):

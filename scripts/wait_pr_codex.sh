@@ -115,6 +115,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
         nodes {
           id
           author { login }
+          authorAssociation
           body
           createdAt
           isMinimized

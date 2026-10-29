@@ -50,10 +50,12 @@ def codex_security_receipt_missing($bot; $head):
         and .has_unresolved_findings == null and .has_any_findings == null)] | length > 0)
   and (codex_clean_security_receipt_for($bot; $head) | not);
 
-# Input: PR comment nodes. Output: whether someone other than Codex already asked for a Codex
-# security review of $head. wait_pr_codex.sh names the head in each request it posts.
+# Input: PR comment nodes. Output: whether a repository member already asked for a Codex
+# security review of $head. wait_pr_codex.sh names the head in each request it posts. Other
+# authors do not count: anyone can comment on a public PR, and Codex may ignore them.
 def codex_security_review_requested_for($bot; $head):
-  any(.[]; .author.login != $bot and (.body | contains("@codex security review") and contains($head)));
+  any(.[]; .author.login != $bot and (.authorAssociation | IN("OWNER", "MEMBER", "COLLABORATOR"))
+    and (.body | contains("@codex security review") and contains($head)));
 
 # Input: review thread nodes. Output: the root comment IDs of resolved Codex
 # threads, the IDs that board advisory links use (#discussion_r<id>).

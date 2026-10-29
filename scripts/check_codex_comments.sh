@@ -247,6 +247,7 @@ fetch_all_comments_via_api() {
           nodes {
             id
             author { login }
+            authorAssociation
             body
             createdAt
             isMinimized
