@@ -98,7 +98,7 @@ describe("Composer decorations across workspace switches", () => {
       if (otherWorkspaceId != null) {
         await app.env.orpc.workspace
           .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
-          .catch(() => undefined);
+          .catch((error: unknown) => console.warn("Removing the second workspace failed", error));
       }
       await app.dispose();
     }
