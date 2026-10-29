@@ -304,6 +304,50 @@ else:
                     data = snapshot([comment(changed)], head=head)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
+    def test_null_security_flags_pass_only_with_a_clean_receipt_for_this_head(self):
+        # Since 2026-10-28 Codex can finish a security review with null findings flags
+        # (coder/xum#7727, observed on #7722). That is clean only beside a clean receipt
+        # for the current head and with no open Codex thread; every other null blocks.
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        older_receipt = receipt.replace("`" + head[:10] + "`", "`" + "c" * 10 + "`")
+        self.assertNotEqual(older_receipt, receipt)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        open_thread = thread("[P2] Open" + code_marker, commit=head)
+        advisory = board.replace(
+            "\n\n\n\n<details>",
+            "\n\n### Security findings\n\n#### Advisory findings (1)\n\n"
+            "- 🟡 [Leak](https://github.com/coder/xum/pull/7722#discussion_r1) · **Medium**"
+            "\n\n\n\n<details>",
+            1,
+        )
+        self.assertNotEqual(advisory, board)
+        running = board.replace(
+            '"has_unresolved_findings":null,"status":"completed"}}',
+            '"has_unresolved_findings":null,"status":"running"}}',
+        ).replace('"status":"completed"} -->', '"status":"running"} -->')
+        self.assertNotEqual(running, board)
+        for case, comments, threads, pr_head, expected in (
+            ("clean receipt for this head", [board, receipt], [], head, 0),
+            ("no receipt", [board], [], head, 1),
+            ("open Codex thread", [board, receipt], [open_thread], head, 1),
+            ("receipt for an older head", [board, older_receipt], [], head, 1),
+            # Unknown, not "older review in progress": null flags are clean only for this head.
+            ("board and receipt for an older head", [board, receipt], [], NEWER_HEAD, 1),
+            ("advisory section", [advisory, receipt], [], head, 1),
+            ("merge gate on", [board.replace('"mergeGateEnabled":false', '"mergeGateEnabled":true'), receipt],
+             [], head, 1),
+            ("running, null findings", [running, receipt], [], head, 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+        with self.subTest("a minimized receipt does not count"):
+            data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
+            self.assert_gate(1, data)
+
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved
         # until it reviews again (seen on coder/xum#6786), like advisory bullets
