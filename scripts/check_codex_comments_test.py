@@ -71,7 +71,7 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, committed_at=None):
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
     # The PR head defaults to the head of the first board in the snapshot, so a
     # fixture board describes the current head unless a test says otherwise.
     if head is None:
@@ -86,11 +86,6 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, commi
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
                     "reactions": connection(list(reactions)),
-                    **(
-                        {"commits": {"nodes": [{"commit": {"committedDate": committed_at}}]}}
-                        if committed_at
-                        else {}
-                    ),
                 }
             }
         }
@@ -111,7 +106,7 @@ args = sys.argv[1:]
 if args[:2] == ['pr', 'comment']:
     # The only write the scripts may make: a Codex review request (wait_pr_codex.sh).
     with open(os.environ['CODEX_GATE_POSTS'], 'a') as posts:
-        posts.write(args[args.index('--body') + 1] + '\\n')
+        posts.write(args[args.index('--body') + 1] + '\\0')
     sys.exit(0)
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
@@ -373,18 +368,22 @@ else:
         board = FIXTURES["review_state_null_security_summary"]["body"]
         receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
         head = board_head(board)
-        request = comment("@codex review", "maintainer", BEFORE)
-        newer = comment("@codex security review", "maintainer", AFTER)
-        for case, comments, committed_at, posts in (
-            ("request older than the head", [request, comment(board)], REQUEST, 1),
-            ("request newer than the head", [request, newer, comment(board)], REQUEST, 0),
-            ("receipt present", [request, comment(board), comment(receipt)], REQUEST, 0),
-            ("head commit time unknown", [request, comment(board)], None, 0),
+        review = comment("@codex review", "maintainer", BEFORE)
+        posted = "@codex security review\n\nHead: " + head
+        approval = comment("Codex Review: Didn't find any major issues. Nice work!", created_at=AFTER)
+        for case, comments, posts, expected in (
+            ("no request names the head", [review, comment(board)], 1, 10),
+            # A request that names another head (an earlier push) does not count.
+            ("request for an older head", [review, comment(posted.replace(head, "c" * 40), "maintainer"),
+                                           comment(board)], 1, 10),
+            ("request names the head", [review, comment(posted, "maintainer"), comment(board)], 0, 10),
+            ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
+            ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
         ):
             with self.subTest(case=case):
-                data = snapshot(comments, head=head, committed_at=committed_at)
-                self.run_gate(data, "wait_pr_codex.sh")
-                self.assertEqual(self.posts.read_text().splitlines(), ["@codex security review"] * posts)
+                result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(self.posts.read_text().split("\0")[:-1], [posted] * posts)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved

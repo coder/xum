@@ -57,6 +57,7 @@ UNRESOLVED_THREADS='[]'
 REGULAR_COUNT=0
 UNRESOLVED_COUNT=0
 IN_PROGRESS_COUNT=0
+SECURITY_RECEIPT_STATE="present"
 
 resolve_repo_context() {
   if [[ -n "${MUX_GH_OWNER:-}" || -n "${MUX_GH_REPO:-}" ]]; then
@@ -142,6 +143,10 @@ compute_codex_sets_from_arrays() {
     '$cleared + {clean_security_receipt: ($receipt and length == 0)}')
 
   REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" --argjson resolved "$resolved_ids" --argjson cleared "$cleared_commits" 'include "codex_comments"; codex_blocking_comments($bot; $head; $resolved; $cleared)')
+  # A push-triggered run posts no security receipt (coder/xum#7731); wait_pr_codex.sh requests one.
+  SECURITY_RECEIPT_STATE=$(printf '%s' "$comments_json" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$PR_HEAD_OID" 'include "codex_comments";
+    if codex_security_receipt_missing($bot; $head) | not then "present"
+    elif codex_security_review_requested_for($bot; $head) then "requested" else "missing" end')
 
   REGULAR_COUNT=$(printf '%s' "$REGULAR_COMMENTS" | jq 'length')
   UNRESOLVED_COUNT=$(printf '%s' "$UNRESOLVED_THREADS" | jq 'length')
@@ -437,6 +442,13 @@ if [ "$TOTAL_UNRESOLVED" -gt 0 ]; then
   echo ""
   if [ "$IN_PROGRESS_COUNT" -gt 0 ]; then
     echo "⏳ Codex has not finished reviewing this PR. Re-run this check after the review completes."
+  fi
+  # wait_pr_codex.sh matches these lines: keep their text in sync.
+  if [ "$SECURITY_RECEIPT_STATE" != "present" ]; then
+    echo "⏳ Waiting for the Codex security receipt for $PR_HEAD_OID."
+  fi
+  if [ "$SECURITY_RECEIPT_STATE" = "missing" ]; then
+    echo "⏳ No Codex security review was requested for $PR_HEAD_OID: request one."
   fi
   if codex_only_in_progress_blocks; then
     exit 10
