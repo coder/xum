@@ -512,6 +512,78 @@ describe("TaskService", () => {
     );
   });
 
+  test("waitForAgentReport releases its waiter and foreground await when the report read throws", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-000";
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    // The requester is itself a running task, so a leaked foreground await shows up in the
+    // parallel-slot count: a foreground-awaiting task does not charge a slot.
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "parent", parentId, {
+          name: "agent_exec_parent",
+          parentWorkspaceId: rootId,
+          agentType: "exec",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings(1, 3)
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    // A persisted report for the running row makes the read after waiter registration adopt it.
+    // The adoption's config write fails once, so that read throws.
+    await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
+      workspaceId: parentId,
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
+      childTaskId: childId,
+      parentWorkspaceId: parentId,
+      ancestorWorkspaceIds: [parentId, rootId],
+      reportMarkdown: "persisted report",
+      nowMs: Date.now(),
+    });
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("config write failed"));
+
+    const waitError = await taskService
+      .waitForAgentReport(childId, { requestingWorkspaceId: parentId })
+      .catch((error: unknown) => error);
+
+    expect(waitError).toBeInstanceOf(Error);
+    expect((waitError as Error).message).toBe("config write failed");
+    expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+    const internal = (
+      taskService as unknown as { waiters: { pendingWaitersByTaskId: Map<string, unknown[]> } }
+    ).waiters;
+    expect({
+      parentForegroundAwaiting: taskService.isForegroundAwaiting(parentId),
+      // Parent and child are both running and neither waits in the foreground: 2 slots.
+      activeAgentTasks: taskService.countActiveAgentTasks(config.loadConfigOrDefault()),
+      childHasPendingWaiter: internal.pendingWaitersByTaskId.has(childId),
+      // Last: on a leak this call would reject (and so clean up) the dead waiter.
+      backgroundableWaiters: taskService.backgroundForegroundWaitsForWorkspace(parentId),
+    }).toEqual({
+      parentForegroundAwaiting: false,
+      activeAgentTasks: 2,
+      childHasPendingWaiter: false,
+      backgroundableWaiters: 0,
+    });
+  });
+
   test("waitForAgentReport returns persisted report after workspace is removed", async () => {
     const config = await createTestConfig(rootDir);
 
