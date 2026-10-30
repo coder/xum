@@ -30,7 +30,7 @@ describe("collectDefinitionLayers", () => {
   });
 
   it("merges duplicate same-ID ancestors closer-first instead of dropping them", () => {
-    // A project exec.md's cacheTtl must reach agents based on exec over the built-in's.
+    // A project exec.md's cacheTtl must reach agents based on exec over a global exec.md's.
     const layers = collectDefinitionLayers("researcher", [
       { id: "researcher" },
       { id: "exec", ai: { thinkingLevel: "high", cacheTtl: "1h" } },
