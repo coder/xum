@@ -1,7 +1,7 @@
 import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
@@ -2822,12 +2822,15 @@ describe("vscode webview background processes strip (#5092)", () => {
   const press = async (target: Element, init: KeyboardEventInit): Promise<boolean> => {
     let notPrevented = true;
     await act(async () => {
-      notPrevented = fireEvent.keyDown(target, init);
+      const event = createEvent.keyDown(target, init);
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(event, "getModifierState", { value: () => false });
+      notPrevented = fireEvent(target, event);
       await Promise.resolve();
     });
     return notPrevented;
   };
-  const FOCUS_STRIP = { key: "J", ctrlKey: true, shiftKey: true };
+  const FOCUS_STRIP = { key: "j", code: "KeyJ", ctrlKey: true, altKey: true };
   const stripRows = (view: ReturnType<typeof render>) =>
     Array.from(view.container.querySelectorAll<HTMLElement>("[data-process-row]"));
   const focusComposerWithProcesses = async (workspace: UiWorkspace) => {
