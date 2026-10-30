@@ -1269,6 +1269,16 @@ describe("TasksSection prompt cache TTL", () => {
     expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
   });
 
+  test("without discovered agents, Inherit reads the fallback agents' own frontmatter", async () => {
+    setGlobalCacheTtl("1h");
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+
+    // Built-in explore's frontmatter 5m outranks the global 1h, as in a run of explore.
+    expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (5 minutes)");
+    expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
+  });
+
   test("Inherit ranks a base's Settings value above frontmatter merged from that base", async () => {
     const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
     const subagent = { scope: "project" as const, uiSelectable: false, subagentRunnable: true };

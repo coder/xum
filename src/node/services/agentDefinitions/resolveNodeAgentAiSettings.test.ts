@@ -29,15 +29,19 @@ describe("collectDefinitionLayers", () => {
     expect(layers.ancestors).toEqual([]);
   });
 
-  it("merges duplicate same-ID ancestors instead of dropping them", () => {
+  it("merges duplicate same-ID ancestors closer-first instead of dropping them", () => {
+    // A project exec.md's cacheTtl must reach agents based on exec over the built-in's.
     const layers = collectDefinitionLayers("researcher", [
       { id: "researcher" },
-      { id: "exec", ai: { thinkingLevel: "high" } },
-      { id: "exec", ai: { model: MODEL_A } },
+      { id: "exec", ai: { thinkingLevel: "high", cacheTtl: "1h" } },
+      { id: "exec", ai: { model: MODEL_A, cacheTtl: "5m" } },
     ]);
     expect(layers.targetDefinitionAiDefaults).toBeUndefined();
     expect(layers.ancestors).toEqual([
-      { agentId: "exec", definitionAiDefaults: { model: MODEL_A, thinkingLevel: "high" } },
+      {
+        agentId: "exec",
+        definitionAiDefaults: { model: MODEL_A, thinkingLevel: "high", cacheTtl: "1h" },
+      },
     ]);
   });
 
