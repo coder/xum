@@ -6,6 +6,7 @@ import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import {
   collectDefinitionLayers,
   loadAgentDefinitionAiLayers,
+  resolveChainAgentCacheTtl,
   resolveNodeAgentAiSettings,
   resolveNodeAgentAiSettingsWithLayers,
 } from "./resolveNodeAgentAiSettings";
@@ -68,6 +69,24 @@ describe("collectDefinitionLayers", () => {
     expect(resolved.selected.model).toBe(MODEL_A);
     expect(resolved.selected.thinkingLevel).toBe("high");
     expect(resolved.sources.model).toEqual({ tier: "definition", agentId: "exec" });
+  });
+});
+
+describe("resolveChainAgentCacheTtl", () => {
+  it("merges same-ID scope refinements closer-first", () => {
+    // A project exec.md (base: exec) without a TTL keeps the built-in exec's; with one, it wins.
+    expect(
+      resolveChainAgentCacheTtl("exec", undefined, [
+        { id: "exec", ai: { model: MODEL_A } },
+        { id: "exec", ai: { cacheTtl: "1h" } },
+      ])
+    ).toBe("1h");
+    expect(
+      resolveChainAgentCacheTtl("exec", undefined, [
+        { id: "exec", ai: { cacheTtl: "5m" } },
+        { id: "exec", ai: { cacheTtl: "1h" } },
+      ])
+    ).toBe("5m");
   });
 });
 

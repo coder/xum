@@ -37,6 +37,7 @@ import { createTestToolConfig } from "./tools/testHelpers";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
   collectDeferLoadingToolNames,
@@ -6973,4 +6974,146 @@ describe("AIService runtimes", () => {
       await testHistory.cleanup();
     }
   });
+});
+
+describe("per-agent prompt cache TTL", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  /**
+   * Streams one turn of `agentId` through real agent resolution and real Anthropic model
+   * creation, then sends the request the turn built. Returns every cache marker's ttl on the
+   * final wire body and the ttl the turn envelope recorded.
+   */
+  async function sendTurn(input: {
+    agentId: string;
+    globalCacheTtl?: "5m" | "1h";
+    agentAiDefaults?: AgentAiDefaults;
+  }): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
+    using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-agent-cache-ttl";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const {
+      config,
+      historyService,
+      initStateManager,
+      providersConfigStore,
+      streamManager,
+      service,
+    } = createBasicAIService(xumHome.path);
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    const { resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      useRequestedModelString: true,
+      allTools: {
+        bash: tool({ description: "b", inputSchema: jsonSchema({ type: "object" }) }),
+      },
+    });
+    // Real agent resolution and message preparation: the final wire body is under test.
+    spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+    spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+    resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    if (input.agentAiDefaults) await config.updateAgentAiDefaults(input.agentAiDefaults);
+    const bodies: unknown[] = [];
+    const recordingFetch: RecordingFetch = (_input, init) => {
+      if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+      bodies.push(JSON.parse(init.body));
+      // Only inspect serialized requests; never contact a provider.
+      return Promise.resolve(new Response("{}", { status: 400 }));
+    };
+    // The provider-config fetch is the base fetch the Anthropic cache wrapper wraps.
+    spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+      anthropic: {
+        apiKey: "test-key",
+        fetch: recordingFetch,
+        ...(input.globalCacheTtl != null ? { cacheTtl: input.globalCacheTtl } : {}),
+      },
+    });
+
+    {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        agentId: input.agentId,
+      });
+      expect(result.success).toBe(true);
+      const request = startStreamCalls[0];
+      expect(request.initialMetadata?.agentId).toBe(input.agentId);
+      await generateText({
+        model: request.model,
+        system: request.system,
+        messages: request.messages,
+        // Like StepPreparation: the assembler sends the cached system prompt as messages.
+        allowSystemInMessages: true,
+        tools: request.tools,
+        providerOptions: request.providerOptions as Parameters<
+          typeof generateText
+        >[0]["providerOptions"],
+        headers: request.headers,
+        maxRetries: 0,
+      }).catch(() => undefined);
+    }
+
+    expect(bodies).toHaveLength(1);
+    const wireTtls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control") wireTtls.push((child as { ttl?: string }).ttl);
+        else walk(child);
+      }
+    };
+    const body = bodies[0] as Record<string, unknown>;
+    // Anthropic's marker order: tools, system, messages.
+    walk([body.tools, body.system, body.messages]);
+    const envelope = (
+      await new DurableEventJournal(path.join(config.sessionsDir, workspaceId)).read()
+    ).findLast((event) => event.kind === "turn-envelope");
+    if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+    return { wireTtls, envelopeTtl: envelope.data.anthropicCacheTtl };
+  }
+
+  const cases: Array<{
+    name: string;
+    input: Parameters<typeof sendTurn>[0];
+    expected: "5m" | "1h";
+  }> = [
+    {
+      name: "Explore keeps its built-in 5m under a global 1h",
+      input: { agentId: "explore", globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "an Explore Settings value wins over its built-in 5m",
+      input: { agentId: "explore", agentAiDefaults: { explore: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+    {
+      name: "Exec without a Settings value follows the global TTL",
+      input: { agentId: "exec", globalCacheTtl: "1h" },
+      expected: "1h",
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, async () => {
+      const { wireTtls, envelopeTtl } = await sendTurn(testCase.input);
+      // Tool, system and last-message markers at least, all on one TTL.
+      expect(wireTtls.length).toBeGreaterThanOrEqual(3);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+      expect(envelopeTtl).toBe(testCase.expected);
+    });
+  }
 });

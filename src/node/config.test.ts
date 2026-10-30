@@ -5411,6 +5411,19 @@ describe("Config", () => {
       );
     });
 
+    it("round-trips a per-agent prompt cache TTL without a legacy delegated mirror", async () => {
+      await config.updateAgentAiDefaults({ explore: { cacheTtl: "1h" }, exec: { cacheTtl: "2h" } });
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults).toEqual({
+        explore: { cacheTtl: "1h" },
+      });
+      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        subagentAiDefaults?: unknown;
+      };
+      // Older builds read the legacy map as a delegated model profile, which has no TTL.
+      expect(raw.subagentAiDefaults).toBeUndefined();
+    });
+
     it("preserves explicit gateway-scoped model strings in nested AI defaults", async () => {
       await config.editConfig((cfg) => {
         cfg.agentAiDefaults = {

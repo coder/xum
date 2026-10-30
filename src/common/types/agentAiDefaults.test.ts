@@ -21,6 +21,18 @@ describe("normalizeAgentAiDefaults reasoningMode", () => {
   });
 });
 
+describe("normalizeAgentAiDefaults cacheTtl", () => {
+  test("keeps an entry that only sets cacheTtl", () => {
+    expect(normalizeAgentAiDefaults({ explore: { cacheTtl: "1h" } })).toEqual({
+      explore: { cacheTtl: "1h" },
+    });
+  });
+
+  test("drops an invalid cacheTtl and the then-empty entry", () => {
+    expect(normalizeAgentAiDefaults({ explore: { cacheTtl: "2h" } })).toEqual({});
+  });
+});
+
 describe("normalizeAgentAiDefaults nested subagent profiles", () => {
   test("keeps a nested profile that only sets reasoningMode", () => {
     const result = normalizeAgentAiDefaults({
