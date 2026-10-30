@@ -70,12 +70,15 @@ export interface ResolveNodeAgentAiSettingsParams {
 }
 
 function toDefinitionDefaults(
-  ai: { model?: string; thinkingLevel?: ThinkingLevel } | undefined
+  ai: AgentAiDefinitionDefaults | undefined
 ): AgentAiDefinitionDefaults | undefined {
-  if (!ai || (ai.model === undefined && ai.thinkingLevel === undefined)) {
+  if (
+    !ai ||
+    (ai.model === undefined && ai.thinkingLevel === undefined && ai.cacheTtl === undefined)
+  ) {
     return undefined;
   }
-  return { model: ai.model, thinkingLevel: ai.thinkingLevel };
+  return { model: ai.model, thinkingLevel: ai.thinkingLevel, cacheTtl: ai.cacheTtl };
 }
 
 /** Field-wise merge of definition layers; the closer scope/hop wins per field. */
@@ -88,6 +91,7 @@ function mergeDefinitionDefaults(
   return {
     model: closer.model ?? further.model,
     thinkingLevel: closer.thinkingLevel ?? further.thinkingLevel,
+    cacheTtl: closer.cacheTtl ?? further.cacheTtl,
   };
 }
 
@@ -101,7 +105,7 @@ function mergeDefinitionDefaults(
  */
 export function collectDefinitionLayers(
   agentId: string,
-  chain: ReadonlyArray<{ id: string; ai?: { model?: string; thinkingLevel?: ThinkingLevel } }>
+  chain: ReadonlyArray<{ id: string; ai?: AgentAiDefinitionDefaults }>
 ): {
   targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
   ancestors: AgentAiAncestorLayer[];

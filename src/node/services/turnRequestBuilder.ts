@@ -69,6 +69,8 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { collectDefinitionLayers } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
+import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -236,7 +238,11 @@ import {
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
-import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import {
+  getAnthropicCacheTtl,
+  supportsAnthropicCache,
+  type AnthropicCacheTtl,
+} from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
@@ -1837,6 +1843,9 @@ export class TurnRequestBuilder {
       workspaceId,
       this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
     );
+    // The running agent's prompt-cache TTL. Models are created before the agent resolves, so
+    // their Anthropic wires read it through a getter at request time (set after resolution).
+    let agentAnthropicCacheTtl: AnthropicCacheTtl | undefined;
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1889,6 +1898,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          getAnthropicCacheTtlOverride: () => agentAnthropicCacheTtl,
           promptCacheScope,
         }
       );
@@ -2279,6 +2289,11 @@ export class TurnRequestBuilder {
       effectiveToolPolicy: agentToolPolicy,
       switchableAgents: resolvedSwitchableAgents,
     } = agentResult.data;
+    agentAnthropicCacheTtl = resolveAgentCacheTtl({
+      targetAgentId: effectiveAgentId,
+      agentAiDefaults: cfg.agentAiDefaults,
+      ...collectDefinitionLayers(effectiveAgentId, agentInheritanceChain),
+    })?.value;
     // Side conversations must not inherit completion requirements for work in the main chat.
     // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
     const effectiveToolPolicy = isSideChat
@@ -3520,10 +3535,13 @@ export class TurnRequestBuilder {
           reasoningMode,
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
-        // Manual cache markers must honor a TTL set through per-model
-        // providerOptions extras when the dedicated mux-level setting is
-        // unset, matching the pre-assembler request-config behavior.
+        // The agent's TTL wins. Otherwise manual cache markers must honor a TTL set through
+        // per-model providerOptions extras when the dedicated mux-level setting is unset,
+        // matching the pre-assembler request-config behavior.
         const effectiveAnthropicCacheTtl =
+          (supportsAnthropicCache(seed.rawModelString, seed.providersConfig)
+            ? agentAnthropicCacheTtl
+            : undefined) ??
           effectiveMuxProviderOptions.anthropic?.cacheTtl ??
           getAnthropicCacheTtl(preparedAttempt.providerOptions);
         const forcedFirstStepToolNames =
@@ -3674,6 +3692,7 @@ export class TurnRequestBuilder {
           toolNamesForSentinel,
           forcedFirstStepToolNames,
           providerOptions: preparedAttempt.providerOptions,
+          anthropicCacheTtl: effectiveAnthropicCacheTtl,
           headers: preparedAttempt.requestHeaders,
           resolvedOverrides: preparedAttempt.resolvedOverrides,
           currentEffectiveLevelRef: preparedAttempt.currentEffectiveLevelRef,
@@ -4189,6 +4208,7 @@ export class TurnRequestBuilder {
                   contextBudgetLimit: nextRequest.contextBudgetLimit,
                   contextBudgetTurnAnchor: nextRequest.contextBudgetTurnAnchor,
                   providerOptions: nextRequest.providerOptions,
+                  anthropicCacheTtl: nextRequest.anthropicCacheTtl,
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
                   thinkingLevel: nextRequest.effectiveThinkingLevel,
@@ -4250,6 +4270,7 @@ export class TurnRequestBuilder {
           }),
         },
         providerOptions: streamProviderOptions,
+        anthropicCacheTtl: primaryRequest.anthropicCacheTtl,
         maxOutputTokens,
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,

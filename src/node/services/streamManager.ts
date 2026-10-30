@@ -1014,7 +1014,8 @@ export class StreamManager {
         effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
         modelString: info.model,
         providerForMessages: info.metadataModel.split(":", 1)[0],
-        anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+        anthropicCacheTtl:
+          info.request.anthropicCacheTtl ?? getAnthropicCacheTtl(info.request.providerOptions),
         ...(deferLoadingToolNames.length > 0 ? { deferLoadingToolNames } : {}),
       },
     };

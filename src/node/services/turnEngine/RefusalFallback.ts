@@ -153,7 +153,10 @@ export function canReuseFallbackPrefix(
 /** The fallback request's system messages plus the swap's conversation prefix. */
 export function buildFallbackPrefix(
   consumedSwap: ContinuousPrefixSwap,
-  nextRequest: Pick<StreamRequestConfig, "messages" | "cacheEnabled" | "providerOptions">
+  nextRequest: Pick<
+    StreamRequestConfig,
+    "messages" | "cacheEnabled" | "providerOptions" | "anthropicCacheTtl"
+  >
 ): ModelMessage[] {
   const conversation = stripMessageCacheControl(
     consumedSwap.prefix.filter((message) => message.role !== "system")
@@ -164,7 +167,7 @@ export function buildFallbackPrefix(
       ? applyCacheControl(
           conversation,
           "anthropic:prefix",
-          getAnthropicCacheTtl(nextRequest.providerOptions)
+          nextRequest.anthropicCacheTtl ?? getAnthropicCacheTtl(nextRequest.providerOptions)
         )
       : conversation),
   ];
@@ -521,6 +524,7 @@ export class RefusalFallback {
       system: prepared.system,
       tools: prepared.tools,
       providerOptions: prepared.providerOptions,
+      anthropicCacheTtl: prepared.anthropicCacheTtl,
       maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,

@@ -4,6 +4,7 @@ import type {
   AgentAiSubagentProfile,
   SubagentAiDefaults,
 } from "@/common/config/schemas/appConfigOnDisk";
+import { CacheTtlSchema } from "@/common/config/schemas/providersConfig";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceOpenAIReasoningMode, coerceThinkingLevel, type ThinkingLevel } from "./thinking";
@@ -67,12 +68,15 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
 
     const autoModelRouting = entry.autoModelRouting === true ? true : undefined;
     const autoThinkingLevel = entry.autoThinkingLevel === true ? true : undefined;
+    // An invalid persisted TTL is dropped so the agent inherits instead (self-healing).
+    const cacheTtl = CacheTtlSchema.safeParse(entry.cacheTtl).data;
 
     const normalized: AgentAiDefaultsEntry = {
       ...base,
       autoModelRouting,
       autoThinkingLevel,
       enabled,
+      ...(cacheTtl !== undefined ? { cacheTtl } : {}),
     };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
@@ -92,6 +96,7 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
       autoModelRouting === undefined &&
       autoThinkingLevel === undefined &&
       enabled === undefined &&
+      cacheTtl === undefined &&
       normalized.subagent === undefined
     ) {
       continue;

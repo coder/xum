@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { CacheTtlSchema } from "../../config/schemas/providersConfig";
 
 export const AgentDefinitionScopeSchema = z.enum(["built-in", "project", "global"]);
 
@@ -35,6 +36,8 @@ const AgentDefinitionAiDefaultsSchema = z
     // Model identifier: full string (e.g. "anthropic:claude-sonnet-4-5") or abbreviation (e.g. "sonnet")
     model: z.string().min(1).optional(),
     thinkingLevel: ThinkingLevelSchema.optional(),
+    // Anthropic prompt-cache TTL; Settings > Agents overrides it, and it overrides the global TTL.
+    cacheTtl: CacheTtlSchema.optional(),
   })
   .strip();
 

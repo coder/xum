@@ -44,6 +44,10 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
@@ -66,6 +70,15 @@ const OFFLINE_SAVE_MESSAGE =
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
 /** The status page agent runs with thinking off (raw streamText, no provider options). */
 const NO_REASONING_AGENT_IDS = new Set(["status_page"]);
+/** Raw streamText agents never take the send path, so a prompt-cache TTL there does nothing. */
+const NO_CACHE_TTL_AGENT_IDS = new Set([
+  ...HEADLESS_REASONING_AGENT_IDS,
+  ...NO_REASONING_AGENT_IDS,
+]);
+const CACHE_TTL_LABELS: Record<AnthropicCacheTtl, string> = {
+  "5m": "5 minutes",
+  "1h": "1 hour",
+};
 
 /**
  * The status page agent only runs when Artifacts, Agent interface view and Status page agent are
@@ -112,6 +125,7 @@ function updateAgentDefaultEntry(
     updated.autoModelRouting === undefined &&
     updated.autoThinkingLevel === undefined &&
     updated.enabled === undefined &&
+    updated.cacheTtl === undefined &&
     updated.subagent === undefined
   ) {
     delete next[normalizedId];
@@ -347,6 +361,9 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
     if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
       return false;
     }
+    if ((aEntry?.cacheTtl ?? undefined) !== (bEntry?.cacheTtl ?? undefined)) {
+      return false;
+    }
     if (!areSubagentProfilesEqual(aEntry?.subagent, bEntry?.subagent)) {
       return false;
     }
@@ -385,9 +402,47 @@ interface AiDefaultsControlsProps {
   showThinkingResetButton?: boolean;
   modelAutoRouting?: { active: boolean; onSelect: () => void };
   thinkingAutoRouting?: { active: boolean; onSelect: () => void };
+  /** Absent hides the Prompt cache control (delegated Exec card, headless agents). */
+  cacheTtl?: PromptCacheTtlControlProps;
   onModelChange: (value: string) => void;
   onThinkingChange: (value: string) => void;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
+}
+
+interface PromptCacheTtlControlProps {
+  agentId: string;
+  /** The agent's own Settings value; undefined inherits. */
+  value: AnthropicCacheTtl | undefined;
+  /** What Inherit resolves to, shown in its label. */
+  inheritedValue: AnthropicCacheTtl;
+  onChange: (value: AnthropicCacheTtl | undefined) => void;
+}
+
+function PromptCacheTtlControl(props: PromptCacheTtlControlProps) {
+  return (
+    <div className="min-w-0 space-y-1">
+      <div className="text-muted text-xs">Prompt cache</div>
+      <Select
+        value={props.value ?? INHERIT}
+        onValueChange={(next) => props.onChange(next === "5m" || next === "1h" ? next : undefined)}
+      >
+        <SelectTrigger
+          className="bg-modal-bg h-9 w-full max-w-60"
+          aria-label={`${props.agentId} prompt cache duration`}
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={INHERIT}>
+            Inherit ({CACHE_TTL_LABELS[props.inheritedValue]})
+          </SelectItem>
+          <SelectItem value="5m">{CACHE_TTL_LABELS["5m"]}</SelectItem>
+          <SelectItem value="1h">{CACHE_TTL_LABELS["1h"]}</SelectItem>
+        </SelectContent>
+      </Select>
+      <div className="text-muted text-xs">Applies to Anthropic models only.</div>
+    </div>
+  );
 }
 
 /** The Reasoning half of AiDefaultsControls. */
@@ -468,6 +523,8 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
       {props.showReasoning === false ? null : (
         <ReasoningDefaultsControl {...props} inheritLabel={inheritLabel} />
       )}
+
+      {props.cacheTtl ? <PromptCacheTtlControl {...props.cacheTtl} /> : null}
     </div>
   );
 }
@@ -505,6 +562,7 @@ export function TasksSection() {
   const pendingSaveRef = useRef<TasksSectionSavePayload | null>(null);
 
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
+  const { config: providersConfig } = useProvidersConfig();
   const newWorkspaceDefaultAgentId = coerceAgentId(
     useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId)
   );
@@ -906,6 +964,47 @@ export function TasksSection() {
     );
   };
 
+  const setAgentCacheTtl = (agentId: string, value: AnthropicCacheTtl | undefined) => {
+    setAgentAiDefaults((prev) =>
+      updateAgentDefaultEntry(prev, agentId, (updated) => {
+        if (value === undefined) {
+          delete updated.cacheTtl;
+        } else {
+          updated.cacheTtl = value;
+        }
+      })
+    );
+  };
+
+  // Inherit shows what the backend resolves without this agent's own Settings value: the
+  // shared per-agent walk (frontmatter, then each base), then the global Anthropic TTL.
+  const getCacheTtlProps = (
+    agentId: string,
+    definition: AgentDefinitionDescriptor | undefined
+  ): PromptCacheTtlControlProps => {
+    const descriptorsById = new Map(
+      listedAgents.map((agent) => [
+        agent.id,
+        { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+      ])
+    );
+    const inherited = resolveAgentCacheTtl({
+      targetAgentId: agentId,
+      agentAiDefaults: {
+        ...agentAiDefaults,
+        [agentId]: { ...agentAiDefaults[agentId], cacheTtl: undefined },
+      },
+      targetDefinitionAiDefaults: definition?.aiDefaults,
+      ancestors: collectDeclaredAncestorLayers(agentId, descriptorsById),
+    })?.value;
+    return {
+      agentId,
+      value: agentAiDefaults[agentId]?.cacheTtl,
+      inheritedValue: inherited ?? providersConfig?.anthropic?.cacheTtl ?? "5m",
+      onChange: (value) => setAgentCacheTtl(agentId, value),
+    };
+  };
+
   const resetAgentEnabled = (agentId: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
@@ -1100,6 +1199,9 @@ export function TasksSection() {
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
           {...(agent.uiSelectable ? getAutoRoutingProps(agent.id, entry) : {})}
+          {...(NO_CACHE_TTL_AGENT_IDS.has(agent.id)
+            ? {}
+            : { cacheTtl: getCacheTtlProps(agent.id, agent) })}
           onModelChange={(value) => setAgentModel(agent.id, value)}
           onThinkingChange={(value) => setAgentThinking(agent.id, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agent.id, mode)}
@@ -1182,6 +1284,9 @@ export function TasksSection() {
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
           {...getAutoRoutingProps(agentId, entry)}
+          {...(NO_CACHE_TTL_AGENT_IDS.has(agentId)
+            ? {}
+            : { cacheTtl: getCacheTtlProps(agentId, undefined) })}
           onModelChange={(value) => setAgentModel(agentId, value)}
           onThinkingChange={(value) => setAgentThinking(agentId, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agentId, mode)}
