@@ -572,11 +572,11 @@ export const KEYBINDS = {
   STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
 
   // Open the live line's background bashes, TODO, sub-agents or reviews panel and focus it; again
-  // (or Esc) closes it. All four share Ctrl/Cmd+Alt so the chips' chords read as one family.
+  // (or Esc) closes it. All four share one modifier pair so the chips' chords read as one family.
   // Ctrl/Cmd+Alt, like NEW_SIDEBAR_TAB: Ctrl/Cmd+Shift has no free letters left for them, and
   // Ctrl+Alt+T is GNOME's terminal. Matched by `code`: Option+letter is a dead key on macOS.
   // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords
-  // (Ctrl/Cmd+Alt+B toggles its secondary side bar, hence J for bashes).
+  // (its secondary side bar toggle takes the "bash" mnemonic letter).
   // The settings backup chords reuse these keys only inside the Settings dialog.
   FOCUS_BACKGROUND_PROCESSES: { key: "j", code: "KeyJ", ctrl: true, alt: true },
   OPEN_TODO_PANEL: { key: "o", code: "KeyO", ctrl: true, alt: true },
