@@ -35,6 +35,7 @@ import {
   localOnlyPayloadFiles,
   mergeBackupPreferences,
   matchedProjectWrites,
+  omitSymlinkedDestinations,
   planProjectBundleRestore,
   planRestoreWrites,
   readProjectMemoryOrigins,
@@ -3856,6 +3857,35 @@ describe("backup payload", () => {
     }
     expect(await fs.readdir(outside)).toEqual([]);
     expect(await fs.readFile(path.join(restoreRoot, "AGENTS.md"), "utf-8")).toBe("local\n");
+  });
+
+  it("omits backed-up files whose local path is a symlink, leaf included", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "from backup\n");
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "skill\n");
+    const payload = await createBackupPayload({
+      muxRoot,
+      contents: CONTENTS,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      preferences: { appearance: { theme: "dark" } },
+    });
+
+    const restoreRoot = path.join(tempDir, "linked-leaf-root");
+    const dotfile = path.join(tempDir, "dotfiles-AGENTS.md");
+    await fs.mkdir(restoreRoot);
+    await fs.writeFile(dotfile, "dotfiles\n", "utf-8");
+    await fs.symlink(dotfile, path.join(restoreRoot, "AGENTS.md"));
+    // Preferences merge into config.json, so a link at their payload path changes nothing.
+    await fs.symlink(dotfile, path.join(restoreRoot, "preferences.json"));
+
+    const omitted = await omitSymlinkedDestinations(restoreRoot, payload);
+
+    expect(omitted.skipped).toEqual(["AGENTS.md"]);
+    expect(omitted.payload.files.map((file) => file.path).sort()).toEqual([
+      "preferences.json",
+      "skills/demo/SKILL.md",
+    ]);
+    expect(omitted.payload.manifest.files.map((file) => file.path)).not.toContain("AGENTS.md");
   });
 
   it("rejects a special-file restore destination during planning", async () => {

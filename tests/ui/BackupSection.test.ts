@@ -1147,6 +1147,28 @@ describe("BackupSection", () => {
     expect(canvas.getByText(/artifacts\/global\/big\.bin/)).toBeTruthy();
   });
 
+  test("lists backed-up files a preview left behind a local symlink", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        symlinkSkipped: ["skills/gh-stack/SKILL.md"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText("skills/gh-stack/SKILL.md")).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("skills/gh-stack/SKILL.md");
+  });
+
   test("drops the left-out artifact notice once different settings are saved", async () => {
     const { view } = renderBackupSection({
       backupPreview: {

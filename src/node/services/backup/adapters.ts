@@ -82,6 +82,7 @@ import {
   mergeBackupPreferences,
   projectBackupPreferences,
   localOnlyPayloadFiles,
+  omitSymlinkedDestinations,
   planRestoreWrites,
   readBackupPayload,
   restoreBackupPayload,
@@ -636,7 +637,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         };
       }
 
-      const payload = await readBackupPayload(sourceDir, { contents });
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents })
+      );
       // The preflight restore itself runs, so a destination this payload cannot be written to
       // fails here instead of after the user accepts a plan that cannot execute. Recomputed
       // rather than carried over to the restore, for the same reason the approvals are.
@@ -708,6 +712,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        symlinkSkipped,
       };
     },
 
@@ -722,7 +727,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const payload = await readBackupPayload(sourceDir, { contents: validateOptions.contents });
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents: validateOptions.contents })
+      );
       assertBackupCommandsApproved(
         await collectMcpCommandApprovals(muxRoot, payload.files, payload.manifest.mcpRedactions),
         validateOptions.approvedCommandTokens
@@ -733,12 +741,22 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
       await readShelfWithPlan(sourceDir, validateOptions.contents);
       if (!validateOptions.contents.includeProjects) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
       const bundlePlan = await readBundleWithPlan(sourceDir);
       if (bundlePlan === null) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
       // The matched writes' own refusals (memory size and count limits, non-file
       // destinations) belong to the preflight too: found only inside the restore, they
@@ -758,6 +776,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       }
       return {
         hasProjectBundle: true,
+        symlinkSkipped,
         projectImports: toProjectImports(bundlePlan.plan),
         // The classification the caller validated against, destination included. Restore
         // re-partitions the bundle but only writes entries that resolve to the very same
@@ -789,7 +808,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async restore(restoreOptions) {
       const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
       const contents = restoreOptions.contents;
-      const payload = await readBackupPayload(sourceDir, { contents });
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+        muxRoot,
+        await readBackupPayload(sourceDir, { contents }),
+        restoreOptions.symlinkSkipped
+      );
       const before = await localFilesByPath(contents);
 
       const restoreCore = async (
@@ -977,6 +1000,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
+        symlinkSkipped,
         restoredProjectMemory,
       };
     },

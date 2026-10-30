@@ -2783,6 +2783,58 @@ async function assertRestoreDestinationWritable(
   }
 }
 
+async function passesThroughSymlink(rootPath: string, relativePath: string): Promise<boolean> {
+  let current = rootPath;
+  for (const segment of relativePath.split("/")) {
+    current = path.join(current, segment);
+    const existing = await lstatOrNull(current);
+    if (existing === null) return false;
+    if (existing.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+/**
+ * Drops the backed-up files whose local destination passes through a symlink, leaf included.
+ * A user who links `skills/<name>` into a shared skills store chose that link, and a backup
+ * pushed before it still holds the real folder: refusing the whole payload failed every preview
+ * and restore. Push skips symlinks too, so neither direction touches these files. A symlink that
+ * appears after this check is still refused when the restore writes.
+ *
+ * `checked` is the skip set a restore's preflight found before the safety snapshot. A restore
+ * applies that set instead of looking again: a symlink replaced by a regular file in between
+ * would otherwise be overwritten, and the snapshot, taken while it was a link, holds no copy.
+ */
+export async function omitSymlinkedDestinations(
+  muxRoot: string,
+  payload: BackupPayload,
+  checked?: readonly string[]
+): Promise<{ payload: BackupPayload; skipped: string[] }> {
+  const root = await resolveRoot(muxRoot);
+  const skipped = new Set<string>();
+  for (const file of payload.files) {
+    // Merged into config.json, never written at its own path.
+    if (file.path === "preferences.json") continue;
+    const linked =
+      checked === undefined
+        ? await passesThroughSymlink(root.path, file.path)
+        : checked.includes(file.path);
+    if (linked) skipped.add(file.path);
+  }
+  if (skipped.size === 0) return { payload, skipped: [] };
+  return {
+    payload: {
+      ...payload,
+      files: payload.files.filter((file) => !skipped.has(file.path)),
+      manifest: {
+        ...payload.manifest,
+        files: payload.manifest.files.filter((file) => !skipped.has(file.path)),
+      },
+    },
+    skipped: [...skipped].sort(),
+  };
+}
+
 /**
  * Everything a restore can reject before it writes anything, so a path or a limit that
  * refuses the payload cannot leave a half-restored install behind. `BackupService.restore`
