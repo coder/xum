@@ -1,9 +1,10 @@
 // Characterization tests for TaskService.waitForAgentReport, written before the method is split
-// into steps. They pin the re-check after the first awaited read, the exits on a failed callback,
-// signal or read, and the completion prompt that an awaiting_report wait queues on the task's
-// event lock without waiting.
+// into steps. They pin the re-check after the first awaited read, the waiter's synchronous
+// registration, "cleanup, then settle" on every exit, the report timeout's arming, and the
+// completion prompt that an awaiting_report wait queues on the task's event lock without waiting.
 // A scripted spy stands in for every report read, so each case controls what each read returns
 // and what changes while it runs. taskService.agentReports.waits.test.ts covers the real reads.
+import assert from "node:assert";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -34,7 +35,8 @@ const REPORT: PendingTaskWaiterReport = { reportMarkdown: "Child report." };
 const FAILURE = "failure from the artifact";
 const LAUNCH_ERROR = "launch error from the row";
 const READ_ERROR = "the read failed";
-const TEST_MESSAGES = new Set([FAILURE, LAUNCH_ERROR, READ_ERROR]);
+const REJECTION = "rejected by the test";
+const TEST_MESSAGES = new Set([FAILURE, LAUNCH_ERROR, READ_ERROR, REJECTION]);
 /** A delay no other timer uses, so the setTimeout spy can tell the report timer apart. */
 const TIMEOUT_MS = 4_321_987;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -252,6 +254,8 @@ async function setup(
   return h;
 }
 
+type Harness = Awaited<ReturnType<typeof setup>>;
+
 /** An AbortController whose signal counts the listeners attached and not yet removed. */
 function abortController(): AbortController {
   const controller = new AbortController();
@@ -268,6 +272,13 @@ function abortController(): AbortController {
     remove(type, listener, listenerOptions);
   }) as typeof signal.removeEventListener;
   return controller;
+}
+
+/** Runs the armed report timer's callback now, as if its delay had passed. */
+function fireTimer(): void {
+  const timer = timers.find((candidate) => !candidate.cleared);
+  assert(timer != null, "no armed report timer");
+  timer.fire();
 }
 
 describe("TaskService.waitForAgentReport before the split", () => {
@@ -434,4 +445,333 @@ describe("TaskService.waitForAgentReport before the split", () => {
       });
     }
   );
+
+  // Registration has no await before it for a task that is not interrupted, so a scheduler call
+  // in the caller's own tick already sees the foreground wait (see maybeStartQueuedTasks).
+  test.each<{
+    name: string;
+    status: TaskStatus;
+    options: WaitOptions;
+    /** A tool-end message already queued backgrounds only a wait registered as backgroundable. */
+    queuedMessage: boolean;
+    foreground: boolean;
+    backgroundable: number;
+    /** What the queue drain counts against maxParallelAgentTasks. */
+    activeTasks: number;
+    queueBackgrounded: boolean;
+    requester: string | undefined;
+  }>([
+    {
+      name: "a running wait, backgroundable by default",
+      status: "running",
+      options: {},
+      queuedMessage: false,
+      foreground: true,
+      backgroundable: 1,
+      activeTasks: 1,
+      queueBackgrounded: false,
+      requester: PARENT,
+    },
+    {
+      name: "a queued wait that opted out of backgrounding",
+      status: "queued",
+      options: { backgroundOnMessageQueued: false },
+      queuedMessage: true,
+      foreground: true,
+      backgroundable: 0,
+      activeTasks: 1,
+      queueBackgrounded: false,
+      requester: PARENT,
+    },
+    {
+      name: "a requester id with spaces around it",
+      status: "running",
+      options: { requestingWorkspaceId: ` ${PARENT} `, backgroundOnMessageQueued: true },
+      queuedMessage: false,
+      foreground: true,
+      backgroundable: 1,
+      activeTasks: 1,
+      queueBackgrounded: false,
+      requester: PARENT,
+    },
+    {
+      name: "no requester",
+      status: "running",
+      options: { requestingWorkspaceId: undefined, backgroundOnMessageQueued: true },
+      queuedMessage: true,
+      foreground: false,
+      backgroundable: 0,
+      activeTasks: 2,
+      queueBackgrounded: true,
+      requester: undefined,
+    },
+  ])("$name: the wait registers in the caller's tick", async (row) => {
+    const h = await setup(row.status);
+    h.flags.queuedMessages = row.queuedMessage;
+    const marks = h.waiters as unknown as { userBackgroundedTaskIds: Set<string> };
+    marks.userBackgroundedTaskIds.add(CHILD);
+
+    const wait = h.start(row.options);
+    expect({
+      pendingWaiter: h.waiters.hasPendingWaiters(CHILD),
+      foreground: h.taskService.isForegroundAwaiting(PARENT),
+      backgroundable: h.snapshot().backgroundable,
+      activeTasks: h.taskService.countActiveAgentTasks(h.config.loadConfigOrDefault()),
+      queueBackgrounded: h.waiters.isTaskQueueBackgrounded(CHILD),
+      reads: h.reads.mock.calls,
+    }).toEqual({
+      pendingWaiter: true,
+      foreground: row.foreground,
+      backgroundable: row.backgroundable,
+      activeTasks: row.activeTasks,
+      queueBackgrounded: row.queueBackgrounded,
+      reads: [[CHILD, row.requester]],
+    });
+
+    await h.armed;
+    h.internals.resolveWaiters(CHILD, REPORT);
+    expect(await outcome(wait)).toBe("report");
+    expect(h.snapshot()).toEqual(RELEASED);
+  });
+
+  test("a wait that opted out of backgrounding leaves its requester's other waits alone", async () => {
+    const h = await setup("running");
+    const backgroundable = h.start();
+    await h.armed;
+    // A tool-end message is queued now. The test models no enqueue edge, so only the opted-out
+    // wait's own last check could background the first wait.
+    h.flags.queuedMessages = true;
+    const optedOut = h.start({ backgroundOnMessageQueued: false });
+    await flush();
+
+    h.internals.resolveWaiters(CHILD, REPORT);
+    expect([await outcome(backgroundable), await outcome(optedOut)]).toEqual(["report", "report"]);
+  });
+
+  const publish = (h: Harness) => h.internals.resolveWaiters(CHILD, REPORT);
+  const reject = (h: Harness) => h.waiters.rejectWaiters(CHILD, new Error(REJECTION));
+  // Each exit cleans up, then settles. Settling runs no code of a plain report or error, so the
+  // earliest point a test can look is the caller's first reaction.
+  test.each<{
+    name: string;
+    status: TaskStatus;
+    reads?: Read[];
+    failure?: boolean;
+    queuedMessage?: boolean;
+    settle: (h: Harness, controller: AbortController) => void;
+    expected: string;
+  }>([
+    {
+      name: "the read finds the report",
+      status: "running",
+      reads: [found],
+      settle: () => undefined,
+      expected: "report",
+    },
+    { name: "resolveWaiters publishes it", status: "running", settle: publish, expected: "report" },
+    {
+      name: "resolveWaiters publishes it while queued",
+      status: "queued",
+      settle: publish,
+      expected: "report",
+    },
+    { name: "rejectWaiters", status: "running", settle: reject, expected: REJECTION },
+    { name: "rejectWaiters while queued", status: "queued", settle: reject, expected: REJECTION },
+    {
+      name: "the signal aborts",
+      status: "running",
+      settle: (_h, c) => c.abort(),
+      expected: "Error",
+    },
+    {
+      name: "the timeout fires",
+      status: "running",
+      settle: fireTimer,
+      expected: "AgentReportWaitTimeoutError",
+    },
+    {
+      name: "the timeout fires, a failure persisted",
+      status: "running",
+      failure: true,
+      settle: fireTimer,
+      expected: FAILURE,
+    },
+    {
+      name: "the started task's timeout fires",
+      status: "queued",
+      settle: (h) => {
+        h.waiters.startPendingStartWaiters(CHILD);
+        fireTimer();
+      },
+      expected: "AgentReportWaitTimeoutError",
+    },
+    {
+      name: "a tool-end message was already queued",
+      status: "running",
+      queuedMessage: true,
+      settle: () => undefined,
+      expected: "ForegroundWaitBackgroundedError",
+    },
+  ])("a $status wait settled because $name has released everything", async (row) => {
+    const h = await setup(row.status, { reads: row.reads, failure: row.failure });
+    h.flags.queuedMessages = row.queuedMessage === true;
+    const controller = abortController();
+
+    const wait = h.start({ abortSignal: controller.signal });
+    const atSettle = wait.then(h.snapshot, h.snapshot);
+    await flush();
+    row.settle(h, controller);
+    const result = await outcome(wait);
+    await flush();
+
+    expect({ result, atSettle: await atSettle, after: h.snapshot() }).toEqual({
+      result: row.expected,
+      atSettle: RELEASED,
+      after: RELEASED,
+    });
+  });
+
+  // The timer starts once the task runs. A queued or starting task gets a start waiter instead,
+  // unless it started during the read after registration or its launch failure is unpersisted.
+  test.each<{
+    name: string;
+    status: TaskStatus;
+    read: Read;
+    options?: WaitOptions;
+    armedTimers: number[];
+    startWaiter: boolean;
+    /** Whether the start waiter was registered at each queue-drain call. */
+    schedules: boolean[];
+  }>([
+    {
+      name: "running",
+      status: "running",
+      read: none,
+      armedTimers: [TIMEOUT_MS],
+      startWaiter: false,
+      schedules: [],
+    },
+    {
+      name: "running, default timeout",
+      status: "running",
+      read: none,
+      options: { timeoutMs: undefined },
+      armedTimers: [DEFAULT_TIMEOUT_MS],
+      startWaiter: false,
+      schedules: [],
+    },
+    {
+      name: "queued",
+      status: "queued",
+      read: none,
+      armedTimers: [],
+      startWaiter: true,
+      schedules: [true],
+    },
+    {
+      name: "starting",
+      status: "starting",
+      read: none,
+      armedTimers: [],
+      startWaiter: true,
+      schedules: [true],
+    },
+    {
+      name: "queued, no requester",
+      status: "queued",
+      read: none,
+      options: { requestingWorkspaceId: undefined },
+      armedTimers: [],
+      startWaiter: true,
+      schedules: [],
+    },
+    {
+      name: "queued, starting during the read",
+      status: "queued",
+      read: after(setStatus("starting")),
+      armedTimers: [],
+      startWaiter: true,
+      schedules: [true],
+    },
+    {
+      name: "queued, running after the read",
+      status: "queued",
+      read: after(setStatus("running")),
+      armedTimers: [TIMEOUT_MS],
+      startWaiter: false,
+      schedules: [false],
+    },
+    {
+      name: "queued, launch failure unpersisted",
+      status: "queued",
+      read: after((h) => h.waiters.armWaitersOfUnendedTask(CHILD)),
+      armedTimers: [TIMEOUT_MS],
+      startWaiter: false,
+      schedules: [false],
+    },
+  ])("$name: the wait arms its timeout once the task runs", async (row) => {
+    const h = await setup(row.status, { reads: [row.read] });
+    const onExecutionStarted = mock(() => undefined);
+
+    const wait = h.start({ onExecutionStarted, ...row.options });
+    await h.armed;
+    const state = h.snapshot();
+    expect({
+      pendingWaiter: state.pendingWaiter,
+      armedTimers: state.armedTimers,
+      startWaiter: state.startWaiter,
+      schedules: h.schedules,
+      started: onExecutionStarted.mock.calls.length,
+    }).toEqual({
+      pendingWaiter: true,
+      armedTimers: row.armedTimers,
+      startWaiter: row.startWaiter,
+      schedules: row.schedules,
+      started: row.armedTimers.length,
+    });
+
+    // The task runs: a start waiter arms the timer and reports the start, each once.
+    h.waiters.startPendingStartWaiters(CHILD);
+    expect({
+      armedTimers: h.snapshot().armedTimers,
+      started: onExecutionStarted.mock.calls.length,
+    }).toEqual({
+      armedTimers: [row.armedTimers[0] ?? TIMEOUT_MS],
+      started: 1,
+    });
+    h.internals.resolveWaiters(CHILD, REPORT);
+    expect(await outcome(wait)).toBe("report");
+  });
+
+  test("a wait without a requester for a removed task reads no failure and rejects", async () => {
+    const h = await setup("running");
+    await removeRow(h);
+
+    const result = await outcome(h.start({ requestingWorkspaceId: undefined }));
+
+    expect({ result, reads: h.reads.mock.calls, ...h.snapshot() }).toEqual({
+      result: "Error",
+      reads: [[CHILD, undefined]],
+      ...RELEASED,
+    });
+  });
+
+  // The cached report comes first (report monotonicity), then the timeout check, before any read.
+  test.each<[number, boolean, string]>([
+    [0, false, "AssertionError"],
+    [-1, false, "AssertionError"],
+    [Number.POSITIVE_INFINITY, false, "AssertionError"],
+    [0, true, JSON.stringify(REPORT)],
+  ])("timeoutMs %p, a report cached: %p", async (timeoutMs, cached, expected) => {
+    const h = await setup("running");
+    if (cached) h.internals.resolveWaiters(CHILD, REPORT);
+
+    const result = await outcome(h.start({ timeoutMs }));
+
+    expect({ result, reads: h.reads.mock.calls.length, ...h.snapshot() }).toEqual({
+      result: expected,
+      reads: 0,
+      ...RELEASED,
+    });
+  });
 });
