@@ -452,6 +452,36 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
   });
 
+  it("leaves a skipped symlink destination alone when it becomes a file after the snapshot", async () => {
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.rm(linkPath, { recursive: true });
+    await fs.symlink(sharedSkill, linkPath);
+
+    const payload = createBackupPayloadStore({ config });
+    const racing = new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payload,
+        async writeSafetySnapshot(snapshotRoot, contents) {
+          await payload.writeSafetySnapshot(snapshotRoot, contents);
+          await fs.rm(linkPath);
+          await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
+        },
+      },
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(await fs.readFile(path.join(linkPath, "SKILL.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();

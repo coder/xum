@@ -727,7 +727,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const { payload } = await omitSymlinkedDestinations(
+      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
         muxRoot,
         await readBackupPayload(sourceDir, { contents: validateOptions.contents })
       );
@@ -741,12 +741,22 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
       await readShelfWithPlan(sourceDir, validateOptions.contents);
       if (!validateOptions.contents.includeProjects) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
       const bundlePlan = await readBundleWithPlan(sourceDir);
       if (bundlePlan === null) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
+        return {
+          hasProjectBundle: false,
+          projectImports: [],
+          matchedProjects: [],
+          symlinkSkipped,
+        };
       }
       // The matched writes' own refusals (memory size and count limits, non-file
       // destinations) belong to the preflight too: found only inside the restore, they
@@ -766,6 +776,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       }
       return {
         hasProjectBundle: true,
+        symlinkSkipped,
         projectImports: toProjectImports(bundlePlan.plan),
         // The classification the caller validated against, destination included. Restore
         // re-partitions the bundle but only writes entries that resolve to the very same
@@ -799,7 +810,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const contents = restoreOptions.contents;
       const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
         muxRoot,
-        await readBackupPayload(sourceDir, { contents })
+        await readBackupPayload(sourceDir, { contents }),
+        restoreOptions.symlinkSkipped
       );
       const before = await localFilesByPath(contents);
 

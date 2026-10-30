@@ -112,6 +112,7 @@ export interface BackupPayloadStore {
      * to; restore writes only these exact pairs, never a newer or different match.
      */
     matchedProjects: BackupMatchedProject[];
+    symlinkSkipped?: string[];
   }>;
   /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
   writeSafetySnapshot(snapshotRoot: string, contents: BackupContents): Promise<void>;
@@ -123,6 +124,8 @@ export interface BackupPayloadStore {
     /** Receives the matched project memory snapshot, taken in the write's lock window. */
     snapshotPath: string;
     matchedProjects: readonly BackupMatchedProject[];
+    /** The preflight's skip set, so the write skips exactly what the snapshot left out. */
+    symlinkSkipped?: readonly string[];
   }): Promise<{
     changedFiles: string[];
     localOnlyFiles: string[];
@@ -797,6 +800,7 @@ export class BackupService {
               contents,
               snapshotPath,
               matchedProjects: validated.matchedProjects,
+              symlinkSkipped: validated.symlinkSkipped,
             });
             // Announced as soon as the memory is on disk: a failure recording the commit below
             // must not leave subscribers showing pre-restore contents.

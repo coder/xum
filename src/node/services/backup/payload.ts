@@ -2789,16 +2789,25 @@ async function assertRestoreDestinationWritable(
  * pushed before it still holds the real folder: refusing the whole payload failed every preview
  * and restore. Push skips symlinks too, so neither direction touches these files. A symlink that
  * appears after this check is still refused when the restore writes.
+ *
+ * `checked` is the skip set a restore's preflight found before the safety snapshot. A restore
+ * applies that set instead of looking again: a symlink replaced by a regular file in between
+ * would otherwise be overwritten, and the snapshot, taken while it was a link, holds no copy.
  */
 export async function omitSymlinkedDestinations(
   muxRoot: string,
-  payload: BackupPayload
+  payload: BackupPayload,
+  checked?: readonly string[]
 ): Promise<{ payload: BackupPayload; skipped: string[] }> {
   const root = await resolveRoot(muxRoot);
   const skipped = new Set<string>();
   for (const file of payload.files) {
     // Merged into config.json, never written at its own path.
     if (file.path === "preferences.json") continue;
+    if (checked !== undefined) {
+      if (checked.includes(file.path)) skipped.add(file.path);
+      continue;
+    }
     let current = root.path;
     for (const segment of file.path.split("/")) {
       current = path.join(current, segment);
