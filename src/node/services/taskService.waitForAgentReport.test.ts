@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import * as subagentFailureArtifacts from "@/node/services/subagentFailureArtifacts";
 import { upsertSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import type { TaskService } from "@/node/services/taskService";
 import type { PendingTaskWaiterReport, TaskWaiters } from "@/node/services/taskWaiters";
@@ -595,6 +596,18 @@ describe("TaskService.waitForAgentReport before the split", () => {
       failure: true,
       settle: fireTimer,
       expected: FAILURE,
+    },
+    {
+      // The timer's failure read is best-effort: when it throws, the wait still times out.
+      name: "the timeout fires, the failure read throws",
+      status: "running",
+      settle: () => {
+        spyOn(subagentFailureArtifacts, "readSubagentFailureArtifact").mockRejectedValueOnce(
+          new Error(READ_ERROR)
+        );
+        fireTimer();
+      },
+      expected: "AgentReportWaitTimeoutError",
     },
     {
       name: "the started task's timeout fires",
