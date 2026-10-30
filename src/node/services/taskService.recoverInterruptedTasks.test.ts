@@ -3,10 +3,13 @@
 // tallies skipped, failed and resumed tasks only in its completion log, so each test asserts what
 // the tally stands for instead: which tasks got a send or a completion prompt, which rows were
 // rotated or left alone, and that the pass went on to the next task.
+// The last test reads the counters of that log by field name (never its message), so a step that
+// counts a task under the wrong outcome fails it.
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as path from "node:path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
+import { log } from "@/node/services/log";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
   createTestConfig,
@@ -87,9 +90,13 @@ describe("TaskService.recoverInterruptedTasks paths before the split", () => {
 
   /**
    * Saves PARENT_ID and `tasks`, then builds a TaskService whose host records each send as
-   * `<workspaceId>:<turn kind or dedupe key>` and fails every send to `failSendsTo`.
+   * `<workspaceId>:<turn kind or dedupe key>` and fails every send to `failSendsTo` (one id or a
+   * list). The tasks in `busy` report a busy session.
    */
-  async function setup(tasks: WorkspaceConfigEntry[], options: { failSendsTo?: string } = {}) {
+  async function setup(
+    tasks: WorkspaceConfigEntry[],
+    options: { failSendsTo?: string | readonly string[]; busy?: readonly string[] } = {}
+  ) {
     await saveWorkspacesWithCheckouts(
       config,
       repo(),
@@ -106,14 +113,17 @@ describe("TaskService.recoverInterruptedTasks paths before the split", () => {
       ): Promise<Result<void, { type: "unknown"; raw: string }>> => {
         const kind = internal?.taskTurnKind ?? internal?.queueDedupeKey ?? "untagged";
         sent.push(`${workspaceId}:${kind}`);
-        if (workspaceId === options.failSendsTo) {
+        if ([options.failSendsTo].flat().includes(workspaceId)) {
           return Err({ type: "unknown", raw: "provider unavailable" });
         }
         await internal?.onAccepted?.();
         return Ok(undefined);
       }
     );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const isBusyForMessage = mock(
+      (workspaceId: string) => options.busy?.includes(workspaceId) ?? false
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage, isBusyForMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     const prompted = spyOn(internals(taskService), "promptTaskForRequiredCompletionTool");
     const settle = trackBackgroundWork(taskService);
@@ -293,5 +303,70 @@ describe("TaskService.recoverInterruptedTasks paths before the split", () => {
 
     expect(sent).toEqual(["first:recovery", "later:recovery"]);
     expect(row("first")?.taskStatus).toBe("running");
+  });
+
+  test("the completion log counts each task under the outcome its re-drive had", async () => {
+    const { taskService, recover } = await setup(
+      [
+        task("ar-resumed", { taskStatus: "awaiting_report" }),
+        task("ar-failed", { taskStatus: "awaiting_report" }),
+        task("ar-refused", { taskStatus: "awaiting_report" }),
+        task("ar-blocked", { taskStatus: "awaiting_report" }),
+        task("ar-blocked-child", { parentWorkspaceId: "ar-blocked", taskStatus: "running" }),
+        task("ar-busy-1", { taskStatus: "awaiting_report" }),
+        task("ar-busy-2", { taskStatus: "awaiting_report" }),
+        task("r-resumed", { taskStatus: "running" }),
+        task("r-failed", { taskStatus: "running" }),
+        task("r-guided-1", { taskStatus: "running", taskPendingGuidance: GUIDANCE.slice(0, 1) }),
+        task("r-guided-2", { taskStatus: "running", taskPendingGuidance: GUIDANCE.slice(0, 1) }),
+        task("r-guided-failed", {
+          taskStatus: "running",
+          taskPendingGuidance: GUIDANCE.slice(0, 1),
+        }),
+        task("r-blocked", { taskStatus: "running" }),
+        task("r-blocked-child", { parentWorkspaceId: "r-blocked", taskStatus: "running" }),
+        task("r-busy-1", { taskStatus: "running" }),
+        task("r-busy-2", { taskStatus: "running" }),
+      ],
+      {
+        failSendsTo: ["r-failed", "r-guided-failed"],
+        busy: ["ar-busy-1", "ar-busy-2", "r-busy-1", "r-busy-2"],
+      }
+    );
+    // Another writer re-admits these rows before the rotation and before the completion
+    // admission, so both re-drives fail.
+    const readmit = (taskId: string) => () =>
+      writeRowElsewhere(taskId, (found) => {
+        found.taskAttemptId = FOREIGN_ATTEMPT_ID;
+      });
+    writeAfterStep(taskService, "settleChildGoalPause", "ar-failed", readmit("ar-failed"));
+    writeAfterStep(
+      taskService,
+      "dispatchFencedStartupCompactionFollowUp",
+      "ar-refused",
+      readmit("ar-refused")
+    );
+    const info = spyOn(log, "info");
+
+    await recover();
+
+    // Read by field name: the completion log is the only one with these counters.
+    const completion = info.mock.calls
+      .map(([, fields]) => fields as Record<string, unknown> | undefined)
+      .filter((fields) => fields != null && "failedRunningCount" in fields);
+    expect(completion).toHaveLength(1);
+    expect(completion[0]).toMatchObject({
+      awaitingReportTaskCount: 6,
+      resumedAwaitingReportCount: 1,
+      skippedAwaitingReportDueToActiveDescendants: 1,
+      skippedAwaitingReportAlreadyBusy: 2,
+      failedAwaitingReportCount: 2,
+      runningTaskCount: 10,
+      // r-resumed and both children get their restart nudge, r-guided-1 and -2 their guidance.
+      resumedRunningCount: 5,
+      skippedRunningDueToActiveDescendants: 1,
+      skippedRunningAlreadyStreaming: 2,
+      failedRunningCount: 2,
+    });
   });
 });
