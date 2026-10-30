@@ -7190,6 +7190,15 @@ describe("per-agent prompt cache TTL", () => {
       input: { agentAiDefaults: { compact: { cacheTtl: "1h" } } },
       expected: "1h",
     },
+    // OpenRouter has no Anthropic cache fetch wrapper: message preparation writes its markers.
+    {
+      name: "a Compact Settings value reaches summaries on a gateway route",
+      input: {
+        agentAiDefaults: { compact: { cacheTtl: "1h" } },
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+      },
+      expected: "1h",
+    },
   ];
 
   for (const testCase of summaryCases) {
