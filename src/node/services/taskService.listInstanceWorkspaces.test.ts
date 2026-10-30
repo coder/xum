@@ -268,6 +268,27 @@ describe("TaskService listInstanceWorkspaces before the split", () => {
     ]);
   });
 
+  test("probes every visibility term of a root before the query test hides it", async () => {
+    const f = await setup((first, second) => [[root(first, "caller")], [root(second, "other")]]);
+    f.traceProbes();
+    const result = f.taskService.listInstanceWorkspaces("caller", { query: "caller" });
+    expect(result.rows.map((row) => row.workspaceId)).toEqual(["caller"]);
+    const probes = (id: string) =>
+      ["endpoint", "stop", "turn", "workflow", "bestOf"].map((p) => `${p}:${id}`);
+    expect(f.trace).toEqual([
+      "config",
+      "endpoint:caller",
+      "index",
+      "workflow:caller",
+      "bestOf:caller",
+      ...probes("caller"),
+      // "other" fails the query only after all 11 terms ran for it.
+      ...probes("other"),
+      "busy:caller",
+      "streaming:caller",
+    ]);
+  });
+
   // Corrupted rows make two terms throw: a non-string id fails the blank-id term, and a parent
   // cycle under a root's id fails the workflow and best-of ancestry walks. Today the whole listing
   // throws when such a term runs. These tests pin that the terms run only for rows that the earlier
