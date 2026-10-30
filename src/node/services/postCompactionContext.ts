@@ -122,7 +122,8 @@ export function findPostCompactionContextBoundaryId(
 /**
  * The boundary row with its header left out of requests from this sequence on, for the
  * context-exceeded retry in AgentSession. The row keeps the header, so replay can rebuild the
- * earlier requests. Null when requests do not render a header for the row.
+ * earlier requests, but its contextUsage no longer counts it. Null when requests do not render
+ * a header for the row.
  */
 export function omitPostCompactionContextFrom(
   boundary: MuxMessage,
@@ -130,11 +131,35 @@ export function omitPostCompactionContextFrom(
 ): MuxMessage | null {
   const context = readPostCompactionContext(boundary);
   if (!context) return null;
-  return {
+  const omitted: MuxMessage = {
     ...boundary,
     metadata: {
       ...boundary.metadata,
       postCompactionContext: { ...context, omittedFromRequestSequence: requestHistorySequence },
+    },
+  };
+  return shiftContextUsageByHeader(omitted, -1);
+}
+
+/**
+ * The boundary with its header's tokens added to (1) or removed from (-1) its contextUsage. The
+ * context meter and the compaction check of the next send read that estimate, so it counts the
+ * header exactly while requests render it.
+ */
+export function shiftContextUsageByHeader(boundary: MuxMessage, sign: 1 | -1): MuxMessage {
+  const usage = boundary.metadata?.contextUsage;
+  if (!usage) return boundary;
+  const tokens =
+    sign * estimatePostCompactionContextTokens(boundary.metadata?.postCompactionContext);
+  return {
+    ...boundary,
+    metadata: {
+      ...boundary.metadata,
+      contextUsage: {
+        ...usage,
+        inputTokens: Math.max(0, (usage.inputTokens ?? 0) + tokens),
+        totalTokens: Math.max(0, (usage.totalTokens ?? 0) + tokens),
+      },
     },
   };
 }

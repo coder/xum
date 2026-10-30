@@ -16,7 +16,7 @@ import {
   type CompactionPendingBoundaryWrite,
 } from "./compactionPendingState";
 import {
-  estimatePostCompactionContextTokens,
+  shiftContextUsageByHeader,
   withPostCompactionContext,
   type PostCompactionContextInput,
 } from "./postCompactionContext";
@@ -279,29 +279,6 @@ interface HeaderOptions {
   countHeader: boolean;
 }
 
-/**
- * Add the header's tokens to the boundary's estimate: the context meter and the compaction check
- * of the next send read it, and every request of the window carries the header.
- */
-function withHeaderInContextUsage(boundary: MuxMessage): MuxMessage {
-  const usage = boundary.metadata?.contextUsage;
-  if (!usage) return boundary;
-  const headerTokens = estimatePostCompactionContextTokens(
-    boundary.metadata?.postCompactionContext
-  );
-  return {
-    ...boundary,
-    metadata: {
-      ...boundary.metadata,
-      contextUsage: {
-        ...usage,
-        inputTokens: (usage.inputTokens ?? 0) + headerTokens,
-        totalTokens: (usage.totalTokens ?? 0) + headerTokens,
-      },
-    },
-  };
-}
-
 export class CompactionHandler {
   private readonly workspaceId: string;
   private readonly historyService: HistoryService;
@@ -439,7 +416,7 @@ export class CompactionHandler {
       });
       const withContext = withPostCompactionContext(summary, built, this.workspaceId);
       return options.countHeader && withContext !== summary
-        ? withHeaderInContextUsage(withContext)
+        ? shiftContextUsageByHeader(withContext, 1)
         : withContext;
     } catch (error) {
       // The header only restores context; it must never block the compaction itself.

@@ -13,6 +13,7 @@ import {
   omitPostCompactionContextFrom,
   renderPostCompactionContext,
   restorePostCompactionContextBefore,
+  shiftContextUsageByHeader,
   withPostCompactionContext,
 } from "./postCompactionContext";
 
@@ -145,6 +146,18 @@ describe("omitPostCompactionContextFrom", () => {
     expect(restorePostCompactionContextBefore(messages, 7)).toBe(messages);
     // A second retry cannot leave out a header that requests no longer render.
     expect(omitPostCompactionContextFrom(omitted, 9)).toBeNull();
+  });
+
+  test("removes the header's tokens from the boundary's context usage", () => {
+    const usage = { inputTokens: 100, outputTokens: 0, totalTokens: 100 };
+    const boundary = compactionBoundary("s", header("CTX ".repeat(500)));
+    const counted = shiftContextUsageByHeader(
+      { ...boundary, metadata: { ...boundary.metadata, contextUsage: usage } },
+      1
+    );
+    expect(counted.metadata?.contextUsage?.inputTokens).toBeGreaterThan(100);
+
+    expect(omitPostCompactionContextFrom(counted, 7)?.metadata?.contextUsage).toEqual(usage);
   });
 });
 

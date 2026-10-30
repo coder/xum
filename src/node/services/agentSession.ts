@@ -9721,6 +9721,8 @@ export class AgentSession {
     if (!omitted) return;
     const updated = await this.historyService.updateHistory(this.workspaceId, omitted);
     if (!updated.success) throw new Error(updated.error);
+    // The next send reads the boundary's estimate again, now without the header.
+    this.lastUsageState = undefined;
   }
 
   /**
