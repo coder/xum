@@ -2037,52 +2037,28 @@ export const PluginsSettingsSection: React.FC = () => {
                   key={`${item.location}:${item.name}`}
                   className="border-border-medium rounded-md border p-3"
                 >
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-baseline gap-2">
-                        {/* break-all: names can be 64 separator-free chars. */}
-                        <span className="text-foreground text-sm font-medium break-all">
-                          {item.name}
-                        </span>
-                        {item.version && (
-                          <span className="text-muted text-xs">v{item.version}</span>
-                        )}
-                        {!item.managed && <Badge tone="muted">unmanaged</Badge>}
-                        {item.managed && !item.present && <Badge tone="error">missing</Badge>}
-                        {check?.status === "update-available" && (
-                          <Badge tone="accent">update available</Badge>
-                        )}
-                        {check?.status === "tag-moved" && <Badge tone="warning">tag moved</Badge>}
-                        {check?.status === "pinned" && <Badge tone="muted">pinned</Badge>}
-                        {check?.status === "error" && <Badge tone="warning">check failed</Badge>}
-                        <NeedsReviewBadge item={item} />
-                      </div>
-                      {item.description && (
-                        <p className="text-muted mt-0.5 text-xs">{item.description}</p>
+                  {/* The header holds only name, badges and actions: whether the actions
+                      wrap then depends on the title alone, not on description length, so
+                      every card puts them in the same place. The flex-1 name block pushes the
+                      actions to the right on the name row. Once they wrap they start at the
+                      left, flush with the card text, so they need no ml-auto/justify-end. */}
+                  <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-2">
+                    <div className="flex min-w-0 flex-1 basis-48 flex-wrap items-baseline gap-2">
+                      {/* break-all: names can be 64 separator-free chars. */}
+                      <span className="text-foreground text-sm font-medium break-all">
+                        {item.name}
+                      </span>
+                      {item.version && <span className="text-muted text-xs">v{item.version}</span>}
+                      {!item.managed && <Badge tone="muted">unmanaged</Badge>}
+                      {item.managed && !item.present && <Badge tone="error">missing</Badge>}
+                      {check?.status === "update-available" && (
+                        <Badge tone="accent">update available</Badge>
                       )}
-                      {item.interface && <PluginInterfaceDetails info={item.interface} />}
-                      {/* break-all: locations/sources can contain unbreakable
-                          64-char tokens (max-length plugin names) that would
-                          otherwise overflow the card at phone widths. */}
-                      <p className="text-muted counter-nums mt-0.5 text-[11px] break-all">
-                        {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
-                        imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
-                        {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
-                      </p>
-                      {formatSource(item) && (
-                        <p className="text-muted mt-0.5 text-[11px] break-all">
-                          {formatSource(item)}
-                          {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
-                        </p>
-                      )}
-                      {check?.status === "error" && check.message && (
-                        <p className="text-warning mt-0.5 flex items-start gap-1 text-[11px]">
-                          <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                          <span className="min-w-0 break-words">{check.message}</span>
-                        </p>
-                      )}
+                      {check?.status === "tag-moved" && <Badge tone="warning">tag moved</Badge>}
+                      {check?.status === "pinned" && <Badge tone="muted">pinned</Badge>}
+                      {check?.status === "error" && <Badge tone="warning">check failed</Badge>}
+                      <NeedsReviewBadge item={item} />
                     </div>
-
                     {item.managed && (
                       <div className="flex flex-wrap gap-1">
                         <ReviewComponentsButton
@@ -2149,6 +2125,33 @@ export const PluginsSettingsSection: React.FC = () => {
                       </div>
                     )}
                   </div>
+
+                  {item.description && (
+                    <p className="text-muted mt-1 text-xs">{item.description}</p>
+                  )}
+                  {item.interface && <PluginInterfaceDetails info={item.interface} />}
+                  <div className="text-muted mt-2 space-y-0.5 text-[11px]">
+                    {/* break-all: locations/sources can contain unbreakable
+                        64-char tokens (max-length plugin names) that would
+                        otherwise overflow the card at phone widths. */}
+                    <p className="counter-nums break-all">
+                      {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
+                      imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
+                      {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
+                    </p>
+                    {formatSource(item) && (
+                      <p className="break-all">
+                        {formatSource(item)}
+                        {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
+                      </p>
+                    )}
+                  </div>
+                  {check?.status === "error" && check.message && (
+                    <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
+                      <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span className="min-w-0 break-words">{check.message}</span>
+                    </p>
+                  )}
 
                   {/* Managed rows only: an unmanaged plugin in another
                       container can share the manifest name, and rendering the
