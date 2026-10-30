@@ -2411,15 +2411,15 @@ describe("CompactionHandler", () => {
       expect(boundary?.metadata?.postCompactionContext).toEqual(journaledHeader ?? undefined);
     });
 
-    it("drops a journaled header that does not fit, not summary text", async () => {
+    // The swapped prefix already sent this summary and header, so the row keeps both even
+    // when it is too big for the history line limit.
+    it("persists a journaled boundary as the swap built it, even when oversized", async () => {
       const summary = "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES - 64 * 1024);
+      const journaledHeader = { text: "h".repeat(64 * 1024), skillNames: [] };
 
-      const boundary = await persistJournaledBoundary(summary, {
-        text: "h".repeat(64 * 1024),
-        skillNames: [],
-      });
+      const boundary = await persistJournaledBoundary(summary, journaledHeader);
 
-      expect(boundary?.metadata?.postCompactionContext).toBeUndefined();
+      expect(boundary?.metadata?.postCompactionContext).toEqual(journaledHeader);
       expect(boundary?.parts[0]).toMatchObject({ type: "text", text: summary });
     });
   });

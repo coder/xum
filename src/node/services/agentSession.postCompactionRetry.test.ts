@@ -435,6 +435,69 @@ describe("AgentSession post-compaction context retry", () => {
     await session.dispose();
   });
 
+  // A compaction request trims its input to its budget, and the trim can drop the header row.
+  // An overflow after its own retry therefore does not show that the header caused it.
+  test("a compaction request that overflows after its own retry keeps the header", async () => {
+    const workspaceId = "ws-compaction-request";
+    const { historyService, config } = await createSessionsFixture(workspaceId);
+    await historyService.appendToHistory(workspaceId, createHeaderBoundary());
+    await historyService.appendToHistory(workspaceId, {
+      id: "compaction-request-1",
+      role: "user",
+      parts: [{ type: "text", text: "Summarize the conversation." }],
+      metadata: {
+        timestamp: 1100,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {},
+          source: "auto-compaction",
+        },
+      },
+    });
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((..._args: unknown[]) => {
+      const messageId = `assistant-ctx-exceeded-${streamMessage.mock.calls.length}`;
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId,
+        error: "Context length exceeded",
+        errorType: "context_exceeded",
+      });
+      return Promise.resolve(contextExceededResult(messageId));
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+
+    await session.resumeStream({
+      model: "anthropic:claude-haiku-4-5",
+      agentId: "compact",
+    } as unknown as SendMessageOptions);
+
+    expect(
+      await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded-1")
+    ).toBe("retry-started");
+    expect(
+      await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded-2")
+    ).toBe("terminal");
+    expect(streamMessage).toHaveBeenCalledTimes(2);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const boundary = history.data.find((message) => message.id === "compaction-summary");
+    expect(boundary?.metadata?.postCompactionContext).toEqual(HEADER);
+
+    await session.dispose();
+  });
+
   // Waiters (task/workspace-turn stream-error settlement) treat the resolved
   // decision as "the retry outcome is known". Resolving while retry startup is
   // still in flight would let a pre-stream startup failure (no further error

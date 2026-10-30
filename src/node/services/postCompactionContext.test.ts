@@ -168,14 +168,10 @@ describe("withPostCompactionContext", () => {
     expect(withPostCompactionContext(bare, oversized, "ws")).toBe(bare);
   });
 
-  test("drops the plan baseline first when the row is too big with it", () => {
+  test("drops the header with its plan baseline when the baseline does not fit", () => {
+    const bare = compactionBoundary("s");
     const text = "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES / 2);
     const bigPlan = { ...plan, content: "y".repeat(SESSION_HISTORY_MAX_LINE_BYTES / 2) };
-    const fitted = withPostCompactionContext(
-      compactionBoundary("s"),
-      { ...header(text), plan: bigPlan },
-      "ws"
-    );
-    expect(boundaryHeader(fitted)).toEqual(header(text));
+    expect(withPostCompactionContext(bare, { ...header(text), plan: bigPlan }, "ws")).toBe(bare);
   });
 });

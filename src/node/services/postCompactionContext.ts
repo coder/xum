@@ -163,21 +163,11 @@ export function restorePostCompactionContextBefore(
   );
 }
 
-/** Split a boundary row into the row without its header and the header (null without one). */
-export function splitPostCompactionContext(boundary: MuxMessage): {
-  boundary: MuxMessage;
-  context: PostCompactionContext | null;
-} {
-  if (boundary.metadata?.postCompactionContext == null) return { boundary, context: null };
-  const { postCompactionContext: context, ...metadata } = boundary.metadata;
-  return { boundary: { ...boundary, metadata }, context };
-}
-
 /**
  * Set the header on a boundary that has none. The summary is worth more than the header, so a
  * header that would push the row over the history line limit is dropped, not the summary cut.
- * The plan baseline goes first: without it, only a session that restarts in the window misses
- * plan edits.
+ * The header keeps its plan baseline or is dropped with it: a plan in the header that nothing
+ * tracks would replay stale after the user edits the file.
  */
 export function withPostCompactionContext(
   boundary: MuxMessage,
@@ -185,17 +175,6 @@ export function withPostCompactionContext(
   workspaceId: string
 ): MuxMessage {
   if (!context || boundary.metadata?.postCompactionContext) return boundary;
-  const withContext = fitPostCompactionContext(boundary, context, workspaceId);
-  if (withContext || !context.plan) return withContext ?? boundary;
-  const { plan: _plan, ...withoutPlan } = context;
-  return fitPostCompactionContext(boundary, withoutPlan, workspaceId) ?? boundary;
-}
-
-function fitPostCompactionContext(
-  boundary: MuxMessage,
-  context: PostCompactionContext,
-  workspaceId: string
-): MuxMessage | null {
   const withContext: MuxMessage = {
     ...boundary,
     metadata: { ...boundary.metadata, postCompactionContext: context },
@@ -210,7 +189,7 @@ function fitPostCompactionContext(
     rowBytes,
     withPlan: context.plan != null,
   });
-  return null;
+  return boundary;
 }
 
 function createPostCompactionContextMessage(

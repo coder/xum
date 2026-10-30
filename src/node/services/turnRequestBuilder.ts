@@ -313,6 +313,7 @@ export function resolveXumToolScope(
 import type { ErrorEvent } from "@/common/types/stream";
 import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
+import { isCompactionRequestTurn } from "@/node/services/contextManagement/compactionRequests";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 
@@ -2286,14 +2287,11 @@ export class TurnRequestBuilder {
         }))
       : resolvedSwitchableAgents;
     // Explicit summaries remain recovery operations, not token-budget turns.
-    // Inspect this request's last effective user row, never an older compact command.
-    const latestUserMessage = providerRequestMessages.findLast(
-      (message) => message.role === "user"
+    const isCompactionRequest = isCompactionRequestTurn(
+      effectiveAgentId,
+      muxMetadata,
+      providerRequestMessages
     );
-    const isCompactionRequest =
-      effectiveAgentId === "compact" ||
-      muxMetadata?.type === "compaction-request" ||
-      latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
     // Before any request is sent: compaction prompts never extend the chat's prefix, and
     // the baseline must clear even when the compaction model is not on an Anthropic route.
     if (isCompactionRequest) promptCacheScope.markCompaction();

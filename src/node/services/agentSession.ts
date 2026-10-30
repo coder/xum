@@ -276,6 +276,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
+  isCompactionRequestTurn,
   type CompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
 import {
@@ -506,6 +507,20 @@ function goalAdvancementSendOptions(
     "type" in metadata &&
     metadata.type === "heartbeat-request";
   return isHeartbeat ? undefined : options;
+}
+
+/**
+ * The boundary whose header a context_exceeded retry may leave out. A compaction request
+ * answers that error with its trim and its own retry. The trim can drop the header row, so a
+ * later overflow does not show that the header caused it.
+ */
+function findOmittableHeaderBoundaryId(
+  options: SendMessageOptions | undefined,
+  requestMessages: readonly MuxMessage[]
+): string | undefined {
+  const muxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+  if (isCompactionRequestTurn(options?.agentId, muxMetadata, requestMessages)) return undefined;
+  return findPostCompactionContextBoundaryId(requestMessages);
 }
 
 type ResolvedSendMessageOptions = SendMessageOptions & {
@@ -9077,8 +9092,10 @@ export class AgentSession {
         }
       }
 
-      this.activeStreamPostCompactionBoundaryId =
-        findPostCompactionContextBoundaryId(requestMessages);
+      this.activeStreamPostCompactionBoundaryId = findOmittableHeaderBoundaryId(
+        options,
+        requestMessages
+      );
 
       // Capture the current user message id so retries are stable across assistant message ids.
       // Retry-eligible rows only: startup recovery matches this persisted ID

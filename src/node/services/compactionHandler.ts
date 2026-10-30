@@ -17,7 +17,6 @@ import {
 } from "./compactionPendingState";
 import {
   estimatePostCompactionContextTokens,
-  splitPostCompactionContext,
   withPostCompactionContext,
   type PostCompactionContextInput,
 } from "./postCompactionContext";
@@ -962,7 +961,11 @@ export class CompactionHandler {
     return fitted;
   }
 
-  /** The rolling summarizer already paid for this text; applying it must not start another turn. */
+  /**
+   * The rolling summarizer already paid for this text; applying it must not start another turn.
+   * The boundary comes back fitted to the history row with its header, so its model-visible
+   * bytes are final: a prefix swap sends them before the row is persisted.
+   */
   buildContinuousCompactionRows(params: {
     boundaryMessageId?: string;
     messages: MuxMessage[];
@@ -972,9 +975,10 @@ export class CompactionHandler {
     systemMessageTokens: number;
     attachmentTokens: number;
     pendingFollowUp?: CompactionFollowUpRequest;
+    postCompactionContext?: PostCompactionContext | null;
   }): { boundary: MuxMessage; copies: MuxMessage[] } {
     assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
-    const boundary = createMuxMessage(
+    const summary = createMuxMessage(
       params.boundaryMessageId ?? createCompactionSummaryMessageId(),
       "assistant",
       params.text,
@@ -991,6 +995,11 @@ export class CompactionHandler {
           pendingFollowUp: params.pendingFollowUp,
         },
       }
+    );
+    const boundary = withPostCompactionContext(
+      this.fitBoundarySummary(summary).message,
+      params.postCompactionContext ?? null,
+      this.workspaceId
     );
     const copies = this.buildTailCopies(params.tail).map((copy) => {
       // Continuous compaction prunes the just-finished answer too. Keep recent pages
@@ -1015,19 +1024,13 @@ export class CompactionHandler {
   ): Promise<boolean> {
     const shouldPersist = params.shouldPersist;
     const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(params.messages);
-    const built = params.prepared
+    // A journaled boundary is persisted as the swap built it, because the swapped prefix sent
+    // its summary and header. Its pending follow-up came later and the model never sees it,
+    // so a follow-up too big for the row leaves the row oversized; the history scanner
+    // recovers oversized compaction boundaries.
+    const { boundary, copies } = params.prepared
       ? structuredClone(params.prepared)
       : this.buildContinuousCompactionRows(params);
-    const unfitted = splitPostCompactionContext(built.boundary);
-    // Bound here, not in the builder: a journaled boundary gets its pending follow-up only
-    // after it was built, and the follow-up counts toward the row size. Fit the summary
-    // without the header, so a row that is too big drops the header, not summary text.
-    const boundary = withPostCompactionContext(
-      this.fitBoundarySummary(unfitted.boundary).message,
-      unfitted.context,
-      this.workspaceId
-    );
-    const copies = built.copies;
     const inputTokens =
       params.systemMessageTokens +
       params.attachmentTokens +

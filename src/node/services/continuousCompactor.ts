@@ -30,7 +30,6 @@ import { log } from "./log";
 import {
   estimatePostCompactionContextTokens,
   findPostCompactionContext,
-  withPostCompactionContext,
 } from "./postCompactionContext";
 
 export interface ContinuousCompactionContext {
@@ -553,21 +552,16 @@ export class ContinuousCompactor {
       return false;
     const prepared = await this.deps.prepareSwap(staged.cut.head);
     if (!prepared || !this.isValid(staged, rows)) return false;
-    const built = this.deps.compactionHandler.buildContinuousCompactionRows({
+    // The swapped prefix and every later request render the header from this boundary.
+    const { boundary, copies } = this.deps.compactionHandler.buildContinuousCompactionRows({
       messages: rows,
       text: staged.text,
       model: staged.model,
       tail,
       systemMessageTokens: context.systemMessageTokens ?? 0,
       attachmentTokens: staged.attachmentTokens,
+      postCompactionContext: prepared.postCompactionContext,
     });
-    // The swapped prefix and every later request render the header from this boundary.
-    const boundary = withPostCompactionContext(
-      built.boundary,
-      prepared.postCompactionContext,
-      this.deps.workspaceId
-    );
-    const copies = built.copies;
     const staticCopies = copies.slice(0, -1);
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
