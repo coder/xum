@@ -325,12 +325,6 @@ import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverrid
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 
 /**
- * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
- * then the MCP tools are flat again, so tool search must treat the request as
- * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
- * presence says PTC ran.
- */
-/**
  * The TTL of the turn's Anthropic cache markers. The running agent's TTL wins on a cache-capable
  * model. Otherwise markers honor a TTL set through per-model providerOptions extras when the
  * dedicated mux-level setting is unset, matching the pre-assembler request-config behavior.
@@ -350,6 +344,12 @@ function resolveTurnAnthropicCacheTtl(input: {
   );
 }
 
+/**
+ * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
+ * then the MCP tools are flat again, so tool search must treat the request as
+ * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
+ * presence says PTC ran.
+ */
 function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
   return ptcEnabled && tools.code_execution !== undefined;
 }

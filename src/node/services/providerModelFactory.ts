@@ -868,13 +868,6 @@ function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
 }
 
 /**
- * Remove every cache marker the request pipeline may have serialized:
- * `cache_control` on system/message/tool entries and nested content parts,
- * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
- * happens HERE, at the wire, so no upstream eligibility check is load-bearing
- * for the global anthropic disableBetaFeatures flag.
- */
-/**
  * Visits every entry of the request body that can hold a cache marker: system/message/tool
  * entries and their nested content parts (tool_result content included), with the entry's
  * prompt-form providerOptions.anthropic record when it has one.
@@ -907,6 +900,13 @@ function forEachAnthropicCacheMarkerHolder(
   }
 }
 
+/**
+ * Remove every cache marker the request pipeline may have serialized:
+ * `cache_control` on system/message/tool entries and nested content parts,
+ * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
+ * happens HERE, at the wire, so no upstream eligibility check is load-bearing
+ * for the global anthropic disableBetaFeatures flag.
+ */
 function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
   forEachAnthropicCacheMarkerHolder(json, (record, anthropicOptions) => {
     delete record.cache_control;
