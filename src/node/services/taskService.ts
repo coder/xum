@@ -984,6 +984,35 @@ interface TaskLaunchState {
   sendAdmitted: boolean;
 }
 
+/**
+ * The plan fields that the launch blocks shared by a reserved launch (TaskLaunchPlan) and a
+ * direct Task.create launch (TaskCreatePlan) read.
+ */
+type TaskLaunchSource = Pick<
+  TaskLaunchPlan,
+  | "taskId"
+  | "workspaceName"
+  | "parentWorkspaceId"
+  | "parentMeta"
+  | "parentRuntimeConfig"
+  | "configProjectPath"
+  | "skipInitHook"
+>;
+
+/** The launch failure message for a prompt admission the launch fence did not grant. */
+function launchAdmissionRefusalMessage(
+  admission: Exclude<TaskTurnAdmission, { kind: "admitted" }>
+): string {
+  return admission.kind === "refused"
+    ? admission.message
+    : "Task launch refused: the task record is no longer an agent task";
+}
+
+/** The launch failure message for a prompt send that failed. */
+function launchSendErrorMessage(error: string | SendMessageError): string {
+  return typeof error === "string" ? error : formatSendMessageError(error).message;
+}
+
 /** What failTaskLaunch's CAS on the task's row found. */
 interface TaskLaunchFailureMark {
   superseded: boolean;
@@ -2635,37 +2664,48 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
   }
 }
 
-async function readTaskBaseCommitShaByProjectPath(params: {
-  workspaceId: string;
-  workspaceName: string;
-  workspacePath: string;
-  runtimeConfig: RuntimeConfig;
-  projectPath: string;
-  projectName: string;
-  projects?: WorkspaceMetadata["projects"];
-  runtime: Runtime;
-}): Promise<Record<string, string>> {
+/**
+ * A launched task's base commits in its materialized checkout: each project's HEAD, keyed by
+ * project path, and the parent project's. The reserved launch and a direct Task.create launch
+ * both persist them on the task's row.
+ */
+async function readTaskBaseCommits(
+  plan: TaskLaunchSource,
+  checkout: Pick<
+    MaterializedTaskLaunch,
+    "workspacePath" | "forkedRuntimeConfig" | "inheritedProjects" | "runtimeForTaskWorkspace"
+  >
+): Promise<{
+  taskBaseCommitSha: string | undefined;
+  taskBaseCommitShaByProjectPath: Record<string, string>;
+}> {
   const projectRepos = getWorkspaceProjectRepos({
     // Outside the agent loop: the host's runtimes.
     runtimeFactory: nodeRuntimeFactory,
-    workspaceId: params.workspaceId,
-    workspaceName: params.workspaceName,
-    workspacePath: params.workspacePath,
-    runtimeConfig: params.runtimeConfig,
-    projectPath: params.projectPath,
-    projectName: params.projectName,
-    projects: params.projects,
+    workspaceId: plan.taskId,
+    workspaceName: plan.workspaceName,
+    workspacePath: checkout.workspacePath,
+    runtimeConfig: checkout.forkedRuntimeConfig,
+    projectPath: plan.parentMeta.projectPath,
+    projectName: plan.parentMeta.projectName,
+    projects: checkout.inheritedProjects,
   });
 
   const taskBaseCommitShaByProjectPath: Record<string, string> = {};
   for (const projectRepo of projectRepos) {
-    const taskBaseCommitSha = await tryReadGitHeadCommitSha(params.runtime, projectRepo.repoCwd);
+    const taskBaseCommitSha = await tryReadGitHeadCommitSha(
+      checkout.runtimeForTaskWorkspace,
+      projectRepo.repoCwd
+    );
     if (taskBaseCommitSha) {
       taskBaseCommitShaByProjectPath[projectRepo.projectPath] = taskBaseCommitSha;
     }
   }
 
-  return taskBaseCommitShaByProjectPath;
+  return {
+    taskBaseCommitSha: taskBaseCommitShaByProjectPath[plan.parentMeta.projectPath] ?? undefined,
+    taskBaseCommitShaByProjectPath,
+  };
 }
 
 function buildWorkflowTimeoutFinalizationPrompt(
@@ -7079,27 +7119,9 @@ export class TaskService implements AgentTaskIntegration {
         return null;
       }
 
-      const forkResult = await orchestrateFork({
-        sourceRuntime,
-        projectPath: plan.parentMeta.projectPath,
-        sourceWorkspaceName: plan.parentMeta.name,
-        newWorkspaceName: plan.workspaceName,
-        newWorkspaceId: plan.taskId,
-        initLogger,
-        config: this.config,
-        sourceWorkspaceId: plan.parentWorkspaceId,
-        sourceRuntimeConfig: plan.parentRuntimeConfig,
-        parentMetadata: plan.parentMeta,
-        allowCreateFallback: true,
-        ...(plan.preferredTrunkBranch != null
-          ? { preferredTrunkBranch: plan.preferredTrunkBranch }
-          : {}),
-        trusted:
-          this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
-        multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-          EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-        ),
-      });
+      const forkResult = await orchestrateFork(
+        this.taskForkOptions(plan, sourceRuntime, initLogger, plan.preferredTrunkBranch)
+      );
 
       if (!forkResult.success) {
         throw new Error(`Task fork failed: ${forkResult.error}`);
@@ -7485,17 +7507,7 @@ export class TaskService implements AgentTaskIntegration {
     } = materialized;
 
     this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
-    const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
-      workspaceId: plan.taskId,
-      workspaceName: plan.workspaceName,
-      workspacePath,
-      runtimeConfig: forkedRuntimeConfig,
-      projectPath: plan.parentMeta.projectPath,
-      projectName: plan.parentMeta.projectName,
-      projects: inheritedProjects,
-      runtime: runtimeForTaskWorkspace,
-    });
-    const taskBaseCommitSha = taskBaseCommitShaByProjectPath[plan.parentMeta.projectPath];
+    const base = await readTaskBaseCommits(plan, materialized);
 
     await this.editWorkspaceEntry(
       plan.taskId,
@@ -7506,8 +7518,8 @@ export class TaskService implements AgentTaskIntegration {
         ws.path = workspacePath;
         ws.runtimeConfig = forkedRuntimeConfig;
         ws.taskTrunkBranch = trunkBranch;
-        ws.taskBaseCommitSha = taskBaseCommitSha ?? undefined;
-        ws.taskBaseCommitShaByProjectPath = taskBaseCommitShaByProjectPath;
+        ws.taskBaseCommitSha = base.taskBaseCommitSha;
+        ws.taskBaseCommitShaByProjectPath = base.taskBaseCommitShaByProjectPath;
         ws.projects = inheritedProjects;
         // The shared parent checkout was gone, so this task had to fork a real workspace.
         // Clear the shared flag so removal cleans up the new worktree.
@@ -7650,32 +7662,10 @@ export class TaskService implements AgentTaskIntegration {
         );
         throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
       }
-      // Registered (not just fired) with the host's abort-and-settlement mechanism:
-      // a model-driven archive of this task workspace must be able to cancel the init and
-      // must wait for the hook process's actual exit before snapshot capture, checkout
-      // deletion, or Coder hooks can proceed (see initSettlementPromises).
-      const initAbortController = new AbortController();
-      this.workspaceService.registerExternalBackgroundInit(
-        plan.taskId,
-        initAbortController,
-        runBackgroundInit(
-          runtimeForTaskWorkspace,
-          {
-            projectPath: plan.parentMeta.projectPath,
-            branchName: plan.workspaceName,
-            trunkBranch,
-            workspacePath,
-            initLogger,
-            env: secrets,
-            abortSignal: initAbortController.signal,
-            skipInitHook: plan.skipInitHook,
-            trusted:
-              this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-              false,
-          },
-          plan.taskId,
-          workspaceUseLeasesFor(this.config)
-        )
+      this.registerTaskBackgroundInit(
+        plan,
+        { initLogger, workspacePath, trunkBranch, runtimeForTaskWorkspace },
+        secrets
       );
     }
 
@@ -7701,10 +7691,7 @@ export class TaskService implements AgentTaskIntegration {
       expectedAttemptId: plan.attemptId,
     });
     if (admission.kind !== "admitted") {
-      const message =
-        admission.kind === "refused"
-          ? admission.message
-          : "Task launch refused: the task record is no longer an agent task";
+      const message = launchAdmissionRefusalMessage(admission);
       await this.cleanupMaterializedTaskWorkspace(
         runtimeForTaskWorkspace,
         plan.parentMeta.projectPath,
@@ -7751,10 +7738,7 @@ export class TaskService implements AgentTaskIntegration {
             turnAdmission: admission.token,
           });
     if (!sendResult.success) {
-      const message =
-        typeof sendResult.error === "string"
-          ? sendResult.error
-          : formatSendMessageError(sendResult.error).message;
+      const message = launchSendErrorMessage(sendResult.error);
       await this.cleanupMaterializedTaskWorkspace(
         runtimeForTaskWorkspace,
         plan.parentMeta.projectPath,
@@ -8372,17 +8356,7 @@ export class TaskService implements AgentTaskIntegration {
     // Multi-project forks need per-project secrets for each runtime's init hook.
     this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
 
-    const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
-      workspaceId: taskId,
-      workspaceName,
-      workspacePath,
-      runtimeConfig: checkout.forkedRuntimeConfig,
-      projectPath: parentMeta.projectPath,
-      projectName: parentMeta.projectName,
-      projects: checkout.inheritedProjects,
-      runtime: runtimeForTaskWorkspace,
-    });
-    const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
+    const base = await readTaskBaseCommits(plan, checkout);
 
     taskQueueDebug("TaskService.create started (workspace created)", {
       taskId,
@@ -8394,10 +8368,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Persist workspace entry before starting work so it's durable across crashes.
     await this.config.editConfig((config) =>
-      this.appendLaunchedTaskEntry(config, plan, launch, checkout, {
-        taskBaseCommitSha: taskBaseCommitSha ?? undefined,
-        taskBaseCommitShaByProjectPath,
-      })
+      this.appendLaunchedTaskEntry(config, plan, launch, checkout, base)
     );
     // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
     // this workspace, whoever issues it, is admitted under an attempt this process owns.
@@ -8452,31 +8423,49 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
-  /** The orchestrateFork options for a task that forks its parent's checkout. */
+  /** The orchestrateFork options for a direct launch that forks its parent's checkout. */
   private buildTaskForkOptions(
     plan: TaskCreatePlan,
     initLogger: InitLogger
   ): Parameters<typeof orchestrateFork>[0] {
     const { parentMeta, parentBranchName } = plan;
+    return this.taskForkOptions(
+      plan,
+      plan.runtime,
+      initLogger,
+      // Create-fallback base when the fork cannot detect a source branch — a shared parent's
+      // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
+      // actual checked-out branch. Only then: other parents keep the existing
+      // branch-discovery fallback.
+      parentBranchName != null && parentBranchName !== parentMeta.name
+        ? parentBranchName
+        : undefined
+    );
+  }
+
+  /**
+   * The orchestrateFork options for a task that forks its parent's checkout. The reserved launch
+   * and a direct launch differ only in the source runtime and the create-fallback trunk branch.
+   */
+  private taskForkOptions(
+    plan: TaskLaunchSource,
+    sourceRuntime: Runtime,
+    initLogger: InitLogger,
+    preferredTrunkBranch: string | undefined
+  ): Parameters<typeof orchestrateFork>[0] {
     return {
-      sourceRuntime: plan.runtime,
-      projectPath: parentMeta.projectPath,
-      sourceWorkspaceName: parentMeta.name,
+      sourceRuntime,
+      projectPath: plan.parentMeta.projectPath,
+      sourceWorkspaceName: plan.parentMeta.name,
       newWorkspaceName: plan.workspaceName,
       newWorkspaceId: plan.taskId,
       initLogger,
       config: this.config,
       sourceWorkspaceId: plan.parentWorkspaceId,
       sourceRuntimeConfig: plan.parentRuntimeConfig,
-      parentMetadata: parentMeta,
+      parentMetadata: plan.parentMeta,
       allowCreateFallback: true,
-      // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-      // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
-      // actual checked-out branch. Only then: other parents keep the existing
-      // branch-discovery fallback.
-      ...(parentBranchName != null && parentBranchName !== parentMeta.name
-        ? { preferredTrunkBranch: parentBranchName }
-        : {}),
+      ...(preferredTrunkBranch != null ? { preferredTrunkBranch } : {}),
       trusted:
         this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
       multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
@@ -8612,35 +8601,44 @@ export class TaskService implements AgentTaskIntegration {
       const secrets = await secretsToRecord(
         this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
-      // Registered (not just fired) with the host's abort-and-settlement mechanism:
-      // a model-driven archive of this task workspace must be able to cancel the init and
-      // must wait for the hook process's actual exit before snapshot capture, checkout
-      // deletion, or Coder hooks can proceed (see initSettlementPromises).
-      const initAbortController = new AbortController();
-      this.workspaceService.registerExternalBackgroundInit(
-        taskId,
-        initAbortController,
-        runBackgroundInit(
-          checkout.runtimeForTaskWorkspace,
-          {
-            projectPath: plan.parentMeta.projectPath,
-            branchName: plan.workspaceName,
-            trunkBranch: checkout.trunkBranch,
-            workspacePath: checkout.workspacePath,
-            initLogger: checkout.initLogger,
-            env: secrets,
-            abortSignal: initAbortController.signal,
-            skipInitHook: plan.skipInitHook,
-            trusted:
-              this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-              false,
-          },
-          taskId,
-          workspaceUseLeasesFor(this.config)
-        )
-      );
+      this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
     return this.sendTaskLaunchPrompt(plan, launch, checkout);
+  }
+
+  /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
+  private registerTaskBackgroundInit(
+    plan: TaskLaunchSource,
+    checkout: Omit<TaskLaunchCheckout, "forkedRuntimeConfig">,
+    env: Record<string, string>
+  ): void {
+    // Registered (not just fired) with the host's abort-and-settlement mechanism:
+    // a model-driven archive of this task workspace must be able to cancel the init and
+    // must wait for the hook process's actual exit before snapshot capture, checkout
+    // deletion, or Coder hooks can proceed (see initSettlementPromises).
+    const initAbortController = new AbortController();
+    this.workspaceService.registerExternalBackgroundInit(
+      plan.taskId,
+      initAbortController,
+      runBackgroundInit(
+        checkout.runtimeForTaskWorkspace,
+        {
+          projectPath: plan.parentMeta.projectPath,
+          branchName: plan.workspaceName,
+          trunkBranch: checkout.trunkBranch,
+          workspacePath: checkout.workspacePath,
+          initLogger: checkout.initLogger,
+          env,
+          abortSignal: initAbortController.signal,
+          skipInitHook: plan.skipInitHook,
+          trusted:
+            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
+            false,
+        },
+        plan.taskId,
+        workspaceUseLeasesFor(this.config)
+      )
+    );
   }
 
   /** Admits the launch's prompt under the attempt it persisted and sends it. */
@@ -8666,11 +8664,7 @@ export class TaskService implements AgentTaskIntegration {
     launch.sendAdmitted = admission.kind === "admitted";
     const sendResult =
       admission.kind !== "admitted"
-        ? Err(
-            admission.kind === "refused"
-              ? admission.message
-              : "Task launch refused: the task record is no longer an agent task"
-          )
+        ? Err(launchAdmissionRefusalMessage(admission))
         : await this.workspaceService
             .sendMessage(
               taskId,
@@ -8690,10 +8684,7 @@ export class TaskService implements AgentTaskIntegration {
             )
             .catch((error: unknown) => Err(getErrorMessage(error)));
     if (!sendResult.success) {
-      const message =
-        typeof sendResult.error === "string"
-          ? sendResult.error
-          : formatSendMessageError(sendResult.error).message;
+      const message = launchSendErrorMessage(sendResult.error);
       await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
         preservePhysicalWorkspace: plan.useSharedWorkspace,
       });
