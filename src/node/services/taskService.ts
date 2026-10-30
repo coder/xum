@@ -2358,6 +2358,30 @@ function withoutSend(state: CompletionPromptFenceState, result: boolean): boolea
   return result;
 }
 
+/** The row of a child task awaiting its report, or null (no row, no parent, another status). */
+function findAwaitingReportTaskEntry(
+  cfg: ProjectsConfig,
+  workspaceId: string
+): CompletionPromptRequest["entry"] | null {
+  const entry = findWorkspaceEntry(cfg, workspaceId);
+  if (!entry?.workspace.parentWorkspaceId) {
+    return null;
+  }
+  if (entry.workspace.taskStatus !== "awaiting_report") {
+    return null;
+  }
+  return entry;
+}
+
+/** The terminal failure message of a task that used up its recovery budget. */
+function recoveryLimitErrorMessage(
+  completionKind: CompletionPromptPlan["completionKind"],
+  error: CompletionPromptOptions["error"]
+): string {
+  const lastError = error ? ` Last error (${error.errorType ?? "unknown"}): ${error.error}` : "";
+  return `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`;
+}
+
 /** Logs a completion prompt's send; true when the send was accepted. */
 function logCompletionPromptResult(
   plan: CompletionPromptPlan,
@@ -18312,87 +18336,101 @@ export class TaskService implements AgentTaskIntegration {
     const state: CompletionPromptFenceState = { disposition: "refused" };
     try {
       const cfg = this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(cfg, workspaceId);
-      if (!entry?.workspace.parentWorkspaceId) {
-        return withoutSend(state, false);
-      }
-      if (entry.workspace.taskStatus !== "awaiting_report") {
-        return withoutSend(state, false);
-      }
-      const taskIndex = this.buildAgentTaskIndex(cfg);
-      if (
-        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          workspaceId,
-          cfg,
-          `completion-tool-${options?.reason ?? "unknown"}`,
-          taskIndex
-        )
-      ) {
-        return withoutSend(state, false);
-      }
-      if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
-        return withoutSend(state, false);
-      }
-      if (this.aiService.isStreaming(workspaceId)) {
-        return withoutSend(state, true);
-      }
-
-      const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
-      const completionKind = isPlanLike ? "propose_plan" : "final_response";
-      const requiresStructuredOutput =
-        entry.workspace.workflowTask?.outputSchema !== undefined &&
-        !(await this.shouldAllowLegacyInvalidWorkflowOutputSchema(workspaceId, entry));
-
-      // Persisted circuit breaker: a task that keeps consuming recovery prompts
-      // without ever completing is stuck (repeated empty output, repeated
-      // length-truncated turns, or a model that never calls its completion
-      // tool). Interrupt it with a descriptive error instead of prompting
-      // forever. The counter lives on the workspace entry so restart loops stay
-      // bounded too; finalizeAgentTaskReport clears it on success.
-      const recoveryAttempts = entry.workspace.taskRecoveryAttempts ?? 0;
-      if (recoveryAttempts >= MAX_TASK_RECOVERY_ATTEMPTS) {
-        const lastError = options?.error
-          ? ` Last error (${options.error.errorType ?? "unknown"}): ${options.error.error}`
-          : "";
-        log.error("Task exceeded its recovery attempt budget; interrupting task", {
-          workspaceId,
-          taskName: entry.workspace.name,
-          recoveryAttempts,
-          limit: MAX_TASK_RECOVERY_ATTEMPTS,
-          reason: options?.reason,
-        });
-        // A fenced prompt's attempt is not this process's to end: the awaits above may have let
-        // another writer take the row (the terminal failure would otherwise decide their attempt).
-        if (fence?.turnAdmission.admissionStale() === true) {
-          return withoutSend(state, false);
-        }
-        // The check above is one-shot: another backend can still take the row before the
-        // failure's own reads and write, so the failure itself is bound to the fenced attempt.
-        await this.failAgentTaskTerminally(
-          workspaceId,
-          entry,
-          {
-            errorType: "task_recovery_limit",
-            errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
-          },
-          { expectedAttemptId: fence?.attemptId ?? options.expectedAttemptId }
-        );
+      const entry = findAwaitingReportTaskEntry(cfg, workspaceId);
+      if (entry == null) {
         return withoutSend(state, false);
       }
       // `return await`, never a bare return: the finally must run after the steps settle, so it
       // sees the hand-off the send step records and leaves the token to the send.
-      return await this.chargeRecoveryAttemptAndPrompt({
-        workspaceId,
-        options,
-        fence,
-        entry,
-        state,
-        completionKind,
-        requiresStructuredOutput,
-      });
+      return await this.promptUnblockedAwaitingReportTask(
+        { workspaceId, options, fence, entry, state },
+        cfg
+      );
     } finally {
       if (state.disposition !== "handed-off") fence?.turnAdmission.onDisposed(state.disposition);
     }
+  }
+
+  /**
+   * Skips a task whose workflow owner is gone (and interrupts it), that has active owned work, or
+   * that is already streaming. Otherwise prompts it.
+   */
+  private async promptUnblockedAwaitingReportTask(
+    request: CompletionPromptRequest,
+    cfg: ProjectsConfig
+  ): Promise<boolean> {
+    const { workspaceId, options, state } = request;
+    const taskIndex = this.buildAgentTaskIndex(cfg);
+    if (
+      await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        workspaceId,
+        cfg,
+        `completion-tool-${options?.reason ?? "unknown"}`,
+        taskIndex
+      )
+    ) {
+      return withoutSend(state, false);
+    }
+    if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
+      return withoutSend(state, false);
+    }
+    if (this.aiService.isStreaming(workspaceId)) {
+      return withoutSend(state, true);
+    }
+    return await this.promptForTaskCompletionKind(request);
+  }
+
+  /** Reads the completion the task owes, then fails it at the recovery limit or prompts it. */
+  private async promptForTaskCompletionKind(request: CompletionPromptRequest): Promise<boolean> {
+    const { workspaceId, entry } = request;
+    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const completionKind = isPlanLike ? "propose_plan" : "final_response";
+    const requiresStructuredOutput =
+      entry.workspace.workflowTask?.outputSchema !== undefined &&
+      !(await this.shouldAllowLegacyInvalidWorkflowOutputSchema(workspaceId, entry));
+    const plan: CompletionPromptPlan = { ...request, completionKind, requiresStructuredOutput };
+
+    // Persisted circuit breaker: a task that keeps consuming recovery prompts
+    // without ever completing is stuck (repeated empty output, repeated
+    // length-truncated turns, or a model that never calls its completion
+    // tool). Interrupt it with a descriptive error instead of prompting
+    // forever. The counter lives on the workspace entry so restart loops stay
+    // bounded too; finalizeAgentTaskReport clears it on success.
+    const recoveryAttempts = entry.workspace.taskRecoveryAttempts ?? 0;
+    if (recoveryAttempts >= MAX_TASK_RECOVERY_ATTEMPTS) {
+      return await this.interruptTaskOverRecoveryBudget(plan, recoveryAttempts);
+    }
+    return await this.chargeRecoveryAttemptAndPrompt(plan);
+  }
+
+  /** Fails a task that used up its recovery budget, unless its fence went stale meanwhile. */
+  private async interruptTaskOverRecoveryBudget(
+    plan: CompletionPromptPlan,
+    recoveryAttempts: number
+  ): Promise<boolean> {
+    const { workspaceId, entry, options, fence, state } = plan;
+    const errorMessage = recoveryLimitErrorMessage(plan.completionKind, options?.error);
+    log.error("Task exceeded its recovery attempt budget; interrupting task", {
+      workspaceId,
+      taskName: entry.workspace.name,
+      recoveryAttempts,
+      limit: MAX_TASK_RECOVERY_ATTEMPTS,
+      reason: options?.reason,
+    });
+    // A fenced prompt's attempt is not this process's to end: the earlier awaits may have let
+    // another writer take the row (the terminal failure would otherwise decide their attempt).
+    if (fence?.turnAdmission.admissionStale() === true) {
+      return withoutSend(state, false);
+    }
+    // The check above is one-shot: another backend can still take the row before the
+    // failure's own reads and write, so the failure itself is bound to the fenced attempt.
+    await this.failAgentTaskTerminally(
+      workspaceId,
+      entry,
+      { errorType: "task_recovery_limit", errorMessage },
+      { expectedAttemptId: fence?.attemptId ?? options.expectedAttemptId }
+    );
+    return withoutSend(state, false);
   }
 
   /** Charges a prompt's recovery budget on its attempt, then sends the prompt. */
