@@ -2296,6 +2296,107 @@ function buildTaskTurnSendOptions(
   };
 }
 
+/** promptTaskForRequiredCompletionTool's options. */
+interface CompletionPromptOptions {
+  reason?: "startup" | "stream_end" | "error";
+  error?: Pick<ErrorEvent, "error" | "errorType">;
+  /** formatStructuredOutputValidationMessage output for an invalid agent_report. */
+  structuredOutputDiagnostic?: string;
+  /**
+   * A caller that decided this prompt for exactly one attempt (the startup re-drive's rotated
+   * id) binds the obligation before calling and hands it over here: the prompt is then
+   * fenced to that attempt through this method's awaits (the budget write is a CAS on it and
+   * the send carries the token), and a token that produces no send is disposed here. Without
+   * a fence the prompt is a same-attempt continuation bound at the handoff.
+   */
+  fence?: { turnAdmission: TurnAdmissionToken; attemptId: string };
+  /**
+   * The attempt the caller decided this prompt for (a stream end's or error's attempt): its
+   * budget write and a recovery-limit failure are CAS'd on it; a row another writer
+   * re-admitted meanwhile gets no write and no prompt. Required (see AttemptFence): `null`
+   * for fenced prompts (the fence carries the attempt) and for callers with no proven one.
+   */
+  expectedAttemptId: AttemptFence;
+}
+
+/**
+ * What promptTaskForRequiredCompletionTool's finally does with the fence token. One mutable
+ * record: the steps write it at their exits, and the finally reads it after the last step.
+ */
+interface CompletionPromptFenceState {
+  disposition: "no-work" | "refused" | "handed-off";
+}
+
+/** The awaiting_report row promptTaskForRequiredCompletionTool read at entry, and its call. */
+interface CompletionPromptRequest {
+  readonly workspaceId: string;
+  readonly options: CompletionPromptOptions;
+  readonly fence: CompletionPromptOptions["fence"];
+  /** The entry-time row: the send options and the logs read it, never a fresh read. */
+  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+  readonly state: CompletionPromptFenceState;
+}
+
+/** A prompt the recovery limit let through, with the completion it asks for. */
+interface CompletionPromptPlan extends CompletionPromptRequest {
+  readonly completionKind: "propose_plan" | "final_response";
+  readonly requiresStructuredOutput: boolean;
+}
+
+/** The send of a prompt that passed its budget charge, built in the charge's tick. */
+interface CompletionPromptSend {
+  readonly taskTurnSendOptions: ReturnType<typeof buildTaskTurnSendOptions>;
+  readonly startedAt: number;
+  readonly recoveryMessage: string;
+  /** The caller's fence token, a token bound to the decided attempt, or none. */
+  readonly sendToken: TurnAdmissionToken | undefined;
+}
+
+/** A prompt exit with no send: the finally disposes the fence token as no-work or refused. */
+function withoutSend(state: CompletionPromptFenceState, result: boolean): boolean {
+  state.disposition = result ? "no-work" : "refused";
+  return result;
+}
+
+/** Logs a completion prompt's send; true when the send was accepted. */
+function logCompletionPromptResult(
+  plan: CompletionPromptPlan,
+  send: CompletionPromptSend,
+  sendResult: Result<void, SendMessageError>
+): boolean {
+  const { workspaceId, entry, options, completionKind } = plan;
+  const { model, agentId } = send.taskTurnSendOptions;
+  const durationMs = Date.now() - send.startedAt;
+  if (!sendResult.success) {
+    log.error("Failed to prompt task for required completion", {
+      workspaceId,
+      taskName: entry.workspace.name,
+      projectPath: entry.projectPath,
+      completionKind,
+      reason: options?.reason,
+      model,
+      agentId,
+      durationMs,
+      sendError: sendResult.error,
+      priorErrorType: options?.error?.errorType,
+      priorError: options?.error?.error,
+    });
+    return false;
+  }
+
+  log.info("Prompted task for required completion", {
+    workspaceId,
+    taskName: entry.workspace.name,
+    projectPath: entry.projectPath,
+    completionKind,
+    reason: options?.reason,
+    model,
+    agentId,
+    durationMs,
+  });
+  return true;
+}
+
 /**
  * The terminal failure the row's marker (#4579) records for `attemptId`, or undefined when the
  * marker is absent or names another attempt (a later attempt ignores an earlier failure).
@@ -18195,27 +18296,7 @@ export class TaskService implements AgentTaskIntegration {
 
   private async promptTaskForRequiredCompletionTool(
     workspaceId: string,
-    options: {
-      reason?: "startup" | "stream_end" | "error";
-      error?: Pick<ErrorEvent, "error" | "errorType">;
-      /** formatStructuredOutputValidationMessage output for an invalid agent_report. */
-      structuredOutputDiagnostic?: string;
-      /**
-       * A caller that decided this prompt for exactly one attempt (the startup re-drive's rotated
-       * id) binds the obligation before calling and hands it over here: the prompt is then
-       * fenced to that attempt through this method's awaits (the budget write is a CAS on it and
-       * the send carries the token), and a token that produces no send is disposed here. Without
-       * a fence the prompt is a same-attempt continuation bound at the handoff.
-       */
-      fence?: { turnAdmission: TurnAdmissionToken; attemptId: string };
-      /**
-       * The attempt the caller decided this prompt for (a stream end's or error's attempt): its
-       * budget write and a recovery-limit failure are CAS'd on it; a row another writer
-       * re-admitted meanwhile gets no write and no prompt. Required (see AttemptFence): `null`
-       * for fenced prompts (the fence carries the attempt) and for callers with no proven one.
-       */
-      expectedAttemptId: AttemptFence;
-    }
+    options: CompletionPromptOptions
   ): Promise<boolean> {
     assert(
       workspaceId.length > 0,
@@ -18228,19 +18309,15 @@ export class TaskService implements AgentTaskIntegration {
     // the attempt's stop cascade waiting on it for good. From the handoff on the token is
     // WorkspaceService.sendMessage's (its scoped disposal covers refusal and throw; the queue owns
     // an enqueued token, the session an admitted one) and is never disposed here.
-    let fenceDisposition: "no-work" | "refused" | "handed-off" = "refused";
-    const withoutSend = (result: boolean): boolean => {
-      fenceDisposition = result ? "no-work" : "refused";
-      return result;
-    };
+    const state: CompletionPromptFenceState = { disposition: "refused" };
     try {
       const cfg = this.config.loadConfigOrDefault();
       const entry = findWorkspaceEntry(cfg, workspaceId);
       if (!entry?.workspace.parentWorkspaceId) {
-        return withoutSend(false);
+        return withoutSend(state, false);
       }
       if (entry.workspace.taskStatus !== "awaiting_report") {
-        return withoutSend(false);
+        return withoutSend(state, false);
       }
       const taskIndex = this.buildAgentTaskIndex(cfg);
       if (
@@ -18251,13 +18328,13 @@ export class TaskService implements AgentTaskIntegration {
           taskIndex
         )
       ) {
-        return withoutSend(false);
+        return withoutSend(state, false);
       }
       if (await this.hasActiveTaskOwnedWork(workspaceId, taskIndex)) {
-        return withoutSend(false);
+        return withoutSend(state, false);
       }
       if (this.aiService.isStreaming(workspaceId)) {
-        return withoutSend(true);
+        return withoutSend(state, true);
       }
 
       const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
@@ -18287,7 +18364,7 @@ export class TaskService implements AgentTaskIntegration {
         // A fenced prompt's attempt is not this process's to end: the awaits above may have let
         // another writer take the row (the terminal failure would otherwise decide their attempt).
         if (fence?.turnAdmission.admissionStale() === true) {
-          return withoutSend(false);
+          return withoutSend(state, false);
         }
         // The check above is one-shot: another backend can still take the row before the
         // failure's own reads and write, so the failure itself is bound to the fenced attempt.
@@ -18300,123 +18377,148 @@ export class TaskService implements AgentTaskIntegration {
           },
           { expectedAttemptId: fence?.attemptId ?? options.expectedAttemptId }
         );
-        return withoutSend(false);
+        return withoutSend(state, false);
       }
-      // Consume budget before sending so a crash mid-send still counts the attempt.
-      // Read the fresh value inside the mutator (not the entry-time snapshot above)
-      // so concurrent edits cannot lose an increment. A fenced prompt charges only the attempt it
-      // was decided for: a row another writer re-admitted meanwhile is theirs (no write, no send).
-      let fenceSuperseded = false;
-      await this.editWorkspaceEntry(
+      // `return await`, never a bare return: the finally must run after the steps settle, so it
+      // sees the hand-off the send step records and leaves the token to the send.
+      return await this.chargeRecoveryAttemptAndPrompt({
         workspaceId,
-        (ws) => {
-          if (
-            (fence != null && ws.taskAttemptId !== fence.attemptId) ||
-            rowSupersedes(ws, options?.expectedAttemptId)
-          ) {
-            fenceSuperseded = true;
-            return;
-          }
-          ws.taskRecoveryAttempts = (ws.taskRecoveryAttempts ?? 0) + 1;
-        },
-        { allowMissing: true }
-      );
-      if (fenceSuperseded || fence?.turnAdmission.admissionStale() === true) {
-        log.info("[task-attempt] completion prompt refused: decided for a superseded attempt", {
-          workspaceId,
-          reason: options?.reason,
-        });
-        return withoutSend(false);
-      }
-
-      const taskTurnSendOptions = buildTaskTurnSendOptions(entry.workspace);
-      const { model, agentId } = taskTurnSendOptions;
-      const startedAt = Date.now();
-      const recoveryMessage = this.buildTaskCompletionRecoveryMessage(
+        options,
+        fence,
+        entry,
+        state,
         completionKind,
         requiresStructuredOutput,
-        options
-      );
-      // Admission classification: recovery prompt = same-attempt continuation (no rotation). A
-      // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
-      // mints none of its own — see WorkspaceService.sendMessage). A prompt decided for one attempt
-      // (expectedAttemptId) is bound to that attempt here, synchronously before the handoff: left
-      // to the handoff it would bind to whichever attempt holds the row then, e.g. a successor
-      // another backend admitted after the budget CAS above (#4414).
-      let sendToken = fence?.turnAdmission;
-      if (fence == null && options.expectedAttemptId != null) {
-        const admission = this.admitTaskWorkspaceTurn(workspaceId, {
-          acceptanceOrigin: "automatic",
-          expectedAttemptId: options.expectedAttemptId,
-        });
-        // An expected attempt makes the row a task with that id, so anything but an admission
-        // (refused, or an impossible not-a-task) means the decision is stale: no prompt.
-        if (admission.kind !== "admitted") return withoutSend(false);
-        sendToken = admission.token;
-      }
-      fenceDisposition = "handed-off";
-      const sendResult = await this.workspaceService.sendMessage(
-        workspaceId,
-        recoveryMessage,
-        {
-          ...taskTurnSendOptions,
-          ...(completionKind === "propose_plan"
-            ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
-            : {}),
-          // A tool-end prompt would cut the child's next turn after one step and re-enter this
-          // path (observed recovery loop); wait for the turn to end instead.
-          queueDispatchMode: "turn-end",
-        },
-        {
-          acceptanceOrigin: "automatic",
-          synthetic: true,
-          agentInitiated: true,
-          taskTurnKind: "required_report",
-          queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
-          removableQueueDedupeKey: true,
-          // Startup recovery gates the server listener: return once the prompt is accepted and
-          // let stream startup (runtime readiness, MCP, model) continue in the background.
-          startStreamInBackground: options?.reason === "startup",
-          ...(sendToken != null
-            ? {
-                turnAdmission: sendToken,
-                admissionStale: () => sendToken.admissionStale(),
-              }
-            : {}),
-        }
-      );
-      const durationMs = Date.now() - startedAt;
-      if (!sendResult.success) {
-        log.error("Failed to prompt task for required completion", {
-          workspaceId,
-          taskName: entry.workspace.name,
-          projectPath: entry.projectPath,
-          completionKind,
-          reason: options?.reason,
-          model,
-          agentId,
-          durationMs,
-          sendError: sendResult.error,
-          priorErrorType: options?.error?.errorType,
-          priorError: options?.error?.error,
-        });
-        return false;
-      }
-
-      log.info("Prompted task for required completion", {
-        workspaceId,
-        taskName: entry.workspace.name,
-        projectPath: entry.projectPath,
-        completionKind,
-        reason: options?.reason,
-        model,
-        agentId,
-        durationMs,
       });
-      return true;
     } finally {
-      if (fenceDisposition !== "handed-off") fence?.turnAdmission.onDisposed(fenceDisposition);
+      if (state.disposition !== "handed-off") fence?.turnAdmission.onDisposed(state.disposition);
     }
+  }
+
+  /** Charges a prompt's recovery budget on its attempt, then sends the prompt. */
+  private async chargeRecoveryAttemptAndPrompt(plan: CompletionPromptPlan): Promise<boolean> {
+    const { workspaceId, options, fence } = plan;
+    // Consume budget before sending so a crash mid-send still counts the attempt.
+    // Read the fresh value inside the mutator (not the entry-time snapshot in plan.entry)
+    // so concurrent edits cannot lose an increment. A fenced prompt charges only the attempt it
+    // was decided for: a row another writer re-admitted meanwhile is theirs (no write, no send).
+    let fenceSuperseded = false;
+    await this.editWorkspaceEntry(
+      workspaceId,
+      (ws) => {
+        if (
+          (fence != null && ws.taskAttemptId !== fence.attemptId) ||
+          rowSupersedes(ws, options?.expectedAttemptId)
+        ) {
+          fenceSuperseded = true;
+          return;
+        }
+        ws.taskRecoveryAttempts = (ws.taskRecoveryAttempts ?? 0) + 1;
+      },
+      { allowMissing: true }
+    );
+    // Sync from here to the send's handoff: the binding and the send run in this tick.
+    const prepared = this.prepareCompletionPromptSend(plan, fenceSuperseded);
+    if (prepared.kind === "refused") return withoutSend(plan.state, false);
+    return await this.sendCompletionPrompt(plan, prepared.send);
+  }
+
+  /**
+   * Refuses a prompt decided for a superseded attempt or one whose binding is refused. Otherwise
+   * builds its send: the task-pinned send options, the recovery message and the token it rides.
+   */
+  private prepareCompletionPromptSend(
+    plan: CompletionPromptPlan,
+    fenceSuperseded: boolean
+  ): { kind: "refused" } | { kind: "send"; send: CompletionPromptSend } {
+    const { workspaceId, options, fence } = plan;
+    if (fenceSuperseded || fence?.turnAdmission.admissionStale() === true) {
+      log.info("[task-attempt] completion prompt refused: decided for a superseded attempt", {
+        workspaceId,
+        reason: options?.reason,
+      });
+      return { kind: "refused" };
+    }
+
+    const taskTurnSendOptions = buildTaskTurnSendOptions(plan.entry.workspace);
+    const startedAt = Date.now();
+    const recoveryMessage = this.buildTaskCompletionRecoveryMessage(
+      plan.completionKind,
+      plan.requiresStructuredOutput,
+      options
+    );
+    const binding = this.bindCompletionPromptToken(plan);
+    if (binding.kind === "stale") return { kind: "refused" };
+    return {
+      kind: "send",
+      send: { taskTurnSendOptions, startedAt, recoveryMessage, sendToken: binding.token },
+    };
+  }
+
+  /** The token a prompt's send rides, or stale when the decided attempt refuses the binding. */
+  private bindCompletionPromptToken(
+    plan: CompletionPromptPlan
+  ): { kind: "stale" } | { kind: "bound"; token: TurnAdmissionToken | undefined } {
+    const { workspaceId, options, fence } = plan;
+    // Admission classification: recovery prompt = same-attempt continuation (no rotation). A
+    // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
+    // mints none of its own — see WorkspaceService.sendMessage). A prompt decided for one attempt
+    // (expectedAttemptId) is bound to that attempt here, synchronously before the handoff: left
+    // to the handoff it would bind to whichever attempt holds the row then, e.g. a successor
+    // another backend admitted after the budget CAS (#4414).
+    let sendToken = fence?.turnAdmission;
+    if (fence == null && options.expectedAttemptId != null) {
+      const admission = this.admitTaskWorkspaceTurn(workspaceId, {
+        acceptanceOrigin: "automatic",
+        expectedAttemptId: options.expectedAttemptId,
+      });
+      // An expected attempt makes the row a task with that id, so anything but an admission
+      // (refused, or an impossible not-a-task) means the decision is stale: no prompt.
+      if (admission.kind !== "admitted") return { kind: "stale" };
+      sendToken = admission.token;
+    }
+    return { kind: "bound", token: sendToken };
+  }
+
+  /** Hands the prompt and its token to WorkspaceService.sendMessage, then logs the result. */
+  private async sendCompletionPrompt(
+    plan: CompletionPromptPlan,
+    send: CompletionPromptSend
+  ): Promise<boolean> {
+    const { workspaceId, options, state } = plan;
+    const { sendToken } = send;
+    state.disposition = "handed-off";
+    const sendResult = await this.workspaceService.sendMessage(
+      workspaceId,
+      send.recoveryMessage,
+      {
+        ...send.taskTurnSendOptions,
+        ...(plan.completionKind === "propose_plan"
+          ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
+          : {}),
+        // A tool-end prompt would cut the child's next turn after one step and re-enter this
+        // path (observed recovery loop); wait for the turn to end instead.
+        queueDispatchMode: "turn-end",
+      },
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        taskTurnKind: "required_report",
+        queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
+        removableQueueDedupeKey: true,
+        // Startup recovery gates the server listener: return once the prompt is accepted and
+        // let stream startup (runtime readiness, MCP, model) continue in the background.
+        startStreamInBackground: options?.reason === "startup",
+        ...(sendToken != null
+          ? {
+              turnAdmission: sendToken,
+              admissionStale: () => sendToken.admissionStale(),
+            }
+          : {}),
+      }
+    );
+    return logCompletionPromptResult(plan, send, sendResult);
   }
 
   private async promptTaskForBackgroundAwait(
