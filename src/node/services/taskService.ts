@@ -387,6 +387,39 @@ export interface SubagentRemovalPreview {
   paths: string[];
 }
 
+/** A sub-agent removal that passed the scope and inactivity checks; later steps extend it. */
+interface InactiveTaskRemoval {
+  readonly taskId: string;
+  /** The row read at entry: the removal stays bound to its attempt (#4478). */
+  readonly entry: { projectPath: string; workspace: WorkspaceConfigEntry };
+  readonly target: { taskId: string; workspaceId: string; displayName?: string };
+  readonly options: SubagentRemovalOptions | undefined;
+}
+
+/** The removal under the patch operation lock, with the patch artifact read there. */
+interface InactiveTaskRemovalUnderPatchLock extends InactiveTaskRemoval {
+  readonly patchArtifact: SubagentGitPatchArtifact | null;
+}
+
+/** The removal after the background-process check; guardLiveWriters gates the hold (#4761). */
+interface GuardedInactiveTaskRemoval extends InactiveTaskRemovalUnderPatchLock {
+  readonly guardLiveWriters: boolean;
+}
+
+/** Forwards a successful removal's warnings to the caller and maps the removal result. */
+function reportInactiveTaskRemoval(
+  result: Result<void> & { warnings?: WorkspaceRemoveWarning[] },
+  removal: InactiveTaskRemoval
+): Result<WorkspaceLifecycleResult, string> {
+  if (result.success && result.warnings?.length)
+    removal.options?.onRemovalWarnings?.(result.warnings);
+  return Ok(
+    result.success
+      ? { status: "removed", action: "remove", ...removal.target }
+      : { status: "error", action: "remove", ...removal.target, error: result.error }
+  );
+}
+
 interface TaskParentAiMeta {
   /** Parent's persisted selected agent (see persistSelectedAgentId). */
   agentId?: string;
@@ -15365,75 +15398,118 @@ export class TaskService implements AgentTaskIntegration {
             "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
         });
       }
-      const liveWriterHold = guardLiveWriters
-        ? this.workspaceService.acquirePreInterruptionArchiveHold(taskId, {
-            queuedDelegatedTurnCount: 0,
-            expectedDelegatedTurnCorrelations: [],
-            operation: "remove",
-          })
-        : undefined;
-      if (liveWriterHold?.success === false) {
-        return Ok({ status: "error", action: "remove", ...target, error: liveWriterHold.error });
-      }
-      using _liveWriterHold = liveWriterHold?.success === true ? liveWriterHold.data : undefined;
-      // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
-      if (options?.lossyWorkPolicy === "refuse") {
-        // An editor or native terminal opened earlier is not trackable, so it may still write.
-        if (
-          guardLiveWriters &&
-          (await this.workspaceService.hasUntrackableExternalAppOpen(taskId))
-        ) {
-          return Ok({
-            status: "error",
-            action: "remove",
-            ...target,
-            error:
-              "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
-          });
-        }
-        const refusal = await this.refuseLossySubagentRemoval(taskId, entry, patchArtifact ?? null);
-        if (refusal != null)
-          return Ok({ status: "error", action: "remove", ...target, ...refusal });
-      }
-      if (options?.acknowledgedWork != null) {
-        const current = await this.describeSubagentRemovalPreview(
-          taskId,
-          entry,
-          patchArtifact ?? null
-        );
-        if (
-          current.summary !== options.acknowledgedWork.summary ||
-          current.paths.join("\0") !== options.acknowledgedWork.paths.join("\0")
-        ) {
-          return Ok({
-            status: "error",
-            action: "remove",
-            ...target,
-            error:
-              "The sub-agent's unsaved work changed after the confirmation was shown, so it was not removed. Review it again.",
-          });
-        }
-      }
-
-      const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
-      if (!tombstoneResult.success) {
-        return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
-      }
-      // Bound to the attempt checked inactive above (#4478): another backend can reawaken the task
-      // during the awaits since, and the removal must then refuse instead of deleting its checkout.
-      const result = await this.workspaceService.removeWhileTaskTreeLocked(
+      return await this.removeInactiveTaskUnderLiveWriterHold({
         taskId,
-        true,
-        { expectedAttemptId: entry.workspace.taskAttemptId },
-        options?.mutationGateHeld === true ? { mutationGateHeld: true } : undefined
-      );
-      if (result.success && result.warnings?.length) options?.onRemovalWarnings?.(result.warnings);
-      return Ok(
-        result.success
-          ? { status: "removed", action: "remove", ...target }
-          : { status: "error", action: "remove", ...target, error: result.error }
-      );
+        entry,
+        target,
+        options,
+        patchArtifact,
+        guardLiveWriters,
+      });
     });
+  }
+
+  /** Takes the live-writer hold (#4761) and keeps it until the checks and the removal settle. */
+  private async removeInactiveTaskUnderLiveWriterHold(
+    removal: GuardedInactiveTaskRemoval
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    const liveWriterHold = removal.guardLiveWriters
+      ? this.workspaceService.acquirePreInterruptionArchiveHold(removal.taskId, {
+          queuedDelegatedTurnCount: 0,
+          expectedDelegatedTurnCorrelations: [],
+          operation: "remove",
+        })
+      : undefined;
+    if (liveWriterHold?.success === false) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error: liveWriterHold.error,
+      });
+    }
+    using _liveWriterHold = liveWriterHold?.success === true ? liveWriterHold.data : undefined;
+    // Awaited, not returned: a bare return would release the hold before the removal runs.
+    return await this.refuseLossyWorkBeforeRemoval(removal);
+  }
+
+  private async refuseLossyWorkBeforeRemoval(
+    removal: GuardedInactiveTaskRemoval
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
+    if (removal.options?.lossyWorkPolicy === "refuse") {
+      // An editor or native terminal opened earlier is not trackable, so it may still write.
+      if (
+        removal.guardLiveWriters &&
+        (await this.workspaceService.hasUntrackableExternalAppOpen(removal.taskId))
+      ) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...removal.target,
+          error:
+            "An external editor or native terminal was opened in this sub-agent's checkout and may still write to it. Ask the user to remove the sub-agent.",
+        });
+      }
+      const refusal = await this.refuseLossySubagentRemoval(
+        removal.taskId,
+        removal.entry,
+        removal.patchArtifact ?? null
+      );
+      if (refusal != null)
+        return Ok({ status: "error", action: "remove", ...removal.target, ...refusal });
+    }
+    return await this.refuseChangedWorkBeforeRemoval(removal);
+  }
+
+  /** #5106: refuses when the work found under the locks differs from what the user confirmed. */
+  private async refuseChangedWorkBeforeRemoval(
+    removal: InactiveTaskRemovalUnderPatchLock
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    if (removal.options?.acknowledgedWork != null) {
+      const current = await this.describeSubagentRemovalPreview(
+        removal.taskId,
+        removal.entry,
+        removal.patchArtifact ?? null
+      );
+      if (
+        current.summary !== removal.options.acknowledgedWork.summary ||
+        current.paths.join("\0") !== removal.options.acknowledgedWork.paths.join("\0")
+      ) {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...removal.target,
+          error:
+            "The sub-agent's unsaved work changed after the confirmation was shown, so it was not removed. Review it again.",
+        });
+      }
+    }
+
+    return await this.persistTombstonesAndRemoveTask(removal);
+  }
+
+  private async persistTombstonesAndRemoveTask(
+    removal: InactiveTaskRemoval
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    const tombstoneResult = await this.persistRemovedAgentTaskTombstones(removal.taskId);
+    if (!tombstoneResult.success) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error: tombstoneResult.error,
+      });
+    }
+    // Bound to the attempt checked inactive above (#4478): another backend can reawaken the task
+    // during the awaits since, and the removal must then refuse instead of deleting its checkout.
+    const result = await this.workspaceService.removeWhileTaskTreeLocked(
+      removal.taskId,
+      true,
+      { expectedAttemptId: removal.entry.workspace.taskAttemptId },
+      removal.options?.mutationGateHeld === true ? { mutationGateHeld: true } : undefined
+    );
+    return reportInactiveTaskRemoval(result, removal);
   }
 
   /**
