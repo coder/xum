@@ -6990,6 +6990,7 @@ describe("per-agent prompt cache TTL", () => {
     agentId: string;
     globalCacheTtl?: "5m" | "1h";
     agentAiDefaults?: AgentAiDefaults;
+    modelString?: string;
   }): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
     using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
     const projectPath = path.join(xumHome.path, "project");
@@ -7030,6 +7031,8 @@ describe("per-agent prompt cache TTL", () => {
       // Only inspect serialized requests; never contact a provider.
       return Promise.resolve(new Response("{}", { status: 400 }));
     };
+    const modelString = input.modelString ?? KNOWN_MODELS.SONNET.id;
+    const provider = modelString.split(":", 1)[0];
     // The provider-config fetch is the base fetch the Anthropic cache wrapper wraps.
     spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
       anthropic: {
@@ -7037,13 +7040,16 @@ describe("per-agent prompt cache TTL", () => {
         fetch: recordingFetch,
         ...(input.globalCacheTtl != null ? { cacheTtl: input.globalCacheTtl } : {}),
       },
+      ...(provider === "anthropic"
+        ? {}
+        : { [provider]: { apiKey: "test-key", fetch: recordingFetch } }),
     });
 
     {
       const result = await service.streamMessage({
         messages: [createMuxMessage("user-message", "user", "hello")],
         workspaceId,
-        modelString: KNOWN_MODELS.SONNET.id,
+        modelString,
         thinkingLevel: "off",
         agentId: input.agentId,
       });
@@ -7116,4 +7122,13 @@ describe("per-agent prompt cache TTL", () => {
       expect(envelopeTtl).toBe(testCase.expected);
     });
   }
+
+  it("a non-Anthropic model ignores the agent's TTL", async () => {
+    const { wireTtls, envelopeTtl } = await sendTurn({
+      agentId: "explore",
+      modelString: KNOWN_MODELS.GPT.id,
+    });
+    expect(wireTtls).toEqual([]);
+    expect(envelopeTtl).toBeUndefined();
+  });
 });

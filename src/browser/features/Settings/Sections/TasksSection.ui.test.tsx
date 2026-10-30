@@ -1225,6 +1225,17 @@ describe("TasksSection prompt cache TTL", () => {
     );
   });
 
+  test("an unknown agent's stale value shows and resets to Inherit", async () => {
+    const view = renderTasksSection({ agentAiDefaults: { mystery: { cacheTtl: "1h" } } });
+    await view.findAllByText("Plan");
+
+    expect(selectedOptionText(cacheSelect(view, "mystery"))).toBe("1 hour");
+    fireEvent.change(cacheSelect(view, "mystery")!, { target: { value: "__inherit__" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.mystery).toBeUndefined()
+    );
+  });
+
   test("Inherit names the value the agent inherits without its own Settings value", async () => {
     setGlobalCacheTtl("1h");
     const view = renderTasksSection({
