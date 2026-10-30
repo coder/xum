@@ -1024,6 +1024,127 @@ interface QueuedLaunchAttempt {
  */
 type QueuedTaskReservation = "reserved" | "skipped" | "shutdown";
 
+/** What a queue drain read under the mutex before its per-task loop, for every task's checks. */
+interface QueuedDrainSnapshot {
+  readonly config: ProjectsConfig;
+  readonly taskIndex: AgentTaskIndex;
+}
+
+/** A queued task's parent, as the drain's config names it, and the runtimes its launch uses. */
+interface QueuedTaskParent {
+  readonly parentWorkspaceId: string;
+  readonly parentEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+  readonly parentWorkspaceName: string;
+  readonly taskRuntimeConfig: RuntimeConfig;
+  readonly parentRuntimeConfig: RuntimeConfig;
+}
+
+/** A queued task past the drain's refusals: snapshots taken before its parent metadata read. */
+interface QueuedTaskCandidate extends QueuedTaskParent {
+  readonly taskId: string;
+  /** The queued row the drain listed. */
+  readonly task: AgentTaskWorkspaceEntry;
+  readonly start: TaskLaunchStart;
+  readonly config: ProjectsConfig;
+  readonly configProjectPath: string;
+}
+
+/** The candidate plus its parent's metadata (read, or rebuilt from the parent's config row). */
+interface QueuedTaskParentRead extends QueuedTaskCandidate {
+  readonly parentRuntimeProjectPath: string;
+  readonly parentMeta: WorkspaceMetadata;
+}
+
+/** A queued task's brief send, or a resume of the stream a legacy record left pending. */
+function queuedTaskLaunchStart(taskId: string, task: AgentTaskWorkspaceEntry): TaskLaunchStart {
+  const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
+  const start: TaskLaunchStart = queuedPrompt
+    ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
+    : { kind: "resumeStream" };
+  if (start.kind === "resumeStream") {
+    // Older queued task records stored the initial prompt only in chat history.
+    // Keep those upgrade-safe by resuming the existing pending stream instead of failing launch.
+    taskQueueDebug("TaskService.maybeStartQueuedTasks legacy resumeStream reservation", {
+      taskId,
+    });
+  }
+  return start;
+}
+
+/** A queued task's parent in the drain's config, or why the task cannot launch under it. */
+function resolveQueuedTaskParent(
+  task: AgentTaskWorkspaceEntry,
+  config: ProjectsConfig
+): { kind: "refused"; reason: string } | { kind: "found"; parent: QueuedTaskParent } {
+  const parentWorkspaceId = coerceNonEmptyString(task.parentWorkspaceId);
+  if (!parentWorkspaceId) {
+    return { kind: "refused", reason: "Queued task missing parentWorkspaceId" };
+  }
+
+  const parentEntry = findWorkspaceEntry(config, parentWorkspaceId);
+  if (!parentEntry) {
+    return { kind: "refused", reason: "Queued task parent not found" };
+  }
+  const parentWorkspaceName = coerceNonEmptyString(parentEntry.workspace.name);
+  if (!parentWorkspaceName) {
+    return { kind: "refused", reason: "Queued task parent missing workspace name" };
+  }
+
+  const taskRuntimeConfig = task.runtimeConfig ?? parentEntry.workspace.runtimeConfig;
+  const parentRuntimeConfig = parentEntry.workspace.runtimeConfig ?? taskRuntimeConfig;
+  if (!taskRuntimeConfig || !parentRuntimeConfig) {
+    return { kind: "refused", reason: "Queued task missing runtimeConfig" };
+  }
+  return {
+    kind: "found",
+    parent: {
+      parentWorkspaceId,
+      parentEntry,
+      parentWorkspaceName,
+      taskRuntimeConfig,
+      parentRuntimeConfig,
+    },
+  };
+}
+
+/** Why a queued task's projects refuse its launch, or undefined when every one is trusted. */
+function queuedTaskTrustRefusal(
+  task: AgentTaskWorkspaceEntry,
+  normalizedTaskProjectPath: string,
+  config: ProjectsConfig
+): string | undefined {
+  const taskProjectConfig = config.projects.get(normalizedTaskProjectPath);
+  if (!taskProjectConfig?.trusted) {
+    return "Task skipped: project is not trusted";
+  }
+  const untrustedSecondaryProject = findUntrustedSecondaryProject(
+    task,
+    normalizedTaskProjectPath,
+    config
+  );
+  if (untrustedSecondaryProject) {
+    return `Task skipped: project ${untrustedSecondaryProject.projectPath} is not trusted`;
+  }
+  return undefined;
+}
+
+/** A multi-project task's first secondary project that the config does not trust. */
+function findUntrustedSecondaryProject(
+  task: AgentTaskWorkspaceEntry,
+  normalizedTaskProjectPath: string,
+  config: ProjectsConfig
+): NonNullable<AgentTaskWorkspaceEntry["projects"]>[number] | undefined {
+  return Array.isArray(task.projects) && task.projects.length > 1
+    ? task.projects.find((project) => {
+        const normalizedProjectPath = stripTrailingSlashes(project.projectPath);
+        if (normalizedProjectPath === normalizedTaskProjectPath) {
+          return false;
+        }
+        return !(config.projects.get(normalizedProjectPath)?.trusted ?? false);
+      })
+    : undefined;
+}
+
 /** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
 async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
   await lease.release().catch((error: unknown) => {
@@ -16744,197 +16865,198 @@ export class TaskService implements AgentTaskIntegration {
       });
       if (availableSlots === 0) return;
 
+      const drain: QueuedDrainSnapshot = { config, taskIndex };
       let reservedSlots = 0;
       for (const task of queuedTasks) {
         if (reservedSlots >= availableSlots) {
           break;
         }
-        const taskId = task.id;
-        assert(taskId != null && taskId.length > 0, "queued task id is required");
-        if (
-          await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-            taskId,
-            config,
-            "queued-launch",
-            taskIndex,
-            { scheduleQueueDrain: false }
-          )
-        ) {
-          continue;
-        }
-
-        // Stop-cascade barrier (see startReservedAgentTask): a task whose own or parent's stop
-        // latch is held is not even reserved; the latch release rechecks the queue.
-        if (
-          this.taskStopLatch.deferLaunchWhileStopInProgress(
-            taskId,
-            coerceNonEmptyString(task.parentWorkspaceId)
-          )
-        ) {
-          continue;
-        }
-
-        if (this.aiService.isStreaming(taskId)) {
-          await this.setTaskStatus(taskId, "running");
-          reservedSlots += 1;
-          continue;
-        }
-
-        const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
-        const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
-          : { kind: "resumeStream" };
-        if (start.kind === "resumeStream") {
-          // Older queued task records stored the initial prompt only in chat history.
-          // Keep those upgrade-safe by resuming the existing pending stream instead of failing launch.
-          taskQueueDebug("TaskService.maybeStartQueuedTasks legacy resumeStream reservation", {
-            taskId,
-          });
-        }
-
-        const parentWorkspaceId = coerceNonEmptyString(task.parentWorkspaceId);
-        if (!parentWorkspaceId) {
-          await this.markTaskLaunchFailed(taskId, "Queued task missing parentWorkspaceId");
-          continue;
-        }
-
-        const parentEntry = findWorkspaceEntry(config, parentWorkspaceId);
-        if (!parentEntry) {
-          await this.markTaskLaunchFailed(taskId, "Queued task parent not found");
-          continue;
-        }
-        const parentWorkspaceName = coerceNonEmptyString(parentEntry.workspace.name);
-        if (!parentWorkspaceName) {
-          await this.markTaskLaunchFailed(taskId, "Queued task parent missing workspace name");
-          continue;
-        }
-
-        const taskRuntimeConfig = task.runtimeConfig ?? parentEntry.workspace.runtimeConfig;
-        const parentRuntimeConfig = parentEntry.workspace.runtimeConfig ?? taskRuntimeConfig;
-        if (!taskRuntimeConfig || !parentRuntimeConfig) {
-          await this.markTaskLaunchFailed(taskId, "Queued task missing runtimeConfig");
-          continue;
-        }
-
-        const normalizedTaskProjectPath = stripTrailingSlashes(task.projectPath);
-        const taskProjectConfig = config.projects.get(normalizedTaskProjectPath);
-        if (!taskProjectConfig?.trusted) {
-          await this.markTaskLaunchFailed(taskId, "Task skipped: project is not trusted");
-          continue;
-        }
-        const untrustedSecondaryProject =
-          Array.isArray(task.projects) && task.projects.length > 1
-            ? task.projects.find((project) => {
-                const normalizedProjectPath = stripTrailingSlashes(project.projectPath);
-                if (normalizedProjectPath === normalizedTaskProjectPath) {
-                  return false;
-                }
-                return !(config.projects.get(normalizedProjectPath)?.trusted ?? false);
-              })
-            : undefined;
-        if (untrustedSecondaryProject) {
-          await this.markTaskLaunchFailed(
-            taskId,
-            `Task skipped: project ${untrustedSecondaryProject.projectPath} is not trusted`
-          );
-          continue;
-        }
-
-        const parentRuntimeProjectPath =
-          parentEntry.workspace.kind === "scratch"
-            ? parentEntry.workspace.path
-            : parentEntry.projectPath;
-        const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
-        const parentMeta = parentMetaResult.success
-          ? parentMetaResult.data
-          : ({
-              id: parentWorkspaceId,
-              name: parentWorkspaceName,
-              kind: parentEntry.workspace.kind,
-              projectPath: parentRuntimeProjectPath,
-              projectName:
-                parentEntry.workspace.kind === "scratch"
-                  ? SCRATCH_PROJECT_NAME
-                  : (parentEntry.workspace.projects?.find(
-                      (project) =>
-                        stripTrailingSlashes(project.projectPath) ===
-                        stripTrailingSlashes(parentEntry.projectPath)
-                    )?.projectName ??
-                    parentEntry.projectPath.split("/").filter(Boolean).at(-1) ??
-                    parentEntry.projectPath),
-              runtimeConfig: parentRuntimeConfig,
-              projects: parentEntry.workspace.projects,
-            } satisfies WorkspaceMetadata);
-
-        const agentId = resolveTaskAgentIdForResume(task);
-        assert(agentId.length > 0, "queued task agentId is required");
-        let skipInitHook = false;
-        try {
-          const parentRuntime = createRuntimeForWorkspace({
-            runtimeConfig: parentRuntimeConfig,
-            projectPath: parentRuntimeProjectPath,
-            name: parentWorkspaceName,
-          });
-          const parentWorkspacePath =
-            coerceNonEmptyString(parentEntry.workspace.path) ??
-            parentRuntime.getWorkspacePath(parentRuntimeProjectPath, parentWorkspaceName);
-          const frontmatter = await resolveAgentFrontmatter(
-            parentRuntime,
-            parentWorkspacePath,
-            agentId,
-            {
-              projectPluginsTrusted: isWorkspaceProjectTrustedIn(config.projects, {
-                kind: parentEntry.workspace.kind,
-                projectPath: parentEntry.projectPath,
-              }),
-              runtimeFactory: nodeRuntimeFactory,
-            }
-          );
-          skipInitHook = frontmatter.subagent?.skip_init_hook === true;
-        } catch (error: unknown) {
-          log.debug("Queued task: failed to resolve skip_init_hook during reservation", {
-            taskId,
-            agentId,
-            error: getErrorMessage(error),
-          });
-        }
-
-        const workspaceName = coerceNonEmptyString(task.name);
-        if (!workspaceName) {
-          await this.markTaskLaunchFailed(taskId, "Queued task missing workspace name");
-          continue;
-        }
-
-        const canonicalModel =
-          coerceNonEmptyString(task.aiSettings?.model) ??
-          // Gateway-preserving (see resolveTaskAISettings): this lands in the
-          // relaunched task's persisted aiSettings.
-          normalizeSelectedModel(task.taskModelString ?? defaultModel);
-        const createdAt = task.createdAt ?? getIsoNow();
-        const reservation = await this.leaseQueuedTaskLaunch(
-          {
-            taskId,
-            task,
-            start,
-            parentWorkspaceId,
-            parentMeta,
-            agentId,
-            workspaceName,
-            createdAt,
-            taskRuntimeConfig,
-            parentRuntimeConfig,
-            configProjectPath: normalizedTaskProjectPath,
-            canonicalModel,
-            skipInitHook,
-          },
-          plans
-        );
+        const reservation = await this.reserveQueuedTaskSlot(task, drain, plans);
         if (reservation === "shutdown") break;
         if (reservation === "reserved") reservedSlots += 1;
       }
     }
 
     await this.launchReservedPlans(plans);
+  }
+
+  /**
+   * One queued task of a drain, in queue order: the workflow-owner and stop checks, a task that
+   * is already streaming and the launch refusals, then its launch from the parent metadata read.
+   */
+  private async reserveQueuedTaskSlot(
+    task: AgentTaskWorkspaceEntry,
+    drain: QueuedDrainSnapshot,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const taskId = task.id;
+    assert(taskId != null && taskId.length > 0, "queued task id is required");
+    if (
+      await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        taskId,
+        drain.config,
+        "queued-launch",
+        drain.taskIndex,
+        { scheduleQueueDrain: false }
+      )
+    ) {
+      return "skipped";
+    }
+
+    // Stop-cascade barrier (see startReservedAgentTask): a task whose own or parent's stop
+    // latch is held is not even reserved; the latch release rechecks the queue.
+    if (
+      this.taskStopLatch.deferLaunchWhileStopInProgress(
+        taskId,
+        coerceNonEmptyString(task.parentWorkspaceId)
+      )
+    ) {
+      return "skipped";
+    }
+
+    if (this.aiService.isStreaming(taskId)) {
+      await this.setTaskStatus(taskId, "running");
+      return "reserved";
+    }
+
+    const start = queuedTaskLaunchStart(taskId, task);
+    const parent = resolveQueuedTaskParent(task, drain.config);
+    if (parent.kind === "refused") {
+      await this.markTaskLaunchFailed(taskId, parent.reason);
+      return "skipped";
+    }
+
+    const configProjectPath = stripTrailingSlashes(task.projectPath);
+    const trustRefusal = queuedTaskTrustRefusal(task, configProjectPath, drain.config);
+    if (trustRefusal != null) {
+      await this.markTaskLaunchFailed(taskId, trustRefusal);
+      return "skipped";
+    }
+    return await this.readQueuedTaskParentMeta(
+      { ...parent.parent, taskId, task, start, config: drain.config, configProjectPath },
+      plans
+    );
+  }
+
+  /** Reads the parent's metadata; a failed read falls back to metadata from its config row. */
+  private async readQueuedTaskParentMeta(
+    candidate: QueuedTaskCandidate,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const { parentWorkspaceId, parentEntry, parentWorkspaceName } = candidate;
+    const parentRuntimeProjectPath =
+      parentEntry.workspace.kind === "scratch"
+        ? parentEntry.workspace.path
+        : parentEntry.projectPath;
+    const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    const parentMeta = parentMetaResult.success
+      ? parentMetaResult.data
+      : ({
+          id: parentWorkspaceId,
+          name: parentWorkspaceName,
+          kind: parentEntry.workspace.kind,
+          projectPath: parentRuntimeProjectPath,
+          projectName:
+            parentEntry.workspace.kind === "scratch"
+              ? SCRATCH_PROJECT_NAME
+              : (parentEntry.workspace.projects?.find(
+                  (project) =>
+                    stripTrailingSlashes(project.projectPath) ===
+                    stripTrailingSlashes(parentEntry.projectPath)
+                )?.projectName ??
+                parentEntry.projectPath.split("/").filter(Boolean).at(-1) ??
+                parentEntry.projectPath),
+          runtimeConfig: candidate.parentRuntimeConfig,
+          projects: parentEntry.workspace.projects,
+        } satisfies WorkspaceMetadata);
+    return await this.resolveQueuedTaskSkipInitHook(
+      { ...candidate, parentRuntimeProjectPath, parentMeta },
+      plans
+    );
+  }
+
+  /**
+   * Reads the agent's skip_init_hook from the parent's checkout. A read that fails is logged and
+   * leaves the init hook on.
+   */
+  private async resolveQueuedTaskSkipInitHook(
+    context: QueuedTaskParentRead,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const { taskId, task, parentEntry, parentWorkspaceName, parentRuntimeProjectPath } = context;
+    const agentId = resolveTaskAgentIdForResume(task);
+    assert(agentId.length > 0, "queued task agentId is required");
+    let skipInitHook = false;
+    try {
+      const parentRuntime = createRuntimeForWorkspace({
+        runtimeConfig: context.parentRuntimeConfig,
+        projectPath: parentRuntimeProjectPath,
+        name: parentWorkspaceName,
+      });
+      const parentWorkspacePath =
+        coerceNonEmptyString(parentEntry.workspace.path) ??
+        parentRuntime.getWorkspacePath(parentRuntimeProjectPath, parentWorkspaceName);
+      const frontmatter = await resolveAgentFrontmatter(
+        parentRuntime,
+        parentWorkspacePath,
+        agentId,
+        {
+          projectPluginsTrusted: isWorkspaceProjectTrustedIn(context.config.projects, {
+            kind: parentEntry.workspace.kind,
+            projectPath: parentEntry.projectPath,
+          }),
+          runtimeFactory: nodeRuntimeFactory,
+        }
+      );
+      skipInitHook = frontmatter.subagent?.skip_init_hook === true;
+    } catch (error: unknown) {
+      log.debug("Queued task: failed to resolve skip_init_hook during reservation", {
+        taskId,
+        agentId,
+        error: getErrorMessage(error),
+      });
+    }
+    return await this.requestQueuedTaskLaunch(context, agentId, skipInitHook, plans);
+  }
+
+  /** Checks the queued task's own workspace name, then requests its launch with its model. */
+  private async requestQueuedTaskLaunch(
+    context: QueuedTaskParentRead,
+    agentId: string,
+    skipInitHook: boolean,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const { taskId, task } = context;
+    const workspaceName = coerceNonEmptyString(task.name);
+    if (!workspaceName) {
+      await this.markTaskLaunchFailed(taskId, "Queued task missing workspace name");
+      return "skipped";
+    }
+
+    const canonicalModel =
+      coerceNonEmptyString(task.aiSettings?.model) ??
+      // Gateway-preserving (see resolveTaskAISettings): this lands in the
+      // relaunched task's persisted aiSettings.
+      normalizeSelectedModel(task.taskModelString ?? defaultModel);
+    const createdAt = task.createdAt ?? getIsoNow();
+    return await this.leaseQueuedTaskLaunch(
+      {
+        taskId,
+        task,
+        start: context.start,
+        parentWorkspaceId: context.parentWorkspaceId,
+        parentMeta: context.parentMeta,
+        agentId,
+        workspaceName,
+        createdAt,
+        taskRuntimeConfig: context.taskRuntimeConfig,
+        parentRuntimeConfig: context.parentRuntimeConfig,
+        configProjectPath: context.configProjectPath,
+        canonicalModel,
+        skipInitHook,
+      },
+      plans
+    );
   }
 
   /** Holds a queued task's launch lease, then claims its launch under it. */
