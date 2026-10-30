@@ -255,7 +255,7 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
         await settle();
       },
       /** The lease wrapper on a plan without an attempt id, as for a pre-identity row. */
-      launchPreIdentity: async () => {
+      launchPreIdentity: async (abortSignal?: AbortSignal) => {
         const parentMeta = (await config.getAllWorkspaceMetadata()).find(
           (metadata) => metadata.id === PARENT_ID
         );
@@ -276,6 +276,7 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
           taskModelString: "openai:gpt-5.2",
           canonicalModel: "openai:gpt-5.2",
           skipInitHook: true,
+          ...(abortSignal != null ? { abortSignal } : {}),
         });
         directLaunches.push(launched);
         await launched;
@@ -530,6 +531,24 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
       expect(s.registeredInits()).toBe(0);
       expect(s.sends()).toBe(0);
       expect(s.markedFailed()).toEqual([]);
+    });
+
+    test("keeps that checkout when the launch is cancelled after the materialize step", async () => {
+      // createMany never shares a checkout on a local parent, so the lease wrapper launches the
+      // shared row directly with a signal that aborts once the checkout is materialized.
+      const s = await setup([child({ taskStatus: "starting", taskIsolation: "none" })]);
+      const cancel = new AbortController();
+      s.hooks.materialized = (launch) => {
+        cancel.abort();
+        return Promise.resolve(launch);
+      };
+
+      await s.launchPreIdentity(cancel.signal);
+
+      expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: true }]]);
+      expect(await pathExists(projectPath)).toBe(true);
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
     });
   });
 

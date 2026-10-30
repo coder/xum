@@ -7353,27 +7353,7 @@ export class TaskService implements AgentTaskIntegration {
     // rechecks the queue. Only a still-reserved record is reverted — a status written meanwhile
     // (an explicit Stop's "interrupted") stays as is and is never relaunched.
     if (this.taskStopLatch.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
-      log.debug("startReservedAgentTask deferred: a stop is in progress", { taskId: plan.taskId });
-      try {
-        await this.editActiveWorkspaceEntry(
-          plan.taskId,
-          (workspace) => {
-            if (workspace.taskStatus !== "starting") return;
-            if (rowSupersedes(workspace, plan.attemptId)) return;
-            workspace.taskStatus = "queued";
-          },
-          { allowMissing: true }
-        );
-      } catch (error) {
-        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
-        return;
-      }
-      await this.emitWorkspaceMetadata(plan.taskId);
-      // The release-time drain may have seen "starting" while this rollback was awaiting disk.
-      // Complete the handoff after publishing "queued", or leave the next release owning it.
-      if (!this.taskStopLatch.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
-        this.scheduleMaybeStartQueuedTasks();
-      }
+      await this.deferLaunchForStopLatch(plan);
       return;
     }
 
@@ -7390,6 +7370,43 @@ export class TaskService implements AgentTaskIntegration {
       });
       return;
     }
+    await this.stampLaunchAttempt(plan, entryAtStart);
+  }
+
+  /**
+   * Defers a launch while a stop latch is held (the barrier in startReservedAgentTaskLeased): a
+   * still-reserved row goes back to `queued`, and the drain runs here if the latch was released
+   * during that write.
+   */
+  private async deferLaunchForStopLatch(plan: TaskLaunchPlan): Promise<void> {
+    log.debug("startReservedAgentTask deferred: a stop is in progress", { taskId: plan.taskId });
+    try {
+      await this.editActiveWorkspaceEntry(
+        plan.taskId,
+        (workspace) => {
+          if (workspace.taskStatus !== "starting") return;
+          if (rowSupersedes(workspace, plan.attemptId)) return;
+          workspace.taskStatus = "queued";
+        },
+        { allowMissing: true }
+      );
+    } catch (error) {
+      await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
+      return;
+    }
+    await this.emitWorkspaceMetadata(plan.taskId);
+    // The release-time drain may have seen "starting" while this rollback was awaiting disk.
+    // Complete the handoff after publishing "queued", or leave the next release owning it.
+    if (!this.taskStopLatch.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
+      this.scheduleMaybeStartQueuedTasks();
+    }
+  }
+
+  /** Gives the launch its attempt id (stamped on a row without one), then adopts it. */
+  private async stampLaunchAttempt(
+    plan: TaskLaunchPlan,
+    entryAtStart: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): Promise<void> {
     // An owned reservation (or the queue drain's launch CAS) keeps its identity through the
     // launch. A `starting` record nobody in this process owns under its current id (pre-identity
     // entry reached without the drain CAS) becomes owned here; without an id it is stamped
@@ -7417,6 +7434,16 @@ export class TaskService implements AgentTaskIntegration {
           .taskAttemptId ?? stamped;
       this.attemptLedger.publishAttemptRotation(plan.taskId, launchAttemptId);
     }
+    this.adoptLaunchAttempt(plan, launchAttemptId, launchReceiptEligible);
+    await this.admitLaunchDesktopRecovery(plan, entryAtStart);
+  }
+
+  /** Binds the plan to the launch's attempt and owns that attempt in this process. */
+  private adoptLaunchAttempt(
+    plan: TaskLaunchPlan,
+    launchAttemptId: string,
+    launchReceiptEligible: boolean
+  ): void {
     plan.attemptId = launchAttemptId;
     if (this.attemptLedger.ownedAttempt(plan.taskId)?.attemptId !== launchAttemptId) {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
@@ -7424,6 +7451,13 @@ export class TaskService implements AgentTaskIntegration {
         receiptEligible: launchReceiptEligible,
       });
     }
+  }
+
+  /** The desktop recovery admission between two cancel checks, then the materialize step. */
+  private async admitLaunchDesktopRecovery(
+    plan: TaskLaunchPlan,
+    entryAtStart: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): Promise<void> {
     if (plan.abortSignal?.aborted) {
       await this.cancelReservedLaunch(plan);
       return;
