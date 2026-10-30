@@ -350,6 +350,12 @@ describe("TaskService.acknowledgeAgentReports", () => {
       rows: [reportRow(4), answer({ requestHistorySequence: 4 }, [childReceipt])],
       consumed: true,
     },
+    // Every receipt of the child counts, not only the newest: a later continuation's receipt must
+    // not hide the initial receipt that an earlier answer holds.
+    "an initial receipt before a later continuation receipt": {
+      rows: [answer({}, [initialReceipt]), answer({}, [childReceipt])],
+      consumed: true,
+    },
   });
 
   // A wake with a generation is a continuation: the receipt must match the turn record that the
