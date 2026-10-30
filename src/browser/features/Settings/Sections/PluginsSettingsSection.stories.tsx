@@ -72,12 +72,16 @@ const MANAGED_ITEM: AgentPluginListItem = {
   mcpServerCount: 1,
 };
 
+const PINNED_DESCRIPTION =
+  "Deploy helpers for the infra team: rollout skills for staging and production, a release-notes drafter, and MCP servers that read cluster health and page the on-call engineer when a canary regresses.";
+
 const PINNED_ITEM: AgentPluginListItem = {
   name: "deploy-tools",
   managed: true,
   present: true,
   location: "~/.mux/plugins/deploy-tools",
   version: "2.0.0",
+  description: PINNED_DESCRIPTION,
   source: {
     type: "git",
     url: "git@git.corp:infra/deploy-tools.git",
@@ -205,6 +209,12 @@ async function openHooksReview(canvasElement: HTMLElement) {
   return canvas;
 }
 
+function pluginCardOf(element: HTMLElement): HTMLElement {
+  const card = element.closest<HTMLElement>("div[class*='rounded-md']");
+  if (card === null) throw new Error("Plugin card not found");
+  return card;
+}
+
 const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: ReactNode }> = (
   props
 ) => {
@@ -277,6 +287,12 @@ export const InstalledWithUpdateStates: Story = {
     await expectInterfaceAsText(canvasElement);
     // Update action appears only for rows whose tracking ref moved.
     await canvas.findAllByRole("button", { name: /Update/ });
+    // A long description must not push the actions off the name row.
+    const uninstall = await canvas.findByRole("button", { name: "Uninstall deploy-tools" });
+    const description = within(pluginCardOf(uninstall)).getByText(PINNED_DESCRIPTION);
+    if (uninstall.getBoundingClientRect().bottom > description.getBoundingClientRect().top) {
+      throw new Error("Plugin actions dropped below the description");
+    }
   },
 };
 
@@ -337,6 +353,12 @@ export const InstalledPhoneViewport: Story = {
       capability.getBoundingClientRect().right > capabilityCard.getBoundingClientRect().right + 1
     ) {
       throw new Error("Max-length capability badge overflows its card at phone width");
+    }
+    // Wrapped actions start flush with the card text, not at the right edge.
+    const manage = await canvas.findByRole("button", { name: "Manage components for grill" });
+    const name = within(pluginCardOf(manage)).getByText("grill");
+    if (Math.abs(manage.getBoundingClientRect().left - name.getBoundingClientRect().left) > 1) {
+      throw new Error("Wrapped plugin actions are not flush with the card text");
     }
   },
 };

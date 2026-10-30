@@ -3,10 +3,7 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import type {
-  AgentPluginInstallPreview,
-  AgentPluginListItem,
-} from "@/common/orpc/schemas/agentPlugins";
+import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 
 export default { ...appMeta, title: "App/PluginImports" };
@@ -127,112 +124,6 @@ function setupPluginSettings(installed = false, conflict = false) {
     entry = { ...entry, importedComponents: input.importedComponents };
     return Promise.resolve({ success: true, data: entry });
   };
-  return client;
-}
-
-// The mix of description lengths, interface details and update states that made card actions
-// jump between the header and a row under long descriptions.
-const installedList: AgentPluginListItem[] = [
-  {
-    name: "review-tools",
-    managed: true,
-    present: true,
-    location: "~/.xum/plugins/review-tools",
-    version: "1.0.0",
-    description: "Review and research tools",
-    source: preview.source,
-    lockedSha: "a".repeat(40),
-    skillCount: 2,
-    mcpServerCount: 1,
-    importedSkillCount: 2,
-    importedMcpServerCount: 1,
-  },
-  {
-    name: "release-notes",
-    managed: true,
-    present: true,
-    location: "~/.xum/plugins/release-notes",
-    version: "2.3.1",
-    description:
-      "Drafts release notes from merged pull requests, groups them by area and audience, links each entry to its PR and flags breaking changes, migrations and deprecations that need a callout before you publish",
-    source: {
-      type: "git",
-      url: "https://github.com/example/release-notes.git",
-      ref: "v2.3.1",
-      refType: "tag",
-    },
-    lockedSha: "b".repeat(40),
-    skillCount: 4,
-    mcpServerCount: 0,
-    importedSkillCount: 3,
-    importedMcpServerCount: 0,
-  },
-  {
-    name: "linear-sync",
-    managed: true,
-    present: true,
-    location: "~/.xum/plugins/linear-sync",
-    version: "0.9.0",
-    description: "Keep Linear issues in sync with workspace progress",
-    interface: {
-      displayName: "Linear Sync",
-      developerName: "Example Labs",
-      shortDescription: "Two-way sync between agent todos and Linear issues",
-      capabilities: ["Read issues", "Write comments", "Update status"],
-      websiteURL: "https://example.com/linear-sync",
-      privacyPolicyURL: "https://example.com/privacy",
-      supportURL: "https://example.com/support",
-    },
-    source: {
-      type: "git",
-      url: "https://github.com/example/linear-sync.git",
-      ref: "main",
-      refType: "branch",
-    },
-    lockedSha: "c".repeat(40),
-    skillCount: 1,
-    mcpServerCount: 1,
-    importedSkillCount: 1,
-    importedMcpServerCount: 1,
-  },
-  {
-    name: "pstack",
-    managed: true,
-    present: true,
-    location: "~/.xum/plugins/pstack",
-    version: "4.2.0",
-    description: "Skills, playbooks and principles for careful agent work",
-    source: {
-      type: "git",
-      url: "https://github.com/example/pstack.git",
-      ref: "main",
-      refType: "branch",
-    },
-    lockedSha: "d".repeat(40),
-    skillCount: 38,
-    mcpServerCount: 0,
-    importedSkillCount: 38,
-    importedMcpServerCount: 0,
-  },
-  {
-    name: "local-snippets",
-    managed: false,
-    present: true,
-    location: "~/.agents/plugins/local-snippets",
-    description: "Hand-written snippets found in the shared agents folder",
-    skillCount: 3,
-    mcpServerCount: 0,
-  },
-];
-
-function setupInstalledPluginList() {
-  const client = setupPluginSettings();
-  client.agentPlugins.list = () => Promise.resolve({ success: true, data: installedList });
-  client.agentPlugins.checkUpdates = () =>
-    Promise.resolve({
-      success: true,
-      data: [{ name: "pstack", status: "update-available", remoteSha: "e".repeat(40) }],
-    });
   return client;
 }
 
@@ -364,25 +255,4 @@ export const SelectionConflict: AppStory = {
     await expect(canvas.queryByRole("alert")).not.toBeInTheDocument();
     await checkPhoneBounds();
   },
-};
-
-export const InstalledListDesktop: AppStory = {
-  ...PreviewDesktop,
-  render: () => <AppWithMocks setup={setupInstalledPluginList} />,
-  play: async ({ canvasElement }) => {
-    const canvas = await openPlugins(canvasElement);
-    // The Update button needs both the list and the update check to have rendered.
-    await canvas.findByRole("button", { name: "Update" });
-    await checkPhoneBounds();
-  },
-};
-
-export const InstalledListPhone: AppStory = {
-  ...InstalledListDesktop,
-  play: async (context) => {
-    await expect(context.parameters.pixel.matrix.viewports).toContain("phone");
-    await InstalledListDesktop.play?.(context);
-  },
-  globals: { viewport: { value: "mobile1", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
 };
