@@ -2802,6 +2802,196 @@ function reportArtifactBelongsToUnreportedRow(
   return artifact.taskAttemptId == null && row.taskStatus === "interrupted";
 }
 
+/** What a parent's one pending best-of `task` call asks for, read from the parent's partial. */
+interface PendingBestOfRequest {
+  readonly total: number;
+  readonly agentId: string | undefined;
+  readonly title: string | undefined;
+  readonly partialStartedAt: number | undefined;
+  readonly legacyVariants: boolean;
+}
+
+/** A child group that can answer the pending request, with the start times of its rows. */
+interface BestOfGroupCandidate {
+  groupId: string;
+  total: number;
+  createdAtMs: number[];
+}
+
+type LegacyBestOfRow = ReturnType<Config["listLegacyTaskVariantWorkspaces"]>[number];
+
+function findSinglePendingTaskToolPart(parts: MuxMessage["parts"]) {
+  const pendingParts = parts.filter(
+    (part): part is DynamicToolPart & { toolName: "task"; state: "input-available" } =>
+      isDynamicToolPart(part) && part.toolName === "task" && part.state === "input-available"
+  );
+  return pendingParts.length === 1 ? pendingParts[0] : undefined;
+}
+
+/** The request of the partial's one pending `task` call, or null unless it asks for a group. */
+function readPendingBestOfRequest(partial: MuxMessage): PendingBestOfRequest | null {
+  const pendingPart = findSinglePendingTaskToolPart(partial.parts);
+  if (!pendingPart) {
+    return null;
+  }
+
+  const parsedInput = parseTaskToolInputForRecovery(pendingPart.input);
+  if (!parsedInput) {
+    return null;
+  }
+
+  const requestedTotal = parsedInput.groupCount;
+  if (requestedTotal <= 1) {
+    return null;
+  }
+
+  return {
+    total: requestedTotal,
+    agentId: coerceNonEmptyString(
+      parsedInput.data.agentId ?? parsedInput.data.subagent_type
+    )?.toLowerCase(),
+    title: coerceNonEmptyString(parsedInput.data.title),
+    partialStartedAt:
+      typeof partial.metadata?.timestamp === "number" ? partial.metadata.timestamp : undefined,
+    legacyVariants: parsedInput.legacyVariants,
+  };
+}
+
+/** A row conflicts only when both the request and the row set the value (truthy) and they differ. */
+function conflictsWithRequested(
+  requested: string | undefined,
+  actual: string | undefined
+): boolean {
+  return Boolean(requested && actual && actual !== requested);
+}
+
+function matchConfigBestOfRow(
+  workspace: WorkspaceConfigEntry,
+  parentWorkspaceId: string,
+  request: PendingBestOfRequest
+): { groupId: string; total: number } | undefined {
+  if (workspace.parentWorkspaceId !== parentWorkspaceId) {
+    return undefined;
+  }
+
+  const groupId = coerceNonEmptyString(workspace.bestOf?.groupId);
+  const total = workspace.bestOf?.total;
+  if (!groupId || total !== request.total) {
+    return undefined;
+  }
+
+  const workspaceAgentId = resolvePersistedAgentId(workspace, "");
+  if (conflictsWithRequested(request.agentId, workspaceAgentId)) {
+    return undefined;
+  }
+
+  const workspaceTitle = coerceNonEmptyString(workspace.title);
+  if (conflictsWithRequested(request.title, workspaceTitle)) {
+    return undefined;
+  }
+
+  return { groupId, total };
+}
+
+function collectConfigBestOfGroups(
+  cfg: ProjectsConfig,
+  parentWorkspaceId: string,
+  request: PendingBestOfRequest
+): Map<string, BestOfGroupCandidate> {
+  const groups = new Map<string, BestOfGroupCandidate>();
+  for (const project of cfg.projects.values()) {
+    for (const workspace of project.workspaces) {
+      const match = matchConfigBestOfRow(workspace, parentWorkspaceId, request);
+      if (!match) {
+        continue;
+      }
+
+      const entry = groups.get(match.groupId) ?? { ...match, createdAtMs: [] };
+      const createdAtMs =
+        typeof workspace.createdAt === "string" ? Date.parse(workspace.createdAt) : Number.NaN;
+      if (Number.isFinite(createdAtMs)) {
+        entry.createdAtMs.push(createdAtMs);
+      }
+      groups.set(match.groupId, entry);
+    }
+  }
+  return groups;
+}
+
+function matchLegacyBestOfRow(
+  workspace: LegacyBestOfRow,
+  request: PendingBestOfRequest
+): { groupId: string; total: number } | undefined {
+  const { groupId, total } = workspace.bestOf;
+  if (total !== request.total) {
+    return undefined;
+  }
+
+  const workspaceAgentId = normalizeAgentId(workspace.agentId ?? workspace.agentType, "");
+  if (conflictsWithRequested(request.agentId, workspaceAgentId)) {
+    return undefined;
+  }
+  // Inline, not conflictsWithRequested: the row title is read only when a title was requested.
+  if (request.title && workspace.title && workspace.title !== request.title) {
+    return undefined;
+  }
+
+  return { groupId, total };
+}
+
+function collectLegacyBestOfGroups(
+  workspaces: LegacyBestOfRow[],
+  request: PendingBestOfRequest,
+  groups: Map<string, BestOfGroupCandidate>
+): void {
+  for (const workspace of workspaces) {
+    const match = matchLegacyBestOfRow(workspace, request);
+    if (!match) {
+      continue;
+    }
+
+    const entry = groups.get(match.groupId) ?? { ...match, createdAtMs: [] };
+    const createdAtMs = workspace.createdAt ? Date.parse(workspace.createdAt) : Number.NaN;
+    if (Number.isFinite(createdAtMs)) {
+      entry.createdAtMs.push(createdAtMs);
+    }
+    groups.set(match.groupId, entry);
+  }
+}
+
+/**
+ * The group the pending call waits on, or null when none or several qualify. Without a partial
+ * start time only a lone group qualifies.
+ */
+function selectPendingBestOfGroup(
+  groups: Map<string, BestOfGroupCandidate>,
+  partialStartedAt: number | undefined
+): BestOfGroupCandidate | null {
+  const matchingGroups = Array.from(groups.values());
+  const startedAfterPartial = (group: { createdAtMs: number[] }): boolean => {
+    if (partialStartedAt == null) {
+      return true;
+    }
+
+    return (
+      group.createdAtMs.length > 0 &&
+      group.createdAtMs.every((createdAtMs) => createdAtMs >= partialStartedAt)
+    );
+  };
+  if (matchingGroups.length === 0) {
+    return null;
+  }
+  if (matchingGroups.length === 1) {
+    return startedAfterPartial(matchingGroups[0]) ? matchingGroups[0] : null;
+  }
+  if (partialStartedAt == null) {
+    return null;
+  }
+
+  const recentMatchingGroups = matchingGroups.filter((group) => startedAfterPartial(group));
+  return recentMatchingGroups.length === 1 ? recentMatchingGroups[0] : null;
+}
+
 export class TaskService implements AgentTaskIntegration {
   // Serialize stream-end processing per workspace to avoid races when
   // finalizing reported tasks and cleanup state transitions. Lock order: acquired BEFORE the
@@ -20810,112 +21000,26 @@ export class TaskService implements AgentTaskIntegration {
       return null;
     }
 
-    const pendingParts = partial.parts.filter(
-      (part): part is DynamicToolPart & { toolName: "task"; state: "input-available" } =>
-        isDynamicToolPart(part) && part.toolName === "task" && part.state === "input-available"
+    // Every step below is sync, so the config and legacy reads run in the tick of the partial read.
+    const request = readPendingBestOfRequest(partial);
+    if (!request) {
+      return null;
+    }
+
+    const groups = collectConfigBestOfGroups(
+      this.config.loadConfigOrDefault(),
+      parentWorkspaceId,
+      request
     );
-    if (pendingParts.length !== 1) {
-      return null;
-    }
-
-    const parsedInput = parseTaskToolInputForRecovery(pendingParts[0].input);
-    if (!parsedInput) {
-      return null;
-    }
-
-    const requestedTotal = parsedInput.groupCount;
-    if (requestedTotal <= 1) {
-      return null;
-    }
-
-    const requestedAgentId = coerceNonEmptyString(
-      parsedInput.data.agentId ?? parsedInput.data.subagent_type
-    )?.toLowerCase();
-    const requestedTitle = coerceNonEmptyString(parsedInput.data.title);
-    const partialStartedAt =
-      typeof partial.metadata?.timestamp === "number" ? partial.metadata.timestamp : undefined;
-
-    const cfg = this.config.loadConfigOrDefault();
-    const groups = new Map<string, { groupId: string; total: number; createdAtMs: number[] }>();
-    for (const project of cfg.projects.values()) {
-      for (const workspace of project.workspaces) {
-        if (workspace.parentWorkspaceId !== parentWorkspaceId) {
-          continue;
-        }
-
-        const groupId = coerceNonEmptyString(workspace.bestOf?.groupId);
-        const total = workspace.bestOf?.total;
-        if (!groupId || total !== requestedTotal) {
-          continue;
-        }
-
-        const workspaceAgentId = resolvePersistedAgentId(workspace, "");
-        if (requestedAgentId && workspaceAgentId && workspaceAgentId !== requestedAgentId) {
-          continue;
-        }
-
-        const workspaceTitle = coerceNonEmptyString(workspace.title);
-        if (requestedTitle && workspaceTitle && workspaceTitle !== requestedTitle) {
-          continue;
-        }
-
-        const entry = groups.get(groupId) ?? { groupId, total, createdAtMs: [] };
-        const createdAtMs =
-          typeof workspace.createdAt === "string" ? Date.parse(workspace.createdAt) : Number.NaN;
-        if (Number.isFinite(createdAtMs)) {
-          entry.createdAtMs.push(createdAtMs);
-        }
-        groups.set(groupId, entry);
-      }
-    }
-
-    if (parsedInput.legacyVariants) {
-      for (const workspace of this.config.listLegacyTaskVariantWorkspaces(parentWorkspaceId)) {
-        const { groupId, total } = workspace.bestOf;
-        if (total !== requestedTotal) {
-          continue;
-        }
-
-        const workspaceAgentId = normalizeAgentId(workspace.agentId ?? workspace.agentType, "");
-        if (requestedAgentId && workspaceAgentId && workspaceAgentId !== requestedAgentId) {
-          continue;
-        }
-        if (requestedTitle && workspace.title && workspace.title !== requestedTitle) {
-          continue;
-        }
-
-        const entry = groups.get(groupId) ?? { groupId, total, createdAtMs: [] };
-        const createdAtMs = workspace.createdAt ? Date.parse(workspace.createdAt) : Number.NaN;
-        if (Number.isFinite(createdAtMs)) {
-          entry.createdAtMs.push(createdAtMs);
-        }
-        groups.set(groupId, entry);
-      }
-    }
-
-    const matchingGroups = Array.from(groups.values());
-    const startedAfterPartial = (group: { createdAtMs: number[] }): boolean => {
-      if (partialStartedAt == null) {
-        return true;
-      }
-
-      return (
-        group.createdAtMs.length > 0 &&
-        group.createdAtMs.every((createdAtMs) => createdAtMs >= partialStartedAt)
+    if (request.legacyVariants) {
+      collectLegacyBestOfGroups(
+        this.config.listLegacyTaskVariantWorkspaces(parentWorkspaceId),
+        request,
+        groups
       );
-    };
-    if (matchingGroups.length === 0) {
-      return null;
-    }
-    if (matchingGroups.length === 1) {
-      return startedAfterPartial(matchingGroups[0]) ? matchingGroups[0] : null;
-    }
-    if (partialStartedAt == null) {
-      return null;
     }
 
-    const recentMatchingGroups = matchingGroups.filter((group) => startedAfterPartial(group));
-    return recentMatchingGroups.length === 1 ? recentMatchingGroups[0] : null;
+    return selectPendingBestOfGroup(groups, request.partialStartedAt);
   }
 
   private async deliverDeferredBestOfSiblingReports(params: {
