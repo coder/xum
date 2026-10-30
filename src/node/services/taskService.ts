@@ -1859,6 +1859,89 @@ export interface InstanceWorkspacesResult {
   callerPeerMessagingRestricted?: true;
 }
 
+/** The paging and query options of one listInstanceWorkspaces call, after defaults. */
+interface InstanceDiscoveryPage {
+  readonly limit: number;
+  readonly offset: number;
+  readonly query: string;
+}
+
+interface InstanceDiscoveryCaller {
+  readonly workspaceId: string;
+  readonly root: string;
+}
+
+interface InstanceDiscoveryCandidate {
+  row: Omit<InstanceWorkspacesResult["rows"][number], "busy">;
+  createdAtMs: number;
+}
+
+/** Applies the paging defaults and asserts their ranges; normalizes the query. */
+function readInstanceDiscoveryPage(options: {
+  query?: string | null;
+  limit?: number | null;
+  offset?: number | null;
+}): InstanceDiscoveryPage {
+  const limit = options.limit ?? INSTANCE_DISCOVERY_DEFAULT_LIMIT;
+  const offset = options.offset ?? 0;
+  assert(
+    Number.isInteger(limit) && limit >= 1 && limit <= INSTANCE_DISCOVERY_MAX_LIMIT,
+    "listInstanceWorkspaces: limit out of range"
+  );
+  assert(
+    Number.isSafeInteger(offset) && offset >= 0,
+    "listInstanceWorkspaces: offset must be a nonnegative integer"
+  );
+  return { limit, offset, query: options.query?.trim().toLowerCase() ?? "" };
+}
+
+/** Match config metadata attribution: synthetic buckets are not searchable project paths. */
+function instanceRowProjectPath(
+  workspace: WorkspaceConfigEntry,
+  projectConfigPath: string
+): string {
+  return workspace.kind === "scratch"
+    ? workspace.path
+    : (workspace.projects?.[0]?.projectPath ?? projectConfigPath);
+}
+
+/** An empty query matches every row; the haystack is built only for a set query. */
+function instanceRowMatchesQuery(
+  query: string,
+  id: string,
+  workspace: WorkspaceConfigEntry,
+  projectPath: string
+): boolean {
+  return (
+    !query ||
+    [id, workspace.title, workspace.name, projectPath].some((value) =>
+      value?.toLowerCase().includes(query)
+    )
+  );
+}
+
+function toInstanceDiscoveryCandidate(
+  id: string,
+  workspace: WorkspaceConfigEntry,
+  projectPath: string,
+  caller: InstanceDiscoveryCaller
+): InstanceDiscoveryCandidate {
+  assert(!workspace.parentWorkspaceId, "Instance discovery must only expose roots");
+  const createdAtMs = Date.parse(workspace.createdAt ?? "");
+  return {
+    row: {
+      workspaceId: id,
+      title: workspace.title,
+      name: workspace.name,
+      projectPath,
+      createdAt: workspace.createdAt,
+      relationship:
+        id === caller.workspaceId ? "self" : id === caller.root ? "ancestor" : "unrelated",
+    },
+    createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : -Infinity,
+  };
+}
+
 export interface TerminateAgentTaskResult {
   /** Task IDs terminated (includes descendants). */
   terminatedTaskIds: string[];
@@ -16225,17 +16308,8 @@ export class TaskService implements AgentTaskIntegration {
     options: { query?: string | null; limit?: number | null; offset?: number | null }
   ): InstanceWorkspacesResult {
     assert(callerWorkspaceId.length > 0, "listInstanceWorkspaces: callerWorkspaceId required");
-    const limit = options.limit ?? INSTANCE_DISCOVERY_DEFAULT_LIMIT;
-    const offset = options.offset ?? 0;
-    assert(
-      Number.isInteger(limit) && limit >= 1 && limit <= INSTANCE_DISCOVERY_MAX_LIMIT,
-      "listInstanceWorkspaces: limit out of range"
-    );
-    assert(
-      Number.isSafeInteger(offset) && offset >= 0,
-      "listInstanceWorkspaces: offset must be a nonnegative integer"
-    );
-    const query = options.query?.trim().toLowerCase() ?? "";
+    // Invalid paging throws here, before the config read.
+    const page = readInstanceDiscoveryPage(options);
     const cfg = this.config.loadConfigOrDefault();
     const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
     // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
@@ -16253,59 +16327,80 @@ export class TaskService implements AgentTaskIntegration {
       index.parentById,
       callerWorkspaceId
     );
-    const candidates: Array<{
-      row: Omit<InstanceWorkspacesResult["rows"][number], "busy">;
-      createdAtMs: number;
-    }> = [];
+    const candidates = this.collectInstanceDiscoveryCandidates(cfg, index, page.query, {
+      workspaceId: callerWorkspaceId,
+      root: callerRoot,
+    });
+    return this.pageInstanceDiscoveryCandidates(candidates, page);
+  }
+
+  /**
+   * The id of a root that instance discovery can list, or undefined for a hidden row. These are
+   * the first six visibility terms; isInstanceRootBusyOrRestricted holds the other five.
+   */
+  private discoverableInstanceRootId(
+    workspace: WorkspaceConfigEntry,
+    callerRoot: string
+  ): string | undefined {
+    const id = workspace.id;
+    if (
+      id == null ||
+      id.trim().length === 0 ||
+      workspace.parentWorkspaceId ||
+      // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
+      (id !== callerRoot &&
+        getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
+      !this.isUnrelatedMessagingEndpoint(workspace) ||
+      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    ) {
+      return undefined;
+    }
+    return id;
+  }
+
+  /**
+   * The last five visibility terms, in memory only. Not isPeerMessagingRestricted: it runs the two
+   * index predicates in the reverse order, and their ancestry walks throw on a parent cycle.
+   */
+  private isInstanceRootBusyOrRestricted(index: AgentTaskIndex, id: string): boolean {
+    return (
+      this.interruptedParentWorkspaceIds.has(id) ||
+      this.isWorkspaceStopInProgress(id) ||
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
+      // Match peer-path predicates, not a new raw-tag rule. The current index contains
+      // only task children, so ordinary roots cannot match these task restrictions.
+      this.isWorkflowOwnedTaskUsingIndex(index, id) ||
+      this.isBestOfChainUsingIndex(index, id)
+    );
+  }
+
+  /** Visible roots that match the query, in config order. Probes no activity. */
+  private collectInstanceDiscoveryCandidates(
+    cfg: ProjectsConfig,
+    index: AgentTaskIndex,
+    query: string,
+    caller: InstanceDiscoveryCaller
+  ): InstanceDiscoveryCandidate[] {
+    const candidates: InstanceDiscoveryCandidate[] = [];
     for (const [projectConfigPath, project] of cfg.projects) {
       for (const workspace of project.workspaces) {
-        const id = workspace.id;
-        if (
-          id == null ||
-          id.trim().length === 0 ||
-          workspace.parentWorkspaceId ||
-          // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
-          (id !== callerRoot &&
-            getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
-          !this.isUnrelatedMessagingEndpoint(workspace) ||
-          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
-          this.interruptedParentWorkspaceIds.has(id) ||
-          this.isWorkspaceStopInProgress(id) ||
-          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(id) != null ||
-          // Match peer-path predicates, not a new raw-tag rule. The current index contains
-          // only task children, so ordinary roots cannot match these task restrictions.
-          this.isWorkflowOwnedTaskUsingIndex(index, id) ||
-          this.isBestOfChainUsingIndex(index, id)
-        )
-          continue;
-        // Match config metadata attribution: synthetic buckets are not searchable project paths.
-        const projectPath =
-          workspace.kind === "scratch"
-            ? workspace.path
-            : (workspace.projects?.[0]?.projectPath ?? projectConfigPath);
-        if (
-          query &&
-          ![id, workspace.title, workspace.name, projectPath].some((value) =>
-            value?.toLowerCase().includes(query)
-          )
-        )
-          continue;
-        assert(!workspace.parentWorkspaceId, "Instance discovery must only expose roots");
-        const createdAtMs = Date.parse(workspace.createdAt ?? "");
-        candidates.push({
-          row: {
-            workspaceId: id,
-            title: workspace.title,
-            name: workspace.name,
-            projectPath,
-            createdAt: workspace.createdAt,
-            relationship:
-              id === callerWorkspaceId ? "self" : id === callerRoot ? "ancestor" : "unrelated",
-          },
-          createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : -Infinity,
-        });
+        // The 11 visibility terms run in order and stop at the first that hides the row.
+        const id = this.discoverableInstanceRootId(workspace, caller.root);
+        if (id == null || this.isInstanceRootBusyOrRestricted(index, id)) continue;
+        const projectPath = instanceRowProjectPath(workspace, projectConfigPath);
+        if (!instanceRowMatchesQuery(query, id, workspace, projectPath)) continue;
+        candidates.push(toInstanceDiscoveryCandidate(id, workspace, projectPath, caller));
       }
     }
+    return candidates;
+  }
+
+  /** Sorts the candidates in place, then probes activity for the requested page only. */
+  private pageInstanceDiscoveryCandidates(
+    candidates: InstanceDiscoveryCandidate[],
+    page: InstanceDiscoveryPage
+  ): InstanceWorkspacesResult {
+    const { limit, offset } = page;
     // Activity must not reorder pages. Missing/invalid dates sort last, including before-epoch histories.
     candidates.sort(
       (a, b) => b.createdAtMs - a.createdAtMs || a.row.workspaceId.localeCompare(b.row.workspaceId)
