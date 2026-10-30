@@ -6,13 +6,16 @@ import * as path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { WorkspaceRemoveWarning } from "@/common/types/workspace";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { HistoryService } from "@/node/services/historyService";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { upsertSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { SubagentRemovalPreview, TaskService } from "@/node/services/taskService";
 import {
   createAIServiceMocks,
+  createTaskServiceStack,
   createTestConfig,
+  createTestProject,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   initGitRepo,
@@ -25,12 +28,18 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
-import type { WorkspaceLifecycleResult } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceHost, WorkspaceLifecycleResult } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import {
+  createMockAIService,
+  createWorkspaceServiceForTest,
+} from "@/node/services/workspaceService.testHarness";
 
 // Characterization tests written before removeInactiveDescendantAgentTaskWhileTaskTreeLocked is
 // split into steps. They pin which refusal wins when several apply, the probes each exit runs,
-// that the live-writer hold spans every exit after it, and the arguments of the final removal.
-// taskService.lifecycle.test.ts covers the single refusals one at a time.
+// that the live-writer hold spans every exit after it, the arguments of the final removal, and
+// the lock nesting with a real WorkspaceService. taskService.lifecycle.test.ts covers the single
+// refusals one at a time.
 
 const ATTEMPT_ID = "att_00000000000000a1";
 const HOLD_ERROR = "held by the test";
@@ -114,6 +123,11 @@ async function dropRow(config: Config, id: string) {
     }
     return cfg;
   });
+}
+
+/** Collapses runs of one label, so a run of config edits reads as one step. */
+function collapseRuns(trace: readonly string[]): string[] {
+  return trace.filter((label, i) => label !== trace[i - 1]);
 }
 
 describe("TaskService removeInactiveDescendantAgentTask before the split", () => {
@@ -491,4 +505,97 @@ describe("TaskService removeInactiveDescendantAgentTask before the split", () =>
     f.setRemoval(() => Promise.resolve(Ok(undefined)));
     expect(await removeAsModel()).toEqual(Ok({ status: "removed", ...target }));
   });
+
+  // The structural mutation gate and the config edits run inside the real WorkspaceService removal.
+  test("with a real WorkspaceService the removal nests patch lock, hold, gate and config edits", async () => {
+    const config = await createTestConfig(rootDir);
+    configs.push(config);
+    const historyService = new HistoryService(config);
+    const projectPath = await createTestProject(rootDir, "repo");
+    const srcBaseDir = path.join(rootDir, "src");
+    const child = (id: string): WorkspaceConfigEntry => {
+      const checkout = path.join(srcBaseDir, "repo", id);
+      execFileSync("git", ["worktree", "add", "-q", "-b", id, checkout], { cwd: projectPath });
+      const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: checkout, encoding: "utf-8" });
+      return {
+        ...{ id, name: id, path: checkout, runtimeConfig: { type: "worktree", srcBaseDir } },
+        ...{
+          parentWorkspaceId: "root",
+          agentType: "exec",
+          agentId: "exec",
+          taskStatus: "reported",
+        },
+        ...{ taskBaseCommitSha: base.trim(), taskAttemptId: ATTEMPT_ID },
+      };
+    };
+    const rows = [projectWorkspace(projectPath, "root", "root"), child("gated"), child("pregated")];
+    await saveWorkspaces(config, projectPath, rows, testTaskSettings());
+    // Metadata is answered from the Config, as AIService does, so the removal deletes the checkout.
+    const getWorkspaceMetadata = mock(async (id: string) => {
+      const metadata = await config.getWorkspaceMetadataById(id);
+      return metadata ? Ok(metadata) : Err(`no metadata for ${id}`);
+    });
+    const aiService = createMockAIService({ getWorkspaceMetadata });
+    const workspaceService = createWorkspaceServiceForTest({ config, historyService, aiService });
+    const { taskService } = createTaskServiceStack(config, {
+      historyService,
+      workspaceService: workspaceService as unknown as WorkspaceHost,
+    });
+    workspaceService.setAgentTaskIntegration(
+      taskService as unknown as Parameters<WorkspaceService["setAgentTaskIntegration"]>[0]
+    );
+    const trace: string[] = [];
+    traceRemovalProbes(taskService, trace);
+    const hold = workspaceService.acquirePreInterruptionArchiveHold.bind(workspaceService);
+    spyOn(workspaceService, "acquirePreInterruptionArchiveHold").mockImplementation(
+      (id, options) => {
+        const result = hold(id, options);
+        if (!result.success) return result;
+        trace.push("hold");
+        return Ok({
+          [Symbol.dispose]: () => {
+            trace.push("release");
+            result.data[Symbol.dispose]();
+          },
+        });
+      }
+    );
+    const gates = workspaceService as unknown as {
+      acquireStructuralMutationGate(...args: unknown[]): Promise<Result<() => Promise<void>>>;
+    };
+    const gate = gates.acquireStructuralMutationGate.bind(workspaceService);
+    spyOn(gates, "acquireStructuralMutationGate").mockImplementation(async (...args) => {
+      const result = await gate(...args);
+      if (!result.success) return result;
+      trace.push("gate");
+      return Ok(() => {
+        trace.push("gate-release");
+        return result.data();
+      });
+    });
+    const edit = config.editConfig.bind(config);
+    spyOn(config, "editConfig").mockImplementation((...args) => {
+      trace.push("config-edit");
+      return edit(...args);
+    });
+    const removeAsModel = (id: string, mutationGateHeld?: true) =>
+      taskService.removeInactiveDescendantAgentTask("root", id, {
+        lossyWorkPolicy: "refuse",
+        mutationGateHeld,
+      });
+
+    const removed = (id: string): RemovalResult =>
+      Ok({ status: "removed", action: "remove", taskId: id, workspaceId: id, displayName: id });
+    expect(await removeAsModel("gated")).toEqual(removed("gated"));
+    const before = ["patch-lock", "wait-patch", "hold", "lossy", "tombstone"];
+    expect(collapseRuns(trace)).toEqual([
+      ...before,
+      ...["gate", "config-edit", "gate-release", "release", "patch-unlock"],
+    ]);
+    trace.length = 0;
+    expect(await removeAsModel("pregated", true)).toEqual(removed("pregated"));
+    expect(collapseRuns(trace)).toEqual([...before, "config-edit", "release", "patch-unlock"]);
+    expect(findWorkspaceInConfig(config, "gated")).toBe(undefined);
+    expect(findWorkspaceInConfig(config, "pregated")).toBe(undefined);
+  }, 20_000);
 });
