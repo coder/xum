@@ -4,6 +4,7 @@ import type {
   AgentAiSubagentProfile,
   SubagentAiDefaults,
 } from "@/common/config/schemas/appConfigOnDisk";
+import { CacheTtlSchema } from "@/common/config/schemas/providersConfig";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceOpenAIReasoningMode, coerceThinkingLevel, type ThinkingLevel } from "./thinking";
@@ -24,8 +25,25 @@ function normalizeProfileFields(entry: Record<string, unknown>): AgentAiSubagent
   return { modelString, thinkingLevel, reasoningMode };
 }
 
+/** The entry fields other than the nested delegated `subagent` profile. */
+export const AGENT_AI_DEFAULTS_SCALAR_FIELDS = [
+  ...SUBAGENT_PROFILE_FIELDS,
+  "autoModelRouting",
+  "autoThinkingLevel",
+  "enabled",
+  "cacheTtl",
+] as const;
+
 function isEmptyProfile(profile: AgentAiSubagentProfile): boolean {
   return SUBAGENT_PROFILE_FIELDS.every((field) => profile[field] === undefined);
+}
+
+/** An entry that sets nothing; callers drop it to keep the map sparse. */
+export function isEmptyAgentAiDefaultsEntry(entry: AgentAiDefaultsEntry): boolean {
+  return (
+    AGENT_AI_DEFAULTS_SCALAR_FIELDS.every((field) => entry[field] === undefined) &&
+    entry.subagent === undefined
+  );
 }
 
 /**
@@ -67,12 +85,15 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
 
     const autoModelRouting = entry.autoModelRouting === true ? true : undefined;
     const autoThinkingLevel = entry.autoThinkingLevel === true ? true : undefined;
+    // An invalid persisted TTL is dropped so the agent inherits instead (self-healing).
+    const cacheTtl = CacheTtlSchema.safeParse(entry.cacheTtl).data;
 
     const normalized: AgentAiDefaultsEntry = {
       ...base,
       autoModelRouting,
       autoThinkingLevel,
       enabled,
+      cacheTtl,
     };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
@@ -87,13 +108,7 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
       }
     }
 
-    if (
-      isEmptyProfile(normalized) &&
-      autoModelRouting === undefined &&
-      autoThinkingLevel === undefined &&
-      enabled === undefined &&
-      normalized.subagent === undefined
-    ) {
+    if (isEmptyAgentAiDefaultsEntry(normalized)) {
       continue;
     }
 

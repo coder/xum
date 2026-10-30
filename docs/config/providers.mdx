@@ -457,6 +457,12 @@ Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic's [Fast mode](https://pl
 
 Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.
 
+### Prompt cache duration
+
+Anthropic caches each request's prompt prefix for 5 minutes by default. Set **Prompt cache TTL** for Anthropic in **Settings → Providers** (`"cacheTtl": "1h"` under `anthropic` in `providers.jsonc`) to keep it for 1 hour. This global value applies to every Anthropic route: the direct API, custom Anthropic providers and Coder Anthropic routes. A per-agent value in **Settings → Agents** or an agent's `ai.cacheTtl` wins over it; see [Prompt cache duration](/agents#prompt-cache-duration).
+
+The tradeoff is cost. A 5-minute cache write costs 1.25× the input price, a 1-hour write costs 2×, and a cache read costs 0.1× or less, depending on the model. A 1-hour cache pays off when an agent waits more than 5 minutes between requests (CI, sub-agents, monitors) and then reuses the same context: with a 5-minute cache, the whole context is written again. Short or one-shot runs gain nothing from it.
+
 ### OpenRouter Provider Routing
 
 Control which infrastructure providers handle your requests:

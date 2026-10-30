@@ -46,6 +46,7 @@ let apiMock: {
 } | null = null;
 
 let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null = null;
+let pendingProjectMock: string | null = null;
 
 // Snapshot real exports before Bun replaces their live bindings for this suite.
 restoreModulesAfterSuite([
@@ -59,7 +60,10 @@ restoreModulesAfterSuite([
 ]);
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
-  useWorkspaceContext: () => ({ selectedWorkspace: selectedWorkspaceMock }),
+  useWorkspaceContext: () => ({
+    selectedWorkspace: selectedWorkspaceMock,
+    pendingNewWorkspaceProject: pendingProjectMock,
+  }),
 }));
 
 // The resource limits section lists projects; these tests have none.
@@ -126,25 +130,35 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ),
 }));
 
+// The native select takes the trigger's accessible name, as the Radix trigger carries it.
+function MockSelectTrigger(_props: { "aria-label"?: string }) {
+  return null;
+}
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => ({
   Select: (props: {
     value: string;
     onValueChange: (value: string) => void;
     children: React.ReactNode;
-  }) => (
-    <select
-      aria-label="Select"
-      value={props.value}
-      onChange={(event) => props.onValueChange(event.currentTarget.value)}
-    >
-      {props.children}
-    </select>
-  ),
+  }) => {
+    const trigger = (Array.isArray(props.children) ? props.children : [props.children]).find(
+      (child): child is React.ReactElement<{ "aria-label"?: string }> =>
+        (child as React.ReactElement | null)?.type === MockSelectTrigger
+    );
+    return (
+      <select
+        aria-label={trigger?.props["aria-label"] ?? "Select"}
+        value={props.value}
+        onChange={(event) => props.onValueChange(event.currentTarget.value)}
+      >
+        {props.children}
+      </select>
+    );
+  },
   SelectContent: (props: { children: React.ReactNode }) => <>{props.children}</>,
   SelectItem: (props: { value: string; children: React.ReactNode }) => (
     <option value={props.value}>{props.children}</option>
   ),
-  SelectTrigger: () => null,
+  SelectTrigger: MockSelectTrigger,
   SelectValue: () => null,
 }));
 
@@ -156,6 +170,8 @@ interface RenderTasksSectionOptions {
   agents?: AgentDefinitionDescriptor[];
   workspaceModel?: string;
   minThinkingLevelByModel?: TestClientConfig["minThinkingLevelByModel"];
+  /** Settings over the project page: the agents come from the project, with no workspace. */
+  projectPageOnly?: boolean;
 }
 
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
@@ -180,7 +196,10 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   } satisfies TestApiOverrides<APIClient>;
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock =
-    options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+    (options.agents || options.workspaceModel) && !options.projectPageOnly
+      ? { projectPath: "/proj", workspaceId: "ws-1" }
+      : null;
+  pendingProjectMock = options.projectPageOnly ? "/proj" : null;
   resetAiSelectionIntentForTests();
   if (options.workspaceModel) {
     markAiSelectionIntent("ws-1", "model", options.workspaceModel);
@@ -1153,5 +1172,218 @@ describe("TasksSection limit inputs", () => {
     await waitFor(() => expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).toContain(2));
     await waitPastAutosave();
     expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).not.toContain(1);
+  });
+});
+
+describe("TasksSection prompt cache TTL", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    providersConfigSpy?.mockRestore();
+    providersConfigSpy = null;
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  const cacheSelect = (view: ReturnType<typeof renderTasksSection>, agentId: string) =>
+    view.queryByRole("combobox", { name: `${agentId} prompt cache duration` });
+  const selectedOptionText = (select: HTMLElement | null) => {
+    const value = (select as { value?: string } | null)?.value;
+    return [...(select?.querySelectorAll("option") ?? [])].find((option) => option.value === value)
+      ?.textContent;
+  };
+  const setGlobalCacheTtl = (cacheTtl: "5m" | "1h") => {
+    providersConfigSpy = spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, cacheTtl },
+    });
+  };
+
+  test("choosing 1 hour saves it, and Inherit removes it", async () => {
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+
+    fireEvent.change(cacheSelect(view, "explore")!, { target: { value: "1h" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toEqual({
+        cacheTtl: "1h",
+      })
+    );
+
+    fireEvent.change(cacheSelect(view, "explore")!, { target: { value: "__inherit__" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toBeUndefined()
+    );
+  });
+
+  test("an unknown agent's stale value shows and resets to Inherit", async () => {
+    const view = renderTasksSection({ agentAiDefaults: { mystery: { cacheTtl: "1h" } } });
+    await view.findAllByText("Plan");
+
+    expect(selectedOptionText(cacheSelect(view, "mystery"))).toBe("1 hour");
+    fireEvent.change(cacheSelect(view, "mystery")!, { target: { value: "__inherit__" } });
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.mystery).toBeUndefined()
+    );
+  });
+
+  test("Inherit names the value the agent inherits without its own Settings value", async () => {
+    setGlobalCacheTtl("1h");
+    const view = renderTasksSection({
+      agentAiDefaults: { exec: { cacheTtl: "5m" }, researcher: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "explore"),
+        {
+          ...FALLBACK_AGENTS.find((agent) => agent.id === "explore")!,
+          aiDefaults: { cacheTtl: "5m" },
+        },
+        {
+          id: "researcher",
+          scope: "project",
+          name: "Researcher",
+          base: "exec",
+          uiSelectable: false,
+          subagentRunnable: true,
+        },
+      ],
+    });
+    await view.findByText("Researcher");
+
+    // Its own Settings value is shown as the choice, and Inherit names its base's value.
+    expect(selectedOptionText(cacheSelect(view, "researcher"))).toBe("1 hour");
+    expect(
+      within(cacheSelect(view, "researcher")!).getByRole("option", { name: "Inherit (5 minutes)" })
+    ).toBeTruthy();
+    // Explore's frontmatter outranks its base's Settings value and the global 1h.
+    expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (5 minutes)");
+    // Plan has no base and no value: the global TTL.
+    expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
+  });
+
+  test("without discovered agents, Inherit reads the fallback agents' own frontmatter", async () => {
+    setGlobalCacheTtl("1h");
+    const view = renderTasksSection();
+    await view.findByText("Explore");
+
+    // Built-in explore's frontmatter 5m outranks the global 1h, as in a run of explore.
+    expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (5 minutes)");
+    expect(selectedOptionText(cacheSelect(view, "plan"))).toBe("Inherit (1 hour)");
+  });
+
+  test("Inherit ranks a base's Settings value above frontmatter merged from that base", async () => {
+    const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
+    const subagent = { scope: "project" as const, uiSelectable: false, subagentRunnable: true };
+    const view = renderTasksSection({
+      agentAiDefaults: { explore: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS,
+        {
+          ...subagent,
+          id: "scout",
+          name: "Scout",
+          base: "explore",
+          // agents.list merges explore's frontmatter 5m into Scout's aiDefaults.
+          aiDefaults: explore.aiDefaults,
+          aiLayers: {
+            ancestors: [
+              { agentId: "explore", definitionAiDefaults: explore.aiDefaults },
+              { agentId: "exec" },
+            ],
+          },
+        },
+        // Did not resolve, so Inherit walks its declared base Scout, by Scout's own layer.
+        { ...subagent, id: "draft", name: "Draft", base: "scout" },
+      ],
+    });
+    await view.findByText("Scout");
+
+    expect(selectedOptionText(cacheSelect(view, "scout"))).toBe("Inherit (1 hour)");
+    expect(selectedOptionText(cacheSelect(view, "draft"))).toBe("Inherit (1 hour)");
+  });
+
+  test("Inherit follows the base layers agents.list resolves over the listed bases", async () => {
+    const exec = FALLBACK_AGENTS.find((agent) => agent.id === "exec")!;
+    const listed = (
+      id: string,
+      scope: "project" | "global",
+      base: string,
+      ancestorIds: string[]
+    ) => ({
+      id,
+      scope,
+      name: id,
+      base,
+      uiSelectable: false,
+      subagentRunnable: true,
+      aiLayers: { ancestors: ancestorIds.map((agentId) => ({ agentId })) },
+    });
+    const view = renderTasksSection({
+      agentAiDefaults: { helper: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "exec"),
+        // A project exec.md, which a global agent's base resolves past.
+        {
+          ...exec,
+          scope: "project",
+          base: "exec",
+          aiLayers: { targetDefinitionAiDefaults: { cacheTtl: "1h" }, ancestors: [] },
+        },
+        listed("helper", "global", "exec", ["exec"]),
+        // Refines a global agent whose base (helper) the listed descriptor no longer shows.
+        listed("refined", "project", "refined", ["helper", "exec"]),
+      ],
+    });
+    await view.findByText("refined");
+
+    expect(selectedOptionText(cacheSelect(view, "refined"))).toBe("Inherit (1 hour)");
+    expect(
+      within(cacheSelect(view, "helper")!).getByRole("option", { name: "Inherit (5 minutes)" })
+    ).toBeTruthy();
+  });
+
+  test("Settings over a project page labels Inherit from that project's agents", async () => {
+    const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
+    const projectExplore = { ...explore, scope: "project" as const, base: "explore" };
+    const view = renderTasksSection({
+      projectPageOnly: true,
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "explore"),
+        {
+          ...projectExplore,
+          aiDefaults: { cacheTtl: "1h" },
+          aiLayers: {
+            targetDefinitionAiDefaults: { cacheTtl: "1h" },
+            ancestors: [{ agentId: "exec" }],
+          },
+        },
+      ],
+    });
+
+    await waitFor(() =>
+      expect(selectedOptionText(cacheSelect(view, "explore"))).toBe("Inherit (1 hour)")
+    );
+  });
+
+  test("is absent on the delegated Exec card and on headless agents", async () => {
+    experimentsEnabledByDefault = true; // shows the Dream and Status Page cards
+    const view = renderTasksSection();
+    await view.findByText("Dream");
+
+    expect(cacheSelect(view, "exec")).toBeTruthy();
+    expect(
+      within(getExecSubagentRow(view)).queryByRole("combobox", { name: /prompt cache/ })
+    ).toBeNull();
+    for (const agentId of ["dream", "name_workspace", "status_page"]) {
+      expect(cacheSelect(view, agentId)).toBeNull();
+    }
   });
 });

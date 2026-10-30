@@ -37,6 +37,7 @@ import { createTestToolConfig } from "./tools/testHelpers";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import {
   collectDeferLoadingToolNames,
@@ -87,6 +88,7 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { OnTurnStartStage } from "./turnRequestBuilder";
 import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
 import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
@@ -6973,4 +6975,254 @@ describe("AIService runtimes", () => {
       await testHistory.cleanup();
     }
   });
+});
+
+describe("per-agent prompt cache TTL", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  interface WireInput {
+    globalCacheTtl?: "5m" | "1h";
+    agentAiDefaults?: AgentAiDefaults;
+    modelString?: string;
+    /** Project agent definitions by agent ID. */
+    projectAgents?: Record<string, string>;
+  }
+
+  /**
+   * An AIService with real agent resolution, message preparation and Anthropic model creation,
+   * whose provider fetch records each serialized request body instead of sending it.
+   */
+  async function createWireHarness(xumHomePath: string, input: WireInput) {
+    const projectPath = path.join(xumHomePath, "project");
+    const agentsDir = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    for (const [agentId, source] of Object.entries(input.projectAgents ?? {})) {
+      await fs.writeFile(path.join(agentsDir, `${agentId}.md`), source);
+    }
+    const workspaceId = "workspace-agent-cache-ttl";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const {
+      config,
+      historyService,
+      initStateManager,
+      providersConfigStore,
+      streamManager,
+      service,
+    } = createBasicAIService(xumHomePath);
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    const { resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      startStreamCalls,
+      useRequestedModelString: true,
+      allTools: {
+        bash: tool({ description: "b", inputSchema: jsonSchema({ type: "object" }) }),
+      },
+    });
+    // Real agent resolution and message preparation: the final wire body is under test.
+    spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+    spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+    resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    if (input.agentAiDefaults) await config.updateAgentAiDefaults(input.agentAiDefaults);
+    const bodies: unknown[] = [];
+    const recordingFetch: RecordingFetch = (_input, init) => {
+      if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+      bodies.push(JSON.parse(init.body));
+      // Only inspect serialized requests; never contact a provider.
+      return Promise.resolve(new Response("{}", { status: 400 }));
+    };
+    const modelString = input.modelString ?? KNOWN_MODELS.SONNET.id;
+    const provider = modelString.split(":", 1)[0];
+    // The provider-config fetch is the base fetch the Anthropic cache wrapper wraps.
+    spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+      anthropic: {
+        apiKey: "test-key",
+        fetch: recordingFetch,
+        ...(input.globalCacheTtl != null ? { cacheTtl: input.globalCacheTtl } : {}),
+      },
+      ...(provider === "anthropic"
+        ? {}
+        : { [provider]: { apiKey: "test-key", fetch: recordingFetch } }),
+    });
+    return { config, service, workspaceId, modelString, startStreamCalls, bodies };
+  }
+
+  /** Every cache marker's ttl on a recorded body, in Anthropic's order: tools, system, messages. */
+  function markerTtls(body: unknown): Array<string | undefined> {
+    const ttls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control") ttls.push((child as { ttl?: string }).ttl);
+        else walk(child);
+      }
+    };
+    const json = body as Record<string, unknown>;
+    walk([json.tools, json.system, json.messages]);
+    return ttls;
+  }
+
+  /**
+   * Streams one turn of `agentId` through real agent resolution and real Anthropic model
+   * creation, then sends the request the turn built. Returns every cache marker's ttl on the
+   * final wire body and the ttl the turn envelope recorded.
+   */
+  async function sendTurn(
+    input: WireInput & { agentId: string }
+  ): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
+    using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
+    const { config, service, workspaceId, modelString, startStreamCalls, bodies } =
+      await createWireHarness(xumHome.path, input);
+
+    {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("user-message", "user", "hello")],
+        workspaceId,
+        modelString,
+        thinkingLevel: "off",
+        agentId: input.agentId,
+      });
+      expect(result.success).toBe(true);
+      const request = startStreamCalls[0];
+      expect(request.initialMetadata?.agentId).toBe(input.agentId);
+      await generateText({
+        model: request.model,
+        system: request.system,
+        messages: request.messages,
+        // Like StepPreparation: the assembler sends the cached system prompt as messages.
+        allowSystemInMessages: true,
+        tools: request.tools,
+        providerOptions: request.providerOptions as Parameters<
+          typeof generateText
+        >[0]["providerOptions"],
+        headers: request.headers,
+        maxRetries: 0,
+      }).catch(() => undefined);
+    }
+
+    expect(bodies).toHaveLength(1);
+    const envelope = (
+      await new DurableEventJournal(path.join(config.sessionsDir, workspaceId)).read()
+    ).findLast((event) => event.kind === "turn-envelope");
+    if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
+    return { wireTtls: markerTtls(bodies[0]), envelopeTtl: envelope.data.anthropicCacheTtl };
+  }
+
+  /** Sends one headless continuous-compaction summary, a Compact run, and returns its markers' ttls. */
+  async function summarizeHead(input: WireInput): Promise<Array<string | undefined>> {
+    using xumHome = new DisposableTempDir("ai-service-compact-cache-ttl");
+    const { config, service, workspaceId, modelString, bodies } = await createWireHarness(
+      xumHome.path,
+      input
+    );
+    const options = { model: modelString, thinkingLevel: "off" as const };
+    // The recording fetch answers 400, so the summary fails once its request is recorded.
+    await summarizeContinuousCompaction({
+      workspaceId,
+      config,
+      aiService: service,
+      head: [createMuxMessage("head", "user", "Preserve the root cause")],
+      receiptRows: [],
+      signal: new AbortController().signal,
+      context: {
+        enabled: true,
+        model: modelString,
+        contextWindowTokens: 200_000,
+        thresholdPercent: 70,
+      },
+      baseOptions: { ...options, agentId: "exec" },
+      compactOptions: { ...options, agentId: "compact" },
+    }).catch(() => undefined);
+    expect(bodies).toHaveLength(1);
+    return markerTtls(bodies[0]);
+  }
+
+  const cases: Array<{
+    name: string;
+    input: Parameters<typeof sendTurn>[0];
+    expected: "5m" | "1h";
+  }> = [
+    {
+      name: "Explore keeps its built-in 5m under a global 1h",
+      input: { agentId: "explore", globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "an Explore Settings value wins over its built-in 5m",
+      input: { agentId: "explore", agentAiDefaults: { explore: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+    {
+      name: "Exec without a Settings value follows the global TTL",
+      input: { agentId: "exec", globalCacheTtl: "1h" },
+      expected: "1h",
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, async () => {
+      const { wireTtls, envelopeTtl } = await sendTurn(testCase.input);
+      // Tool, system and last-message markers at least, all on one TTL.
+      expect(wireTtls.length).toBeGreaterThanOrEqual(3);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+      expect(envelopeTtl).toBe(testCase.expected);
+    });
+  }
+
+  it("a non-Anthropic model ignores the agent's TTL", async () => {
+    const { wireTtls, envelopeTtl } = await sendTurn({
+      agentId: "explore",
+      modelString: KNOWN_MODELS.GPT.id,
+    });
+    expect(wireTtls).toEqual([]);
+    expect(envelopeTtl).toBeUndefined();
+  });
+
+  const summaryCases: Array<{ name: string; input: WireInput; expected: "5m" | "1h" }> = [
+    {
+      name: "a continuous-compaction summary keeps Compact's built-in 5m under a global 1h",
+      input: { globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "a Compact Settings value reaches continuous-compaction summaries",
+      input: { agentAiDefaults: { compact: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+    // OpenRouter has no Anthropic cache fetch wrapper: message preparation writes its markers.
+    {
+      name: "a Compact Settings value reaches summaries on a gateway route",
+      input: {
+        agentAiDefaults: { compact: { cacheTtl: "1h" } },
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+      },
+      expected: "1h",
+    },
+    {
+      name: "a summary on a gateway route follows the global TTL when no Compact layer sets one",
+      input: {
+        globalCacheTtl: "1h",
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+        projectAgents: {
+          compact: "---\nname: Compact\ndescription: Custom compaction\n---\n\nSummarize.\n",
+        },
+      },
+      expected: "1h",
+    },
+  ];
+
+  for (const testCase of summaryCases) {
+    it(testCase.name, async () => {
+      const wireTtls = await summarizeHead(testCase.input);
+      expect(wireTtls.length).toBeGreaterThan(0);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+    });
+  }
 });

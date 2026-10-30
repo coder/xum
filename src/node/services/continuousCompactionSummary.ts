@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { resolveTurnAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { agentPluginHookService } from "./agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
@@ -37,6 +38,7 @@ import {
   resolveAgentBody,
   getSkipScopesAboveForKnownScope,
 } from "./agentDefinitions/agentDefinitionsService";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import type { ContinuousCompactionContext } from "./continuousCompactor";
 import { looksLikeRawJsonObject } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
@@ -102,6 +104,7 @@ export async function summarizeContinuousCompaction(args: {
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
+  const cfg = args.config.loadConfigOrDefault();
   const agent = await resolveAgentForStream({
     workspaceId: args.workspaceId,
     metadata: metadata.data,
@@ -111,10 +114,17 @@ export async function summarizeContinuousCompaction(args: {
     requestedAgentId: "compact",
     disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
-    cfg: args.config.loadConfigOrDefault(),
+    cfg,
     emitError: () => undefined,
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
+  // A summary is a Compact run, so it keeps Compact's prompt-cache TTL (its built-in 5m under a
+  // global 1h) as a /compact turn does.
+  const agentCacheTtl = resolveChainAgentCacheTtl(
+    agent.data.effectiveAgentId,
+    cfg.agentAiDefaults,
+    agent.data.agentInheritanceChain
+  );
   const system = await resolveAgentBody(
     agent.data.agentDiscoveryRuntime,
     agent.data.agentDiscoveryPath,
@@ -132,6 +142,7 @@ export async function summarizeContinuousCompaction(args: {
     thinkingLevel: initialThinkingLevel,
     // Summaries run at the chat's speed, not the provider-wide one.
     providerOptions: getSendProviderOptions(options),
+    getAnthropicCacheTtlOverride: () => agentCacheTtl,
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
@@ -161,6 +172,21 @@ export async function summarizeContinuousCompaction(args: {
       created.data.wireProviderName,
       thinkingLevel
     );
+    const providerOptions = buildProviderOptions(
+      created.data.optionsModelString,
+      thinkingLevel,
+      // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
+      // which must see the same boundary-sliced history as the resolution above.
+      prepared.providerRequestMessages,
+      undefined,
+      created.data.optionsMuxProviderOptions,
+      args.workspaceId,
+      undefined,
+      created.data.optionsProvidersConfig,
+      created.data.optionsRouteProvider,
+      undefined,
+      options.reasoningMode
+    );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
       replayReceiptMessages: args.receiptRows,
@@ -171,6 +197,15 @@ export async function summarizeContinuousCompaction(args: {
       effectiveThinkingLevel: thinkingLevel,
       modelString: created.data.optionsModelString,
       providersConfig: created.data.optionsProvidersConfig,
+      // Routes without the Anthropic cache fetch wrapper, such as OpenRouter, send the markers
+      // written here as they are, so they need the TTL a /compact turn's markers get.
+      anthropicCacheTtl: resolveTurnAnthropicCacheTtl({
+        agentCacheTtl,
+        modelString: created.data.optionsModelString,
+        providersConfig: created.data.optionsProvidersConfig,
+        muxProviderOptions: created.data.optionsMuxProviderOptions,
+        providerOptions,
+      }),
       workspaceId: args.workspaceId,
     });
     messages.push({
@@ -212,21 +247,9 @@ export async function summarizeContinuousCompaction(args: {
       tools: Object.keys(assembleContext.tools).length > 0 ? assembleContext.tools : undefined,
       messages,
       abortSignal: args.signal,
-      providerOptions: buildProviderOptions(
-        created.data.optionsModelString,
-        thinkingLevel,
-        // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
-        // which must see the same boundary-sliced history as the resolution above.
-        prepared.providerRequestMessages,
-        undefined,
-        created.data.optionsMuxProviderOptions,
-        args.workspaceId,
-        undefined,
-        created.data.optionsProvidersConfig,
-        created.data.optionsRouteProvider,
-        undefined,
-        options.reasoningMode
-      ) as NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>,
+      providerOptions: providerOptions as NonNullable<
+        Parameters<typeof streamText>[0]["providerOptions"]
+      >,
       headers: buildRequestHeaders(
         created.data.optionsModelString,
         created.data.optionsMuxProviderOptions,

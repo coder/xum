@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { CacheTtlSchema } from "../../config/schemas/providersConfig";
 
 export const AgentDefinitionScopeSchema = z.enum(["built-in", "project", "global"]);
 
@@ -35,6 +36,8 @@ const AgentDefinitionAiDefaultsSchema = z
     // Model identifier: full string (e.g. "anthropic:claude-sonnet-4-5") or abbreviation (e.g. "sonnet")
     model: z.string().min(1).optional(),
     thinkingLevel: ThinkingLevelSchema.optional(),
+    // Anthropic prompt-cache TTL; Settings > Agents overrides it, and it overrides the global TTL.
+    cacheTtl: CacheTtlSchema.optional(),
   })
   .strip();
 
@@ -101,6 +104,22 @@ export const AgentDefinitionDescriptorSchema = z
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+    // The `ai` layers a run of this agent resolves (collectDefinitionLayers): its own, with
+    // same-ID hops merged, which the per-agent AI resolvers rank above base agents' Settings,
+    // then each different-ID base's, child to root. The bases' descriptors cannot stand in: a
+    // same-ID hop hides its base's base, and a global agent's base skips project agents.
+    // Absent when aiDefaults is unmerged (the definition did not resolve).
+    aiLayers: z
+      .object({
+        targetDefinitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+        ancestors: z.array(
+          z.object({
+            agentId: AgentIdSchema,
+            definitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+          })
+        ),
+      })
+      .optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)
