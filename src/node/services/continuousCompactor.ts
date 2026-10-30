@@ -27,10 +27,6 @@ import {
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
-import {
-  estimatePostCompactionContextTokens,
-  findPostCompactionContext,
-} from "./postCompactionContext";
 
 export interface ContinuousCompactionContext {
   enabled: boolean;
@@ -559,7 +555,6 @@ export class ContinuousCompactor {
       model: staged.model,
       tail,
       systemMessageTokens: context.systemMessageTokens ?? 0,
-      attachmentTokens: staged.attachmentTokens,
       postCompactionContext: prepared.postCompactionContext,
     });
     const staticCopies = copies.slice(0, -1);
@@ -757,7 +752,6 @@ export class ContinuousCompactor {
       model: journal.summaryModel,
       tail: [],
       systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
-      attachmentTokens: estimatePostCompactionContextTokens(findPostCompactionContext([boundary])),
       // Sequence assignment must not mutate the exact journal receipt used by cleanup.
       prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
       publication: { generation: journal.publicationGeneration, journal },
@@ -829,7 +823,6 @@ export class ContinuousCompactor {
       model: staged.model,
       tail,
       systemMessageTokens: context.systemMessageTokens ?? 0,
-      attachmentTokens: context.attachmentTokens ?? 0,
       pendingFollowUp,
     });
     if (applied && staged.generation === this.generation) this.reset("applied");

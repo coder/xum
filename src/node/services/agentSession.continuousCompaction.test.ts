@@ -699,7 +699,6 @@ describe("AgentSession continuous compaction wiring", () => {
         model,
         tail: [retained],
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         shouldPersist: () => true,
       })
     ).toBe(true);
@@ -1109,7 +1108,6 @@ describe("AgentSession continuous compaction wiring", () => {
                 tail: history.slice(-1),
                 pendingFollowUp: followUp,
                 systemMessageTokens: 0,
-                attachmentTokens: 0,
                 shouldPersist: () => true,
               });
               failRead = true;

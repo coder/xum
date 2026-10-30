@@ -161,7 +161,6 @@ async function compact(
         model: MODEL,
         tail: [],
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         shouldPersist: () => true,
       })
     ).toBe(true);

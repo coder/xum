@@ -429,7 +429,6 @@ export async function compactSessionForTest(
     model: "anthropic:claude-sonnet-4-5",
     tail: [],
     systemMessageTokens: 0,
-    attachmentTokens: 0,
     shouldPersist: () => true,
   });
   assert(persisted, "Expected the compaction to persist");

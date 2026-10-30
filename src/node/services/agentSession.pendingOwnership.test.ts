@@ -91,7 +91,6 @@ describe("pending snapshot consumers", () => {
             model,
             tail: [],
             systemMessageTokens: 0,
-            attachmentTokens: 0,
             shouldPersist: () => true,
           })
         ).toBe(true);

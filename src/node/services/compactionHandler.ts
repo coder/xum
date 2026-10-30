@@ -16,6 +16,7 @@ import {
   type CompactionPendingBoundaryWrite,
 } from "./compactionPendingState";
 import {
+  estimatePostCompactionContextTokens,
   shiftContextUsageByHeader,
   withPostCompactionContext,
   type PostCompactionContextInput,
@@ -273,10 +274,9 @@ function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetad
   ) as Partial<RowMetadata>;
 }
 
-/** Whether a boundary publication builds the header, and adds it to the boundary's contextUsage. */
+/** Whether a boundary publication builds the header. A header it builds counts in contextUsage. */
 interface HeaderOptions {
   buildHeader: boolean;
-  countHeader: boolean;
 }
 
 export class CompactionHandler {
@@ -355,7 +355,7 @@ export class CompactionHandler {
     preparation: CompactionPreparation,
     messages: MuxMessage[],
     boundary: CompactionPendingBoundaryWrite,
-    options: HeaderOptions = { buildHeader: true, countHeader: true }
+    options: HeaderOptions = { buildHeader: true }
   ) {
     messages = structuredClone(messages);
     boundary = {
@@ -415,9 +415,7 @@ export class CompactionHandler {
         reportsCompletedBeforeMs: nodeClock.nowMs(),
       });
       const withContext = withPostCompactionContext(summary, built, this.workspaceId);
-      return options.countHeader && withContext !== summary
-        ? shiftContextUsageByHeader(withContext, 1)
-        : withContext;
+      return withContext === summary ? summary : shiftContextUsageByHeader(withContext, 1);
     } catch (error) {
       // The header only restores context; it must never block the compaction itself.
       log.warn("Failed to build post-compaction context; publishing the boundary without it", {
@@ -950,7 +948,6 @@ export class CompactionHandler {
     model: string;
     tail: MuxMessage[];
     systemMessageTokens: number;
-    attachmentTokens: number;
     pendingFollowUp?: CompactionFollowUpRequest;
     postCompactionContext?: PostCompactionContext | null;
   }): { boundary: MuxMessage; copies: MuxMessage[] } {
@@ -1008,9 +1005,10 @@ export class CompactionHandler {
     const { boundary, copies } = params.prepared
       ? structuredClone(params.prepared)
       : this.buildContinuousCompactionRows(params);
+    // A header too big for the row is dropped, so count only the header the row keeps.
     const inputTokens =
       params.systemMessageTokens +
-      params.attachmentTokens +
+      estimatePostCompactionContextTokens(boundary.metadata?.postCompactionContext) +
       estimateMuxMessageTokens(boundary) +
       copies.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
     assert(boundary.metadata !== undefined, "Continuous boundary requires metadata");
@@ -1032,9 +1030,8 @@ export class CompactionHandler {
         shouldPersist: (messages, partial) => !partial && shouldPersist(messages),
       },
       // The swapped prefix already rendered the journaled header, or none. A new header here
-      // would change that prefix after the stream sent it. inputTokens already counts
-      // attachmentTokens, so the header is not counted again.
-      { buildHeader: !params.prepared, countHeader: false }
+      // would change that prefix after the stream sent it.
+      { buildHeader: !params.prepared }
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

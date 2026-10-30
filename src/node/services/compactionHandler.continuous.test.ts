@@ -62,7 +62,6 @@ describe("continuous compaction provider replay", () => {
         text: "Unpublished summary",
         model: "anthropic:test",
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         shouldPersist: () => false,
       })
     ).toBe(false);
@@ -109,7 +108,6 @@ describe("continuous compaction provider replay", () => {
           text: "Fix completed",
           model: "anthropic:test",
           systemMessageTokens: 0,
-          attachmentTokens: 0,
         })
         .catch((error: unknown) => error)
     ).toEqual(new Error("observer failed"));
@@ -166,7 +164,6 @@ describe("continuous compaction provider replay", () => {
       model: "anthropic:test-model",
       tail: [prompt, answer],
       systemMessageTokens: 0,
-      attachmentTokens: 0,
     });
     const answerCopy = copies[1];
     expect(answerCopy.metadata?.uiVisible).toBe(true);
@@ -294,7 +291,6 @@ describe("continuous compaction provider replay", () => {
           model: `${provider}:test-model`,
           tail,
           systemMessageTokens: 200,
-          attachmentTokens: 50,
         })
       ).toBe(true);
       const after = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -379,7 +375,6 @@ describe("continuous compaction provider replay", () => {
         model: "anthropic:test-model",
         tail: [prompt, answer],
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         pendingFollowUp: followUp,
       })
     ).toBe(true);

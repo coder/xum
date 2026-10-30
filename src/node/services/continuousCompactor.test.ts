@@ -1423,13 +1423,13 @@ describe("ContinuousCompactor", () => {
     expect(copy.metadata?.usage).toBeUndefined();
     expect(copy.metadata?.contextUsage).toBeUndefined();
     expect(copy.metadata?.compactionBoundary).toBeUndefined();
+    // The handler builds no header, so the attachment estimate is not counted.
     const expectedInput =
       context.systemMessageTokens! +
-      context.attachmentTokens! +
       persisted.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
     expect(boundary.metadata?.contextUsage?.inputTokens).toBe(expectedInput);
     expect(boundary.metadata?.contextUsage?.inputTokens).toBeGreaterThan(
-      estimateMuxMessageTokens(boundary) + context.systemMessageTokens! + context.attachmentTokens!
+      estimateMuxMessageTokens(boundary) + context.systemMessageTokens!
     );
     expect(boundary.metadata?.usage).toBeUndefined();
     expect(completed).toHaveBeenCalledTimes(1);

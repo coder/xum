@@ -22,6 +22,7 @@ import {
 } from "./postCompactionContext";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import assert from "@/common/utils/assert";
 import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
@@ -2356,6 +2357,46 @@ describe("CompactionHandler", () => {
       expect(getEmittedStreamEndEvent(emittedEvents)?.metadata.contextUsage).toEqual(expected);
     });
 
+    // A header too big for the continuous boundary row is dropped, so the row must not count it.
+    it.each([
+      ["counts the header that a continuous boundary keeps", "Rolling summary", true],
+      [
+        "does not count a header that the continuous boundary row drops",
+        "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES - 64 * 1024),
+        false,
+      ],
+    ])("%s", async (_name, text, kept) => {
+      const built: PostCompactionContext = { text: "h".repeat(64 * 1024), skillNames: [] };
+      installBuilder(() => Promise.resolve(built));
+      const source = createMuxMessage("source", "assistant", "Fixed the bug");
+      await seedHistory(source);
+
+      expect(
+        await handler.persistContinuousCompaction({
+          messages: [source],
+          text,
+          model: "anthropic:test",
+          tail: [],
+          systemMessageTokens: 10,
+          preparation: handler.beginPreparation(() => true),
+          attachmentMessages: [source],
+          publication: {
+            generation: await historyService
+              .getContinuousCompactionJournal(workspaceId)
+              .captureGeneration(),
+          },
+          shouldPersist: () => true,
+        })
+      ).toBe(true);
+
+      const boundary = await latestBoundary();
+      expect(boundary.metadata?.postCompactionContext).toEqual(kept ? built : undefined);
+      const headerTokens = kept ? estimatePostCompactionContextTokens(built) : 0;
+      expect(boundary.metadata?.contextUsage?.inputTokens).toBe(
+        10 + estimateMuxMessageTokens(boundary) + headerTokens
+      );
+    });
+
     async function persistJournaledBoundary(
       text: string,
       journaledHeader: PostCompactionContext | null
@@ -2372,7 +2413,6 @@ describe("CompactionHandler", () => {
         model: "anthropic:test",
         tail: [],
         systemMessageTokens: 0,
-        attachmentTokens: 0,
       };
       const prepared = handler.buildContinuousCompactionRows(rows);
       if (journaledHeader) {
@@ -2409,6 +2449,9 @@ describe("CompactionHandler", () => {
       const boundary = await persistJournaledBoundary("Rolling summary", journaledHeader);
 
       expect(boundary?.metadata?.postCompactionContext).toEqual(journaledHeader ?? undefined);
+      expect(boundary?.metadata?.contextUsage?.inputTokens).toBe(
+        estimateMuxMessageTokens(boundary) + estimatePostCompactionContextTokens(journaledHeader)
+      );
     });
 
     // The swapped prefix already sent this summary and header, so the row keeps both even
