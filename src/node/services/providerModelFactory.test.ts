@@ -1297,6 +1297,58 @@ describe("ProviderModelFactory GitHub Copilot", () => {
     }
   );
 
+  it.each([
+    [true, "agent"],
+    [undefined, "user"],
+  ] as const)(
+    "a pinned model with agentInitiated=%p sends Copilot X-Initiator %s",
+    async (agentInitiated, expectedInitiator) => {
+      await withTempConfig(async (_config, factory, _oauth, providersConfigStore) => {
+        // Copilot bills X-Initiator "user" as a premium request; headless summaries and titles
+        // pass agentInitiated so their user-role prompts do not.
+        const initiators: Array<string | null> = [];
+        const recordingFetch = (_input: unknown, init?: RequestInit) => {
+          initiators.push(new Headers(init?.headers).get("X-Initiator"));
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_initiator",
+                created_at: 0,
+                model: "gpt-5.3-codex",
+                output: [
+                  {
+                    type: "message",
+                    id: "msg_1",
+                    role: "assistant",
+                    status: "completed",
+                    content: [{ type: "output_text", text: "ok", annotations: [] }],
+                  },
+                ],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { headers: { "Content-Type": "application/json" } }
+            )
+          );
+        };
+        spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+          "github-copilot": {
+            apiKey: COPILOT_TOKEN,
+            models: ["gpt-5.3-codex"],
+            fetch: recordingFetch,
+          },
+        } as unknown as ProvidersConfig);
+
+        const created = await factory.createModelWithPinnedOptions("github-copilot:gpt-5.3-codex", {
+          agentInitiated,
+        });
+        if (!created.success) throw new Error(created.error.type);
+        await generateText({ model: created.data.model, prompt: "summarize", maxRetries: 0 });
+
+        expect(initiators).toEqual([expectedInitiator]);
+      });
+    }
+  );
+
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
