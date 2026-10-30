@@ -4713,7 +4713,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## Background Processes",
       "",
-      "In the desktop app and the VS Code extension, `Ctrl+Shift+J` focuses the background processes strip (again, or `Esc`, collapses it). On a focused row, `↓`/`↑` move, `Enter` opens the output, and `Backspace` terminates the process.",
+      "In the desktop app and the VS Code extension, `Ctrl+Alt+J` focuses the background processes strip (again, or `Esc`, collapses it). On a focused row, `↓`/`↑` move, `Enter` opens the output, and `Backspace` terminates the process.",
       "",
       "## Composer Activity",
       "",
