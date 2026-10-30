@@ -37,6 +37,7 @@ import {
   resolveAgentBody,
   getSkipScopesAboveForKnownScope,
 } from "./agentDefinitions/agentDefinitionsService";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import type { ContinuousCompactionContext } from "./continuousCompactor";
 import { looksLikeRawJsonObject } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
@@ -102,6 +103,7 @@ export async function summarizeContinuousCompaction(args: {
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
+  const cfg = args.config.loadConfigOrDefault();
   const agent = await resolveAgentForStream({
     workspaceId: args.workspaceId,
     metadata: metadata.data,
@@ -111,10 +113,17 @@ export async function summarizeContinuousCompaction(args: {
     requestedAgentId: "compact",
     disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
-    cfg: args.config.loadConfigOrDefault(),
+    cfg,
     emitError: () => undefined,
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
+  // A summary is a Compact run, so it keeps Compact's prompt-cache TTL (its built-in 5m under a
+  // global 1h) as a /compact turn does.
+  const agentCacheTtl = resolveChainAgentCacheTtl(
+    agent.data.effectiveAgentId,
+    cfg.agentAiDefaults,
+    agent.data.agentInheritanceChain
+  );
   const system = await resolveAgentBody(
     agent.data.agentDiscoveryRuntime,
     agent.data.agentDiscoveryPath,
@@ -132,6 +141,7 @@ export async function summarizeContinuousCompaction(args: {
     thinkingLevel: initialThinkingLevel,
     // Summaries run at the chat's speed, not the provider-wide one.
     providerOptions: getSendProviderOptions(options),
+    getAnthropicCacheTtlOverride: () => agentCacheTtl,
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {

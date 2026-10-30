@@ -88,6 +88,7 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { OnTurnStartStage } from "./turnRequestBuilder";
 import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
 import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
@@ -6981,19 +6982,18 @@ describe("per-agent prompt cache TTL", () => {
     mock.restore();
   });
 
-  /**
-   * Streams one turn of `agentId` through real agent resolution and real Anthropic model
-   * creation, then sends the request the turn built. Returns every cache marker's ttl on the
-   * final wire body and the ttl the turn envelope recorded.
-   */
-  async function sendTurn(input: {
-    agentId: string;
+  interface WireInput {
     globalCacheTtl?: "5m" | "1h";
     agentAiDefaults?: AgentAiDefaults;
     modelString?: string;
-  }): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
-    using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
-    const projectPath = path.join(xumHome.path, "project");
+  }
+
+  /**
+   * An AIService with real agent resolution, message preparation and Anthropic model creation,
+   * whose provider fetch records each serialized request body instead of sending it.
+   */
+  async function createWireHarness(xumHomePath: string, input: WireInput) {
+    const projectPath = path.join(xumHomePath, "project");
     await fs.mkdir(projectPath, { recursive: true });
     const workspaceId = "workspace-agent-cache-ttl";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
@@ -7004,7 +7004,7 @@ describe("per-agent prompt cache TTL", () => {
       providersConfigStore,
       streamManager,
       service,
-    } = createBasicAIService(xumHome.path);
+    } = createBasicAIService(xumHomePath);
     const startStreamCalls: TurnExecutionOptions[] = [];
     const { resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
       service,
@@ -7044,6 +7044,36 @@ describe("per-agent prompt cache TTL", () => {
         ? {}
         : { [provider]: { apiKey: "test-key", fetch: recordingFetch } }),
     });
+    return { config, service, workspaceId, modelString, startStreamCalls, bodies };
+  }
+
+  /** Every cache marker's ttl on a recorded body, in Anthropic's order: tools, system, messages. */
+  function markerTtls(body: unknown): Array<string | undefined> {
+    const ttls: Array<string | undefined> = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) return value.forEach(walk);
+      if (value == null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "cache_control") ttls.push((child as { ttl?: string }).ttl);
+        else walk(child);
+      }
+    };
+    const json = body as Record<string, unknown>;
+    walk([json.tools, json.system, json.messages]);
+    return ttls;
+  }
+
+  /**
+   * Streams one turn of `agentId` through real agent resolution and real Anthropic model
+   * creation, then sends the request the turn built. Returns every cache marker's ttl on the
+   * final wire body and the ttl the turn envelope recorded.
+   */
+  async function sendTurn(
+    input: WireInput & { agentId: string }
+  ): Promise<{ wireTtls: Array<string | undefined>; envelopeTtl: string | undefined }> {
+    using xumHome = new DisposableTempDir("ai-service-agent-cache-ttl");
+    const { config, service, workspaceId, modelString, startStreamCalls, bodies } =
+      await createWireHarness(xumHome.path, input);
 
     {
       const result = await service.streamMessage({
@@ -7072,23 +7102,40 @@ describe("per-agent prompt cache TTL", () => {
     }
 
     expect(bodies).toHaveLength(1);
-    const wireTtls: Array<string | undefined> = [];
-    const walk = (value: unknown): void => {
-      if (Array.isArray(value)) return value.forEach(walk);
-      if (value == null || typeof value !== "object") return;
-      for (const [key, child] of Object.entries(value)) {
-        if (key === "cache_control") wireTtls.push((child as { ttl?: string }).ttl);
-        else walk(child);
-      }
-    };
-    const body = bodies[0] as Record<string, unknown>;
-    // Anthropic's marker order: tools, system, messages.
-    walk([body.tools, body.system, body.messages]);
     const envelope = (
       await new DurableEventJournal(path.join(config.sessionsDir, workspaceId)).read()
     ).findLast((event) => event.kind === "turn-envelope");
     if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
-    return { wireTtls, envelopeTtl: envelope.data.anthropicCacheTtl };
+    return { wireTtls: markerTtls(bodies[0]), envelopeTtl: envelope.data.anthropicCacheTtl };
+  }
+
+  /** Sends one headless continuous-compaction summary, a Compact run, and returns its markers' ttls. */
+  async function summarizeHead(input: WireInput): Promise<Array<string | undefined>> {
+    using xumHome = new DisposableTempDir("ai-service-compact-cache-ttl");
+    const { config, service, workspaceId, modelString, bodies } = await createWireHarness(
+      xumHome.path,
+      input
+    );
+    const options = { model: modelString, thinkingLevel: "off" as const };
+    // The recording fetch answers 400, so the summary fails once its request is recorded.
+    await summarizeContinuousCompaction({
+      workspaceId,
+      config,
+      aiService: service,
+      head: [createMuxMessage("head", "user", "Preserve the root cause")],
+      receiptRows: [],
+      signal: new AbortController().signal,
+      context: {
+        enabled: true,
+        model: modelString,
+        contextWindowTokens: 200_000,
+        thresholdPercent: 70,
+      },
+      baseOptions: { ...options, agentId: "exec" },
+      compactOptions: { ...options, agentId: "compact" },
+    }).catch(() => undefined);
+    expect(bodies).toHaveLength(1);
+    return markerTtls(bodies[0]);
   }
 
   const cases: Array<{
@@ -7131,4 +7178,25 @@ describe("per-agent prompt cache TTL", () => {
     expect(wireTtls).toEqual([]);
     expect(envelopeTtl).toBeUndefined();
   });
+
+  const summaryCases: Array<{ name: string; input: WireInput; expected: "5m" | "1h" }> = [
+    {
+      name: "a continuous-compaction summary keeps Compact's built-in 5m under a global 1h",
+      input: { globalCacheTtl: "1h" },
+      expected: "5m",
+    },
+    {
+      name: "a Compact Settings value reaches continuous-compaction summaries",
+      input: { agentAiDefaults: { compact: { cacheTtl: "1h" } } },
+      expected: "1h",
+    },
+  ];
+
+  for (const testCase of summaryCases) {
+    it(testCase.name, async () => {
+      const wireTtls = await summarizeHead(testCase.input);
+      expect(wireTtls.length).toBeGreaterThan(0);
+      expect(new Set(wireTtls)).toEqual(new Set([testCase.expected]));
+    });
+  }
 });

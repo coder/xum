@@ -3254,25 +3254,23 @@ export class ProviderModelFactory {
   /** Create a model and its complete request options from one config/route decision. */
   async createModelWithPinnedOptions(
     modelString: string,
-    opts?: {
+    opts: {
       thinkingLevel?: ThinkingLevel;
       providerOptions?: MuxProviderOptions;
-      agentInitiated?: boolean;
-      workspaceId?: string;
-    }
+    } & Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "getAnthropicCacheTtlOverride"
+    > = {}
   ): Promise<Result<PinnedModelOptions, SendMessageError>> {
+    const { thinkingLevel, providerOptions, ...createOptions } = opts;
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const optionsProvidersConfig = this.providerService.getConfig(providersConfig);
-    const optionsMuxProviderOptions = structuredClone(opts?.providerOptions ?? {});
+    const optionsMuxProviderOptions = structuredClone(providerOptions ?? {});
     const result = await this.resolveAndCreateModel(
       modelString,
-      opts?.thinkingLevel,
+      thinkingLevel,
       optionsMuxProviderOptions,
-      {
-        agentInitiated: opts?.agentInitiated,
-        workspaceId: opts?.workspaceId,
-        providersConfig,
-      }
+      { ...createOptions, providersConfig }
     );
     if (!result.success) return result;
 
