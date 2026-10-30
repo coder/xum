@@ -360,7 +360,7 @@ export const WorstCaseDesktop: AppStory = {
 // cannot take it.
 async function assertBashesFromOverflow(line: HTMLElement) {
   const more = within(line).getByRole("button", { name: /^\d+ more$/ });
-  for (const close of ["{Escape}", "{Control>}{Shift>}J{/Shift}{/Control}"]) {
+  for (const close of ["{Escape}", "{Control>}{Alt>}j{/Alt}{/Control}"]) {
     await userEvent.click(more);
     const list = await within(line).findByRole("group", { name: "More activity" });
     await userEvent.click(within(list).getByRole("button", { name: /Bashes/ }));
@@ -467,12 +467,12 @@ async function assertSheetChords(canvasElement: HTMLElement) {
   await expect(reviews).toHaveAccessibleName("Reviews");
   await waitFor(() => expect(reviews.contains(document.activeElement)).toBe(true));
 
-  await userEvent.keyboard("{Control>}{Shift>}J{/Shift}{/Control}");
+  await userEvent.keyboard("{Control>}{Alt>}j{/Alt}{/Control}");
   await waitFor(() =>
     expect(within(sheet).getByRole("tabpanel")).toHaveAccessibleName("Background bashes")
   );
   await waitFor(() => expect(document.activeElement?.closest("[data-process-row]")).not.toBeNull());
-  await userEvent.keyboard("{Control>}{Shift>}J{/Shift}{/Control}");
+  await userEvent.keyboard("{Control>}{Alt>}j{/Alt}{/Control}");
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Activity" })).toBeNull());
   await waitFor(() => expect(composer).toHaveFocus());
 }
