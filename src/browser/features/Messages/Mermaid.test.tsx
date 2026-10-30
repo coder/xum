@@ -322,6 +322,100 @@ describe("Mermaid layout stability", () => {
     });
   });
 
+  describe("layout width", () => {
+    const WIDE_CHART =
+      "flowchart LR\nA[Request]-->B[Parse]-->C[Plan]-->D[Build]-->E[Test]-->F[Ship]";
+    let observers: Array<{ callback: ResizeObserverCallback; element: Element | null }>;
+    let measuredWidth: number;
+    let originalResizeObserver: typeof globalThis.ResizeObserver;
+    let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
+    let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
+
+    beforeEach(() => {
+      observers = [];
+      measuredWidth = 0;
+      originalResizeObserver = globalThis.ResizeObserver;
+      originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+      originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+      globalThis.requestAnimationFrame = (callback) =>
+        setTimeout(() => callback(0), 0) as unknown as number;
+      globalThis.cancelAnimationFrame = (handle) => clearTimeout(handle);
+      globalThis.ResizeObserver = class {
+        private readonly entry: { callback: ResizeObserverCallback; element: Element | null };
+        constructor(callback: ResizeObserverCallback) {
+          this.entry = { callback, element: null };
+          observers.push(this.entry);
+        }
+        observe(element: Element) {
+          this.entry.element = element;
+        }
+        unobserve() {
+          return undefined;
+        }
+        disconnect() {
+          this.entry.element = null;
+        }
+      } as unknown as typeof ResizeObserver;
+      spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+        this: HTMLElement
+      ) {
+        const width = this.classList.contains("mermaid-container") ? measuredWidth : 0;
+        return new window.DOMRect(0, 0, width, 300);
+      });
+    });
+
+    afterEach(() => {
+      globalThis.ResizeObserver = originalResizeObserver;
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+      globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    });
+
+    function resizeContainer(width: number) {
+      measuredWidth = width;
+      for (const { callback, element } of observers) {
+        if (!element) continue;
+        const entry = { target: element, contentRect: { width, height: 300 } };
+        callback([entry as unknown as ResizeObserverEntry], {} as ResizeObserver);
+      }
+    }
+
+    function viewBoxOf(container: Element | null) {
+      const viewBox = container?.querySelector("svg.pele")?.getAttribute("viewBox") ?? "0 0 0 0";
+      const [, , width, height] = viewBox.split(" ").map(Number);
+      return { width, height };
+    }
+
+    test("an unmeasured container renders the diagram's natural layout", async () => {
+      const view = renderMermaid({ chart: WIDE_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+      const natural = viewBoxOf(container);
+      expect(natural.width).toBeGreaterThan(400);
+      expect(natural.width).toBeGreaterThan(natural.height);
+      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+    });
+
+    test("a narrow container gets a vertical layout and reflows when it widens", async () => {
+      measuredWidth = 326;
+      const view = renderMermaid({ chart: WIDE_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+      const narrow = viewBoxOf(container);
+      expect(narrow.width).toBeLessThanOrEqual(326);
+      expect(narrow.height).toBeGreaterThan(narrow.width);
+      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("none");
+
+      act(() => resizeContainer(1200));
+      await waitFor(() => {
+        const wide = viewBoxOf(container);
+        expect(wide.width).toBeGreaterThan(wide.height);
+      });
+      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+    });
+  });
+
   test("renders chart text as text, without links or images", async () => {
     const chart = [
       "flowchart TD",

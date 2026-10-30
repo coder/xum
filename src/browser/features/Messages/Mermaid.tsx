@@ -5,6 +5,7 @@ import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import {
@@ -18,6 +19,9 @@ const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
+// Below this container width Pele may turn wide layouts vertical, so the diagram also drops
+// the height clamp that would shrink a tall layout until its labels are unreadable.
+const NARROW_DIAGRAM_WIDTH = 640;
 
 function decodeNumericCodePoint(codePoint: number): string {
   if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
@@ -130,7 +134,11 @@ export function sanitizeMermaidSvg(svg: string): string | null {
 }
 
 /** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
-async function renderMermaidSvg(chart: string, idPrefix: string): Promise<string> {
+async function renderMermaidSvg(
+  chart: string,
+  idPrefix: string,
+  layoutWidth: number
+): Promise<string> {
   // Pele measures labels with canvas when it renders, so the font must be loaded first
   // or boxes are sized for the fallback font. happy-dom has no document.fonts.
   if ("fonts" in document) await document.fonts.ready;
@@ -142,6 +150,9 @@ async function renderMermaidSvg(chart: string, idPrefix: string): Promise<string
     fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
     fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
     fontSize: 14,
+    // A zero width (hidden, or not laid out yet) keeps the diagram's natural layout.
+    maxWidth: layoutWidth > 0 ? layoutWidth : undefined,
+    directionBreakpoint: NARROW_DIAGRAM_WIDTH,
     // Diagram text is untrusted model output: no clickable links, and no images,
     // which would fetch from the network as soon as the SVG is inserted.
     links: false,
@@ -255,6 +266,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   );
   const svg = renderedDiagram?.svg ?? "";
   const stableId = useId();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const layoutWidth = useResizeObserver(containerRef)?.width ?? 0;
+  const isNarrow = layoutWidth > 0 && layoutWidth < NARROW_DIAGRAM_WIDTH;
 
   // Debounce chart changes to avoid flickering during streaming
   const [debouncedChart, setDebouncedChart] = useState(chart);
@@ -295,7 +309,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
 
     const renderDiagram = async () => {
       try {
-        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix);
+        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix, layoutWidth);
         if (cancelled) return;
 
         setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
@@ -312,7 +326,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     return () => {
       cancelled = true;
     };
-  }, [debouncedChart, stableId]);
+  }, [debouncedChart, layoutWidth, stableId]);
 
   // Update modal container when opened
   useEffect(() => {
@@ -373,6 +387,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           className="mermaid-container"
           ref={(element) => {
+            containerRef.current = element;
             if (!element) return;
             if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
             else transcriptMermaidSources.delete(element);
@@ -380,6 +395,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           style={{
             ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
+            ...(isNarrow ? { ["--diagram-max-height" as string]: "none" } : {}),
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
