@@ -2783,6 +2783,17 @@ async function assertRestoreDestinationWritable(
   }
 }
 
+async function passesThroughSymlink(rootPath: string, relativePath: string): Promise<boolean> {
+  let current = rootPath;
+  for (const segment of relativePath.split("/")) {
+    current = path.join(current, segment);
+    const existing = await lstatOrNull(current);
+    if (existing === null) return false;
+    if (existing.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
 /**
  * Drops the backed-up files whose local destination passes through a symlink, leaf included.
  * A user who links `skills/<name>` into a shared skills store chose that link, and a backup
@@ -2804,20 +2815,11 @@ export async function omitSymlinkedDestinations(
   for (const file of payload.files) {
     // Merged into config.json, never written at its own path.
     if (file.path === "preferences.json") continue;
-    if (checked !== undefined) {
-      if (checked.includes(file.path)) skipped.add(file.path);
-      continue;
-    }
-    let current = root.path;
-    for (const segment of file.path.split("/")) {
-      current = path.join(current, segment);
-      const existing = await lstatOrNull(current);
-      if (existing === null) break;
-      if (existing.isSymbolicLink()) {
-        skipped.add(file.path);
-        break;
-      }
-    }
+    const linked =
+      checked === undefined
+        ? await passesThroughSymlink(root.path, file.path)
+        : checked.includes(file.path);
+    if (linked) skipped.add(file.path);
   }
   if (skipped.size === 0) return { payload, skipped: [] };
   return {
