@@ -137,7 +137,7 @@ export function sanitizeMermaidSvg(svg: string): string | null {
 async function renderMermaidSvg(
   chart: string,
   idPrefix: string,
-  layoutWidth: number
+  maxWidth: number | undefined
 ): Promise<string> {
   // Pele measures labels with canvas when it renders, so the font must be loaded first
   // or boxes are sized for the fallback font. happy-dom has no document.fonts.
@@ -150,8 +150,7 @@ async function renderMermaidSvg(
     fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
     fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
     fontSize: 14,
-    // A zero width (hidden, or not laid out yet) keeps the diagram's natural layout.
-    maxWidth: layoutWidth > 0 ? layoutWidth : undefined,
+    maxWidth,
     directionBreakpoint: NARROW_DIAGRAM_WIDTH,
     // Diagram text is untrusted model output: no clickable links, and no images,
     // which would fetch from the network as soon as the SVG is inserted.
@@ -164,6 +163,14 @@ async function renderMermaidSvg(
     throw new Error("Diagram renderer returned invalid SVG output");
   }
   return sanitizedSvg;
+}
+
+/** Zero width (hidden, or not laid out yet) means unknown: render the natural layout. */
+function diagramLayout(containerSize: { width: number } | null) {
+  const width = containerSize?.width ?? 0;
+  const isNarrow = width > 0 && width < NARROW_DIAGRAM_WIDTH;
+  const style: CSSProperties = isNarrow ? { ["--diagram-max-height" as string]: "none" } : {};
+  return { maxWidth: width > 0 ? width : undefined, style };
 }
 
 function normalizeDiagramZoom(value: number): number {
@@ -267,8 +274,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const svg = renderedDiagram?.svg ?? "";
   const stableId = useId();
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const layoutWidth = useResizeObserver(containerRef)?.width ?? 0;
-  const isNarrow = layoutWidth > 0 && layoutWidth < NARROW_DIAGRAM_WIDTH;
+  const layout = diagramLayout(useResizeObserver(containerRef));
 
   // Debounce chart changes to avoid flickering during streaming
   const [debouncedChart, setDebouncedChart] = useState(chart);
@@ -309,7 +315,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
 
     const renderDiagram = async () => {
       try {
-        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix, layoutWidth);
+        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix, layout.maxWidth);
         if (cancelled) return;
 
         setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
@@ -326,7 +332,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     return () => {
       cancelled = true;
     };
-  }, [debouncedChart, layoutWidth, stableId]);
+  }, [debouncedChart, layout.maxWidth, stableId]);
 
   // Update modal container when opened
   useEffect(() => {
@@ -395,7 +401,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           style={{
             ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
-            ...(isNarrow ? { ["--diagram-max-height" as string]: "none" } : {}),
+            ...layout.style,
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
