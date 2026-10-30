@@ -12,8 +12,6 @@ export const MERMAID_FRAME_STYLE: CSSProperties = {
 };
 
 export const MERMAID_CONTAINER_STYLE: CSSProperties = {
-  maxWidth: "70%",
-  margin: "0 auto",
   minHeight: "300px",
 };
 
