@@ -10,7 +10,7 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitizeMermaidSvg("<svg><g></svg")).toBeNull();
   });
 
-  it("removes active content/unsafe attributes while preserving foreignObject labels", () => {
+  it("removes active content, foreignObject and unsafe attributes", () => {
     const input =
       '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">' +
       "<script>alert(1)</script>" +
@@ -35,7 +35,7 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("href=");
     expect(sanitized).toContain("<svg");
     expect(sanitized).toContain("<rect");
-    expect(sanitized).toContain("<foreignObject");
-    expect(sanitized).toContain("label");
+    expect(sanitized).not.toContain("foreignObject");
+    expect(sanitized).not.toContain("label");
   });
 });

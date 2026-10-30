@@ -209,7 +209,34 @@
   opacity: 0.6;
 }
 
-/* Mermaid diagrams */
+/* Mermaid diagrams. Pele reads these variables. Not under .markdown-content: the artifact
+   viewer renders diagrams outside it. --pele-font must match the fontFamily that Mermaid.tsx
+   measures with, or labels overflow their boxes. */
+.mermaid-container {
+  --pele-bg: var(--color-code-bg);
+  --pele-fg: var(--color-content-primary);
+  --pele-muted: var(--color-content-secondary);
+  --pele-line: var(--color-content-secondary);
+  --pele-surface: var(--color-surface-secondary);
+  --pele-surface-alt: var(--color-surface-tertiary);
+  --pele-border: var(--color-border-medium);
+  --pele-accent: var(--color-content-link);
+  --pele-critical: var(--color-highlight-red);
+  --pele-error: var(--color-highlight-red);
+  /* Coder series order. */
+  --pele-series-1: var(--color-highlight-purple);
+  --pele-series-2: var(--color-highlight-sky);
+  --pele-series-3: var(--color-highlight-orange);
+  --pele-series-4: var(--color-highlight-magenta);
+  --pele-series-5: var(--color-highlight-green);
+  --pele-series-6: var(--color-highlight-red);
+  --pele-series-7: var(--color-content-link);
+  --pele-series-8: var(--color-content-secondary);
+  --pele-font: var(--font-primary);
+  --pele-font-mono: var(--font-monospace);
+  --pele-radius: 6px;
+}
+
 .markdown-content .mermaid-container {
   display: flex;
   justify-content: center;

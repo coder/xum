@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
@@ -8,25 +8,9 @@ import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/trans
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import * as RealMermaidModule from "mermaid";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as PeleModule from "pele";
 
-const DEFAULT_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
-
-const mermaidInitialize = mock(() => undefined);
-const mermaidParse = mock((_chart: string) => Promise.resolve());
-const mermaidRender = mock((_id: string, _chart: string) => Promise.resolve({ svg: DEFAULT_SVG }));
-
-// Restore the real mermaid module after this suite so the renderer stub cannot leak into later files.
-restoreModulesAfterSuite([["mermaid", { ...RealMermaidModule }]]);
-void mock.module("mermaid", () => ({
-  default: {
-    initialize: mermaidInitialize,
-    parse: (chart: string) => mermaidParse(chart),
-    render: (id: string, chart: string) => mermaidRender(id, chart),
-  },
-}));
+const INVALID_CHART = "graph TD\nA-->";
 
 function renderMermaid(props: { chart?: string; isStreaming?: boolean } = {}) {
   return render(
@@ -53,9 +37,6 @@ describe("Mermaid layout stability", () => {
     globalThis.document = domWindow.document;
     globalThis.DOMParser = domWindow.DOMParser;
     globalThis.HTMLElement = domWindow.HTMLElement;
-
-    mermaidParse.mockImplementation(() => Promise.resolve());
-    mermaidRender.mockImplementation(() => Promise.resolve({ svg: DEFAULT_SVG }));
   });
 
   afterEach(() => {
@@ -64,8 +45,6 @@ describe("Mermaid layout stability", () => {
     globalThis.document = originalDocument;
     globalThis.DOMParser = originalDOMParser;
     globalThis.HTMLElement = originalHTMLElement;
-    mermaidParse.mockClear();
-    mermaidRender.mockClear();
   });
 
   test("markdown's diagram fallback keeps the loaded diagram's frame", async () => {
@@ -105,7 +84,7 @@ describe("Mermaid layout stability", () => {
     expect(loaded?.style.minHeight).toBe("300px");
   });
 
-  test("copies a selected textless diagram and excludes diagram controls", async () => {
+  test("copies a selected diagram as its source and excludes diagram controls", async () => {
     const chart = "graph TD\nA-->B";
     const view = render(
       <div data-transcript-message>
@@ -125,7 +104,6 @@ describe("Mermaid layout stability", () => {
     const selection = window.getSelection()!;
     selection.removeAllRanges();
     selection.addRange(range);
-    expect(selection.toString()).toBe("");
     const options = {
       transcriptRoot: view.container,
       selection,
@@ -162,7 +140,7 @@ describe("Mermaid layout stability", () => {
 
   test("copies the displayed chart during pending and invalid streaming updates", async () => {
     const first = "graph TD\nA-->B";
-    const next = "graph TD\nB-->C";
+    const next = INVALID_CHART;
     const renderContent = (chart: string) => (
       <ThemeProvider forcedTheme="dark">
         <StreamingContext.Provider value={{ isStreaming: true }}>
@@ -193,19 +171,16 @@ describe("Mermaid layout stability", () => {
     };
     await waitFor(() => expect(view.container.querySelector("svg")).not.toBeNull());
     expect(copySource()).toBe(first);
-    const pending = Promise.withResolvers<void>();
-    mermaidParse.mockImplementation(() => pending.promise);
+    const peleRender = spyOn(PeleModule, "render");
+    // Before the debounce fires the new chart is pending; after it, the chart fails to parse.
     view.rerender(renderContent(next));
     expect(copySource()).toBe(first);
-    await waitFor(() => expect(mermaidParse).toHaveBeenCalledWith(next + "\n"));
+    await waitFor(() => expect(peleRender).toHaveBeenCalledWith(next + "\n", expect.anything()));
+    peleRender.mockRestore();
     expect(copySource()).toBe(first);
-    await act(async () => {
-      pending.reject(new Error("Incomplete diagram"));
-      await pending.promise.catch(() => undefined);
-    });
-    expect(copySource()).toBe(first);
+    // The last valid diagram stays on screen while the stream is mid-chart.
+    expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull();
 
-    mermaidParse.mockImplementation(() => Promise.resolve());
     const third = "graph TD\nC-->D";
     view.rerender(renderContent(third));
     await waitFor(() => expect(copySource()).toBe(third));
@@ -237,13 +212,10 @@ describe("Mermaid layout stability", () => {
     expect(view.queryByRole("button", { name: "Close" })).toBeNull();
   });
 
-  test("reserves diagram height while a streaming diagram is still rendering", () => {
-    mermaidParse.mockImplementation(
-      () =>
-        new Promise<never>((resolve) => {
-          void resolve;
-        })
-    );
+  test("reserves diagram height until fonts load, then renders", async () => {
+    // Pele measures labels when it renders, so it waits for web fonts first.
+    const fonts = Promise.withResolvers<void>();
+    Object.defineProperty(document, "fonts", { value: { ready: fonts.promise } });
 
     const view = renderMermaid({ isStreaming: true });
 
@@ -251,14 +223,22 @@ describe("Mermaid layout stability", () => {
     expect(container).not.toBeNull();
     expect(container?.style.minHeight).toBe("300px");
     expect(container?.textContent).toBe("Rendering diagram...");
+
+    await act(async () => {
+      fonts.resolve();
+      await fonts.promise;
+    });
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+    );
   });
 
   test("keeps the stable diagram frame for streaming parse errors", async () => {
-    mermaidParse.mockImplementation(() => Promise.reject(new Error("diagram is incomplete")));
+    const peleRender = spyOn(PeleModule, "render");
+    const view = renderMermaid({ chart: INVALID_CHART, isStreaming: true });
 
-    const view = renderMermaid({ isStreaming: true });
-
-    await waitFor(() => expect(mermaidParse).toHaveBeenCalled());
+    await waitFor(() => expect(peleRender).toHaveBeenCalled());
+    peleRender.mockRestore();
     const container = view.container.querySelector<HTMLElement>(".mermaid-container");
     expect(container).not.toBeNull();
     expect(container?.style.minHeight).toBe("300px");
@@ -267,45 +247,22 @@ describe("Mermaid layout stability", () => {
   });
 
   test("shows parse errors after streaming settles", async () => {
-    mermaidParse.mockImplementation(() => Promise.reject(new Error("bad diagram")));
+    const view = renderMermaid({ chart: INVALID_CHART, isStreaming: false });
 
-    const view = renderMermaid({ isStreaming: false });
-
-    await waitFor(() => expect(view.container.textContent).toContain("Mermaid Error: bad diagram"));
+    await waitFor(() => expect(view.container.textContent).toContain("Mermaid Error: "));
     expect(view.container.querySelector(".mermaid-container")).toBeNull();
   });
 
-  // Regression: Mermaid embeds HTML labels (with bare <br>, <hr>, etc.) inside
-  // <foreignObject>. A strict image/svg+xml DOMParser rejects that markup and
-  // we used to surface "Mermaid returned invalid SVG output" for any diagram
-  // that wrapped a label. Sanitization must accept foreignObject HTML while
-  // still stripping active content.
-  describe("sanitizeMermaidSvg (foreignObject + void elements)", () => {
-    const SVG_WITH_BR = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-      <foreignObject x="0" y="0" width="100" height="100">
-        <div xmlns="http://www.w3.org/1999/xhtml"><span><p>first<br>second</p></span></div>
-      </foreignObject>
-    </svg>`;
-
-    test("accepts SVG whose foreignObject HTML labels use bare <br>", () => {
-      const out = sanitizeMermaidSvg(SVG_WITH_BR);
-      expect(out).not.toBeNull();
-      expect(out).toContain("<svg");
-      expect(out).toContain("first");
-      expect(out).toContain("second");
-    });
-
-    test("still strips <script> nested inside foreignObject", () => {
-      const malicious = `<svg xmlns="http://www.w3.org/2000/svg"><foreignObject>
-        <div xmlns="http://www.w3.org/1999/xhtml">
-          <p>hi<br>there</p>
-          <script>alert(1)</script>
-        </div>
-      </foreignObject></svg>`;
-      const out = sanitizeMermaidSvg(malicious);
-      expect(out).not.toBeNull();
+  describe("sanitizeMermaidSvg", () => {
+    test("removes foreignObject and its contents", () => {
+      const withForeignObject =
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/>' +
+        '<foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><p>label</p><script>alert(1)</script></div></foreignObject></svg>';
+      const out = sanitizeMermaidSvg(withForeignObject);
+      expect(out).toContain("<rect");
+      expect(out).not.toContain("foreignObject");
+      expect(out).not.toContain("label");
       expect(out).not.toContain("<script");
-      expect(out).not.toContain("alert(1)");
     });
 
     test("still strips on* handlers and javascript: hrefs", () => {
@@ -323,41 +280,13 @@ describe("Mermaid layout stability", () => {
       expect(sanitizeMermaidSvg("")).toBeNull();
     });
 
-    test("still rejects malformed SVG that lacks foreignObject", () => {
-      // Codex regression: HTML parsing is permissive enough to "repair" missing
-      // close tags. We only relax to HTML parsing for the foreignObject case
-      // (Mermaid's known idiom). Other malformed input must still fail closed
-      // so callers see "invalid SVG output" instead of a silently-recovered
-      // tree.
+    test("rejects malformed SVG instead of repairing it", () => {
       expect(sanitizeMermaidSvg("<svg><g></svg>")).toBeNull();
       expect(sanitizeMermaidSvg("<svg><rect></svg>")).toBeNull();
-    });
-
-    test("rejects malformed SVG even when foreignObject is present and broken", () => {
-      // A foreignObject opens the HTML-parser fallback, but the input still
-      // has to contain a recognizable <svg> root. Garbage without one fails.
-      expect(sanitizeMermaidSvg("<foreignObject><p>oops</p></foreignObject>")).toBeNull();
-    });
-
-    test("rejects malformed SVG that has foreignObject but breaks outside it", () => {
-      // Codex regression #2: the presence of <foreignObject> alone must not
-      // open the door to repairing structural errors elsewhere in the SVG.
-      // After stripping the foreignObject subtree, the outer structure
-      // (unbalanced <g>) is still malformed → must fail closed.
-      const malformedOutside =
-        '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><p>x<br></p></foreignObject><g></svg>';
-      expect(sanitizeMermaidSvg(malformedOutside)).toBeNull();
-    });
-
-    test("accepts valid SVG whose only XML non-conformance is inside foreignObject", () => {
-      // Positive complement of the above: when stripping <foreignObject>
-      // produces well-formed XML, we relax to the HTML parser and keep the
-      // embedded label intact.
-      const wrappedLabel =
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><g><foreignObject x="0" y="0" width="10" height="10"><div xmlns="http://www.w3.org/1999/xhtml"><p>a<br>b</p></div></foreignObject></g></svg>';
-      const out = sanitizeMermaidSvg(wrappedLabel);
-      expect(out).not.toBeNull();
-      expect(out).toContain("<svg");
+      // HTML void elements inside foreignObject are not well-formed XML either.
+      const htmlLabel =
+        '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><p>a<br>b</p></foreignObject></svg>';
+      expect(sanitizeMermaidSvg(htmlLabel)).toBeNull();
     });
   });
 
@@ -393,21 +322,22 @@ describe("Mermaid layout stability", () => {
     });
   });
 
-  test("renders sanitized SVG inside the stable container", async () => {
-    mermaidRender.mockImplementation(() =>
-      Promise.resolve({
-        svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><script>alert(1)</script><rect width="10" height="10" /></svg>',
-      })
+  test("renders chart text as text, without links or images", async () => {
+    const chart = [
+      "flowchart TD",
+      'A["<script>alert(1)</script>"]-->B',
+      'C@{ img: "https://example.com/beacon.png", label: "pic" }',
+      'click B "https://example.com"',
+    ].join("\n");
+    const view = renderMermaid({ chart });
+
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
     );
-
-    const view = renderMermaid();
-
-    await waitFor(() => {
-      const svg = view.container.querySelector(".mermaid-container svg");
-      expect(svg).not.toBeNull();
-    });
     const container = view.container.querySelector<HTMLElement>(".mermaid-container");
     expect(container?.style.minHeight).toBe("300px");
+    expect(container?.textContent).toContain("alert(1)");
     expect(view.container.querySelector("script")).toBeNull();
+    expect(container?.querySelector("a, [href], image")).toBeNull();
   });
 });

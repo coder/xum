@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import React, { useContext, useEffect, useId, useRef, useState } from "react";
-import mermaid from "mermaid";
+import { render as renderPele } from "pele";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
@@ -18,28 +18,6 @@ const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
-
-mermaid.initialize({
-  startOnLoad: false,
-  theme: "dark",
-  layout: "elk",
-  // Security hardening: Mermaid content is untrusted (comes from markdown),
-  // so keep Mermaid's strict sanitization and disallow scriptable links.
-  securityLevel: "strict",
-  fontFamily: "var(--font-monospace)",
-  darkMode: true,
-  elk: {
-    nodePlacementStrategy: "LINEAR_SEGMENTS",
-    mergeEdges: true,
-  },
-  wrap: true,
-  markdownAutoWrap: true,
-  flowchart: {
-    nodeSpacing: 60,
-    curve: "linear",
-    defaultRenderer: "elk",
-  },
-});
 
 function decodeNumericCodePoint(codePoint: number): string {
   if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
@@ -109,70 +87,19 @@ function canonicalizeUrlForSchemeCheck(value: string): string {
 }
 
 export function sanitizeMermaidSvg(svg: string): string | null {
-  // Validate the SVG structure strictly so genuinely malformed input still
-  // fails closed. The complication: Mermaid embeds HTML labels inside
-  // <foreignObject> (wrap/markdownAutoWrap), and that HTML legitimately uses
-  // void elements like bare <br>. Strict image/svg+xml DOMParser rejects such
-  // SVG with a parsererror, which used to make every wrapped-label diagram
-  // surface as "Mermaid returned invalid SVG output".
-  //
-  // Approach:
-  //   1. Try strict XML parsing on the original. If it succeeds, the input is
-  //      well-formed SVG; we're done.
-  //   2. Otherwise, replace each <foreignObject>...</foreignObject> subtree
-  //      with a self-closed placeholder and re-parse strictly. If that
-  //      succeeds, the *only* XML invalidity lives inside foreignObject HTML
-  //      (the known idiom we want to tolerate); we then materialize the
-  //      original via the HTML parser, which handles SVG-plus-embedded-HTML
-  //      the same way the browser does when innerHTML'd at the render sink.
-  //   3. If stripping foreignObject doesn't make the outer structure parse,
-  //      the malformed input is outside the wrapped-label case — reject it.
-  //
-  // This keeps the original "reject malformed SVG" contract intact while
-  // accepting Mermaid's legitimate output.
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(svg, "image/svg+xml");
-  const xmlHasError = xmlDoc.querySelector("parsererror") !== null;
-
-  let svgRoot: Element | null;
-  if (!xmlHasError) {
-    svgRoot =
-      xmlDoc.documentElement.tagName.toLowerCase() === "svg" ? xmlDoc.documentElement : null;
-  } else {
-    // Strip foreignObject subtrees and validate the outer structure strictly.
-    // Non-greedy match; Mermaid does not nest foreignObject, and over-stripping
-    // would only cause us to reject more aggressively (acceptable for a
-    // validation step).
-    const strippedForValidation = svg.replace(
-      /<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi,
-      "<foreignObject/>"
-    );
-    if (strippedForValidation === svg) {
-      // No foreignObject in the input, so the XML error isn't the known idiom.
-      return null;
-    }
-    const revalidated = parser.parseFromString(strippedForValidation, "image/svg+xml");
-    if (revalidated.querySelector("parsererror") !== null) {
-      // Outer structure is still malformed — fail closed.
-      return null;
-    }
-    if (revalidated.documentElement.tagName.toLowerCase() !== "svg") {
-      return null;
-    }
-    // Outer SVG is well-formed XML; only foreignObject HTML was problematic.
-    // Materialize the original tree via the HTML parser so embedded labels
-    // survive intact.
-    const htmlDoc = parser.parseFromString(svg, "text/html");
-    svgRoot = htmlDoc.querySelector("svg");
+  // Pele emits well-formed SVG with no foreignObject, so anything that fails a strict
+  // parse is not its output: fail closed.
+  const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
+  if (xmlDoc.querySelector("parsererror") !== null) {
+    return null;
   }
-
-  if (!svgRoot) {
+  const svgRoot = xmlDoc.documentElement;
+  if (svgRoot.tagName.toLowerCase() !== "svg") {
     return null;
   }
 
   // Defense in depth: remove active content containers and sanitize remaining attributes.
-  // NOTE: Keep <foreignObject> because Mermaid uses it for wrapped node labels.
-  svgRoot.querySelectorAll("script,iframe,object,embed").forEach((node) => {
+  svgRoot.querySelectorAll("script,iframe,object,embed,foreignObject").forEach((node) => {
     node.remove();
   });
 
@@ -336,32 +263,39 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   };
 
   useEffect(() => {
-    // Use stable ID to avoid ELK layout recalculating from scratch each render
-    const id = `mermaid-${stableId.replace(/:/g, "")}`;
+    // Each diagram needs its own prefix: inline SVG ids (markers, clip paths) share the document.
+    const idPrefix = `mermaid-${stableId.replace(/[^A-Za-z0-9_-]/g, "")}`;
     let cancelled = false;
 
     const renderDiagram = async () => {
       try {
-        // Parse first to validate syntax without rendering
-        await mermaid.parse(debouncedChart);
-
-        // If parse succeeds, render the diagram
-        const { svg: renderedSvg } = await mermaid.render(id, debouncedChart);
+        // Pele measures labels with canvas when it renders, so the font must be loaded first
+        // or boxes are sized for the fallback font. happy-dom has no document.fonts.
+        if ("fonts" in document) await document.fonts.ready;
         if (cancelled) return;
+
+        const rootStyle = window.getComputedStyle(document.documentElement);
+        const { svg: renderedSvg } = renderPele(debouncedChart, {
+          idPrefix,
+          // Measure with the same fonts the .mermaid-container CSS draws with.
+          fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
+          fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
+          fontSize: 14,
+          // Diagram text is untrusted model output: no clickable links, and no images,
+          // which would fetch from the network as soon as the SVG is inserted.
+          links: false,
+          images: false,
+        });
 
         const sanitizedSvg = sanitizeMermaidSvg(renderedSvg);
         if (!sanitizedSvg) {
-          throw new Error("Mermaid returned invalid SVG output");
+          throw new Error("Diagram renderer returned invalid SVG output");
         }
 
         setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
         setError(null);
       } catch (err) {
         if (cancelled) return;
-
-        // Don't remove elements by ID - with stable IDs, we'd remove the last valid render
-        // Mermaid error artifacts are cleaned up by subsequent successful renders
-
         setError(err instanceof Error ? err.message : "Failed to render diagram");
         // Don't clear SVG - keep showing last valid render during errors
       }
