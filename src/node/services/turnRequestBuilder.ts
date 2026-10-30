@@ -1864,7 +1864,7 @@ export class TurnRequestBuilder {
     );
     // The running agent's prompt-cache TTL. Models are created before the agent resolves, so
     // their Anthropic wires read it through a getter at request time (set after resolution).
-    let agentAnthropicCacheTtl: AnthropicCacheTtl | undefined;
+    const agentCacheTtl: { value?: AnthropicCacheTtl } = {};
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1917,7 +1917,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
-          getAnthropicCacheTtlOverride: () => agentAnthropicCacheTtl,
+          getAnthropicCacheTtlOverride: () => agentCacheTtl.value,
           promptCacheScope,
         }
       );
@@ -2308,7 +2308,7 @@ export class TurnRequestBuilder {
       effectiveToolPolicy: agentToolPolicy,
       switchableAgents: resolvedSwitchableAgents,
     } = agentResult.data;
-    agentAnthropicCacheTtl = resolveChainAgentCacheTtl(
+    agentCacheTtl.value = resolveChainAgentCacheTtl(
       effectiveAgentId,
       cfg.agentAiDefaults,
       agentInheritanceChain
@@ -3555,7 +3555,7 @@ export class TurnRequestBuilder {
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
         const effectiveAnthropicCacheTtl = resolveTurnAnthropicCacheTtl({
-          agentCacheTtl: agentAnthropicCacheTtl,
+          agentCacheTtl: agentCacheTtl.value,
           modelString: seed.rawModelString,
           providersConfig: seed.providersConfig,
           muxProviderOptions: effectiveMuxProviderOptions,
