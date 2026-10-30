@@ -368,6 +368,47 @@ export class AgentReportWaitTimeoutError extends Error {
   }
 }
 
+/** The options of TaskService.waitForAgentReport. */
+interface AgentReportWaitOptions {
+  timeoutMs?: number;
+  abortSignal?: AbortSignal;
+  requestingWorkspaceId?: string;
+  backgroundOnMessageQueued?: boolean;
+  onExecutionStarted?: () => void | Promise<void>;
+}
+
+/** What one waitForAgentReport call waits for, fixed before its first await. */
+interface ReportWaitRequest {
+  readonly taskId: string;
+  /** The caller's object: steps read its fields when they run, as the method did. */
+  readonly options: AgentReportWaitOptions | undefined;
+  readonly timeoutMs: number;
+  readonly requestingWorkspaceId: string | undefined;
+}
+
+/** The resolve and reject of the promise a pending report wait returns. */
+interface ReportWaitSettle {
+  readonly resolve: (report: AgentTaskReport) => void;
+  readonly reject: (error: Error) => void;
+}
+
+/**
+ * A registered report wait. The waiter's closures, the report timer and the abort listener read
+ * the mutable fields when they run, so steps read and write them here and never copy one into a
+ * local.
+ */
+interface ReportWaitSession {
+  readonly request: ReportWaitRequest;
+  readonly settle: ReportWaitSettle;
+  /** The waiter-store record. Its resolve and reject clean up, then settle. */
+  readonly waiter: PendingTaskWaiter;
+  timeout: ReturnType<typeof setTimeout> | null;
+  startWaiter: PendingTaskStartWaiter | null;
+  abortListener: (() => void) | null;
+  stopBlockingRequester: (() => void) | null;
+  executionStartNotified: boolean;
+}
+
 /** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
 export interface SubagentRemovalOptions {
   lossyWorkPolicy?: "refuse";
@@ -15057,13 +15098,7 @@ export class TaskService implements AgentTaskIntegration {
 
   async waitForAgentReport(
     taskId: string,
-    options?: {
-      timeoutMs?: number;
-      abortSignal?: AbortSignal;
-      requestingWorkspaceId?: string;
-      backgroundOnMessageQueued?: boolean;
-      onExecutionStarted?: () => void | Promise<void>;
-    }
+    options?: AgentReportWaitOptions
   ): Promise<AgentTaskReport> {
     assert(taskId.length > 0, "waitForAgentReport: taskId must be non-empty");
 
@@ -15089,21 +15124,11 @@ export class TaskService implements AgentTaskIntegration {
       // A renewed foreground wait means this task is blocking again unless re-backgrounded later.
       this.markTaskForegroundRelevant(taskId);
     }
+    const request: ReportWaitRequest = { taskId, options, timeoutMs, requestingWorkspaceId };
 
     const tryReadPersistedReport = () =>
       this.readPersistedReportForWait(taskId, requestingWorkspaceId);
-
-    // Persisted terminal failures (e.g. model_refusal) are checked AFTER reports —
-    // report monotonicity — and surface as rejections, never as reportMarkdown.
-    const tryReadPersistedFailureError = async (): Promise<Error | null> => {
-      if (!requestingWorkspaceId) {
-        return null;
-      }
-
-      const sessionDir = path.join(this.config.sessionsDir, requestingWorkspaceId);
-      const failure = await readSubagentFailureArtifact(sessionDir, taskId);
-      return failure ? new Error(failure.errorMessage) : null;
-    };
+    const tryReadPersistedFailureError = () => this.readPersistedFailureForWait(request);
 
     // Fast-path: if the task is already gone (cleanup) or already reported (restart), return the
     // persisted artifact from the requesting workspace session dir.
@@ -15187,83 +15212,60 @@ export class TaskService implements AgentTaskIntegration {
           }
         }
 
-        let timeout: ReturnType<typeof setTimeout> | null = null;
-        let startWaiter: PendingTaskStartWaiter | null = null;
-        let abortListener: (() => void) | null = null;
-        let stopBlockingRequester: (() => void) | null = requestingWorkspaceId
-          ? this.startForegroundAwait(requestingWorkspaceId)
-          : null;
-
-        let executionStartNotified = false;
-        const notifyExecutionStarted = () => {
-          if (executionStartNotified) return;
-          executionStartNotified = true;
-          void Promise.resolve(options?.onExecutionStarted?.()).catch((error: unknown) => {
-            log.error("waitForAgentReport execution-start callback failed", { taskId, error });
-          });
-        };
-
-        const startReportTimeout = () => {
-          if (timeout) return;
-          notifyExecutionStarted();
-          timeout = setTimeout(() => {
-            // Prefer a persisted terminal failure over a generic timeout so late
-            // awaits surface the typed failure (e.g. model_refusal) even when the
-            // live rejection was missed (restart/cleanup windows).
-            void (async () => {
-              const persistedFailure = await tryReadPersistedFailureError().catch(() => null);
-              entry.cleanup();
-              reject(persistedFailure ?? new AgentReportWaitTimeoutError());
-            })();
-          }, timeoutMs);
-        };
-
-        const cleanupStartWaiter = () => {
-          if (!startWaiter) return;
-          startWaiter.cleanup();
-          startWaiter = null;
-        };
-
-        const entry: PendingTaskWaiter = {
-          taskId,
-          requestingWorkspaceId: undefined,
-          backgroundOnMessageQueued: false,
-          resolve: (report) => {
-            entry.cleanup();
-            resolve(report);
-          },
-          reject: (error) => {
-            entry.cleanup();
-            reject(error);
-          },
-          cleanup: () => {
-            if (entry.requestingWorkspaceId && entry.backgroundOnMessageQueued) {
-              this.unregisterBackgroundableForegroundWaiter(entry.requestingWorkspaceId, entry);
-            }
-
-            this.waiters.removePendingWaiter(taskId, entry);
-
-            cleanupStartWaiter();
-
-            if (timeout) {
-              clearTimeout(timeout);
-              timeout = null;
-            }
-
-            if (abortListener && options?.abortSignal) {
-              options.abortSignal.removeEventListener("abort", abortListener);
-              abortListener = null;
-            }
-
-            if (stopBlockingRequester) {
-              try {
-                stopBlockingRequester();
-              } finally {
-                stopBlockingRequester = null;
+        const session: ReportWaitSession = {
+          request,
+          settle: { resolve, reject },
+          timeout: null,
+          startWaiter: null,
+          abortListener: null,
+          stopBlockingRequester: requestingWorkspaceId
+            ? this.startForegroundAwait(requestingWorkspaceId)
+            : null,
+          executionStartNotified: false,
+          // The waiter's closures run after this literal, so they can name `session`.
+          waiter: {
+            taskId,
+            requestingWorkspaceId: undefined,
+            backgroundOnMessageQueued: false,
+            resolve: (report) => {
+              session.waiter.cleanup();
+              resolve(report);
+            },
+            reject: (error) => {
+              session.waiter.cleanup();
+              reject(error);
+            },
+            cleanup: () => {
+              const { waiter } = session;
+              if (waiter.requestingWorkspaceId && waiter.backgroundOnMessageQueued) {
+                this.unregisterBackgroundableForegroundWaiter(waiter.requestingWorkspaceId, waiter);
               }
-            }
+
+              this.waiters.removePendingWaiter(taskId, waiter);
+
+              this.cleanupReportWaitStartWaiter(session);
+
+              if (session.timeout) {
+                clearTimeout(session.timeout);
+                session.timeout = null;
+              }
+
+              if (session.abortListener && options?.abortSignal) {
+                options.abortSignal.removeEventListener("abort", session.abortListener);
+                session.abortListener = null;
+              }
+
+              if (session.stopBlockingRequester) {
+                try {
+                  session.stopBlockingRequester();
+                } finally {
+                  session.stopBlockingRequester = null;
+                }
+              }
+            },
           },
         };
+        const entry = session.waiter;
 
         this.waiters.addPendingWaiter(taskId, entry);
 
@@ -15291,80 +15293,154 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
 
-        // Don't start the execution timeout while the task is still queued/starting.
-        // The timer starts once the child actually begins running (queued/starting -> running).
-        const initialStatus = taskWorkspaceEntry.workspace.taskStatus;
-        if (initialStatus === "queued" || initialStatus === "starting") {
-          const startWaiterEntry: PendingTaskStartWaiter = {
-            start: startReportTimeout,
-            cleanup: () => {
-              this.waiters.removePendingStartWaiter(taskId, startWaiterEntry);
-            },
-          };
-          startWaiter = startWaiterEntry;
-
-          this.waiters.addPendingStartWaiter(taskId, startWaiterEntry);
-
-          // Close the race where the task starts between the initial config read and registering the waiter.
-          // A launch whose failure could not be written never starts: arm the timeout now (#4747).
-          const cfgAfterRegister = this.config.loadConfigOrDefault();
-          const afterEntry = findWorkspaceEntry(cfgAfterRegister, taskId);
-          if (
-            (afterEntry?.workspace.taskStatus !== "queued" &&
-              afterEntry?.workspace.taskStatus !== "starting") ||
-            this.waiters.isLaunchFailureUnpersisted(taskId)
-          ) {
-            cleanupStartWaiter();
-            startReportTimeout();
-          }
-
-          // If the awaited task is queued and the caller is blocked in the foreground, ensure the
-          // scheduler runs after the waiter is registered. This avoids deadlocks when
-          // maxParallelAgentTasks is low.
-          if (requestingWorkspaceId) {
-            this.scheduleMaybeStartQueuedTasks();
-          }
-        } else {
-          startReportTimeout();
-        }
-
-        if (initialStatus === "awaiting_report") {
-          // Reuse the standard completion reminder when a waiter attaches instead of carrying a
-          // separate waiter-only recovery mode and prompt string.
-          void this.workspaceEventLocks
-            .withLock(taskId, async () => {
-              // A waiter attaching decides for whatever attempt runs now: no captured attempt.
-              await this.promptTaskForRequiredCompletionTool(taskId, { expectedAttemptId: null });
-            })
-            .catch((error: unknown) => {
-              log.error("Failed to resume awaiting_report task for waiter", {
-                taskId,
-                error,
-              });
-            });
-        }
-        if (options?.abortSignal) {
-          if (options.abortSignal.aborted) {
-            entry.cleanup();
-            reject(new Error("Interrupted"));
-            return;
-          }
-
-          abortListener = () => {
-            entry.cleanup();
-            reject(new Error("Interrupted"));
-          };
-          options.abortSignal.addEventListener("abort", abortListener, { once: true });
-        }
-
-        this.backgroundForegroundWaitIfQueued(
-          shouldBackgroundOnQueuedMessage,
-          requestingWorkspaceId
+        this.armPendingReportWaiter(
+          session,
+          taskWorkspaceEntry.workspace.taskStatus,
+          shouldBackgroundOnQueuedMessage
         );
       })().catch((error: unknown) => {
         reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
+  }
+
+  /**
+   * The rest of a wait's setup once the read after registration found no report: arms the report
+   * timer (or a start waiter), queues the completion prompt of an awaiting_report task, listens
+   * for the abort, then backgrounds the wait if a message is already queued.
+   */
+  private armPendingReportWaiter(
+    session: ReportWaitSession,
+    initialStatus: WorkspaceConfigEntry["taskStatus"],
+    shouldBackgroundOnQueuedMessage: boolean
+  ): void {
+    // Don't start the execution timeout while the task is still queued/starting.
+    // The timer starts once the child actually begins running (queued/starting -> running).
+    if (initialStatus === "queued" || initialStatus === "starting") {
+      this.armQueuedReportWaitStart(session);
+    } else {
+      this.startReportWaitTimeout(session);
+    }
+
+    if (initialStatus === "awaiting_report") {
+      this.promptAwaitingReportTaskForWaiter(session.request.taskId);
+    }
+    if (this.listenForReportWaitAbort(session) === "aborted") {
+      return;
+    }
+
+    this.backgroundForegroundWaitIfQueued(
+      shouldBackgroundOnQueuedMessage,
+      session.request.requestingWorkspaceId
+    );
+  }
+
+  /** A queued or starting task's wait: a start waiter arms the report timer once the task runs. */
+  private armQueuedReportWaitStart(session: ReportWaitSession): void {
+    const { taskId, requestingWorkspaceId } = session.request;
+    const startWaiterEntry: PendingTaskStartWaiter = {
+      start: () => this.startReportWaitTimeout(session),
+      cleanup: () => {
+        this.waiters.removePendingStartWaiter(taskId, startWaiterEntry);
+      },
+    };
+    session.startWaiter = startWaiterEntry;
+
+    this.waiters.addPendingStartWaiter(taskId, startWaiterEntry);
+
+    // Close the race where the task starts between the initial config read and registering the waiter.
+    // A launch whose failure could not be written never starts: arm the timeout now (#4747).
+    const cfgAfterRegister = this.config.loadConfigOrDefault();
+    const afterEntry = findWorkspaceEntry(cfgAfterRegister, taskId);
+    if (
+      (afterEntry?.workspace.taskStatus !== "queued" &&
+        afterEntry?.workspace.taskStatus !== "starting") ||
+      this.waiters.isLaunchFailureUnpersisted(taskId)
+    ) {
+      this.cleanupReportWaitStartWaiter(session);
+      this.startReportWaitTimeout(session);
+    }
+
+    // If the awaited task is queued and the caller is blocked in the foreground, ensure the
+    // scheduler runs after the waiter is registered. This avoids deadlocks when
+    // maxParallelAgentTasks is low.
+    if (requestingWorkspaceId) {
+      this.scheduleMaybeStartQueuedTasks();
+    }
+  }
+
+  /** Removes the wait's start waiter, if it still has one. */
+  private cleanupReportWaitStartWaiter(session: ReportWaitSession): void {
+    if (!session.startWaiter) return;
+    session.startWaiter.cleanup();
+    session.startWaiter = null;
+  }
+
+  /** Arms the wait's report timer once the task runs, and reports that start to the caller. */
+  private startReportWaitTimeout(session: ReportWaitSession): void {
+    if (session.timeout) return;
+    this.notifyReportWaitExecutionStarted(session);
+    session.timeout = setTimeout(() => {
+      // Prefer a persisted terminal failure over a generic timeout so late
+      // awaits surface the typed failure (e.g. model_refusal) even when the
+      // live rejection was missed (restart/cleanup windows).
+      void (async () => {
+        const persistedFailure = await this.readPersistedFailureForWait(session.request).catch(
+          () => null
+        );
+        session.waiter.cleanup();
+        session.settle.reject(persistedFailure ?? new AgentReportWaitTimeoutError());
+      })();
+    }, session.request.timeoutMs);
+  }
+
+  /** Calls the caller's onExecutionStarted once per wait, without waiting for it. */
+  private notifyReportWaitExecutionStarted(session: ReportWaitSession): void {
+    if (session.executionStartNotified) return;
+    session.executionStartNotified = true;
+    const { taskId, options } = session.request;
+    void Promise.resolve(options?.onExecutionStarted?.()).catch((error: unknown) => {
+      log.error("waitForAgentReport execution-start callback failed", { taskId, error });
+    });
+  }
+
+  /** Queues the completion prompt of an awaiting_report task on its event lock, never awaited. */
+  private promptAwaitingReportTaskForWaiter(taskId: string): void {
+    // Reuse the standard completion reminder when a waiter attaches instead of carrying a
+    // separate waiter-only recovery mode and prompt string.
+    void this.workspaceEventLocks
+      .withLock(taskId, async () => {
+        // A waiter attaching decides for whatever attempt runs now: no captured attempt.
+        await this.promptTaskForRequiredCompletionTool(taskId, { expectedAttemptId: null });
+      })
+      .catch((error: unknown) => {
+        log.error("Failed to resume awaiting_report task for waiter", {
+          taskId,
+          error,
+        });
+      });
+  }
+
+  /**
+   * An already-aborted signal ends the wait now ("aborted"). A live one gets a listener that ends
+   * the wait when it aborts ("pending").
+   */
+  private listenForReportWaitAbort(session: ReportWaitSession): "aborted" | "pending" {
+    const { options } = session.request;
+    if (options?.abortSignal) {
+      if (options.abortSignal.aborted) {
+        session.waiter.cleanup();
+        session.settle.reject(new Error("Interrupted"));
+        return "aborted";
+      }
+
+      session.abortListener = () => {
+        session.waiter.cleanup();
+        session.settle.reject(new Error("Interrupted"));
+      };
+      options.abortSignal.addEventListener("abort", session.abortListener, { once: true });
+    }
+    return "pending";
   }
 
   getAgentTaskExecutionId(taskId: string): string | null {
@@ -22112,6 +22188,21 @@ export class TaskService implements AgentTaskIntegration {
       model: artifact.model,
       thinkingLevel: artifact.thinkingLevel,
     };
+  }
+
+  /**
+   * waitForAgentReport's read of the terminal failure persisted in the requesting workspace's
+   * session dir. Persisted terminal failures (e.g. model_refusal) are checked AFTER reports —
+   * report monotonicity — and surface as rejections, never as reportMarkdown.
+   */
+  private async readPersistedFailureForWait(request: ReportWaitRequest): Promise<Error | null> {
+    if (!request.requestingWorkspaceId) {
+      return null;
+    }
+
+    const sessionDir = path.join(this.config.sessionsDir, request.requestingWorkspaceId);
+    const failure = await readSubagentFailureArtifact(sessionDir, request.taskId);
+    return failure ? new Error(failure.errorMessage) : null;
   }
 
   /**
