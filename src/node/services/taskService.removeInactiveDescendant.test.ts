@@ -125,12 +125,15 @@ async function dropRow(config: Config, id: string) {
   });
 }
 
-/** Collapses runs of one label, so a run of config edits reads as one step. */
+/**
+ * Collapses a run of config edits into one entry (their count belongs to WorkspaceService). Any
+ * other repeated entry stays, so a doubled hold, gate or release fails the nesting asserts.
+ */
 function collapseRuns(trace: readonly string[]): string[] {
-  return trace.filter((label, i) => label !== trace[i - 1]);
+  return trace.filter((label, i) => label !== "config-edit" || trace[i - 1] !== label);
 }
 
-describe("TaskService removeInactiveDescendantAgentTask before the split", () => {
+describe("TaskService removeInactiveDescendantAgentTask: scope, refusals, hold and locks", () => {
   let rootDir: string;
   // Every test awaits each removal it starts. The background work left is the persist of the
   // config migrations that a load can start (Config.migrationPersist): one more edit on the same
