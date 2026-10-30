@@ -1197,6 +1197,17 @@ function deepMergeAgentFrontmatter(
   return overlay;
 }
 
+type AgentFrontmatterAi = AgentDefinitionPackage["frontmatter"]["ai"];
+
+interface ResolvedAgentDefinitionWithOwnAi {
+  definition: AgentDefinitionPackage;
+  /**
+   * The agent's own `ai` layer: its hops of the same ID (project `exec.md` with `base: exec`)
+   * merged closer-first, without a different-ID base. Mirrors collectDefinitionLayers' target.
+   */
+  ownAi: AgentFrontmatterAi;
+}
+
 /**
  * Resolve prompt and frontmatter in one base-chain walk so callers authorize
  * and execute the same definition snapshot. Frontmatter always inherits when
@@ -1208,6 +1219,16 @@ export async function resolveAgentDefinition(
   agentId: AgentId,
   options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
+  return (await resolveAgentDefinitionWithOwnAi(runtime, workspacePath, agentId, options))
+    .definition;
+}
+
+async function resolveAgentDefinitionWithOwnAi(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options: ReadAgentDefinitionOptions
+): Promise<ResolvedAgentDefinitionWithOwnAi> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -1242,7 +1263,7 @@ export async function resolveAgentDefinition(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<AgentDefinitionPackage> {
+  ): Promise<ResolvedAgentDefinitionWithOwnAi> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -1262,14 +1283,15 @@ export async function resolveAgentDefinition(
 
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return pkg;
+      return { definition: pkg, ownAi: pkg.frontmatter.ai };
     }
 
-    const base = await resolve(
+    const resolvedBase = await resolve(
       baseId,
       depth + 1,
       mergeSkipScopesAbove(skipScopesAbove, computeBaseSkipScope(baseId, id, pkg.scope))
     );
+    const base = resolvedBase.definition;
 
     const mergedRaw = deepMergeAgentFrontmatter(base.frontmatter, pkg.frontmatter, []);
     const merged = AgentDefinitionFrontmatterSchema.safeParse(mergedRaw);
@@ -1280,11 +1302,18 @@ export async function resolveAgentDefinition(
     }
 
     const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
+    const ownAi =
+      baseId === pkg.id ? { ...resolvedBase.ownAi, ...pkg.frontmatter.ai } : pkg.frontmatter.ai;
     return {
-      ...pkg,
-      frontmatter: merged.data,
-      body:
-        pkg.frontmatter.prompt?.append === false ? pkg.body : `${base.body}${separator}${pkg.body}`,
+      definition: {
+        ...pkg,
+        frontmatter: merged.data,
+        body:
+          pkg.frontmatter.prompt?.append === false
+            ? pkg.body
+            : `${base.body}${separator}${pkg.body}`,
+      },
+      ownAi,
     };
   }
 
@@ -1403,7 +1432,7 @@ export async function listAgentDefinitions(
   const resolved = await Promise.all(
     descriptors.map(async (descriptor) => {
       try {
-        const resolvedFrontmatter = await resolveAgentFrontmatter(
+        const resolvedDefinition = await resolveAgentDefinitionWithOwnAi(
           runtime,
           discoveryPath,
           descriptor.id,
@@ -1413,12 +1442,13 @@ export async function listAgentDefinitions(
             runtimeFactory,
           }
         );
+        const resolvedFrontmatter = resolvedDefinition.definition.frontmatter;
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
           input.includeDisabled !== true
         )
           return null;
-        return { descriptor, resolvedFrontmatter };
+        return { descriptor, resolvedFrontmatter, ownAi: resolvedDefinition.ownAi };
       } catch {
         return { descriptor };
       }
@@ -1438,6 +1468,8 @@ export async function listAgentDefinitions(
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
+        // An empty layer still marks aiDefaults as merged, so readers never fall back to it.
+        ownAiDefaults: entry.ownAi ?? {},
         tools: frontmatter.tools,
       },
     ];

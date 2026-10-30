@@ -24,6 +24,7 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
@@ -453,10 +454,14 @@ function buildPromptCacheTtlProps(input: {
   onChange: (value: AnthropicCacheTtl | undefined) => void;
 }): PromptCacheTtlControlProps | undefined {
   if (NO_CACHE_TTL_AGENT_IDS.has(input.agentId)) return undefined;
+  // agents.list merges aiDefaults down the base chain; the backend ranks a base's Settings above
+  // the base's frontmatter, so each layer must hold only that agent's own frontmatter.
+  const ownAiDefaults = (agent: AgentDefinitionDescriptor | undefined) =>
+    agent?.ownAiDefaults ?? agent?.aiDefaults;
   const descriptorsById = new Map(
     input.listedAgents.map((agent) => [
       agent.id,
-      { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+      { base: agent.base, definitionAiDefaults: ownAiDefaults(agent) },
     ])
   );
   const ownEntry = input.agentAiDefaults[input.agentId];
@@ -466,7 +471,7 @@ function buildPromptCacheTtlProps(input: {
       ...input.agentAiDefaults,
       [input.agentId]: { ...ownEntry, cacheTtl: undefined },
     },
-    targetDefinitionAiDefaults: input.definition?.aiDefaults,
+    targetDefinitionAiDefaults: ownAiDefaults(input.definition),
     ancestors: collectDeclaredAncestorLayers(input.agentId, descriptorsById),
   });
   return {
@@ -570,12 +575,20 @@ export function TasksSection() {
   useEffect(() => {
     liveApiRef.current = liveApi;
   }, [liveApi]);
-  const { selectedWorkspace } = useWorkspaceContext();
+  const { selectedWorkspace, pendingNewWorkspaceProject } = useWorkspaceContext();
+  // Settings opened over a project page has no workspace; list that project's agents so its
+  // overrides reach the cards (the Prompt cache Inherit label included). Scratch is no project.
+  const agentsProjectPath =
+    selectedWorkspace?.projectPath ??
+    (pendingNewWorkspaceProject !== SCRATCH_PROJECT_CONFIG_KEY
+      ? (pendingNewWorkspaceProject ?? undefined)
+      : undefined);
+  const agentsWorkspaceId = selectedWorkspace?.workspaceId;
 
-  const selectedWorkspaceRef = useRef(selectedWorkspace);
+  const agentsScopeRef = useRef({ projectPath: agentsProjectPath, workspaceId: agentsWorkspaceId });
   useEffect(() => {
-    selectedWorkspaceRef.current = selectedWorkspace;
-  }, [selectedWorkspace]);
+    agentsScopeRef.current = { projectPath: agentsProjectPath, workspaceId: agentsWorkspaceId };
+  }, [agentsProjectPath, agentsWorkspaceId]);
 
   const [taskSettings, setTaskSettings] = useState<TaskSettings>(DEFAULT_TASK_SETTINGS);
   const [agentAiDefaults, setAgentAiDefaults] = useState<AgentAiDefaults>({});
@@ -657,8 +670,8 @@ export function TasksSection() {
   useEffect(() => {
     if (!api) return;
 
-    const projectPath = selectedWorkspace?.projectPath;
-    const workspaceId = selectedWorkspace?.workspaceId;
+    const projectPath = agentsProjectPath;
+    const workspaceId = agentsWorkspaceId;
     if (!projectPath) {
       setAgents([]);
       setEnabledAgentIds(FALLBACK_AGENTS.map((agent) => agent.id));
@@ -699,7 +712,7 @@ export function TasksSection() {
     return () => {
       cancelled = true;
     };
-  }, [api, selectedWorkspace?.projectPath, selectedWorkspace?.workspaceId]);
+  }, [api, agentsProjectPath, agentsWorkspaceId]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -764,8 +777,7 @@ export function TasksSection() {
             if (agentDefaultsChanged) {
               window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED));
 
-              const projectPath = selectedWorkspaceRef.current?.projectPath;
-              const workspaceId = selectedWorkspaceRef.current?.workspaceId;
+              const { projectPath, workspaceId } = agentsScopeRef.current;
               if (!projectPath) {
                 return;
               }

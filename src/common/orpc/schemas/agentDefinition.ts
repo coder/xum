@@ -104,6 +104,9 @@ export const AgentDefinitionDescriptorSchema = z
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+    // The agent's own `ai` layer (same-ID hops merged, no different-ID base), which the
+    // per-agent AI resolvers rank above base agents' Settings. Absent when aiDefaults is unmerged.
+    ownAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)

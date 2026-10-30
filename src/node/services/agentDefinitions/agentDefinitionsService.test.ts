@@ -217,7 +217,50 @@ class TrackingRemotePathMappedRuntime extends RemotePathMappedRuntime {
   }
 }
 
+// Project-only listing does not use workspace initialization or AI services.
+function projectListContext(config: Config): AgentDefinitionsContext {
+  return {
+    config,
+    aiService: {
+      getWorkspaceMetadata: () => {
+        throw new Error("Unexpected workspace lookup");
+      },
+      runtimeFactory,
+    },
+    initStateManager: {
+      waitForInit: () => {
+        throw new Error("Unexpected workspace initialization");
+      },
+    },
+  };
+}
+
 describe("agentDefinitionsService", () => {
+  test("Settings lists each agent's own ai layer apart from its base-merged aiDefaults", async () => {
+    using project = new DisposableTempDir("agent-list-own-ai");
+    using home = new DisposableTempDir("agent-list-own-ai-home");
+    const projectRoot = path.join(project.path, ".xum", "agents");
+    await fs.mkdir(projectRoot, { recursive: true });
+    const write = (id: string, frontmatter: string) =>
+      fs.writeFile(
+        path.join(projectRoot, `${id}.md`),
+        `---\nname: ${id}\n${frontmatter}---\nBody.`
+      );
+    await write("explore", "base: explore\nai:\n  thinkingLevel: high\n");
+    await write("scout", "base: explore\n");
+
+    const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+      projectPath: project.path,
+    });
+    const byId = (id: string) => agents.find((agent) => agent.id === id);
+
+    // A same-ID hop refines the built-in explore (cacheTtl 5m) inside its own layer.
+    expect(byId("explore")?.ownAiDefaults).toEqual({ cacheTtl: "5m", thinkingLevel: "high" });
+    // Scout inherits explore's frontmatter, which stays out of its own layer.
+    expect(byId("scout")?.aiDefaults).toEqual({ cacheTtl: "5m", thinkingLevel: "high" });
+    expect(byId("scout")?.ownAiDefaults).toEqual({});
+  });
+
   test.each([true, false])(
     "Settings lists project overrides and filters disabled agents (disabled=%s)",
     async (disabled) => {
@@ -234,21 +277,7 @@ describe("agentDefinitionsService", () => {
         "---\nname: Project Exec\nai:\n  model: private:project-exec\n---\nProject execution."
       );
       const config = new Config(home.path);
-      // Project-only listing does not use workspace initialization or AI services.
-      const context: AgentDefinitionsContext = {
-        config,
-        aiService: {
-          getWorkspaceMetadata: () => {
-            throw new Error("Unexpected workspace lookup");
-          },
-          runtimeFactory,
-        },
-        initStateManager: {
-          waitForInit: () => {
-            throw new Error("Unexpected workspace initialization");
-          },
-        },
-      };
+      const context = projectListContext(config);
       const list = (includeDisabled = false) =>
         listAgentDefinitions(context, { projectPath: project.path, includeDisabled });
       const all = await list(true);
