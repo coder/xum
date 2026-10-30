@@ -991,6 +991,39 @@ interface TaskLaunchFailureMark {
   parentWorkspaceId: string | undefined;
 }
 
+/**
+ * A queued task the drain cleared for launch, with what it read for the launch plan before the
+ * launch lease: snapshots, never re-read after the lease and CAS awaits.
+ */
+interface QueuedTaskLaunchRequest {
+  readonly taskId: string;
+  /** The queued row the drain listed. */
+  readonly task: AgentTaskWorkspaceEntry;
+  readonly start: TaskLaunchStart;
+  readonly parentWorkspaceId: string;
+  readonly parentMeta: WorkspaceMetadata;
+  readonly agentId: string;
+  readonly workspaceName: string;
+  readonly createdAt: string;
+  readonly taskRuntimeConfig: RuntimeConfig;
+  readonly parentRuntimeConfig: RuntimeConfig;
+  readonly configProjectPath: string;
+  readonly canonicalModel: string;
+  readonly skipInitHook: boolean;
+}
+
+/** The attempt a queued task's launch CAS wrote on the fresh row. */
+interface QueuedLaunchAttempt {
+  readonly attemptId: string;
+  readonly receiptEligible: boolean;
+}
+
+/**
+ * One queued task's outcome in a drain: it took a slot, it was skipped (refused, failed or left
+ * queued), or shutdown began and the drain reserves no more tasks.
+ */
+type QueuedTaskReservation = "reserved" | "skipped" | "shutdown";
+
 /** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
 async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
   await lease.release().catch((error: unknown) => {
@@ -16878,115 +16911,193 @@ export class TaskService implements AgentTaskIntegration {
           // relaunched task's persisted aiSettings.
           normalizeSelectedModel(task.taskModelString ?? defaultModel);
         const createdAt = task.createdAt ?? getIsoNow();
-        // Exclusive launch CAS (queued → starting): a `queued` entry has never been admitted (the
-        // only path back to queued sets the unproven marker), so whichever process commits this
-        // transition is the attempt's single owner. The id rotates unless this process's own
-        // reservation already owns it; eligibility is read from the fresh row (another process's
-        // stale-starting revert can add the marker without changing the id).
-        let launch: { attemptId: string; receiptEligible: boolean } | undefined;
-        let shuttingDown = false;
-        // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
-        // removal, archive or rename of the task in progress refuses it: the task stays queued
-        // and the drain retries it after a backoff.
-        let launchLease: WorkspaceUseLease;
-        try {
-          launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
-        } catch (error) {
-          // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
-          // unleased would let another backend's startup recovery requeue it mid-launch.
-          log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
-            "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
-            { taskId, error: getErrorMessage(error) }
-          );
-          // The gate's release (another backend's above all) schedules no drain: retry.
-          this.armQueuedLaunchLeaseRetry();
-          continue;
-        }
-        try {
-          await this.editActiveWorkspaceEntry(taskId, (workspace) => {
-            // Once shutdown latched the sessions the launch would only fail against them: the
-            // task stays queued for the next start (#4473). Checked inside the CAS so no await
-            // separates the check from the reservation.
-            if (this.workspaceService.isShuttingDown()) {
-              shuttingDown = true;
-              return;
-            }
-            if (
-              workspace.taskStatus !== "queued" ||
-              workspace.taskAttemptRetiredBy != null ||
-              workspace.pendingRemoval != null
-            ) {
-              return;
-            }
-            const owned = this.attemptLedger.ownedAttempt(taskId);
-            const attemptId =
-              owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
-                ? owned.attemptId
-                : newTaskAttemptId();
-            workspace.taskAttemptId = attemptId;
-            workspace.taskStatus = "starting";
-            // This launch's brief id, durable before its send (see TaskLaunchStart).
-            if (start.kind === "sendMessage") workspace.taskPromptSendId = start.sendId;
-            launch = { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
-          });
-        } catch (error) {
-          await releaseLaunchLease(taskId, launchLease);
-          await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
-          continue;
-        }
-        if (shuttingDown) {
-          await releaseLaunchLease(taskId, launchLease);
-          log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
-          break;
-        }
-        if (launch == null) {
-          await releaseLaunchLease(taskId, launchLease);
-          log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {
+        const reservation = await this.leaseQueuedTaskLaunch(
+          {
             taskId,
-          });
-          continue;
-        }
-        this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
-        if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
-          this.beginOwnedTaskAttempt(taskId, "launch", launch);
-        }
-        reservedSlots += 1;
-
-        plans.push({
-          taskId,
-          parentWorkspaceId,
-          parentMeta,
-          agentId,
-          agentType: task.agentType ?? agentId,
-          start,
-          title: task.title ?? workspaceName,
-          workspaceName,
-          createdAt,
-          taskRuntimeConfig,
-          parentRuntimeConfig,
-          configProjectPath: normalizedTaskProjectPath,
-          workspaceKind: task.kind,
-          taskModelString: task.taskModelString ?? defaultModel,
-          canonicalModel,
-          effectiveThinkingLevel: task.taskThinkingLevel,
-          // Durable pro-mode source: the task record's aiSettings (written at
-          // creation, kept current by subsequent sends' persistence merge).
-          effectiveReasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-          skipInitHook,
-          preferredTrunkBranch: task.taskTrunkBranch,
-          workflowTask: task.workflowTask,
-          bestOf: this.getEffectiveTaskGroup(taskId, task),
-          attemptId: launch.attemptId,
-          launchLease,
-          // A reservation this process owns keeps its cancellation across the queue.
-          ...(() => {
-            const abortSignal = this.attemptLedger.ownedAttempt(taskId)?.abortSignal;
-            return abortSignal != null ? { abortSignal } : {};
-          })(),
-        });
+            task,
+            start,
+            parentWorkspaceId,
+            parentMeta,
+            agentId,
+            workspaceName,
+            createdAt,
+            taskRuntimeConfig,
+            parentRuntimeConfig,
+            configProjectPath: normalizedTaskProjectPath,
+            canonicalModel,
+            skipInitHook,
+          },
+          plans
+        );
+        if (reservation === "shutdown") break;
+        if (reservation === "reserved") reservedSlots += 1;
       }
     }
 
+    await this.launchReservedPlans(plans);
+  }
+
+  /** Holds a queued task's launch lease, then claims its launch under it. */
+  private async leaseQueuedTaskLaunch(
+    request: QueuedTaskLaunchRequest,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const { taskId } = request;
+    // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
+    // removal, archive or rename of the task in progress refuses it: the task stays queued
+    // and the drain retries it after a backoff.
+    let launchLease: WorkspaceUseLease;
+    try {
+      launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
+    } catch (error) {
+      // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
+      // unleased would let another backend's startup recovery requeue it mid-launch.
+      log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
+        "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
+        { taskId, error: getErrorMessage(error) }
+      );
+      // The gate's release (another backend's above all) schedules no drain: retry.
+      this.armQueuedLaunchLeaseRetry();
+      return "skipped";
+    }
+    return await this.claimQueuedTaskLaunch(request, launchLease, plans);
+  }
+
+  /**
+   * The launch CAS (queued → starting) under the held launch lease. Every exit without a plan
+   * releases the lease; a launched task's plan takes it.
+   */
+  private async claimQueuedTaskLaunch(
+    request: QueuedTaskLaunchRequest,
+    launchLease: WorkspaceUseLease,
+    plans: TaskLaunchPlan[]
+  ): Promise<QueuedTaskReservation> {
+    const { taskId, start } = request;
+    // Exclusive launch CAS (queued → starting): a `queued` entry has never been admitted (the
+    // only path back to queued sets the unproven marker), so whichever process commits this
+    // transition is the attempt's single owner. The id rotates unless this process's own
+    // reservation already owns it; eligibility is read from the fresh row (another process's
+    // stale-starting revert can add the marker without changing the id).
+    let launch: QueuedLaunchAttempt | undefined;
+    let shuttingDown = false;
+    try {
+      await this.editActiveWorkspaceEntry(taskId, (workspace) => {
+        // Once shutdown latched the sessions the launch would only fail against them: the
+        // task stays queued for the next start (#4473). Checked inside the CAS so no await
+        // separates the check from the reservation.
+        if (this.workspaceService.isShuttingDown()) {
+          shuttingDown = true;
+          return;
+        }
+        if (
+          workspace.taskStatus !== "queued" ||
+          workspace.taskAttemptRetiredBy != null ||
+          workspace.pendingRemoval != null
+        ) {
+          return;
+        }
+        launch = this.moveQueuedRowToStarting(taskId, start, workspace);
+      });
+    } catch (error) {
+      await releaseLaunchLease(taskId, launchLease);
+      await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
+      return "skipped";
+    }
+    if (shuttingDown) {
+      await releaseLaunchLease(taskId, launchLease);
+      log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
+      return "shutdown";
+    }
+    if (launch == null) {
+      await releaseLaunchLease(taskId, launchLease);
+      log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {
+        taskId,
+      });
+      return "skipped";
+    }
+    this.recordQueuedLaunch(request, launch, launchLease, plans);
+    return "reserved";
+  }
+
+  /**
+   * The launch CAS's write on the fresh queued row, run inside its updater: the attempt id (kept
+   * only when this process's own reservation owns it), `starting`, and the brief's send id.
+   */
+  private moveQueuedRowToStarting(
+    taskId: string,
+    start: TaskLaunchStart,
+    workspace: WorkspaceConfigEntry
+  ): QueuedLaunchAttempt {
+    const owned = this.attemptLedger.ownedAttempt(taskId);
+    const attemptId =
+      owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
+        ? owned.attemptId
+        : newTaskAttemptId();
+    workspace.taskAttemptId = attemptId;
+    workspace.taskStatus = "starting";
+    // This launch's brief id, durable before its send (see TaskLaunchStart).
+    if (start.kind === "sendMessage") workspace.taskPromptSendId = start.sendId;
+    return { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
+  }
+
+  /** Publishes a won launch CAS's attempt and collects the task's launch plan. */
+  private recordQueuedLaunch(
+    request: QueuedTaskLaunchRequest,
+    launch: QueuedLaunchAttempt,
+    launchLease: WorkspaceUseLease,
+    plans: TaskLaunchPlan[]
+  ): void {
+    const { taskId } = request;
+    this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
+    if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
+      this.beginOwnedTaskAttempt(taskId, "launch", launch);
+    }
+    plans.push(this.buildQueuedTaskLaunchPlan(request, launch.attemptId, launchLease));
+  }
+
+  /** The launch plan of a queued task whose launch CAS won, from the drain's snapshots. */
+  private buildQueuedTaskLaunchPlan(
+    request: QueuedTaskLaunchRequest,
+    attemptId: string,
+    launchLease: WorkspaceUseLease
+  ): TaskLaunchPlan {
+    const { taskId, task, agentId, workspaceName } = request;
+    return {
+      taskId,
+      parentWorkspaceId: request.parentWorkspaceId,
+      parentMeta: request.parentMeta,
+      agentId,
+      agentType: task.agentType ?? agentId,
+      start: request.start,
+      title: task.title ?? workspaceName,
+      workspaceName,
+      createdAt: request.createdAt,
+      taskRuntimeConfig: request.taskRuntimeConfig,
+      parentRuntimeConfig: request.parentRuntimeConfig,
+      configProjectPath: request.configProjectPath,
+      workspaceKind: task.kind,
+      taskModelString: task.taskModelString ?? defaultModel,
+      canonicalModel: request.canonicalModel,
+      effectiveThinkingLevel: task.taskThinkingLevel,
+      // Durable pro-mode source: the task record's aiSettings (written at
+      // creation, kept current by subsequent sends' persistence merge).
+      effectiveReasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+      skipInitHook: request.skipInitHook,
+      preferredTrunkBranch: task.taskTrunkBranch,
+      workflowTask: task.workflowTask,
+      bestOf: this.getEffectiveTaskGroup(taskId, task),
+      attemptId,
+      launchLease,
+      // A reservation this process owns keeps its cancellation across the queue.
+      ...(() => {
+        const abortSignal = this.attemptLedger.ownedAttempt(taskId)?.abortSignal;
+        return abortSignal != null ? { abortSignal } : {};
+      })(),
+    };
+  }
+
+  /** Starts the reserved launches after the drain released the mutex; a failed one is marked. */
+  private async launchReservedPlans(plans: readonly TaskLaunchPlan[]): Promise<void> {
     await Promise.allSettled(
       plans.map(async (plan) => {
         try {
