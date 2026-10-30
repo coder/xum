@@ -12,6 +12,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err } from "@/common/types/result";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -30,16 +31,25 @@ import {
 
 const PARENT_ID = "parent";
 const RUN_ID = "wfr_queued_drain";
+const RESERVED_ATTEMPT_ID = "att_0123456789abcdef";
 
 /** The fields of the drain's launch plan these tests read. */
 interface LaunchPlan {
   taskId: string;
   parentMeta: WorkspaceMetadata;
   skipInitHook: boolean;
+  start: { kind: "sendMessage"; sendId: string } | { kind: "resumeStream" };
+  attemptId?: string;
+  abortSignal?: AbortSignal;
 }
 interface Internals {
   enqueueReservedTaskLaunch: (plan: LaunchPlan) => Promise<void>;
   markTaskLaunchFailed: (taskId: string, ...rest: unknown[]) => Promise<void>;
+  beginOwnedTaskAttempt: (
+    taskId: string,
+    source: string,
+    identity: { attemptId: string; receiptEligible: boolean; abortSignal?: AbortSignal }
+  ) => unknown;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -101,6 +111,7 @@ describe("TaskService queue drain paths before the split", () => {
    * Saves PARENT_ID (with the `parent` fields) plus `rows` with `slots` as maxParallelAgentTasks,
    * then builds a TaskService on a fake host. `streaming` names the tasks the AI service reports
    * as streaming. `parentMetadataFails` makes every metadata read of PARENT_ID return Err.
+   * `shuttingDown` makes the host report that shutdown began.
    */
   async function setup(
     rows: WorkspaceConfigEntry[],
@@ -109,6 +120,7 @@ describe("TaskService queue drain paths before the split", () => {
       streaming?: readonly string[];
       parentMetadataFails?: boolean;
       parent?: Partial<WorkspaceConfigEntry>;
+      shuttingDown?: boolean;
     }
   ) {
     await saveWorkspaces(
@@ -128,7 +140,9 @@ describe("TaskService queue drain paths before the split", () => {
           : readMetadata(workspaceId, ...rest)
       );
     }
-    const host = createWorkspaceServiceMocks();
+    const host = createWorkspaceServiceMocks(
+      options.shuttingDown === true ? { isShuttingDown: mock(() => true) } : {}
+    );
     spyOn(host.workspaceService, "registerExternalBackgroundInit").mockImplementation(
       (_workspaceId: string, _controller: AbortController, settlement: Promise<void>) => {
         backgroundInits.push(settlement);
@@ -195,6 +209,18 @@ describe("TaskService queue drain paths before the split", () => {
     expect(row("second")?.taskStatus).toBe("queued");
   });
 
+  test("queued tasks are reserved oldest first, whatever their order in the config", async () => {
+    const { drain, launched } = await setup([queued("newer", 2), queued("older", 1)], {
+      slots: 1,
+    });
+
+    await drain();
+
+    expect(launched()).toEqual(["older"]);
+    expect(row("older")?.taskStatus).toBe("running");
+    expect(row("newer")?.taskStatus).toBe("queued");
+  });
+
   test("a queued task that is already streaming becomes running and takes a slot", async () => {
     // The capacity count already charges the streaming task one of the two slots.
     const { drain, launched } = await setup([queued("streaming", 1), queued("later", 2)], {
@@ -239,13 +265,41 @@ describe("TaskService queue drain paths before the split", () => {
     }
   );
 
+  test("a queued task with a secondary project the config does not list is marked failed", async () => {
+    const { drain, launched, markedFailed } = await setup(
+      [
+        queued("multi", 1, {
+          projects: [
+            { projectPath, projectName: "repo" },
+            { projectPath: "/elsewhere/unlisted", projectName: "unlisted" },
+          ],
+        }),
+        queued("later", 2),
+      ],
+      { slots: 1 }
+    );
+
+    await drain();
+
+    // An unlisted project counts as untrusted. The refusal takes no slot.
+    expect(markedFailed()).toEqual(["multi"]);
+    expect(row("multi")?.taskStatus).toBe("interrupted");
+    expect(row("multi")?.taskLaunchError).toBeDefined();
+    expect(launched()).toEqual(["later"]);
+  });
+
   test.each([
-    ["the project directory's name", undefined, "repo"],
-    ["its projects entry's name", "Named project", "Named project"],
+    ["the project directory's name", "none", "repo"],
+    ["its projects entry's name", "own", "Named project"],
+    ["the project directory's name when its projects list names only others", "others", "repo"],
   ] as const)(
     "a failed parent metadata read launches with metadata from the parent row, named by %s",
-    async (_label, listedName, projectName) => {
-      const projects = listedName == null ? undefined : [{ projectPath, projectName: listedName }];
+    async (_label, listed, projectName) => {
+      const projects = {
+        none: undefined,
+        own: [{ projectPath, projectName: "Named project" }],
+        others: [{ projectPath: path.join(rootDir, "other"), projectName: "Other project" }],
+      }[listed];
       const { drain, plans } = await setup([queued("child", 1)], {
         slots: 1,
         parentMetadataFails: true,
@@ -297,6 +351,74 @@ describe("TaskService queue drain paths before the split", () => {
       expect(row("child")?.taskStatus).toBe("running");
     }
   );
+
+  test("once shutdown began the drain stops at the first launch CAS and leaves the tasks queued", async () => {
+    const { drain, launched, markedFailed } = await setup(
+      [queued("first", 1), queued("second", 2)],
+      { slots: 2, shuttingDown: true }
+    );
+    const leaseHolds = spyOn(workspaceUseLeasesFor(config), "hold");
+
+    await drain();
+
+    // No launch lease for the second task: the drain stopped instead of trying it.
+    expect(leaseHolds.mock.calls.map(([taskId]) => taskId)).toEqual(["first"]);
+    expect(launched()).toEqual([]);
+    expect(markedFailed()).toEqual([]);
+    expect(row("first")?.taskStatus).toBe("queued");
+    expect(row("second")?.taskStatus).toBe("queued");
+  });
+
+  test.each([
+    ["owns", true],
+    ["does not own", false],
+  ] as const)(
+    "a queued task whose reservation this process %s: the plan's attempt id and cancellation",
+    async (_label, owned) => {
+      const { taskService, drain, plans } = await setup(
+        [queued("child", 1, { taskAttemptId: RESERVED_ATTEMPT_ID })],
+        { slots: 1 }
+      );
+      const reservation = new AbortController();
+      if (owned) {
+        internals(taskService).beginOwnedTaskAttempt("child", "reservation", {
+          attemptId: RESERVED_ATTEMPT_ID,
+          receiptEligible: true,
+          abortSignal: reservation.signal,
+        });
+      }
+
+      await drain();
+
+      // An owned reservation keeps its attempt id and its cancellation across the queue; any
+      // other launch rotates the id.
+      const [plan] = plans();
+      expect(plan.taskId).toBe("child");
+      expect(plan.attemptId === RESERVED_ATTEMPT_ID).toBe(owned);
+      expect(plan.abortSignal === reservation.signal).toBe(owned);
+      expect(row("child")?.taskStatus).toBe("running");
+    }
+  );
+
+  test("the launch CAS writes starting, the attempt id and the brief's send id before the launch", async () => {
+    const { taskService, drain, plans } = await setup([queued("child", 1)], { slots: 1 });
+    let rowAtLaunch: WorkspaceConfigEntry | undefined;
+    // Read the row when the drain hands the plan over, then skip the launch.
+    spyOn(internals(taskService), "enqueueReservedTaskLaunch").mockImplementationOnce((plan) => {
+      rowAtLaunch = row(plan.taskId);
+      return Promise.resolve();
+    });
+
+    await drain();
+
+    const [plan] = plans();
+    expect(plan.start.kind).toBe("sendMessage");
+    expect(rowAtLaunch).toMatchObject({
+      taskStatus: "starting",
+      taskAttemptId: plan.attemptId,
+      taskPromptSendId: plan.start.kind === "sendMessage" ? plan.start.sendId : undefined,
+    });
+  });
 
   test("a workflow-owned task whose run ends after the prepass is interrupted in the loop", async () => {
     const { drain, launched, markedFailed, workspaceTurnManager } = await setup(
