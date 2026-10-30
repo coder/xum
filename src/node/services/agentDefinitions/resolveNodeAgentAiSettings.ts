@@ -20,7 +20,11 @@ import type {
   ParsedThinkingInput,
   ThinkingLevel,
 } from "@/common/types/thinking";
-import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import {
+  resolveAgentAiSettings,
+  resolveAgentCacheTtl,
+} from "@/common/utils/ai/resolveAgentAiSettings";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
@@ -130,6 +134,19 @@ export function collectDefinitionLayers(
     }
   }
   return { targetDefinitionAiDefaults, ancestors: [...ancestorsById.values()] };
+}
+
+/** The agent's prompt-cache TTL over its resolved inheritance chain (see resolveAgentCacheTtl). */
+export function resolveChainAgentCacheTtl(
+  agentId: string,
+  agentAiDefaults: AgentAiDefaults | undefined,
+  chain: Parameters<typeof collectDefinitionLayers>[1]
+): AnthropicCacheTtl | undefined {
+  return resolveAgentCacheTtl({
+    targetAgentId: agentId,
+    agentAiDefaults,
+    ...collectDefinitionLayers(agentId, chain),
+  })?.value;
 }
 
 /** Definition-derived resolver layers for one agent (target defaults + declared ancestors). */

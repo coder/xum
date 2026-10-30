@@ -69,8 +69,7 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
-import { collectDefinitionLayers } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
-import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
+import { resolveChainAgentCacheTtl } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -331,6 +330,26 @@ import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService"
  * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
  * presence says PTC ran.
  */
+/**
+ * The TTL of the turn's Anthropic cache markers. The running agent's TTL wins on a cache-capable
+ * model. Otherwise markers honor a TTL set through per-model providerOptions extras when the
+ * dedicated mux-level setting is unset, matching the pre-assembler request-config behavior.
+ */
+function resolveTurnAnthropicCacheTtl(input: {
+  agentCacheTtl: AnthropicCacheTtl | undefined;
+  modelString: string;
+  providersConfig: ProvidersConfigMap;
+  muxProviderOptions: MuxProviderOptions;
+  providerOptions: Record<string, unknown>;
+}): AnthropicCacheTtl | undefined {
+  if (input.agentCacheTtl && supportsAnthropicCache(input.modelString, input.providersConfig)) {
+    return input.agentCacheTtl;
+  }
+  return (
+    input.muxProviderOptions.anthropic?.cacheTtl ?? getAnthropicCacheTtl(input.providerOptions)
+  );
+}
+
 function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
   return ptcEnabled && tools.code_execution !== undefined;
 }
@@ -2289,11 +2308,11 @@ export class TurnRequestBuilder {
       effectiveToolPolicy: agentToolPolicy,
       switchableAgents: resolvedSwitchableAgents,
     } = agentResult.data;
-    agentAnthropicCacheTtl = resolveAgentCacheTtl({
-      targetAgentId: effectiveAgentId,
-      agentAiDefaults: cfg.agentAiDefaults,
-      ...collectDefinitionLayers(effectiveAgentId, agentInheritanceChain),
-    })?.value;
+    agentAnthropicCacheTtl = resolveChainAgentCacheTtl(
+      effectiveAgentId,
+      cfg.agentAiDefaults,
+      agentInheritanceChain
+    );
     // Side conversations must not inherit completion requirements for work in the main chat.
     // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
     const effectiveToolPolicy = isSideChat
@@ -3535,15 +3554,13 @@ export class TurnRequestBuilder {
           reasoningMode,
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
-        // The agent's TTL wins. Otherwise manual cache markers must honor a TTL set through
-        // per-model providerOptions extras when the dedicated mux-level setting is unset,
-        // matching the pre-assembler request-config behavior.
-        const effectiveAnthropicCacheTtl =
-          (supportsAnthropicCache(seed.rawModelString, seed.providersConfig)
-            ? agentAnthropicCacheTtl
-            : undefined) ??
-          effectiveMuxProviderOptions.anthropic?.cacheTtl ??
-          getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        const effectiveAnthropicCacheTtl = resolveTurnAnthropicCacheTtl({
+          agentCacheTtl: agentAnthropicCacheTtl,
+          modelString: seed.rawModelString,
+          providersConfig: seed.providersConfig,
+          muxProviderOptions: effectiveMuxProviderOptions,
+          providerOptions: preparedAttempt.providerOptions,
+        });
         const forcedFirstStepToolNames =
           seed.routeProvider === "xai"
             ? getForcedXaiSearchToolNames(

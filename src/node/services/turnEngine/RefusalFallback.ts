@@ -12,7 +12,7 @@ import { hasTokenUsage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
-import { applyCacheControl, getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { applyCacheControl, getRequestAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
@@ -167,7 +167,7 @@ export function buildFallbackPrefix(
       ? applyCacheControl(
           conversation,
           "anthropic:prefix",
-          nextRequest.anthropicCacheTtl ?? getAnthropicCacheTtl(nextRequest.providerOptions)
+          getRequestAnthropicCacheTtl(nextRequest)
         )
       : conversation),
   ];

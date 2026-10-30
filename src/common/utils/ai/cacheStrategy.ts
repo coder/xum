@@ -52,6 +52,18 @@ export function getAnthropicCacheTtl(
 }
 
 /**
+ * A built request's marker TTL: the turn's resolved TTL (the agent's, else the global one), else
+ * a per-model providerOptions extra. Markers added to the request later (a continuous-compaction
+ * or refusal-fallback prefix) use it, so no 1h marker follows a 5m one.
+ */
+export function getRequestAnthropicCacheTtl(request: {
+  anthropicCacheTtl?: AnthropicCacheTtl;
+  providerOptions?: Record<string, unknown>;
+}): AnthropicCacheTtl | undefined {
+  return request.anthropicCacheTtl ?? getAnthropicCacheTtl(request.providerOptions);
+}
+
+/**
  * Check if a model supports Anthropic cache control.
  *
  * Coder gateway strings resolve their wire from instance metadata FIRST (raw

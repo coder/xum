@@ -25,7 +25,10 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
+  AGENT_AI_DEFAULTS_SCALAR_FIELDS,
+  isEmptyAgentAiDefaultsEntry,
   normalizeAgentAiDefaults,
   type AgentAiDefaults,
   type AgentAiDefaultsEntry,
@@ -118,16 +121,7 @@ function updateAgentDefaultEntry(
     updated.thinkingLevel = enforceThinkingPolicy(updated.modelString, updated.thinkingLevel);
   }
 
-  if (
-    !updated.modelString &&
-    !updated.thinkingLevel &&
-    !updated.reasoningMode &&
-    updated.autoModelRouting === undefined &&
-    updated.autoThinkingLevel === undefined &&
-    updated.enabled === undefined &&
-    updated.cacheTtl === undefined &&
-    updated.subagent === undefined
-  ) {
+  if (isEmptyAgentAiDefaultsEntry(updated)) {
     delete next[normalizedId];
   } else {
     next[normalizedId] = updated;
@@ -343,25 +337,11 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
 
     const aEntry = a[key];
     const bEntry = b[key];
-    if ((aEntry?.modelString ?? undefined) !== (bEntry?.modelString ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.thinkingLevel ?? undefined) !== (bEntry?.thinkingLevel ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.reasoningMode ?? undefined) !== (bEntry?.reasoningMode ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.autoModelRouting ?? undefined) !== (bEntry?.autoModelRouting ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.autoThinkingLevel ?? undefined) !== (bEntry?.autoThinkingLevel ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
-      return false;
-    }
-    if ((aEntry?.cacheTtl ?? undefined) !== (bEntry?.cacheTtl ?? undefined)) {
+    if (
+      AGENT_AI_DEFAULTS_SCALAR_FIELDS.some(
+        (field) => (aEntry?.[field] ?? undefined) !== (bEntry?.[field] ?? undefined)
+      )
+    ) {
       return false;
     }
     if (!areSubagentProfilesEqual(aEntry?.subagent, bEntry?.subagent)) {
@@ -443,6 +423,58 @@ function PromptCacheTtlControl(props: PromptCacheTtlControlProps) {
       <div className="text-muted text-xs">Applies to Anthropic models only.</div>
     </div>
   );
+}
+
+function withAgentCacheTtl(
+  previous: AgentAiDefaults,
+  agentId: string,
+  value: AnthropicCacheTtl | undefined
+): AgentAiDefaults {
+  return updateAgentDefaultEntry(previous, agentId, (updated) => {
+    if (value === undefined) {
+      delete updated.cacheTtl;
+    } else {
+      updated.cacheTtl = value;
+    }
+  });
+}
+
+/**
+ * The Prompt cache control of one agent card, or undefined where a TTL does nothing. Inherit
+ * shows what the backend resolves without the agent's own Settings value: the shared per-agent
+ * walk (its frontmatter, then each declared base), then the global Anthropic TTL.
+ */
+function buildPromptCacheTtlProps(input: {
+  agentId: string;
+  definition: AgentDefinitionDescriptor | undefined;
+  listedAgents: readonly AgentDefinitionDescriptor[];
+  agentAiDefaults: AgentAiDefaults;
+  providersConfig: ProvidersConfigMap | null;
+  onChange: (value: AnthropicCacheTtl | undefined) => void;
+}): PromptCacheTtlControlProps | undefined {
+  if (NO_CACHE_TTL_AGENT_IDS.has(input.agentId)) return undefined;
+  const descriptorsById = new Map(
+    input.listedAgents.map((agent) => [
+      agent.id,
+      { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+    ])
+  );
+  const ownEntry = input.agentAiDefaults[input.agentId];
+  const inherited = resolveAgentCacheTtl({
+    targetAgentId: input.agentId,
+    agentAiDefaults: {
+      ...input.agentAiDefaults,
+      [input.agentId]: { ...ownEntry, cacheTtl: undefined },
+    },
+    targetDefinitionAiDefaults: input.definition?.aiDefaults,
+    ancestors: collectDeclaredAncestorLayers(input.agentId, descriptorsById),
+  });
+  return {
+    agentId: input.agentId,
+    value: ownEntry?.cacheTtl,
+    inheritedValue: inherited?.value ?? input.providersConfig?.anthropic?.cacheTtl ?? "5m",
+    onChange: input.onChange,
+  };
 }
 
 /** The Reasoning half of AiDefaultsControls. */
@@ -964,46 +996,15 @@ export function TasksSection() {
     );
   };
 
-  const setAgentCacheTtl = (agentId: string, value: AnthropicCacheTtl | undefined) => {
-    setAgentAiDefaults((prev) =>
-      updateAgentDefaultEntry(prev, agentId, (updated) => {
-        if (value === undefined) {
-          delete updated.cacheTtl;
-        } else {
-          updated.cacheTtl = value;
-        }
-      })
-    );
-  };
-
-  // Inherit shows what the backend resolves without this agent's own Settings value: the
-  // shared per-agent walk (frontmatter, then each base), then the global Anthropic TTL.
-  const getCacheTtlProps = (
-    agentId: string,
-    definition: AgentDefinitionDescriptor | undefined
-  ): PromptCacheTtlControlProps => {
-    const descriptorsById = new Map(
-      listedAgents.map((agent) => [
-        agent.id,
-        { base: agent.base, definitionAiDefaults: agent.aiDefaults },
-      ])
-    );
-    const inherited = resolveAgentCacheTtl({
-      targetAgentId: agentId,
-      agentAiDefaults: {
-        ...agentAiDefaults,
-        [agentId]: { ...agentAiDefaults[agentId], cacheTtl: undefined },
-      },
-      targetDefinitionAiDefaults: definition?.aiDefaults,
-      ancestors: collectDeclaredAncestorLayers(agentId, descriptorsById),
-    })?.value;
-    return {
+  const getCacheTtlProps = (agentId: string, definition: AgentDefinitionDescriptor | undefined) =>
+    buildPromptCacheTtlProps({
       agentId,
-      value: agentAiDefaults[agentId]?.cacheTtl,
-      inheritedValue: inherited ?? providersConfig?.anthropic?.cacheTtl ?? "5m",
-      onChange: (value) => setAgentCacheTtl(agentId, value),
-    };
-  };
+      definition,
+      listedAgents,
+      agentAiDefaults,
+      providersConfig,
+      onChange: (value) => setAgentAiDefaults((prev) => withAgentCacheTtl(prev, agentId, value)),
+    });
 
   const resetAgentEnabled = (agentId: string) => {
     setAgentAiDefaults((prev) =>
@@ -1199,9 +1200,7 @@ export function TasksSection() {
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
           {...(agent.uiSelectable ? getAutoRoutingProps(agent.id, entry) : {})}
-          {...(NO_CACHE_TTL_AGENT_IDS.has(agent.id)
-            ? {}
-            : { cacheTtl: getCacheTtlProps(agent.id, agent) })}
+          cacheTtl={getCacheTtlProps(agent.id, agent)}
           onModelChange={(value) => setAgentModel(agent.id, value)}
           onThinkingChange={(value) => setAgentThinking(agent.id, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agent.id, mode)}
@@ -1284,9 +1283,7 @@ export function TasksSection() {
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
           {...getAutoRoutingProps(agentId, entry)}
-          {...(NO_CACHE_TTL_AGENT_IDS.has(agentId)
-            ? {}
-            : { cacheTtl: getCacheTtlProps(agentId, undefined) })}
+          cacheTtl={getCacheTtlProps(agentId, undefined)}
           onModelChange={(value) => setAgentModel(agentId, value)}
           onThinkingChange={(value) => setAgentThinking(agentId, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agentId, mode)}
