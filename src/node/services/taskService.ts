@@ -7607,62 +7607,83 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
 
-    if (sharesParentCheckout) {
+    await this.initReservedLaunchWorkspace(plan, checkout);
+  }
+
+  /**
+   * Starts the init in the task's own checkout (a shared parent checkout skips it), then admits
+   * the prompt.
+   */
+  private async initReservedLaunchWorkspace(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
+    if (checkout.sharesParentCheckout) {
       // The parent's checkout is already initialized and live; re-running init would redundantly
       // (and possibly disruptively) mutate it. Skip init entirely.
-      initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
-      initLogger.logComplete(0);
-    } else {
-      const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+      checkout.initLogger.logStep(
+        "Sharing parent workspace (isolation: none) — skipping fork and init"
       );
-      // The sanitize and secrets awaits above leave a window in which the parent can cancel this
-      // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
-      // started after that: a cancel and a Stop never do, and a removal aborts only the init
-      // already running at its mark. So recheck all four right before starting the init (the
-      // abort signal alone misses the Stop and the removal).
-      if (plan.abortSignal?.aborted) {
-        await this.cancelMaterializedLaunch(plan, checkout);
-        return;
-      }
-      let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
-      try {
-        // Strict: an unreadable config.json must not read as a removed row, or the launch would
-        // return without settling and leave the row `starting`. The throw reaches
-        // scheduleReservedTaskLaunch, which marks the launch failed.
-        entryBeforeInit = findWorkspaceEntry(
-          this.config.loadConfigOrDefault({ throwOnError: true }),
-          plan.taskId
-        );
-      } catch (error) {
-        initLogger.logComplete(-1);
-        throw error;
-      }
-      if (!entryBeforeInit) {
-        initLogger.logComplete(-1);
-        await this.cleanupLaunchCheckout(plan, checkout);
-        return;
-      }
-      if (
-        entryBeforeInit.workspace.taskStatus !== "starting" ||
-        this.launchSuperseded(plan, entryBeforeInit.workspace)
-      ) {
-        initLogger.logComplete(-1);
-        return;
-      }
-      if (entryBeforeInit.workspace.pendingRemoval != null) {
-        // As the admission below would refuse it: the removal owns the row and its checkout.
-        initLogger.logComplete(-1);
-        await this.cleanupLaunchCheckout(plan, checkout);
-        throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
-      }
-      this.registerTaskBackgroundInit(
-        plan,
-        { initLogger, workspacePath, trunkBranch, runtimeForTaskWorkspace },
-        secrets
-      );
+      checkout.initLogger.logComplete(0);
+      await this.admitReservedLaunchPrompt(plan, checkout);
+      return;
     }
+    const secrets = await secretsToRecord(
+      this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
+    );
+    // The sanitize and secrets awaits above leave a window in which the parent can cancel this
+    // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
+    // started after that: a cancel and a Stop never do, and a removal aborts only the init
+    // already running at its mark. So recheck all four right before starting the init (the
+    // abort signal alone misses the Stop and the removal).
+    if (plan.abortSignal?.aborted) {
+      await this.cancelMaterializedLaunch(plan, checkout);
+      return;
+    }
+    await this.registerReservedLaunchInit(plan, checkout, secrets);
+  }
 
+  /**
+   * The three row rechecks after the abort check (a strict read, the status and attempt, a
+   * removal mark), then the init registration and the prompt admission, in the same tick.
+   */
+  private async registerReservedLaunchInit(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout,
+    secrets: Record<string, string>
+  ): Promise<void> {
+    let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
+    try {
+      // Strict: an unreadable config.json must not read as a removed row, or the launch would
+      // return without settling and leave the row `starting`. The throw reaches
+      // scheduleReservedTaskLaunch, which marks the launch failed.
+      entryBeforeInit = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        plan.taskId
+      );
+    } catch (error) {
+      checkout.initLogger.logComplete(-1);
+      throw error;
+    }
+    if (!entryBeforeInit) {
+      checkout.initLogger.logComplete(-1);
+      await this.cleanupLaunchCheckout(plan, checkout);
+      return;
+    }
+    if (
+      entryBeforeInit.workspace.taskStatus !== "starting" ||
+      this.launchSuperseded(plan, entryBeforeInit.workspace)
+    ) {
+      checkout.initLogger.logComplete(-1);
+      return;
+    }
+    if (entryBeforeInit.workspace.pendingRemoval != null) {
+      // As the admission below would refuse it: the removal owns the row and its checkout.
+      checkout.initLogger.logComplete(-1);
+      await this.cleanupLaunchCheckout(plan, checkout);
+      throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
+    }
+    this.registerTaskBackgroundInit(plan, checkout, secrets);
     await this.admitReservedLaunchPrompt(plan, checkout);
   }
 
