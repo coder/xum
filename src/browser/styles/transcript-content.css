@@ -239,7 +239,9 @@
 
 .markdown-content .mermaid-container {
   display: flex;
-  justify-content: center;
+  /* safe: Pele SVGs keep their measured width, so a wide diagram overflows. Plain center
+     would push its left edge out of the scrollable area. */
+  justify-content: safe center;
   align-items: center;
   overflow: auto;
   max-width: 100%;
