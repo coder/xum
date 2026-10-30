@@ -265,6 +265,22 @@ function ChangeList(props: {
   );
 }
 
+function SkippedNotice(props: { intro: string; items: readonly string[] | undefined }) {
+  if (props.items === undefined || props.items.length === 0) return null;
+  return (
+    <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+      {props.intro}
+      <ul className="mt-1 list-disc pl-4">
+        {props.items.map((item) => (
+          <li key={item} className="break-words">
+            {item}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
 // only while focus is in the dialog hosting this section, never in a nested dialog or popover.
 // A nested dialog without a trigger drops focus to the body when it closes; the section owns the
@@ -316,6 +332,7 @@ export function BackupSection() {
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
   // Pinned artifacts the last preview, push, or restore left out, each with its reason.
   const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
+  const [symlinkSkipped, setSymlinkSkipped] = useState<string[]>();
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -393,6 +410,7 @@ export function BackupSection() {
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
           setShelfSkipped([]);
+          setSymlinkSkipped(undefined);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -504,6 +522,7 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setShelfSkipped([]);
+      setSymlinkSkipped(undefined);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -572,6 +591,7 @@ export function BackupSection() {
     setProjectImports([]);
     setProjectBundleSkipped(false);
     setShelfSkipped([]);
+    setSymlinkSkipped(undefined);
 
     try {
       const result = await api.backup.preview(requestDraft);
@@ -605,6 +625,7 @@ export function BackupSection() {
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(result.data.symlinkSkipped);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -648,6 +669,7 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(undefined);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -725,6 +747,7 @@ export function BackupSection() {
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
+      setSymlinkSkipped(result.data.symlinkSkipped);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -1115,16 +1138,11 @@ export function BackupSection() {
         </div>
       ) : null}
 
-      {shelfSkipped.length > 0 ? (
-        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
-          Some pinned artifacts were left out:
-          <ul className="mt-1 list-disc pl-4">
-            {shelfSkipped.map((notice) => (
-              <li key={notice}>{notice}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      <SkippedNotice intro="Some pinned artifacts were left out:" items={shelfSkipped} />
+      <SkippedNotice
+        intro="These backed-up files were not restored because their local path is a symlink:"
+        items={symlinkSkipped}
+      />
 
       {projectImports.length > 0 ? (
         <div className="border-border-light space-y-3 rounded-md border p-3">

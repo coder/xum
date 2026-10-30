@@ -97,6 +97,8 @@ export interface BackupPayloadStore {
     projectBundleSkipped: boolean;
     /** Shelf files a restore would not write, with the reason (M5c). */
     shelfSkipped?: string[];
+    /** Backed-up files left untouched because their local path is a symlink. */
+    symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -127,6 +129,8 @@ export interface BackupPayloadStore {
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
     shelfSkipped?: string[];
+    /** Backed-up files left untouched because their local path is a symlink. */
+    symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -573,6 +577,8 @@ export class BackupService {
         projectBundleSkipped: boolean;
         /** Artifact shelf files left out of the push or the restore, with the reason. */
         shelfSkipped: string[];
+        /** Backed-up files left untouched because their local path is a symlink. */
+        symlinkSkipped?: string[];
         pushError: string | null;
       },
       BackupOperationError
@@ -618,6 +624,7 @@ export class BackupService {
           ...("pushError" in exported ? [] : (exported.shelfSkipped ?? [])),
           ...(restorePreview.shelfSkipped ?? []),
         ],
+        symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
@@ -708,6 +715,8 @@ export class BackupService {
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
         shelfSkipped: string[];
+        /** Backed-up files left untouched because their local path is a symlink. */
+        symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -826,6 +835,7 @@ export class BackupService {
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
               shelfSkipped: restored.shelfSkipped ?? [],
+              symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>

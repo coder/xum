@@ -2784,6 +2784,47 @@ async function assertRestoreDestinationWritable(
 }
 
 /**
+ * Drops the backed-up files whose local destination passes through a symlink, leaf included.
+ * A user who links `skills/<name>` into a shared skills store chose that link, and a backup
+ * pushed before it still holds the real folder: refusing the whole payload failed every preview
+ * and restore. Push skips symlinks too, so neither direction touches these files. A symlink that
+ * appears after this check is still refused when the restore writes.
+ */
+export async function omitSymlinkedDestinations(
+  muxRoot: string,
+  payload: BackupPayload
+): Promise<{ payload: BackupPayload; skipped: string[] }> {
+  const root = await resolveRoot(muxRoot);
+  const skipped = new Set<string>();
+  for (const file of payload.files) {
+    // Merged into config.json, never written at its own path.
+    if (file.path === "preferences.json") continue;
+    let current = root.path;
+    for (const segment of file.path.split("/")) {
+      current = path.join(current, segment);
+      const existing = await lstatOrNull(current);
+      if (existing === null) break;
+      if (existing.isSymbolicLink()) {
+        skipped.add(file.path);
+        break;
+      }
+    }
+  }
+  if (skipped.size === 0) return { payload, skipped: [] };
+  return {
+    payload: {
+      ...payload,
+      files: payload.files.filter((file) => !skipped.has(file.path)),
+      manifest: {
+        ...payload.manifest,
+        files: payload.manifest.files.filter((file) => !skipped.has(file.path)),
+      },
+    },
+    skipped: [...skipped].sort(),
+  };
+}
+
+/**
  * Everything a restore can reject before it writes anything, so a path or a limit that
  * refuses the payload cannot leave a half-restored install behind. `BackupService.restore`
  * runs this ahead of the safety snapshot too: a refused restore changes nothing, so it must
