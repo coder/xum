@@ -180,43 +180,12 @@ export function restorePostCompactionContextBefore(
     requestHistorySequence >= context.omittedFromRequestSequence
   )
     return messages;
+  const { omittedFromRequestSequence: _omitted, ...restored } = context;
   return messages.map((message, messageIndex) =>
-    messageIndex === index ? withHeaderRendered(message, context) : message
+    messageIndex === index
+      ? { ...message, metadata: { ...message.metadata, postCompactionContext: restored } }
+      : message
   );
-}
-
-/**
- * Edit and fork truncation: the latest boundary renders its header again when the cut removed
- * every row that a request without the header saw. The retained turns ran with the header, and
- * the request that overflowed is gone.
- */
-export function restorePostCompactionContextAfterCut(
-  retained: readonly MuxMessage[]
-): (message: MuxMessage) => MuxMessage {
-  const boundary = retained.findLast(isDurableContextBoundaryMarker);
-  const context = boundary ? readPersistedPostCompactionContext(boundary) : null;
-  if (!boundary || !context || !retainsOnlyRowsBeforeOmission(retained, context))
-    return (message) => message;
-  return (message) =>
-    message.id === boundary.id
-      ? shiftContextUsageByHeader(withHeaderRendered(message, context), 1)
-      : message;
-}
-
-function retainsOnlyRowsBeforeOmission(
-  retained: readonly MuxMessage[],
-  context: PostCompactionContext
-): boolean {
-  const omittedFrom = context.omittedFromRequestSequence;
-  return (
-    omittedFrom != null &&
-    !retained.some((message) => (message.metadata?.historySequence ?? -1) >= omittedFrom)
-  );
-}
-
-function withHeaderRendered(boundary: MuxMessage, context: PostCompactionContext): MuxMessage {
-  const { omittedFromRequestSequence: _omitted, ...rendered } = context;
-  return { ...boundary, metadata: { ...boundary.metadata, postCompactionContext: rendered } };
 }
 
 /**

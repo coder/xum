@@ -7,7 +7,6 @@ import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
-import { findPostCompactionContext, omitPostCompactionContextFrom } from "./postCompactionContext";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
@@ -1086,44 +1085,6 @@ describe("HistoryService", () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].id).toBe("msg1");
       expect(messages[1].id).toBe("msg2");
-    });
-
-    it("renders a left-out header again once the cut removes every request without it", async () => {
-      const workspaceId = "workspace-header-cut";
-      const usage = { inputTokens: 100, outputTokens: 0, totalTokens: 100 };
-      const boundary = createMuxMessage("summary", "assistant", "summary", {
-        compacted: "user",
-        compactionBoundary: true,
-        compactionEpoch: 1,
-        contextUsage: usage,
-        postCompactionContext: { text: "CTX", skillNames: [] },
-      });
-      await service.appendToHistory(workspaceId, boundary);
-      for (const [id, role] of [
-        ["u1", "user"],
-        ["a1", "assistant"],
-        ["u2", "user"],
-        ["a2", "assistant"],
-      ] as const) {
-        await service.appendToHistory(workspaceId, createMuxMessage(id, role, id));
-      }
-      // The u2 request overflowed, and its retry left the header out from u2's sequence on.
-      const omitted = omitPostCompactionContextFrom(boundary, 3);
-      assert(omitted, "expected the header to be left out");
-      expect((await service.updateHistory(workspaceId, omitted)).success).toBe(true);
-      const latestBoundary = async () => {
-        const history = await service.getHistoryFromLatestBoundary(workspaceId);
-        assert(history.success);
-        return history.data;
-      };
-
-      await service.truncateAfterMessage(workspaceId, "u2", { keepTargetMessage: true });
-      expect(findPostCompactionContext(await latestBoundary())).toBeNull();
-
-      await service.truncateAfterMessage(workspaceId, "a1", { keepTargetMessage: true });
-      const restored = await latestBoundary();
-      expect(findPostCompactionContext(restored)?.text).toBe("CTX");
-      expect(restored[0].metadata?.contextUsage).toEqual(usage);
     });
   });
 
