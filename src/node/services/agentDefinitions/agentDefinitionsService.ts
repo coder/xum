@@ -15,6 +15,7 @@ import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
+import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
 import {
   execBuffered,
   readFileString,
@@ -864,6 +865,30 @@ export interface ReadAgentDefinitionOptions {
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
 
+/** The skip scope of a base read in an inheritance walk: whichever of the two skips more. */
+function mergeSkipScopesAbove(
+  a: AgentDefinitionScope | undefined,
+  b: AgentDefinitionScope | undefined
+): AgentDefinitionScope | undefined {
+  if (!a) {
+    return b;
+  }
+  if (!b) {
+    return a;
+  }
+
+  const aIndex = SCOPE_PRIORITY.indexOf(a);
+  const bIndex = SCOPE_PRIORITY.indexOf(b);
+
+  // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
+  if (aIndex === -1 || bIndex === -1) {
+    return a;
+  }
+
+  // Prefer the scope that skips *more* (e.g. global skips project+global).
+  return aIndex > bIndex ? a : b;
+}
+
 /** The caller's roots, else the default roots for its trust (discovery and reads share it). */
 function resolveAgentDefinitionsRoots(
   runtime: Runtime,
@@ -1073,28 +1098,6 @@ export async function resolveAgentBody(
   const visited = new Set<string>();
   const baseReadOptions = pickInheritedReadOptions(options);
 
-  function mergeSkipScopesAbove(
-    a: AgentDefinitionScope | undefined,
-    b: AgentDefinitionScope | undefined
-  ): AgentDefinitionScope | undefined {
-    if (!a) {
-      return b;
-    }
-    if (!b) {
-      return a;
-    }
-
-    const aIndex = SCOPE_PRIORITY.indexOf(a);
-    const bIndex = SCOPE_PRIORITY.indexOf(b);
-
-    // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
-    if (aIndex === -1 || bIndex === -1) {
-      return a;
-    }
-
-    return aIndex > bIndex ? a : b;
-  }
-
   async function resolve(
     id: AgentId,
     depth: number,
@@ -1197,16 +1200,14 @@ function deepMergeAgentFrontmatter(
   return overlay;
 }
 
-type AgentFrontmatterAi = NonNullable<AgentDefinitionPackage["frontmatter"]["ai"]>;
-
-interface ResolvedAgentDefinitionWithOwnAi {
+interface ResolvedAgentDefinitionWithAiChain {
   definition: AgentDefinitionPackage;
   /**
-   * The agent's own `ai` layer: its hops of the same ID (project `exec.md` with `base: exec`)
-   * merged closer-first, without a different-ID base. Mirrors collectDefinitionLayers' target.
-   * Never undefined, so a listed descriptor always marks its aiDefaults as merged.
+   * Each hop's own (unmerged) `ai`, target first. The walk skips the scopes that
+   * resolveAgentInheritanceChain skips, so collectDefinitionLayers over it gives the layers a
+   * run of the agent resolves.
    */
-  ownAi: AgentFrontmatterAi;
+  aiChain: Array<{ id: AgentId; ai?: AgentDefinitionPackage["frontmatter"]["ai"] }>;
 }
 
 /**
@@ -1220,16 +1221,16 @@ export async function resolveAgentDefinition(
   agentId: AgentId,
   options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
-  return (await resolveAgentDefinitionWithOwnAi(runtime, workspacePath, agentId, options))
+  return (await resolveAgentDefinitionWithAiChain(runtime, workspacePath, agentId, options))
     .definition;
 }
 
-async function resolveAgentDefinitionWithOwnAi(
+async function resolveAgentDefinitionWithAiChain(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
   options: ReadAgentDefinitionOptions
-): Promise<ResolvedAgentDefinitionWithOwnAi> {
+): Promise<ResolvedAgentDefinitionWithAiChain> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -1237,34 +1238,11 @@ async function resolveAgentDefinitionWithOwnAi(
   const visited = new Set<string>();
   const baseReadOptions = pickInheritedReadOptions(options);
 
-  function mergeSkipScopesAbove(
-    a: AgentDefinitionScope | undefined,
-    b: AgentDefinitionScope | undefined
-  ): AgentDefinitionScope | undefined {
-    if (!a) {
-      return b;
-    }
-    if (!b) {
-      return a;
-    }
-
-    const aIndex = SCOPE_PRIORITY.indexOf(a);
-    const bIndex = SCOPE_PRIORITY.indexOf(b);
-
-    // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
-    if (aIndex === -1 || bIndex === -1) {
-      return a;
-    }
-
-    // Prefer the scope that skips *more* (e.g. global skips project+global).
-    return aIndex > bIndex ? a : b;
-  }
-
   async function resolve(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<ResolvedAgentDefinitionWithOwnAi> {
+  ): Promise<ResolvedAgentDefinitionWithAiChain> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -1282,9 +1260,10 @@ async function resolveAgentDefinitionWithOwnAi(
     }
     visited.add(visitKey);
 
+    const hop = { id: pkg.id, ai: pkg.frontmatter.ai };
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return { definition: pkg, ownAi: pkg.frontmatter.ai ?? {} };
+      return { definition: pkg, aiChain: [hop] };
     }
 
     const resolvedBase = await resolve(
@@ -1303,10 +1282,6 @@ async function resolveAgentDefinitionWithOwnAi(
     }
 
     const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
-    const ownAi =
-      baseId === pkg.id
-        ? { ...resolvedBase.ownAi, ...pkg.frontmatter.ai }
-        : (pkg.frontmatter.ai ?? {});
     return {
       definition: {
         ...pkg,
@@ -1316,7 +1291,7 @@ async function resolveAgentDefinitionWithOwnAi(
             ? pkg.body
             : `${base.body}${separator}${pkg.body}`,
       },
-      ownAi,
+      aiChain: [hop, ...resolvedBase.aiChain],
     };
   }
 
@@ -1435,7 +1410,7 @@ export async function listAgentDefinitions(
   const resolved = await Promise.all(
     descriptors.map(async (descriptor) => {
       try {
-        const resolvedDefinition = await resolveAgentDefinitionWithOwnAi(
+        const resolvedDefinition = await resolveAgentDefinitionWithAiChain(
           runtime,
           discoveryPath,
           descriptor.id,
@@ -1451,7 +1426,11 @@ export async function listAgentDefinitions(
           input.includeDisabled !== true
         )
           return null;
-        return { descriptor, resolvedFrontmatter, ownAi: resolvedDefinition.ownAi };
+        return {
+          descriptor,
+          resolvedFrontmatter,
+          aiLayers: collectDefinitionLayers(descriptor.id, resolvedDefinition.aiChain),
+        };
       } catch {
         return { descriptor };
       }
@@ -1471,7 +1450,7 @@ export async function listAgentDefinitions(
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
-        ownAiDefaults: entry.ownAi,
+        aiLayers: entry.aiLayers,
         tools: frontmatter.tools,
       },
     ];

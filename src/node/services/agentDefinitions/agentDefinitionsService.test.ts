@@ -255,10 +255,56 @@ describe("agentDefinitionsService", () => {
     const byId = (id: string) => agents.find((agent) => agent.id === id);
 
     // A same-ID hop refines the built-in explore (cacheTtl 5m) inside its own layer.
-    expect(byId("explore")?.ownAiDefaults).toEqual({ cacheTtl: "5m", thinkingLevel: "high" });
+    expect(byId("explore")?.aiLayers?.targetDefinitionAiDefaults).toEqual({
+      cacheTtl: "5m",
+      thinkingLevel: "high",
+    });
     // Scout inherits explore's frontmatter, which stays out of its own layer.
     expect(byId("scout")?.aiDefaults).toEqual({ cacheTtl: "5m", thinkingLevel: "high" });
-    expect(byId("scout")?.ownAiDefaults).toEqual({});
+    expect(byId("scout")?.aiLayers).toEqual({
+      ancestors: [
+        { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m", thinkingLevel: "high" } },
+        { agentId: "exec" },
+      ],
+    });
+  });
+
+  test("Settings lists the base layers a run resolves, which listed bases cannot show", async () => {
+    using project = new DisposableTempDir("agent-list-ancestor-ai");
+    using home = new DisposableTempDir("agent-list-ancestor-ai-home");
+    const write = async (root: string, id: string, frontmatter: string) => {
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(path.join(root, `${id}.md`), `---\nname: ${id}\n${frontmatter}---\nBody.`);
+    };
+    const projectRoot = path.join(project.path, ".xum", "agents");
+    const globalRoot = path.join(home.path, "agents");
+    await write(globalRoot, "refined", "base: exec\n");
+    await write(projectRoot, "refined", "base: refined\n");
+    await write(globalRoot, "helper", "base: exec\n");
+    await write(projectRoot, "bar", "base: helper\n");
+    await write(projectRoot, "exec", "base: exec\nai:\n  cacheTtl: 1h\n");
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+        projectPath: project.path,
+      });
+      const byId = (id: string) => agents.find((agent) => agent.id === id);
+
+      // The project refinement lists `base: refined`, yet runs reach the global agent's base.
+      expect(byId("refined")?.base).toBe("refined");
+      expect(byId("refined")?.aiLayers?.ancestors).toEqual([{ agentId: "exec" }]);
+      // The listed exec is the project's, but a global agent's base resolves past project agents.
+      expect(byId("exec")?.aiLayers?.targetDefinitionAiDefaults).toEqual({ cacheTtl: "1h" });
+      expect(byId("bar")?.aiLayers?.ancestors).toEqual([
+        { agentId: "helper" },
+        { agentId: "exec" },
+      ]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   });
 
   test.each([true, false])(

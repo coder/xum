@@ -1270,28 +1270,74 @@ describe("TasksSection prompt cache TTL", () => {
   });
 
   test("Inherit ranks a base's Settings value above frontmatter merged from that base", async () => {
-    setGlobalCacheTtl("1h");
     const explore = FALLBACK_AGENTS.find((agent) => agent.id === "explore")!;
+    const subagent = { scope: "project" as const, uiSelectable: false, subagentRunnable: true };
     const view = renderTasksSection({
       agentAiDefaults: { explore: { cacheTtl: "1h" } },
       agents: [
         ...FALLBACK_AGENTS,
         {
+          ...subagent,
           id: "scout",
-          scope: "project",
           name: "Scout",
           base: "explore",
-          uiSelectable: false,
-          subagentRunnable: true,
           // agents.list merges explore's frontmatter 5m into Scout's aiDefaults.
           aiDefaults: explore.aiDefaults,
-          ownAiDefaults: {},
+          aiLayers: {
+            ancestors: [
+              { agentId: "explore", definitionAiDefaults: explore.aiDefaults },
+              { agentId: "exec" },
+            ],
+          },
         },
+        // Did not resolve, so Inherit walks its declared base Scout, by Scout's own layer.
+        { ...subagent, id: "draft", name: "Draft", base: "scout" },
       ],
     });
     await view.findByText("Scout");
 
     expect(selectedOptionText(cacheSelect(view, "scout"))).toBe("Inherit (1 hour)");
+    expect(selectedOptionText(cacheSelect(view, "draft"))).toBe("Inherit (1 hour)");
+  });
+
+  test("Inherit follows the base layers agents.list resolves over the listed bases", async () => {
+    const exec = FALLBACK_AGENTS.find((agent) => agent.id === "exec")!;
+    const listed = (
+      id: string,
+      scope: "project" | "global",
+      base: string,
+      ancestorIds: string[]
+    ) => ({
+      id,
+      scope,
+      name: id,
+      base,
+      uiSelectable: false,
+      subagentRunnable: true,
+      aiLayers: { ancestors: ancestorIds.map((agentId) => ({ agentId })) },
+    });
+    const view = renderTasksSection({
+      agentAiDefaults: { helper: { cacheTtl: "1h" } },
+      agents: [
+        ...FALLBACK_AGENTS.filter((agent) => agent.id !== "exec"),
+        // A project exec.md, which a global agent's base resolves past.
+        {
+          ...exec,
+          scope: "project",
+          base: "exec",
+          aiLayers: { targetDefinitionAiDefaults: { cacheTtl: "1h" }, ancestors: [] },
+        },
+        listed("helper", "global", "exec", ["exec"]),
+        // Refines a global agent whose base (helper) the listed descriptor no longer shows.
+        listed("refined", "project", "refined", ["helper", "exec"]),
+      ],
+    });
+    await view.findByText("refined");
+
+    expect(selectedOptionText(cacheSelect(view, "refined"))).toBe("Inherit (1 hour)");
+    expect(
+      within(cacheSelect(view, "helper")!).getByRole("option", { name: "Inherit (5 minutes)" })
+    ).toBeTruthy();
   });
 
   test("Settings over a project page labels Inherit from that project's agents", async () => {
@@ -1301,7 +1347,14 @@ describe("TasksSection prompt cache TTL", () => {
       projectPageOnly: true,
       agents: [
         ...FALLBACK_AGENTS.filter((agent) => agent.id !== "explore"),
-        { ...projectExplore, aiDefaults: { cacheTtl: "1h" }, ownAiDefaults: { cacheTtl: "1h" } },
+        {
+          ...projectExplore,
+          aiDefaults: { cacheTtl: "1h" },
+          aiLayers: {
+            targetDefinitionAiDefaults: { cacheTtl: "1h" },
+            ancestors: [{ agentId: "exec" }],
+          },
+        },
       ],
     });
 

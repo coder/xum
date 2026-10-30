@@ -49,6 +49,7 @@ import {
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
+import { CacheTtlSchema } from "@/common/config/schemas/providersConfig";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -405,7 +406,7 @@ function PromptCacheTtlControl(props: PromptCacheTtlControlProps) {
       <div className="text-muted text-xs">Prompt cache</div>
       <Select
         value={props.value ?? INHERIT}
-        onValueChange={(next) => props.onChange(next === "5m" || next === "1h" ? next : undefined)}
+        onValueChange={(next) => props.onChange(CacheTtlSchema.safeParse(next).data)}
       >
         <SelectTrigger
           className="bg-modal-bg h-9 w-full max-w-60"
@@ -454,16 +455,27 @@ function buildPromptCacheTtlProps(input: {
   onChange: (value: AnthropicCacheTtl | undefined) => void;
 }): PromptCacheTtlControlProps | undefined {
   if (NO_CACHE_TTL_AGENT_IDS.has(input.agentId)) return undefined;
-  // agents.list merges aiDefaults down the base chain; the backend ranks a base's Settings above
-  // the base's frontmatter, so each layer must hold only that agent's own frontmatter.
-  const ownAiDefaults = (agent: AgentDefinitionDescriptor | undefined) =>
-    agent?.ownAiDefaults ?? agent?.aiDefaults;
-  const descriptorsById = new Map(
-    input.listedAgents.map((agent) => [
-      agent.id,
-      { base: agent.base, definitionAiDefaults: ownAiDefaults(agent) },
-    ])
-  );
+  // agents.list resolves each agent's layers as a run does. Only the fallback list and agents
+  // whose definition did not resolve walk the listed agents' declared bases instead.
+  const layers = input.definition?.aiLayers ?? {
+    targetDefinitionAiDefaults: input.definition?.aiDefaults,
+    ancestors: collectDeclaredAncestorLayers(
+      input.agentId,
+      new Map(
+        input.listedAgents.map((agent) => [
+          agent.id,
+          {
+            base: agent.base,
+            // A resolved agent's aiDefaults merge its bases' frontmatter, which the backend
+            // ranks below those bases' Settings, so the walk takes only its own layer.
+            definitionAiDefaults: agent.aiLayers
+              ? agent.aiLayers.targetDefinitionAiDefaults
+              : agent.aiDefaults,
+          },
+        ])
+      )
+    ),
+  };
   const ownEntry = input.agentAiDefaults[input.agentId];
   const inherited = resolveAgentCacheTtl({
     targetAgentId: input.agentId,
@@ -471,8 +483,7 @@ function buildPromptCacheTtlProps(input: {
       ...input.agentAiDefaults,
       [input.agentId]: { ...ownEntry, cacheTtl: undefined },
     },
-    targetDefinitionAiDefaults: ownAiDefaults(input.definition),
-    ancestors: collectDeclaredAncestorLayers(input.agentId, descriptorsById),
+    ...layers,
   });
   return {
     agentId: input.agentId,

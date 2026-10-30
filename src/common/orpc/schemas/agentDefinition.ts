@@ -104,9 +104,22 @@ export const AgentDefinitionDescriptorSchema = z
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
-    // The agent's own `ai` layer (same-ID hops merged, no different-ID base), which the
-    // per-agent AI resolvers rank above base agents' Settings. Absent when aiDefaults is unmerged.
-    ownAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+    // The `ai` layers a run of this agent resolves (collectDefinitionLayers): its own, with
+    // same-ID hops merged, which the per-agent AI resolvers rank above base agents' Settings,
+    // then each different-ID base's, child to root. The bases' descriptors cannot stand in: a
+    // same-ID hop hides its base's base, and a global agent's base skips project agents.
+    // Absent when aiDefaults is unmerged (the definition did not resolve).
+    aiLayers: z
+      .object({
+        targetDefinitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+        ancestors: z.array(
+          z.object({
+            agentId: AgentIdSchema,
+            definitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
+          })
+        ),
+      })
+      .optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)

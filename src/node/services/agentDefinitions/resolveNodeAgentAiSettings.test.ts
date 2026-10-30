@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
+import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 
 import {
-  collectDefinitionLayers,
   loadAgentDefinitionAiLayers,
   resolveChainAgentCacheTtl,
   resolveNodeAgentAiSettings,
