@@ -342,9 +342,8 @@
   /* Theme override hook: redeclare tokens inside this block to swap palettes */
 }
 
-/* Light values of the Coder link and highlight tokens in theme-dark.css. flexoki-dark keeps the dark values. */
-:root[data-theme="light"],
-:root[data-theme="flexoki-light"] {
+/* Light values of the Coder link and highlight tokens in theme-dark.css. The Flexoki themes set their own. */
+:root[data-theme="light"] {
   --color-content-link: hsl(221 83% 53%);
   --color-highlight-purple: hsl(271 61% 35%);
   --color-highlight-sky: hsl(195 61% 22%);
@@ -613,6 +612,15 @@
   --color-init-output-bg: #e6e4d9;
   --color-init-output-text: #6f6e69;
   --color-init-output-error-text: var(--color-danger);
+
+  /* Link and highlight tokens (Mermaid accent and series colors), Flexoki 600 */
+  --color-content-link: #205ea6; /* Flexoki blue-600 */
+  --color-highlight-purple: #5e409d;
+  --color-highlight-sky: #24837b; /* Flexoki cyan-600 */
+  --color-highlight-orange: #bc5215;
+  --color-highlight-magenta: #a02f6f;
+  --color-highlight-green: #66800b;
+  --color-highlight-red: #af3029;
 }
 
 :root[data-theme="flexoki-dark"] {
@@ -859,6 +867,15 @@
   --color-init-output-bg: #1c1b1a;
   --color-init-output-text: #cecdc3;
   --color-init-output-error-text: var(--color-danger);
+
+  /* Link and highlight tokens (Mermaid accent and series colors), Flexoki 400 */
+  --color-content-link: #4385be; /* Flexoki blue-400 */
+  --color-highlight-purple: #8b7ec8;
+  --color-highlight-sky: #3aa99f; /* Flexoki cyan-400 */
+  --color-highlight-orange: #da702c;
+  --color-highlight-magenta: #ce5d97;
+  --color-highlight-green: #879a39;
+  --color-highlight-red: #d14d41;
 }
 h1,
 h2,
