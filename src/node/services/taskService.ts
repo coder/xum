@@ -14868,7 +14868,15 @@ export class TaskService implements AgentTaskIntegration {
           this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, entry);
         }
 
-        const persistedAfterRegister = await tryReadPersistedReport();
+        // The read can throw (e.g. adopting the report fails to write config). The waiter, its
+        // backgroundable registration and the foreground-await count are live by now: release
+        // them before the outer catch rejects (cleanup, then settle, like entry.reject). Else the
+        // requester stays foreground-awaiting, so it charges no maxParallelAgentTasks slot, and a
+        // dead waiter stays registered.
+        const persistedAfterRegister = await tryReadPersistedReport().catch((error: unknown) => {
+          entry.cleanup();
+          throw error;
+        });
         if (persistedAfterRegister) {
           entry.resolve(persistedAfterRegister);
           return;
