@@ -129,6 +129,32 @@ export function sanitizeMermaidSvg(svg: string): string | null {
   return svgRoot.outerHTML;
 }
 
+/** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
+async function renderMermaidSvg(chart: string, idPrefix: string): Promise<string> {
+  // Pele measures labels with canvas when it renders, so the font must be loaded first
+  // or boxes are sized for the fallback font. happy-dom has no document.fonts.
+  if ("fonts" in document) await document.fonts.ready;
+
+  const rootStyle = window.getComputedStyle(document.documentElement);
+  const { svg } = renderPele(chart, {
+    idPrefix,
+    // Measure with the same fonts the .mermaid-container CSS draws with.
+    fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
+    fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
+    fontSize: 14,
+    // Diagram text is untrusted model output: no clickable links, and no images,
+    // which would fetch from the network as soon as the SVG is inserted.
+    links: false,
+    images: false,
+  });
+
+  const sanitizedSvg = sanitizeMermaidSvg(svg);
+  if (!sanitizedSvg) {
+    throw new Error("Diagram renderer returned invalid SVG output");
+  }
+  return sanitizedSvg;
+}
+
 function normalizeDiagramZoom(value: number): number {
   if (!Number.isFinite(value)) {
     return DEFAULT_ZOOM;
@@ -269,28 +295,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
 
     const renderDiagram = async () => {
       try {
-        // Pele measures labels with canvas when it renders, so the font must be loaded first
-        // or boxes are sized for the fallback font. happy-dom has no document.fonts.
-        if ("fonts" in document) await document.fonts.ready;
+        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix);
         if (cancelled) return;
-
-        const rootStyle = window.getComputedStyle(document.documentElement);
-        const { svg: renderedSvg } = renderPele(debouncedChart, {
-          idPrefix,
-          // Measure with the same fonts the .mermaid-container CSS draws with.
-          fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
-          fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
-          fontSize: 14,
-          // Diagram text is untrusted model output: no clickable links, and no images,
-          // which would fetch from the network as soon as the SVG is inserted.
-          links: false,
-          images: false,
-        });
-
-        const sanitizedSvg = sanitizeMermaidSvg(renderedSvg);
-        if (!sanitizedSvg) {
-          throw new Error("Diagram renderer returned invalid SVG output");
-        }
 
         setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
         setError(null);
