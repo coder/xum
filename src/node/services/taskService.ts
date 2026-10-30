@@ -15337,96 +15337,128 @@ export class TaskService implements AgentTaskIntegration {
           }
         }
 
-        const session: ReportWaitSession = {
-          request,
-          settle: { resolve, reject },
-          timeout: null,
-          startWaiter: null,
-          abortListener: null,
-          stopBlockingRequester: requestingWorkspaceId
-            ? this.startForegroundAwait(requestingWorkspaceId)
-            : null,
-          executionStartNotified: false,
-          // The waiter's closures run after this literal, so they can name `session`.
-          waiter: {
-            taskId,
-            requestingWorkspaceId: undefined,
-            backgroundOnMessageQueued: false,
-            resolve: (report) => {
-              session.waiter.cleanup();
-              resolve(report);
-            },
-            reject: (error) => {
-              session.waiter.cleanup();
-              reject(error);
-            },
-            cleanup: () => {
-              const { waiter } = session;
-              if (waiter.requestingWorkspaceId && waiter.backgroundOnMessageQueued) {
-                this.unregisterBackgroundableForegroundWaiter(waiter.requestingWorkspaceId, waiter);
-              }
-
-              this.waiters.removePendingWaiter(taskId, waiter);
-
-              this.cleanupReportWaitStartWaiter(session);
-
-              if (session.timeout) {
-                clearTimeout(session.timeout);
-                session.timeout = null;
-              }
-
-              if (session.abortListener && options?.abortSignal) {
-                options.abortSignal.removeEventListener("abort", session.abortListener);
-                session.abortListener = null;
-              }
-
-              if (session.stopBlockingRequester) {
-                try {
-                  session.stopBlockingRequester();
-                } finally {
-                  session.stopBlockingRequester = null;
-                }
-              }
-            },
-          },
-        };
-        const entry = session.waiter;
-
-        this.waiters.addPendingWaiter(taskId, entry);
-
-        const shouldBackgroundOnQueuedMessage = Boolean(
-          requestingWorkspaceId && (options?.backgroundOnMessageQueued ?? true)
-        );
-        entry.requestingWorkspaceId = requestingWorkspaceId;
-        entry.backgroundOnMessageQueued = shouldBackgroundOnQueuedMessage;
-
-        if (shouldBackgroundOnQueuedMessage && requestingWorkspaceId) {
-          this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, entry);
-        }
-
-        // The read can throw (e.g. adopting the report fails to write config). The waiter, its
-        // backgroundable registration and the foreground-await count are live by now: release
-        // them before the outer catch rejects (cleanup, then settle, like entry.reject). Else the
-        // requester stays foreground-awaiting, so it charges no maxParallelAgentTasks slot, and a
-        // dead waiter stays registered.
-        const persistedAfterRegister = await tryReadPersistedReport().catch((error: unknown) => {
-          entry.cleanup();
-          throw error;
-        });
-        if (persistedAfterRegister) {
-          entry.resolve(persistedAfterRegister);
-          return;
-        }
-
-        this.armPendingReportWaiter(
-          session,
-          taskWorkspaceEntry.workspace.taskStatus,
-          shouldBackgroundOnQueuedMessage
-        );
+        await this.registerPendingReportWaiter(request, { resolve, reject }, taskWorkspaceEntry);
       })().catch((error: unknown) => {
         reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
+  }
+
+  /**
+   * Registers the wait with no await before the registration: the foreground await, the waiter and
+   * its backgroundable registration. Then reads the report once more, and arms the rest unless that
+   * read found it.
+   */
+  private async registerPendingReportWaiter(
+    request: ReportWaitRequest,
+    settle: ReportWaitSettle,
+    taskWorkspaceEntry: { projectPath: string; workspace: WorkspaceConfigEntry }
+  ): Promise<void> {
+    const session: ReportWaitSession = {
+      request,
+      settle,
+      timeout: null,
+      startWaiter: null,
+      abortListener: null,
+      stopBlockingRequester: request.requestingWorkspaceId
+        ? this.startForegroundAwait(request.requestingWorkspaceId)
+        : null,
+      executionStartNotified: false,
+      // The waiter's closures run after this literal, so they can name `session`.
+      waiter: {
+        taskId: request.taskId,
+        requestingWorkspaceId: undefined,
+        backgroundOnMessageQueued: false,
+        resolve: (report) => {
+          session.waiter.cleanup();
+          settle.resolve(report);
+        },
+        reject: (error) => {
+          session.waiter.cleanup();
+          settle.reject(error);
+        },
+        cleanup: () => this.cleanupPendingReportWaiter(session),
+      },
+    };
+    const shouldBackgroundOnQueuedMessage = this.addPendingReportWaiter(session);
+
+    // The read can throw (e.g. adopting the report fails to write config). The waiter, its
+    // backgroundable registration and the foreground-await count are live by now: release
+    // them before the outer catch rejects (cleanup, then settle, like waiter.reject). Else the
+    // requester stays foreground-awaiting, so it charges no maxParallelAgentTasks slot, and a
+    // dead waiter stays registered.
+    const persistedAfterRegister = await this.readPersistedReportForWait(
+      request.taskId,
+      request.requestingWorkspaceId
+    ).catch((error: unknown) => {
+      session.waiter.cleanup();
+      throw error;
+    });
+    if (persistedAfterRegister) {
+      session.waiter.resolve(persistedAfterRegister);
+      return;
+    }
+
+    this.armPendingReportWaiter(
+      session,
+      taskWorkspaceEntry.workspace.taskStatus,
+      shouldBackgroundOnQueuedMessage
+    );
+  }
+
+  /**
+   * Adds the session's waiter to the store, then registers it as backgroundable when a queued
+   * message may background it. Returns whether it may.
+   */
+  private addPendingReportWaiter(session: ReportWaitSession): boolean {
+    const { waiter } = session;
+    const { taskId, options, requestingWorkspaceId } = session.request;
+    this.waiters.addPendingWaiter(taskId, waiter);
+
+    const shouldBackgroundOnQueuedMessage = Boolean(
+      requestingWorkspaceId && (options?.backgroundOnMessageQueued ?? true)
+    );
+    waiter.requestingWorkspaceId = requestingWorkspaceId;
+    waiter.backgroundOnMessageQueued = shouldBackgroundOnQueuedMessage;
+
+    if (shouldBackgroundOnQueuedMessage && requestingWorkspaceId) {
+      this.registerBackgroundableForegroundWaiter(requestingWorkspaceId, waiter);
+    }
+    return shouldBackgroundOnQueuedMessage;
+  }
+
+  /**
+   * The waiter's cleanup: releases everything the wait holds (backgroundable registration,
+   * waiter, start waiter, report timer, abort listener, foreground await).
+   */
+  private cleanupPendingReportWaiter(session: ReportWaitSession): void {
+    const { waiter } = session;
+    const { taskId, options } = session.request;
+    if (waiter.requestingWorkspaceId && waiter.backgroundOnMessageQueued) {
+      this.unregisterBackgroundableForegroundWaiter(waiter.requestingWorkspaceId, waiter);
+    }
+
+    this.waiters.removePendingWaiter(taskId, waiter);
+
+    this.cleanupReportWaitStartWaiter(session);
+
+    if (session.timeout) {
+      clearTimeout(session.timeout);
+      session.timeout = null;
+    }
+
+    if (session.abortListener && options?.abortSignal) {
+      options.abortSignal.removeEventListener("abort", session.abortListener);
+      session.abortListener = null;
+    }
+
+    if (session.stopBlockingRequester) {
+      try {
+        session.stopBlockingRequester();
+      } finally {
+        session.stopBlockingRequester = null;
+      }
+    }
   }
 
   /**
