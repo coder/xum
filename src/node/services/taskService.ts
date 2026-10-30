@@ -409,6 +409,18 @@ interface ReportWaitSession {
   executionStartNotified: boolean;
 }
 
+/** The request of one waitForAgentReport call: the timeout (default 10 minutes) and requester. */
+function buildReportWaitRequest(
+  taskId: string,
+  options: AgentReportWaitOptions | undefined
+): ReportWaitRequest {
+  const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000; // 10 minutes
+  assert(Number.isFinite(timeoutMs) && timeoutMs > 0, "waitForAgentReport: timeoutMs invalid");
+
+  const requestingWorkspaceId = coerceNonEmptyString(options?.requestingWorkspaceId);
+  return { taskId, options, timeoutMs, requestingWorkspaceId };
+}
+
 /** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
 export interface SubagentRemovalOptions {
   lossyWorkPolicy?: "refuse";
@@ -15106,117 +15118,155 @@ export class TaskService implements AgentTaskIntegration {
     // interruption handling so a finalized report stays awaitable once observed.
     const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
-      return {
-        reportMarkdown: cached.reportMarkdown,
-        title: cached.title,
-        planFilePath: cached.planFilePath,
-        structuredOutput: cached.structuredOutput,
-        model: cached.model,
-        thinkingLevel: cached.thinkingLevel,
-      };
+      return toAgentTaskReport(cached);
     }
 
-    const timeoutMs = options?.timeoutMs ?? 10 * 60 * 1000; // 10 minutes
-    assert(Number.isFinite(timeoutMs) && timeoutMs > 0, "waitForAgentReport: timeoutMs invalid");
-
-    const requestingWorkspaceId = coerceNonEmptyString(options?.requestingWorkspaceId);
-    if (requestingWorkspaceId) {
+    const request = buildReportWaitRequest(taskId, options);
+    if (request.requestingWorkspaceId) {
       // A renewed foreground wait means this task is blocking again unless re-backgrounded later.
       this.markTaskForegroundRelevant(taskId);
     }
-    const request: ReportWaitRequest = { taskId, options, timeoutMs, requestingWorkspaceId };
 
-    const tryReadPersistedReport = () =>
-      this.readPersistedReportForWait(taskId, requestingWorkspaceId);
-    const tryReadPersistedFailureError = () => this.readPersistedFailureForWait(request);
+    return await this.waitForUncachedAgentReport(request);
+  }
 
+  /**
+   * The wait once no report is cached. Sync up to the step it returns, so a task that is not
+   * interrupted registers its waiter in the caller's own tick (see maybeStartQueuedTasks).
+   */
+  private waitForUncachedAgentReport(request: ReportWaitRequest): Promise<AgentTaskReport> {
     // Fast-path: if the task is already gone (cleanup) or already reported (restart), return the
     // persisted artifact from the requesting workspace session dir.
     const cfg = this.config.loadConfigOrDefault();
-    const taskWorkspaceEntry = findWorkspaceEntry(cfg, taskId);
+    const taskWorkspaceEntry = findWorkspaceEntry(cfg, request.taskId);
     const taskStatus = taskWorkspaceEntry?.workspace.taskStatus;
 
     if (!taskWorkspaceEntry || taskStatus === "reported") {
-      const persisted = await tryReadPersistedReport();
-      if (persisted) {
-        return persisted;
-      }
-
-      const persistedFailure = await tryReadPersistedFailureError();
-      if (persistedFailure) {
-        throw persistedFailure;
-      }
-
-      throw new Error("Task not found");
+      return this.readSettledAgentReport(request);
     }
 
     if (taskStatus === "interrupted") {
-      const persisted = await tryReadPersistedReport();
-      if (persisted) {
-        return persisted;
-      }
-
-      // Report monotonicity: interrupted tasks can still be streaming while stream-end
-      // finalization persists agent_report. Waiters should keep waiting in that window.
-      if (!this.aiService.isStreaming(taskId)) {
-        throw new Error(taskWorkspaceEntry.workspace.taskLaunchError ?? "Task interrupted");
-      }
+      return this.waitForInterruptedAgentReport(request, taskWorkspaceEntry);
     }
 
-    return await new Promise<{
-      reportMarkdown: string;
-      title?: string;
-      planFilePath?: string;
-      structuredOutput?: unknown;
-    }>((resolve, reject) => {
-      void (async () => {
-        // Validate existence early to avoid waiting on never-resolving task IDs.
-        const cfg = this.config.loadConfigOrDefault();
-        const taskWorkspaceEntry = findWorkspaceEntry(cfg, taskId);
-        if (!taskWorkspaceEntry) {
-          const persisted = await tryReadPersistedReport();
-          if (persisted) {
-            resolve(persisted);
-            return;
-          }
+    return this.awaitPendingAgentReport(request);
+  }
 
-          const persistedFailure = await tryReadPersistedFailureError();
-          reject(persistedFailure ?? new Error("Task not found"));
-          return;
-        }
+  /** A gone or reported task: its persisted report, else its persisted failure, else not found. */
+  private async readSettledAgentReport(request: ReportWaitRequest): Promise<AgentTaskReport> {
+    const persisted = await this.readPersistedReportForWait(
+      request.taskId,
+      request.requestingWorkspaceId
+    );
+    if (persisted) {
+      return persisted;
+    }
 
-        if (taskWorkspaceEntry.workspace.taskStatus === "reported") {
-          const persisted = await tryReadPersistedReport();
-          if (persisted) {
-            resolve(persisted);
-            return;
-          }
+    const persistedFailure = await this.readPersistedFailureForWait(request);
+    if (persistedFailure) {
+      throw persistedFailure;
+    }
 
-          const persistedFailure = await tryReadPersistedFailureError();
-          reject(persistedFailure ?? new Error("Task not found"));
-          return;
-        }
+    throw new Error("Task not found");
+  }
 
-        if (taskWorkspaceEntry.workspace.taskStatus === "interrupted") {
-          const persisted = await tryReadPersistedReport();
-          if (persisted) {
-            resolve(persisted);
-            return;
-          }
+  /** An interrupted task: its persisted report, else a wait while its stream still runs. */
+  private async waitForInterruptedAgentReport(
+    request: ReportWaitRequest,
+    taskWorkspaceEntry: { projectPath: string; workspace: WorkspaceConfigEntry }
+  ): Promise<AgentTaskReport> {
+    const persisted = await this.readPersistedReportForWait(
+      request.taskId,
+      request.requestingWorkspaceId
+    );
+    if (persisted) {
+      return persisted;
+    }
 
-          // Report monotonicity: an interrupted task may still be in stream-end teardown,
-          // so keep the waiter alive while the stream is active.
-          if (!this.aiService.isStreaming(taskId)) {
-            reject(new Error(taskWorkspaceEntry.workspace.taskLaunchError ?? "Task interrupted"));
-            return;
-          }
-        }
+    // Report monotonicity: interrupted tasks can still be streaming while stream-end
+    // finalization persists agent_report. Waiters should keep waiting in that window.
+    if (!this.aiService.isStreaming(request.taskId)) {
+      throw new Error(taskWorkspaceEntry.workspace.taskLaunchError ?? "Task interrupted");
+    }
 
-        await this.registerPendingReportWaiter(request, { resolve, reject }, taskWorkspaceEntry);
-      })().catch((error: unknown) => {
+    return await this.awaitPendingAgentReport(request);
+  }
+
+  /**
+   * The promise of a pending wait. Its executor starts the wait's setup without waiting for it,
+   * and a setup that rejects rejects the wait with an Error.
+   */
+  private awaitPendingAgentReport(request: ReportWaitRequest): Promise<AgentTaskReport> {
+    return new Promise<AgentTaskReport>((resolve, reject) => {
+      void this.startPendingReportWait(request, { resolve, reject }).catch((error: unknown) => {
         reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
+  }
+
+  /**
+   * A pending wait's setup: re-reads the row, then settles a gone or reported task, re-checks an
+   * interrupted one, or registers the waiter.
+   */
+  private async startPendingReportWait(
+    request: ReportWaitRequest,
+    settle: ReportWaitSettle
+  ): Promise<void> {
+    // Validate existence early to avoid waiting on never-resolving task IDs.
+    const cfg = this.config.loadConfigOrDefault();
+    const taskWorkspaceEntry = findWorkspaceEntry(cfg, request.taskId);
+    if (!taskWorkspaceEntry || taskWorkspaceEntry.workspace.taskStatus === "reported") {
+      return await this.settleGoneReportWait(request, settle);
+    }
+
+    if (taskWorkspaceEntry.workspace.taskStatus === "interrupted") {
+      return await this.continueInterruptedReportWait(request, settle, taskWorkspaceEntry);
+    }
+
+    return await this.registerPendingReportWaiter(request, settle, taskWorkspaceEntry);
+  }
+
+  /** The row is gone or reported: settle with its persisted report, else its failure. */
+  private async settleGoneReportWait(
+    request: ReportWaitRequest,
+    settle: ReportWaitSettle
+  ): Promise<void> {
+    const persisted = await this.readPersistedReportForWait(
+      request.taskId,
+      request.requestingWorkspaceId
+    );
+    if (persisted) {
+      settle.resolve(persisted);
+      return;
+    }
+
+    const persistedFailure = await this.readPersistedFailureForWait(request);
+    settle.reject(persistedFailure ?? new Error("Task not found"));
+  }
+
+  /** The row is still interrupted: settle with its persisted report, else wait while it streams. */
+  private async continueInterruptedReportWait(
+    request: ReportWaitRequest,
+    settle: ReportWaitSettle,
+    taskWorkspaceEntry: { projectPath: string; workspace: WorkspaceConfigEntry }
+  ): Promise<void> {
+    const persisted = await this.readPersistedReportForWait(
+      request.taskId,
+      request.requestingWorkspaceId
+    );
+    if (persisted) {
+      settle.resolve(persisted);
+      return;
+    }
+
+    // Report monotonicity: an interrupted task may still be in stream-end teardown,
+    // so keep the waiter alive while the stream is active.
+    if (!this.aiService.isStreaming(request.taskId)) {
+      settle.reject(new Error(taskWorkspaceEntry.workspace.taskLaunchError ?? "Task interrupted"));
+      return;
+    }
+
+    return await this.registerPendingReportWaiter(request, settle, taskWorkspaceEntry);
   }
 
   /**
