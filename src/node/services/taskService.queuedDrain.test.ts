@@ -448,7 +448,8 @@ describe("TaskService queue drain: reservations, refusals and launch leases", ()
       const [plan] = plans();
       expect(plan.taskId).toBe("child");
       expect(plan.attemptId === RESERVED_ATTEMPT_ID).toBe(owned);
-      expect(plan.abortSignal === reservation.signal).toBe(owned);
+      // A launch this process does not own begins its attempt without a cancellation signal.
+      expect(plan.abortSignal).toBe(owned ? reservation.signal : undefined);
       expect(row("child")?.taskStatus).toBe("running");
     }
   );
