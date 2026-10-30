@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { Err } from "@/common/types/result";
 import { retiredAttemptMessage } from "@/constants/agentMessaging";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -32,6 +33,11 @@ const PARENT_ID = "parent";
 const CHILD = "child";
 const FOREIGN_ATTEMPT_ID = "att_00000000000000f1";
 const EDIT_FAILURE = "config write failed";
+const SEND_FAILURE = "send failed";
+const UNREADABLE = "config.json is unreadable";
+const FORK_FAILURE = "fork failed";
+const SANITIZE_FAILURE = "stale plugin overrides could not be removed";
+const RECLAIM_FAILURE = "reclaim failed";
 const CLAIM = { runId: "wfr_claim", stepId: "step" };
 
 interface Internals {
@@ -41,6 +47,7 @@ interface Internals {
   admitTaskDesktopRecovery: (taskId: string) => Promise<boolean>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<object | null>;
   cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
+  reclaimUnsanitizedTaskCheckout: (...args: unknown[]) => Promise<object>;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -59,6 +66,8 @@ interface LaunchHooks {
   nextRowEdit?: () => Promise<void>;
   /** While the host sanitizes the checkout (the sanitize/secrets window before the init). */
   sanitize?: () => Promise<void>;
+  /** The error the host's sanitize step returns (unset: the sanitize passes). */
+  sanitizeError?: string;
   /** Synchronously, when the launch registers its init with the host. */
   initRegistered?: () => void;
 }
@@ -160,7 +169,7 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
       "sanitizeMaterializedTaskWorkspace"
     ).mockImplementation(async () => {
       await hooks.sanitize?.();
-      return undefined;
+      return hooks.sanitizeError;
     });
     const { taskService, initStateManager } = createTaskServiceHarness(config, {
       workspaceService: host.workspaceService,
@@ -272,6 +281,24 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
         await launched;
         await settle();
       },
+      /** The reclaim of an unsanitized checkout throws RECLAIM_FAILURE. */
+      failReclaim: () =>
+        spyOn(svc, "reclaimUnsanitizedTaskCheckout").mockRejectedValue(new Error(RECLAIM_FAILURE)),
+      /** Every send of the brief fails with SEND_FAILURE. */
+      failSends: () =>
+        host.sendMessage.mockImplementation(() => Promise.resolve(Err(SEND_FAILURE))),
+      /**
+       * config.json turns unreadable until the next strict read, which throws UNREADABLE (a
+       * lenient read meanwhile reads it empty).
+       */
+      unreadableUntilNextStrictRead: () => {
+        const load = config.loadConfigOrDefault.bind(config);
+        const spy = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+          if (options?.throwOnError !== true) return { ...load(options), projects: new Map() };
+          spy.mockRestore();
+          throw new Error(UNREADABLE);
+        });
+      },
       /** Hold CHILD's stop latch until teardown, as a Stop between its latch and its write. */
       holdStopLatch: () => releases.push(taskService.latchWorkspaceStopsInProgress([CHILD])),
       launched: () => launches.mock.calls.map(([plan]) => plan.taskId),
@@ -285,6 +312,22 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
       cleanups: () => cleanups.mock.calls.map(([, , , taskId, options]) => [taskId, options]),
     };
   }
+
+  /** The marker a removal in another process writes on the row before it deletes the checkout. */
+  const removalMarker = (): NonNullable<WorkspaceConfigEntry["pendingRemoval"]> => ({
+    removalId: "removal",
+    instanceId: "other",
+    pid: 1,
+    identity: {
+      birth: null,
+      bootId: null,
+      pidNs: null,
+      machineId: null,
+      platform: process.platform,
+      hostname: null,
+    },
+    at: new Date(Date.UTC(2026, 0, 1, 0, 2)).toISOString(),
+  });
 
   const pathExists = (target: string) =>
     fs.access(target).then(
@@ -305,6 +348,53 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
     expect(s.markedFailed()).toEqual([]);
     expect(s.initLogStarts()).toBe(0);
     expect(s.sends()).toBe(0);
+  });
+
+  test("a row a removal unpublished before the launch ran is left alone", async () => {
+    const s = await setup([child({ taskStatus: "queued" })]);
+    s.hooks.beforeLaunch = unpublishChild;
+
+    await s.drain();
+
+    expect(s.launched()).toEqual([CHILD]);
+    expect(row(CHILD)).toBe(undefined);
+    expect(s.markedFailed()).toEqual([]);
+    expect(s.initLogStarts()).toBe(0);
+    expect(s.sends()).toBe(0);
+  });
+
+  describe("a launch a held stop latch defers", () => {
+    test("hands its row back to queued", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.beforeLaunch = () => {
+        s.holdStopLatch();
+      };
+
+      await s.drain();
+
+      expect(row(CHILD)?.taskStatus).toBe("queued");
+      expect(s.markedFailed()).toEqual([]);
+      expect(s.initLogStarts()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("leaves a row another writer re-admitted as is", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.beforeLaunch = () => {
+        s.holdStopLatch();
+        return patchChild({ taskAttemptId: FOREIGN_ATTEMPT_ID });
+      };
+
+      await s.drain();
+
+      expect(row(CHILD)).toMatchObject({
+        taskStatus: "starting",
+        taskAttemptId: FOREIGN_ATTEMPT_ID,
+      });
+      expect(s.markedFailed()).toEqual([]);
+      expect(s.initLogStarts()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
   });
 
   test("a launch a held stop latch defers is marked failed when its revert to queued fails", async () => {
@@ -410,6 +500,221 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
     expect(s.sends()).toBe(1);
   });
 
+  describe("a shared task whose parent checkout exists", () => {
+    test("runs in that checkout without a sanitize step or an init", async () => {
+      const s = await setup([child({ taskStatus: "queued", taskIsolation: "none" })]);
+
+      await s.drain();
+
+      expect(row(CHILD)).toMatchObject({ taskStatus: "running", taskIsolation: "none" });
+      expect(s.sanitized()).toBe(0);
+      expect(s.registeredInits()).toBe(0);
+      // The skipped init ends its log as done, not failed.
+      expect(s.initLogExitCodes()).toEqual([0]);
+      expect(s.sends()).toBe(1);
+    });
+
+    test("keeps that checkout when a removal unpublishes its row after the materialize step", async () => {
+      const s = await setup([child({ taskStatus: "queued", taskIsolation: "none" })]);
+      s.hooks.materialized = async (launch) => {
+        await unpublishChild();
+        return launch;
+      };
+
+      await s.drain();
+
+      // The cleanup of the unpublished row never deletes the checkout: it is the parent's.
+      expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: true }]]);
+      expect(await pathExists(projectPath)).toBe(true);
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+      expect(s.markedFailed()).toEqual([]);
+    });
+  });
+
+  describe("a row another writer re-admits under its own attempt", () => {
+    test("during the checkout persist keeps its fields and is not sanitized", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.materialized = (launch) => {
+        s.hooks.nextRowEdit = () => patchChild({ taskAttemptId: FOREIGN_ATTEMPT_ID });
+        return Promise.resolve(launch);
+      };
+
+      await s.drain();
+
+      // The row and its checkout are the other writer's: the persist skips the row, and the
+      // launch stops before the sanitize step without a cleanup or a failure mark.
+      expect(row(CHILD)).toMatchObject({
+        taskStatus: "starting",
+        taskAttemptId: FOREIGN_ATTEMPT_ID,
+      });
+      expect(row(CHILD)?.taskBaseCommitShaByProjectPath).toBe(undefined);
+      expect(s.sanitized()).toBe(0);
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.registeredInits()).toBe(0);
+      expect(s.cleanups()).toEqual([]);
+      expect(s.markedFailed()).toEqual([]);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("during the sanitize step gets no init", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.sanitize = () => patchChild({ taskAttemptId: FOREIGN_ATTEMPT_ID });
+
+      await s.drain();
+
+      expect(row(CHILD)).toMatchObject({
+        taskStatus: "starting",
+        taskAttemptId: FOREIGN_ATTEMPT_ID,
+      });
+      expect(s.registeredInits()).toBe(0);
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.cleanups()).toEqual([]);
+      expect(s.markedFailed()).toEqual([]);
+      expect(s.sends()).toBe(0);
+    });
+  });
+
+  test("a row a removal unpublishes during the checkout persist gets its checkout cleaned up before the sanitize step", async () => {
+    const s = await setup([child({ taskStatus: "queued" })]);
+    s.hooks.materialized = (launch) => {
+      s.hooks.nextRowEdit = unpublishChild;
+      return Promise.resolve(launch);
+    };
+
+    await s.drain();
+
+    expect(row(CHILD)).toBe(undefined);
+    expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: false }]]);
+    expect(s.initLogExitCodes()).toEqual([-1]);
+    expect(s.sanitized()).toBe(0);
+    expect(s.markedFailed()).toEqual([]);
+    expect(s.sends()).toBe(0);
+  });
+
+  test("a row a removal marks before the init gets its checkout cleaned up and no init, and fails", async () => {
+    const s = await setup([child({ taskStatus: "queued" })]);
+    s.hooks.sanitize = () => patchChild({ pendingRemoval: removalMarker() });
+
+    await s.drain();
+
+    expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: false }]]);
+    expect(s.initLogExitCodes()).toEqual([-1]);
+    expect(s.registeredInits()).toBe(0);
+    expect(s.sends()).toBe(0);
+    expect(s.markedFailed()).toEqual([CHILD]);
+  });
+
+  describe("an unreadable config fails the launch and ends its init log", () => {
+    test("at the row check after the materialize step", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.materialized = (launch) => {
+        s.unreadableUntilNextStrictRead();
+        return Promise.resolve(launch);
+      };
+
+      await s.drain();
+
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.markedFailed()).toEqual([CHILD]);
+      expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted", taskLaunchError: UNREADABLE });
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("at the row check before the init", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.sanitize = () => {
+        s.unreadableUntilNextStrictRead();
+        return Promise.resolve();
+      };
+
+      await s.drain();
+
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.markedFailed()).toEqual([CHILD]);
+      expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted", taskLaunchError: UNREADABLE });
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+  });
+
+  test("a launch whose materialize step throws ends its init log and fails", async () => {
+    const s = await setup([child({ taskStatus: "queued" })]);
+    s.hooks.materialized = () => Promise.reject(new Error(FORK_FAILURE));
+
+    await s.drain();
+
+    expect(s.initLogExitCodes()).toEqual([-1]);
+    expect(s.markedFailed()).toEqual([CHILD]);
+    expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted", taskLaunchError: FORK_FAILURE });
+    expect(s.sends()).toBe(0);
+  });
+
+  describe("a forked checkout whose sanitize step fails", () => {
+    test("is reclaimed with its row, and its init state is dropped, not ended", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.sanitizeError = SANITIZE_FAILURE;
+
+      await s.drain();
+
+      expect(row(CHILD)).toBe(undefined);
+      expect(s.initLogExitCodes()).toEqual([]);
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("whose row cannot be unpublished is kept and ends its init log failed", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.sanitizeError = SANITIZE_FAILURE;
+      // The reclaim's unpublish write is the next config edit after the sanitize step.
+      s.hooks.sanitize = () => {
+        spyOn(config, "editConfig").mockRejectedValueOnce(new Error(EDIT_FAILURE));
+        return Promise.resolve();
+      };
+
+      await s.drain();
+
+      expect(row(CHILD)).toMatchObject({
+        taskStatus: "interrupted",
+        taskLaunchError: SANITIZE_FAILURE,
+      });
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("whose reclaim throws ends its init log failed", async () => {
+      const s = await setup([child({ taskStatus: "queued" })]);
+      s.hooks.sanitizeError = SANITIZE_FAILURE;
+      s.failReclaim();
+
+      await s.drain();
+
+      expect(s.initLogExitCodes()).toEqual([-1]);
+      expect(s.markedFailed()).toEqual([CHILD]);
+      expect(row(CHILD)).toMatchObject({
+        taskStatus: "interrupted",
+        taskLaunchError: RECLAIM_FAILURE,
+      });
+      expect(s.registeredInits()).toBe(0);
+      expect(s.sends()).toBe(0);
+    });
+  });
+
+  test("a launch whose send fails cleans up its checkout and is marked failed", async () => {
+    const s = await setup([child({ taskStatus: "queued" })]);
+    s.failSends();
+
+    await s.drain();
+
+    expect(s.sends()).toBe(1);
+    expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: false }]]);
+    expect(s.markedFailed()).toEqual([CHILD]);
+    expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted", taskLaunchError: SEND_FAILURE });
+  });
+
   test("an attempt a workflow claim retires before the init is refused at admission and fails", async () => {
     const s = await setup([child({ taskStatus: "queued" })]);
     s.hooks.sanitize = async () => {
@@ -471,6 +776,24 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
       expect(row(CHILD)?.taskStatus).toBe("interrupted");
       expect(s.initLogStarts()).toBe(0);
       expect(s.cleanups()).toEqual([]);
+      expect(s.sends()).toBe(0);
+    });
+
+    test("during the materialize step is cancelled before the checkout persist", async () => {
+      const s = await setup([]);
+      const reservation = new AbortController();
+      s.hooks.materialized = (launch) => {
+        reservation.abort();
+        return Promise.resolve(launch);
+      };
+
+      await s.spawn(reservation.signal);
+
+      expect(row(CHILD)?.taskBaseCommitShaByProjectPath).toBe(undefined);
+      expect(s.cleanups()).toEqual([[CHILD, { preservePhysicalWorkspace: false }]]);
+      expect(s.markedFailed()).toEqual([CHILD]);
+      expect(row(CHILD)?.taskStatus).toBe("interrupted");
+      expect(s.sanitized()).toBe(0);
       expect(s.sends()).toBe(0);
     });
 
