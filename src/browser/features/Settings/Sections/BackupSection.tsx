@@ -1140,7 +1140,7 @@ export function BackupSection() {
 
       <SkippedNotice intro="Some pinned artifacts were left out:" items={shelfSkipped} />
       <SkippedNotice
-        intro="These backed-up files were not restored because their local path is a symlink:"
+        intro="These backed-up files are skipped because their local path is a symlink:"
         items={symlinkSkipped}
       />
 
