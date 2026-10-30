@@ -342,6 +342,18 @@
   /* Theme override hook: redeclare tokens inside this block to swap palettes */
 }
 
+/* Light values of the Coder link and highlight tokens in theme-dark.css. flexoki-dark keeps the dark values. */
+:root[data-theme="light"],
+:root[data-theme="flexoki-light"] {
+  --color-content-link: hsl(221 83% 53%);
+  --color-highlight-purple: hsl(271 61% 35%);
+  --color-highlight-sky: hsl(195 61% 22%);
+  --color-highlight-orange: hsl(30 100% 32%);
+  --color-highlight-magenta: hsl(295 68% 40%);
+  --color-highlight-green: hsl(143 64% 24%);
+  --color-highlight-red: hsl(0 74% 42%);
+}
+
 /* Flexoki themes (https://stephango.com/flexoki) */
 :root[data-theme="flexoki-light"] {
   color-scheme: light;
