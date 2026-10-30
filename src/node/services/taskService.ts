@@ -1475,6 +1475,18 @@ interface MaterializedTaskLaunch {
   reusedExistingCheckout: boolean;
 }
 
+/**
+ * A reserved launch's checkout once materialized: what the materialize step returned, with the
+ * launch's init log and its shared-checkout facts. Built once after the fork, never re-read.
+ */
+interface ReservedLaunchCheckout extends Readonly<MaterializedTaskLaunch> {
+  readonly initLogger: InitLogger;
+  /** The row was queued as isolation: "none" (read when the launch started). */
+  readonly taskWasShared: boolean;
+  /** The task reuses its parent's checkout: it was shared and that checkout still existed. */
+  readonly sharesParentCheckout: boolean;
+}
+
 export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
 
 export interface SendAgentTaskMessageResult {
@@ -7320,6 +7332,11 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
+  /**
+   * The launch under its lease, in steps. Each step calls the next one right after its own last
+   * await instead of returning a value to await, so no write, admission or send waits an extra
+   * microtask. startReservedAgentTask awaits the whole chain before it releases the lease.
+   */
   private async startReservedAgentTaskLeased(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
     if (plan.start.kind === "sendMessage") {
@@ -7452,6 +7469,12 @@ export class TaskService implements AgentTaskIntegration {
 
     // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
+    const checkout: ReservedLaunchCheckout = {
+      ...materialized,
+      initLogger,
+      taskWasShared,
+      sharesParentCheckout,
+    };
     // The row reads between the fork and the sanitize step. A throw fails the launch, which
     // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
     // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
@@ -7464,26 +7487,15 @@ export class TaskService implements AgentTaskIntegration {
         throw error;
       }
     };
-    const cancelMaterializedLaunch = () =>
-      this.cancelReservedLaunch(plan, initLogger, {
-        runtime: materialized.runtimeForTaskWorkspace,
-        preservePhysicalWorkspace: sharesParentCheckout,
-      });
     if (plan.abortSignal?.aborted) {
-      await cancelMaterializedLaunch();
+      await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
 
     const entryAfterMaterialize = readLaunchRowBeforeSanitize();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
-      await this.cleanupMaterializedTaskWorkspace(
-        materialized.runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await this.cleanupLaunchCheckout(plan, checkout);
       return;
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
@@ -7531,20 +7543,14 @@ export class TaskService implements AgentTaskIntegration {
     );
     await this.emitWorkspaceMetadata(plan.taskId);
     if (plan.abortSignal?.aborted) {
-      await cancelMaterializedLaunch();
+      await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
 
     const entryBeforeSend = readLaunchRowBeforeSanitize();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await this.cleanupLaunchCheckout(plan, checkout);
       return;
     }
     if (
@@ -7616,7 +7622,7 @@ export class TaskService implements AgentTaskIntegration {
       // already running at its mark. So recheck all four right before starting the init (the
       // abort signal alone misses the Stop and the removal).
       if (plan.abortSignal?.aborted) {
-        await cancelMaterializedLaunch();
+        await this.cancelMaterializedLaunch(plan, checkout);
         return;
       }
       let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
@@ -7634,13 +7640,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       if (!entryBeforeInit) {
         initLogger.logComplete(-1);
-        await this.cleanupMaterializedTaskWorkspace(
-          runtimeForTaskWorkspace,
-          plan.parentMeta.projectPath,
-          plan.workspaceName,
-          plan.taskId,
-          { preservePhysicalWorkspace: sharesParentCheckout }
-        );
+        await this.cleanupLaunchCheckout(plan, checkout);
         return;
       }
       if (
@@ -7653,13 +7653,7 @@ export class TaskService implements AgentTaskIntegration {
       if (entryBeforeInit.workspace.pendingRemoval != null) {
         // As the admission below would refuse it: the removal owns the row and its checkout.
         initLogger.logComplete(-1);
-        await this.cleanupMaterializedTaskWorkspace(
-          runtimeForTaskWorkspace,
-          plan.parentMeta.projectPath,
-          plan.workspaceName,
-          plan.taskId,
-          { preservePhysicalWorkspace: sharesParentCheckout }
-        );
+        await this.cleanupLaunchCheckout(plan, checkout);
         throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
       }
       this.registerTaskBackgroundInit(
@@ -7669,6 +7663,17 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
+    await this.admitReservedLaunchPrompt(plan, checkout);
+  }
+
+  /**
+   * The launch's linearization point and launch fence: a cancel seen here never launched, and
+   * past the admission only a Stop ends the execution. Then the send, in the same tick.
+   */
+  private async admitReservedLaunchPrompt(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
     const startOptions = {
       model: plan.taskModelString,
       agentId: plan.agentId,
@@ -7680,7 +7685,7 @@ export class TaskService implements AgentTaskIntegration {
     // Linearization point: cancellation observed here guarantees "never launched"; past the
     // admission below only a Stop (Layer 2) ends the execution.
     if (plan.abortSignal?.aborted) {
-      await cancelMaterializedLaunch();
+      await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
     // Launch fence (same-attempt send under the reservation's id): bind the obligation before
@@ -7692,16 +7697,23 @@ export class TaskService implements AgentTaskIntegration {
     });
     if (admission.kind !== "admitted") {
       const message = launchAdmissionRefusalMessage(admission);
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await this.cleanupLaunchCheckout(plan, checkout);
       throw new Error(message);
     }
     plan.sendAdmitted = true;
+    await this.sendReservedLaunchPrompt(plan, checkout, admission, startOptions);
+  }
+
+  /**
+   * Sends the admitted prompt (or resumes the stream) under the admission token. A failed send
+   * reclaims the checkout and fails the launch. A sent launch becomes `running`.
+   */
+  private async sendReservedLaunchPrompt(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout,
+    admission: Extract<TaskTurnAdmission, { kind: "admitted" }>,
+    startOptions: SendMessageOptions
+  ): Promise<void> {
     // The token doubles as the send's staleness probe: a guarded send is never a user resume, so
     // WorkspaceService skips markInterruptedTaskRunning for it (that rescue serializes on the
     // global mutex createMany may still hold while this launch starts). The resume-kind start has
@@ -7739,13 +7751,7 @@ export class TaskService implements AgentTaskIntegration {
           });
     if (!sendResult.success) {
       const message = launchSendErrorMessage(sendResult.error);
-      await this.cleanupMaterializedTaskWorkspace(
-        runtimeForTaskWorkspace,
-        plan.parentMeta.projectPath,
-        plan.workspaceName,
-        plan.taskId,
-        { preservePhysicalWorkspace: sharesParentCheckout }
-      );
+      await this.cleanupLaunchCheckout(plan, checkout);
       throw new Error(message);
     }
 
@@ -7762,6 +7768,31 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
     this.scheduleMaybeStartQueuedTasks();
+  }
+
+  /** Cancels a launch after its fork, with the checkout's runtime and its shared flag. */
+  private cancelMaterializedLaunch(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
+    return this.cancelReservedLaunch(plan, checkout.initLogger, {
+      runtime: checkout.runtimeForTaskWorkspace,
+      preservePhysicalWorkspace: checkout.sharesParentCheckout,
+    });
+  }
+
+  /** Reclaims the launch's checkout (never the parent's shared one) when the launch ends early. */
+  private cleanupLaunchCheckout(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
+    return this.cleanupMaterializedTaskWorkspace(
+      checkout.runtimeForTaskWorkspace,
+      plan.parentMeta.projectPath,
+      plan.workspaceName,
+      plan.taskId,
+      { preservePhysicalWorkspace: checkout.sharesParentCheckout }
+    );
   }
 
   createFromRpc(args: RpcTaskCreateArgs): Promise<Result<TaskCreateResult, string>> {
