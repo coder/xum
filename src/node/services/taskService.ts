@@ -15500,14 +15500,7 @@ export class TaskService implements AgentTaskIntegration {
     const config = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(config, taskId);
     if (entry == null) {
-      const wasOwned =
-        (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
-        (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
-      return Ok(
-        wasOwned
-          ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
-          : { status: "invalid_scope", action: "remove", taskId }
-      );
+      return await this.reportMissingRemovalTarget(ownerWorkspaceId, taskId);
     }
 
     const index = this.buildAgentTaskIndex(config);
@@ -15521,6 +15514,37 @@ export class TaskService implements AgentTaskIntegration {
       workspaceId: taskId,
       ...(displayName != null ? { displayName } : {}),
     };
+    const busyRefusal = this.refuseBusyRemovalTarget(taskId, entry, target);
+    if (busyRefusal != null) {
+      return busyRefusal;
+    }
+
+    return await this.gitPatchArtifactService.withOperationLock(taskId, () =>
+      this.removeInactiveTaskUnderPatchLock({ taskId, entry, target, options })
+    );
+  }
+
+  /** A missing row was the owner's when its tombstone or a report or failure record names it. */
+  private async reportMissingRemovalTarget(
+    ownerWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    const wasOwned =
+      (await this.hasRemovedAgentTaskTombstone(ownerWorkspaceId, taskId)) ||
+      (await this.filterDescendantAgentTaskIds(ownerWorkspaceId, [taskId])).includes(taskId);
+    return Ok(
+      wasOwned
+        ? { status: "already_removed", action: "remove", taskId, workspaceId: taskId }
+        : { status: "invalid_scope", action: "remove", taskId }
+    );
+  }
+
+  /** Refuses while descendants remain or the task is active or streaming; undefined when idle. */
+  private refuseBusyRemovalTarget(
+    taskId: string,
+    entry: InactiveTaskRemoval["entry"],
+    target: InactiveTaskRemoval["target"]
+  ): Result<WorkspaceLifecycleResult, string> | undefined {
     const descendantTaskIds = this.listDescendantAgentTasks(taskId).map((task) => task.taskId);
     if (descendantTaskIds.length > 0) {
       return Ok({
@@ -15544,59 +15568,62 @@ export class TaskService implements AgentTaskIntegration {
         note: "Stop the sub-agent before removing it.",
       });
     }
+    return undefined;
+  }
 
-    return await this.gitPatchArtifactService.withOperationLock(taskId, async () => {
-      // The task can become inactive before its background format-patch job finishes. Wait for the
-      // in-process job, then refuse removal if a restart left a durable pending marker behind; the
-      // child worktree is the source needed to recover that artifact.
-      await this.gitPatchArtifactService.waitForGeneration(taskId);
-      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-      const patchArtifact = parentWorkspaceId
-        ? await readSubagentGitPatchArtifact(
-            path.join(this.config.sessionsDir, parentWorkspaceId),
-            taskId
-          )
-        : null;
-      if (patchArtifact?.status === "pending") {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
-        });
-      }
-      // #4761: a live writer in the checkout (a background process, a terminal, an external
-      // editor) could write after the lossy-work check below, and the forced removal would lose
-      // that work unreported. Take the archive path's admission hold: it refuses while such
-      // activity exists and admits no new sends, bash, terminals or opens until it is released
-      // after the removal. Model-driven only: automatic cleanup and the user cascade never refuse.
-      // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
-      // checkout loses no files, and the sticky app marker would block its removal forever.
-      const guardLiveWriters =
-        options?.lossyWorkPolicy === "refuse" && !subagentRemovalPreservesCheckout(entry.workspace);
-      // The fresh background-process check first, as model-driven archive does: it refreshes exit
-      // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
-      if (
-        guardLiveWriters &&
-        (await this.workspaceService.hasRunningBackgroundBashProcesses(taskId))
-      ) {
-        return Ok({
-          status: "error",
-          action: "remove",
-          ...target,
-          error:
-            "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
-        });
-      }
-      return await this.removeInactiveTaskUnderLiveWriterHold({
-        taskId,
-        entry,
-        target,
-        options,
-        patchArtifact,
-        guardLiveWriters,
+  private async removeInactiveTaskUnderPatchLock(
+    removal: InactiveTaskRemoval
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    // The task can become inactive before its background format-patch job finishes. Wait for the
+    // in-process job, then refuse removal if a restart left a durable pending marker behind; the
+    // child worktree is the source needed to recover that artifact.
+    await this.gitPatchArtifactService.waitForGeneration(removal.taskId);
+    const parentWorkspaceId = removal.entry.workspace.parentWorkspaceId;
+    const patchArtifact = parentWorkspaceId
+      ? await readSubagentGitPatchArtifact(
+          path.join(this.config.sessionsDir, parentWorkspaceId),
+          removal.taskId
+        )
+      : null;
+    if (patchArtifact?.status === "pending") {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
       });
-    });
+    }
+    return await this.refuseBackgroundBashBeforeRemoval({ ...removal, patchArtifact });
+  }
+
+  private async refuseBackgroundBashBeforeRemoval(
+    removal: InactiveTaskRemovalUnderPatchLock
+  ): Promise<Result<WorkspaceLifecycleResult, string>> {
+    // #4761: a live writer in the checkout (a background process, a terminal, an external
+    // editor) could write after the lossy-work check below, and the forced removal would lose
+    // that work unreported. Take the archive path's admission hold: it refuses while such
+    // activity exists and admits no new sends, bash, terminals or opens until it is released
+    // after the removal. Model-driven only: automatic cleanup and the user cascade never refuse.
+    // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
+    // checkout loses no files, and the sticky app marker would block its removal forever.
+    const guardLiveWriters =
+      removal.options?.lossyWorkPolicy === "refuse" &&
+      !subagentRemovalPreservesCheckout(removal.entry.workspace);
+    // The fresh background-process check first, as model-driven archive does: it refreshes exit
+    // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
+    if (
+      guardLiveWriters &&
+      (await this.workspaceService.hasRunningBackgroundBashProcesses(removal.taskId))
+    ) {
+      return Ok({
+        status: "error",
+        action: "remove",
+        ...removal.target,
+        error:
+          "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
+      });
+    }
+    return await this.removeInactiveTaskUnderLiveWriterHold({ ...removal, guardLiveWriters });
   }
 
   /** Takes the live-writer hold (#4761) and keeps it until the checks and the removal settle. */
