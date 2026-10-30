@@ -1,9 +1,10 @@
 // Characterization tests for paths of TaskService's queue drain
 // (maybeStartQueuedTasksFromReservations, reached through the public maybeStartQueuedTasks) that
-// the other suites do not reach: they pin today's behavior before that method is split into
-// steps. Each test asserts what the drain did with every queued row: reserved it (a plan handed
-// to enqueueReservedTaskLaunch), marked it failed (interrupted with a taskLaunchError), or left
-// it alone, and whether it took a slot.
+// the other suites do not reach. Each test asserts what the drain did with every queued row:
+// reserved it (a plan handed to enqueueReservedTaskLaunch), marked it failed (interrupted with a
+// taskLaunchError), or left it alone, and whether it took a slot. The lease tests assert that a
+// launch lease the drain holds for a task it does not launch is released: a leaked one makes the
+// task's removal refuse until the process exits.
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as path from "node:path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -56,7 +57,7 @@ function internals(taskService: TaskService): Internals {
   return taskService as unknown as Internals;
 }
 
-describe("TaskService queue drain paths before the split", () => {
+describe("TaskService queue drain: reservations, refusals and launch leases", () => {
   let rootDir: string;
   let config: Config;
   let projectPath: string;
@@ -81,6 +82,9 @@ describe("TaskService queue drain paths before the split", () => {
   });
 
   const row = (id: string) => findWorkspaceInConfig(config, id);
+  /** The tasks among `taskIds` on which this backend still holds a launch lease. */
+  const launchLeasesHeld = (...taskIds: string[]) =>
+    taskIds.filter((taskId) => workspaceUseLeasesFor(config).heldCount(taskId, "launch") > 0);
 
   /** A local workspace row in the project directory; tasks sort by `minute` (createdAt). */
   function workspace(id: string, minute: number, overrides: Partial<WorkspaceConfigEntry> = {}) {
@@ -231,7 +235,8 @@ describe("TaskService queue drain paths before the split", () => {
     await drain();
 
     // No launch for the streaming task, and it takes the free slot too: the next task stays
-    // queued.
+    // queued. That second slot is issue #7743 (the double slot): its fix makes this test fail,
+    // and must change it to expect `later` to launch.
     expect(launched()).toEqual([]);
     expect(row("streaming")?.taskStatus).toBe("running");
     expect(row("later")?.taskStatus).toBe("queued");
@@ -363,10 +368,58 @@ describe("TaskService queue drain paths before the split", () => {
 
     // No launch lease for the second task: the drain stopped instead of trying it.
     expect(leaseHolds.mock.calls.map(([taskId]) => taskId)).toEqual(["first"]);
+    // The drain released the first task's lease when it stopped.
+    expect(launchLeasesHeld("first", "second")).toEqual([]);
     expect(launched()).toEqual([]);
     expect(markedFailed()).toEqual([]);
     expect(row("first")?.taskStatus).toBe("queued");
     expect(row("second")?.taskStatus).toBe("queued");
+  });
+
+  test("a launch CAS lost to another writer releases the launch lease and plans nothing", async () => {
+    const { taskService, drain, plans, markedFailed } = await setup([queued("child", 1)], {
+      slots: 1,
+    });
+    const leases = workspaceUseLeasesFor(config);
+    const hold = leases.hold.bind(leases);
+    spyOn(leases, "hold").mockImplementationOnce(async (workspaceId, kind) => {
+      const lease = await hold(workspaceId, kind);
+      // Another writer (a Stop) ends the task after the drain's lease hold, before its CAS.
+      await taskService.editWorkspaceEntry(workspaceId, (workspace) => {
+        workspace.taskStatus = "interrupted";
+      });
+      return lease;
+    });
+
+    await drain();
+
+    expect(launchLeasesHeld("child")).toEqual([]);
+    expect(plans()).toEqual([]);
+    expect(markedFailed()).toEqual([]);
+    expect(row("child")?.taskStatus).toBe("interrupted");
+  });
+
+  test("a config write that throws out of the loop after an earlier task's plan leaves no launch lease held", async () => {
+    const { taskService, launched, markedFailed } = await setup(
+      [queued("first", 1), queued("second", 2)],
+      { slots: 2 }
+    );
+    // Every config write of the second task fails: its launch CAS throws, then the write of its
+    // failure mark rethrows out of the loop. The first task's plan is collected, not launched.
+    const editRow = taskService.editWorkspaceEntry.bind(taskService);
+    spyOn(taskService, "editWorkspaceEntry").mockImplementation((workspaceId, ...rest) =>
+      workspaceId === "second"
+        ? Promise.reject(new Error("config write failed"))
+        : editRow(workspaceId, ...rest)
+    );
+
+    const drainFailure = await taskService.maybeStartQueuedTasks().catch((error: unknown) => error);
+    expect(drainFailure).toMatchObject({ message: "config write failed" });
+
+    // The CAS failure released the second task's lease, and the drain's scope exit the first's.
+    expect(launchLeasesHeld("first", "second")).toEqual([]);
+    expect(launched()).toEqual([]);
+    expect(markedFailed()).toEqual(["second"]);
   });
 
   test.each([
