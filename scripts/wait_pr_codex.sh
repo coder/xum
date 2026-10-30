@@ -115,6 +115,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
         nodes {
           id
           author { login }
+          authorAssociation
           body
           createdAt
           isMinimized
@@ -370,6 +371,18 @@ run_codex_comments_gate() {
   fi
 }
 
+# A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on one.
+# The gate reads every comment and says when a request is needed: once per head, because the
+# request names the head and the gate skips a head that a request already names.
+request_security_review_if_needed() {
+  local head="$1"
+  [[ "$check_output" == *"No Codex security review was requested for $head"* ]] || return 0
+  echo "⏳ Codex finished without a security receipt for ${head:0:10}; requesting a Codex security review."
+  gh pr comment "$PR_NUMBER" --repo "$OWNER/$REPO" --body "@codex security review
+
+Head: $head" >/dev/null
+}
+
 CHECK_CODEX_STATUS_ONCE() {
   local pr_data
   local pr_state
@@ -444,6 +457,21 @@ CHECK_CODEX_STATUS_ONCE() {
   fi
 
   LAST_REQUEST_AT="$request_at"
+
+  # Before any approval returns: an approved head that still lacks its security receipt fails
+  # the gate, so request the receipt and keep waiting (coder/xum#7731).
+  run_codex_comments_gate
+  if [ "$check_rc" -eq 10 ] && [[ "$check_output" == *"Waiting for the Codex security receipt for $pr_head"* ]]; then
+    # A usage-limit notice after this head's request means no receipt will come: fail, never pass.
+    if [ "$(echo "$all_comments" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" 'include "codex_comments";
+      ([.[] | select(.author.login != $bot and (.body | contains("@codex security review") and contains($head))) | .createdAt] | max) as $asked
+      | $asked != null and any(.[]; .createdAt > $asked and .isMinimized != true and codex_usage_limit($bot))')" = "true" ]; then
+      echo "❌ Codex usage limits reached: no security receipt for $pr_head."
+      return 1
+    fi
+    request_security_review_if_needed "$pr_head" || return 1
+    return 10
+  fi
 
   # A fresh quota notice may pass the gate, but only after the full findings check below.
   rate_limit_comment=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
@@ -538,7 +566,6 @@ CHECK_CODEX_STATUS_ONCE() {
   # request or a board pushed out of this script's 100-comment window still fails
   # fast here instead of after the review ends. Gate 10 means Codex is still
   # reviewing the current head and nothing else blocks.
-  run_codex_comments_gate
   case "$check_rc" in
     0) ;;
     10)

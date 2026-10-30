@@ -40,10 +40,11 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
-def comment(body, author=BOT, created_at=AFTER, minimized=False):
+def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
         "author": {"login": author},
+        "authorAssociation": association,
         "body": body,
         "createdAt": created_at,
         "isMinimized": minimized,
@@ -103,6 +104,11 @@ class CodexGateTest(unittest.TestCase):
         gh.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if args[:2] == ['pr', 'comment']:
+    # The only write the scripts may make: a Codex review request (wait_pr_codex.sh).
+    with open(os.environ['CODEX_GATE_POSTS'], 'a') as posts:
+        posts.write(args[args.index('--body') + 1] + '\\0')
+    sys.exit(0)
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
 cursor = next((arg[7:] for arg in args if arg.startswith('cursor=')), 'null')
@@ -151,6 +157,8 @@ else:
             round_marker.unlink()
         calls = self.directory / "calls"
         calls.write_text("")
+        self.posts = self.directory / "posts"
+        self.posts.write_text("")
         cache_file = self.directory / "cache.json"
         if cache is not None:
             cache_file.write_text(json.dumps(cache))
@@ -164,6 +172,7 @@ else:
                 "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
                 "CODEX_GATE_FIXTURE": str(fixture),
                 "CODEX_GATE_CALLS": str(calls),
+                "CODEX_GATE_POSTS": str(self.posts),
                 "MUX_GH_OWNER": "fixture",
                 "MUX_GH_REPO": "fixture",
                 "MUX_SKIP_FETCH_SYNC": "1",
@@ -331,9 +340,10 @@ else:
         self.assertNotEqual(running, board)
         for case, comments, threads, pr_head, expected in (
             ("clean receipt for this head", [board, receipt], [], head, 0),
-            ("no receipt", [board], [], head, 1),
+            # Pending, not failed: a push-triggered run posts no receipt (coder/xum#7731).
+            ("no receipt", [board], [], head, 10),
             ("open Codex thread", [board, receipt], [open_thread], head, 1),
-            ("receipt for an older head", [board, older_receipt], [], head, 1),
+            ("receipt for an older head", [board, older_receipt], [], head, 10),
             # Unknown, not "older review in progress": null flags are clean only for this head.
             ("board and receipt for an older head", [board, receipt], [], NEWER_HEAD, 1),
             ("advisory section", [advisory, receipt], [], head, 1),
@@ -347,7 +357,44 @@ else:
                     self.assert_gate(expected, data, cache=data if cached else None)
         with self.subTest("a minimized receipt does not count"):
             data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
-            self.assert_gate(1, data)
+            self.assert_gate(10, data)
+        with self.subTest("the CI wait ends once the receipt lands"):
+            pending = snapshot([comment(board)], head=head)
+            self.assert_gate(0, [pending, snapshot([comment(board), comment(receipt)], head=head)], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("a finding still fails while the receipt is pending"):
+            data = snapshot([comment(board)], [open_thread], head=head)
+            self.assert_gate(1, data, wait=60)
+
+    def test_missing_security_receipt_is_requested_once_per_head(self):
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        review = comment("@codex review", "maintainer", BEFORE)
+        posted = "@codex security review\n\nHead: " + head
+        approval = comment("Codex Review: Didn't find any major issues. Nice work!", created_at=AFTER)
+        for case, comments, posts, expected in (
+            ("no request names the head", [review, comment(board)], 1, 10),
+            # A request that names another head (an earlier push) does not count.
+            ("request for an older head", [review, comment(posted.replace(head, "c" * 40), "maintainer"),
+                                           comment(board)], 1, 10),
+            ("request names the head", [review, comment(posted, "maintainer"), comment(board)], 0, 10),
+            # Anyone can comment on a public PR: only a member's request counts.
+            ("outsider's request names the head",
+             [review, comment(posted, "outsider", association="NONE"), comment(board)], 1, 10),
+            ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
+            ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
+            # No receipt will come after a usage-limit notice: fail, never pass the security half.
+            ("usage limits after the head's request",
+             [review, comment(posted, "maintainer", REQUEST), comment(board), comment(USAGE_LIMIT_NOTICES[0])], 0, 1),
+            ("usage limits before the head's request",
+             [review, comment(USAGE_LIMIT_NOTICES[0], created_at=BEFORE), comment(posted, "maintainer", REQUEST),
+              comment(board)], 0, 10),
+        ):
+            with self.subTest(case=case):
+                result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(self.posts.read_text().split("\0")[:-1], [posted] * posts)
 
     def test_null_code_review_flags_pass_only_for_this_head(self):
         # Since 2026-10-29 Codex can finish a code review with null flags (coder/xum#7734,
