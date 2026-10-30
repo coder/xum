@@ -98,6 +98,7 @@ import {
   type SendIdentity,
 } from "./sendIds";
 import { log } from "./log";
+import { restorePostCompactionContextAfterCut } from "./postCompactionContext";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
@@ -258,6 +259,16 @@ function retireReexposedCompactionFollowUp(
   const { pendingFollowUp: _consumed, ...remaining } = metadata;
   const retired = { ...exposed, metadata: { ...exposed.metadata, muxMetadata: remaining } };
   return (message) => (message === exposed ? retired : message);
+}
+
+/** The retained-row sanitizer of an edit or fork cut. */
+function sanitizeRetainedAfterCut(
+  retained: readonly MuxMessage[],
+  removed: readonly MuxMessage[]
+): (message: MuxMessage) => MuxMessage {
+  const retire = retireReexposedCompactionFollowUp(retained, removed);
+  const restoreHeader = restorePostCompactionContextAfterCut(retained);
+  return (message) => restoreHeader(retire(message));
 }
 
 function deletionCreatesRawReset(
@@ -6064,7 +6075,7 @@ export class HistoryService {
             rows,
             workspaceId,
             truncatedMessages,
-            retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
+            sanitizeRetainedAfterCut(truncatedMessages, removedMessages)
           );
 
           const archiveMaxSeq = await this.getArchiveTailMaxSequence(workspaceId);
@@ -6193,7 +6204,7 @@ export class HistoryService {
           [...archiveRows, ...activeEpochRows],
           workspaceId,
           truncatedMessages,
-          retireReexposedCompactionFollowUp(truncatedMessages, removedMessages)
+          sanitizeRetainedAfterCut(truncatedMessages, removedMessages)
         ),
         publication
       );
