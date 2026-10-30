@@ -1197,13 +1197,14 @@ function deepMergeAgentFrontmatter(
   return overlay;
 }
 
-type AgentFrontmatterAi = AgentDefinitionPackage["frontmatter"]["ai"];
+type AgentFrontmatterAi = NonNullable<AgentDefinitionPackage["frontmatter"]["ai"]>;
 
 interface ResolvedAgentDefinitionWithOwnAi {
   definition: AgentDefinitionPackage;
   /**
    * The agent's own `ai` layer: its hops of the same ID (project `exec.md` with `base: exec`)
    * merged closer-first, without a different-ID base. Mirrors collectDefinitionLayers' target.
+   * Never undefined, so a listed descriptor always marks its aiDefaults as merged.
    */
   ownAi: AgentFrontmatterAi;
 }
@@ -1283,7 +1284,7 @@ async function resolveAgentDefinitionWithOwnAi(
 
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return { definition: pkg, ownAi: pkg.frontmatter.ai };
+      return { definition: pkg, ownAi: pkg.frontmatter.ai ?? {} };
     }
 
     const resolvedBase = await resolve(
@@ -1303,7 +1304,9 @@ async function resolveAgentDefinitionWithOwnAi(
 
     const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
     const ownAi =
-      baseId === pkg.id ? { ...resolvedBase.ownAi, ...pkg.frontmatter.ai } : pkg.frontmatter.ai;
+      baseId === pkg.id
+        ? { ...resolvedBase.ownAi, ...pkg.frontmatter.ai }
+        : (pkg.frontmatter.ai ?? {});
     return {
       definition: {
         ...pkg,
@@ -1468,8 +1471,7 @@ export async function listAgentDefinitions(
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
-        // An empty layer still marks aiDefaults as merged, so readers never fall back to it.
-        ownAiDefaults: entry.ownAi ?? {},
+        ownAiDefaults: entry.ownAi,
         tools: frontmatter.tools,
       },
     ];
