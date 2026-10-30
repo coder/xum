@@ -2039,7 +2039,9 @@ export const PluginsSettingsSection: React.FC = () => {
                 >
                   {/* The header holds only name, badges and actions: whether the actions
                       wrap then depends on the title alone, not on description length, so
-                      every card puts them in the same place. */}
+                      every card puts them in the same place. The flex-1 name block pushes the
+                      actions to the right on the name row. Once they wrap they start at the
+                      left, flush with the card text, so they need no ml-auto/justify-end. */}
                   <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-2">
                     <div className="flex min-w-0 flex-1 basis-48 flex-wrap items-baseline gap-2">
                       {/* break-all: names can be 64 separator-free chars. */}
@@ -2058,7 +2060,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       <NeedsReviewBadge item={item} />
                     </div>
                     {item.managed && (
-                      <div className="ml-auto flex flex-wrap justify-end gap-1">
+                      <div className="flex flex-wrap gap-1">
                         <ReviewComponentsButton
                           item={item}
                           disabled={busyPlugin !== null}
