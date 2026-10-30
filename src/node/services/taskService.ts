@@ -7475,24 +7475,12 @@ export class TaskService implements AgentTaskIntegration {
       taskWasShared,
       sharesParentCheckout,
     };
-    // The row reads between the fork and the sanitize step. A throw fails the launch, which
-    // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
-    // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
-    const readLaunchRowBeforeSanitize = () => {
-      try {
-        return this.readLaunchRow(plan.taskId);
-      } catch (error) {
-        if (!sharesParentCheckout) this.initStateManager.markCheckoutUnsanitized(plan.taskId);
-        initLogger.logComplete(-1);
-        throw error;
-      }
-    };
     if (plan.abortSignal?.aborted) {
       await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
 
-    const entryAfterMaterialize = readLaunchRowBeforeSanitize();
+    const entryAfterMaterialize = this.readLaunchRowBeforeSanitize(plan, checkout);
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupLaunchCheckout(plan, checkout);
@@ -7510,16 +7498,16 @@ export class TaskService implements AgentTaskIntegration {
       await this.emitWorkspaceMetadata(plan.parentWorkspaceId);
     }
 
-    const {
-      workspacePath,
-      trunkBranch,
-      forkedRuntimeConfig,
-      runtimeForTaskWorkspace,
-      inheritedProjects,
-    } = materialized;
+    await this.persistLaunchCheckout(plan, checkout);
+  }
 
-    this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
-    const base = await readTaskBaseCommits(plan, materialized);
+  /** Writes the checkout and its base commits on the task's row and publishes it. */
+  private async persistLaunchCheckout(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
+    this.configureMultiProjectRuntimeEnvResolver(checkout.runtimeForTaskWorkspace);
+    const base = await readTaskBaseCommits(plan, checkout);
 
     await this.editWorkspaceEntry(
       plan.taskId,
@@ -7527,15 +7515,15 @@ export class TaskService implements AgentTaskIntegration {
         if (ws.taskStatus !== "starting" || this.launchSuperseded(plan, ws)) {
           return;
         }
-        ws.path = workspacePath;
-        ws.runtimeConfig = forkedRuntimeConfig;
-        ws.taskTrunkBranch = trunkBranch;
+        ws.path = checkout.workspacePath;
+        ws.runtimeConfig = checkout.forkedRuntimeConfig;
+        ws.taskTrunkBranch = checkout.trunkBranch;
         ws.taskBaseCommitSha = base.taskBaseCommitSha;
         ws.taskBaseCommitShaByProjectPath = base.taskBaseCommitShaByProjectPath;
-        ws.projects = inheritedProjects;
+        ws.projects = checkout.inheritedProjects;
         // The shared parent checkout was gone, so this task had to fork a real workspace.
         // Clear the shared flag so removal cleans up the new worktree.
-        if (taskWasShared && !sharesParentCheckout) {
+        if (checkout.taskWasShared && !checkout.sharesParentCheckout) {
           ws.taskIsolation = undefined;
         }
       },
@@ -7546,10 +7534,17 @@ export class TaskService implements AgentTaskIntegration {
       await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
+    await this.sanitizeLaunchCheckout(plan, checkout);
+  }
 
-    const entryBeforeSend = readLaunchRowBeforeSanitize();
+  /** Rechecks the persisted row, then sanitizes a forked checkout: sanitize or fail. */
+  private async sanitizeLaunchCheckout(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
+    const entryBeforeSend = this.readLaunchRowBeforeSanitize(plan, checkout);
     if (!entryBeforeSend) {
-      initLogger.logComplete(-1);
+      checkout.initLogger.logComplete(-1);
       await this.cleanupLaunchCheckout(plan, checkout);
       return;
     }
@@ -7557,11 +7552,11 @@ export class TaskService implements AgentTaskIntegration {
       entryBeforeSend.workspace.taskStatus !== "starting" ||
       this.launchSuperseded(plan, entryBeforeSend.workspace)
     ) {
-      initLogger.logComplete(-1);
+      checkout.initLogger.logComplete(-1);
       return;
     }
 
-    if (!sharesParentCheckout) {
+    if (!checkout.sharesParentCheckout) {
       // SECURITY: task worktrees materialize AFTER their workspace entry is
       // registered, so creation-time plugin-override sanitization never saw
       // this checkout — a tracked stale `plugin:` enable would re-activate a
@@ -7569,8 +7564,8 @@ export class TaskService implements AgentTaskIntegration {
       // Same contract as the host's create/fork paths: sanitize or fail.
       const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
         plan.taskId,
-        workspacePath,
-        forkedRuntimeConfig
+        checkout.workspacePath,
+        checkout.forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
         // Before any reclaim or init completion: MCP and sends refuse this checkout (#4674).
@@ -7583,7 +7578,7 @@ export class TaskService implements AgentTaskIntegration {
         try {
           reclaimed = (
             await this.reclaimUnsanitizedTaskCheckout(
-              runtimeForTaskWorkspace,
+              checkout.runtimeForTaskWorkspace,
               plan.parentMeta.projectPath,
               plan.workspaceName,
               plan.taskId,
@@ -7600,7 +7595,7 @@ export class TaskService implements AgentTaskIntegration {
           if (reclaimed) {
             this.initStateManager.clearInMemoryState(plan.taskId);
           } else {
-            initLogger.logComplete(-1);
+            checkout.initLogger.logComplete(-1);
           }
         }
         throw new Error(sanitizeError);
@@ -7814,6 +7809,26 @@ export class TaskService implements AgentTaskIntegration {
       plan.taskId,
       { preservePhysicalWorkspace: checkout.sharesParentCheckout }
     );
+  }
+
+  /**
+   * The row reads between the fork and the sanitize step. A throw fails the launch, which
+   * leaves the task resumable: first quarantine a checkout the sanitize step has not run in
+   * (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
+   */
+  private readLaunchRowBeforeSanitize(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): ReturnType<typeof findWorkspaceEntry> {
+    try {
+      return this.readLaunchRow(plan.taskId);
+    } catch (error) {
+      if (!checkout.sharesParentCheckout) {
+        this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+      }
+      checkout.initLogger.logComplete(-1);
+      throw error;
+    }
   }
 
   createFromRpc(args: RpcTaskCreateArgs): Promise<Result<TaskCreateResult, string>> {
