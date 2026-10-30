@@ -423,6 +423,35 @@ describe("BackupService against a real repository", () => {
     expect(service.getSettings()?.lastRestoredCommit).toBe(pushed.data.commit);
   });
 
+  it("previews and restores around a backed-up skill whose local folder is now a symlink", async () => {
+    // A skill pushed as a real folder, then replaced locally by a symlink into a shared skills
+    // store (`~/.xum/skills/gh-stack -> ~/.agents/skills/gh-stack`), once failed every preview
+    // and restore with "Refusing to follow symlink 'skills/gh-stack/SKILL.md'".
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await fs.rm(path.join(muxRoot, "skills/gh-stack"), { recursive: true });
+    await fs.symlink(sharedSkill, path.join(muxRoot, "skills/gh-stack"));
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      "skills/gh-stack/SKILL.md"
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(path.join(muxRoot, "skills/gh-stack"))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();
