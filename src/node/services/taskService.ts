@@ -7435,7 +7435,17 @@ export class TaskService implements AgentTaskIntegration {
       await this.cancelReservedLaunch(plan);
       return;
     }
+    await this.materializeLaunchCheckout(plan, entryAtStart);
+  }
 
+  /**
+   * Starts the init log and materializes the task's checkout (a fork, or the shared parent
+   * checkout it reuses), then builds the checkout record the later steps read.
+   */
+  private async materializeLaunchCheckout(
+    plan: TaskLaunchPlan,
+    entryAtStart: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): Promise<void> {
     // isolation: "none" tasks were queued pointing at the parent's checkout. When that checkout
     // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
     // back to forking a real workspace and the shared flag must be cleared below.
@@ -7479,21 +7489,31 @@ export class TaskService implements AgentTaskIntegration {
       await this.cancelMaterializedLaunch(plan, checkout);
       return;
     }
+    await this.updateLaunchSourceRuntime(plan, checkout);
+  }
 
+  /**
+   * Rechecks the row after the fork, then writes the parent's runtime config when the fork
+   * changed it.
+   */
+  private async updateLaunchSourceRuntime(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout
+  ): Promise<void> {
     const entryAfterMaterialize = this.readLaunchRowBeforeSanitize(plan, checkout);
     if (!entryAfterMaterialize) {
-      initLogger.logComplete(-1);
+      checkout.initLogger.logComplete(-1);
       await this.cleanupLaunchCheckout(plan, checkout);
       return;
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
-      initLogger.logComplete(-1);
+      checkout.initLogger.logComplete(-1);
       return;
     }
 
-    if (materialized.sourceRuntimeConfigUpdate) {
+    if (checkout.sourceRuntimeConfigUpdate) {
       await this.config.updateWorkspaceMetadata(plan.parentWorkspaceId, {
-        runtimeConfig: materialized.sourceRuntimeConfigUpdate,
+        runtimeConfig: checkout.sourceRuntimeConfigUpdate,
       });
       await this.emitWorkspaceMetadata(plan.parentWorkspaceId);
     }
