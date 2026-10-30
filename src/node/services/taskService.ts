@@ -1030,6 +1030,17 @@ interface QueuedDrainSnapshot {
   readonly taskIndex: AgentTaskIndex;
 }
 
+/** A drain that has queued tasks and a free slot: what its per-task loop reads. */
+interface QueuedDrain extends QueuedDrainSnapshot {
+  readonly queuedTasks: readonly AgentTaskWorkspaceEntry[];
+  readonly availableSlots: number;
+}
+
+/** A drain's reads under the mutex: idle (nothing queued, or no free slot), or open. */
+type QueuedDrainOpening =
+  | { readonly kind: "idle" }
+  | { readonly kind: "open"; readonly drain: QueuedDrain };
+
 /** A queued task's parent, as the drain's config names it, and the runtimes its launch uses. */
 interface QueuedTaskParent {
   readonly parentWorkspaceId: string;
@@ -16799,76 +16810,12 @@ export class TaskService implements AgentTaskIntegration {
     {
       await using _lock = await this.mutex.acquire();
 
-      let config = this.config.loadConfigOrDefault();
-      const taskSettings: TaskSettings = config.taskSettings ?? DEFAULT_TASK_SETTINGS;
-      const listQueuedTasks = (sourceConfig: ProjectsConfig): AgentTaskWorkspaceEntry[] =>
-        this.listAgentTaskWorkspaces(sourceConfig)
-          .filter((task) => task.taskStatus === "queued" && typeof task.id === "string")
-          .sort((a, b) => {
-            const aTime = a.createdAt ? Date.parse(a.createdAt) : 0;
-            const bTime = b.createdAt ? Date.parse(b.createdAt) : 0;
-            return aTime - bTime;
-          });
-      let taskIndex = this.buildAgentTaskIndex(config);
-      let queuedTasks = listQueuedTasks(config);
-
-      let interruptedInactiveWorkflowQueuedTask = false;
-      for (const task of queuedTasks) {
-        const taskId = task.id;
-        assert(taskId != null && taskId.length > 0, "queued task id is required");
-        if (
-          await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-            taskId,
-            config,
-            "queued-inactive-workflow-owner-prepass",
-            taskIndex,
-            { scheduleQueueDrain: false }
-          )
-        ) {
-          interruptedInactiveWorkflowQueuedTask = true;
-        }
-      }
-      if (interruptedInactiveWorkflowQueuedTask) {
-        config = this.config.loadConfigOrDefault();
-        taskIndex = this.buildAgentTaskIndex(config);
-        queuedTasks = listQueuedTasks(config);
-      }
-
-      // Captured before the count reads any turn file: only requests armed before then are swept.
-      const staleTurnSweepGeneration = this.staleTurnSweepRequestedGeneration;
-      if (
-        queuedTasks.length === 0 &&
-        staleTurnSweepGeneration === this.staleTurnSweepDoneGeneration
-      ) {
-        taskQueueDebug("TaskService.maybeStartQueuedTasks no queued tasks", {});
-        return;
-      }
-      const activeAgentTasks = this.countActiveAgentTasks(config);
-      const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
-        await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
-      // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
-      // request pending so a later drain retries the sweep (empty-queue drains included).
-      if (sweptEveryOwner) {
-        this.staleTurnSweepDoneGeneration = Math.max(
-          this.staleTurnSweepDoneGeneration,
-          staleTurnSweepGeneration
-        );
-      }
-      if (queuedTasks.length === 0) return;
-      const availableSlots = Math.max(
-        0,
-        taskSettings.maxParallelAgentTasks - (activeAgentTasks + activeWorkspaceTurns)
-      );
-      taskQueueDebug("TaskService.maybeStartQueuedTasks reservation summary", {
-        maxParallelAgentTasks: taskSettings.maxParallelAgentTasks,
-        availableSlots,
-      });
-      if (availableSlots === 0) return;
-
-      const drain: QueuedDrainSnapshot = { config, taskIndex };
+      const opening = await this.openQueuedDrain();
+      if (opening.kind === "idle") return;
+      const { drain } = opening;
       let reservedSlots = 0;
-      for (const task of queuedTasks) {
-        if (reservedSlots >= availableSlots) {
+      for (const task of drain.queuedTasks) {
+        if (reservedSlots >= drain.availableSlots) {
           break;
         }
         const reservation = await this.reserveQueuedTaskSlot(task, drain, plans);
@@ -16878,6 +16825,93 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.launchReservedPlans(plans);
+  }
+
+  /** A config's queued tasks, oldest first. */
+  private listQueuedAgentTasks(sourceConfig: ProjectsConfig): AgentTaskWorkspaceEntry[] {
+    return this.listAgentTaskWorkspaces(sourceConfig)
+      .filter((task) => task.taskStatus === "queued" && typeof task.id === "string")
+      .sort((a, b) => {
+        const aTime = a.createdAt ? Date.parse(a.createdAt) : 0;
+        const bTime = b.createdAt ? Date.parse(b.createdAt) : 0;
+        return aTime - bTime;
+      });
+  }
+
+  /**
+   * The drain's first reads under the mutex: the queued tasks, after a prepass that interrupts
+   * the ones whose workflow owner is no longer active (and re-reads the config if it did).
+   */
+  private async openQueuedDrain(): Promise<QueuedDrainOpening> {
+    let config = this.config.loadConfigOrDefault();
+    const taskSettings: TaskSettings = config.taskSettings ?? DEFAULT_TASK_SETTINGS;
+    let taskIndex = this.buildAgentTaskIndex(config);
+    let queuedTasks = this.listQueuedAgentTasks(config);
+
+    let interruptedInactiveWorkflowQueuedTask = false;
+    for (const task of queuedTasks) {
+      const taskId = task.id;
+      assert(taskId != null && taskId.length > 0, "queued task id is required");
+      if (
+        await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          taskId,
+          config,
+          "queued-inactive-workflow-owner-prepass",
+          taskIndex,
+          { scheduleQueueDrain: false }
+        )
+      ) {
+        interruptedInactiveWorkflowQueuedTask = true;
+      }
+    }
+    if (interruptedInactiveWorkflowQueuedTask) {
+      config = this.config.loadConfigOrDefault();
+      taskIndex = this.buildAgentTaskIndex(config);
+      queuedTasks = this.listQueuedAgentTasks(config);
+    }
+    return await this.countQueuedDrainSlots(taskSettings, { config, taskIndex }, queuedTasks);
+  }
+
+  /**
+   * The drain's free slots, from the active tasks and the turn count (which also completes a
+   * pending stale-turn sweep). Idle when no task is queued or no slot is free.
+   */
+  private async countQueuedDrainSlots(
+    taskSettings: TaskSettings,
+    snapshot: QueuedDrainSnapshot,
+    queuedTasks: readonly AgentTaskWorkspaceEntry[]
+  ): Promise<QueuedDrainOpening> {
+    // Captured before the count reads any turn file: only requests armed before then are swept.
+    const staleTurnSweepGeneration = this.staleTurnSweepRequestedGeneration;
+    if (
+      queuedTasks.length === 0 &&
+      staleTurnSweepGeneration === this.staleTurnSweepDoneGeneration
+    ) {
+      taskQueueDebug("TaskService.maybeStartQueuedTasks no queued tasks", {});
+      return { kind: "idle" };
+    }
+    const activeAgentTasks = this.countActiveAgentTasks(snapshot.config);
+    const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
+      await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
+    // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
+    // request pending so a later drain retries the sweep (empty-queue drains included).
+    if (sweptEveryOwner) {
+      this.staleTurnSweepDoneGeneration = Math.max(
+        this.staleTurnSweepDoneGeneration,
+        staleTurnSweepGeneration
+      );
+    }
+    if (queuedTasks.length === 0) return { kind: "idle" };
+    const availableSlots = Math.max(
+      0,
+      taskSettings.maxParallelAgentTasks - (activeAgentTasks + activeWorkspaceTurns)
+    );
+    taskQueueDebug("TaskService.maybeStartQueuedTasks reservation summary", {
+      maxParallelAgentTasks: taskSettings.maxParallelAgentTasks,
+      availableSlots,
+    });
+    if (availableSlots === 0) return { kind: "idle" };
+    return { kind: "open", drain: { ...snapshot, queuedTasks, availableSlots } };
   }
 
   /**
