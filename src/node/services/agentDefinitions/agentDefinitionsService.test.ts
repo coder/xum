@@ -5,6 +5,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
@@ -27,6 +28,7 @@ import {
 } from "./agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+import { resolveChainAgentCacheTtl } from "./resolveNodeAgentAiSettings";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
@@ -301,6 +303,56 @@ describe("agentDefinitionsService", () => {
         { agentId: "helper" },
         { agentId: "exec" },
       ]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
+  test("Settings keeps an agent ID that comes back further down the chain at its later hop", async () => {
+    using project = new DisposableTempDir("agent-list-repeated-id");
+    using home = new DisposableTempDir("agent-list-repeated-id-home");
+    const write = async (root: string, id: string, frontmatter: string) => {
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(path.join(root, `${id}.md`), `---\nname: ${id}\n${frontmatter}---\nBody.`);
+    };
+    await write(path.join(project.path, ".xum", "agents"), "explore", "base: helper\n");
+    await write(path.join(home.path, "agents"), "helper", "base: explore\nai:\n  cacheTtl: 1h\n");
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+        projectPath: project.path,
+      });
+      const aiLayers = agents.find((agent) => agent.id === "explore")?.aiLayers;
+
+      // The global helper's base skips the project explore and reaches the built-in one (5m),
+      // which ranks below helper instead of joining the project explore's own layer.
+      expect(aiLayers).toEqual({
+        ancestors: [
+          { agentId: "helper", definitionAiDefaults: { cacheTtl: "1h" } },
+          { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+          { agentId: "exec" },
+        ],
+      });
+      expect(resolveAgentCacheTtl({ targetAgentId: "explore", ...aiLayers })?.value).toBe("1h");
+
+      // A run reads the same chain from the checkout.
+      const runtime = new LocalRuntime(project.path);
+      const agentId = AgentIdSchema.parse("explore");
+      const agentDefinition = await readAgentDefinition(runtime, project.path, agentId, {
+        runtimeFactory,
+      });
+      const chain = await resolveAgentInheritanceChain({
+        runtime,
+        workspacePath: project.path,
+        agentId,
+        agentDefinition,
+        workspaceId: "ws",
+        runtimeFactory,
+      });
+      expect(resolveChainAgentCacheTtl("explore", undefined, chain)).toBe("1h");
     } finally {
       if (previousRoot === undefined) delete process.env.XUM_ROOT;
       else process.env.XUM_ROOT = previousRoot;

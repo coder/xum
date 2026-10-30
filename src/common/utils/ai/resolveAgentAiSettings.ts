@@ -138,9 +138,12 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 
   const chainIds = new Set<string>([input.targetAgentId]);
   for (const ancestor of input.ancestors ?? []) {
-    if (chainIds.has(ancestor.agentId)) continue;
-    chainIds.add(ancestor.agentId);
-    pushConfig(ancestor.agentId, false);
+    // An ID can come back further down a resolved chain (see collectDefinitionLayers): its
+    // Settings already ranked at its first hop, but this hop's frontmatter ranks here.
+    if (!chainIds.has(ancestor.agentId)) {
+      chainIds.add(ancestor.agentId);
+      pushConfig(ancestor.agentId, false);
+    }
     if (ancestor.definitionAiDefaults) {
       candidates.push({
         values: {

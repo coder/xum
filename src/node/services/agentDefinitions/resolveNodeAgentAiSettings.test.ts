@@ -77,6 +77,40 @@ describe("collectDefinitionLayers", () => {
 });
 
 describe("resolveChainAgentCacheTtl", () => {
+  it("ranks an agent ID that comes back after another ancestor at its later hop", () => {
+    // Project explore.md (base: helper) over a global helper.md (base: explore), whose base
+    // skips the project explore and resolves to the built-in explore (5m): helper is closer.
+    expect(
+      resolveChainAgentCacheTtl("explore", undefined, [
+        { id: "explore" },
+        { id: "helper", ai: { cacheTtl: "1h" } },
+        { id: "explore", ai: { cacheTtl: "5m" } },
+      ])
+    ).toBe("1h");
+    // Nothing closer sets one, so the later hop's own value still applies.
+    expect(
+      resolveChainAgentCacheTtl("explore", undefined, [
+        { id: "explore" },
+        { id: "helper" },
+        { id: "explore", ai: { cacheTtl: "5m" } },
+      ])
+    ).toBe("5m");
+  });
+
+  it("ranks a base ID that comes back after another ancestor at its later hop", () => {
+    // Project scout -> project helper -> global relay -> global helper (a global agent's base
+    // skips the project helper): relay is closer than the second helper hop, while helper's
+    // Settings still rank at its first hop.
+    const chain = [
+      { id: "scout" },
+      { id: "helper" },
+      { id: "relay", ai: { cacheTtl: "1h" as const } },
+      { id: "helper", ai: { cacheTtl: "5m" as const } },
+    ];
+    expect(resolveChainAgentCacheTtl("scout", undefined, chain)).toBe("1h");
+    expect(resolveChainAgentCacheTtl("scout", { helper: { cacheTtl: "5m" } }, chain)).toBe("5m");
+  });
+
   it("merges same-ID scope refinements closer-first", () => {
     // A project exec.md (base: exec) without a TTL keeps the built-in exec's; with one, it wins.
     expect(

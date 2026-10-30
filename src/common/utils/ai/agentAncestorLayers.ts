@@ -69,11 +69,12 @@ function mergeDefinitionDefaults(
 
 /**
  * Map an inheritance chain (target first, as returned by
- * resolveAgentInheritanceChain) onto resolver layers. The chain may contain
- * multiple entries with the same agent ID distinguished by scope (e.g.
- * project `exec.md` with `base: exec` refining the global/built-in `exec`);
- * the shared resolver deduplicates ancestors by ID, so same-ID entries must
- * merge field-wise into one layer here instead of being dropped.
+ * resolveAgentInheritanceChain) onto resolver layers. Consecutive entries with
+ * the same agent ID are scope refinements (e.g. project `exec.md` with
+ * `base: exec` refining the global/built-in `exec`) and merge field-wise into
+ * one layer, closer first. An ID that comes back after a different agent (a
+ * global agent's base skips the project agent of that ID) is a further hop and
+ * keeps its own, later layer.
  */
 export function collectDefinitionLayers(
   agentId: string,
@@ -84,22 +85,20 @@ export function collectDefinitionLayers(
 } {
   const targetId = chain[0]?.id ?? agentId;
   let targetDefinitionAiDefaults = toDefinitionDefaults(chain[0]?.ai);
-  const ancestorsById = new Map<string, AgentAiAncestorLayer>();
+  const ancestors: AgentAiAncestorLayer[] = [];
   for (const entry of chain.slice(1)) {
     const defaults = toDefinitionDefaults(entry.ai);
-    if (entry.id === targetId || entry.id === agentId) {
+    const previous = ancestors.at(-1);
+    if (!previous && (entry.id === targetId || entry.id === agentId)) {
       targetDefinitionAiDefaults = mergeDefinitionDefaults(targetDefinitionAiDefaults, defaults);
-      continue;
-    }
-    const existing = ancestorsById.get(entry.id);
-    if (existing) {
-      existing.definitionAiDefaults = mergeDefinitionDefaults(
-        existing.definitionAiDefaults,
+    } else if (previous?.agentId === entry.id) {
+      previous.definitionAiDefaults = mergeDefinitionDefaults(
+        previous.definitionAiDefaults,
         defaults
       );
     } else {
-      ancestorsById.set(entry.id, { agentId: entry.id, definitionAiDefaults: defaults });
+      ancestors.push({ agentId: entry.id, definitionAiDefaults: defaults });
     }
   }
-  return { targetDefinitionAiDefaults, ancestors: [...ancestorsById.values()] };
+  return { targetDefinitionAiDefaults, ancestors };
 }
