@@ -424,6 +424,135 @@ function parseTerminalSubagentTaskId(content: string): string | null {
 }
 
 /**
+ * What acknowledgeAgentReports learns from one pass over the owner's history, for pending children
+ * only: the sequence of each child's newest report row, the receipts that completed answers hold,
+ * and the highest request sequence such an answer covered.
+ */
+interface TerminalReportHistoryScan {
+  readonly terminalSequenceByTaskId: Map<string, number>;
+  coveredHistorySequence: number;
+  readonly toolReportsByTaskId: Map<string, CompletedTaskReportReceipt[]>;
+}
+
+/** A wake decided from the history scan, or a continuation that its turn record must decide. */
+type AgentReportConsumption =
+  | { kind: "decided"; consumed: boolean }
+  | { kind: "continuation"; handleId: string; reports: readonly CompletedTaskReportReceipt[] };
+
+/** Records the history sequence of a synthetic report row that names a pending child. */
+function recordTerminalSubagentSequence(
+  message: MuxMessage,
+  pendingIds: ReadonlySet<string>,
+  scan: TerminalReportHistoryScan
+): void {
+  const text = message.parts
+    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+  const taskId = parseTerminalSubagentTaskId(text);
+  const historySequence = message.metadata?.historySequence;
+  if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
+    scan.terminalSequenceByTaskId.set(taskId, historySequence);
+  }
+}
+
+/** An assistant row that finished its stream: the first three terms of a completed answer. */
+function isStoppedAssistantMessage(message: MuxMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    message.metadata?.partial !== true &&
+    message.metadata?.finishReason === "stop"
+  );
+}
+
+/** A compaction summary (or its legacy mode form) also stops, but it is not an answer. */
+function isCompactionMessage(message: MuxMessage): boolean {
+  return message.metadata?.agentId === "compact" || message.metadata?.mode === "compact";
+}
+
+/** Collects a completed answer's receipts for pending children and the request it covered. */
+function collectAssistantReportReceipts(
+  message: MuxMessage,
+  pendingIds: ReadonlySet<string>,
+  scan: TerminalReportHistoryScan
+): void {
+  // A late task_await can supply a report inside this SDK stream even though the
+  // request's history watermark predates it. Collect receipts independently of row
+  // order: the assistant placeholder is updated in place ahead of mid-stream reports.
+  for (const report of collectCompletedTaskReportReceipts(message)) {
+    if (!pendingIds.has(report.taskId)) continue;
+    const reports = scan.toolReportsByTaskId.get(report.taskId) ?? [];
+    reports.push(report);
+    scan.toolReportsByTaskId.set(report.taskId, reports);
+  }
+  const requestHistorySequence = message.metadata?.requestHistorySequence;
+  if (typeof requestHistorySequence !== "number") return;
+  scan.coveredHistorySequence = Math.max(scan.coveredHistorySequence, requestHistorySequence);
+}
+
+/** Scans the whole history before any wake is decided: receipts can precede their report rows. */
+function scanTerminalReportHistory(
+  messages: readonly MuxMessage[],
+  pendingIds: ReadonlySet<string>
+): TerminalReportHistoryScan {
+  const scan: TerminalReportHistoryScan = {
+    terminalSequenceByTaskId: new Map<string, number>(),
+    coveredHistorySequence: -1,
+    toolReportsByTaskId: new Map<string, CompletedTaskReportReceipt[]>(),
+  };
+  for (const message of messages) {
+    if (message.role === "user" && message.metadata?.synthetic === true) {
+      recordTerminalSubagentSequence(message, pendingIds, scan);
+      continue;
+    }
+
+    if (isStoppedAssistantMessage(message) && !isCompactionMessage(message)) {
+      collectAssistantReportReceipts(message, pendingIds, scan);
+    }
+  }
+  return scan;
+}
+
+/**
+ * Decides a wake from the scan alone: a covered report row, or a first assignment's receipt. A
+ * continuation of a workspace-turn handle is left to its turn record, which only TaskService reads.
+ */
+function decideAgentReportConsumption(
+  notification: TerminalAttentionNotification,
+  scan: TerminalReportHistoryScan
+): AgentReportConsumption {
+  const terminalSequence = scan.terminalSequenceByTaskId.get(notification.sourceId);
+  const consumed = terminalSequence != null && scan.coveredHistorySequence >= terminalSequence;
+  const reports = scan.toolReportsByTaskId.get(notification.sourceId) ?? [];
+  if (!consumed && notification.terminalOutcome === "completed" && reports.length > 0) {
+    if (notification.generationId == null) {
+      // Initial assignments have no execution identity; continuations do. Never let
+      // a stable child ID's older receipt consume a later assignment's notification.
+      return { kind: "decided", consumed: reports.some((report) => report.kind === "initial") };
+    }
+    // Resolve the notification's assignment, not the child's latest execution: the
+    // parent may already have reawakened that child before this drain gets its turn.
+    const [handleId] = notification.generationId.split(":");
+    if (!isWorkspaceTurnTaskId(handleId)) return { kind: "decided", consumed: false };
+    return { kind: "continuation", handleId, reports };
+  }
+  return { kind: "decided", consumed };
+}
+
+/** A continuation receipt that names the record's handle (or no handle), final message and report. */
+function receiptMatchesTurnRecord(
+  report: CompletedTaskReportReceipt,
+  record: WorkspaceTurnTaskHandleRecord
+): boolean {
+  return (
+    report.kind === "continuation" &&
+    (report.handleId == null || report.handleId === record.handleId) &&
+    report.messageId === record.messageId &&
+    receiptMatchesReport(report, record.reportMarkdown)
+  );
+}
+
+/**
  * Workspace-turn terminal output is not injected into parent history; it lives in the task handle
  * store. The wake-up must tell the agent to retrieve it with a one-shot task_await.
  */
@@ -13384,9 +13513,6 @@ export class TaskService implements AgentTaskIntegration {
     if (pending.length === 0) return consumedIds;
 
     const pendingIds = new Set(pending.map((notification) => notification.sourceId));
-    const terminalSequenceByTaskId = new Map<string, number>();
-    let coveredHistorySequence = -1;
-    const toolReportsByTaskId = new Map<string, CompletedTaskReportReceipt[]>();
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(ownerWorkspaceId);
     if (!historyResult.success) {
       log.warn("Failed to inspect terminal sub-agent responses", {
@@ -13396,81 +13522,40 @@ export class TaskService implements AgentTaskIntegration {
       return consumedIds;
     }
 
-    for (const message of historyResult.data) {
-      if (message.role === "user" && message.metadata?.synthetic === true) {
-        const text = message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-        const taskId = parseTerminalSubagentTaskId(text);
-        const historySequence = message.metadata?.historySequence;
-        if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
-          terminalSequenceByTaskId.set(taskId, historySequence);
-        }
-        continue;
-      }
+    const scan = scanTerminalReportHistory(historyResult.data, pendingIds);
+    return await this.markConsumedAgentReports(ownerWorkspaceId, pending, scan, consumedIds);
+  }
 
-      if (
-        message.role === "assistant" &&
-        message.metadata?.partial !== true &&
-        message.metadata?.finishReason === "stop" &&
-        message.metadata?.agentId !== "compact" &&
-        message.metadata?.mode !== "compact"
-      ) {
-        // A late task_await can supply a report inside this SDK stream even though the
-        // request's history watermark predates it. Collect receipts independently of row
-        // order: the assistant placeholder is updated in place ahead of mid-stream reports.
-        for (const report of collectCompletedTaskReportReceipts(message)) {
-          if (!pendingIds.has(report.taskId)) continue;
-          const reports = toolReportsByTaskId.get(report.taskId) ?? [];
-          reports.push(report);
-          toolReportsByTaskId.set(report.taskId, reports);
-        }
-        const requestHistorySequence = message.metadata?.requestHistorySequence;
-        if (typeof requestHistorySequence !== "number") continue;
-        coveredHistorySequence = Math.max(coveredHistorySequence, requestHistorySequence);
-      }
-    }
-
+  /**
+   * Decides each pending wake in order and marks the consumed ones delivered. One config read serves
+   * every wake. A failed delivery rejects before any later wake is decided.
+   */
+  private async markConsumedAgentReports(
+    ownerWorkspaceId: string,
+    pending: readonly TerminalAttentionNotification[],
+    scan: TerminalReportHistoryScan,
+    consumedIds: Set<string>
+  ): Promise<ReadonlySet<string>> {
     const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
     const owners = [
       ownerWorkspaceId,
       ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, ownerWorkspaceId),
     ];
     for (const notification of pending) {
-      const terminalSequence = terminalSequenceByTaskId.get(notification.sourceId);
-      let consumed = terminalSequence != null && coveredHistorySequence >= terminalSequence;
-      const reports = toolReportsByTaskId.get(notification.sourceId) ?? [];
-      if (!consumed && notification.terminalOutcome === "completed" && reports.length > 0) {
-        if (notification.generationId == null) {
-          // Initial assignments have no execution identity; continuations do. Never let
-          // a stable child ID's older receipt consume a later assignment's notification.
-          consumed = reports.some((report) => report.kind === "initial");
-        } else {
-          // Resolve the notification's assignment, not the child's latest execution: the
-          // parent may already have reawakened that child before this drain gets its turn.
-          const [handleId] = notification.generationId.split(":");
-          if (!isWorkspaceTurnTaskId(handleId)) continue;
-          let record: WorkspaceTurnTaskHandleRecord | null = null;
-          for (const ownerId of owners) {
-            record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(ownerId, handleId);
-            if (record != null) break;
-          }
-          if (record?.status === "completed" && record.workspaceId === notification.sourceId) {
-            const generation =
-              this.getWorkspaceTurnManager().workspaceTurnTerminalAttentionGenerationId(record);
-            consumed =
-              (notification.generationId === generation ||
-                notification.generationId === record.handleId) &&
-              reports.some(
-                (report) =>
-                  report.kind === "continuation" &&
-                  (report.handleId == null || report.handleId === record.handleId) &&
-                  report.messageId === record.messageId &&
-                  receiptMatchesReport(report, record.reportMarkdown)
-              );
-          }
+      const decision = decideAgentReportConsumption(notification, scan);
+      let consumed: boolean;
+      if (decision.kind === "decided") {
+        consumed = decision.consumed;
+      } else {
+        let record: WorkspaceTurnTaskHandleRecord | null = null;
+        for (const ownerId of owners) {
+          record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
+            ownerId,
+            decision.handleId
+          );
+          if (record != null) break;
         }
+        consumed = this.continuationReceiptConsumes(notification, record, decision.reports);
       }
       if (consumed) {
         await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
@@ -13478,6 +13563,24 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     return consumedIds;
+  }
+
+  /** A continuation is consumed when a receipt matches its handle's completed turn record. */
+  private continuationReceiptConsumes(
+    notification: TerminalAttentionNotification,
+    record: WorkspaceTurnTaskHandleRecord | null,
+    reports: readonly CompletedTaskReportReceipt[]
+  ): boolean {
+    if (record?.status === "completed" && record.workspaceId === notification.sourceId) {
+      const generation =
+        this.getWorkspaceTurnManager().workspaceTurnTerminalAttentionGenerationId(record);
+      return (
+        (notification.generationId === generation ||
+          notification.generationId === record.handleId) &&
+        reports.some((report) => receiptMatchesTurnRecord(report, record))
+      );
+    }
+    return false;
   }
 
   /**
