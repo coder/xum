@@ -367,6 +367,34 @@ describe("TaskService.promptTaskForRequiredCompletionTool before the split", () 
     expect(rowState(id)).toStrictEqual(c.row === undefined ? state() : c.row);
   });
 
+  test("the recovery-limit failure names the task's completion tool and its prior error", async () => {
+    const PLAN_ID = "plan-child";
+    const t = await setup([
+      task(TASK_ID, atLimit),
+      task(PLAN_ID, { ...atLimit, agentId: "plan", agentType: "plan" }),
+    ]);
+    const prior = { error: "injected model failure", errorType: "empty_output" };
+    const failed: { value: boolean; probes: Probe[] } = {
+      value: false,
+      probes: [...CHECKS, "fail"],
+    };
+    const options = { reason: "error", error: prior, expectedAttemptId: null } as const;
+    expect(await t.prompt(TASK_ID, options)).toEqual(failed);
+    expect(await t.prompt(PLAN_ID, { expectedAttemptId: null })).toEqual(failed);
+    const message = (id: string) => findWorkspaceInConfig(config, id)?.taskLaunchError ?? "";
+    // An exec task owes a final response, a plan task propose_plan. Only the exec prompt had a
+    // prior error, and its message carries that error's type and text.
+    const facts = (id: string) => [
+      message(id).includes("propose_plan"),
+      message(id).includes(prior.errorType),
+      message(id).includes(prior.error),
+    ];
+    expect([facts(TASK_ID), facts(PLAN_ID)]).toEqual([
+      [false, true, true],
+      [true, false, false],
+    ]);
+  });
+
   /**
    * One prompt that reaches the send. Defaults: an exec task, no fence and no decided attempt,
    * an accepted send (outcome true), and the probes of a prompt with no binding.
