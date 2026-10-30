@@ -181,7 +181,7 @@ export async function summarizeContinuousCompaction(args: {
       effectiveThinkingLevel: thinkingLevel,
       modelString: created.data.optionsModelString,
       providersConfig: created.data.optionsProvidersConfig,
-      // Routes without the Anthropic cache fetch wrapper (OpenRouter, Bedrock) send the markers
+      // Routes without the Anthropic cache fetch wrapper, such as OpenRouter, send the markers
       // written here as they are, so Compact's TTL must be on them too.
       anthropicCacheTtl: agentCacheTtl,
       workspaceId: args.workspaceId,
