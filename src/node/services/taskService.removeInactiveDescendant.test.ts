@@ -487,6 +487,44 @@ describe("TaskService removeInactiveDescendantAgentTask before the split", () =>
     expect(f.onRemovalWarnings).not.toHaveBeenCalled();
   });
 
+  test("the removal stays bound to the attempt read at entry while a patch job holds the lock", async () => {
+    const f = await setup();
+    const nextAttemptId = "att_00000000000000c3";
+    const patches = f.probes.gitPatchArtifactService;
+    // A patch job holds the child's operation lock until the test releases it.
+    const jobRunning = Promise.withResolvers<void>();
+    const jobHeld = Promise.withResolvers<void>();
+    const job = patches.withOperationLock("child", async () => {
+      jobRunning.resolve();
+      await jobHeld.promise;
+    });
+    await jobRunning.promise;
+    // Resolves once the removal asks for the lock, so the edit below lands while it waits.
+    const lock = patches.withOperationLock.bind(patches);
+    const removalQueued = Promise.withResolvers<void>();
+    patches.withOperationLock = <T>(id: string, operation: () => Promise<T>) => {
+      const locked = lock(id, operation);
+      removalQueued.resolve();
+      return locked;
+    };
+    const removal = f.taskService.removeInactiveDescendantAgentTask("parent", "child");
+    await removalQueued.promise;
+    // #4478: another backend starts a new attempt before this removal gets the lock.
+    await editRow(f.config, "child", (row) => (row.taskAttemptId = nextAttemptId));
+    f.trace.push("new-attempt");
+    jobHeld.resolve();
+    await job;
+
+    expect(await removal).toEqual(Ok({ status: "removed", ...target }));
+    expect(f.trace).toEqual([
+      ...["patch-lock", "streaming", "new-attempt", "patch-unlock"],
+      ...["patch-lock", "wait-patch", "tombstone", "remove", "patch-unlock"],
+    ]);
+    expect(f.remove.mock.calls).toEqual([
+      ["child", true, { expectedAttemptId: ATTEMPT_ID }, undefined],
+    ]);
+  });
+
   test("a removal that throws releases the hold and both locks, then rethrows", async () => {
     const f = await setup();
     const failure = new Error("runtime gone");
