@@ -27,6 +27,7 @@ import {
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
+import { estimatePostCompactionContextTokens } from "./postCompactionContext";
 
 export interface ContinuousCompactionContext {
   enabled: boolean;
@@ -151,6 +152,12 @@ function journalSourceRows(
   partIndex: number
 ): MuxMessage[] {
   return [...rows.slice(0, -1), { ...source, parts: source.parts.slice(0, partIndex) }];
+}
+
+/** The first tool part in a row's first step: the wire anchor of a prefix swap. */
+function firstStepTool(row: MuxMessage | undefined) {
+  const firstStepEnd = row?.metadata?.stepStartPartIndices?.[1] ?? row?.parts.length;
+  return row?.parts.slice(0, firstStepEnd).find((part) => part.type === "dynamic-tool");
 }
 
 /** Background summary + recent pages. Only the short apply is serialized with the turn. */
@@ -534,11 +541,7 @@ export class ContinuousCompactor {
     const retainedLive = tail.at(-1);
     // Rebuild all committed context in the prefix: persisted rows can combine
     // consecutive tool-only steps. Only the current live step supplies a wire anchor.
-    const firstStepEnd =
-      retainedLive?.metadata?.stepStartPartIndices?.[1] ?? retainedLive?.parts.length;
-    const tool = retainedLive?.parts
-      .slice(0, firstStepEnd)
-      .find((part) => part.type === "dynamic-tool");
+    const tool = firstStepTool(retainedLive);
     if (
       retainedLive?.id !== live.messageId ||
       retainedLive.role !== "assistant" ||
@@ -557,6 +560,12 @@ export class ContinuousCompactor {
       systemMessageTokens: context.systemMessageTokens ?? 0,
       postCompactionContext: prepared.postCompactionContext,
     });
+    // The estimate that admitted the summary can lack this header (a timed-out build has
+    // none), and the swapped prefix sends it with no later size check.
+    const headerTokens = estimatePostCompactionContextTokens(
+      boundary.metadata?.postCompactionContext
+    );
+    if (!this.wouldFit({ ...staged, attachmentTokens: headerTokens }, rows, context)) return false;
     const staticCopies = copies.slice(0, -1);
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");

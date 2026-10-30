@@ -334,6 +334,22 @@ describe("AgentSession file-change notification (turn start)", () => {
     });
   });
 
+  test("a plan state recorded after the boundary header stays the baseline", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      await compact(session, historyService);
+      // A tool after a mid-stream swap edits the plan and records the state the model saw.
+      await editPlanExternally(planFile);
+      await session.recordFileState(planFile, {
+        content: "plan v2",
+        timestamp: (await stat(planFile)).mtimeMs,
+      });
+
+      await resume(session);
+      expect(await countNotifications(historyService)).toBe(0);
+    });
+  });
+
   test("a header build that misses its time box leaves the plan untracked", async () => {
     await withPlanFile(async (planFile) => {
       const { historyService, session } = await createSessionFixture();

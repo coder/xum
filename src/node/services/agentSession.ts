@@ -13554,7 +13554,9 @@ export class AgentSession {
     this.planBaselineBoundaryId = boundaryId;
     const plan = findPostCompactionPlan(history.data);
     if (plan) {
-      await this.recordFileState(plan.path, {
+      // A tool in the retained tail of a mid-stream swap can record a newer plan state that
+      // the model already saw; the older header snapshot must not replace it.
+      await this.fileChangeTracker.recordIfNewer(plan.path, {
         content: plan.content,
         timestamp: plan.modifiedTimeMs,
       });

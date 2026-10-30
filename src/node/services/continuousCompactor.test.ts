@@ -1135,6 +1135,46 @@ describe("ContinuousCompactor", () => {
     expect(current[0].metadata?.compactionBoundary).toBe(true);
   });
 
+  it("uses the durable fallback when the swap header no longer fits the window", async () => {
+    const answer = await seedLiveTurn();
+    assert(live, "Live fixture missing");
+    const toolPart: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      toolCallId: "tail-tool",
+      toolName: "bash",
+      state: "output-available",
+      input: { script: "pwd" },
+      output: { success: true },
+    };
+    live.parts[1] = toolPart;
+    answer.parts[1] = toolPart;
+    const deps = Reflect.get(compactor, "deps") as Dependencies;
+    const setSwap = mock(() => true);
+    deps.streamManager.setPrefixSwap = setSwap;
+    // The eager estimate counted a small header; the header built at swap time is huge.
+    deps.prepareSwap = () =>
+      Promise.resolve({
+        preparation: {
+          modelString: context.model,
+          providerForMessages: "anthropic",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: ["bash"],
+        },
+        postCompactionContext: { text: "kept header line ".repeat(40_000), skillNames: [] },
+        systemPrefix: [],
+        cacheEnabled: true,
+      });
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(
+      await compactor.observe(context.thresholdPercent, { ...context, phase: "mid-stream" })
+    ).toBe("applied");
+    expect(setSwap).not.toHaveBeenCalled();
+    expect(fastApply).toHaveBeenCalledTimes(1);
+  });
+
   it("seamlessly rebuilds an internal committed cut as static prefix context and anchors the live step", async () => {
     const { answer, journal, journalStore } = await activateJournaledSwap(true, true, true);
     expect(journal.headEnd.id).toBe("committed-tail");
