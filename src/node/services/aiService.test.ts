@@ -6986,6 +6986,8 @@ describe("per-agent prompt cache TTL", () => {
     globalCacheTtl?: "5m" | "1h";
     agentAiDefaults?: AgentAiDefaults;
     modelString?: string;
+    /** Project agent definitions by agent ID. */
+    projectAgents?: Record<string, string>;
   }
 
   /**
@@ -6994,7 +6996,11 @@ describe("per-agent prompt cache TTL", () => {
    */
   async function createWireHarness(xumHomePath: string, input: WireInput) {
     const projectPath = path.join(xumHomePath, "project");
-    await fs.mkdir(projectPath, { recursive: true });
+    const agentsDir = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    for (const [agentId, source] of Object.entries(input.projectAgents ?? {})) {
+      await fs.writeFile(path.join(agentsDir, `${agentId}.md`), source);
+    }
     const workspaceId = "workspace-agent-cache-ttl";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
     const {
@@ -7196,6 +7202,17 @@ describe("per-agent prompt cache TTL", () => {
       input: {
         agentAiDefaults: { compact: { cacheTtl: "1h" } },
         modelString: "openrouter:anthropic/claude-sonnet-4-5",
+      },
+      expected: "1h",
+    },
+    {
+      name: "a summary on a gateway route follows the global TTL when no Compact layer sets one",
+      input: {
+        globalCacheTtl: "1h",
+        modelString: "openrouter:anthropic/claude-sonnet-4-5",
+        projectAgents: {
+          compact: "---\nname: Compact\ndescription: Custom compaction\n---\n\nSummarize.\n",
+        },
       },
       expected: "1h",
     },

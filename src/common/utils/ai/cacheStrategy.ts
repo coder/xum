@@ -1,5 +1,6 @@
 import type { ModelMessage, SystemModelMessage, Tool } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { isGpt6FamilyModel } from "@/common/types/thinking";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
@@ -106,6 +107,26 @@ export function supportsAnthropicCache(
   // After normalizeToCanonical, all gateway Anthropic models normalize to "anthropic:..."
   // so we only need to check for the "anthropic:" prefix.
   return normalized.startsWith("anthropic:");
+}
+
+/**
+ * The TTL of the turn's Anthropic cache markers. The running agent's TTL wins on a cache-capable
+ * model. Otherwise markers honor a TTL set through per-model providerOptions extras when the
+ * dedicated mux-level setting is unset, matching the pre-assembler request-config behavior.
+ */
+export function resolveTurnAnthropicCacheTtl(input: {
+  agentCacheTtl: AnthropicCacheTtl | undefined;
+  modelString: string;
+  providersConfig: ProvidersConfigMap;
+  muxProviderOptions: MuxProviderOptions;
+  providerOptions: Record<string, unknown>;
+}): AnthropicCacheTtl | undefined {
+  if (input.agentCacheTtl && supportsAnthropicCache(input.modelString, input.providersConfig)) {
+    return input.agentCacheTtl;
+  }
+  return (
+    input.muxProviderOptions.anthropic?.cacheTtl ?? getAnthropicCacheTtl(input.providerOptions)
+  );
 }
 
 /** Build cache control providerOptions for Anthropic with optional TTL. */

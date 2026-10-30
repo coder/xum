@@ -238,7 +238,7 @@ import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEva
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import {
-  getAnthropicCacheTtl,
+  resolveTurnAnthropicCacheTtl,
   supportsAnthropicCache,
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
@@ -323,26 +323,6 @@ import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/to
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
-
-/**
- * The TTL of the turn's Anthropic cache markers. The running agent's TTL wins on a cache-capable
- * model. Otherwise markers honor a TTL set through per-model providerOptions extras when the
- * dedicated mux-level setting is unset, matching the pre-assembler request-config behavior.
- */
-function resolveTurnAnthropicCacheTtl(input: {
-  agentCacheTtl: AnthropicCacheTtl | undefined;
-  modelString: string;
-  providersConfig: ProvidersConfigMap;
-  muxProviderOptions: MuxProviderOptions;
-  providerOptions: Record<string, unknown>;
-}): AnthropicCacheTtl | undefined {
-  if (input.agentCacheTtl && supportsAnthropicCache(input.modelString, input.providersConfig)) {
-    return input.agentCacheTtl;
-  }
-  return (
-    input.muxProviderOptions.anthropic?.cacheTtl ?? getAnthropicCacheTtl(input.providerOptions)
-  );
-}
 
 /**
  * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and

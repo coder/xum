@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { resolveTurnAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
 import { agentPluginHookService } from "./agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "./agentPlugins/mcpConfig";
@@ -171,6 +172,21 @@ export async function summarizeContinuousCompaction(args: {
       created.data.wireProviderName,
       thinkingLevel
     );
+    const providerOptions = buildProviderOptions(
+      created.data.optionsModelString,
+      thinkingLevel,
+      // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
+      // which must see the same boundary-sliced history as the resolution above.
+      prepared.providerRequestMessages,
+      undefined,
+      created.data.optionsMuxProviderOptions,
+      args.workspaceId,
+      undefined,
+      created.data.optionsProvidersConfig,
+      created.data.optionsRouteProvider,
+      undefined,
+      options.reasoningMode
+    );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
       replayReceiptMessages: args.receiptRows,
@@ -182,8 +198,14 @@ export async function summarizeContinuousCompaction(args: {
       modelString: created.data.optionsModelString,
       providersConfig: created.data.optionsProvidersConfig,
       // Routes without the Anthropic cache fetch wrapper, such as OpenRouter, send the markers
-      // written here as they are, so Compact's TTL must be on them too.
-      anthropicCacheTtl: agentCacheTtl,
+      // written here as they are, so they need the TTL a /compact turn's markers get.
+      anthropicCacheTtl: resolveTurnAnthropicCacheTtl({
+        agentCacheTtl,
+        modelString: created.data.optionsModelString,
+        providersConfig: created.data.optionsProvidersConfig,
+        muxProviderOptions: created.data.optionsMuxProviderOptions,
+        providerOptions,
+      }),
       workspaceId: args.workspaceId,
     });
     messages.push({
@@ -225,21 +247,9 @@ export async function summarizeContinuousCompaction(args: {
       tools: Object.keys(assembleContext.tools).length > 0 ? assembleContext.tools : undefined,
       messages,
       abortSignal: args.signal,
-      providerOptions: buildProviderOptions(
-        created.data.optionsModelString,
-        thinkingLevel,
-        // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
-        // which must see the same boundary-sliced history as the resolution above.
-        prepared.providerRequestMessages,
-        undefined,
-        created.data.optionsMuxProviderOptions,
-        args.workspaceId,
-        undefined,
-        created.data.optionsProvidersConfig,
-        created.data.optionsRouteProvider,
-        undefined,
-        options.reasoningMode
-      ) as NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>,
+      providerOptions: providerOptions as NonNullable<
+        Parameters<typeof streamText>[0]["providerOptions"]
+      >,
       headers: buildRequestHeaders(
         created.data.optionsModelString,
         created.data.optionsMuxProviderOptions,
