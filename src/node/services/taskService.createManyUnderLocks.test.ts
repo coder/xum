@@ -26,6 +26,8 @@ import {
 const PARENT_ID = "1111111111";
 const TASK_ID = "aaaaaaaaaa";
 const SECOND_ID = "cccccccccc";
+// TASK_RESERVATION_CANCELED_MESSAGE: the fence persists it and rejects the waiters with it.
+const CANCELED = "Reservation canceled";
 const realResolveAgentDefinition = agentDefinitionsService.resolveAgentDefinition;
 
 type CreateManyArgs = Parameters<TaskService["createMany"]>[0][number];
@@ -43,6 +45,19 @@ interface Internals {
   scheduleReservedTaskLaunch(plan: LaunchPlan): void;
   startReservedAgentTask(plan: LaunchPlan): Promise<void>;
   resolveTaskAISettings(...args: unknown[]): Promise<unknown>;
+  closeReservedAttempts(plans: unknown, source: string): void;
+  recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void;
+  settleChildGoalPause(workspaceId: string): Promise<void>;
+  rejectWaiters(taskId: string, error: Error): void;
+  attemptLedger: {
+    persistOwnedAttemptSettlement(
+      id: string,
+      attempt: unknown,
+      receipt: string,
+      source: string
+    ): Promise<void>;
+  };
+  waiters: { armWaitersOfUnendedTask(taskId: string): void };
 }
 
 function internals(taskService: TaskService): Internals {
@@ -70,6 +85,12 @@ interface Hooks {
   duringTurnCount?: () => void;
   /** The next launch lease hold rejects. */
   refuseLease?: boolean;
+  /** Runs inside each checkpoint callback. */
+  duringCheckpoint?: () => void;
+  /** Runs after each metadata emit, before it resolves. */
+  afterEmit?: (taskId: string) => Promise<void> | void;
+  /** The error a task's editWorkspaceEntry rejects with (before its updater runs, or after). */
+  failFenceEdit?: (taskId: string) => { error: Error; afterUpdate: boolean } | undefined;
 }
 
 describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", () => {
@@ -180,9 +201,13 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
       }
     });
     const realBegin = target.beginOwnedTaskAttempt.bind(taskService);
+    // The attempts the reservation owns, and the attempt id each one minted.
+    const owned = new Map<string, { attempt: unknown; attemptId: unknown }>();
     spyOn(target, "beginOwnedTaskAttempt").mockImplementation((taskId, source, identity) => {
       event(`own ${taskId} ${source}`);
-      return realBegin(taskId, source, identity);
+      const attempt = realBegin(taskId, source, identity);
+      owned.set(taskId, { attempt, attemptId: (identity as { attemptId?: string }).attemptId });
+      return attempt;
     });
     const realEdit = config.editConfig.bind(config);
     spyOn(config, "editConfig").mockImplementation(async (fn, editOptions) => {
@@ -197,6 +222,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     spyOn(taskService, "emitWorkspaceMetadata").mockImplementation(async (id) => {
       event(`emit ${id}`);
       await realEmit(id);
+      await hooks.afterEmit?.(id);
     });
     const realSchedule = target.scheduleReservedTaskLaunch.bind(taskService);
     spyOn(target, "scheduleReservedTaskLaunch").mockImplementation((plan) => {
@@ -216,7 +242,9 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     const onTaskReserved = mock(async (index: number, result: { taskId: string }) => {
       await Promise.resolve();
       event(`reserved ${index} ${result.taskId} @${stage()}`);
+      hooks.duringCheckpoint?.();
     });
+    recordFence(taskService, hooks, event, owned);
     const createMany = (
       count: number,
       options: { abortSignal?: AbortSignal; args?: Partial<CreateManyArgs> } = {}
@@ -237,7 +265,87 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
         }
       );
     };
-    return { taskService, hooks, events, onTaskReserved, stage, createMany };
+    return { taskService, hooks, events, onTaskReserved, stage, createMany, owned };
+  }
+
+  /** Records the post-commit fence's collaborators (call-through, see setup). */
+  function recordFence(
+    taskService: TaskService,
+    hooks: Hooks,
+    event: (name: string) => void,
+    owned: ReadonlyMap<string, { attempt: unknown }>
+  ) {
+    const target = internals(taskService);
+    const realClose = target.closeReservedAttempts.bind(taskService);
+    spyOn(target, "closeReservedAttempts").mockImplementation((plans, source) => {
+      event(`close ${source}`);
+      realClose(plans, source);
+    });
+    const realEditEntry = taskService.editWorkspaceEntry.bind(taskService);
+    spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+      event(`edit ${id}`);
+      const failure = hooks.failFenceEdit?.(id);
+      if (failure == null) return await realEditEntry(id, updater, options);
+      if (failure.afterUpdate) await realEditEntry(id, updater, options);
+      throw failure.error;
+    });
+    const realInterrupted = target.recordTaskInterrupted.bind(taskService);
+    spyOn(target, "recordTaskInterrupted").mockImplementation((id, parentId) => {
+      event(`interrupted ${id} ${parentId ?? "none"}`);
+      realInterrupted(id, parentId);
+    });
+    const realGoalPause = target.settleChildGoalPause.bind(taskService);
+    spyOn(target, "settleChildGoalPause").mockImplementation((id) => {
+      event(`goal-pause ${id}`);
+      return realGoalPause(id);
+    });
+    const realReject = target.rejectWaiters.bind(taskService);
+    spyOn(target, "rejectWaiters").mockImplementation((id, error) => {
+      event(`reject ${id} ${error.message}`);
+      realReject(id, error);
+    });
+    const ledger = target.attemptLedger;
+    const realReceipt = ledger.persistOwnedAttemptSettlement.bind(ledger);
+    spyOn(ledger, "persistOwnedAttemptSettlement").mockImplementation((id, attempt, ...rest) => {
+      const whose = attempt === owned.get(id)?.attempt ? "owned" : "other";
+      event(`receipt ${id} ${whose} ${rest.join(" ")}`);
+      return realReceipt(id, attempt, ...rest);
+    });
+    const realArm = target.waiters.armWaitersOfUnendedTask.bind(target.waiters);
+    spyOn(target.waiters, "armWaitersOfUnendedTask").mockImplementation((id) => {
+      event(`arm ${id}`);
+      realArm(id);
+    });
+  }
+
+  /** The events after the commit left the desktop gate, without the config-edit records. */
+  function afterCommit(events: readonly string[]): string[] {
+    return events
+      .slice(events.indexOf("gate-exit +mutex") + 1)
+      .filter((name) => !name.startsWith("config-edit"));
+  }
+
+  interface RowState {
+    taskStatus?: string;
+    taskLaunchError?: string;
+    taskAttemptId?: string;
+    taskGoalPauseOwed?: string;
+  }
+  /** A task row's fenced fields; the reservation's own attempt id reads "reserved". */
+  function rowState(
+    taskId: string,
+    owned: ReadonlyMap<string, { attemptId: unknown }>
+  ): RowState | undefined {
+    const row = findWorkspaceEntry(config.loadConfigOrDefault(), taskId)?.workspace;
+    if (row == null) return undefined;
+    const attempt = (id: string | undefined) =>
+      id != null && id === owned.get(taskId)?.attemptId ? "reserved" : id;
+    return {
+      taskStatus: row.taskStatus,
+      taskLaunchError: row.taskLaunchError,
+      taskAttemptId: attempt(row.taskAttemptId),
+      taskGoalPauseOwed: row.taskGoalPauseOwed == null ? undefined : attempt(row.taskGoalPauseOwed),
+    };
   }
 
   // Before the split, the head of the method (prepare, then the mutex) and the per-plan
@@ -486,5 +594,190 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     expect(workspaceIds(config).sort()).toEqual([PARENT_ID, TASK_ID, SECOND_ID].sort());
     // Nothing queued, so no queue drain is scheduled.
     expect(events.filter((name) => name.startsWith("queue-drain"))).toEqual([]);
+  });
+
+  // The post-commit fence (an abort that landed after the commit's mutator ran), one plan. Each
+  // row names who else wrote the task row before the fence's own edit, which the fence must
+  // respect: it interrupts only a row still in the status it committed under its own attempt.
+  // Well formed: the config loader replaces a malformed attempt id on read.
+  const OTHER_ATTEMPT = "att_00000000000000ff";
+  const fenceCases: Array<{
+    label: string;
+    otherWriter?: (cfg: ReturnType<Config["loadConfigOrDefault"]>) => void;
+    canceledInsideCommit?: boolean;
+    fence: { edit: boolean; transition: boolean; reject: boolean };
+    row: RowState | undefined;
+  }> = [
+    {
+      label: "a row nobody else wrote is interrupted with the cancel message",
+      fence: { edit: true, transition: true, reject: true },
+      row: {
+        taskStatus: "interrupted",
+        taskLaunchError: CANCELED,
+        taskAttemptId: "reserved",
+        taskGoalPauseOwed: "reserved",
+      },
+    },
+    {
+      label: "a row whose status moved on is left as is, its waiters still rejected",
+      otherWriter: (cfg) => {
+        const row = findWorkspaceEntry(cfg, TASK_ID)?.workspace;
+        if (row != null) row.taskStatus = "running";
+      },
+      fence: { edit: true, transition: false, reject: true },
+      row: { taskStatus: "running", taskAttemptId: "reserved" },
+    },
+    {
+      label: "a row another writer re-admitted keeps its status and its waiters",
+      otherWriter: (cfg) => {
+        const row = findWorkspaceEntry(cfg, TASK_ID)?.workspace;
+        if (row != null) row.taskAttemptId = OTHER_ATTEMPT;
+      },
+      fence: { edit: true, transition: false, reject: false },
+      row: { taskStatus: "starting", taskAttemptId: OTHER_ATTEMPT },
+    },
+    {
+      // allowMissing: the fence's edit of a removed row is a no-op, not a failure.
+      label: "a row another writer removed is not an error",
+      otherWriter: (cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((ws) => ws.id !== TASK_ID);
+        }
+      },
+      fence: { edit: true, transition: false, reject: true },
+      row: undefined,
+    },
+    {
+      // The commit's mutator saw the abort and wrote the row interrupted itself (the callback
+      // it calls sets canceledInsideCommit): the fence does not edit it again.
+      label: "a row the commit already wrote interrupted is not edited again",
+      canceledInsideCommit: true,
+      fence: { edit: false, transition: true, reject: true },
+      row: { taskStatus: "interrupted", taskLaunchError: CANCELED, taskAttemptId: "reserved" },
+    },
+  ];
+  test.each(fenceCases)("$label", async ({ otherWriter, canceledInsideCommit, fence, row }) => {
+    const { hooks, events, stage, createMany, owned } = await setup();
+    const controller = new AbortController();
+    if (canceledInsideCommit === true) {
+      hooks.duringCheckpoint = () => controller.abort();
+    } else {
+      hooks.afterEmit = async () => {
+        hooks.afterEmit = undefined;
+        if (otherWriter != null) {
+          await config.editConfig((cfg) => {
+            otherWriter(cfg);
+            return cfg;
+          });
+        }
+        controller.abort();
+      };
+    }
+    const created = await createMany(1, { abortSignal: controller.signal });
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error.startsWith("Interrupted")).toBe(true);
+    expect(afterCommit(events)).toEqual([
+      `emit ${TASK_ID} +mutex`,
+      "close reservation-canceled +mutex",
+      ...(fence.edit ? [`edit ${TASK_ID} +mutex`] : []),
+      ...(fence.transition
+        ? [`interrupted ${TASK_ID} ${PARENT_ID} +mutex`, `goal-pause ${TASK_ID} +mutex`]
+        : []),
+      // Rejected before the receipt write's await.
+      ...(fence.reject ? [`reject ${TASK_ID} ${CANCELED} +mutex`] : []),
+      `receipt ${TASK_ID} owned reservation-canceled reservation-canceled +mutex`,
+      `emit ${TASK_ID} +mutex`,
+      // The untaken lease is released at scope exit, before the mutex.
+      `lease-release ${TASK_ID} +mutex`,
+      "tree-exit",
+    ]);
+    expect(rowState(TASK_ID, owned)).toEqual(row);
+    expect(stage()).toBe("launch");
+    expect(launched).toEqual([]);
+  });
+
+  test.each([
+    ["the first plan's fence write rejects", [TASK_ID], false],
+    ["both plans' fence writes reject", [TASK_ID, SECOND_ID], false],
+    // The updater ran and saw the row moved on (another writer's): its waiters are not armed.
+    ["the first plan's fence write rejects after its row moved on", [TASK_ID], true],
+  ])("%s: every plan is still fenced, then the first failure is thrown", async (_l, ids, moved) => {
+    const { hooks, events, createMany, owned } = await setup();
+    const controller = new AbortController();
+    const failures = new Map(ids.map((id) => [id, new Error(`fence write of ${id} failed`)]));
+    hooks.failFenceEdit = (id) => {
+      const error = failures.get(id);
+      return error == null ? undefined : { error, afterUpdate: moved };
+    };
+    hooks.afterEmit = async (id) => {
+      if (id !== SECOND_ID) return;
+      hooks.afterEmit = undefined;
+      if (moved) {
+        await config.editConfig((cfg) => {
+          const row = findWorkspaceEntry(cfg, TASK_ID)?.workspace;
+          if (row != null) row.taskStatus = "running";
+          return cfg;
+        });
+      }
+      controller.abort();
+    };
+    const outcome = await createMany(2, { abortSignal: controller.signal }).then(
+      () => "resolved",
+      (error: unknown) => error
+    );
+    expect(outcome).toBe(failures.get(TASK_ID));
+    // A rejected write leaves the row starting with nothing to launch it: its waiters are armed.
+    const fenced = (id: string) =>
+      failures.has(id)
+        ? [`edit ${id} +mutex`, ...(moved ? [] : [`arm ${id} +mutex`])]
+        : [
+            `edit ${id} +mutex`,
+            `interrupted ${id} ${PARENT_ID} +mutex`,
+            `goal-pause ${id} +mutex`,
+            `reject ${id} ${CANCELED} +mutex`,
+            `receipt ${id} owned reservation-canceled reservation-canceled +mutex`,
+            `emit ${id} +mutex`,
+          ];
+    expect(afterCommit(events)).toEqual([
+      `emit ${TASK_ID} +mutex`,
+      `emit ${SECOND_ID} +mutex`,
+      "close reservation-canceled +mutex",
+      ...fenced(TASK_ID),
+      ...fenced(SECOND_ID),
+      `lease-release ${TASK_ID} +mutex`,
+      `lease-release ${SECOND_ID} +mutex`,
+      "tree-exit",
+    ]);
+    expect(rowState(TASK_ID, owned)?.taskStatus).toBe(moved ? "running" : "starting");
+    expect(rowState(SECOND_ID, owned)?.taskStatus).toBe(
+      failures.has(SECOND_ID) ? "starting" : "interrupted"
+    );
+  });
+
+  test("the post-commit fence reads the abort after the last emit, in the tick that schedules", async () => {
+    const { events, createMany } = await setup();
+    const controller = new AbortController();
+    // Every read is recorded, with a marker queued behind it: work after an await lands after it.
+    Object.defineProperty(controller.signal, "aborted", {
+      get(this: AbortSignal): boolean {
+        events.push("abort-read");
+        queueMicrotask(() => events.push("tick"));
+        // The prototype's accessor, read for this signal.
+        return Reflect.get(AbortSignal.prototype, "aborted", this);
+      },
+    });
+    const created = await createMany(2, { abortSignal: controller.signal });
+    expect(created.success).toBe(true);
+    expect(events.slice(events.lastIndexOf(`emit ${SECOND_ID} +mutex`))).toEqual([
+      `emit ${SECOND_ID} +mutex`,
+      "abort-read",
+      `schedule ${TASK_ID} +mutex`,
+      `launch ${TASK_ID} leased +mutex`,
+      `schedule ${SECOND_ID} +mutex`,
+      `launch ${SECOND_ID} leased +mutex`,
+      "tick",
+      "tree-exit",
+    ]);
   });
 });
