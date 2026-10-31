@@ -244,7 +244,7 @@
   max-width: 100%;
 }
 
-.markdown-content .mermaid-container svg {
+.mermaid-container svg {
   min-width: min-content;
   max-width: none;
   max-height: var(--diagram-max-height, 300px);
@@ -254,7 +254,7 @@
 }
 
 /* Mermaid in modal - allow larger sizing */
-.markdown-content .mermaid-modal svg {
+.mermaid-modal svg {
   max-width: none;
   width: auto;
   max-height: 80vh;
