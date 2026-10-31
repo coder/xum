@@ -187,6 +187,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isDockerRuntime,
   isLocalProjectRuntime,
+  isSSHRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeConfig,
@@ -1638,6 +1639,18 @@ type TerminalFailureChild = Pick<
 
 /** The launch leases of a batch's `starting` plans (see holdLaunchLeases). */
 type HeldLaunchLeases = Awaited<ReturnType<typeof holdLaunchLeases>>;
+
+/**
+ * The runtime config a task's row carries until its fork persists the fork's own. A task never
+ * owns its parent's Coder workspace (a fork marks both sides shared), so its row must not claim
+ * it either: removing or archiving a task whose fork failed or was stopped would otherwise delete
+ * or stop the parent's Coder workspace.
+ */
+function nonOwningTaskRuntimeConfig(runtimeConfig: RuntimeConfig): RuntimeConfig {
+  if (!isSSHRuntime(runtimeConfig) || runtimeConfig.coder == null) return runtimeConfig;
+  if (runtimeConfig.coder.existingWorkspace === true) return runtimeConfig;
+  return { ...runtimeConfig, coder: { ...runtimeConfig.coder, existingWorkspace: true } };
+}
 
 /**
  * Marks the refusal of a batch whose prepared inputs changed before the mutex. Such a refusal
@@ -7425,7 +7438,7 @@ export class TaskService implements AgentTaskIntegration {
           name: plan.workspaceName,
           title: plan.title,
           createdAt: plan.createdAt,
-          runtimeConfig: plan.taskRuntimeConfig,
+          runtimeConfig: nonOwningTaskRuntimeConfig(plan.taskRuntimeConfig),
           // New rows have no legacy plan to migrate (#5174).
           remotePlanMigrated: true,
           aiSettings:
@@ -7810,11 +7823,9 @@ export class TaskService implements AgentTaskIntegration {
     const workspacePath =
       coerceNonEmptyString(workspace.path) ??
       sourceRuntime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
-    if (!(await runtimePathExists(sourceRuntime, workspacePath))) {
-      return null;
-    }
-
-    const forkedRuntimeConfig = workspace.runtimeConfig ?? plan.taskRuntimeConfig;
+    const forkedRuntimeConfig = nonOwningTaskRuntimeConfig(
+      workspace.runtimeConfig ?? plan.taskRuntimeConfig
+    );
     const runtimeForTaskWorkspace = createRuntimeForWorkspace({
       // The task's id, as on the fork paths: a devcontainer recreated after a crash gets the
       // workspace's scratch mount only when the runtime knows whose workspace it is.
@@ -7824,6 +7835,12 @@ export class TaskService implements AgentTaskIntegration {
       name: plan.workspaceName,
       namedWorkspacePath: workspacePath,
     });
+    // Probed through the task's own runtime: the parent's can resolve the task's path to the
+    // parent's own checkout (a Docker workspace is /src in its own container), which must not
+    // count as the task's.
+    if (!(await runtimePathExists(runtimeForTaskWorkspace, workspacePath))) {
+      return null;
+    }
     const trunkBranch =
       coerceNonEmptyString(workspace.taskTrunkBranch) ??
       coerceNonEmptyString(plan.preferredTrunkBranch) ??
@@ -7999,7 +8016,10 @@ export class TaskService implements AgentTaskIntegration {
      * fence never admitted the send (sendAdmitted still false). Without it the attempt settles in
      * memory only, as before receipts existed.
      */
-    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted" | "abortSignal"> &
+    launch?: Pick<
+      TaskLaunchPlan,
+      "attemptId" | "sendAdmitted" | "abortSignal" | "taskModelString" | "attentionPolicy"
+    > &
       TerminalFailureChild
   ): Promise<void> {
     assert(taskId.length > 0, "markTaskLaunchFailed requires taskId");
@@ -8109,12 +8129,15 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * A launch failure ends the child's attempt without a report, so the parent learns of it the way
-   * it learns of a terminal stream failure: a failure message in its history and a terminal
-   * wake. Without it a background child whose launch fails stays silent, since its launch runs
-   * after the task tool returned. A row this failure did not move to interrupted was already
-   * ended by a Stop or an earlier failure, which gave its own notice. A row the launch itself
-   * unpublished (an unsanitized checkout's reclaim) is described by the launch's plan.
+   * A launch failure ends the child's attempt without a report, and the parent learns of it
+   * exactly once. For a task the parent blocks on (its attention policy), the parent's own wait
+   * delivers it: a pending waiter is rejected with it, and a later wait reads it from the row, or
+   * from the reclaimed row's failure artifact. A background task with a waiter pending now
+   * delivers it the same way. Any other task gives the notice a terminal stream failure gives: a
+   * failure message in the parent's history and a terminal wake. A row this failure did not move
+   * to interrupted was already ended by a Stop or an earlier failure, which gave its own notice.
+   * A row the launch itself unpublished (an unsanitized checkout's reclaim) is described by the
+   * launch's plan.
    */
   private async deliverLaunchFailureToParent(
     taskId: string,
@@ -8122,19 +8145,84 @@ export class TaskService implements AgentTaskIntegration {
     failure: {
       failedRow: WorkspaceConfigEntry | undefined;
       transitionedToInterrupted: boolean;
-      launch: TerminalFailureChild | undefined;
+      launch:
+        | (TerminalFailureChild & Pick<TaskLaunchPlan, "taskModelString" | "attentionPolicy">)
+        | undefined;
       hadForegroundWaiters: boolean;
     }
   ): Promise<void> {
     if (failure.failedRow != null && !failure.transitionedToInterrupted) return;
     const child = failure.failedRow ?? failure.launch;
     if (child == null) return;
+    if (failure.failedRow == null && failure.launch != null) {
+      await this.persistReclaimedLaunchFailure(taskId, message, failure.launch);
+    }
+    const attentionPolicy = resolveBackgroundWorkAttentionPolicy(
+      failure.failedRow != null
+        ? failure.failedRow.taskAttentionPolicy
+        : failure.launch?.attentionPolicy
+    );
     await this.maybeResumeParentAfterTerminalChildFailure(
       taskId,
       child,
       { errorType: "launch_failed", errorMessage: message },
-      failure.hadForegroundWaiters
+      failure.hadForegroundWaiters || attentionPolicy === "blocking_until_terminal"
     );
+  }
+
+  /**
+   * A launch that reclaimed its row (an unsanitized checkout) leaves no row that names the task.
+   * Its failure is persisted for each ancestor, as a terminal stream failure's is, so task_await
+   * and waitForAgentReport still return the launch error for that task id. Workflow-owned
+   * children report failures through their step result instead.
+   */
+  private async persistReclaimedLaunchFailure(
+    taskId: string,
+    message: string,
+    child: TerminalFailureChild & Pick<TaskLaunchPlan, "taskModelString">
+  ): Promise<void> {
+    const parentWorkspaceId = child.parentWorkspaceId;
+    if (parentWorkspaceId == null || child.workflowTask != null) return;
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const ancestorWorkspaceIds = [
+      parentWorkspaceId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, parentWorkspaceId),
+    ];
+    // The child itself is not workflow-owned: it is workflow-owned below an ancestor exactly
+    // when its parent is.
+    const workflowOwnedAncestorWorkspaceIds = ancestorWorkspaceIds.filter(
+      (ancestorWorkspaceId) =>
+        ancestorWorkspaceId !== parentWorkspaceId &&
+        this.getWorkflowOwnedDescendantAgentTaskUsingIndex(
+          index,
+          ancestorWorkspaceId,
+          parentWorkspaceId
+        ) === true
+    );
+    const persistedAtMs = Date.now();
+    for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
+      try {
+        await upsertSubagentFailureArtifact({
+          locks: this.historyService.locks,
+          workspaceId: ancestorWorkspaceId,
+          workspaceSessionDir: path.join(this.config.sessionsDir, ancestorWorkspaceId),
+          childTaskId: taskId,
+          parentWorkspaceId,
+          ancestorWorkspaceIds,
+          workflowOwnedAncestorWorkspaceIds,
+          errorType: "launch_failed",
+          errorMessage: message,
+          model: child.taskModelString,
+          nowMs: persistedAtMs,
+        });
+      } catch (error: unknown) {
+        log.error("Failed to persist a reclaimed task's launch failure", {
+          workspaceId: ancestorWorkspaceId,
+          childTaskId: taskId,
+          error,
+        });
+      }
+    }
   }
 
   /**
@@ -8393,7 +8481,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     if (entryAfterMaterialize.workspace.taskStatus !== "starting") {
-      checkout.initLogger.logComplete(-1);
+      await this.sanitizeStoppedLaunchCheckout(plan, checkout, entryAfterMaterialize.workspace);
       return;
     }
 
@@ -8443,6 +8531,49 @@ export class TaskService implements AgentTaskIntegration {
     await this.sanitizeLaunchCheckout(plan, checkout);
   }
 
+  /**
+   * SECURITY: a Stop that lands while the launch forks leaves the task interrupted with the
+   * checkout the fork made, and the task can be sent to again later. So that checkout is
+   * sanitized all the same, before its init ends and releases the requests parked on it. A failed
+   * sanitize quarantines the checkout, in memory and on the row, so sends and MCP refuse it
+   * (#4674). A row another writer re-admitted is that writer's to prepare, and a shared parent
+   * checkout is not the task's to sanitize.
+   */
+  private async sanitizeStoppedLaunchCheckout(
+    plan: TaskLaunchPlan,
+    checkout: ReservedLaunchCheckout,
+    row: WorkspaceConfigEntry
+  ): Promise<void> {
+    try {
+      if (checkout.sharesParentCheckout || this.launchSuperseded(plan, row)) return;
+      let sanitizeError: string | undefined;
+      try {
+        sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
+          plan.taskId,
+          checkout.workspacePath,
+          checkout.forkedRuntimeConfig
+        );
+      } catch (error: unknown) {
+        sanitizeError = getErrorMessage(error);
+      }
+      if (sanitizeError === undefined) return;
+      log.warn("Task launch: the stopped task's checkout failed to sanitize; quarantined", {
+        taskId: plan.taskId,
+        error: sanitizeError,
+      });
+      this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+      await this.editWorkspaceEntry(
+        plan.taskId,
+        (ws) => {
+          if (!this.launchSuperseded(plan, ws)) ws.taskCheckoutUnsanitized = true;
+        },
+        { allowMissing: true }
+      );
+    } finally {
+      checkout.initLogger.logComplete(-1);
+    }
+  }
+
   /** Rechecks the persisted row, then sanitizes a forked checkout: sanitize or fail. */
   private async sanitizeLaunchCheckout(
     plan: TaskLaunchPlan,
@@ -8458,7 +8589,7 @@ export class TaskService implements AgentTaskIntegration {
       entryBeforeSend.workspace.taskStatus !== "starting" ||
       this.launchSuperseded(plan, entryBeforeSend.workspace)
     ) {
-      checkout.initLogger.logComplete(-1);
+      await this.sanitizeStoppedLaunchCheckout(plan, checkout, entryBeforeSend.workspace);
       return;
     }
 

@@ -620,12 +620,14 @@ describe("direct create: MCP after sanitize", () => {
       const wakes = spyOn(env.services.taskService, "enqueueTerminalAttention").mockResolvedValue(
         undefined
       );
+      // A background spawn: the parent learns of its launch failure from the notice.
       const created = await env.services.taskService.create({
         parentWorkspaceId: parentId,
         kind: "agent",
         agentId: "explore",
         prompt: "Summarize durable workflows",
         title: "Direct",
+        attentionPolicy: "notify_on_terminal",
       });
       assert(
         created.success,

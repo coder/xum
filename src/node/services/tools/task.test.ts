@@ -1411,6 +1411,9 @@ describe("task tool", () => {
       const result: unknown = await runGroup(new Set(["child-task-2"]), () => undefined);
 
       expect(result).toMatchObject({
+        // Every member ended, so the group no longer reads as running.
+        status: "interrupted",
+        note: expect.stringContaining(`Task child-task-2 failed: ${LAUNCH_FAILURE}`),
         taskIds: ["child-task-1", "child-task-2", "child-task-3"],
         tasks: [
           { taskId: "child-task-1", status: "completed" },

@@ -43,6 +43,24 @@ describe("formatToolEnd(task)", () => {
     expect(formatted).toContain("task-b");
   });
 
+  it.each(["starting", "interrupted"])("formats a %s task result with its task ID", (status) => {
+    const formatted = formatToolEnd(
+      {
+        type: "tool-call-end",
+        workspaceId: "parent",
+        messageId: "message-1",
+        toolCallId: "tool-task-1",
+        toolName: "task",
+        result: { status, taskId: "task-a", note: "Task started in background." },
+        timestamp: Date.now(),
+      },
+      { agentId: "explore", prompt: "inspect", title: "Inspect" }
+    );
+
+    expect(formatted).toContain(`${status}:`);
+    expect(formatted).toContain("task-a");
+  });
+
   it("formats grouped completed task results with report counts", () => {
     const formatted = formatToolEnd(
       {

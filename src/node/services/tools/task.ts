@@ -317,9 +317,16 @@ function emitTaskCreatedEvent(params: {
 
 function toAggregatePendingStatus(
   statuses: ReadonlyArray<PendingTaskInfo["status"]>
-): "queued" | "starting" | "running" {
+): "queued" | "starting" | "running" | "interrupted" {
   if (statuses.every((status) => status === "queued")) return "queued";
   if (statuses.every((status) => status === "starting" || status === "queued")) return "starting";
+  // Every member ended, and not every one with its report.
+  if (
+    statuses.includes("interrupted") &&
+    statuses.every((status) => status === "completed" || status === "interrupted")
+  ) {
+    return "interrupted";
+  }
   return "running";
 }
 
@@ -428,10 +435,25 @@ function buildForegroundContinuationNote(
     : "Tasks exceeded the foreground wait limit and continue running in background. Use task_await to monitor progress.";
 }
 
-function buildInterruptedTaskNote(taskCount: number): string {
-  return taskCount === 1
-    ? "Task was interrupted before reporting. Use task_await to inspect the final task state."
-    : "Some tasks were interrupted before reporting. Use task_await to inspect the final task states.";
+function buildInterruptedTaskNote(taskCount: number, failures: readonly string[]): string {
+  const note =
+    taskCount === 1
+      ? "Task was interrupted before reporting. Use task_await to inspect the final task state."
+      : "Some tasks were interrupted before reporting. Use task_await to inspect the final task states.";
+  return [note, ...failures].join(" ");
+}
+
+/** Each member whose wait failed, with its error (a failed launch's): the caller must see why. */
+function describeWaitFailures(
+  tasks: readonly SpawnedTaskInfo[],
+  outcomes: readonly ForegroundWaitOutcome[]
+): string[] {
+  return outcomes.flatMap((outcome, index) => {
+    if (outcome.kind !== "error") return [];
+    const taskId = tasks[index]?.taskId;
+    assert(taskId != null, "every wait outcome belongs to a created task");
+    return [`Task ${taskId} failed: ${getErrorMessage(outcome.error)}`];
+  });
 }
 
 function buildPendingTaskResult(params: {
@@ -906,7 +928,10 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             ),
             reports: completedReports,
             note: hadInterruptedTask
-              ? buildInterruptedTaskNote(createdTasks.length)
+              ? buildInterruptedTaskNote(
+                  createdTasks.length,
+                  describeWaitFailures(createdTasks, waitOutcomes)
+                )
               : buildForegroundContinuationNote(
                   createdTasks.length,
                   wasBackgrounded ? "backgrounded" : "timed_out"

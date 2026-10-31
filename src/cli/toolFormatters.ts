@@ -324,15 +324,24 @@ function formatTaskEnd(_toolName: string, _args: unknown, result: unknown): stri
     return `${chalk.green("✓")} ${reportCount}${idSummary}`;
   }
 
-  if ((status === "queued" || status === "running") && typeof taskId === "string") {
+  if (!isPendingTaskStatus(status)) return null;
+
+  if (typeof taskId === "string") {
     return `${chalk.blue("→")} ${status}: ${chalk.dim(taskId)}`;
   }
 
-  if ((status === "queued" || status === "running") && taskIds.length > 0) {
+  if (taskIds.length > 0) {
     return `${chalk.blue("→")} ${status}: ${formatTaskIdSummary(taskIds)}`;
   }
 
   return null;
+}
+
+/** The statuses of a task result that is not completed (TaskToolQueuedResultSchema). */
+const PENDING_TASK_STATUSES = new Set<unknown>(["queued", "starting", "running", "interrupted"]);
+
+function isPendingTaskStatus(status: unknown): status is string {
+  return PENDING_TASK_STATUSES.has(status);
 }
 
 function formatWebFetchEnd(_toolName: string, _args: unknown, result: unknown): string | null {

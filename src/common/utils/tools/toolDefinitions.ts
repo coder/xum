@@ -499,7 +499,8 @@ const TaskToolCompletedReportSchema = z
 
 export const TaskToolQueuedResultSchema = z
   .object({
-    status: z.enum(["queued", "starting", "running"]),
+    // "interrupted": every member of a foreground group ended, and not every one reported.
+    status: z.enum(["queued", "starting", "running", "interrupted"]),
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     handleKind: TaskHandleKindSchema.optional(),
