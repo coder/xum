@@ -699,7 +699,9 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         constant beside `MAX_STOP_HOOK_CONTINUATIONS`. Reaching it pauses the
         loop: the next user message starts a new user turn, and the hooks can
         continue again.
-    4.  The chat shows "plugin continued turn n of 50" for each continuation.
+    4.  The chat shows "plugin continued turn n of 50" for each continuation
+        that a plugin hook asked for. A continuation made only of Xum's own
+        TODO or status nudges shows no notice, and still counts toward n.
 *   Counting scope (D4): per user turn, for
     every hook source, as today. Each hook's count and the 50 ceiling reset
     when a user turn starts, and stay in memory. `loop_count` in the hook input
@@ -852,7 +854,7 @@ Each one needs a line in the release notes.
 | Adding a repository with both marketplace files shows one merged list. `cursor/plugins` goes from 2 entries to 128. | Users of the Plugins tab | D20 |
 | A folder with a schema-less root `plugin.json` and a Cursor manifest loads the Cursor manifest. | Users with such a folder (none in the marketplace) | D21 |
 | The turn-stop text passed to hooks keeps the last 16 × 1024 characters of the reply's trailing text run instead of the first. Codex `Stop` hooks receive the same text. | Users of Codex `Stop` hooks | D22 |
-| Stop-hook continuations are counted per hook, with a ceiling of 50 per user turn. A hook without `loop_limit`, every Codex hook included, continues a user turn at most 3 times. Each continuation that a plugin hook asks for shows the chat notice "plugin continued turn n of 50", for Codex `Stop` hooks too. A Xum TODO or status nudge does not count against a hook's 3. After a nudge continues a turn, a Codex `Stop` hook can still continue it 3 times, so one user turn can reach 4 continuations. Today it stops at 3. | Users of Codex `Stop` hooks | D2, D3, D4 |
+| Stop-hook continuations are counted per hook, with a ceiling of 50 per user turn. A hook without `loop_limit`, every Codex hook included, continues a user turn at most 3 times. Each continuation that a plugin hook asks for shows the chat notice "plugin continued turn n of 50", for Codex `Stop` hooks too. A Xum TODO or status nudge does not count against a hook's 3. After a nudge continues a turn, a Codex `Stop` hook can still continue it 3 times, so one user turn can reach 4 continuations. Two Codex `Stop` hooks can continue one user turn up to 6 times. Today it stops at 3. | Users of Codex `Stop` hooks | D2, D3, D4 |
 
 ## Risks & Mitigations
 
@@ -2142,25 +2144,28 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         key). A hook key alone can repeat across plugins. `loopLimit` absent
         means the shared default. The snapshot and restore at
         `eventSpine.ts:247-250` copy the objects.
-    *   `TurnStopContext` gains `stopHookCounts: ReadonlyMap<string, number>`:
-        the continuations per `hookKey` in this user turn. It is set before
-        `spine.run`, so a hook reads its own count while the chain runs. A
+    *   `TurnStopContext` gains `turnContinuations: number` (the
+        continuations in this user turn, all sources) and
+        `hookContinuations: ReadonlyMap<string, number>` (the continuations
+        per `hookKey` in this user turn). Both are set before `spine.run`, so
+        a hook reads its own count while the chain runs. `stopHookActive` is
+        `turnContinuations > 0`. A
         Cursor `stop` hook sends it as `loop_count` (5.4, PR 8).
     *   `CodexHookRegistration` (`codexHookRunner.ts:72-79`) gains
         `instanceId`. `codexHookService.ts` sets it from
         `instanceIdOf(entry.plugin)` where it registers each plugin (line 125).
     *   `codexHookRunner.ts:170` pushes `{text: output.continueWith, hookKey}`,
         where `hookKey` joins `registration.instanceId`, `:` and `hook.key`.
-    *   `runTurnStopHooks` (`promptHooks.ts:138-165`) takes `stopHookCounts`
+    *   `runTurnStopHooks` (`promptHooks.ts:138-165`) takes `hookContinuations`
         in its input (the `Pick` at lines 141-144), so the context has it
         before `spine.run`. After the run, it drops a reason whose hook has
-        reached its limit: `stopHookCounts.get(hookKey) ?? 0` is at least
+        reached its limit: `hookContinuations.get(hookKey) ?? 0` is at least
         `loopLimit ?? MAX_STOP_HOOK_CONTINUATIONS`, and `loopLimit === null`
         never reaches a limit. It returns `{kind: "continue", prompt,
         hookKeys}` with the keys of the kept reasons, each key once.
     *   The input `Pick` of the `aiService.runTurnStopHooks` contract
         (`agentSession.ts:1075-1078`) and of its implementation
-        (`aiService.ts:608-616`) adds `stopHookCounts`.
+        (`aiService.ts:608-616`) adds `hookContinuations`.
 
 #### 7.3 `src/node/services/agentSession.ts` (Modify)
 
@@ -2175,7 +2180,7 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         `MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN` instead of
         `MAX_STOP_HOOK_CONTINUATIONS`. At the increment (line 10817), add 1 to
         `stopHookCountsByKey` for each key in `hookKeys`.
-    *   Pass a copy of `stopHookCountsByKey` as `stopHookCounts` in the input
+    *   Pass a copy of `stopHookCountsByKey` as `hookContinuations` in the input
         of `aiService.runTurnStopHooks`, the call in `readTurnStopContinuation`
         (line 10852). The hooks then see the counts before they run.
     *   After the increment, emit `plugin.hook.notice` "plugin continued turn
@@ -2197,7 +2202,7 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
     *   two Codex plugins whose `Stop` hooks have the same hook key,
         registered through `registerCodexPluginHooks` with different
         `instanceId` values, each continue 3 times in the same user turn;
-    *   a middleware reads `ctx.stopHookCounts.get(hookKey)` as 0, 1 and 2 on
+    *   a middleware reads `ctx.hookContinuations.get(hookKey)` as 0, 1 and 2 on
         the first three stops of a user turn;
     *   a new user message resets both counts;
     *   a user Stop adds no continuation;
@@ -2272,7 +2277,7 @@ the tests in 8.7.
 *   **Type / Scope**: TypeScript module.
 *   **Proposed Changes**:
     *   Register on `turn.stop`: `afterAgentResponse` first, then `stop`. A
-        `stop` hook's `loop_count` is `ctx.stopHookCounts.get(hookKey) ?? 0`
+        `stop` hook's `loop_count` is `ctx.hookContinuations.get(hookKey) ?? 0`
         (7.2), with `hookKey` as in step 7.
     *   Register on `tool.execute`, after the tool runs (the `next()` call of
         the middleware), for `file_edit_replace_string` and `file_edit_insert`
@@ -2384,7 +2389,8 @@ the tests in 8.7.
         Both walks set `keepBytesUpTo` to 64 × 1024 (8.4). For a record whose
         bytes decode as UTF-8 without replacement characters (`new
         TextDecoder("utf-8", {fatal: true})`), `before` and `after` are that
-        text through `reviewText` (lines 540-542). Xum opens no file a second
+        text through `showInvisibleControls` (line 561), the function
+        `reviewText` (lines 540-542) applies to its display. Xum opens no file a second
         time. For a symlink, `before` and `after` are its link text. Any other
         file has no `before` or `after`;
     *   the list still goes through `assertReviewFits` (lines 586-597), so an
@@ -2431,7 +2437,7 @@ the tests in 8.7.
         key `<instance id>:<hook key>` and the hook's `loopLimit`, and empty
         stdout adds none;
     *   `stop` input `loop_count` is the context's count for that key: 0 with
-        an empty `stopHookCounts`, 1 after one continuation;
+        an empty `hookContinuations`, 1 after one continuation;
     *   a context `abortSignal` that aborts while `stop` runs reaches `exec`,
         and the call adds no reason and shows no notice;
     *   exit 2, `{"permission": "deny"}`, invalid JSON, `{"followup_message":
