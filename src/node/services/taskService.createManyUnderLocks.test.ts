@@ -9,6 +9,7 @@ import type { TaskService } from "@/node/services/taskService";
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Ok, Err, type Result } from "@/common/types/result";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
@@ -80,10 +81,18 @@ interface Hooks {
     call: number,
     read: Result<WorkspaceMetadata>
   ) => Result<WorkspaceMetadata> | Promise<Result<WorkspaceMetadata>>;
-  /** Rewrites (or, by throwing, rejects) the Nth (1-based) agent definition read. */
-  reviseDefinition?: (call: number, read: AgentDefinitionPackage) => AgentDefinitionPackage;
+  /**
+   * Rewrites (or, by throwing, rejects; by returning a pending promise, holds) the Nth (1-based)
+   * agent definition read.
+   */
+  reviseDefinition?: (
+    call: number,
+    read: AgentDefinitionPackage
+  ) => AgentDefinitionPackage | Promise<AgentDefinitionPackage>;
   /** Runs inside the active workspace-turn count, before it resolves. */
   duringTurnCount?: () => void;
+  /** The active workspace turns the count reports (by default, the real count). */
+  activeTurns?: number;
   /** The next launch lease hold rejects. */
   refuseLease?: boolean;
   /** Runs inside each checkpoint callback. */
@@ -171,7 +180,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     spyOn(workspaceTurnManager, "countActiveWorkspaceTurns").mockImplementation(() => {
       event("turns");
       hooks.duringTurnCount?.();
-      return realCount();
+      return hooks.activeTurns != null ? Promise.resolve(hooks.activeTurns) : realCount();
     });
     spyOn(config, "generateStableId").mockImplementation(() => {
       const id = hooks.ids.shift() ?? "fffffffff0";
@@ -518,6 +527,32 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     }
   );
 
+  test("an abort while the definition re-read is held interrupts the batch at once, and the late read is discarded", async () => {
+    const { hooks, events, onTaskReserved, stage, createMany, owned } = await setup();
+    const controller = new AbortController();
+    // The revalidation's definition read stalls until the test ends it; the abort lands meanwhile.
+    const stalled = Promise.withResolvers<void>();
+    let heldRead: Promise<AgentDefinitionPackage> | undefined;
+    hooks.reviseDefinition = (call, read) => {
+      if (call !== 2) return read;
+      controller.abort();
+      heldRead = stalled.promise.then(() => read);
+      return heldRead;
+    };
+    // Returns while the read is still held.
+    const created = await createMany(1, { abortSignal: controller.signal });
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error.startsWith("Interrupted")).toBe(true);
+    expect(stage()).toBe("revalidate");
+    expect(events).toEqual([...REVALIDATING, "definition +mutex", "tree-exit"]);
+    stalled.resolve();
+    await heldRead;
+    expect(onTaskReserved).not.toHaveBeenCalled();
+    expect(owned.size).toBe(0);
+    expect(workspaceIds(config)).toEqual([PARENT_ID]);
+  });
+
   test("the mutex and the launch leases are held from revalidation through scheduling, inside the tree locks", async () => {
     // One parallel slot: the first plan starts and takes the only launch lease, the second queues.
     const { events, stage, createMany } = await setup({ maxParallelAgentTasks: 1 });
@@ -575,6 +610,51 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     ]);
   });
 
+  test("an abort while the batch waits for a held desktop gate interrupts it there, and its late entry does nothing", async () => {
+    const { taskService, events, onTaskReserved, stage, createMany, owned } = await setup();
+    const coordinator = internals(taskService).desktopInputCoordinator as unknown as {
+      withReservations: { mock: { results: Array<{ value: unknown }> } };
+      withOwnerGate(ownerWorkspaceId: string, run: () => Promise<void>): Promise<void>;
+    };
+    // Another admission holds the parent's desktop until the test ends it.
+    const otherAdmission = Promise.withResolvers<void>();
+    const holding = coordinator.withOwnerGate(PARENT_ID, () => otherAdmission.promise);
+    const controller = new AbortController();
+    const realOwnerGate = coordinator.withOwnerGate.bind(coordinator);
+    spyOn(coordinator, "withOwnerGate").mockImplementation((ownerWorkspaceId, run) => {
+      // The batch queues behind the other admission: abort once it waits there.
+      queueMicrotask(() => controller.abort());
+      return realOwnerGate(ownerWorkspaceId, run);
+    });
+    // Returns while the other admission still holds the gate.
+    const created = await createMany(1, {
+      abortSignal: controller.signal,
+      args: { desktop: "shared" },
+    });
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error.startsWith("Interrupted")).toBe(true);
+    expect(stage()).toBe("desktop-gate");
+    // The gate frees only now: the batch's abandoned entry runs and returns without any work.
+    otherAdmission.resolve();
+    await holding;
+    await coordinator.withReservations.mock.results[0]?.value;
+    const reservation = { ownerWorkspaceId: PARENT_ID, borrowerWorkspaceId: TASK_ID };
+    expect(events).toEqual([
+      ...REVALIDATING,
+      "definition +mutex",
+      `mint ${TASK_ID} +mutex`,
+      `lease-hold ${TASK_ID} +mutex`,
+      `gate-enter ${JSON.stringify([reservation])} @desktop-gate +mutex`,
+      `lease-release ${TASK_ID} +mutex`,
+      "tree-exit",
+      "gate-exit",
+    ]);
+    expect(onTaskReserved).not.toHaveBeenCalled();
+    expect(owned.size).toBe(0);
+    expect(workspaceIds(config)).toEqual([PARENT_ID]);
+  });
+
   test("every plan is revalidated against the config and task settings read once under the mutex", async () => {
     const { hooks, events, createMany } = await setup();
     // While the first plan's parent is re-read, another writer changes an input of every plan
@@ -598,6 +678,80 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     expect(workspaceIds(config).sort()).toEqual([PARENT_ID, TASK_ID, SECOND_ID].sort());
     // Nothing queued, so no queue drain is scheduled.
     expect(events.filter((name) => name.startsWith("queue-drain"))).toEqual([]);
+  });
+
+  test("active workspace turns take parallel slots before the batch's plans", async () => {
+    const { hooks, createMany } = await setup({ maxParallelAgentTasks: 2 });
+    hooks.activeTurns = 1;
+    const created = await createMany(2);
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    expect(created.data.map((result) => [result.taskId, result.status])).toEqual([
+      [TASK_ID, "starting"],
+      [SECOND_ID, "queued"],
+    ]);
+  });
+
+  test.each<[string, Partial<CreateManyArgs>, string]>([
+    ["its own desktop", {}, TASK_ID],
+    ["its parent's shared desktop", { desktop: "shared" }, PARENT_ID],
+  ])(
+    "each result carries the persisted model and thinking level, and the desktop owner (%s)",
+    async (_label, args, owner) => {
+      const { createMany } = await setup();
+      const created = await createMany(1, { args });
+      expect(created.success).toBe(true);
+      if (!created.success) return;
+      const row = findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace;
+      expect(typeof row?.taskModelString).toBe("string");
+      expect(typeof row?.taskThinkingLevel).toBe("string");
+      expect(created.data).toEqual([
+        {
+          taskId: TASK_ID,
+          kind: "agent",
+          status: "starting",
+          modelString: row?.taskModelString,
+          thinkingLevel: row?.taskThinkingLevel,
+          desktopOwnerWorkspaceId: owner,
+        },
+      ]);
+    }
+  );
+
+  // Project plugins load only in a trusted project (#6426): the revalidation re-reads the
+  // definition under the trust the preparation read it with.
+  test("the definition is re-read with the plugin trust it was prepared with", async () => {
+    const { createMany } = await setup();
+    const created = await createMany(1);
+    expect(created.success).toBe(true);
+    const reads = (
+      agentDefinitionsService.resolveAgentDefinition as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls;
+    const trusted = (args: unknown[]) =>
+      (args[3] as { projectPluginsTrusted?: boolean }).projectPluginsTrusted;
+    expect(reads.map(trusted)).toEqual([true, true]);
+  });
+
+  test.each<[string, boolean]>([
+    ["a scratch parent's child is a scratch row in its checkout", true],
+    ["any other parent's child is a regular row", false],
+  ])("%s", async (_label, scratch) => {
+    const { createMany } = await setup();
+    if (scratch) {
+      await config.editConfig((cfg) => {
+        const parent = findWorkspaceEntry(cfg, PARENT_ID)?.workspace;
+        if (parent != null) parent.kind = "scratch";
+        cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, { workspaces: [], trusted: true });
+        return cfg;
+      });
+    }
+    const created = await createMany(1);
+    expect(created.success).toBe(true);
+    const cfg = config.loadConfigOrDefault();
+    const child = findWorkspaceEntry(cfg, TASK_ID)?.workspace;
+    expect(child?.kind).toBe(scratch ? "scratch" : undefined);
+    // A scratch parent's child shares its checkout.
+    expect(child?.taskIsolation).toBe(scratch ? "none" : undefined);
   });
 
   // The post-commit fence (an abort that landed after the commit's mutator ran), one plan. Each
