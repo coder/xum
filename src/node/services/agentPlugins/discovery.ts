@@ -7,6 +7,7 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
+import type { AgentPluginNotApplied } from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
@@ -368,11 +369,7 @@ export interface AgentPluginContainer {
   registryPath?: string;
 }
 
-export interface AgentPluginNotApplied {
-  part: "field" | "rule" | "agent" | "hook" | "mcp" | "command";
-  name: string;
-  reason: string;
-}
+export type { AgentPluginNotApplied };
 
 export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */

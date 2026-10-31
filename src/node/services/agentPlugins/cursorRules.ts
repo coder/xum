@@ -6,6 +6,7 @@
  */
 import YAML from "yaml";
 
+import type { AgentPluginRuleType } from "@/common/orpc/schemas/agentPlugins";
 import { MAX_SKILL_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentSkill";
 import {
   AgentSkillParseError,
@@ -23,7 +24,7 @@ import { isPlainObject } from "./manifest";
 
 export const CURSOR_RULE_EXTENSIONS = [".md", ".mdc", ".markdown"] as const;
 
-export type CursorRuleType = "always-apply" | "description" | "glob" | "manual";
+export type CursorRuleType = AgentPluginRuleType;
 
 export function cursorRuleName(file: string): string | undefined {
   const extension = CURSOR_RULE_EXTENSIONS.find((candidate) => file.endsWith(candidate));
