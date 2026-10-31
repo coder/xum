@@ -30,16 +30,44 @@ export function formatIssuePath(path: StandardSchemaV1.Issue["path"]): string {
     .join("");
 }
 
+/** The server log formatter lists the same number, so both sides show the same issues. */
+export const MAX_SHOWN_VALIDATION_ISSUES = 5;
+const MAX_ISSUE_MESSAGE_CHARS = 300;
+
+function formatIssueDetails(issues: readonly StandardSchemaV1.Issue[]): string {
+  const details = issues.slice(0, MAX_SHOWN_VALIDATION_ISSUES).map((issue) => {
+    const message =
+      issue.message.length > MAX_ISSUE_MESSAGE_CHARS
+        ? `${issue.message.slice(0, MAX_ISSUE_MESSAGE_CHARS)}…`
+        : issue.message;
+    return `${formatIssuePath(issue.path)}: ${message}`;
+  });
+  const hidden = issues.length - MAX_SHOWN_VALIDATION_ISSUES;
+  if (hidden > 0) details.push(`+${hidden} more`);
+  return details.join("; ");
+}
+
+function readValidationIssues(error: Error): StandardSchemaV1.Issue[] {
+  const data = "data" in error ? error.data : undefined;
+  if (typeof data !== "object" || data === null || !("issues" in data)) return [];
+  return Array.isArray(data.issues) ? data.issues.filter(isValidationIssue) : [];
+}
+
 /**
  * oRPC rejects schema-invalid input with the generic "Input validation failed" and puts
  * each schema issue in `data.issues`, which survives serialization to the client. Without
  * them a settings form cannot say which field is wrong or why (#7771).
+ *
+ * Best effort: crash and stream-failure paths format arbitrary thrown values through
+ * `getErrorMessage`, so a throwing `data` getter or Proxy trap must not replace the original
+ * message with a new error.
  */
 export function getMessageWithInputValidationIssues(error: Error): string {
-  const data = "data" in error ? error.data : undefined;
-  if (typeof data !== "object" || data === null || !("issues" in data)) return error.message;
-  const issues = Array.isArray(data.issues) ? data.issues.filter(isValidationIssue) : [];
-  if (issues.length === 0) return error.message;
-  const details = issues.map((issue) => `${formatIssuePath(issue.path)}: ${issue.message}`);
-  return `${error.message}: ${details.join("; ")}`;
+  try {
+    const issues = readValidationIssues(error);
+    if (issues.length === 0) return error.message;
+    return `${error.message}: ${formatIssueDetails(issues)}`;
+  } catch {
+    return error.message;
+  }
 }

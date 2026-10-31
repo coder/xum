@@ -2,7 +2,11 @@ import { ORPCError, ValidationError } from "@orpc/server";
 import { COMMON_ERROR_STATUS_MAP } from "@orpc/client";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { inspect } from "node:util";
-import { formatIssuePath, isValidationIssue } from "@/common/utils/errors/formatValidationIssues";
+import {
+  formatIssuePath,
+  isValidationIssue,
+  MAX_SHOWN_VALIDATION_ISSUES,
+} from "@/common/utils/errors/formatValidationIssues";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { WorkflowDeclaredPhasesValidationError } from "@/node/services/workflows/workflowMetadata";
 
@@ -310,7 +314,7 @@ export function formatOrpcError(error: unknown, interceptorOptions?: unknown): F
         );
 
         if (validation.issues.length > 0) {
-          const maxIssues = 5;
+          const maxIssues = MAX_SHOWN_VALIDATION_ISSUES;
           lines.push(`Validation issues (${validation.issues.length}):`);
 
           for (const issue of validation.issues.slice(0, maxIssues)) {
