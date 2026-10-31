@@ -20,7 +20,7 @@ import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   isPlainObject,
 } from "./manifest";
-import { claudeComponentPath, readAuthor } from "./claudeManifest";
+import { claudeComponentPath, claudePluginName, readAuthor } from "./claudeManifest";
 import { CURSOR_RULE_EXTENSIONS } from "./cursorRules";
 import type { AgentPluginNotApplied } from "./discovery";
 
@@ -225,6 +225,7 @@ function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<
     if (raw[key] !== undefined) manifest[key] = raw[key];
   }
   if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
+  if (typeof raw.name === "string") manifest.name = claudePluginName(raw.name, warnings);
   for (const key of Object.keys(raw)) {
     if (HANDLED_CURSOR_KEYS.has(key)) continue;
     warnings.push(`'${key}' is not supported in ${CURSOR_MANIFEST_LABEL}; ignoring`);

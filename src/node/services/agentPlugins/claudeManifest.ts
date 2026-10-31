@@ -224,7 +224,7 @@ function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<
  * its lowercase form with `_` as `-`, with a warning. Any other invalid name stays as it is, so
  * the validator refuses the plugin with its usual error.
  */
-function claudePluginName(name: string, warnings: string[]): string {
+export function claudePluginName(name: string, warnings: string[]): string {
   if (isValidAgentPluginName(name)) return name;
   const mapped = name.toLowerCase().replaceAll("_", "-");
   if (!isValidAgentPluginName(mapped)) return name;
