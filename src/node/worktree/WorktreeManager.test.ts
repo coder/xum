@@ -2088,6 +2088,36 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("reuses origin's answer that an unpushed branch is missing for a burst of forks from it", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      execFileSync("git", ["branch", "unpushed-parent"], { cwd: fixture.projectPath });
+      const parentHead = gitRevParseHead(fixture.projectPath);
+
+      const heads: string[] = [];
+      for (const branchName of ["child-1", "child-2", "child-3"]) {
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "unpushed-parent",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        });
+        if (!result.success || !result.workspacePath) {
+          throw new Error(`Expected ${branchName}: ${result.error ?? "no workspace path"}`);
+        }
+        heads.push(gitRevParseHead(result.workspacePath));
+      }
+
+      expect(await uploadPackRuns()).toBe(1);
+      expect(heads).toEqual([parentHead, parentHead, parentHead]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("fetches again after origin moves to another remote and back", async () => {
     const fixture = await createWorktreeManagerFixture();
     try {

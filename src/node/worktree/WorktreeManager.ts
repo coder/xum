@@ -61,9 +61,10 @@ const DEFERRED_SYNC_FALLBACK = "keeping the branch at its current commit";
  * rewrites of the workspace branch map, which is written whole, and `git branch -m`, which moves
  * a branch's reflog through one fixed temporary file (logs/refs/.tmp-renamed-log): two at once
  * drop a mapping or fail one rename. Worktree creations named in the backend rename their branch
- * as soon as their checkout is done, so their renames can meet. Also serializes the creations'
- * upstream writes (`worktree add -b`, `branch --set-upstream-to`) through .git/config.lock:
- * creations that share one origin fetch all reach them in the same tick.
+ * as soon as their checkout is done, so their renames can meet. Also serializes every other
+ * write of a branch's config section through .git/config.lock (`worktree add -b`,
+ * `branch --set-upstream-to`, `branch -d`): creations that share one origin fetch all reach
+ * them in the same tick.
  */
 const branchRefLocks = new MutexMap<string>();
 
@@ -827,12 +828,14 @@ export class WorktreeManager {
       return;
     }
 
-    using deleteProc = execFileAsync(
-      "git",
-      ["-C", args.projectPath, "branch", "-D", args.branchName],
-      noHooksEnv
-    );
-    await deleteProc.result;
+    await branchRefLocks.withLock(args.projectPath, async () => {
+      using deleteProc = execFileAsync(
+        "git",
+        ["-C", args.projectPath, "branch", "-D", args.branchName],
+        noHooksEnv
+      );
+      await deleteProc.result;
+    });
   }
 
   /**
@@ -943,13 +946,14 @@ export class WorktreeManager {
     const entry: SharedOriginFetch = {
       outcome: run().then((outcome) => {
         entry.settledAtMs = performance.now();
-        // Only a success is reused. After a failure the next creation fetches again, so a burst
-        // never branches from local refs once the network is back. A fetch from another origin
-        // that finished first no longer describes the ref this one just wrote.
+        // Only origin's answer is reused: the branch, or that origin has none (the usual case for
+        // a sub-agent's unpushed parent branch). After a failure or timeout the next creation
+        // fetches again, so a burst never branches from local refs once the network is back. A
+        // fetch from another origin that finished first no longer describes the ref this one
+        // just wrote.
         const published = originFetches.get(key);
-        if (
-          published === entry ? outcome.kind !== "fetched" : published?.settledAtMs !== undefined
-        ) {
+        const answered = outcome.kind === "fetched" || outcome.kind === "not-on-origin";
+        if (published === entry ? !answered : published?.settledAtMs !== undefined) {
           originFetches.delete(key);
         }
         return outcome;
@@ -1624,12 +1628,14 @@ export class WorktreeManager {
 
     const deleteFlag = args.force ? "-D" : "-d";
     try {
-      using deleteProc = execFileAsync(
-        "git",
-        ["-C", args.projectPath, "branch", deleteFlag, branchToDelete],
-        args.noHooksEnv
-      );
-      await deleteProc.result;
+      await branchRefLocks.withLock(args.projectPath, async () => {
+        using deleteProc = execFileAsync(
+          "git",
+          ["-C", args.projectPath, "branch", deleteFlag, branchToDelete],
+          args.noHooksEnv
+        );
+        await deleteProc.result;
+      });
     } catch (error) {
       // Best-effort: workspace deletion should not fail just because branch cleanup failed.
       log.debug("Failed to delete git branch after removing worktree", {
