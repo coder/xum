@@ -335,6 +335,46 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("url(#mermaid-r1-c)");
   });
 
+  // CSS whitespace is only space, tab, LF, CR and FF. Chromium reads url(&#160;#id) as a relative
+  // URL and requests /%C2%A0 from the page's origin.
+  it.each([
+    ["W1", svgWith(`<rect fill="url(&#160;#mermaid-r1-g)"/>`), "fill"],
+    ["W2", svgWith(`<rect stroke="url(&#xFEFF;#mermaid-r1-g)"/>`), "stroke"],
+    ["W3", svgWith(`<rect fill="url(&#x3000;#mermaid-r1-g)"/>`), "fill"],
+    ["W4", svgWith(`<rect fill="url(&#x2028;#mermaid-r1-g)"/>`), "fill"],
+    [
+      "W5",
+      svgWith(peleMathLabel(MATH.replace("<mi>", `<mi mathcolor="url(&#160;#mermaid-r1-g)">`))),
+      "mathcolor",
+    ],
+    ["W29", svgWith(`<rect fill="url(&#160;'#mermaid-r1-g')"/>`), "fill"],
+    ["a vertical tab", svgWith(`<rect fill="red&#11;"/>`), "fill"],
+    ["a NEL", svgWith(`<rect fill="red&#133;"/>`), "fill"],
+    ["a non-ASCII font name", svgWith(`<rect style="font-family:Café"/>`), "style"],
+  ])("removes a CSS value with a character outside printable ASCII in %s", (_case, svg, name) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(sanitized).not.toContain(` ${name}=`);
+    expect(htmlParts(sanitized).filter((part) => part.includes(`> ${name}`))).toEqual([]);
+  });
+
+  // Pele's source limit is 50,000 characters, and Pele renders on the renderer thread.
+  it.each([
+    ["a long name", `font-family:${"a".repeat(49_000)}`],
+    ["a long whitespace run", `fill:${" ".repeat(49_000)}`],
+    ["many parentheses", `fill:${"rgb(".repeat(12_250)}`],
+  ])("checks a near-limit style with %s in linear time", (_case, style) => {
+    const svg = svgWith(`<rect style="${style}"/>`);
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toContain("<rect");
+    expect(elapsed).toBeLessThan(200);
+  });
+
   it("keeps only the text of title and desc", () => {
     const sanitized = sanitizeMermaidSvg(
       svgWith("<title>tip<rect/><text>x</text></title><desc>about<g><rect/></g></desc>"),
