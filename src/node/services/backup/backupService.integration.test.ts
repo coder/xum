@@ -482,7 +482,8 @@ describe("BackupService against a real repository", () => {
     );
   });
 
-  it("previews and restores around a matched project whose local memory folder is now a symlink", async () => {
+  /** A registered project whose memory folder was pushed as a real folder and is now a link. */
+  async function linkMatchedProjectMemory(): Promise<{ memoryDir: string; sharedMemory: string }> {
     const projectPath = path.join(tempDir, "projects", "rocket");
     await fs.mkdir(projectPath, { recursive: true });
     const created = await new ProjectService(config).create(projectPath);
@@ -495,6 +496,11 @@ describe("BackupService against a real repository", () => {
     await writeFixtureFile(sharedMemory, "notes.md", "shared memory\n");
     await fs.rm(path.join(muxRoot, memoryDir), { recursive: true });
     await fs.symlink(sharedMemory, path.join(muxRoot, memoryDir));
+    return { memoryDir, sharedMemory };
+  }
+
+  it("previews and restores around a matched project whose local memory folder is now a symlink", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
     await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
 
     const preview = await service.preview(settings);
@@ -512,6 +518,30 @@ describe("BackupService against a real repository", () => {
     );
     expect((await fs.lstat(path.join(muxRoot, memoryDir))).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe("shared memory\n");
+  });
+
+  it("leaves a skipped symlinked memory folder alone when it becomes a folder after the snapshot", async () => {
+    const { memoryDir } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    const payload = createBackupPayloadStore({ config });
+    const racing = new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payload,
+        async writeSafetySnapshot(snapshotRoot, contents) {
+          await payload.writeSafetySnapshot(snapshotRoot, contents);
+          await fs.rm(linkPath);
+          await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "written after snapshot\n");
+        },
+      },
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(linkPath, "notes.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
   });
 
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
