@@ -1641,6 +1641,21 @@ type TerminalFailureChild = Pick<
 /** The launch leases of a batch's `starting` plans (see holdLaunchLeases). */
 type HeldLaunchLeases = Awaited<ReturnType<typeof holdLaunchLeases>>;
 
+/**
+ * Marks the refusal of a batch whose prepared inputs changed before the mutex. Such a refusal
+ * owns and writes nothing, so create() prepares again (MAX_CREATE_PREPARATION_RETRIES times).
+ */
+const PREPARATION_DRIFT = Symbol("preparationDrift");
+const MAX_CREATE_PREPARATION_RETRIES = 2;
+
+function preparationDrift(error: string): Result<never, string> {
+  return Object.assign(Err(error), { [PREPARATION_DRIFT]: true });
+}
+
+function isPreparationDrift(result: Result<unknown, string>): boolean {
+  return !result.success && PREPARATION_DRIFT in result;
+}
+
 /** createManyUnderTaskTreeLifecycleLocks' arguments, as its steps read them. */
 interface ReservationRun {
   readonly options: TaskCreateManyOptions;
@@ -6948,7 +6963,7 @@ export class TaskService implements AgentTaskIntegration {
       plan.agentId
     );
     if (inputsNow !== plan.inputs) {
-      return Err(
+      return preparationDrift(
         "Task.createMany: reservation inputs changed during preparation (parent, trust or AI defaults); retry"
       );
     }
@@ -6965,7 +6980,7 @@ export class TaskService implements AgentTaskIntegration {
       !parentMetaNow.success ||
       this.pinParentMetaForReservation(parentMetaNow.data) !== plan.parentMetaJson
     ) {
-      return Err(
+      return preparationDrift(
         "Task.createMany: parent workspace changed during preparation (runtime, name or projects); retry"
       );
     }
@@ -7002,7 +7017,7 @@ export class TaskService implements AgentTaskIntegration {
       if (definitionNowRead.kind !== "ok") return run.interrupted();
       definitionNow = definitionNowRead.value;
     } catch (error) {
-      return Err(
+      return preparationDrift(
         `Task.createMany: agent definition changed during preparation (${plan.agentId}): ${getErrorMessage(error)}; retry`
       );
     }
@@ -7010,7 +7025,7 @@ export class TaskService implements AgentTaskIntegration {
       definitionNow.source !== plan.definitionSource ||
       JSON.stringify(definitionNow.frontmatter) !== plan.frontmatter
     ) {
-      return Err(
+      return preparationDrift(
         `Task.createMany: agent definition changed during preparation (${plan.agentId}); retry`
       );
     }
@@ -8732,7 +8747,17 @@ export class TaskService implements AgentTaskIntegration {
    * reaches the caller through waitForAgentReport, and the parent through its history.
    */
   async create(args: TaskCreateArgs): Promise<Result<TaskCreateResult, string>> {
-    const created = await this.createMany([args]);
+    // A spawn prepares while other spawns' launches run, and a launch can change the parent
+    // before this reservation (a Coder parent's first fork rewrites its runtime config). Prepare
+    // again rather than fail the spawn.
+    let created = await this.createMany([args]);
+    for (
+      let retry = 0;
+      retry < MAX_CREATE_PREPARATION_RETRIES && isPreparationDrift(created);
+      retry++
+    ) {
+      created = await this.createMany([args]);
+    }
     if (!created.success) {
       // The caller asked for one task: its refusals name that call, as they always have.
       return Err(created.error.replace(/^Task\.createMany:/, "Task.create:"));

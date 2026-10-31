@@ -201,6 +201,50 @@ describe("TaskService.create paths", () => {
     expect(host.sendMessage).not.toHaveBeenCalled();
   });
 
+  /**
+   * Another writer edits the parent's AI settings while each of the first `count` spawn
+   * preparations resolves the child's settings, as when the user picks another model meanwhile.
+   * Returns the number of preparations so far.
+   */
+  function editParentDuringPreparations(parentId: string, count: number) {
+    let preparations = 0;
+    const load = resolveNodeAgentAiSettingsModule.loadAgentDefinitionAiLayers;
+    spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers").mockImplementation(
+      async (...args) => {
+        preparations += 1;
+        if (preparations <= count) {
+          const thinkingLevel = preparations % 2 === 1 ? "low" : "medium";
+          await editRow(parentId, (row) => {
+            row.aiSettings = { model: "openai:gpt-5.2", thinkingLevel };
+          });
+        }
+        return load(...args);
+      }
+    );
+    return () => preparations;
+  }
+
+  test("a parent edited while the spawn prepares is prepared again instead of refused", async () => {
+    const { parentId, taskService } = await setup();
+    editParentDuringPreparations(parentId, 1);
+    const created = await createAgentTask(taskService, parentId, "go");
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    // The second preparation read the edit.
+    expect(created.data.modelString).toBe("openai:gpt-5.2");
+  });
+
+  test("a parent edited during every preparation refuses the spawn after a bounded retry", async () => {
+    const { parentId, host, taskService } = await setup();
+    const preparations = editParentDuringPreparations(parentId, Number.POSITIVE_INFINITY);
+    const created = await createAgentTask(taskService, parentId, "go");
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error).toContain("changed during preparation");
+    expect(preparations()).toBeGreaterThan(1);
+    expect(workspaceIds(config)).toEqual([parentId]);
+    expect(host.sendMessage).not.toHaveBeenCalled();
+  });
+
   test("a disabled agent is refused with a hint that skips agents whose definition cannot be read", async () => {
     const { parentId, taskService } = await setup({
       agentAiDefaults: { explore: { enabled: false } },
