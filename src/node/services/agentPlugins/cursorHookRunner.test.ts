@@ -286,6 +286,25 @@ describe("failures warn once and never block", () => {
     expect(h.notices[0]).not.toContain("\u202E");
   });
 
+  test("stdout over 64 KiB that is valid JSON adds no reason and one notice", async () => {
+    // Valid JSON with a followup, one byte over the limit: the runner reads a few bytes past the
+    // limit, so this arrives whole and only the byte check refuses it, not the JSON parse.
+    const base = JSON.stringify({ followup_message: "again", pad: "" });
+    const stdout = JSON.stringify({
+      followup_message: "again",
+      pad: "x".repeat(64 * 1024 + 1 - base.length),
+    });
+    expect(Buffer.byteLength(stdout)).toBe(64 * 1024 + 1);
+    const h = harness({
+      hooks: await hooksOf({ stop: [{ command: "./s.sh" }] }),
+      runtime: fakeRuntime({ "./s.sh": { stdout } }),
+    });
+    expect(await h.stop()).toEqual({ kind: "none" });
+    expect(h.notices).toEqual([
+      "hook stop failed (invalid output: over 65536 bytes). Turn the hook off in Settings > Plugins.",
+    ]);
+  });
+
   test("failClosed: true changes nothing for stop: a crash adds no reason and one notice", async () => {
     const h = harness({
       hooks: await hooksOf({ stop: [{ command: "./s.sh", failClosed: true }] }),
@@ -385,6 +404,21 @@ describe("start conditions", () => {
     trusted = false;
     expect(await h.stop()).toEqual({ kind: "none" });
     expect(runtime.execCalls).toHaveLength(1);
+    expect(h.notices).toEqual([]);
+  });
+
+  test("a trusted hook whose status is not runnable starts no process", async () => {
+    // Trust is a record of the user's decision, not of what Xum applies: the gate allows these
+    // here, so only the status filter keeps them from running.
+    const runtime = fakeRuntime({ "./a.sh": {}, "./s.sh": followup("again") });
+    const hooks = await hooksOf({
+      afterAgentResponse: [{ command: "./a.sh", matcher: "x" }],
+      stop: [{ command: "./s.sh", matcher: "x" }],
+    });
+    expect(hooks.map((hook) => hook.status)).toEqual(["ignored-event", "ignored-event"]);
+    const h = harness({ hooks, runtime, gate: () => "allowed" });
+    expect(await h.stop()).toEqual({ kind: "none" });
+    expect(runtime.execCalls).toEqual([]);
     expect(h.notices).toEqual([]);
   });
 
