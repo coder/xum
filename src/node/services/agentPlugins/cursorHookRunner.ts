@@ -298,7 +298,7 @@ async function startAndRead(
     model: call.model,
     hook_event_name: hook.event,
     cursor_version: registration.cursorVersion,
-    workspace_roots: registration.deps.workspaceRoots?.(call.workspaceRoot) ?? [call.workspaceRoot],
+    workspace_roots: workspaceRootsOf(registration, call.workspaceRoot),
     user_email: null,
     transcript_path: registration.transcriptPath,
     ...eventFields,
@@ -424,6 +424,11 @@ async function settledBy<T>(promise: Promise<T>, ms: number): Promise<T | undefi
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Each project's folder in a multi-project workspace (the deps know them), else the call's. */
+function workspaceRootsOf(registration: CursorHookRegistration, cwd: string): string[] {
+  return registration.deps.workspaceRoots?.(cwd) ?? [cwd];
 }
 
 async function writeInput(
