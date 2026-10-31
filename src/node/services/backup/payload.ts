@@ -3441,10 +3441,7 @@ export function matchedProjectWrites(
   }));
 }
 
-/**
- * Drops each matched file whose local destination `findSymlinkedDestinations` skips. The
- * entries themselves stay: a restore checks them against the validated match keys.
- */
+/** Drops each matched file whose local destination `findSymlinkedDestinations` skips. */
 export async function omitSymlinkedProjectMemory(
   muxRoot: string,
   matched: readonly MatchedProjectEntry[],
