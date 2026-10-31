@@ -277,7 +277,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     );
   }
 
-  async function buildPayload(contents: BackupContents, overrides?: { keepLocalSecrets: true }) {
+  async function buildPayload(
+    contents: BackupContents,
+    overrides?: { keepLocalSecrets: true; followSkillLinks: false }
+  ) {
     return await createBackupPayload({
       muxRoot,
       contents,
@@ -286,6 +289,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       sourceLabel: path.basename(muxRoot),
       // The service owns the user-facing override, so report rather than throw.
       reportSecrets: true,
+      followSkillLinks: true,
       ...overrides,
     });
   }
@@ -653,7 +657,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const { localOnly, overwritten } = await localOnlyPayloadFiles(
         muxRoot,
         local.keys(),
-        restoredPaths
+        restoredPaths,
+        new Set(symlinkSkipped)
       );
       const changes: BackupFileChange[] = [];
       for (const file of payload.files) {
@@ -811,7 +816,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // write, so nothing can edit a file between its snapshot bytes and its overwrite.
       await writeBackupPayload(
         snapshotRoot,
-        await buildPayload(contents, { keepLocalSecrets: true }),
+        await buildPayload(contents, { keepLocalSecrets: true, followSkillLinks: false }),
         { portable: false, ownerOnly: true }
       );
     },
@@ -833,6 +838,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           muxRoot,
           contents,
           payload,
+          symlinkSkipped,
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         if (result.backupPreferences !== undefined) {
