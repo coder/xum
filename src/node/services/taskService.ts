@@ -1293,7 +1293,15 @@ interface TaskLaunchState {
   sendAdmitted: boolean;
 }
 
-/** A direct launch whose first send create's locked steps admitted and started. */
+/** A direct launch's first send, started under create's locks (see dispatchTaskLaunchPrompt). */
+interface TaskLaunchDispatch {
+  /** Never rejects. */
+  readonly send: Promise<Result<void, string | SendMessageError>>;
+  /** Resolves once the session admits the send's turn; never for a send refused before that. */
+  readonly admitted: Promise<void>;
+}
+
+/** A direct launch whose first send's turn was admitted before create released its locks. */
 interface DispatchedTaskLaunch {
   readonly plan: TaskCreatePlan;
   readonly launch: TaskLaunchState;
@@ -1301,6 +1309,18 @@ interface DispatchedTaskLaunch {
   /** Never rejects. */
   readonly send: Promise<Result<void, string | SendMessageError>>;
   readonly releaseWaiters: () => void;
+}
+
+/** create's result for a direct launch whose first send succeeded. */
+function launchedTaskCreateResult(plan: TaskCreatePlan): Result<TaskCreateResult, string> {
+  return Ok({
+    taskId: plan.taskId,
+    kind: "agent",
+    status: "running",
+    modelString: plan.taskModelString,
+    thinkingLevel: plan.effectiveThinkingLevel,
+    desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? plan.taskId,
+  });
 }
 
 type TaskCreateOutcome =
@@ -8857,9 +8877,9 @@ export class TaskService implements AgentTaskIntegration {
     const outcome = await this.withTaskTreeLifecycleLock(parentWorkspaceId, async () =>
       this.createUnderTaskTreeLifecycleLock(args, parentWorkspaceId)
     );
-    // A direct launch's first send was admitted and started under both locks. Its pre-stream
-    // preparation (seconds) runs here, after they were released, so it holds up no other spawn,
-    // Stop or queue drain.
+    // A direct launch's first send started under both locks, which stayed held until the session
+    // admitted its turn. The rest of its pre-stream preparation (seconds) runs here, after both
+    // were released, so it holds up no other spawn, Stop or queue drain.
     return "dispatched" in outcome
       ? await this.awaitDispatchedTaskLaunch(outcome.dispatched)
       : outcome;
@@ -9683,18 +9703,46 @@ export class TaskService implements AgentTaskIntegration {
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
-    const send = this.dispatchTaskLaunchPrompt(plan, launch);
-    if (!send.success) {
-      await this.failTaskLaunch(plan, launch, send.error, checkout.runtimeForTaskWorkspace, {
-        preservePhysicalWorkspace: plan.useSharedWorkspace,
-      });
-      return Err(send.error);
+    return this.releaseOnTaskLaunchAdmission(
+      plan,
+      launch,
+      checkout,
+      this.dispatchTaskLaunchPrompt(plan, launch)
+    );
+  }
+
+  /**
+   * Holds create's locks until the session admits the brief's turn (its rows are durable in
+   * history by then) or the send settles. A Stop queued on the locks then finds the brief in
+   * history, as when create held them through the whole send: a direct row keeps no taskPrompt
+   * that a resume could replay.
+   */
+  private async releaseOnTaskLaunchAdmission(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout,
+    dispatch: TaskLaunchDispatch
+  ): Promise<TaskCreateOutcome> {
+    const settled = await Promise.race([dispatch.admitted.then(() => undefined), dispatch.send]);
+    if (settled === undefined) {
+      const waiters = Promise.withResolvers<void>();
+      this.inFlightFirstSends.set(plan.taskId, waiters.promise);
+      return {
+        dispatched: {
+          plan,
+          launch,
+          checkout,
+          send: dispatch.send,
+          releaseWaiters: waiters.resolve,
+        },
+      };
     }
-    const waiters = Promise.withResolvers<void>();
-    this.inFlightFirstSends.set(taskId, waiters.promise);
-    return {
-      dispatched: { plan, launch, checkout, send: send.data, releaseWaiters: waiters.resolve },
-    };
+    if (settled.success) return launchedTaskCreateResult(plan);
+    const message = launchSendErrorMessage(settled.error);
+    await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
+      preservePhysicalWorkspace: plan.useSharedWorkspace,
+    });
+    return Err(message);
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
@@ -9737,12 +9785,12 @@ export class TaskService implements AgentTaskIntegration {
    * purpose: the admission and the send's synchronous entry, which takes its place ahead of any
    * later send into the task and captures the session's stop generation, must run before create
    * releases its locks. So a user Stop of the task refuses the brief even after the Stop's latch
-   * dropped.
+   * dropped. A refused admission is a send that already failed.
    */
   private dispatchTaskLaunchPrompt(
     plan: TaskCreatePlan,
     launch: TaskLaunchState
-  ): Result<Promise<Result<void, string | SendMessageError>>, string> {
+  ): TaskLaunchDispatch {
     const { taskId } = plan;
     assert(launch.launchAttempt != null, "the first send runs once the launch owns its attempt");
     // Start immediately (counts towards parallel limit). Launch fence, as in startReservedAgentTask:
@@ -9759,11 +9807,22 @@ export class TaskService implements AgentTaskIntegration {
       expectedAttemptId: launch.attemptId,
     });
     launch.sendAdmitted = admission.kind === "admitted";
+    const admitted = Promise.withResolvers<void>();
     if (admission.kind !== "admitted") {
-      return Err(launchAdmissionRefusalMessage(admission));
+      return {
+        send: Promise.resolve(Err(launchAdmissionRefusalMessage(admission))),
+        admitted: admitted.promise,
+      };
     }
-    return Ok(
-      this.workspaceService
+    const token: TurnAdmissionToken = {
+      ...admission.token,
+      onAdmitted: (turnId) => {
+        admission.token.onAdmitted(turnId);
+        admitted.resolve();
+      },
+    };
+    return {
+      send: this.workspaceService
         .sendMessage(
           taskId,
           plan.prompt,
@@ -9776,12 +9835,13 @@ export class TaskService implements AgentTaskIntegration {
           {
             acceptanceOrigin: "automatic",
             agentInitiated: true,
-            turnAdmission: admission.token,
-            admissionStale: () => admission.token.admissionStale(),
+            turnAdmission: token,
+            admissionStale: () => token.admissionStale(),
           }
         )
-        .catch((error: unknown) => Err(getErrorMessage(error)))
-    );
+        .catch((error: unknown) => Err(getErrorMessage(error))),
+      admitted: admitted.promise,
+    };
   }
 
   /** Awaits a dispatched first send once create released its locks, and fails the launch on Err. */
@@ -9807,14 +9867,7 @@ export class TaskService implements AgentTaskIntegration {
         this.scheduleMaybeStartQueuedTasks();
         return Err(message);
       }
-      return Ok({
-        taskId,
-        kind: "agent",
-        status: "running",
-        modelString: plan.taskModelString,
-        thinkingLevel: plan.effectiveThinkingLevel,
-        desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
-      });
+      return launchedTaskCreateResult(plan);
     } finally {
       this.inFlightFirstSends.delete(taskId);
       dispatched.releaseWaiters();

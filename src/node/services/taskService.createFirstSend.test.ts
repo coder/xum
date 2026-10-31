@@ -1,11 +1,11 @@
-// TaskService.create sends a direct launch's first prompt after releasing the task-tree lock and
-// the global mutex: concurrent spawns overlap their first sends, and Stops, failures and the
-// child's own lifecycle operations behave as when the send held both locks.
+// TaskService.create holds the task-tree lock and the global mutex until the session admits a
+// direct launch's first turn, then lets the rest of that send run after releasing them:
+// concurrent spawns overlap their first sends, and Stops, failures and the child's own lifecycle
+// operations behave as when the send held both locks.
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
 import type { SendMessageError } from "@/common/types/errors";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { SEND_ADMISSION_STALE_MESSAGE } from "@/constants/agentMessaging";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
@@ -38,6 +38,8 @@ const SIBLING = "bbbbbbbbb1";
 const QUEUED = "ccccccccc1";
 const GATE_MS = 1_000;
 const OVERLAP_WAIT_MS = 3_000;
+// How long a probe waits for an operation that must not run before the brief's turn is admitted.
+const ADMISSION_PROBE_MS = 200;
 
 type SendMock = (
   workspaceId: string,
@@ -71,10 +73,9 @@ async function withinGate<T>(what: string, promise: Promise<T>): Promise<T> {
   }
 }
 
-function sessionGate(internal: Parameters<SendMock>[3]): Result<void, SendMessageError> {
-  return internal?.admissionStale?.() === true
-    ? Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
-    : Ok(undefined);
+/** The session admits the send's turn, as AgentSession does once the brief's rows are durable. */
+function admitTurn(internal: Parameters<SendMock>[3]): void {
+  internal?.turnAdmission?.onAdmitted(Symbol("turn"));
 }
 
 async function failureNotices(historyService: HistoryService, parentId: string) {
@@ -151,7 +152,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
     async (_, parents) => {
       const sends: Array<{ startedAt: number; endedAt: number }> = [];
       let started = 0;
-      const { taskService } = await setup(async () => {
+      const { taskService } = await setup(async (_workspaceId, _message, _options, internal) => {
+        admitTurn(internal);
         const startedAt = performance.now();
         started++;
         // Each send lasts until every send started (bounded), so the sends overlap unless a
@@ -178,11 +180,17 @@ describe("TaskService.create: the first send runs after the create locks are rel
     4 * OVERLAP_WAIT_MS
   );
 
-  test("a parent Stop issued while the create holds its locks refuses the brief it captured", async () => {
+  test("a parent Stop issued while the create holds its locks waits until the brief's turn is admitted", async () => {
     let stopping: Promise<string[]> | undefined;
+    let latchedBeforeAdmission: boolean | undefined;
     const harness = await setup(async (workspaceId, _message, _options, internal) => {
-      await waitFor(() => harness.taskService.isWorkspaceStopInProgress(workspaceId));
-      return sessionGate(internal);
+      // A Stop that did not wait for create's locks would latch the child here.
+      latchedBeforeAdmission = await waitFor(
+        () => harness.taskService.isWorkspaceStopInProgress(workspaceId),
+        ADMISSION_PROBE_MS
+      );
+      admitTurn(internal);
+      return Ok(undefined);
     });
     const { taskService } = harness;
     const svc = internals(taskService);
@@ -195,44 +203,73 @@ describe("TaskService.create: the first send runs after the create locks are rel
 
     const created = await createAgentTask(taskService, PARENT_A, "go");
 
-    expect(created).toEqual(Err(SEND_ADMISSION_STALE_MESSAGE));
+    expect(latchedBeforeAdmission).toBe(false);
+    expect(created).toMatchObject({ success: true, data: { status: "running" } });
     expect(await stopping).toEqual([CHILD]);
-    expect(row(CHILD)).toMatchObject({
-      taskStatus: "interrupted",
-      taskLaunchError: SEND_ADMISSION_STALE_MESSAGE,
-    });
-    expect(svc.attemptLedger.attemptSettlementByTaskId.get(CHILD)?.phase).toBe("settled");
+    expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted" });
   });
 
-  test("a parent Stop during the brief's preparation refuses it", async () => {
-    const entered = Promise.withResolvers<void>();
-    const harness = await setup(async (workspaceId, _message, _options, internal) => {
-      entered.resolve();
-      await waitFor(() => harness.taskService.isWorkspaceStopInProgress(workspaceId));
-      return sessionGate(internal);
+  test("a parent Stop during the brief's preparation does not wait for it", async () => {
+    const preparing = Promise.withResolvers<void>();
+    const finishPreparation = Promise.withResolvers<void>();
+    const { taskService } = await setup(async (_workspaceId, _message, _options, internal) => {
+      admitTurn(internal);
+      preparing.resolve();
+      await finishPreparation.promise;
+      return Ok(undefined);
     });
-    const { taskService } = harness;
+
+    const creating = createAgentTask(taskService, PARENT_A, "go");
+    try {
+      await preparing.promise;
+      expect(
+        await withinGate("the parent Stop", taskService.terminateAllDescendantAgentTasks(PARENT_A))
+      ).toEqual([CHILD]);
+      expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted" });
+    } finally {
+      finishPreparation.resolve();
+    }
+    expect((await creating).success).toBe(true);
+  });
+
+  test("a first send that fails before its turn is admitted fails the launch under create's locks", async () => {
+    const entered = Promise.withResolvers<void>();
+    const failSend = Promise.withResolvers<void>();
+    const { taskService } = await setup(async () => {
+      entered.resolve();
+      await failSend.promise;
+      return Err({ type: "unknown", raw: "provider unavailable" });
+    });
 
     const creating = createAgentTask(taskService, PARENT_A, "go");
     await entered.promise;
-    const stopping = taskService.terminateAllDescendantAgentTasks(PARENT_A);
+    const lock = taskService.acquireTaskCreationLock();
+    const lockedBeforeAdmission = await Promise.race([
+      lock.then(() => true),
+      sleep(ADMISSION_PROBE_MS).then(() => false),
+    ]);
+    failSend.resolve();
 
-    expect(await creating).toEqual(Err(SEND_ADMISSION_STALE_MESSAGE));
-    expect(await stopping).toEqual([CHILD]);
-    expect(row(CHILD)).toMatchObject({ taskStatus: "interrupted" });
-    expect(internals(taskService).attemptLedger.attemptSettlementByTaskId.get(CHILD)?.phase).toBe(
-      "settled"
-    );
+    expect(lockedBeforeAdmission).toBe(false);
+    expect(await creating).toEqual(Err("provider unavailable"));
+    await (await lock)[Symbol.asyncDispose]();
+    expect(row(CHILD)).toMatchObject({
+      taskStatus: "interrupted",
+      taskLaunchError: "provider unavailable",
+    });
   });
 
   test("a first send that fails after the release reaches the parent only through create's result", async () => {
     const entered = Promise.withResolvers<void>();
     const failSend = Promise.withResolvers<void>();
-    const { taskService, historyService, workspaceTurnManager } = await setup(async () => {
-      entered.resolve();
-      await failSend.promise;
-      return Err({ type: "unknown", raw: "provider unavailable" });
-    });
+    const { taskService, historyService, workspaceTurnManager } = await setup(
+      async (_workspaceId, _message, _options, internal) => {
+        admitTurn(internal);
+        entered.resolve();
+        await failSend.promise;
+        return Err({ type: "unknown", raw: "provider unavailable" });
+      }
+    );
     const wakes = spyOn(taskService, "enqueueTerminalAttention");
     const settlements = internals(taskService).attemptLedger.attemptSettlementByTaskId;
 
@@ -281,7 +318,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
     const failSend = Promise.withResolvers<void>();
     let queuedSent = false;
     const { taskService } = await setup(
-      async (workspaceId) => {
+      async (workspaceId, _message, _options, internal) => {
+        admitTurn(internal);
         if (workspaceId === queued) {
           queuedSent = true;
           return Ok(undefined);
@@ -321,7 +359,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
     let briefDone = false;
     let queuedSent = false;
     const { taskService } = await setup(
-      async (workspaceId) => {
+      async (workspaceId, _message, _options, internal) => {
+        admitTurn(internal);
         if (workspaceId === QUEUED) {
           queuedSent = true;
           return Ok(undefined);
@@ -377,7 +416,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
     const finishBrief = Promise.withResolvers<void>();
     let briefDone = false;
     const order: string[] = [];
-    const { taskService } = await setup(async (workspaceId) => {
+    const { taskService } = await setup(async (workspaceId, _message, _options, internal) => {
+      admitTurn(internal);
       if (workspaceId === CHILD) {
         await finishBrief.promise;
         briefDone = true;
