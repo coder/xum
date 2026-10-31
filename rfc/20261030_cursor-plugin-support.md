@@ -1370,7 +1370,10 @@ code and this list are correct.
     `claude-marketplace` marker.
 *   PR 3: `placement` is dropped like `auth`. Every `${...}` that Xum does not
     expand counts as needs values, `${env:NAME}` and a data-folder `cwd`
-    included. Each server skipped for needs values, and each dropped `auth` or
+    included. In a Cursor package only `${CURSOR_PLUGIN_ROOT}` and
+    `${CLAUDE_PLUGIN_ROOT}` expand, so `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`
+    also count as needs values (D29). Each server skipped for needs values, and
+    each dropped `auth` or
     `placement`, is a `notApplied` entry. A Cursor package without
     `mcpServers` reads only `mcp.json`. On cursor/plugins at `4dd1d05818`, 89
     servers load, 14 need values and 1 is refused for a static header. The
@@ -1392,6 +1395,19 @@ code and this list are correct.
     plugin-supplied string that the file review, the hooks panel, its warnings
     and the exit-127 notice show. An update that changes a hook command, or a
     file that a hook runs, never applies without review.
+*   PR 8, trust: the first trust of a hook in a plugin with no trusted hook
+    shows every file, and the trust needs a digest of those rows (each file's
+    content hash and mode). A trust record gains an optional `reviewedSha`, the
+    commit the user reviewed. A trust whose `reviewedSha` does not match the
+    installed commit, or that has none, reads "changed" and does not run until
+    the full review is shown again. The gate decides trust after its last
+    await. Hooks that the parser drops are `notApplied` entries.
+    `workspace_roots` holds each project's root in a local multi-project
+    workspace. The trust prompt says the hook runs a shell command on this
+    computer as the user, without a sandbox.
+*   PR 8, accepted risks: a script edited on disk outside an update runs
+    unreviewed (D1). A trust revoked while `runtime.exec` checks its folder can
+    still start that one process.
 
 ### PR 1: Cursor manifest reader, rules as skills, agent prompt
 
