@@ -8862,9 +8862,6 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     hooks: { preToolUse: [{ command: "bash hooks/stop.sh" }] },
   });
   const BASE_FILES: Record<string, string> = {
-    // A schema-less root plugin.json yields to the Cursor manifest (D21) and gives the install
-    // method agent-plugin.
-    "plugin.json": JSON.stringify({ name: "looper" }),
     ".cursor-plugin/plugin.json": JSON.stringify({ name: "looper" }),
     "hooks/hooks.json": RUNNABLE_HOOKS,
     "hooks/stop.sh": "#!/bin/bash\nsource hooks/lib.sh\n",

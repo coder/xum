@@ -28,7 +28,9 @@ import type {
   AgentPluginMarketplaceListing,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginNotApplied,
   AgentPluginPendingSignOuts,
+  AgentPluginRuleType,
   AgentPluginUpdateCheck,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
@@ -200,6 +202,20 @@ const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) =>
   );
 };
 
+/**
+ * The label of a skill that Xum made from a Cursor rule. Xum loads every rule as a skill, so the
+ * label says where that differs from Cursor.
+ */
+const RULE_TYPE_LABEL: Record<AgentPluginRuleType, string> = {
+  "always-apply": "always-apply rule, loaded on request in Xum",
+  description: "rule",
+  glob: "glob rule, not attached by file in Xum",
+  manual: "manual rule",
+};
+
+const RuleTypeLabel: React.FC<{ ruleType?: AgentPluginRuleType }> = (props) =>
+  props.ruleType ? <span className="text-muted"> — {RULE_TYPE_LABEL[props.ruleType]}</span> : null;
+
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
@@ -217,11 +233,13 @@ const ComponentChooser: React.FC<{
               name: skill.name,
               detail: skill.description,
               directives: skill.directives,
+              ruleType: skill.ruleType,
             }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
               directives: undefined,
+              ruleType: undefined,
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -259,7 +277,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail, directives }) => (
+          {entries.map(({ name, detail, directives, ruleType }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -275,6 +293,7 @@ const ComponentChooser: React.FC<{
               />
               <span className="min-w-0 break-words">
                 <span className="text-foreground font-mono break-all">{name}</span>
+                <RuleTypeLabel ruleType={ruleType} />
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
                 {/* Prose wraps between words. break-words still splits an unbroken URL or path
                     that cannot fit, so nothing scrolls sideways at phone width. */}
@@ -641,7 +660,7 @@ const AddPluginPanel: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
-  /** A Claude Code marketplace repository: the user picks an entry, then previews it. */
+  /** A marketplace repository: the user picks an entry, then previews it. */
   const [marketplace, setMarketplace] = useState<AgentPluginMarketplaceListing | null>(null);
   const [selected, setSelected] = useState<AgentPluginImportedComponents>({
     skills: [],
@@ -675,7 +694,7 @@ const AddPluginPanel: React.FC<{
       } else {
         const next = result.data.preview;
         setPreview(next);
-        setPreviewedEntry(method?.kind === "claude-marketplace" ? method.entry : null);
+        setPreviewedEntry(method !== null && "entry" in method ? method.entry : null);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
           skills: next.skills.map((skill) => skill.name),
@@ -741,7 +760,7 @@ const AddPluginPanel: React.FC<{
             setError(null);
           }}
           onPickEntry={() => setError(null)}
-          onPreviewEntry={(entry) => void handlePreview({ kind: "claude-marketplace", entry })}
+          onPreviewEntry={(selector) => void handlePreview(selector)}
           onPickMethod={(method) => void handlePreview(method)}
         />
       ) : preview === null ? (
@@ -1056,6 +1075,29 @@ const PreviewConsent: React.FC<{
   );
 };
 
+const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; className?: string }> = (
+  props
+) => {
+  if (props.items === undefined || props.items.length === 0) return null;
+  return (
+    <div className={props.className}>
+      <h4 className="text-foreground mb-1 text-xs font-medium">
+        Not applied in Xum ({props.items.length})
+      </h4>
+      <ul className="space-y-0.5">
+        {props.items.map((item, index) => (
+          <li key={index} className="min-w-0 text-xs break-words">
+            <span className="text-foreground">
+              {item.part} <span className="font-mono">{item.name}</span>
+            </span>
+            <span className="text-muted">: {item.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
 const PreviewDisclosures: React.FC<{
   preview: AgentPluginInstallPreview;
@@ -1070,9 +1112,15 @@ const PreviewDisclosures: React.FC<{
         {/* Activatable components: consent must name everything that
             becomes available after install, not just skills/MCP. */}
         <p className="text-xs">
-          <span className="text-foreground font-mono break-all">
-            {props.preview.agents.join(", ")}
-          </span>{" "}
+          {props.preview.agents.map((agent, index) => (
+            <React.Fragment key={agent}>
+              {index > 0 && ", "}
+              <span className="text-foreground font-mono break-all">{agent}</span>
+              {props.preview.readonlyAgents.includes(agent) && (
+                <span className="text-muted"> (edit tools removed, shell still available)</span>
+              )}
+            </React.Fragment>
+          ))}{" "}
           <span className="text-muted">
             — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
             such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
@@ -1158,6 +1206,8 @@ const PreviewDisclosures: React.FC<{
         </ul>
       </div>
     )}
+
+    <NotAppliedList items={props.preview.notApplied} />
   </>
 );
 
@@ -1422,6 +1472,7 @@ const UpdateReviewPanel: React.FC<{
           ))}
         </div>
       )}
+      <NotAppliedList items={props.review.notApplied} />
       <p className="text-muted text-[11px] break-all">{copy.commits(props.review)}</p>
       {mustExpand.length > 0 && (
         <p className="text-warning text-xs">
@@ -2195,6 +2246,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       </p>
                     )}
                   </div>
+                  <NotAppliedList items={item.notApplied} className="mt-2" />
                   {check?.status === "error" && check.message && (
                     <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
                       <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />

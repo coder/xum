@@ -33,8 +33,14 @@ const listing: AgentPluginMarketplaceListing = {
   source,
   lockedSha: "a".repeat(40),
   entries: [
-    { name: "first", sourceKind: "relative", source: "./first", installable: true },
-    { name: "remote", sourceKind: "github", source: "acme/tools", installable: true },
+    {
+      name: "first",
+      builds: [{ file: "claude", sourceKind: "relative", source: "./first", installable: true }],
+    },
+    {
+      name: "remote",
+      builds: [{ file: "claude", sourceKind: "github", source: "acme/tools", installable: true }],
+    },
   ],
   methods: [],
   warnings: [],
@@ -52,12 +58,14 @@ const remotePreview: AgentPluginInstallPreview = {
   skills: [{ name: "pdf", description: "The pdf skill." }],
   mcpServers: [],
   agents: [],
+  readonlyAgents: [],
   workflows: [],
   slashCommands: [],
   reviewedComponents: [],
   codexHooks: [],
   fileChanges: [],
   warnings: [],
+  notApplied: [],
   consentDigest: "c".repeat(64),
 };
 
@@ -94,4 +102,54 @@ test("an entry preview focuses Back and offers no Skills CLI; Back focuses the p
   const remote = await view.findByRole("radio", { name: /remote/ });
   expect((remote as HTMLInputElement).checked).toBe(true);
   await waitFor(() => expect(document.activeElement).toBe(remote));
+});
+
+test("Back from a Cursor build preview picks the same row; the preview offers no Skills CLI", async () => {
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [],
+      marketplace: {
+        ...listing,
+        entries: [
+          listing.entries[0],
+          {
+            name: "pstack",
+            builds: [
+              { file: "cursor", sourceKind: "relative", source: "pstack", installable: true },
+              { file: "claude", sourceKind: "relative", source: "./claude", installable: true },
+            ],
+          },
+        ],
+      },
+      // The mock answers a cursor-marketplace selector by its kind, a Claude entry by its name.
+      previewsByMethod: {
+        "cursor-marketplace": {
+          ...remotePreview,
+          source: { ...source, subpath: "pstack" },
+          method: { kind: "cursor-plugin" },
+          methods: [{ kind: "cursor-plugin" }],
+          manifest: { name: "pstack", description: "The Cursor build of pstack" },
+        },
+      },
+    },
+  });
+  const view = render(
+    <APIProvider client={api}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+  fireEvent.click(await view.findByRole("button", { name: /Add plugin/ }));
+  await userEvent.type(await view.findByLabelText(/Git URL or owner\/repo/), "acme/market");
+  fireEvent.click(view.getByRole("button", { name: "Preview" }));
+  fireEvent.click(await view.findByRole("radio", { name: /pstack/ }));
+  fireEvent.click(view.getByRole("button", { name: "Preview Cursor build" }));
+
+  await view.findByText("The Cursor build of pstack");
+  expect(view.queryByRole("radio", { name: "Skills CLI" })).toBeNull();
+
+  fireEvent.click(view.getByRole("button", { name: /Back/ }));
+  const pstack = await view.findByRole("radio", { name: /pstack/ });
+  expect((pstack as HTMLInputElement).checked).toBe(true);
 });

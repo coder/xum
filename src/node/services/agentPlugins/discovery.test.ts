@@ -2523,6 +2523,31 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test.each([
+    ["prompts.chat", "prompts-chat"],
+    ["foo.-bar", "foo-bar"],
+    ["a.-.b", "a-b"],
+  ])("a %s plugin's root skill is named %s", async (pluginName, skillName) => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: pluginName }),
+      "SKILL.md": skill(skillName),
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: skillName },
+    ]);
+  });
+
+  test("a skills entry that is not a folder leaves the root skill on", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      skills: "not a folder\n",
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: "kit" },
+    ]);
+  });
+
   test("agents in .mdc and .markdown files are listed; .md agents load", async () => {
     const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nBody\n`;
     using kit = await discoverKit({
