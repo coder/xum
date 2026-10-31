@@ -101,6 +101,7 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("label");
   });
 
+  const SVG = "http://www.w3.org/2000/svg";
   const XHTML = "http://www.w3.org/1999/xhtml";
   const MATHML = "http://www.w3.org/1998/Math/MathML";
   const MATH = `<math xmlns="${MATHML}" display="block"><semantics><msup><mi>x</mi><mn>2</mn></msup><annotation encoding="application/x-tex">x^2</annotation></semantics></math>`;
@@ -176,13 +177,35 @@ describe("sanitizeMermaidSvg", () => {
     // The HTML parser ends the <svg> at an SVG-namespace <p>, so the <link> after it loads.
     ["an SVG p before a link", '<p/><link rel="stylesheet" href="https://example.com/x.css"/>'],
     ["an unknown element", "<unknown><text>label</text></unknown>"],
+    // Pele writes no namespace prefix. The HTML parser knows no s:foreignobject, so a serializer
+    // that keeps the prefix lets the label's div leave the <svg>.
+    ["a prefixed element", `<s:rect xmlns:s="${SVG}" width="5"/>`],
+    [
+      "a prefixed math label",
+      peleMathLabel()
+        .replaceAll("foreignObject", "s:foreignObject")
+        .replace("<s:foreignObject", `<s:foreignObject xmlns:s="${SVG}"`),
+    ],
+    [
+      "a math label with a prefixed wrapper",
+      peleMathLabel()
+        .replace("<foreignObject", `<foreignObject xmlns:h="${XHTML}"`)
+        .replace("<div", "<h:div")
+        .replace("</div>", "</h:div>"),
+    ],
+    [
+      "a math label with a prefixed MathML element",
+      peleMathLabel(MATH.replace("<mi>x</mi>", `<m:mi xmlns:m="${MATHML}">x</m:mi>`)),
+    ],
   ])("removes %s", (_case, label) => {
     const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX) ?? "";
     const injected = ["#comment", "img", "style", "a", "set", "animate", "p", "link", "unknown"];
 
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toMatch(/<!--|<\?|<!\[CDATA\[|javascript:/);
-    expect(htmlNodeNames(sanitized).filter((name) => injected.includes(name))).toEqual([]);
+    expect(
+      htmlNodeNames(sanitized).filter((name) => injected.includes(name) || name.includes(":"))
+    ).toEqual([]);
   });
 
   // Inserted without the sanitizer, every payload but the gradient hrefs, cross-fade(), @import,
@@ -236,6 +259,33 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitizeMermaidSvg(svgRoot(`style="mask:url(${REMOTE})"`), ID_PREFIX)).not.toContain(
       "style="
     );
+  });
+
+  // A ; inside a quoted string does not end the declaration. Chromium reads a string that the
+  // sanitizer cut open to the end of the attribute, so fill:red would be lost.
+  it.each([
+    ["single", `font-family:'a;background:url(${REMOTE})';fill:red`],
+    ["double", `font-family:&quot;a;background:url(${REMOTE})&quot;;fill:red`],
+  ])("removes a declaration with a %s-quoted ;", (_case, style) => {
+    const sanitized = sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain('<rect style="fill:red"');
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([
+      "<rect> style fill:red",
+    ]);
+  });
+
+  it("keeps an id list with whitespace around its ids", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgRoot(`aria-describedby=" mermaid-r1-desc " aria-labelledby=" "`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain('aria-describedby=" mermaid-r1-desc "');
+    expect(htmlParts(sanitized).filter((part) => part.includes("aria-"))).toEqual([
+      '<svg> aria-describedby=" mermaid-r1-desc "',
+    ]);
   });
 
   it("keeps a url(#id) attribute but no url() declaration", () => {
