@@ -398,7 +398,12 @@ const HookDecisionNotes: React.FC<HookDecisionProps> = (props) => {
         </p>
       )}
       {props.hook.handler.type === "cursor-command" && (
-        <p className="text-muted">Once trusted, this hook runs a command in your workspace.</p>
+        // The process has the user's access and HOME, and two events run in the plugin folder:
+        // "in your workspace" understated what the user consents to (Codex review).
+        <p className="text-muted">
+          Once trusted, this hook runs a shell command on this computer as you, without a sandbox.
+          It can read and change any file you can.
+        </p>
       )}
     </>
   );

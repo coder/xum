@@ -163,7 +163,7 @@ describe("PluginHooksPanel with Cursor hooks", () => {
 
     const trust = await view.findByRole("button", { name: /^Trust / });
     expect(trust.hasAttribute("disabled")).toBe(false);
-    view.getByText(/runs a command in your workspace/);
+    view.getByText(/runs a shell command on this computer as you, without a sandbox/);
     view.getByText(/does not run in remote workspaces/i);
   });
 
