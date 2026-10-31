@@ -7,12 +7,10 @@
  * reads the trust store and the plugin and project state at that moment, never a snapshot from
  * turn start, so a revoke, an uninstall or an untrusted project stops the next call.
  *
- * Failure rule: every event fails OPEN. An error, a timeout, a missing server or a malformed
- * output never blocks anything; Xum logs a warning and continues. The brief proposed failing
- * PreToolUse closed, but Codex documents the opposite ("Errors, missing servers, and unavailable
- * tools don't block the operation"; a PreToolUse "error, timeout, or malformed response can fail
- * the hook without blocking the tool"), and the brief says to follow Codex where they differ.
- * Only an explicit deny or block decision blocks.
+ * Failure rule: every event fails OPEN, with one exception: a PreToolUse output that is malformed
+ * or fails its schema check blocks the call (Cursor plugin RFC, D8). An updatedInput that fails
+ * the tool's schema also blocks (blockRewrite), as does an input too large for the hook to check
+ * (inputTooLarge).
  *
  * Within one plugin, matching hooks run one after another in declaration order (Codex launches
  * them concurrently). Plugins run in discovery order (spine `order`), except PostToolUse: it runs
@@ -196,12 +194,21 @@ async function runToolHooks(
     inputTooLarge: {
       denyReason: `the call is too large for the hook to check (its input is over ${HOOK_INPUT_MAX_CHARS} characters)`,
     } satisfies PreToolUseOutput,
+    malformed: (detail: string): PreToolUseOutput => {
+      const denyReason = `its output is malformed: ${detail}`;
+      // Without this line a broken guard looks like a stalled agent. The toast adds the plugin name.
+      registration.deps.notifyUser(
+        `hook PreToolUse blocked this call (${denyReason}). Turn the hook off in Settings > Plugins.`
+      );
+      return { denyReason };
+    },
   };
   // Codex names and fields (Bash, mcp__<server>__<tool>, tool_input.command), so a Codex
   // hooks.json works without edits. Xum's own names and fields stay available too.
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
   const toolEvent = () => ({
     ...turnFields(ctx),
+    // mutation-equivalent: codexName is "Bash", an mcp__ name or undefined, never "".
     tool_name: view.codexName ?? ctx.toolName,
     tool_input: view.toCodexInput(ctx.args),
   });
@@ -497,9 +504,14 @@ async function invoke<T extends { systemMessage?: string; invalid?: string }>(
   parse: (result: unknown) => T | null,
   /**
    * Tool calls: the session cwd (a Codex common field) and the tool's abort signal. PreToolUse
-   * also passes the decision for an input too large to send.
+   * also passes the decisions for an input too large to send and for a malformed output.
    */
-  call: { cwd?: string; abortSignal?: AbortSignal; inputTooLarge?: T } = {}
+  call: {
+    cwd?: string;
+    abortSignal?: AbortSignal;
+    inputTooLarge?: T;
+    malformed?: (detail: string) => T;
+  } = {}
 ): Promise<T | null> {
   const handler = hook.handler;
   if (handler.type !== "mcp_tool") return null;
@@ -517,11 +529,13 @@ async function invoke<T extends { systemMessage?: string; invalid?: string }>(
     const onAbort = () =>
       reject(new Error(timeout.signal.aborted ? `timed out after ${seconds}s` : "interrupted"));
     if (signal.aborted) onAbort();
+    // mutation-equivalent: an AbortSignal dispatches "abort" once, so `once` changes no behavior.
     else signal.addEventListener("abort", onAbort, { once: true });
   });
   // Unobserved until a race below awaits it; a rejection must not surface as unhandled.
   ended.catch(() => undefined);
-  // Everything below fails open, the trust gate included (it reads stores that can fail).
+  // Everything below fails open, the trust gate included (it reads stores that can fail), except a
+  // malformed output when `call.malformed` is set (applyOutput).
   try {
     if (!(await Promise.race([registration.deps.isHookAllowed(hook), ended]))) return null;
     const event = {
@@ -553,7 +567,7 @@ async function invoke<T extends { systemMessage?: string; invalid?: string }>(
       }),
       ended,
     ]);
-    return applyOutput(parse(result), registration, hook);
+    return applyOutput(result, parse, registration, hook, call.malformed);
   } catch (error) {
     warn(registration, hook, `failed (${getErrorMessage(error)}); continuing without it`);
     return null;
@@ -563,16 +577,40 @@ async function invoke<T extends { systemMessage?: string; invalid?: string }>(
 }
 
 function applyOutput<T extends { systemMessage?: string; invalid?: string }>(
-  output: T | null,
+  result: unknown,
+  parse: (result: unknown) => T | null,
   registration: CodexHookRegistration,
-  hook: PluginHookDefinition
+  hook: PluginHookDefinition,
+  malformed: ((detail: string) => T) | undefined
 ): T | null {
+  // A tool error (isError) is the hook failing, not a malformed output: it fails open like a
+  // timeout, PreToolUse included.
+  const onMalformed = isPlainObject(result) && result.isError === true ? undefined : malformed;
+  let output: T | null;
+  try {
+    output = parse(result);
+  } catch (error) {
+    return rejectOutput(getErrorMessage(error), registration, hook, onMalformed);
+  }
   if (output === null) return null;
   // Codex shows systemMessage even when the rest of the output breaks a rule.
   if (output.systemMessage !== undefined) registration.deps.notifyUser(output.systemMessage);
   if (output.invalid === undefined) return output;
-  warn(registration, hook, `${output.invalid}; ignoring its output`);
-  return null;
+  return rejectOutput(output.invalid, registration, hook, onMalformed);
+}
+
+function rejectOutput<T>(
+  detail: string,
+  registration: CodexHookRegistration,
+  hook: PluginHookDefinition,
+  malformed: ((detail: string) => T) | undefined
+): T | null {
+  if (malformed === undefined) {
+    warn(registration, hook, `${detail}; ignoring its output`);
+    return null;
+  }
+  warn(registration, hook, `${detail}; blocking the call`);
+  return malformed(detail);
 }
 
 /**
