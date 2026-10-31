@@ -2,7 +2,8 @@
  * Reads a Codex `mcp_tool` hook's output into one decision per event, with Codex's rules
  * (openai/codex codex-rs/hooks/src/engine/output_parser.rs and hooks/src/events/*.rs).
  *
- * Two failure kinds, both fail open in the runner:
+ * Two failure kinds. The runner blocks a PreToolUse call on either (Cursor plugin RFC, D8), and
+ * every other event fails open:
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
  *   `additionalProperties: false`), a wrong type or a value outside an enum. Nothing of it applies.
@@ -13,7 +14,8 @@
  * - An explicit PreToolUse deny and a PostToolUse block or stop always apply, also when Codex
  *   would void the output for a semantic rule (no reason, suppressOutput, continue: false next to
  *   a deny). A trusted guard's refusal must not let a model-controlled call through (Codex
- *   security review PRRT_kwDOPxxmWM6sQaTD). Only a malformed output fails open.
+ *   security review PRRT_kwDOPxxmWM6sQaTD).
+ * - A malformed PreToolUse output blocks the call (Codex fails it open, D8).
  * - JSON null on any optional field reads as absent (Codex PRRT_kwDOPxxmWM6rgpoH).
  * - `structuredContent` is read when the result has no text (Codex reads text only).
  */
@@ -165,8 +167,7 @@ function hasSpecificDecision(specific: Record<string, unknown>): boolean {
 /**
  * Xum honors an explicit deny even when Codex would void the output for a missing reason or an
  * extra field next to it (Codex security review PRRT_kwDOPxxmWM6sQaTD): a trusted guard that
- * denies a model-controlled call must not let it run. Only a malformed output (readWire) fails
- * open, as in Codex.
+ * denies a model-controlled call must not let it run.
  */
 const NO_REASON = "No reason given by the hook.";
 
