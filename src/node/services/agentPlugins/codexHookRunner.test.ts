@@ -267,6 +267,30 @@ describe("PreToolUse", () => {
     }
   });
 
+  test("a malformed output's keys and values never reach the model or the notice", async () => {
+    const secret = "sk-SECRET-123";
+    const specific = { hookEventName: "PreToolUse" };
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    for (const output of [
+      json({ hookSpecificOutput: { ...specific, permissionDecision: secret } }),
+      json({ decision: secret }),
+      json({ [secret]: true }),
+      json({ hookSpecificOutput: { ...specific, additionalContext: "x", [secret]: 1 } }),
+      // A voided rewrite denies the call with the reason that voided it.
+      json({
+        [secret]: true,
+        hookSpecificOutput: { ...specific, permissionDecision: "allow", updatedInput: {} },
+      }),
+    ]) {
+      const { spine, notices } = setup([hook("PreToolUse")], () => output);
+      const ctx = await runTool(spine, "bash", { script: "ls" }, schema);
+
+      expect(ctx.executed).toBe(false);
+      expect(JSON.stringify(ctx.blocked?.result)).not.toContain(secret);
+      expect(notices.join("\n")).not.toContain(secret);
+    }
+  });
+
   test("an unsupported permissionDecision (an invalid output) blocks the call (D8)", async () => {
     const { spine, notices } = setup([hook("PreToolUse")], () =>
       json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" } })
@@ -1223,7 +1247,7 @@ describe("Codex output rules (output_parser.rs)", () => {
   test("a voided output without a rewrite or a deny blocks the call (D8)", async () => {
     for (const [extra, detail] of [
       [{ suppressOutput: true }, "returned unsupported suppressOutput"],
-      [{ unexpectedField: true }, 'unknown field "unexpectedField"'],
+      [{ unexpectedField: true }, "returned output with an unknown field"],
     ] as const) {
       const { spine } = setup([hook("PreToolUse")], () =>
         json({
@@ -1384,9 +1408,7 @@ describe("Codex output rules (output_parser.rs)", () => {
         },
       })
     );
-    expect(blockedError(await runTool(pre.spine, "bash", {}))).toContain(
-      'invalid decision "invalid"'
-    );
+    expect(blockedError(await runTool(pre.spine, "bash", {}))).toContain("invalid decision value");
     const post = setup([hook("PostToolUse")], () =>
       json({ continue: false, decision: "Block", stopReason: "x" })
     );

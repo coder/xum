@@ -439,15 +439,18 @@ function looksLikeJson(text: string): boolean {
   return text.startsWith("{") || text.startsWith("[");
 }
 
-/** The first field the event's Codex schema does not list, as a semantic error message. */
+/**
+ * A semantic error message when a field is not in the event's Codex schema. It never names the
+ * field: a PreToolUse block shows this message to the model and the user, and a hook's field
+ * name can hold a secret.
+ */
 function findUnknown(
   record: Record<string, unknown>,
   allowed: string[],
   where: string
 ): string | undefined {
-  const key = Object.keys(record).find((candidate) => !allowed.includes(candidate));
-  return key !== undefined
-    ? `returned ${where} with the unknown field ${JSON.stringify(key).slice(0, 80)}`
+  return Object.keys(record).some((key) => !allowed.includes(key))
+    ? `returned ${where} with an unknown field`
     : undefined;
 }
 
@@ -460,12 +463,15 @@ function typed(record: Record<string, unknown>, fields: string[], type: string) 
   }
 }
 
-/** Codex's enums allow only these exact values (" deny ", "Block" are malformed). */
+/**
+ * Codex's enums allow only these exact values (" deny ", "Block" are malformed). The error never
+ * quotes the value, for the reason in findUnknown.
+ */
 function enumField(record: Record<string, unknown>, field: string, allowed: string[]) {
   const value = record[field];
   if (value == null) return undefined;
   if (typeof value !== "string" || !allowed.includes(value)) {
-    throw new Error(`invalid ${field} ${JSON.stringify(value).slice(0, 80)}`);
+    throw new Error(`invalid ${field} value`);
   }
   return value;
 }
