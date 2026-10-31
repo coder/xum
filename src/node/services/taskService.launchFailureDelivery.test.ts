@@ -115,6 +115,7 @@ describe("a sub-agent whose launch fails", () => {
     const waited = taskService.waitForAgentReport(taskId, { requestingWorkspaceId: parentId });
     failSend();
 
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see
     await expect(waited).rejects.toThrow(SEND_FAILURE);
     await taskService.reservedLaunchesSettled();
     expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");

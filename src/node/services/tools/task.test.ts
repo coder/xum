@@ -1388,7 +1388,7 @@ describe("task tool", () => {
         getAgentTaskStatus: mock(statusOf),
       } as unknown as TaskService;
       const tool = createTaskTool({ ...baseConfig, taskService });
-      return Promise.resolve(
+      const result: unknown = await Promise.resolve(
         tool.execute!(
           {
             subagent_type: "explore",
@@ -1400,6 +1400,7 @@ describe("task tool", () => {
           mockToolCallOptions
         )
       );
+      return result;
     }
 
     it("keeps the other members' reports and shows the failed one as interrupted", async () => {

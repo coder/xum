@@ -317,6 +317,7 @@ interface TaskRowProps {
   variant?: "default" | "await";
 }
 
+// dry-duplicate-ok: task statuses and web_fetch's redirect codes only share a membership test
 function isTaskRowElapsedActive(status: string): boolean {
   return (
     status === "queued" ||
