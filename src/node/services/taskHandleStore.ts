@@ -220,6 +220,7 @@ export class TaskHandleStore {
   private readonly scanIndex = new Map<string, OwnerScanIndex>();
   /** Bumped after each write by this store, so a scan that overlapped it publishes no proof. */
   private readonly writeGenerations = new Map<string, number>();
+  private scansInFlight = 0;
   private readonly now: () => number;
 
   /**
@@ -410,23 +411,32 @@ export class TaskHandleStore {
     };
     const owners = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
     let complete = true;
-    const recordsByOwner = await Promise.all(
-      owners.map(async (ownerWorkspaceId) => {
-        try {
-          return await this.scanOwnerWorkspaceTurns(ownerWorkspaceId, scan);
-        } catch (error: unknown) {
-          // Startup reconciliation is best-effort: one unreadable session must not prevent every
-          // other workspace (or the app itself) from loading.
-          log.warn("Skipping unreadable workspace-turn handle directory", {
-            ownerWorkspaceId,
-            error,
-          });
-          this.scanIndex.delete(ownerWorkspaceId);
-          complete = false;
-          return [];
-        }
-      })
-    );
+    this.scansInFlight += 1;
+    let recordsByOwner: WorkspaceTurnTaskHandleRecord[][];
+    try {
+      recordsByOwner = await Promise.all(
+        owners.map(async (ownerWorkspaceId) => {
+          try {
+            return await this.scanOwnerWorkspaceTurns(ownerWorkspaceId, scan);
+          } catch (error: unknown) {
+            // Startup reconciliation is best-effort: one unreadable session must not prevent every
+            // other workspace (or the app itself) from loading.
+            log.warn("Skipping unreadable workspace-turn handle directory", {
+              ownerWorkspaceId,
+              error,
+            });
+            this.scanIndex.delete(ownerWorkspaceId);
+            complete = false;
+            return [];
+          }
+        })
+      );
+    } finally {
+      this.scansInFlight -= 1;
+      // Only a running scan compares generations, so an idle store can forget them all. Pruning
+      // by listing instead could hand a running scan a generation it already saw.
+      if (this.scansInFlight === 0) this.writeGenerations.clear();
+    }
     const listed = new Set(owners);
     for (const ownerWorkspaceId of this.scanIndex.keys()) {
       if (!listed.has(ownerWorkspaceId)) this.scanIndex.delete(ownerWorkspaceId);

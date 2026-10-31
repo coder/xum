@@ -1496,15 +1496,14 @@ export class WorkspaceTurnManager {
 
       // The owner rule. The active-turn lookup reads only the owners it admits
       // (workspaceTurnOwners.ts), so changing it must update that module.
-      const ownsExistingWorkspaceTurn = await this.taskHandleStore.isWorkspaceOwnedBy(
-        ownerWorkspaceId,
-        existingWorkspaceId
-      );
       const ownsDescendantAgentWorkspace =
         args.allowAgentWorkspace === true &&
         targetEntry?.workspace.parentWorkspaceId != null &&
         this.taskHost.isDescendantAgentTaskInConfig(cfg, ownerWorkspaceId, existingWorkspaceId);
-      if (!ownsExistingWorkspaceTurn && !ownsDescendantAgentWorkspace) {
+      if (
+        !ownsDescendantAgentWorkspace &&
+        !(await this.createdThroughWorkspaceTurn(ownerWorkspaceId, existingWorkspaceId))
+      ) {
         return Err("Task.createWorkspaceTurn: invalid_scope for existing workspace");
       }
       if (
@@ -4713,6 +4712,19 @@ export class WorkspaceTurnManager {
       return false;
     }
     return isActiveWorkspaceTurnTaskStatus(record.status);
+  }
+
+  /** An unreadable handle directory reads as no records, as it does in the global scan. */
+  private async createdThroughWorkspaceTurn(
+    ownerWorkspaceId: string,
+    workspaceId: string
+  ): Promise<boolean> {
+    try {
+      return await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
+    } catch (error: unknown) {
+      log.warn("Skipping unreadable workspace-turn handle directory", { ownerWorkspaceId, error });
+      return false;
+    }
   }
 
   private async findActiveWorkspaceTurnForWorkspace(
