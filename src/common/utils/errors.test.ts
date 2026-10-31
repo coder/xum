@@ -133,6 +133,7 @@ describe("getErrorMessage for oRPC input validation", () => {
         })
       )
       .handler(() => "unreachable");
+    // @ts-expect-error The input breaks the schema on purpose.
     const error = await call(procedure, { name: "", tags: [7] }).catch((e: unknown) => e);
 
     expect(getErrorMessage(error)).toBe(

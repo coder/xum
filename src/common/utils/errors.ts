@@ -1,5 +1,5 @@
 import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
-import { formatInputValidationIssues } from "@/common/utils/errors/formatValidationIssues";
+import { getMessageWithInputValidationIssues } from "@/common/utils/errors/formatValidationIssues";
 
 /**
  * Extract a string message from an unknown error value.
@@ -59,11 +59,7 @@ export function getErrorMessage(error: unknown): string {
     }
   }
 
-  let msg = error.message;
-  const issues = formatInputValidationIssues(error);
-  if (issues != null) {
-    msg += `: ${issues}`;
-  }
+  let msg = getMessageWithInputValidationIssues(error);
   // Guard against cyclic cause chains (e.g. err.cause = err) with a visited set.
   const seen = new WeakSet<Error>();
   seen.add(error);
