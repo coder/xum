@@ -902,6 +902,26 @@ describe("backup payload", () => {
       }
     });
 
+    it("aborts instead of skipping a skill folder whose SKILL.md it cannot read", async () => {
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      const shared = await skillFolder("gh-stack");
+      await fs.symlink(shared, path.join(muxRoot, "skills/gh-stack"));
+      const marker = path.join(await fs.realpath(shared), "SKILL.md");
+      const lstat = fs.lstat;
+      const spy = spyOn(fs, "lstat").mockImplementation((async (target: string) => {
+        if (target === marker) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+        return await lstat(target);
+      }) as typeof fs.lstat);
+      try {
+        const rejected = await captureRejection(
+          collectAllowlistedFiles(muxRoot, CONTENTS, FOLLOW_SKILL_LINKS)
+        );
+        expect((rejected as NodeJS.ErrnoException).code).toBe("EACCES");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it("does not follow a link to a folder without SKILL.md", async () => {
       const notSkill = path.join(tempDir, "dotfiles");
       await writeFixtureFile(notSkill, "notes.md", "not a skill\n");

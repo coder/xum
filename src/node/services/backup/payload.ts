@@ -783,6 +783,7 @@ interface CollectionSource {
 }
 
 function joinRelative(parent: string, name: string): string {
+  if (name === "") return parent;
   return parent === "" ? name : toPosixPath(parent, name);
 }
 
@@ -936,7 +937,7 @@ function createBackupFileCollector(root: BackupRoot) {
  */
 async function linkedSkillSources(root: BackupRoot): Promise<CollectionSource[]> {
   const skillsDir = absolutePathOf(root.path, "skills");
-  const skillsStat = await lstatOrNull(skillsDir);
+  const skillsStat = await lstatIfExists(skillsDir);
   if (skillsStat?.isDirectory() !== true) return [];
   const sources: CollectionSource[] = [];
   for (const entry of await fs.readdir(skillsDir, { withFileTypes: true })) {
@@ -964,17 +965,28 @@ async function realpathOfSkillLink(linkPath: string): Promise<string | null> {
   }
 }
 
+/**
+ * A link to the Xum root or a folder above it (`skills/all -> ~`) would export sessions and
+ * everything else beside the settings, so no stray SKILL.md there makes it a skill folder.
+ */
+function containsOrIs(folder: string, target: string): boolean {
+  const relative = path.relative(folder, target);
+  if (relative === "") return true;
+  const outside = relative === ".." || relative.startsWith(`..${path.sep}`);
+  return !outside && !path.isAbsolute(relative);
+}
+
 async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<BackupRoot | null> {
   const canonical = await realpathOfSkillLink(linkPath);
   if (canonical === null) return null;
   const stat = await fs.lstat(canonical);
   if (!stat.isDirectory()) return null;
   const target: BackupRoot = { path: canonical, dev: stat.dev, ino: stat.ino };
-  // A link to the Xum root or a folder above it (`skills/all -> ~`) would export sessions and
-  // everything else beside the settings, so no stray SKILL.md there makes it a skill folder.
-  const relative = path.relative(target.path, root.path);
-  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return null;
-  return (await isRegularFile(absolutePathOf(target.path, "SKILL.md"))) ? target : null;
+  if (containsOrIs(target.path, root.path)) return null;
+  // Not `isRegularFile`, which reads every failure as "missing": an unreadable SKILL.md must
+  // abort the push, not publish a backup without the skill.
+  const marker = await lstatIfExists(absolutePathOf(target.path, "SKILL.md"));
+  return marker?.isFile() === true ? target : null;
 }
 
 /**
