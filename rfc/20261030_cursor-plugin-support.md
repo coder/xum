@@ -1349,6 +1349,50 @@ second rebases. PR 4 modifies `pluginAgentFormat.test.ts`, which PR 1 creates.
 Each PR with a row in section 8 puts that row's text in its PR description under
 "Release note".
 
+### As built
+
+The PRs differ from the sections below in these points. Where they differ, the
+code and this list are correct.
+
+*   Order: PR 6 (#7834) is alone on `main`. The stack is PR 5 (#7833), PR 7
+    (#7835), PR 1 (#7837), PR 3 (#7838), PR 4 (#7841), PR 2, PR 8, PR 9. PR 3
+    and PR 4 do not need PR 2, so they come first.
+*   PR 1: a rule that has invalid frontmatter, or that is too large once
+    rewritten as a skill, is a `notApplied` entry. `displayName` and `logo` are
+    `notApplied` entries. A `SKILL.md` at the plugin root loads as one skill.
+    `.mdc` and `.markdown` agent files are listed as not applied. Every rule
+    file Xum reads counts toward the 256-file cap.
+*   PR 2: a Cursor marketplace path source starts at the marketplace root, with
+    or without `./`, and a Cursor file ignores `metadata.pluginRoot`. The
+    containment checks are the Claude ones. The preview has a `readonlyAgents`
+    field, and the label shows only for a Claude Code or Cursor agent file with
+    `readonly: true`. `chooseUpdateMethod` also offers `cursor-plugin` for a
+    `claude-marketplace` marker.
+*   PR 3: `placement` is dropped like `auth`. Every `${...}` that Xum does not
+    expand counts as needs values, `${env:NAME}` and a data-folder `cwd`
+    included. Each server skipped for needs values, and each dropped `auth` or
+    `placement`, is a `notApplied` entry. A Cursor package without
+    `mcpServers` reads only `mcp.json`. On cursor/plugins at `4dd1d05818`, 89
+    servers load, 14 need values and 1 is refused for a static header. The
+    count of 102 above is the remote HTTP servers.
+*   PR 4: the settings base comes from the closest chain entry that sets one.
+    The renderer and ACP take the hops through an agent that the list hides
+    (a disabled Explore) from the resolved ancestors, so they resolve the same
+    chain as a run.
+*   PR 6: a malformed-output reason never quotes the hook's own data.
+*   PR 7: `runTurnStopHooks` returns the kept reasons, and
+    `mergeTurnStopContinuation` makes the only cut, after the TODO and status
+    nudges take their room. A reason that the cut removes entirely does not
+    count toward its hook's limit.
+*   PR 8: Cursor command hooks have their own gate (local and worktree
+    runtimes, not side chats), which does not need plugin MCP. A hook with a
+    `matcher` does not run. The file review skips only the top-level `.git`. A
+    file over 64 KiB, or not UTF-8, shows "(contents not shown: binary or
+    larger than 64 KiB)". Control characters are marked in every
+    plugin-supplied string that the file review, the hooks panel, its warnings
+    and the exit-127 notice show. An update that changes a hook command, or a
+    file that a hook runs, never applies without review.
+
 ### PR 1: Cursor manifest reader, rules as skills, agent prompt
 
 Files: `src/node/services/agentPlugins/discovery.ts` (Modify),
