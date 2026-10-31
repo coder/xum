@@ -461,6 +461,7 @@ export const AddPluginConsentPreview: Story = {
               },
             ],
             agents: ["grill-master.md"],
+            readonlyAgents: [],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
             reviewedComponents: [
@@ -473,6 +474,7 @@ export const AddPluginConsentPreview: Story = {
             ],
             codexHooks: GRILL_HOOKS.hooks.map(({ review: _review, ...hook }) => hook),
             warnings: ["Unknown top-level field 'hooks' ignored"],
+            notApplied: [],
             targetPath: "~/.mux/plugins/grill",
             consentDigest: "c".repeat(64),
           },
@@ -556,11 +558,13 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             skills: [],
             mcpServers: [],
             agents: [],
+            readonlyAgents: [],
             workflows: [],
             slashCommands: [],
             reviewedComponents: [],
             codexHooks: [],
             warnings: [],
+            notApplied: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
             consentDigest: "c".repeat(64),
           },
@@ -1267,11 +1271,13 @@ const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
   ],
   mcpServers: [{ serverName: "review-db", transport: "stdio", summary: "node ./bin/db.js" }],
   agents: ["reviewer.md"],
+  readonlyAgents: [],
   workflows: [],
   slashCommands: [],
   reviewedComponents: [],
   codexHooks: [],
   warnings: [],
+  notApplied: [],
   targetPath: "~/.mux/plugins/review-kit",
   consentDigest: "c".repeat(64),
 };
@@ -1486,6 +1492,14 @@ const MARKETPLACE_SOURCE = {
   refType: "branch" as const,
 };
 
+/** A marketplace build Xum refuses: its source is an npm package. */
+const NPM_BUILD = {
+  sourceKind: "npm",
+  source: "npm",
+  installable: false,
+  reason: "Xum does not install npm packages. Only git sources install.",
+} as const;
+
 /** A Claude Code marketplace shaped like anthropics/skills, plus an npm entry Xum refuses. */
 const MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
   name: "anthropic-agent-skills",
@@ -1497,34 +1511,28 @@ const MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
     {
       name: "document-skills",
       description: "Excel, Word, PowerPoint and PDF",
-      sourceKind: "relative",
-      source: "./",
-      skillCount: 4,
-      installable: true,
+      builds: [
+        { file: "claude", sourceKind: "relative", source: "./", skillCount: 4, installable: true },
+      ],
     },
     {
       name: "example-skills",
       description: "Skill creation, MCP building, design, testing",
-      sourceKind: "relative",
-      source: "./",
-      skillCount: 12,
-      installable: true,
+      builds: [
+        { file: "claude", sourceKind: "relative", source: "./", skillCount: 12, installable: true },
+      ],
     },
     {
       name: "claude-api",
       description: "Claude API and SDK documentation",
-      sourceKind: "relative",
-      source: "./",
-      skillCount: 1,
-      installable: true,
+      builds: [
+        { file: "claude", sourceKind: "relative", source: "./", skillCount: 1, installable: true },
+      ],
     },
     {
       name: "npm-tools",
       description: "Tools published to npm",
-      sourceKind: "npm",
-      source: "npm",
-      installable: false,
-      reason: "Xum does not install npm packages. Only git sources install.",
+      builds: [{ file: "claude", ...NPM_BUILD }],
     },
   ],
   methods: [{ kind: "skills" }],

@@ -58,7 +58,10 @@ test("claude-review-kit is a Claude Code plugin that also fits Skills", async ()
 test("claude-market lists five entries, one of them not installable", async () => {
   const result = await preview("claude-market");
   if (result.kind !== "marketplace") throw new Error(`previewed as a ${result.kind}`);
-  const entries = result.marketplace.entries.map((entry) => [entry.name, entry.installable]);
+  const entries = result.marketplace.entries.map((entry) => [
+    entry.name,
+    entry.builds.some((build) => build.installable),
+  ]);
   // The github entry is listed as installable; it fails only when Xum fetches it.
   expect(entries).toEqual([
     ["document-skills", true],
