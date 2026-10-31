@@ -219,7 +219,9 @@ describe("Mermaid layout stability", () => {
   test("reserves diagram height until fonts load, then renders", async () => {
     // Pele measures labels when it renders, so it waits for web fonts first.
     const fonts = Promise.withResolvers<void>();
-    Object.defineProperty(document, "fonts", { value: { ready: fonts.promise } });
+    Object.defineProperty(document, "fonts", {
+      value: { ready: fonts.promise, load: () => Promise.resolve([]) },
+    });
 
     const view = renderMermaid({ isStreaming: true });
 
@@ -232,6 +234,28 @@ describe("Mermaid layout stability", () => {
       fonts.resolve();
       await fonts.promise;
     });
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+    );
+  });
+
+  test("waits for the diagram font to load, and still renders when it fails", async () => {
+    // fonts.ready alone resolves before a face that nothing on the page uses yet has loaded.
+    document.documentElement.style.setProperty("--font-primary", "Geist");
+    const fontLoad = Promise.withResolvers<FontFace[]>();
+    Object.defineProperty(document, "fonts", {
+      value: { ready: Promise.resolve(), load: () => fontLoad.promise },
+    });
+
+    const view = renderMermaid();
+    // A macrotask drains every promise chain that does not wait on the font.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(view.container.querySelector(".mermaid-container svg")).toBeNull();
+    expect(view.container.querySelector(".mermaid-container")?.textContent).toBe(
+      "Rendering diagram..."
+    );
+
+    act(() => fontLoad.reject(new Error("font failed to load")));
     await waitFor(() =>
       expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
     );

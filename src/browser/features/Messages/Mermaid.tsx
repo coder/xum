@@ -233,17 +233,29 @@ async function renderMermaidSvg(
   idPrefix: string,
   maxWidth: number | undefined
 ): Promise<string> {
-  // Pele measures labels with canvas when it renders, so the font must be loaded first
-  // or boxes are sized for the fallback font. happy-dom has no document.fonts.
-  if ("fonts" in document) await document.fonts.ready;
-
   const rootStyle = window.getComputedStyle(document.documentElement);
+  // Measure with the same fonts the .mermaid-container CSS draws with.
+  const fontFamily = rootStyle.getPropertyValue("--font-primary").trim() || undefined;
+  const fontFamilyMono = rootStyle.getPropertyValue("--font-monospace").trim() || undefined;
+  const fontSize = 14;
+
+  // Pele measures labels with canvas when it renders, so the fonts must be loaded first
+  // or boxes are sized for the fallback font. fonts.ready does not start loading a face
+  // that nothing on the page uses yet, so request each family. A failed load falls back
+  // to measuring whatever font is there. happy-dom has no document.fonts.
+  if ("fonts" in document) {
+    const families = [fontFamily, fontFamilyMono].filter((family) => family !== undefined);
+    await Promise.allSettled(
+      families.map((family) => document.fonts.load(`${fontSize}px ${family}`))
+    );
+    await document.fonts.ready;
+  }
+
   const { svg } = renderPele(chart, {
     idPrefix,
-    // Measure with the same fonts the .mermaid-container CSS draws with.
-    fontFamily: rootStyle.getPropertyValue("--font-primary").trim() || undefined,
-    fontFamilyMono: rootStyle.getPropertyValue("--font-monospace").trim() || undefined,
-    fontSize: 14,
+    fontFamily,
+    fontFamilyMono,
+    fontSize,
     maxWidth,
     directionBreakpoint: NARROW_DIAGRAM_WIDTH,
     // Diagram text is untrusted model output: no clickable links, and no images,
