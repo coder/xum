@@ -63,18 +63,19 @@ Definitions larger than 1 MB are rejected at parse time. Filenames that don't ma
 
 A plugin agent without any of those fields is read as a Claude Code or Cursor subagent. Both tools give such an agent every tool when it omits `tools`, so Xum maps it like this:
 
-| Plugin field                                                                                               | Xum meaning                                                                                                                  |
-| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| (always)                                                                                                   | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`                                           |
-| `name` omitted                                                                                             | The file name (agent id), as both tools do for plugin agents                                                                 |
-| `readonly: true` (Cursor)                                                                                  | `base: explore` and `prompt.append: true` (no file edits or task spawning; bash stays; Explore's prompt first)               |
-| `model`                                                                                                    | `ai.model` for an alias or a known Claude ID. Other values use the inherited model.                                          |
-| `effort` (Claude Code)                                                                                     | `ai.thinkingLevel`, when it is a valid thinking level                                                                        |
-| `is_background`, `background`                                                                              | Ignored. The `task` caller chooses `run_in_background`.                                                                      |
-| Other keys (`maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `permissionMode`, `isolation`, `color`) | Ignored, as Xum ignores unknown keys. Claude Code also ignores `hooks`, `mcpServers` and `permissionMode` for plugin agents. |
-| `tools`, `disallowedTools` as a list                                                                       | Translated to Xum tool patterns, see [Claude Code tool lists](#claude-code-tool-lists)                                       |
+| Plugin field                                                                                               | Xum meaning                                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (always)                                                                                                   | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`                                                                                     |
+| `name` omitted                                                                                             | The file name (agent id), as both tools do for plugin agents                                                                                                           |
+| `readonly: true` (Cursor)                                                                                  | `base: explore` and `prompt.append: true` (no file edits or task spawning; bash stays; Explore's prompt first)                                                         |
+| `model`                                                                                                    | `ai.model` for an alias or a known Claude ID. `fast` (Cursor) sets `ai.settingsBase: explore`, see [`model: fast`](#model-fast). Other values use the inherited model. |
+| `effort` (Claude Code)                                                                                     | `ai.thinkingLevel`, when it is a valid thinking level                                                                                                                  |
+| `is_background: true` (Cursor)                                                                             | `subagent.background_hint: true`. The `task` caller still chooses `run_in_background`.                                                                                 |
+| `background`                                                                                               | Ignored. The `task` caller chooses `run_in_background`.                                                                                                                |
+| Other keys (`maxTurns`, `skills`, `memory`, `hooks`, `mcpServers`, `permissionMode`, `isolation`, `color`) | Ignored, as Xum ignores unknown keys. Claude Code also ignores `hooks`, `mcpServers` and `permissionMode` for plugin agents.                                           |
+| `tools`, `disallowedTools` as a list                                                                       | Translated to Xum tool patterns, see [Claude Code tool lists](#claude-code-tool-lists)                                                                                 |
 
-So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools, narrowed by any Claude Code tool list: without one, it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools, narrowed by any Claude Code tool list: without one, it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. A `readonly: true` agent gets Explore's tools, prompt and sub-agent instructions instead, with its own body after Explore's prompt. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
 
 #### Claude Code tool lists
 
@@ -110,7 +111,25 @@ The rules follow Claude Code:
 - A specifier such as `Bash(git push *)` in `disallowedTools` removes the whole tool, as in Claude Code. In `tools`, Xum cannot limit a tool to some of its calls, so it does not grant a tool with a specifier. `Agent(worker)` is the exception: Claude Code ignores its type list in sub-agents, so it grants the task tools. Commas inside a specifier do not split the list.
 - MCP entries (`mcp__<server>`, `mcp__<server>__<tool>`) are not translated yet. In `tools` they grant nothing. In `disallowedTools`, Xum skips the agent with a warning.
 
-A changed list changes the agent's definition, so a plugin update that changes it asks for consent again.
+A changed list changes the agent's definition, so a plugin update that changes it asks for consent again. The same holds for a change to `readonly`, `model: fast` or `is_background: true`. This Xum version maps those three fields to new Xum fields, so each installed plugin agent that sets one needs one review after the upgrade.
+
+#### `model: fast`
+
+A plugin agent with `model: fast` takes its model, thinking level and prompt cache duration from Explore's settings, as an Explore sub-agent does. Its tools and prompt still come from its base. For each field, the first source that sets it wins:
+
+1. Values pinned for this sub-agent: the `model` and `thinking` arguments of the `task` call, or a choice you sent in its chat.
+2. The agent's own entry in **Settings → Agents**, then its frontmatter (a Claude Code `effort` lands here).
+3. Explore's entry in **Settings → Agents**, then Explore's definition.
+4. Exec's entry in **Settings → Agents**, then Exec's definition.
+5. The parent's model and thinking level.
+
+With no Explore model in Settings, a fast agent runs on Exec's model from Settings, else on the parent's model. The built-in Explore agent sets a 5-minute prompt cache, so a fast agent keeps 5 minutes unless its own card or Explore's card sets another value. `Fast` and other spellings are not `fast`: they use the inherited model.
+
+Any agent can set `ai.settingsBase`. Xum ignores it, and logs a warning, when it names a missing agent, the agent itself, an agent whose chain contains the agent, or an agent whose chain sets its own `ai.settingsBase`.
+
+#### `is_background: true`
+
+The `task` tool's agent list marks such an agent with `[meant to run in the background (run_in_background=true)]`. This is a hint for the parent model. `run_in_background` still defaults to `false`.
 
 ## File Format
 
@@ -147,12 +166,14 @@ subagent:
   skip_init_hook: false
   append_prompt: | # Appended to the prompt ONLY when running as a subagent.
     Extra instructions only the subagent should see.
+  background_hint: false # Marks the agent in the task tool's agent list as meant to run in the background. Does not change run_in_background.
 
 # Per-agent AI defaults (overridable by user settings)
 ai:
   model: sonnet # Abbreviation or full ID like "anthropic:claude-sonnet-4-5".
   thinkingLevel: medium # "off" | "low" | "medium" | "high"
   cacheTtl: 1h # Anthropic prompt-cache duration: "5m" | "1h". Omit to inherit.
+  settingsBase: explore # Take model, thinking and cache defaults from this agent's chain instead of base's. Tools and prompt still follow base.
 
 # Tool policy
 tools:
@@ -313,13 +334,13 @@ The first source that sets a duration wins:
 
 1. The agent's **Prompt cache** value in **Settings → Agents**.
 2. The agent's own frontmatter `ai.cacheTtl` (a project `exec.md` with `base: exec` refines the built-in one).
-3. Each declared `base` agent, child to root: its Settings value, then its frontmatter.
+3. Each declared `base` agent, child to root: its Settings value, then its frontmatter. With `ai.settingsBase`, Xum walks the settings-base agent and its bases instead.
 4. The global **Prompt cache TTL** for Anthropic in **Settings → Providers** (`cacheTtl` in `providers.jsonc`).
 5. Anthropic's default, 5 minutes.
 
 An agent without a `base` does not inherit Exec's value. **Inherit** on the card shows the value the agent gets without its own Settings value.
 
-The built-in Explore and Compact agents set `cacheTtl: 5m`: their runs are short or one-shot, so a 1-hour cache costs more and is rarely read again. With a global 1-hour duration, Exec, Plan and custom agents use 1 hour while Explore and Compact keep 5 minutes, unless you pick another value on their cards. See [Prompt cache duration](/config/providers#prompt-cache-duration) for the costs.
+The built-in Explore and Compact agents set `cacheTtl: 5m`: their runs are short or one-shot, so a 1-hour cache costs more and is rarely read again. With a global 1-hour duration, Exec, Plan and custom agents use 1 hour while Explore and Compact keep 5 minutes, unless you pick another value on their cards. Agents based on Explore, and agents with `ai.settingsBase: explore`, also keep 5 minutes. See [Prompt cache duration](/config/providers#prompt-cache-duration) for the costs.
 
 ## Examples
 
