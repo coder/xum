@@ -356,7 +356,7 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       await seedOnDisk(
         (projectPath) => [
           projectWorkspace(projectPath, "owner", "owner"),
-          // A valid claim, so the listing spy below is shown to see the creator-directory reads.
+          // A valid claim: its creator-directory read proves the listing spy below sees reads.
           projectWorkspace(projectPath, "control", "control", claimTag("owner")),
           ...targets.map((target, index) =>
             projectWorkspace(projectPath, target, target, claimTag(claims[index]))

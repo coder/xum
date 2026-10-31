@@ -218,7 +218,6 @@ async function unlessMissing<T>(pending: Promise<T>): Promise<T | null> {
 }
 
 export class TaskHandleStore {
-  /** The global scan reads only the handle files whose indexed status it selects. */
   private readonly scanIndex = new Map<string, OwnerScanIndex>();
   /** Bumped after each write by this store, so a scan that overlapped it does not publish. */
   private readonly writeGenerations = new Map<string, number>();
@@ -462,7 +461,6 @@ export class TaskHandleStore {
       : await this.readSelectedHandles(ownerWorkspaceId, index.rows, scan, parsed);
   }
 
-  /** The indexed rows while the directory that proves them is unchanged, else null. */
   private async reusableRows(
     ownerWorkspaceId: string,
     entry: OwnerScanIndex | undefined,
@@ -483,7 +481,7 @@ export class TaskHandleStore {
    * Re-list one owner, re-reading only the handle files whose fingerprint changed, and add the
    * selected records it read to `parsed`. Each stamp is taken before the content it vouches for,
    * so a write that lands mid-scan leaves a stale fingerprint and the next scan re-reads. Returns
-   * null when the session directory is gone.
+   * null when the session directory or its task-handles directory disappears mid-scan.
    */
   private async refreshOwnerScanIndex(
     ownerWorkspaceId: string,
@@ -521,7 +519,6 @@ export class TaskHandleStore {
     return { provenBy: "handle-dir", proof: proven ? proof : null, rows: present };
   }
 
-  /** One handle's row: `known` while the file's fingerprint still matches it. Null when gone. */
   private async scanHandleFile(
     ownerWorkspaceId: string,
     handleId: string,
