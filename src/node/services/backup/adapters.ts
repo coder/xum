@@ -39,6 +39,7 @@ import {
   applyShelfRestore,
   collectShelfBackup,
   measureManagedTree,
+  omitSymlinkedShelfEntries,
   planShelfRestore,
   previewShelfRestore,
   readShelfBackup,
@@ -706,7 +707,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         }
       }
       const shelfPlan = await readShelfWithPlan(sourceDir, contents);
-      changes.push(...(await previewShelfRestore(muxRoot, shelfPlan.entries)));
+      const shelf = await omitSymlinkedShelfEntries(muxRoot, shelfPlan.entries);
+      changes.push(...(await previewShelfRestore(muxRoot, shelf.entries)));
       return {
         changes: changes.sort((a, b) => a.path.localeCompare(b.path)),
         localOnlyFiles: localOnly,
@@ -718,7 +720,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped].sort(),
+        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
       };
     },
 
@@ -733,7 +735,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const { payload, skipped: symlinkSkipped } = await omitSymlinkedDestinations(
+      const { payload, skipped: coreSymlinkSkipped } = await omitSymlinkedDestinations(
         muxRoot,
         await readBackupPayload(sourceDir, { contents: validateOptions.contents })
       );
@@ -745,7 +747,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
-      await readShelfWithPlan(sourceDir, validateOptions.contents);
+      const shelf = await omitSymlinkedShelfEntries(
+        muxRoot,
+        (await readShelfWithPlan(sourceDir, validateOptions.contents)).entries
+      );
+      const symlinkSkipped = [...coreSymlinkSkipped, ...shelf.skipped].sort();
       if (!validateOptions.contents.includeProjects) {
         return {
           hasProjectBundle: false,
@@ -866,6 +872,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // Read and validated before anything changes; written after the settings, since a
       // pinned artifact is the least important part of a restore.
       const shelfPlan = await readShelfWithPlan(sourceDir, contents);
+      const shelf = await omitSymlinkedShelfEntries(
+        muxRoot,
+        shelfPlan.entries,
+        restoreOptions.symlinkSkipped
+      );
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
@@ -999,7 +1010,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
       const shelfWritten = await applyShelfRestore({
         xumRoot: muxRoot,
-        entries: shelfPlan.entries,
+        entries: shelf.entries,
         snapshotPath: restoreOptions.snapshotPath,
         registeredProjects: registeredProjectDirs(),
       });
@@ -1015,7 +1026,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped].sort(),
+        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
         restoredProjectMemory,
       };
     },
