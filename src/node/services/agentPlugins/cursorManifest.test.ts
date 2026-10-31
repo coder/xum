@@ -36,7 +36,7 @@ describe("normalizeCursorManifest metadata", () => {
     expect(notApplied).toEqual([]);
   });
 
-  test("drops displayName and logo without a warning or a not-applied entry", () => {
+  test("lists displayName and logo as not applied, without a warning", () => {
     const { loaded, warnings, validatorWarnings, notApplied } = load({
       displayName: "Cursor Kit",
       logo: "assets/logo.svg",
@@ -45,7 +45,10 @@ describe("normalizeCursorManifest metadata", () => {
     expect(loaded).not.toHaveProperty("logo");
     expect(warnings).toEqual([]);
     expect(validatorWarnings).toEqual([]);
-    expect(notApplied).toEqual([]);
+    expect(notApplied).toEqual([
+      { part: "field", name: "displayName", reason: "not applied in Xum" },
+      { part: "field", name: "logo", reason: "not applied in Xum" },
+    ]);
   });
 
   // RFC section 1 table: `name` gets the "same handling as Claude", and Claude loads a
