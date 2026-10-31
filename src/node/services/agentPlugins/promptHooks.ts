@@ -124,7 +124,7 @@ function capContextEntries(
   return kept;
 }
 
-/** turn.stop reply text is cut to this length. */
+/** turn.stop reply text keeps at most this many trailing UTF-16 units. */
 const TURN_STOP_TEXT_MAX_CHARS = 16 * 1024;
 /** A continuation prompt is a new user row; longer prompts are cut. */
 export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
@@ -168,7 +168,8 @@ export async function runTurnStopHooks(
  * The reply's trailing text run (Codex last_assistant_message). Text before a later tool call is
  * an intermediate step, not the reply, so a turn that ends on a tool part gets null (#6067).
  * Reasoning parts are skipped. Taken from the stream-end parts, not a history read, so rows
- * appended after the reply cannot hide it (#6062).
+ * appended after the reply cannot hide it (#6062). A long run keeps its end, because a completion
+ * promise sits at the end of a reply.
  */
 export function lastAssistantText(parts: readonly CompletedMessagePart[]): string | null {
   let text = "";
@@ -178,5 +179,7 @@ export function lastAssistantText(parts: readonly CompletedMessagePart[]): strin
     if (part.type !== "text") break;
     text = part.text + text;
   }
-  return text.trim().length > 0 ? text.slice(0, TURN_STOP_TEXT_MAX_CHARS) : null;
+  if (text.trim().length === 0) return null;
+  // Drop a low surrogate whose high half fell outside the cut.
+  return text.slice(-TURN_STOP_TEXT_MAX_CHARS).replace(/^[\uDC00-\uDFFF]/, "");
 }

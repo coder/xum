@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { EventSpine } from "@/node/services/events/eventSpine";
-import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { lastAssistantText, runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const input = { text: "hello", origin: "user" as const, canBlock: true };
@@ -195,5 +196,42 @@ describe("runTurnStopHooks", () => {
         stopHookActive: false,
       })
     ).toEqual({ kind: "continue", prompt: "Run the tests again." });
+  });
+});
+
+describe("lastAssistantText", () => {
+  test("a long run keeps its end, cut across the joined text parts", () => {
+    const tail = "y".repeat(10_000 - "<promise>DONE</promise>".length) + "<promise>DONE</promise>";
+    const parts: CompletedMessagePart[] = [
+      { type: "text", text: "x".repeat(10_000) },
+      { type: "text", text: tail },
+    ];
+
+    expect(lastAssistantText(parts)).toBe("x".repeat(6_384) + tail);
+  });
+
+  test("a cut inside a surrogate pair drops the lone low half", () => {
+    const parts: CompletedMessagePart[] = [{ type: "text", text: "😀".repeat(10_000) + "!" }];
+
+    expect(lastAssistantText(parts)).toBe("😀".repeat(8_191) + "!");
+  });
+
+  test("a cut on a high surrogate keeps the whole pair", () => {
+    const parts: CompletedMessagePart[] = [{ type: "text", text: "😀".repeat(10_000) }];
+
+    expect(lastAssistantText(parts)).toBe("😀".repeat(8_192));
+  });
+
+  test("a turn that ends on a tool is null even after long text", () => {
+    const tool: CompletedMessagePart = {
+      type: "dynamic-tool",
+      toolCallId: "t1",
+      toolName: "bash",
+      state: "output-available",
+      input: {},
+      output: {},
+    };
+
+    expect(lastAssistantText([{ type: "text", text: "x".repeat(20_000) }, tool])).toBeNull();
   });
 });
