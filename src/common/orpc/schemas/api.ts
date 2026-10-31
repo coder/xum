@@ -1299,6 +1299,8 @@ export const agentPlugins = {
       key: z.string(),
       hash: z.string(),
       state: z.enum(["trusted", "disabled"]).nullable(),
+      /** `getHooks().fileReview.digest`: required to trust while that review is shown. */
+      fileReviewDigest: z.string().optional(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },

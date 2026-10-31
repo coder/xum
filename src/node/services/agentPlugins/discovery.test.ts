@@ -2351,7 +2351,10 @@ describe("Cursor plugin discovery", () => {
     expect(plugin.cursorHooks?.hooks.map((hook) => [hook.key, hook.status])).toEqual([
       ["cursor:hooks/hooks.json#stop[0]", "runnable"],
     ]);
-    expect(plugin.notApplied).toEqual([]);
+    // The Codex-shaped entry has no command string: the Cursor parser drops it and says so.
+    expect(plugin.notApplied).toEqual([
+      { part: "hook", name: "Stop[0]", reason: "an entry needs a command string" },
+    ]);
   });
 
   test("the file that mcpServers names loads in the cursor MCP dialect", async () => {

@@ -182,6 +182,7 @@ import {
   removePluginHookTrust,
   reviewStateOf,
   setPluginHookTrust,
+  type PluginHookTrustRecord,
   type PluginHookTrustState,
 } from "./pluginHookTrust";
 import {
@@ -594,6 +595,24 @@ const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
  */
 function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
   return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
+}
+
+/**
+ * Whether the user trusted a current Cursor hook of the plugin, at any hash. Trusting the first
+ * one took the full file review (firstTrustFileReview), and every update since reviewed its
+ * changed files. Trust of a hook the plugin no longer has does not count.
+ */
+function trustsCursorHook(
+  hooks: readonly PluginHookDefinition[],
+  trust: PluginHookTrustRecord
+): boolean {
+  return hooks.some(
+    (hook) => hook.handler.type === "cursor-command" && getOwn(trust, hook.key)?.state === "trusted"
+  );
+}
+
+function fileReviewDigest(changes: readonly AgentPluginCapabilityChange[]): string {
+  return createHash("sha256").update(JSON.stringify(changes)).digest("hex");
 }
 
 function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
@@ -4855,17 +4874,41 @@ export class AgentPluginInstallService {
     // The hook load and the trust read are two reads: an update from another process between
     // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
     // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
-    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+    const { hooks, warnings, trust, fileReview } = await this.readInsideDiscoveryGate(
       "Plugin files changed during hook review. Refresh the hook review.",
-      async () => ({
-        ...(await this.loadManagedPluginHooks(args.name)),
-        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
-      })
+      async () => {
+        const { plugin, ...loaded } = await this.loadManagedPluginHooks(args.name);
+        const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+        return {
+          ...loaded,
+          trust,
+          fileReview: await this.firstTrustFileReview(plugin, loaded.hooks, trust),
+        };
+      }
     );
     return {
       hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
       warnings,
+      ...(fileReview !== undefined ? { fileReview } : {}),
     };
+  }
+
+  /**
+   * D30 at the first trust (Codex review of the RFC, P1): a plugin installed by a build without
+   * the file review never showed its files, and later updates show only changed ones. So while
+   * no Cursor hook of the plugin is trusted, trusting one needs the install preview's review of
+   * every file. Xum keeps no record of which install showed the files, so a plugin installed with
+   * the review shows it once more here.
+   */
+  private async firstTrustFileReview(
+    plugin: AgentPluginInfo,
+    hooks: readonly PluginHookDefinition[],
+    trust: PluginHookTrustRecord
+  ): Promise<AgentPluginHooks["fileReview"]> {
+    if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
+    const changes = fileReviewRows(null, await this.fileReviewRecords(plugin.rootPath));
+    assertReviewFits(changes);
+    return { changes, digest: fileReviewDigest(changes) };
   }
 
   /**
@@ -4878,11 +4921,13 @@ export class AgentPluginInstallService {
     key: string;
     hash: string;
     state: PluginHookTrustState | null;
+    /** getHooks' `fileReview.digest`, when it showed one. */
+    fileReviewDigest?: string;
   }): Promise<void> {
     // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
     // the trust file between this check and the write, which would recreate it.
     return this.runExclusive(async () => {
-      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const { plugin, hooks } = await this.loadManagedPluginHooks(args.name);
       const hook = hooks.find((candidate) => candidate.key === args.key);
       if (hook?.hash !== args.hash) {
         throw new Error("This hook changed since you reviewed it. Review it again.");
@@ -4890,7 +4935,24 @@ export class AgentPluginInstallService {
       if (args.state === "trusted" && hook.status !== "runnable") {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
-      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+      const instanceId = this.instanceIdFor(args.name);
+      if (args.state === "trusted" && hook.handler.type === "cursor-command") {
+        const trust = await readPluginHookTrust(this.config.rootDir, instanceId);
+        // Read again here, not taken from the caller: the trust covers the files as they are now.
+        const review = await this.firstTrustFileReview(plugin, hooks, trust);
+        if (review !== undefined && review.digest !== args.fileReviewDigest) {
+          throw new Error(
+            args.fileReviewDigest === undefined
+              ? "Review this plugin's files before you trust its first hook."
+              : "This plugin's files changed since you reviewed them. Review them again."
+          );
+        }
+      }
+      await setPluginHookTrust(this.config.rootDir, instanceId, {
+        key: args.key,
+        hash: args.hash,
+        state: args.state,
+      });
     });
   }
 
@@ -4933,7 +4995,7 @@ export class AgentPluginInstallService {
       scope: "global",
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
-    return loadPluginHooks(plugin);
+    return { plugin, ...(await loadPluginHooks(plugin)) };
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {

@@ -164,6 +164,41 @@ describe("loadPluginCursorHooks", () => {
     ]);
   });
 
+  test("a hook dropped at parse gets a not-applied row with its reason", async () => {
+    const { hooks, notApplied } = await inline({
+      version: 1,
+      hooks: {
+        stop: [
+          { command: 3 },
+          { command: "./x.sh", loop_limit: -1 },
+          { command: "./x.sh", loop_limit: 1.5 },
+          { command: "./x.sh", loop_limit: "3" },
+          { command: "./x.sh", matcher: "x" },
+        ],
+        "after\u202EFileEdit": "./x.sh",
+      },
+    });
+    expect(hooks.map((hook) => hook.key)).toEqual(["cursor:plugin.json#hooks#stop[4]"]);
+    // The kept hook's row first, then the dropped ones in file order. Names stay raw here: the
+    // display marks their controls, as for every not-applied row.
+    expect(notApplied).toEqual([
+      { part: "hook", name: "stop[4]", reason: "matcher not applied in Xum" },
+      { part: "hook", name: "stop[0]", reason: "an entry needs a command string" },
+      { part: "hook", name: "stop[1]", reason: "loop_limit must be a whole number or null" },
+      { part: "hook", name: "stop[2]", reason: "loop_limit must be a whole number or null" },
+      { part: "hook", name: "stop[3]", reason: "loop_limit must be a whole number or null" },
+      { part: "hook", name: "after\u202EFileEdit", reason: "must be an array of hooks" },
+    ]);
+  });
+
+  test("dropped-hook rows stop at 50, as the warnings do", async () => {
+    const stop = Array.from({ length: 60 }, () => ({ command: 3 }));
+    const { notApplied, warnings } = await inline({ version: 1, hooks: { stop } });
+    expect(notApplied).toHaveLength(50);
+    expect(notApplied.at(-1)?.name).toBe("stop[49]");
+    expect(warnings.at(-1)).toBe("10 more hook warnings not shown");
+  });
+
   test("a file with 300 hooks keeps the first 256 and warns", async () => {
     const stop = Array.from({ length: 300 }, (_, index) => ({ command: `./x${index}.sh` }));
     const { hooks, warnings } = await inline({ version: 1, hooks: { stop } });

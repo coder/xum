@@ -4,6 +4,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
 import { cursorHookNotAppliedReason, effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import type {
+  AgentPluginCapabilityChange,
   AgentPluginHook,
   AgentPluginHooks,
   PluginHookHandler,
@@ -175,6 +176,267 @@ const HookReviewDetailText: React.FC<{
   </>
 );
 
+export function cutReviewTextKeys(changes: readonly AgentPluginCapabilityChange[]): string[] {
+  return changes.flatMap((change, index) =>
+    (["before", "after"] as const).flatMap((field) => {
+      const text = change[field];
+      return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
+    })
+  );
+}
+
+/**
+ * Which cut texts of a row list the user expanded (#6629). Keys are valid only for the list they
+ * were expanded in: a new review or preview (same plugin, other rows) starts with nothing expanded.
+ */
+export function useCutTextExpansion(changes: readonly AgentPluginCapabilityChange[]) {
+  const [expansion, setExpansion] = useState<{
+    changes: readonly AgentPluginCapabilityChange[] | null;
+    keys: ReadonlySet<string>;
+  }>({ changes: null, keys: new Set() });
+  const keys = expansion.changes === changes ? expansion.keys : new Set<string>();
+  return {
+    isExpanded: (key: string) => keys.has(key),
+    mustExpand: cutReviewTextKeys(changes).filter((key) => !keys.has(key)),
+    expand: (key: string) =>
+      setExpansion((previous) => ({
+        changes,
+        keys: new Set(previous.changes === changes ? previous.keys : []).add(key),
+      })),
+  };
+}
+export type CutTextExpansion = ReturnType<typeof useCutTextExpansion>;
+
+/** One review row: its summary and its before/after texts. */
+export const ReviewChangeRow: React.FC<{
+  change: AgentPluginCapabilityChange;
+  index: number;
+  isExpanded: (key: string) => boolean;
+  onExpand: (key: string) => void;
+}> = (props) => {
+  const fields = (["before", "after"] as const).flatMap((field) => {
+    const text = props.change[field];
+    return text !== undefined ? [{ field, text, key: `${props.index}:${field}` }] : [];
+  });
+  return (
+    <li className="text-xs">
+      <span className="text-foreground break-words">{props.change.summary}</span>
+      {fields.length > 0 && (
+        <dl className="mt-1 space-y-1">
+          {fields.map((item) => (
+            <ReviewTextField
+              key={item.field}
+              label={item.field === "before" ? "Before" : "After"}
+              text={item.text}
+              expanded={props.isExpanded(item.key)}
+              onExpand={() => props.onExpand(item.key)}
+            />
+          ))}
+        </dl>
+      )}
+    </li>
+  );
+};
+
+/**
+ * One before/after text of a review row (#6629). A long text is cut at the display bound, and the
+ * user must show all of it before confirming: a plugin can pad a definition and hide the part that
+ * matters after the cut.
+ */
+const ReviewTextField: React.FC<{
+  label: string;
+  text: string;
+  expanded: boolean;
+  onExpand: () => void;
+}> = (props) => {
+  const view = cutReviewText(props.text);
+  return (
+    <div className="flex gap-2">
+      <dt className="text-muted w-10 shrink-0 text-[11px]">{props.label}</dt>
+      <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+        {view.cut && !props.expanded ? view.shown : props.text}
+        {view.cut && !props.expanded && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-1 h-7 px-2 font-sans text-xs"
+            onClick={props.onExpand}
+          >
+            Show full text ({kilobytes(props.text)} KB)
+          </Button>
+        )}
+      </dd>
+    </div>
+  );
+};
+
+/** D30 at the first trust: every file of the plugin, as the install preview lists them. */
+const FirstTrustFileReview: React.FC<{
+  fileReview: NonNullable<AgentPluginHooks["fileReview"]>;
+  expansion: CutTextExpansion;
+}> = (props) => (
+  <div>
+    <h4 className="text-foreground mb-1 text-xs font-medium">
+      Files ({props.fileReview.changes.length})
+    </h4>
+    <p className="text-muted mb-1 text-xs">
+      Read every file before you trust this plugin&apos;s first hook: a command hook can run any of
+      them.
+    </p>
+    <ul className="space-y-2">
+      {props.fileReview.changes.map((change, index) => (
+        <ReviewChangeRow
+          key={`${index}:${change.summary}`}
+          change={change}
+          index={index}
+          isExpanded={props.expansion.isExpanded}
+          onExpand={props.expansion.expand}
+        />
+      ))}
+    </ul>
+  </div>
+);
+
+/** One hook of the review: what it is, where it comes from, and its trust controls. */
+const PluginHookRow: React.FC<{
+  hook: AgentPluginHook;
+  busy: boolean;
+  expanded: boolean;
+  onExpand: () => void;
+  /** The first trust's file review still holds cut texts the user did not show (D30). */
+  filesUnread: boolean;
+  onDecide: (state: "trusted" | "disabled") => void;
+}> = (props) => {
+  const hook = props.hook;
+  const label = REVIEW_LABEL[hook.review];
+  const note = hookStatusNote(hook);
+  const summary = describePluginHookHandler(hook.handler);
+  const detail = hookReviewDetail(hook.handler);
+  return (
+    <li className="border-border-light space-y-1 rounded border p-2 text-xs">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-foreground font-mono break-all">
+          {showOneLineControls(hook.event)}
+        </span>
+        {hook.matcher !== undefined && (
+          <span className="text-muted font-mono break-all">
+            matcher {showOneLineControls(hook.matcher)}
+          </span>
+        )}
+        {note === null && <span className={label.className}>{label.text}</span>}
+      </div>
+      <p className="text-foreground font-mono break-all">{summary}</p>
+      {detail !== null && (
+        <HookReviewDetailText detail={detail} expanded={props.expanded} onExpand={props.onExpand} />
+      )}
+      <p className="text-muted break-all">{showOneLineControls(hook.source)}</p>
+      {isCursorHookHandler(hook.handler) && <p className="text-muted">{CURSOR_HOOK_REMOTE_NOTE}</p>}
+      {note !== null ? (
+        <p className="text-muted">{note}</p>
+      ) : (
+        <HookDecision
+          hook={hook}
+          summary={summary}
+          busy={props.busy}
+          unreadDetail={unreadDetailNoun(detail, props.expanded)}
+          filesUnread={props.filesUnread}
+          onDecide={props.onDecide}
+        />
+      )}
+    </li>
+  );
+};
+
+/** Trust covers the full definition: it waits until the user can have read all of it. */
+function unreadDetailNoun(
+  detail: PluginHookReviewDetail | null,
+  expanded: boolean
+): PluginHookReviewDetail["noun"] | null {
+  return detail?.full != null && !expanded ? detail.noun : null;
+}
+
+interface HookDecisionProps {
+  hook: AgentPluginHook;
+  summary: string;
+  busy: boolean;
+  /** The noun of a cut definition the user has not shown in full, else null. */
+  unreadDetail: PluginHookReviewDetail["noun"] | null;
+  /** The first trust's file review still holds cut texts the user did not show (D30). */
+  filesUnread: boolean;
+  onDecide: (state: "trusted" | "disabled") => void;
+}
+
+const HookDecision: React.FC<HookDecisionProps> = (props) => {
+  // The first trust of a command hook covers the plugin's files too (D30).
+  const filesUnread = props.filesUnread && props.hook.handler.type === "cursor-command";
+  return (
+    <>
+      <HookDecisionNotes {...props} filesUnread={filesUnread} />
+      <HookDecisionButtons {...props} filesUnread={filesUnread} />
+    </>
+  );
+};
+
+/** Why Trust is waiting, and what trusting does. A trusted hook needs none of these. */
+const HookDecisionNotes: React.FC<HookDecisionProps> = (props) => {
+  if (props.hook.review === "trusted") return null;
+  return (
+    <>
+      {props.hook.review === "changed" && (
+        <p className="text-warning">
+          This hook changed since your last decision. Read it again before you trust it.
+        </p>
+      )}
+      {props.unreadDetail !== null && (
+        <p className="text-muted">
+          Show the full {props.unreadDetail} to review it before trusting.
+        </p>
+      )}
+      {props.filesUnread && (
+        <p className="text-muted">
+          Show the full text of each file above to review it before trusting.
+        </p>
+      )}
+      {props.hook.handler.type === "cursor-command" && (
+        <p className="text-muted">Once trusted, this hook runs a command in your workspace.</p>
+      )}
+    </>
+  );
+};
+
+const HookDecisionButtons: React.FC<HookDecisionProps> = (props) => {
+  const hook = props.hook;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {hook.review !== "trusted" && (
+        <Button
+          size="sm"
+          className={cn("h-7 px-2 text-xs")}
+          disabled={props.busy || props.unreadDetail !== null || props.filesUnread}
+          onClick={() => props.onDecide("trusted")}
+          aria-label={`Trust ${hook.event} hook ${props.summary}`}
+        >
+          Trust
+        </Button>
+      )}
+      {hook.review !== "disabled" && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          disabled={props.busy}
+          onClick={() => props.onDecide("disabled")}
+          aria-label={`Turn off ${hook.event} hook ${props.summary}`}
+        >
+          Turn off
+        </Button>
+      )}
+    </div>
+  );
+};
+
+const NO_FILE_CHANGES: readonly AgentPluginCapabilityChange[] = [];
+
 export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> = (props) => {
   const { api } = useAPI();
   const [data, setData] = useState<AgentPluginHooks | null>(null);
@@ -188,6 +450,8 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
   // definition must be expanded again before it can be trusted.
   const [expandedInputs, setExpandedInputs] = useState<ReadonlySet<string>>(() => new Set());
   const name = props.name;
+  const fileReview = data?.fileReview;
+  const fileExpansion = useCutTextExpansion(fileReview?.changes ?? NO_FILE_CHANGES);
 
   useEffect(() => {
     let ignore = false;
@@ -223,6 +487,8 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
         key: hook.key,
         hash: hook.hash,
         state,
+        // The files on screen: the backend refuses the trust if they changed since.
+        ...(fileReview !== undefined ? { fileReviewDigest: fileReview.digest } : {}),
       });
       if (!result.success) setError(result.error);
     } catch (err) {
@@ -248,96 +514,24 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
             </p>
           )
       )}
+      {fileReview !== undefined && (
+        <FirstTrustFileReview fileReview={fileReview} expansion={fileExpansion} />
+      )}
       {data?.hooks.length === 0 && <p className="text-muted text-xs">No hooks.json hooks.</p>}
       {data && data.hooks.length > 0 && (
         <ul className="space-y-2">
           {data.hooks.map((hook) => {
-            const label = REVIEW_LABEL[hook.review];
-            const note = hookStatusNote(hook);
-            const summary = describePluginHookHandler(hook.handler);
-            const detail = hookReviewDetail(hook.handler);
             const expandKey = `${hook.key}\0${hook.hash}`;
-            const expanded = expandedInputs.has(expandKey);
-            // Trust covers the full definition: it waits until the user can have read all of it.
-            const mustExpand = detail?.full != null && !expanded;
             return (
-              <li
+              <PluginHookRow
                 key={hook.key}
-                className="border-border-light space-y-1 rounded border p-2 text-xs"
-              >
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="text-foreground font-mono break-all">
-                    {showOneLineControls(hook.event)}
-                  </span>
-                  {hook.matcher !== undefined && (
-                    <span className="text-muted font-mono break-all">
-                      matcher {showOneLineControls(hook.matcher)}
-                    </span>
-                  )}
-                  {note === null && <span className={label.className}>{label.text}</span>}
-                </div>
-                <p className="text-foreground font-mono break-all">{summary}</p>
-                {detail !== null && (
-                  <HookReviewDetailText
-                    detail={detail}
-                    expanded={expanded}
-                    onExpand={() =>
-                      setExpandedInputs((previous) => new Set(previous).add(expandKey))
-                    }
-                  />
-                )}
-                <p className="text-muted break-all">{showOneLineControls(hook.source)}</p>
-                {isCursorHookHandler(hook.handler) && (
-                  <p className="text-muted">{CURSOR_HOOK_REMOTE_NOTE}</p>
-                )}
-                {note !== null ? (
-                  <p className="text-muted">{note}</p>
-                ) : (
-                  <>
-                    {hook.review === "changed" && (
-                      <p className="text-warning">
-                        This hook changed since your last decision. Read it again before you trust
-                        it.
-                      </p>
-                    )}
-                    {mustExpand && hook.review !== "trusted" && (
-                      <p className="text-muted">
-                        Show the full {detail.noun} to review it before trusting.
-                      </p>
-                    )}
-                    {hook.handler.type === "cursor-command" && hook.review !== "trusted" && (
-                      <p className="text-muted">
-                        Once trusted, this hook runs a command in your workspace.
-                      </p>
-                    )}
-                    <div className="flex flex-wrap gap-2">
-                      {hook.review !== "trusted" && (
-                        <Button
-                          size="sm"
-                          className={cn("h-7 px-2 text-xs")}
-                          disabled={busy || mustExpand}
-                          onClick={() => void decide(hook, "trusted")}
-                          aria-label={`Trust ${hook.event} hook ${summary}`}
-                        >
-                          Trust
-                        </Button>
-                      )}
-                      {hook.review !== "disabled" && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 px-2 text-xs"
-                          disabled={busy}
-                          onClick={() => void decide(hook, "disabled")}
-                          aria-label={`Turn off ${hook.event} hook ${summary}`}
-                        >
-                          Turn off
-                        </Button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </li>
+                hook={hook}
+                busy={busy}
+                expanded={expandedInputs.has(expandKey)}
+                onExpand={() => setExpandedInputs((previous) => new Set(previous).add(expandKey))}
+                filesUnread={fileExpansion.mustExpand.length > 0}
+                onDecide={(state) => void decide(hook, state)}
+              />
             );
           })}
         </ul>
