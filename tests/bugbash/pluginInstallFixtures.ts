@@ -293,7 +293,7 @@ function cursorTeamKitMini(): Files {
  * cursor/plugins lists `third_party/attio`.
  */
 function cursorMarket(): Files {
-  const marketplace = (plugins: Array<{ name: string; source: string }>) =>
+  const marketplace = (plugins: { name: string; source: string }[]) =>
     JSON.stringify({ name: "cursor-market", owner: { name: "Bug Bash" }, plugins }, null, 2);
   return {
     ".cursor-plugin/marketplace.json": marketplace([

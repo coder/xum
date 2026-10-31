@@ -4,7 +4,10 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isReadonlyForeignPluginAgent, mapForeignPluginAgentFrontmatter } from "./pluginAgentFormat";
+import {
+  isReadonlyForeignPluginAgent,
+  mapForeignPluginAgentFrontmatter,
+} from "./pluginAgentFormat";
 
 export class AgentDefinitionParseError extends Error {
   constructor(message: string) {
