@@ -714,13 +714,40 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         The parent chat's Exec choice is skipped for Exec-derived agents on
         purpose (`src/common/utils/ai/resolveAgentAiSettings.ts:99-111`).
     *   Mechanism: the Cursor mapping writes a new optional Xum frontmatter
-        field, `ai.settingsBase: "explore"`, for `model: fast`. When it is set,
-        `collectDefinitionLayers`
-        (`src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts:102`)
-        walks the chain from that ID instead of `base`, for AI settings only. It
-        calls `resolveAgentInheritanceChain` with the `ai.settingsBase` ID as the
-        start of the chain. `loadAgentDefinitionAiLayers` (`:145`) is unchanged.
-        Tool policy still follows `base`.
+        field, `ai.settingsBase: "explore"`, for `model: fast`. Where Xum turns
+        an agent's inheritance chain into AI-settings layers, a set
+        `settingsBase` replaces the chain after the agent's own entries with
+        the settings-base agent's chain. One pure helper,
+        `applySettingsBaseChain` (new, in
+        `src/common/utils/ai/agentAncestorLayers.ts`), does this for every
+        consumer, so the consumers cannot disagree. Tool policy still follows
+        `base`.
+    *   The consumers (checked against `main` at `85abd10b10`):
+        1.  Model and thinking level for a run and for a task reawaken:
+            `loadAgentDefinitionAiLayers`
+            (`src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts:104`),
+            called from `resolveNodeAgentAiSettings` (`:206`) and
+            `taskService.ts:10577`.
+        2.  The Anthropic prompt-cache TTL (#7767):
+            `resolveChainAgentCacheTtl` (`resolveNodeAgentAiSettings.ts:78`),
+            called from `turnRequestBuilder.ts:2291` and
+            `continuousCompactionSummary.ts:123` with the chain from
+            `resolveAgentForStream` (`agentResolution.ts:259`).
+        3.  The agent descriptor's `aiLayers` (#7767), built at
+            `agentDefinitionsService.ts:1432` and shown in Settings > Tasks
+            (`TasksSection.tsx:460`).
+        4.  Paths that walk the declared `base` of listed agents instead of a
+            read chain: the renderer's configured defaults
+            (`resolveConfiguredAiDefaults`,
+            `src/browser/utils/workspaceModeAi.ts:38-51`, fed by
+            `setAgentBases`, `src/browser/utils/aiSelectionIntent.ts:145`,
+            from `AgentContext.tsx:174`), the Settings > Tasks fallback walk
+            (`TasksSection.tsx:460-476`) and ACP
+            (`src/node/acp/resolveAgentAiSettings.ts:68`). The descriptor gets
+            a new field, `aiSettingsBase`, and each of these uses
+            `aiSettingsBase ?? base` when it builds its map. A child workspace
+            of a `fast` agent then shows the same configured model as a run
+            uses.
     *   New lookup order for a `fast` agent: its own saved choice, its own
         Settings entry, its own frontmatter defaults, then Explore's Settings
         (Delegated override, then base entry) and Explore's definition, then
@@ -728,6 +755,11 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
     *   The built-in Explore agent sets no model (`src/node/builtinAgents/explore.md`).
         With no Explore model in Settings, a `fast` agent falls through to the
         parent model, as today.
+    *   The built-in Explore agent sets `ai.cacheTtl: 5m` (#7767). A `fast`
+        agent therefore also uses a 5-minute prompt-cache TTL unless its own
+        Settings entry or frontmatter sets one. This fits short sub-agent runs
+        and follows from D11 ("AI settings" covers every field in those
+        layers).
     *   Consent: the mapped frontmatter is fingerprinted
         (`pluginAgentFormat.ts:361-362`), so each installed `fast` agent asks
         for consent once after the update that ships this field.
@@ -1668,28 +1700,41 @@ Files: `src/node/services/agentPlugins/mcpConfig.ts`,
 
 ### PR 4: `model: fast` and the `is_background` hint
 
+Anchors checked against `main` at `85abd10b10`, after #7767 (per-agent
+prompt-cache TTL) moved the AI-settings layer code.
+
 Files: `src/common/orpc/schemas/agentDefinition.ts`,
 `src/node/services/agentDefinitions/pluginAgentFormat.ts`,
+`src/common/utils/ai/agentAncestorLayers.ts`,
 `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts`,
+`src/node/services/agentResolution.ts`,
+`src/node/services/turnRequestBuilder.ts`,
+`src/node/services/continuousCompactionSummary.ts`,
 `src/node/services/agentDefinitions/agentDefinitionsService.ts`,
 `src/node/services/turnContextAssembler.ts`,
-`src/node/services/tools/task.ts` (all Modify), and the tests in 4.6.
+`src/node/services/tools/task.ts`,
+`src/browser/utils/aiSelectionIntent.ts`,
+`src/browser/features/Settings/Sections/TasksSection.tsx`,
+`src/node/acp/resolveAgentAiSettings.ts` (all Modify), and the tests in 4.10.
 
 #### 4.1 `src/common/orpc/schemas/agentDefinition.ts` (Modify)
 
 *   **Type / Scope**: Agent frontmatter schema.
 *   **Proposed Changes**:
     *   Add `settingsBase: AgentIdSchema.optional()` to
-        `AgentDefinitionAiDefaultsSchema` (lines 33-39).
+        `AgentDefinitionAiDefaultsSchema` (lines 34-42), beside `model`,
+        `thinkingLevel` and `cacheTtl`.
     *   Add `background_hint: z.boolean().optional()` to
-        `AgentDefinitionSubagentSchema` (lines 20-31).
-    *   Add `backgroundHint: z.boolean().optional()` to
-        `AgentDefinitionDescriptorSchema` (lines 92-109).
+        `AgentDefinitionSubagentSchema` (lines 21-32).
+    *   Add `backgroundHint: z.boolean().optional()` and
+        `aiSettingsBase: AgentIdSchema.optional()` to
+        `AgentDefinitionDescriptorSchema` (starts at line 95), beside
+        `subagentRunnable` (line 103) and `base`.
 
 #### 4.2 `src/node/services/agentDefinitions/pluginAgentFormat.ts` (Modify)
 
 *   **Type / Scope**: Agent frontmatter mapping.
-*   **Proposed Changes**: `mapAiDefaults` (lines 306-312) returns
+*   **Proposed Changes**: `mapAiDefaults` (line 306) returns
     `{settingsBase: "explore"}` (plus `thinkingLevel` when set) for `model:
     fast` (D11). In the `subagent` literal (line 351), `is_background: true`
     adds `background_hint: true` (D12). Claude's `background` field stays
@@ -1698,40 +1743,100 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     `background` stays ignored: the parent chooses `run_in_background` per
     spawn."
 
-#### 4.3 `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts` (Modify)
+#### 4.3 `src/common/utils/ai/agentAncestorLayers.ts` (Modify)
 
-*   **Type / Scope**: AI settings resolution.
-*   **Proposed Changes**: In `loadAgentDefinitionAiLayers` (lines 145-176),
-    after `readAgentDefinition`, when `agentDefinition.frontmatter.ai?.settingsBase`
-    is set:
-    1.  Read the settings-base agent with `readAgentDefinition` and resolve its
-        chain with `resolveAgentInheritanceChain` (same options as the existing
-        call).
-    2.  Pass `[ownChain[0], ...settingsBaseChain]` (the agent itself, then the
-        settings-base chain) to
-        `collectDefinitionLayers` (line 102), in place of the agent's own
-        chain. `collectDefinitionLayers` does not change.
-    3.  When the settings-base ID equals the agent's ID, when the read throws
-        a not-found error, or when the agent's ID appears in the settings-base
-        chain, log `log.warn("settingsBase ignored", {agentId, settingsBase,
-        reason})` and use the agent's own chain (D26). A transport
-        `RuntimeError` still rethrows, as the function documents.
-    *   Tool policy keeps following `base`: only this AI-settings loader reads
+*   **Type / Scope**: Pure helper, shared by the chain consumers in 4.4-4.6.
+*   **Proposed Changes**: Add
+    `applySettingsBaseChain(agentId, ownChain, settingsBaseChain)`. Both chains
+    have the shape `collectDefinitionLayers` (line 79) takes
+    (`{id, ai?}[]`, target first). `settingsBaseChain` is `null` when the
+    settings-base agent could not be read. It returns
+    `{chain, ignored?: "missing" | "self" | "cycle"}`:
+    1.  `settingsBaseChain === null`: own chain, `ignored: "missing"`.
+    2.  `settingsBaseChain[0].id === agentId`: own chain, `ignored: "self"`.
+    3.  `agentId` appears anywhere in `settingsBaseChain`: own chain,
+        `ignored: "cycle"`.
+    4.  Otherwise: the leading entries of `ownChain` whose `id` equals
+        `agentId` (the agent and its same-ID scope refinements), then all of
+        `settingsBaseChain`.
+    *   `collectDefinitionLayers` does not change. Callers pass it the returned
+        chain.
+
+#### 4.4 `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts` (Modify)
+
+*   **Type / Scope**: Node AI-settings loader.
+*   **Proposed Changes**:
+    *   Add `resolveAgentAiSettingsChain(agentDefinition, chain, context)`. When
+        `agentDefinition.frontmatter.ai?.settingsBase` is unset, it returns
+        `chain` unchanged. Otherwise:
+        1.  It reads the settings-base agent with `readAgentDefinition` and
+            resolves its chain with `resolveAgentInheritanceChain`, with the
+            same read options and abort signal as the caller.
+        2.  A not-found read passes `null` to `applySettingsBaseChain`. A
+            transport `RuntimeError` rethrows, as the doc comment of
+            `loadAgentDefinitionAiLayers` requires.
+        3.  When the result has `ignored`, it logs
+            `log.warn("settingsBase ignored", {agentId, settingsBase, reason})`
+            (D26).
+        4.  It returns the result's `chain`.
+    *   `loadAgentDefinitionAiLayers` (line 104): pass the chain from
+        `resolveAgentInheritanceChain` (line 124) through
+        `resolveAgentAiSettingsChain` before `collectDefinitionLayers`
+        (line 134). This covers runs (`resolveNodeAgentAiSettings`, line 206)
+        and task reawaken (`taskService.ts:10577`).
+    *   `resolveChainAgentCacheTtl` (line 78) does not change. Its callers pass
+        the AI-settings chain (4.5).
+    *   Tool policy keeps following `base`: only AI-settings consumers read
         `settingsBase`.
 
-#### 4.4 Agent descriptor builders (Modify)
+#### 4.5 Stream resolution and the prompt-cache TTL (Modify)
 
-*   **Type / Scope**: `agentDefinitionsService.ts` and `turnContextAssembler.ts`.
-*   **Proposed Changes**: Each place that sets `subagentRunnable` on a
-    descriptor (`agentDefinitionsService.ts:621`, `:652`, `:1438` and
-    `turnContextAssembler.ts:1697`) also sets `backgroundHint: true` when the
-    frontmatter has `subagent.background_hint === true`, and omits the field
-    otherwise.
+*   **Type / Scope**: `agentResolution.ts`, `turnRequestBuilder.ts`,
+    `continuousCompactionSummary.ts`.
+*   **Proposed Changes**:
+    *   `resolveAgentForStream` (`agentResolution.ts:259`) returns a new field,
+        `agentAiSettingsChain`, beside `agentInheritanceChain` (type at
+        line 103, value at line 707). It is
+        `resolveAgentAiSettingsChain(agentDefinition, agentInheritanceChain,
+        ...)`. `agentInheritanceChain` keeps its meaning (capability checks
+        and tool policy).
+    *   `turnRequestBuilder.ts:2291` and `continuousCompactionSummary.ts:123`
+        pass `agentAiSettingsChain` to `resolveChainAgentCacheTtl` instead of
+        `agentInheritanceChain`. The Compact agent has no `settingsBase`, so
+        compaction keeps its TTL. The second call site changes only so that
+        both callers read the same field.
 
-#### 4.5 `src/node/services/tools/task.ts` (Modify)
+#### 4.6 `src/node/services/agentDefinitions/agentDefinitionsService.ts` (Modify)
+
+*   **Type / Scope**: Agent descriptor list.
+*   **Proposed Changes**:
+    *   Descriptor `aiLayers` (line 1432): keep each resolved entry's
+        `aiChain` until all descriptors have resolved. Then, for an entry whose
+        `resolvedFrontmatter.ai?.settingsBase` is set, build `aiLayers` from
+        `applySettingsBaseChain(id, entry.aiChain, settingsBaseEntry?.aiChain
+        ?? null)`, where `settingsBaseEntry` is the resolved entry with that ID
+        in the same list. Log the same warning when `ignored` is set. Other
+        entries keep `collectDefinitionLayers(id, aiChain)`. This adds no file
+        reads: the list resolves every descriptor already.
+    *   `backgroundHint` and `aiSettingsBase`: each place that sets
+        `subagentRunnable` on a descriptor (lines 622, 653, 1450) also sets
+        `backgroundHint: true` when the frontmatter has
+        `subagent.background_hint === true`, and `aiSettingsBase` to
+        `frontmatter.ai.settingsBase` when it is set. Both fields are omitted
+        otherwise.
+
+#### 4.7 `src/node/services/turnContextAssembler.ts` (Modify)
+
+*   **Type / Scope**: Turn context descriptors.
+*   **Proposed Changes**: Where the descriptor sets `subagentRunnable`
+    (line 1697), also set `backgroundHint: true` when the resolved frontmatter
+    has `subagent.background_hint === true`, and `aiSettingsBase` when
+    `ai.settingsBase` is set, as in 4.6.
+
+#### 4.8 `src/node/services/tools/task.ts` (Modify)
 
 *   **Type / Scope**: Task tool description.
-*   **Proposed Changes**: In `buildTaskDescription` (lines 102-124), an agent
+*   **Proposed Changes**: In `buildTaskDescription` (line 102), an agent
     with `backgroundHint: true` gets the line
     `- <id>: <description> [meant to run in the background (run_in_background=true)]`.
     Without a description the line is
@@ -1739,8 +1844,32 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     lines do not change. The `task` schema (`toolDefinitions.ts:423`) does not
     change.
 
-#### 4.6 Tests for PR 4
+#### 4.9 Base-map walks in the renderer and ACP (Modify)
 
+*   **Type / Scope**: `src/browser/utils/aiSelectionIntent.ts`,
+    `src/browser/features/Settings/Sections/TasksSection.tsx`,
+    `src/node/acp/resolveAgentAiSettings.ts`.
+*   **Proposed Changes**: Each map from agent ID to base uses
+    `agent.aiSettingsBase ?? agent.base`:
+    *   `setAgentBases` (`aiSelectionIntent.ts:145`, the map at line 150, with
+        `aiSettingsBase?` added to its parameter type), which feeds
+        `resolveConfiguredAiDefaults` and `workspaceAiSettingsSync.ts`;
+    *   the fallback walk in `TasksSection.tsx` (lines 460-476);
+    *   the ACP map (`acp/resolveAgentAiSettings.ts:68`).
+    *   These maps serve AI settings only. Tool policy and capability checks do
+        not read them.
+
+#### 4.10 Tests for PR 4
+
+*   `src/common/utils/ai/agentAncestorLayers.test.ts` (Create):
+    `applySettingsBaseChain` with
+    *   no settings-base chain (`null`): own chain, `ignored: "missing"`;
+    *   a settings-base chain that starts with the agent's ID: own chain,
+        `ignored: "self"`;
+    *   a settings-base chain that contains the agent's ID later: own chain,
+        `ignored: "cycle"`;
+    *   own chain `[a(project), a(plugin), exec]` with settings-base chain
+        `[explore, exec]`: result `[a(project), a(plugin), explore, exec]`.
 *   `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.test.ts`
     (Modify):
     *   a `fast` agent with no Settings entry takes Explore's Settings model and
@@ -1749,8 +1878,25 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     *   the `fast` agent's own Settings entry wins over Explore's;
     *   `settingsBase: "missing-agent"` and `settingsBase` equal to the agent's
         own ID each log the warning and resolve as without the field;
+    *   a transport `RuntimeError` while reading the settings-base agent
+        rethrows;
     *   the agent's resolved tool policy is the same with and without
         `settingsBase`.
+*   `src/node/services/agentResolution.test.ts` (Modify): `agentAiSettingsChain` equals
+    `agentInheritanceChain` for an agent without `settingsBase`, and starts
+    with the agent then `explore` for a `fast` agent. A `fast` agent's
+    `resolveChainAgentCacheTtl` over that chain returns `5m` (Explore's
+    built-in value) when no Settings entry sets a TTL.
+*   `src/node/services/agentDefinitions/agentDefinitionsService.test.ts`
+    (Modify): the descriptor list for a plugin agent with
+    `settingsBase: "explore"` has `aiLayers.ancestors` starting with
+    `explore`, `aiSettingsBase: "explore"`, and `backgroundHint: true` when
+    `background_hint` is set.
+*   `src/browser/utils/workspaceModeAi.test.ts` (Modify): after
+    `setAgentBases` with a descriptor `{id: "ci-watcher", base: "exec",
+    aiSettingsBase: "explore"}`, `resolveConfiguredAiDefaults("ci-watcher",
+    {explore: {modelString: "m-explore"}, exec: {modelString: "m-exec"}},
+    getAgentBases(scope))` returns `m-explore`.
 *   `src/node/services/agentDefinitions/pluginAgentFormat.test.ts` (Modify):
     `model: fast` writes `ai.settingsBase: "explore"`; `is_background: true`
     writes `subagent.background_hint: true`; `background: true` writes
@@ -1759,9 +1905,10 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     holding one runnable agent with `backgroundHint: true` and one without, the
     `task` description has the hint line for the first and the plain line for
     the second, and `run_in_background` still parses to `false` when omitted.
-*   `src/common/orpc/schemas/agentDefinition.test.ts` (Create): a frontmatter parse with the schema from before this PR strips
-    `ai.settingsBase` and `subagent.background_hint` (copy the two schemas
-    from `0f82063e7e` into the test).
+*   `src/common/orpc/schemas/agentDefinition.test.ts` (Create): a frontmatter
+    parse with the schema from before this PR strips `ai.settingsBase` and
+    `subagent.background_hint` (copy the two schemas from `0f82063e7e` into the
+    test).
 
 ### PR 5: Turn-stop text (changes shipped behavior)
 
@@ -2193,8 +2340,9 @@ navigation.
         agents. Spawn `thermo-nuclear-code-quality-review` and expect a report
         from it (success tests 1, 2).
     3.  PR 4: set an Explore model in Settings, then spawn `ci-watcher`. Expect
-        the sub-agent header to show that model, and the `task` tool's agent
-        list to show `ci-watcher` with "[meant to run in the background
+        the sub-agent header to show that model, Settings > Tasks to show the
+        same model for `ci-watcher`, and the `task` tool's agent list to show
+        `ci-watcher` with "[meant to run in the background
         (run_in_background=true)]" (success test 3, CUJ 2).
     4.  PR 7 and PR 8: install the `ralph-loop-cursor` fixture, trust both
         hooks, and run a loop to its promise. Expect "plugin continued turn n of
