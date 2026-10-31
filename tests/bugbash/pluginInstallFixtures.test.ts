@@ -74,6 +74,25 @@ test("claude-market lists five entries, one of them not installable", async () =
   expect(result.marketplace.methods.map((method) => method.kind)).toEqual(["skills"]);
 });
 
+test("cursor-market lists pstack once, with an installable Cursor build and Claude build", async () => {
+  const result = await preview("cursor-market");
+  if (result.kind !== "marketplace") throw new Error(`previewed as a ${result.kind}`);
+  expect(
+    result.marketplace.entries.map((entry) => [
+      entry.name,
+      entry.builds.map((build) => [build.file, build.installable]),
+    ])
+  ).toEqual([
+    [
+      "pstack",
+      [
+        ["cursor", true],
+        ["claude", true],
+      ],
+    ],
+  ]);
+});
+
 test("plain-skills installs as Skills only, without the skill whose description is too long", async () => {
   const skills = await pluginPreview("plain-skills");
   expect(skills.methods.map((method) => method.kind)).toEqual(["skills"]);
