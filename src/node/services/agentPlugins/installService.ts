@@ -4980,17 +4980,8 @@ export class AgentPluginInstallService {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
       const instanceId = this.instanceIdFor(args.name);
-      if (args.state === "trusted" && hook.handler.type === "cursor-command") {
-        const trust = await readPluginHookTrust(this.config.rootDir, instanceId);
-        // Read again here, not taken from the caller: the trust covers the files as they are now.
-        const review = await this.firstTrustFileReview(plugin, hooks, trust);
-        if (review !== undefined && review.digest !== args.fileReviewDigest) {
-          throw new Error(
-            args.fileReviewDigest === undefined
-              ? "Review this plugin's files before you trust its first hook."
-              : "This plugin's files changed since you reviewed them. Review them again."
-          );
-        }
+      if (args.state === "trusted") {
+        await this.assertFilesReviewed({ plugin, hooks, hook, instanceId }, args.fileReviewDigest);
       }
       await setPluginHookTrust(this.config.rootDir, instanceId, {
         key: args.key,
@@ -5000,6 +4991,31 @@ export class AgentPluginInstallService {
         ...(hook.handler.type === "cursor-command" ? { reviewedSha: entry.lockedSha } : {}),
       });
     });
+  }
+
+  /**
+   * Before a Cursor command hook's trust: while getHooks shows the first-trust file review, the
+   * trust needs the digest of that review, read again here, not taken from the caller: the trust
+   * covers the files as they are now.
+   */
+  private async assertFilesReviewed(
+    target: {
+      plugin: AgentPluginInfo;
+      hooks: readonly PluginHookDefinition[];
+      hook: PluginHookDefinition;
+      instanceId: string;
+    },
+    fileReviewDigest: string | undefined
+  ): Promise<void> {
+    if (target.hook.handler.type !== "cursor-command") return;
+    const trust = await readPluginHookTrust(this.config.rootDir, target.instanceId);
+    const review = await this.firstTrustFileReview(target.plugin, target.hooks, trust);
+    if (review === undefined || review.digest === fileReviewDigest) return;
+    throw new Error(
+      fileReviewDigest === undefined
+        ? "Review this plugin's files before you trust its first hook."
+        : "This plugin's files changed since you reviewed them. Review them again."
+    );
   }
 
   /**
