@@ -43,6 +43,7 @@ import {
   createAgentPluginsMcpProvider,
   buildPluginServerKey,
 } from "./mcpConfig";
+import { setPluginHookTrust } from "./pluginHookTrust";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
 import {
@@ -9151,5 +9152,39 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
       ["stop", "trusted"],
       ["afterAgentResponse", "trusted"],
     ]);
+  });
+
+  test("turning a hook off does not end the first-trust review", async () => {
+    await install();
+    const [stop] = (await service.getHooks({ name: "looper" })).hooks;
+    // A decision, not trust: it needs no review and ends none.
+    await service.setHookTrust({
+      name: "looper",
+      key: stop.key,
+      hash: stop.hash,
+      state: "disabled",
+    });
+    expect((await service.getHooks({ name: "looper" })).fileReview).toBeDefined();
+  });
+
+  test("trust of a hook the plugin no longer has does not end the first-trust review", async () => {
+    await install();
+    // A record whose hook an update removed: the review of the files it ran is no review of the
+    // files the plugin has now.
+    await setPluginHookTrust(
+      muxRoot,
+      computePluginInstanceId(path.join(muxRoot, "plugins", "looper")),
+      { key: "cursor:hooks/hooks.json#stop[9]", hash: "a".repeat(64), state: "trusted" }
+    );
+    const { hooks, fileReview } = await service.getHooks({ name: "looper" });
+    expect(fileReview).toBeDefined();
+    await expect(
+      service.setHookTrust({
+        name: "looper",
+        key: hooks[0].key,
+        hash: hooks[0].hash,
+        state: "trusted",
+      })
+    ).rejects.toThrow("Review this plugin's files before you trust its first hook.");
   });
 });
