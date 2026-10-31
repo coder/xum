@@ -941,7 +941,8 @@ const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHo
                   {" "}
                   — {describePluginHookHandler(hook.handler)}
                   {note !== null && `. ${note}`}
-                  {isCursorHookHandler(hook.handler) && ` ${CURSOR_HOOK_REMOTE_NOTE}`}
+                  {isCursorHookHandler(hook.handler) &&
+                    `${note === null ? "." : ""} ${CURSOR_HOOK_REMOTE_NOTE}`}
                 </span>
               </li>
             );
