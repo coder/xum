@@ -384,7 +384,6 @@ describe("sanitizeMermaidSvg", () => {
   it.each([
     ["a long name", `font-family:${"a".repeat(49_000)}`],
     ["a long whitespace run", `fill:${" ".repeat(49_000)}`],
-    ["many parentheses", `fill:${"rgb(".repeat(12_250)}`],
   ])("checks a near-limit style with %s in linear time", (_case, style) => {
     const svg = svgWith(`<rect style="${style}"/>`);
 
@@ -393,6 +392,17 @@ describe("sanitizeMermaidSvg", () => {
     const elapsed = performance.now() - start;
 
     expect(sanitized).toContain("<rect");
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it("returns null for a near-limit style of unclosed parentheses in linear time", () => {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg"><rect style="fill:${"rgb(".repeat(12_250)}"/></svg>`;
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toBeNull();
     expect(elapsed).toBeLessThan(200);
   });
 
@@ -484,5 +494,47 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
       expect([...new Set(htmlParts(parsed))].filter((part) => !kept.has(part))).toEqual([]);
       expect(sanitized).toBe(parsed);
     }
+  });
+
+  // Chromium parses a style while DOMParser builds the tree, in time that doubles with each
+  // color-mix() nested around an invalid value: 1.27 s at depth 22. Pele passes these values
+  // unchanged, and its 50,000-character source limit allows far deeper nesting.
+  const nestedColorMix = (depth: number, after = "") => {
+    let value = "nope(1)";
+    for (let level = 0; level < depth; level++)
+      value = `color-mix(in srgb, ${value}${after}, blue)`;
+    return value;
+  };
+  const sequenceRect = (color: string) =>
+    `sequenceDiagram\n  participant A\n  rect ${color}\n  A->>A: hi\n  end`;
+  it.each([
+    ["a sequence rect", sequenceRect(nestedColorMix(22))],
+    [
+      "a C4 $bgColor",
+      `C4Context\n  Person(a, "A")\n  UpdateElementStyle(a, $bgColor="${nestedColorMix(22)}")`,
+    ],
+    // CSS reads each ')' as a string, so it closes no function.
+    ["a rect with a quoted ) at each level", sequenceRect(nestedColorMix(22, " ')'"))],
+    ["a rect nested 200 deep", sequenceRect(nestedColorMix(200))],
+  ])("returns null for CSS functions nested deeply in %s", (_case, chart) => {
+    const { svg } = renderPele(chart, peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts }));
+    expect(svg).toContain("nope(1)");
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toBeNull();
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it("keeps a label with deeply nested parentheses in its text", () => {
+    const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
+    const { svg } = renderPele(
+      `sequenceDiagram\n  participant A\n  A->>A: ${label}`,
+      peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts })
+    );
+
+    expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toContain(`>${label}<`);
   });
 });
