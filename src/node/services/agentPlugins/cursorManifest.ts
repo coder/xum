@@ -88,8 +88,8 @@ function folderPathRefusal(entry: string): string | undefined {
 
 /**
  * The folder paths of `skills`, `rules` or `agents`, in declared order and without repeats, at
- * most MAX_SKILLS_ROOTS of them. Undefined when the value is not a path or a list of paths: the
- * field is then dropped with a warning, and the default folder applies.
+ * most MAX_SKILLS_ROOTS of them. Undefined when the field is absent, or when the value is not a
+ * path or a list of paths: such a field is dropped with a warning, and the default folder applies.
  */
 function readFolderPaths(
   field: string,
@@ -97,6 +97,7 @@ function readFolderPaths(
   warnings: string[],
   notApplied: AgentPluginNotApplied[]
 ): string[] | undefined {
+  if (value === undefined) return undefined;
   const entries = Array.isArray(value) ? value : [value];
   if (!entries.every((entry): entry is string => typeof entry === "string")) {
     warnings.push(`'${field}' must be a path or a list of paths; ignoring it`);
@@ -107,8 +108,17 @@ function readFolderPaths(
       `'${field}' lists more than ${MAX_SKILLS_ROOTS} paths; reading only the first ${MAX_SKILLS_ROOTS}`
     );
   }
+  return appliedFolders(field, entries.slice(0, MAX_SKILLS_ROOTS), notApplied);
+}
+
+/** The folder paths among `entries`, normalized and without repeats; the rest are listed. */
+function appliedFolders(
+  field: string,
+  entries: string[],
+  notApplied: AgentPluginNotApplied[]
+): string[] {
   const folders: string[] = [];
-  for (const entry of entries.slice(0, MAX_SKILLS_ROOTS)) {
+  for (const entry of entries) {
     const reason = folderPathRefusal(entry);
     if (reason !== undefined) {
       notApplied.push({ part: "field", name: `${field}: ${entry}`, reason });
@@ -120,19 +130,29 @@ function readFolderPaths(
   return folders;
 }
 
-/** Cursor reads one agents folder per path; Xum reads one agents folder in all. */
-function firstAgentsFolder(
-  folders: string[],
+/**
+ * A declared folder list as a `contributes` member. A field that names no folder replaces the
+ * default folder with nothing, so the inert path keeps the default from loading in its place.
+ */
+function declaredFolders(folders: string[]): string[] {
+  return folders.length > 0 ? folders : [INERT_COMPONENT_PATH];
+}
+
+/** `contributes.agents`: Cursor reads every agents path, Xum one agents folder. */
+function agentsFolder(
+  folders: string[] | undefined,
   notApplied: AgentPluginNotApplied[]
-): string | undefined {
-  for (const later of folders.slice(1)) {
+): { agents?: string } {
+  if (folders === undefined) return {};
+  const [first, ...later] = declaredFolders(folders);
+  for (const folder of later) {
     notApplied.push({
       part: "field",
-      name: `agents: ${later}`,
+      name: `agents: ${folder}`,
       reason: "only one agents folder is applied in Xum",
     });
   }
-  return folders[0];
+  return { agents: first };
 }
 
 /**
@@ -168,7 +188,13 @@ function mcpFile(
   return {};
 }
 
-/** Cursor `hooks`: a hooks file path or an inline object. Default `hooks/hooks.json`. */
+/** Until Cursor hooks run (Cursor plugin RFC PR 8), every Cursor hook is listed with this reason. */
+export const CURSOR_HOOKS_REASON = "Cursor hooks run in a later Xum build";
+
+/**
+ * Cursor `hooks`: a hooks file path or an inline object. Default `hooks/hooks.json`. Inline hooks
+ * are listed here; discovery lists a hooks file that exists.
+ */
 function readHooks(
   value: unknown,
   warnings: string[],
@@ -184,7 +210,10 @@ function readHooks(
     });
     return {};
   }
-  if (isPlainObject(value)) return { hooks: value };
+  if (isPlainObject(value)) {
+    notApplied.push({ part: "hook", name: "hooks", reason: CURSOR_HOOKS_REASON });
+    return { hooks: value };
+  }
   if (value !== undefined) warnings.push("'hooks' must be a path or an object; ignoring it");
   return { hooks: "hooks/hooks.json" };
 }
@@ -227,18 +256,12 @@ export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   if (!isPlainObject(raw)) return { manifest: raw, warnings, ruleDirs: [], notApplied: [] };
   const notApplied = notAppliedFields(raw);
   const manifest = readMetadata(raw, warnings);
-  const read = (field: string) =>
-    raw[field] === undefined ? undefined : readFolderPaths(field, raw[field], warnings, notApplied);
+  const read = (field: string) => readFolderPaths(field, raw[field], warnings, notApplied);
   const skills = read("skills");
   const rules = read("rules");
-  const agentFolders = read("agents");
-  const agents =
-    agentFolders === undefined ? undefined : firstAgentsFolder(agentFolders, notApplied);
   manifest.contributes = {
-    ...(skills !== undefined
-      ? { skills: skills.length > 0 ? skills : [INERT_COMPONENT_PATH] }
-      : {}),
-    ...(agentFolders !== undefined ? { agents: agents ?? INERT_COMPONENT_PATH } : {}),
+    ...(skills !== undefined ? { skills: declaredFolders(skills) } : {}),
+    ...agentsFolder(read("agents"), notApplied),
     ...mcpFile(raw.mcpServers, warnings, notApplied),
   };
   return {

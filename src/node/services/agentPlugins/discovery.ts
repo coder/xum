@@ -35,7 +35,11 @@ import {
   type OpenAIPluginExtension,
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
-import { normalizeCursorManifest, type CursorManifestResult } from "./cursorManifest";
+import {
+  CURSOR_HOOKS_REASON,
+  normalizeCursorManifest,
+  type CursorManifestResult,
+} from "./cursorManifest";
 import { convertCursorRule, cursorRuleName, type CursorRuleRefusal } from "./cursorRules";
 import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
@@ -1060,10 +1064,22 @@ async function resolveRuleRoots(args: {
   return { roots, notApplied };
 }
 
+/** The first of `candidates` that exists under `rootReal` (any entry kind), or undefined. */
+async function firstExisting(rootReal: string, candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    const entry = await pluginFs()
+      .lstat(path.join(rootReal, candidate))
+      .catch(() => null);
+    if (entry !== null) return candidate;
+  }
+  return undefined;
+}
+
 /**
  * The parts of a Cursor package that discovery finds on disk and does not apply yet: the MCP file
- * the manifest names (or `mcp.json`, else `.mcp.json`), the hooks file or inline hooks, and a
- * `commands/` folder when the manifest has no `commands` field (that field lists itself).
+ * the manifest names (or `mcp.json`, else `.mcp.json`), the hooks file, and a `commands/` folder
+ * when the manifest has no `commands` field (that field lists itself). The normalizer lists
+ * inline hooks and inline MCP servers.
  */
 async function cursorPackageNotApplied(args: {
   rootReal: string;
@@ -1071,42 +1087,42 @@ async function cursorPackageNotApplied(args: {
   declaredMcp: string | undefined;
   declaresCommands: boolean;
 }): Promise<AgentPluginNotApplied[]> {
-  const exists = (relative: string) =>
-    pluginFs()
-      .lstat(path.join(args.rootReal, relative))
-      .then(
-        () => true,
-        () => false
-      );
-  const entries: AgentPluginNotApplied[] = [];
-  const mcpCandidates =
-    args.declaredMcp !== undefined ? [args.declaredMcp] : ["mcp.json", ".mcp.json"];
-  for (const candidate of mcpCandidates) {
-    if (!(await exists(candidate))) continue;
-    entries.push({
+  const checks: Array<{
+    part: AgentPluginNotApplied["part"];
+    candidates: string[];
+    reason: string;
+  }> = [
+    {
       part: "mcp",
-      name: candidate,
+      candidates: args.declaredMcp !== undefined ? [args.declaredMcp] : ["mcp.json", ".mcp.json"],
       reason: "MCP servers of Cursor plugins load in a later Xum build",
-    });
-    break;
-  }
-  const { hooks } = args;
-  if (hooks !== undefined && (typeof hooks !== "string" || (await exists(hooks)))) {
-    entries.push({
+    },
+    {
       part: "hook",
-      name: typeof hooks === "string" ? hooks : "hooks",
-      reason: "Cursor hooks run in a later Xum build",
-    });
-  }
-  if (!args.declaresCommands && (await exists("commands"))) {
-    entries.push({ part: "command", name: "commands/", reason: "not applied in Xum" });
+      candidates: typeof args.hooks === "string" ? [args.hooks] : [],
+      reason: CURSOR_HOOKS_REASON,
+    },
+    {
+      part: "command",
+      candidates: args.declaresCommands ? [] : ["commands"],
+      reason: "not applied in Xum",
+    },
+  ];
+  const entries: AgentPluginNotApplied[] = [];
+  for (const { part, candidates, reason } of checks) {
+    const found = await firstExisting(args.rootReal, candidates);
+    if (found !== undefined)
+      entries.push({ part, name: part === "command" ? `${found}/` : found, reason });
   }
   return entries;
 }
 
-/** A Cursor package's rule roots and every part of it that Xum does not apply. */
+/**
+ * A Cursor package's rule roots and every part of it that Xum does not apply. Another package
+ * kind (no `cursor` result) has neither.
+ */
 async function resolveCursorParts(args: {
-  cursor: CursorManifestResult;
+  cursor: CursorManifestResult | undefined;
   rawManifest: unknown;
   /** `contributes.mcp` of the normalized manifest. */
   declaredMcp: string | undefined;
@@ -1115,8 +1131,10 @@ async function resolveCursorParts(args: {
   rootReal: string;
   warn: (message: string) => void;
 }): Promise<{ ruleRoots: PluginSkillsRoot[]; notApplied: AgentPluginNotApplied[] }> {
+  const { cursor } = args;
+  if (cursor === undefined) return { ruleRoots: [], notApplied: [] };
   const rules = await resolveRuleRoots({
-    ruleDirs: args.cursor.ruleDirs,
+    ruleDirs: cursor.ruleDirs,
     skillsDirs: args.skillsDirs,
     resolveComponent: args.resolveComponent,
     rootReal: args.rootReal,
@@ -1124,13 +1142,13 @@ async function resolveCursorParts(args: {
   });
   const onDisk = await cursorPackageNotApplied({
     rootReal: args.rootReal,
-    hooks: args.cursor.hooks,
+    hooks: cursor.hooks,
     declaredMcp: args.declaredMcp,
     declaresCommands: isPlainObject(args.rawManifest) && args.rawManifest.commands !== undefined,
   });
   return {
     ruleRoots: rules.roots,
-    notApplied: [...args.cursor.notApplied, ...rules.notApplied, ...onDisk],
+    notApplied: [...cursor.notApplied, ...rules.notApplied, ...onDisk],
   };
 }
 
@@ -1203,6 +1221,32 @@ async function resolvePluginMcpConfig(args: {
   return args.declared === undefined && !rootMcpJson
     ? { mcpConfigPath, mcpConfigDialect: "codex" }
     : { mcpConfigPath };
+}
+
+/**
+ * The MCP file a package kind loads. A skills-only package has none, and the MCP servers of a
+ * Cursor package load in a later Xum build (Cursor plugin RFC PR 3). A Codex or Claude package's
+ * file is in its manifest's dialect.
+ */
+async function resolvePackageMcpConfig(args: {
+  packageKind: {
+    skillsOnly: boolean;
+    claudePackage: boolean;
+    codexFallback: boolean;
+    cursorFallback: boolean;
+  };
+  rootReal: string;
+  declared: string | undefined;
+  resolveComponent: (relativePath: string, expectKind: "file") => Promise<string | undefined>;
+}): Promise<Pick<AgentPluginInfo, "mcpConfigPath" | "mcpConfigDialect">> {
+  const { skillsOnly, claudePackage, codexFallback, cursorFallback } = args.packageKind;
+  if (skillsOnly || cursorFallback) return {};
+  return resolvePluginMcpConfig({
+    rootReal: args.rootReal,
+    declared: args.declared,
+    manifestDialect: claudePackage ? "claude" : codexFallback ? "codex" : undefined,
+    resolveComponent: args.resolveComponent,
+  });
 }
 
 /**
@@ -1500,18 +1544,15 @@ async function discoverPluginAt(args: {
     claude: normalized.claude,
   });
 
+  // Not written for Xum (xumComponentGate).
+  const foreign = claudePackage || cursorFallback || skillsOnly;
   const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
     rootReal,
     manifest,
     manifestRelative,
-    // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
+    // A Claude or Cursor package has no extensions (its normalizer drops them), so it gets no
     // overlay either. Nor does a skills-only package: com.openai can point at hooks.
-    overlay:
-      !codexFallback &&
-      !claudePackage &&
-      !cursorFallback &&
-      !skillsOnly &&
-      !isPlainObject(manifest.extensions?.["com.openai"]),
+    overlay: !codexFallback && !foreign && !isPlainObject(manifest.extensions?.["com.openai"]),
     scope,
     diagnostics,
   });
@@ -1569,38 +1610,27 @@ async function discoverPluginAt(args: {
       })
     : [];
   // Cursor rules load as skills, after every skills root (a skill wins).
-  const cursorParts =
-    cursor !== undefined
-      ? await resolveCursorParts({
-          cursor,
-          rawManifest,
-          declaredMcp: contributes?.mcp,
-          skillsDirs,
-          resolveComponent,
-          rootReal,
-          warn: (message) => {
-            log.debug(`Agent plugin ${pluginDir}: ${message}`);
-            diagnostics.push({ path: rootReal, scope, severity: "warning", message });
-          },
-        })
-      : { ruleRoots: [], notApplied: [] };
+  const cursorParts = await resolveCursorParts({
+    cursor,
+    rawManifest,
+    declaredMcp: contributes?.mcp,
+    skillsDirs,
+    resolveComponent,
+    rootReal,
+    warn: (message) => {
+      log.debug(`Agent plugin ${pluginDir}: ${message}`);
+      diagnostics.push({ path: rootReal, scope, severity: "warning", message });
+    },
+  });
   const allSkillsRoots = [...skillsDirs, ...commandRoots, ...cursorParts.ruleRoots];
-  // MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3).
-  const mcp =
-    skillsOnly || cursorFallback
-      ? {}
-      : await resolvePluginMcpConfig({
-          rootReal,
-          declared: contributes?.mcp,
-          manifestDialect: claudePackage ? "claude" : codexFallback ? "codex" : undefined,
-          resolveComponent,
-        });
+  const mcp = await resolvePackageMcpConfig({
+    packageKind: { skillsOnly, claudePackage, codexFallback, cursorFallback },
+    rootReal,
+    declared: contributes?.mcp,
+    resolveComponent,
+  });
   const { agentsDir: resolvedAgentsDir, ...xumComponents } = await resolveXumComponents({
-    allowed: xumComponentGate({
-      codexFallback,
-      foreign: claudePackage || cursorFallback || skillsOnly,
-      skillsOnly,
-    }),
+    allowed: xumComponentGate({ codexFallback, foreign, skillsOnly }),
     contributes,
     resolveComponent,
   });
