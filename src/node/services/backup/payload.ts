@@ -2799,12 +2799,14 @@ async function passesThroughSymlink(rootPath: string, relativePath: string): Pro
  * through a symlink, leaf included. A user who links `skills/<name>` (or a project's memory
  * folder) into a shared store chose that link, and a backup pushed before it still holds the
  * real folder: refusing the whole restore failed every preview and restore. Push skips
- * symlinks too, so neither direction touches these files. A symlink that appears after this
- * check is still refused when the restore writes.
+ * symlinks too, so neither direction touches these files.
  *
  * `checked` is the skip set a restore's preflight found before the safety snapshot. A restore
- * applies that set instead of looking again: a symlink replaced by a regular file in between
- * would otherwise be overwritten, and the snapshot, taken while it was a link, holds no copy.
+ * keeps every path in it and also skips any path that is a link now. Dropping a checked path
+ * would overwrite a link replaced by a regular file in between, which the snapshot, taken
+ * while it was a link, holds no copy of. Not looking again would let a link created after
+ * the preflight be replaced by a real folder (a shelf entry is renamed aside, not written
+ * through).
  */
 export async function findSymlinkedDestinations(
   muxRoot: string,
@@ -2815,9 +2817,8 @@ export async function findSymlinkedDestinations(
   const skipped = new Set<string>();
   for (const relativePath of relativePaths) {
     const linked =
-      checked === undefined
-        ? await passesThroughSymlink(root.path, relativePath)
-        : checked.includes(relativePath);
+      checked?.includes(relativePath) === true ||
+      (await passesThroughSymlink(root.path, relativePath));
     if (linked) skipped.add(relativePath);
   }
   return skipped;

@@ -614,6 +614,22 @@ describe("BackupService against a real repository", () => {
     );
   });
 
+  it("leaves a shelf entry alone when it becomes a symlink after the snapshot", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await fs.rm(entryPath);
+    await fs.cp(sharedEntry, entryPath, { recursive: true });
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath, { recursive: true });
+      await fs.symlink(sharedEntry, entryPath);
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();
