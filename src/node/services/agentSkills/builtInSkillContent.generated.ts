@@ -3046,7 +3046,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "With no Explore model in Settings, a fast agent runs on Exec's model from Settings, else on the parent's model. The built-in Explore agent sets a 5-minute prompt cache, so a fast agent keeps 5 minutes unless its own card or Explore's card sets another value. `Fast` and other spellings are not `fast`: they use the inherited model.",
       "",
-      "Any agent can set `ai.settingsBase`. Xum ignores it, and logs a warning, when it names a missing agent, the agent itself, an agent whose chain contains the agent, or an agent whose chain sets its own `ai.settingsBase`.",
+      "Any agent can set `ai.settingsBase`. Xum ignores it, and logs a warning, when it names a missing agent, the agent itself, an agent whose chain contains the agent, an agent whose chain has a missing or cyclic base, or an agent whose chain sets its own `ai.settingsBase`.",
       "",
       "#### `is_background: true`",
       "",
