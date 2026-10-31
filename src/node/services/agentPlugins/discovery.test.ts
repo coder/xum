@@ -2474,6 +2474,40 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("refused rules count toward the rule cap", async () => {
+    const broken = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        `rules/r${String(index).padStart(3, "0")}.mdc`,
+        "---\n: [\n---\nBroken\n",
+      ])
+    );
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ...broken,
+      "rules/valid.mdc": rule("Valid"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([]);
+    expect(plugin.notApplied).toHaveLength(256);
+    expect(messages).toContain("More than 256 rules; ignoring the rest");
+  });
+
+  test("a rule that links to an earlier rule's file is refused without a second read", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/a.mdc": rule("A"),
+    });
+    await fs.symlink("a.mdc", path.join(kit.plugin.rootPath, "rules", "b.mdc"));
+    const rediscovered = await discoverAgentPlugins([
+      { path: kit.plugin.containerPath, scope: "global" },
+    ]);
+    const [plugin] = rediscovered.plugins;
+    expect(ruleSkills(plugin)).toEqual([["a", "a.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "b.mdc", reason: "the same file as an earlier rule" },
+    ]);
+  });
+
   test("a root SKILL.md is one skill only without skills/ and a skills field", async () => {
     using rootSkill = await discoverKit({
       ...cursorManifest({ name: "kit" }),

@@ -1002,6 +1002,48 @@ async function ruleRefusal(args: {
   return "warning" in converted ? converted : undefined;
 }
 
+/**
+ * Why one rule file does not load, or undefined when it does. A file that an earlier rule of the
+ * plugin already read (through a link) is not read again, so links to one large file cost one read.
+ */
+async function ruleFileRefusal(args: {
+  dir: string;
+  file: string;
+  name: string;
+  rootReal: string;
+  taken: ReadonlySet<string>;
+  readFiles: Set<string>;
+}): Promise<CursorRuleRefusal | undefined> {
+  const { file, name } = args;
+  if (!SkillNameSchema.safeParse(name).success) {
+    return {
+      reason: "not a valid skill name",
+      warning: `Rule '${file}' has no valid skill name (kebab-case); ignoring it`,
+    };
+  }
+  if (args.taken.has(name)) {
+    return {
+      reason: "a skill or rule of the same name comes first",
+      warning: `Rule '${file}' is ignored: a skill or rule named '${name}' comes first`,
+    };
+  }
+  const canonical = await pluginFs()
+    .realpath(path.join(args.dir, file))
+    .catch(() => undefined);
+  if (canonical !== undefined && args.readFiles.has(canonical)) {
+    return {
+      reason: "the same file as an earlier rule",
+      warning: `Rule '${file}' is the same file as an earlier rule; ignoring it`,
+    };
+  }
+  if (canonical !== undefined) args.readFiles.add(canonical);
+  return ruleRefusal(args);
+}
+
+/**
+ * Every rule file counts toward MAX_PLUGIN_COMMANDS, a refused one too: discovery reads and parses
+ * each one before any consent, so a repository must not get past the cap with files that fail.
+ */
 async function resolveRuleRoots(args: {
   ruleDirs: string[];
   skillsDirs: PluginSkillsRoot[];
@@ -1010,37 +1052,30 @@ async function resolveRuleRoots(args: {
   warn: (message: string) => void;
 }): Promise<{ roots: PluginSkillsRoot[]; notApplied: AgentPluginNotApplied[] }> {
   const taken = await listSkillNames(args.skillsDirs, args.rootReal);
+  const readFiles = new Set<string>();
   const roots: PluginSkillsRoot[] = [];
   const notApplied: AgentPluginNotApplied[] = [];
-  const drop = (file: string, refusal: CursorRuleRefusal): void => {
-    args.warn(refusal.warning);
-    notApplied.push({ part: "rule", name: file, reason: refusal.reason });
-  };
+  let examined = 0;
   for (const relative of args.ruleDirs) {
     const dir = await args.resolveComponent(relative, "directory");
     if (dir === undefined) continue;
     for (const { file, name } of await listRuleFiles(dir)) {
-      if (!SkillNameSchema.safeParse(name).success) {
-        drop(file, {
-          reason: "not a valid skill name",
-          warning: `Rule '${file}' has no valid skill name (kebab-case); ignoring it`,
-        });
-        continue;
-      }
-      if (taken.has(name)) {
-        drop(file, {
-          reason: "a skill or rule of the same name comes first",
-          warning: `Rule '${file}' is ignored: a skill or rule named '${name}' comes first`,
-        });
-        continue;
-      }
-      if (roots.length >= MAX_PLUGIN_COMMANDS) {
+      if (examined >= MAX_PLUGIN_COMMANDS) {
         args.warn(`More than ${MAX_PLUGIN_COMMANDS} rules; ignoring the rest`);
         return { roots, notApplied };
       }
-      const refusal = await ruleRefusal({ dir, file, name, rootReal: args.rootReal });
+      examined++;
+      const refusal = await ruleFileRefusal({
+        dir,
+        file,
+        name,
+        rootReal: args.rootReal,
+        taken,
+        readFiles,
+      });
       if (refusal !== undefined) {
-        drop(file, refusal);
+        args.warn(refusal.warning);
+        notApplied.push({ part: "rule", name: file, reason: refusal.reason });
         continue;
       }
       taken.add(name);
