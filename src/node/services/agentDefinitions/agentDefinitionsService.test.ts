@@ -461,10 +461,19 @@ describe("agentDefinitionsService", () => {
       ]);
     });
 
-    test("keeps the settings base when Explore is disabled", async () => {
-      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, { explore: { enabled: false } });
+    test("keeps the settings base when Explore is disabled, and the renderer still reaches Exec", async () => {
+      const agentAiDefaults: AgentAiDefaults = {
+        explore: { enabled: false },
+        exec: { modelString: "custom:m-exec" },
+      };
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, agentAiDefaults);
       expect(agents.some((agent) => agent.id === "explore")).toBe(false);
       expect(agents.find((agent) => agent.id === "ci-watcher")?.aiSettingsBase).toBe("explore");
+      // A run resolves [explore, exec]; the renderer's walk must not stop at the unlisted Explore.
+      expect(
+        resolveConfiguredAiDefaults("ci-watcher", agentAiDefaults, getAgentAiSettingsBases(agents))
+          .modelString
+      ).toBe("custom:m-exec");
     });
 
     test("leaves out a settings base that names a missing agent", async () => {

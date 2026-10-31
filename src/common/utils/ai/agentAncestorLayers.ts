@@ -109,11 +109,45 @@ export function aiSettingsBaseOf(agent: { base?: string; aiSettingsBase?: string
   return agent.aiSettingsBase ?? agent.base;
 }
 
+export interface ListedAgentAiAncestry {
+  id: string;
+  base?: string;
+  aiSettingsBase?: string;
+  /** The layers a run resolves (agents.list `aiLayers`). */
+  aiLayers?: { ancestors: readonly AgentAiAncestorLayer[] };
+}
+
+/**
+ * The hops of the listed agents' resolved ancestry through agents the list leaves out, such as a
+ * disabled Explore that a `fast` agent's settings base names: without them a declared-base walk
+ * stops at the unlisted agent, while a run goes on to its bases.
+ */
+export function collectUnlistedAncestorHops(
+  agents: readonly ListedAgentAiAncestry[]
+): Map<string, AgentAncestorDescriptor> {
+  const listed = new Set(agents.map((agent) => agent.id));
+  const hops = new Map<string, AgentAncestorDescriptor>();
+  for (const agent of agents) {
+    const ancestors = agent.aiLayers?.ancestors ?? [];
+    ancestors.forEach((layer, index) => {
+      if (listed.has(layer.agentId) || hops.has(layer.agentId)) return;
+      hops.set(layer.agentId, {
+        base: ancestors[index + 1]?.agentId,
+        definitionAiDefaults: layer.definitionAiDefaults,
+      });
+    });
+  }
+  return hops;
+}
+
 /** Agent ID -> AI-settings base, for the declared-base walks (collectDeclaredAncestorLayers). */
 export function getAgentAiSettingsBases(
-  agents: ReadonlyArray<{ id: string; base?: string; aiSettingsBase?: string }>
+  agents: readonly ListedAgentAiAncestry[]
 ): Map<string, string | undefined> {
-  return new Map(agents.map((agent) => [agent.id, aiSettingsBaseOf(agent)]));
+  return new Map([
+    ...[...collectUnlistedAncestorHops(agents)].map(([id, hop]) => [id, hop.base] as const),
+    ...agents.map((agent) => [agent.id, aiSettingsBaseOf(agent)] as const),
+  ]);
 }
 
 /** The settings base a read chain declares: its closest hop's, as in the base-merged frontmatter. */

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 
-import { applySettingsBaseChain } from "./agentAncestorLayers";
+import { applySettingsBaseChain, getAgentAiSettingsBases } from "./agentAncestorLayers";
 
 interface Hop {
   id: string;
@@ -57,5 +57,29 @@ describe("applySettingsBaseChain", () => {
       [explore, { id: "exec" }]
     );
     expect(result).toEqual({ chain: [project, plugin, explore, { id: "exec" }] });
+  });
+});
+
+describe("getAgentAiSettingsBases", () => {
+  const watcher = {
+    id: "ci-watcher",
+    base: "exec",
+    aiSettingsBase: "explore",
+    aiLayers: { ancestors: [{ agentId: "explore" }, { agentId: "exec" }] },
+  };
+
+  test("adds the resolved hops through an agent the list leaves out", () => {
+    expect(getAgentAiSettingsBases([watcher, { id: "exec" }])).toEqual(
+      new Map([
+        ["explore", "exec"],
+        ["ci-watcher", "explore"],
+        ["exec", undefined],
+      ])
+    );
+  });
+
+  test("keeps a listed agent's own base over a hop from another agent's layers", () => {
+    const bases = getAgentAiSettingsBases([watcher, { id: "explore", base: "helper" }]);
+    expect(bases.get("explore")).toBe("helper");
   });
 });
