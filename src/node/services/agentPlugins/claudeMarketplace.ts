@@ -484,6 +484,10 @@ export interface MergedMarketplaceEntry {
   builds: Array<{ file: MarketplaceFile; entry: ClaudeMarketplaceEntry }>;
 }
 
+function entriesOf(marketplace: ClaudeMarketplace | null): ClaudeMarketplaceEntry[] {
+  return marketplace?.entries ?? [];
+}
+
 /**
  * One list from both marketplace files: the Cursor entries in file order, then each Claude entry
  * whose name the Cursor rows lack. A Claude entry joins the Cursor row of its name only when
@@ -493,7 +497,7 @@ export function mergeMarketplaces(
   cursor: ClaudeMarketplace | null,
   claude: ClaudeMarketplace | null
 ): MergedMarketplaceEntry[] {
-  const rows: MergedMarketplaceEntry[] = (cursor?.entries ?? []).map((entry) => ({
+  const rows: MergedMarketplaceEntry[] = entriesOf(cursor).map((entry) => ({
     name: entry.name,
     builds: [{ file: "cursor", entry }],
   }));
@@ -501,7 +505,7 @@ export function mergeMarketplaces(
   const mergeable = new Map(
     rows.flatMap((row) => (row.builds[0].entry.problem === undefined ? [[row.name, row]] : []))
   );
-  for (const entry of claude?.entries ?? []) {
+  for (const entry of entriesOf(claude)) {
     const row = entry.problem === undefined ? mergeable.get(entry.name) : undefined;
     if (row === undefined) {
       rows.push({ name: entry.name, builds: [{ file: "claude", entry }] });
