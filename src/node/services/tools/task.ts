@@ -325,18 +325,19 @@ function toAggregatePendingStatus(
 
 /**
  * The wait error the tool throws. A member's wait error ends that member only when its task did
- * end (`taskEnded`, as a failed launch does); any other wait error is thrown. When every member's
- * wait failed, the first error is thrown. Otherwise the group returns its completed, live or
- * backgrounded members, so a model that retries does not duplicate work that still runs.
+ * end, as a failed launch does (launchEndedTask); any other wait error is thrown. When every
+ * member's wait failed, the first error is thrown. Otherwise the group returns its completed,
+ * live or backgrounded members, so a model that retries does not duplicate work that still runs.
  */
 function waitFailureToRethrow(
-  outcomes: readonly ForegroundWaitOutcome[],
-  taskEnded: (index: number) => boolean
+  taskService: TaskService,
+  tasks: readonly SpawnedTaskInfo[],
+  outcomes: readonly ForegroundWaitOutcome[]
 ): Extract<ForegroundWaitOutcome, { kind: "error" }> | undefined {
   const failures = outcomes.flatMap((outcome, index) =>
-    outcome.kind === "error" ? [{ outcome, index }] : []
+    outcome.kind === "error" ? [{ outcome, taskId: tasks[index]?.taskId }] : []
   );
-  const unexplained = failures.find((failure) => !taskEnded(failure.index));
+  const unexplained = failures.find((failure) => !launchEndedTask(taskService, failure.taskId));
   if (unexplained != null) return unexplained.outcome;
   return failures.length === outcomes.length ? failures[0]?.outcome : undefined;
 }
@@ -865,9 +866,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         throw new Error("Interrupted");
       }
 
-      const unexpectedFailure = waitFailureToRethrow(waitOutcomes, (index) =>
-        launchEndedTask(taskService, createdTasks[index]?.taskId)
-      );
+      const unexpectedFailure = waitFailureToRethrow(taskService, createdTasks, waitOutcomes);
       if (unexpectedFailure) {
         throw unexpectedFailure.error;
       }
