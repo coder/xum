@@ -528,6 +528,39 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe("shared memory\n");
   });
 
+  it("leaves a memory folder alone when it becomes a symlink while the core settings restore", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    await fs.rm(linkPath);
+    await fs.cp(sharedMemory, linkPath, { recursive: true });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const editConfig = config.editConfig.bind(config);
+    let swapped = false;
+    const spy = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fs.rm(linkPath, { recursive: true });
+        await fs.symlink(sharedMemory, linkPath);
+      }
+      return await editConfig(...args);
+    });
+    try {
+      const restored = await service.restore(settings);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(swapped).toBe(true);
+      expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+      expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+        "global instructions\n"
+      );
+      expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe(
+        "shared memory\n"
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("leaves a skipped symlinked memory folder alone when it becomes a folder after the snapshot", async () => {
     const { memoryDir } = await linkMatchedProjectMemory();
     const linkPath = path.join(muxRoot, memoryDir);

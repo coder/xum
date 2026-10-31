@@ -972,9 +972,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // lock, or the registration read above may no longer describe the project set.
             await registration.assertStillOwned();
             const coreResult = await restoreCore(registration);
+            // Again after the core writes, keeping every path skipped above: a memory path
+            // turned into a link meanwhile is left alone (its snapshot copy is already taken)
+            // instead of failing the restore after the settings changed.
+            const writable = await omitSymlinkedProjectMemory(muxRoot, matched, memory.skipped);
+            memorySymlinkSkipped.push(
+              ...writable.skipped.filter((file) => !memory.skipped.includes(file))
+            );
             // Matched entries restore verbatim, exactly what the preview promised. Imports
             // are executed separately by the service, after project registration.
-            for (const match of matched) {
+            for (const match of writable.matched) {
               let written: string[];
               try {
                 await registration.assertStillOwned();
