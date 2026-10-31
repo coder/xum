@@ -244,7 +244,8 @@ Trust covers the entry, not the scripts it runs. A hook can run any file in the 
 
 - When a plugin first has a hook that can run, the install preview lists every file of the plugin under **Files**, as `file <path> added`. An update that adds the plugin's first such hook lists every file among its changes.
 - Later updates list each file that the update adds, changes, or removes.
-- A UTF-8 text file of at most 64 KiB shows its text. A symlink shows its link text. Other files show only the row.
+- A UTF-8 text file of at most 64 KiB shows its text. A symlink shows its link text. Any other file shows only the row, with "(contents not shown: binary or larger than 64 KiB)".
+- Xum marks invisible and bidi control characters in file paths, file texts, and the preview's warnings as `<U+XXXX>`, for example `<U+202E>`.
 - If Xum cut a long text, Xum does not install or update the plugin until you select **Show full text** on it.
 - A review too large to show fails with "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
 
