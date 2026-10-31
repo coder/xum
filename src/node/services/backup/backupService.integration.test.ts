@@ -468,6 +468,25 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
   });
 
+  it("backs up a skill folder linked in from a shared skills store (#7775)", async () => {
+    // `~/.xum/skills/gh-stack -> ~/.agents/skills/gh-stack`: the skill is the user's, kept in
+    // a store other tools read too, and a push that skipped the link dropped it from the backup.
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await writeFixtureFile(sharedSkill, "references/usage.md", "shared reference\n");
+    await fs.symlink(sharedSkill, path.join(muxRoot, "skills/gh-stack"));
+
+    await pushOrThrow();
+
+    const clone = await cloneOrigin("verify-linked-skill");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/skills/gh-stack/SKILL.md");
+    expect(files).toContain("mux/skills/gh-stack/references/usage.md");
+    expect(await fs.readFile(path.join(clone, "mux/skills/gh-stack/SKILL.md"), "utf-8")).toBe(
+      "shared skill\n"
+    );
+  });
+
   it("leaves a skipped symlink destination alone when it becomes a file after the snapshot", async () => {
     await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
     await pushOrThrow();
