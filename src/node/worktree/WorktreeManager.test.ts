@@ -132,7 +132,6 @@ async function installStalledOriginFetch(fixture: { rootDir: string; projectPath
   };
 }
 
-/** Routes the fixture's origin fetches through an upload-pack shim that counts its runs. */
 async function countOriginUploadPacks(
   fixture: { rootDir: string; projectPath: string },
   delaySeconds = 0
@@ -2024,7 +2023,7 @@ describe("WorktreeManager.createWorkspace", () => {
       const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
       const uploadPackRuns = await countOriginUploadPacks(fixture, 1);
       // Existing branches: `worktree add -b` writes upstream config, and concurrent writers
-      // fail on .git/config.lock with or without a shared fetch.
+      // fail on .git/config.lock.
       const branches = ["joined-1", "joined-2", "joined-3"];
       for (const branchName of branches) {
         execFileSync("git", ["branch", branchName], { cwd: fixture.projectPath });

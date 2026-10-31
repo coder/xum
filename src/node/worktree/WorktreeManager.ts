@@ -68,26 +68,18 @@ const branchRefLocks = new MutexMap<string>();
 type OriginFetchOutcome =
   | { kind: "fetched" }
   | { kind: "timed-out" }
-  // The branch was never pushed (common for sub-agent local-only branches).
-  | { kind: "missing-ref" }
+  | { kind: "not-on-origin" }
   | { kind: "failed"; message: string };
 
 interface SharedOriginFetch {
-  /** Never rejects. */
   readonly outcome: Promise<OriginFetchOutcome>;
-  /** performance.now() when `outcome` resolved; set before any waiter resumes. */
   settledAtMs?: number;
   waiters: number;
   readonly controller: AbortController;
 }
 
-/**
- * One origin fetch per repository and branch, shared per WORKTREE_CREATE_FETCH_REUSE_MS;
- * module-level because each runtime constructs its own manager.
- */
 const originFetches = new Map<string, SharedOriginFetch>();
 
-/** Drops settled fetches the reuse window has passed; a running fetch stays until it settles. */
 function sweepOriginFetches(now: number): void {
   for (const [key, { settledAtMs }] of originFetches) {
     if (settledAtMs !== undefined && now - settledAtMs >= WORKTREE_CREATE_FETCH_REUSE_MS) {
@@ -96,8 +88,7 @@ function sweepOriginFetches(now: number): void {
   }
 }
 
-/** The last waiter to leave a running fetch unpublishes it before anyone joins, then kills git. */
-function leaveOriginFetch(key: string, entry: SharedOriginFetch): void {
+function leaveOriginFetchAndStopIfAbandoned(key: string, entry: SharedOriginFetch): void {
   entry.waiters -= 1;
   if (entry.waiters > 0 || entry.settledAtMs !== undefined) return;
   if (originFetches.get(key) === entry) originFetches.delete(key);
@@ -388,7 +379,12 @@ export class WorktreeManager {
     }
     if (!args.remoteSyncAllowed) return false;
     return (
-      (await this.fetchOriginTrunk(projectPath, trunkBranch, args.initLogger, noHooksEnv)) &&
+      (await this.fetchOriginTrunk(
+        projectPath,
+        trunkBranch,
+        args.initLogger,
+        noHooksEnv?.signal
+      )) &&
       this.canFastForwardToOrigin(projectPath, trunkBranch, args.initLogger, noHooksEnv?.signal)
     );
   }
@@ -668,7 +664,7 @@ export class WorktreeManager {
       projectPath,
       trunkBranch,
       initLogger,
-      noHooksEnv,
+      noHooksEnv?.signal,
       DEFERRED_SYNC_FALLBACK
     );
     if (
@@ -789,14 +785,11 @@ export class WorktreeManager {
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
-    noHooksEnv: GitExecOptions,
+    signal: AbortSignal | undefined,
     fallback = "using local branch state"
   ): Promise<boolean> {
-    // Only trusted projects fetch (remoteSyncAllowed), so every fetch runs with the process env
-    // and one fetch can serve every caller.
-    assert(noHooksEnv?.env === undefined, "fetchOriginTrunk: origin fetches use the process env");
     initLogger.logStep(`Fetching latest from origin/${trunkBranch}...`);
-    const outcome = await this.joinOriginFetch(projectPath, trunkBranch, initLogger, noHooksEnv);
+    const outcome = await this.joinOriginFetch(projectPath, trunkBranch, initLogger, signal);
     switch (outcome.kind) {
       case "fetched":
         initLogger.logStep("Fetched latest from origin");
@@ -808,7 +801,7 @@ export class WorktreeManager {
         );
         return false;
       }
-      case "missing-ref":
+      case "not-on-origin":
         initLogger.logStep(`Branch "${trunkBranch}" not found on origin; ${fallback}.`);
         return false;
       case "failed":
@@ -817,14 +810,12 @@ export class WorktreeManager {
     }
   }
 
-  /** See WORKTREE_CREATE_FETCH_REUSE_MS. Throws only when the caller aborts. */
   private async joinOriginFetch(
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
-    noHooksEnv: GitExecOptions
+    callerSignal: AbortSignal | undefined
   ): Promise<OriginFetchOutcome> {
-    const callerSignal = noHooksEnv?.signal;
     callerSignal?.throwIfAborted();
     const now = performance.now();
     sweepOriginFetches(now);
@@ -837,7 +828,6 @@ export class WorktreeManager {
     }
     entry.waiters += 1;
     try {
-      // One caller's abort must not kill a fetch that other creations still wait on.
       const result = await raceWithAbortAndTimeout(entry.outcome, { signal: callerSignal });
       if (result.kind !== "ok") {
         callerSignal?.throwIfAborted();
@@ -845,7 +835,7 @@ export class WorktreeManager {
       }
       return result.value;
     } finally {
-      leaveOriginFetch(key, entry);
+      leaveOriginFetchAndStopIfAbandoned(key, entry);
     }
   }
 
@@ -853,8 +843,6 @@ export class WorktreeManager {
     const controller = new AbortController();
     // A credential helper such as Coder's askpass can block the fetch indefinitely while it waits
     // for external authentication, and even a killed fetch leaves helpers holding the stdio pipes.
-    // Bound the fetch separately from caller cancellation so a deadline falls back to the local
-    // trunk while an explicit abort still cancels creation. Joiners never extend it.
     const deadline = AbortSignal.timeout(this.fetchTimeoutMs);
     const run = async (): Promise<OriginFetchOutcome> => {
       try {
@@ -879,7 +867,7 @@ export class WorktreeManager {
         }
         const message = getErrorMessage(error);
         return message.includes("couldn't find remote ref")
-          ? { kind: "missing-ref" }
+          ? { kind: "not-on-origin" }
           : { kind: "failed", message };
       }
     };

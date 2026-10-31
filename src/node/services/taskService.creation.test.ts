@@ -1794,7 +1794,6 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
-  // create is the direct launch (the task tool's n loop); createMany launches reserved tasks.
   for (const launch of ["create", "createMany"] as const) {
     test(`a burst of forks from one parent (${launch}) runs one origin fetch and bases every child on it`, async () => {
       const config = await createTestConfig(rootDir);
