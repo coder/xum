@@ -17,13 +17,13 @@ import * as path from "node:path";
 import { tool, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DevToolsLogEntry } from "@/common/types/devtools";
 import {
   createMuxMessage,
   filterOrphanedMcpPromptSnapshots,
   type MuxMessage,
   type PluginHookContextEntry,
+  type PostCompactionContext,
   type SystemSectionRecords,
 } from "@/common/types/message";
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -31,6 +31,7 @@ import assert from "@/common/utils/assert";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { HistoryService } from "@/node/services/historyService";
+import { omitPostCompactionContextFrom } from "@/node/services/postCompactionContext";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -90,7 +91,6 @@ export interface ReplayFixtureTurnSpec {
   /** Request-time inputs beyond chat.jsonl — logged in the turn envelope. */
   planContentForTransition?: string;
   planFilePath?: string;
-  postCompactionAttachments?: PostCompactionAttachment[];
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
   /** MCP Apps model context message (request-only, never in chat.jsonl). */
@@ -102,6 +102,8 @@ export interface ReplayFixtureTurnSpec {
   systemVolatileSuffixLength?: number;
   /** Set false to simulate devtools logging being off for this turn. */
   recordDevtools?: boolean;
+  /** Leave the boundary's header out from this turn on, as AgentSession's context-exceeded retry does. */
+  omitPostCompactionContext?: boolean;
   /**
    * Emit this many extra turn-envelope rows (same requestHistorySequence)
    * before the final one — simulates retried attempts whose streams failed.
@@ -184,6 +186,7 @@ export async function appendReplayFixtureTurn(
     ...(spec.pluginHookContext != null ? { pluginHookContext: spec.pluginHookContext } : {}),
   });
   const requestHistorySequence = await appendOrThrow(ctx, userMessage);
+  await omitFixturePostCompactionContext(ctx, spec, requestHistorySequence);
 
   // The request is built from history as read BEFORE the assistant row is
   // appended — same ordering as AgentSession.streamWithHistory.
@@ -212,7 +215,6 @@ export async function appendReplayFixtureTurn(
       anthropicCacheTtl: spec.anthropicCacheTtl,
       planContentForTransition: spec.planContentForTransition,
       planFilePath: spec.planFilePath,
-      postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuationMessage: spec.partialContinuation,
       mcpAppModelContextMessage:
         spec.envelopeOmitsMcpAppModelContext === true ? undefined : spec.mcpAppModelContext,
@@ -281,6 +283,20 @@ export async function appendReplayFixtureTurn(
   }
 }
 
+async function omitFixturePostCompactionContext(
+  ctx: ReplayFixtureSessionContext,
+  spec: ReplayFixtureTurnSpec,
+  requestHistorySequence: number
+): Promise<void> {
+  if (!spec.omitPostCompactionContext) return;
+  const history = await ctx.historyService.getHistoryFromLatestBoundary(ctx.workspaceId);
+  assert(history.success, "fixture history read failed");
+  const omitted = omitPostCompactionContextFrom(history.data[0], requestHistorySequence);
+  assert(omitted != null, "fixture boundary has no post-compaction header to omit");
+  const result = await ctx.historyService.updateHistory(ctx.workspaceId, omitted);
+  assert(result.success, "fixture boundary update failed");
+}
+
 function fixtureModel(spec: ReplayFixtureTurnSpec): string {
   return spec.liveToolInstructions == null ? REPLAY_FIXTURE_MODEL : REPLAY_FIXTURE_ROWS_MODEL;
 }
@@ -316,7 +332,6 @@ async function buildReplayedFixtureRequest(
     anthropicCacheTtl: spec.anthropicCacheTtl,
     planContentForTransition: spec.planContentForTransition,
     planFilePath: spec.planFilePath,
-    postCompactionAttachments: spec.postCompactionAttachments,
     partialContinuation: spec.partialContinuation,
     mcpAppModelContext: spec.mcpAppModelContext,
     // Production derives these from the request tools (assemblePromptPayload).
@@ -364,7 +379,6 @@ async function buildLiveFixtureRequest(
     anthropicCacheTtl: spec.anthropicCacheTtl,
     planContentForTransition: spec.planContentForTransition,
     planFilePath: spec.planFilePath,
-    postCompactionAttachments: spec.postCompactionAttachments,
     requestContextMessage: spec.mcpAppModelContext,
     compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
     modelString: REPLAY_FIXTURE_ROWS_MODEL,
@@ -406,7 +420,8 @@ async function buildLiveFixtureRequest(
 export async function appendReplayFixtureCompactionBoundary(
   ctx: ReplayFixtureSessionContext,
   summaryText: string,
-  compactionEpoch: number
+  compactionEpoch: number,
+  postCompactionContext?: PostCompactionContext
 ): Promise<void> {
   ctx.turnCounter += 1;
   const boundaryMessage = createMuxMessage(
@@ -418,6 +433,7 @@ export async function appendReplayFixtureCompactionBoundary(
       compactionBoundary: true,
       compacted: true,
       compactionEpoch,
+      postCompactionContext,
     }
   );
   await appendOrThrow(ctx, boundaryMessage);

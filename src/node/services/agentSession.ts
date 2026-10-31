@@ -36,6 +36,7 @@ import {
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
+  isDurableContextBoundaryMarker,
   isProviderEligibleMessage,
   leavesCompactionFollowUpPending,
   sliceMessagesForProviderFromLatestContextBoundary,
@@ -120,6 +121,7 @@ import type {
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
+import { POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS } from "@/constants/compaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
   mergeTurnStopContinuation,
@@ -174,6 +176,7 @@ import {
 import {
   FileChangeTracker,
   createFileChangeNotificationMessage,
+  type FileChangeDetection,
   type FileState,
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
@@ -219,11 +222,12 @@ import {
   type MuxMessage,
   type MuxMetadata,
   type PluginHookContextEntry,
+  type PostCompactionContext,
+  type PostCompactionPlan,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { toValidGoalId } from "@/common/types/goal";
-import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   carriedPlanReviewFeedback,
@@ -272,6 +276,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
+  isCompactionRequestTurn,
   type CompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
 import {
@@ -286,7 +291,7 @@ import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
-import { AttachmentService } from "./attachmentService";
+import { AttachmentService, type PlanFileRead } from "./attachmentService";
 import { generateArtifactsIndexAttachment } from "./artifactVersionsOperations";
 import type { TodoItem } from "@/common/types/tools";
 import type {
@@ -294,12 +299,15 @@ import type {
   PostCompactionAttachment,
   PostCompactionExclusions,
 } from "@/common/types/attachment";
-import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
 
+import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import {
-  extractEditedFileDiffs,
-  type FileEditDiff,
-} from "@/common/utils/messages/extractEditedFiles";
+  findPostCompactionPlan,
+  findPostCompactionContextBoundaryId,
+  omitPostCompactionContextFrom,
+  renderPostCompactionContext,
+  type PostCompactionContextInput,
+} from "./postCompactionContext";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
@@ -333,8 +341,6 @@ import {
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createLoadedSkillSnapshot,
-  extractLoadedSkillSnapshotsFromMessages,
-  mergeLoadedSkillSnapshots,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { createSkillArgumentSubstituter } from "@/node/services/agentSkills/skillArguments";
@@ -503,6 +509,20 @@ function goalAdvancementSendOptions(
   return isHeartbeat ? undefined : options;
 }
 
+/**
+ * The boundary whose header a context_exceeded retry may leave out. A compaction request
+ * answers that error with its trim and its own retry. The trim can drop the header row, so a
+ * later overflow does not show that the header caused it.
+ */
+function findOmittableHeaderBoundaryId(
+  options: SendMessageOptions | undefined,
+  requestMessages: readonly MuxMessage[]
+): string | undefined {
+  const muxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+  if (isCompactionRequestTurn(options?.agentId, muxMetadata, requestMessages)) return undefined;
+  return findPostCompactionContextBoundaryId(requestMessages);
+}
+
 type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
@@ -551,6 +571,19 @@ class FollowUpReadError extends Error {}
  */
 function overflowedModel(request: { modelString: string }, failedModel: string | undefined) {
   return failedModel ?? request.modelString;
+}
+
+/** The header's plan baseline for a plan read with a stat first; null without one. */
+function postCompactionPlan(
+  runtime: Runtime,
+  plan: PlanFileRead | null
+): PostCompactionPlan | null {
+  if (plan?.modifiedTimeMs == null) return null;
+  return {
+    path: runtime.normalizePath(plan.planFilePath, "/"),
+    content: plan.planContent,
+    modifiedTimeMs: plan.modifiedTimeMs,
+  };
 }
 
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
@@ -1729,19 +1762,7 @@ export class AgentSession {
   };
 
   /**
-   * Track turns since last post-compaction attachment injection.
-   * Start at max to trigger immediate injection on first turn after compaction.
-   */
-  private turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
-
-  /**
-   * Flag indicating compaction has occurred in this session.
-   * Used to enable the cooldown-based attachment injection.
-   */
-  private compactionOccurred = false;
-
-  /**
-   * Retain the exact injected snapshot so a late completion cannot consume a replacement.
+   * Retain the exact consumed snapshot so a late completion cannot consume a replacement.
    *
    * This is intentionally delayed until stream-end so a crash mid-stream doesn't lose the diffs.
    */
@@ -1798,8 +1819,17 @@ export class AgentSession {
    */
   private turnStartedByUserMessage = false;
 
-  /** Track user message ids that already retried without post-compaction injection. */
+  /** Track user message ids that already retried without the post-compaction header. */
   private readonly postCompactionRetryAttempts = new Set<string>();
+
+  /** The boundary whose post-compaction header the active stream's request rendered. */
+  private activeStreamPostCompactionBoundaryId: string | undefined;
+
+  /**
+   * The latest boundary when turn start last took the plan baseline from it (null without a
+   * boundary); undefined until the first turn of this session (seedPlanBaselineFromBoundary).
+   */
+  private planBaselineBoundaryId: string | null | undefined;
 
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
@@ -1840,9 +1870,6 @@ export class AgentSession {
 
   /** Last lifecycle snapshot emitted to live subscribers (used for change detection only). */
   private lastEmittedStreamLifecycle: StreamLifecycleSnapshot | null = null;
-
-  /** Tracks whether the current stream included post-compaction attachments. */
-  private activeStreamHadPostCompactionInjection = false;
 
   /**
    * muxMetadata of the queued entry currently being dispatched, held from
@@ -2078,7 +2105,7 @@ export class AgentSession {
       dispatchPendingFollowUp: async (summaryId, admissionStale) => {
         await this.dispatchPendingFollowUp(summaryId ?? undefined, admissionStale);
       },
-      buildAttachments: (input) => this.buildAttachmentsFromContext(input),
+      buildPostCompactionContext: (input) => this.buildPostCompactionContext(input),
       emitChatEvent: (event) => this.emitChatEvent(event),
       onCompactionComplete: (metadata) => onCompactionComplete?.(metadata),
       onIdleCompactionOutcome: (success) => onIdleCompactionOutcome?.(success),
@@ -6559,7 +6586,6 @@ export class AgentSession {
         modelForStream,
         optionsForStream,
         undefined,
-        undefined,
         agentInitiated,
         preparedTurnAbortController.signal,
         goalKind,
@@ -6762,7 +6788,6 @@ export class AgentSession {
         preparedTurn,
         modelForStream,
         optionsForStream,
-        undefined,
         undefined,
         internal?.agentInitiated,
         startupController?.signal,
@@ -7350,7 +7375,6 @@ export class AgentSession {
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
         recordProposedPlan: this.recordProposedPlan,
-        postCompactionAttachments: null,
         resolveMemoryContext: (model) => this.resolveMemoryContext(model, cache, { windowKey }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
@@ -8770,7 +8794,6 @@ export class AgentSession {
     modelString: string,
     options?: ResolvedSendMessageOptions,
     openaiTruncationModeOverride?: "auto" | "disabled",
-    disablePostCompactionAttachments?: boolean,
     agentInitiated?: boolean,
     abortSignal?: AbortSignal,
     goalKind?: GoalSyntheticMessageKind,
@@ -8841,8 +8864,8 @@ export class AgentSession {
       this.contextController.onStreamStarting();
       this.clearLiveUsageState();
       this.pendingPostCompactionStateToAcknowledge = null;
+      this.activeStreamPostCompactionBoundaryId = undefined;
       this.activeStreamHadAnyDelta = false;
-      this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
       // Provider-start fence closes over the epoch captured at this turn's admission (never
       // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
@@ -8971,7 +8994,7 @@ export class AgentSession {
       const fileChangeDetection =
         preparedRequest || leaseRefusal != null
           ? { attachments: [], commit: () => undefined }
-          : await this.fileChangeTracker.getChangedAttachments();
+          : await this.detectFileChanges();
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }
@@ -9069,6 +9092,11 @@ export class AgentSession {
         }
       }
 
+      this.activeStreamPostCompactionBoundaryId = findOmittableHeaderBoundaryId(
+        options,
+        requestMessages
+      );
+
       // Capture the current user message id so retries are stable across assistant message ids.
       // Retry-eligible rows only: startup recovery matches this persisted ID
       // against shouldUseUserMessageForRetry candidates, so selecting an
@@ -9097,21 +9125,16 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      // Check if post-compaction attachments should be injected.
-      const postCompactionAttachments =
-        disablePostCompactionAttachments === true || preparedRequest != null || leaseRefusal != null
-          ? null
-          : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled());
-      if (isStreamStartAborted()) {
-        return Ok(undefined);
+      if (preparedRequest == null && leaseRefusal == null) {
+        await this.consumePendingPostCompactionState(historyResult.data);
+        if (isStreamStartAborted()) {
+          return Ok(undefined);
+        }
       }
 
       // #4476: from here the provider can run tools in the checkout, so another backend's rename
       // or removal must have seen this turn's lease (confirmed above; a running one refused it).
       if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
-
-      this.activeStreamHadPostCompactionInjection =
-        postCompactionAttachments !== null && postCompactionAttachments.length > 0;
 
       // Apply per-model thinking floors once so desktop, mobile, and ACP requests match.
       // Gateway-preserving key first (an explicit coder:<instance>/<model>
@@ -9227,10 +9250,9 @@ export class AgentSession {
         muxMetadata: streamMuxMetadata,
         recordFileState,
         recordProposedPlan: this.recordProposedPlan,
-        postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
         // listing needs a running runtime). Still ordered after the
-        // post-compaction check above: a just-consumed compaction boundary has
+        // post-compaction step above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
         // The window's first row keys the saved context (see resolveMemoryContext).
         resolveMemoryContext: (forModelString) =>
@@ -9312,7 +9334,6 @@ export class AgentSession {
               recovery.model,
               rolled.data.options ?? options,
               openaiTruncationModeOverride,
-              true,
               agentInitiated,
               abortSignal,
               goalKind,
@@ -9642,7 +9663,6 @@ export class AgentSession {
         context.modelString,
         retryOptions,
         openaiTruncation,
-        undefined,
         retryAgentInitiated,
         undefined,
         retryGoalKind,
@@ -9680,9 +9700,39 @@ export class AgentSession {
     return true;
   }
 
+  /**
+   * Mark the boundary row's header as left out of the failed request and every later one. The
+   * mark is in chat.jsonl, so the header stays out after a restart, and replay still rebuilds
+   * the earlier requests of the window with it.
+   */
+  private async omitPostCompactionContextFromFailedRequest(
+    boundaryId: string,
+    failedMessageId: string
+  ): Promise<void> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const boundary = history.data.find((message) => message.id === boundaryId);
+    if (!boundary) return;
+    const failed = history.data.find((message) => message.id === failedMessageId);
+    const omitted = omitPostCompactionContextFrom(
+      boundary,
+      failed?.metadata?.requestHistorySequence ?? newestHistorySequence(history.data)
+    );
+    if (!omitted) return;
+    const updated = await this.historyService.updateHistory(this.workspaceId, omitted);
+    if (!updated.success) throw new Error(updated.error);
+    // The next send reads the boundary's estimate again, now without the header.
+    this.lastUsageState = undefined;
+  }
+
+  /**
+   * #1932: a post-compaction header can push the first request of a window over the context
+   * limit. Only token-budget mode rolls over on that error, so other modes would fail every turn.
+   * Retry once without the header, and keep it out of later requests for this boundary.
+   */
   private async maybeRetryWithoutPostCompactionOnContextExceeded(
     data: { messageId: string; errorType?: string },
-    pendingState = this.pendingPostCompactionStateToAcknowledge
+    pendingState: typeof this.pendingPostCompactionStateToAcknowledge
   ): Promise<boolean> {
     const expectedTurnId = this.coordinator.turnId;
     const expectedOperationId = this.coordinator.operationId;
@@ -9690,8 +9740,8 @@ export class AgentSession {
       return false;
     }
 
-    // Only retry if we actually injected post-compaction context.
-    if (!this.activeStreamHadPostCompactionInjection) {
+    const boundaryId = this.activeStreamPostCompactionBoundaryId;
+    if (boundaryId == null) {
       return false;
     }
 
@@ -9712,22 +9762,28 @@ export class AgentSession {
 
     this.postCompactionRetryAttempts.add(requestId);
 
+    // The next compaction must not carry the same context forward again. Discard before the
+    // header is left out, and fail closed if either step throws: once the header is out, no
+    // later request hits this path to discard it, so the next compaction would merge it again.
+    try {
+      await this.contextController.discardFailedCarryover(pendingState);
+      this.onPostCompactionStateChange?.();
+      await this.omitPostCompactionContextFromFailedRequest(boundaryId, data.messageId);
+    } catch (error) {
+      log.warn("Failed to discard the post-compaction context; not retrying without it", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+      // A later retry of this request must still be able to discard and retry.
+      this.postCompactionRetryAttempts.delete(requestId);
+      return false;
+    }
+
     log.info("Post-compaction context hit context limit; retrying once without it", {
       workspaceId: this.workspaceId,
       requestId,
       model: context.modelString,
     });
-
-    // The post-compaction context is likely the culprit; discard it so we don't loop.
-    try {
-      await this.contextController.discardFailedCarryover(pendingState);
-      this.onPostCompactionStateChange?.();
-    } catch (error) {
-      log.warn("Failed to discard pending post-compaction state", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
 
     // Abort the failed assistant placeholder and clean up persisted partial/history state.
     this.resetActiveStreamState();
@@ -9748,7 +9804,6 @@ export class AgentSession {
       return false;
     }
 
-    // Retry the same request, but without post-compaction injection.
     if (!this.coordinator.isCurrentOperation(expectedOperationId)) return false;
     let claimedTurn: TurnId | undefined;
     using _preparation = {
@@ -9780,7 +9835,6 @@ export class AgentSession {
         context.modelString,
         context.options,
         context.openaiTruncationModeOverride,
-        true,
         context.agentInitiated,
         undefined,
         context.goalKind,
@@ -9928,7 +9982,7 @@ export class AgentSession {
     this.activeStreamContext = undefined;
     this.activeStreamUserMessageId = undefined;
     this.activeStreamStartedAtMs = undefined;
-    this.activeStreamHadPostCompactionInjection = false;
+    this.activeStreamPostCompactionBoundaryId = undefined;
     this.activeStreamHadAnyDelta = false;
     this.pendingPostCompactionStateToAcknowledge = null;
   }
@@ -9996,7 +10050,6 @@ export class AgentSession {
             model,
             rolled.data.options ?? context.options,
             context.openaiTruncationModeOverride,
-            true,
             context.agentInitiated,
             undefined,
             context.goalKind,
@@ -13373,18 +13426,15 @@ export class AgentSession {
    * Discard cumulative post-compaction carryover when a NEW context segment
    * starts (context reset, full history clear, destructive replace). The
    * cached read-file paths, loaded skills, and pending diff snapshot
-   * summarize PRE-boundary epochs; injecting them into a later turn would
-   * resurrect context the user explicitly discarded and tell the model files
-   * were "previously read" when their contents are gone from active context.
-   * Covers both injection routes: the immediate pending-state path (on-disk
-   * post-compaction.json) and the periodic capture of qualified carryover.
+   * summarize PRE-boundary epochs; a later compaction header built from them
+   * would resurrect context the user explicitly discarded and tell the model
+   * files were "previously read" when their contents are gone from active
+   * context.
    */
   async clearPostCompactionState(): Promise<void> {
     await this.discardMemoryContext();
-    // In-memory clears stay unconditional: they stop THIS session from
-    // injecting carryover even when the durable discard below fails.
-    this.compactionOccurred = false;
-    this.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
+    // The in-memory clear stays unconditional: it stops THIS session from
+    // acknowledging carryover even when the durable discard below fails.
     this.pendingPostCompactionStateToAcknowledge = null;
     // The destructive history operation already fenced its captured context under the locks.
     // Retire compatible old bytes for downgrades; preserve newer publications and unknown schemas.
@@ -13478,94 +13528,90 @@ export class AgentSession {
     await this.memoryContextStore.discard();
   }
 
-  /**
-   * Get post-compaction attachments if they should be injected this turn.
-   *
-   * Logic:
-   * - On first turn after compaction: inject immediately, clear file state cache
-   * - Subsequent turns: inject every TURNS_BETWEEN_ATTACHMENTS turns
-   *
-   * @returns Attachments to inject, or null if none needed
-   */
-  private async getPostCompactionAttachmentsIfNeeded(
-    includeReadFiles: boolean
-  ): Promise<PostCompactionAttachment[] | null> {
-    // Check if compaction just occurred (immediate injection with cached post-compaction state)
-    const pendingState = await this.contextController.compaction.peekPendingState();
-    if (pendingState !== null) {
-      this.pendingPostCompactionStateToAcknowledge = pendingState;
-      this.compactionOccurred = true;
-      this.turnsSinceLastAttachment = 0;
-      // Compaction boundary: invalidate the session-cached memory context so
-      // the next stream recomputes the index from current files.
-      await this.discardMemoryContext();
-      // Clear file state cache since history context is gone
-      this.clearFileState();
-
-      return this.buildAttachmentsFromContext({
-        diffs: pendingState.diffs,
-        loadedSkills: pendingState.loadedSkills,
-        // Read tracking is internal bookkeeping in both modes but only ever
-        // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
-        readFilePaths: includeReadFiles ? pendingState.readFiles : [],
-        // Compaction just completed, so every already-completed report predates the boundary.
-        // Wall clock: TaskService and WorkflowService stamp report completion with Date.now() (#7282).
-        reportsCompletedBeforeMs: nodeClock.nowMs(),
-      });
-    }
-
-    // Increment turn counter
-    this.turnsSinceLastAttachment++;
-
-    // Check cooldown for subsequent injections (re-read from current history)
-    if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
-      const warm = await this.contextController.compaction.peekCarryoverState();
-      this.pendingPostCompactionStateToAcknowledge = warm;
-      this.turnsSinceLastAttachment = 0;
-      return this.generatePostCompactionAttachments(includeReadFiles, warm);
-    }
-
-    return null;
+  /** External file edits since the tracked baselines, which include the boundary header's plan. */
+  private async detectFileChanges(): Promise<FileChangeDetection> {
+    await this.seedPlanBaselineFromBoundary();
+    return this.fileChangeTracker.getChangedAttachments();
   }
 
   /**
-   * Generate post-compaction attachments by extracting diffs and loaded skills from message history.
+   * Turn start, before file-change detection: track the plan file from the state that the latest
+   * boundary's header carries. The model sees that header, so detection reports any edit made
+   * after it. The state is on the boundary row, so this also works after a restart. Each
+   * boundary seeds once per session, and in a session only a compaction (with its pending
+   * state) adds a boundary, so most turns skip the history read.
    */
-  private async generatePostCompactionAttachments(
-    includeReadFiles: boolean,
-    warm: Awaited<ReturnType<CompactionHandler["peekCarryoverState"]>>
-  ): Promise<PostCompactionAttachment[]> {
-    // getHistoryFromLatestBoundary already returns only the active compaction epoch,
-    // so no further boundary slicing is needed.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!historyResult.success) {
-      return [];
+  private async seedPlanBaselineFromBoundary(): Promise<void> {
+    if (
+      this.planBaselineBoundaryId !== undefined &&
+      (await this.contextController.compaction.peekPendingState()) === null
+    )
+      return;
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return;
+    const boundaryId = history.data.findLast(isDurableContextBoundaryMarker)?.id ?? null;
+    if (boundaryId === this.planBaselineBoundaryId) return;
+    this.planBaselineBoundaryId = boundaryId;
+    const plan = findPostCompactionPlan(history.data);
+    if (plan) {
+      // A tool in the retained tail of a mid-stream swap can record a newer plan state that
+      // the model already saw; the older header snapshot must not replace it.
+      await this.fileChangeTracker.recordIfNewer(plan.path, {
+        content: plan.content,
+        timestamp: plan.modifiedTimeMs,
+      });
     }
+  }
 
-    const fileDiffs = extractEditedFileDiffs(historyResult.data);
-    const loadedSkills = mergeLoadedSkillSnapshots([
-      ...(warm?.loadedSkills ?? []),
-      ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
-    ]);
-    // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
-    // merged with reads from the current epoch (newest-first, capped).
-    const readFilePaths = includeReadFiles
-      ? mergeReadFilePaths(warm?.readFiles ?? [], extractReadFilePaths(historyResult.data))
-      : [];
+  /**
+   * The first turn after a compaction consumes its pending state. The boundary row already
+   * carries the post-compaction context, so this only starts the new window: it keeps the
+   * snapshot to acknowledge when the turn succeeds and clears per-window caches.
+   */
+  private async consumePendingPostCompactionState(history: readonly MuxMessage[]): Promise<void> {
+    const pendingState = await this.contextController.compaction.peekPendingState();
+    if (pendingState === null) return;
+    this.pendingPostCompactionStateToAcknowledge = pendingState;
+    // The next stream recomputes the memory index from current files.
+    await this.discardMemoryContext();
+    // History context is gone, so drop the file baselines. Keep the plan baseline that turn
+    // start took from the boundary header (seedPlanBaselineFromBoundary).
+    await this.fileChangeTracker.clearExcept(findPostCompactionPlan(history)?.path);
+    this.acceptedFileSnapshotBaseline = undefined;
+  }
 
-    // Reports completed before the latest boundary had their tool results summarized away;
-    // anything newer is still visible in the active epoch and would be redundant.
-    const boundaryTimestampMs = historyResult.data.find(
-      (message) => message.metadata?.compactionBoundary === true
-    )?.metadata?.timestamp;
-
-    return this.buildAttachmentsFromContext({
-      diffs: fileDiffs,
-      loadedSkills,
-      readFilePaths,
-      // Wall clock, like the boundary timestamp: report times come from Date.now() (#7282).
-      reportsCompletedBeforeMs: boundaryTimestampMs ?? nodeClock.nowMs(),
+  /**
+   * Render the boundary header from the compaction's carryover; null when nothing is kept or
+   * the build does not settle in time.
+   */
+  private async buildPostCompactionContext(
+    input: PostCompactionContextInput
+  ): Promise<PostCompactionContext | null> {
+    const built = await raceWithAbortAndTimeout(this.renderPostCompactionContextHeader(input), {
+      timeoutMs: POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS,
     });
+    if (built.kind !== "ok") {
+      log.warn("Post-compaction context build timed out; continuing without it", {
+        workspaceId: this.workspaceId,
+      });
+      return null;
+    }
+    return built.value;
+  }
+
+  /** The unbounded header build. */
+  private async renderPostCompactionContextHeader(
+    input: PostCompactionContextInput
+  ): Promise<PostCompactionContext | null> {
+    const excludedItems = await this.loadExcludedItems();
+    const { attachments, plan } = await this.buildAttachmentsFromContext({
+      ...input,
+      excludedItems,
+      // Read tracking is internal bookkeeping in both modes but only ever
+      // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
+      readFilePaths: this.isRlmCompactionEnabled() ? input.readFilePaths : [],
+    });
+    return renderPostCompactionContext(attachments, plan);
   }
 
   /**
@@ -13580,8 +13626,13 @@ export class AgentSession {
     readFilePaths: string[];
     /** Cutoff for the completed-reports index: reports completed before this were summarized away. */
     reportsCompletedBeforeMs: number;
-  }): Promise<PostCompactionAttachment[]> {
-    const excludedItems = await this.loadExcludedItems();
+    excludedItems: Set<string>;
+  }): Promise<{
+    attachments: PostCompactionAttachment[];
+    /** The plan the attachments carry, for the file-change tracker; local runtimes only. */
+    plan: PostCompactionPlan | null;
+  }> {
+    const { excludedItems } = context;
     const todoAttachment = await this.loadTodoListAttachment(excludedItems);
 
     // Host-side disk read (session dir), independent of workspace metadata/runtime.
@@ -13639,17 +13690,17 @@ export class AgentSession {
         attachments.push(editedFilesRef);
       }
 
-      return attachments;
+      return { attachments, plan: null };
     }
     const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
-
-    const attachments = await AttachmentService.generatePostCompactionAttachments(
-      await resolvePlanFileLocation(
-        this.config,
-        runtime,
-        { ...metadataResult.data, id: this.workspaceId },
-        this.historyService.locks
-      ),
+    const planLocation = await resolvePlanFileLocation(
+      this.config,
+      runtime,
+      { ...metadataResult.data, id: this.workspaceId },
+      this.historyService.locks
+    );
+    const { attachments, plan } = await AttachmentService.generatePostCompactionAttachments(
+      planLocation,
       context.diffs,
       context.loadedSkills,
       runtime,
@@ -13676,7 +13727,7 @@ export class AgentSession {
       attachments.push(artifactsIndexAttachment);
     }
 
-    return attachments;
+    return { attachments, plan: postCompactionPlan(runtime, plan) };
   }
 
   /**

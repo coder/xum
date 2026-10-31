@@ -27,7 +27,6 @@ import type {
   LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import {
   filterOrphanedMcpPromptSnapshots,
   type MuxMessage,
@@ -86,8 +85,6 @@ export interface ReplayRequestInputs {
   /** Plan→exec handoff content from the turn-envelope blob (model-visible). */
   planContentForTransition?: string;
   planFilePath?: string;
-  /** Post-compaction attachments from the turn-envelope blob (model-visible). */
-  postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Refusal-fallback partial continuation from the turn-envelope blob. The
    * eventual assistant row lands after requestHistorySequence, so this
@@ -252,7 +249,6 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     toolNamesForSentinel: inputs.toolNamesForSentinel,
     planContentForTransition: inputs.planContentForTransition,
     planFilePath: inputs.planFilePath,
-    postCompactionAttachments: inputs.postCompactionAttachments,
     providersConfig: inputs.providersConfig,
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,

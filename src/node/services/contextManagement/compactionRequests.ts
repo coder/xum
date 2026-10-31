@@ -183,3 +183,20 @@ export function isCompactionRequestMetadata(meta: unknown): meta is CompactionRe
   if (typeof obj.parsed !== "object" || obj.parsed === null) return false;
   return true;
 }
+
+/**
+ * Whether TurnRequestBuilder builds a compaction request, which it trims to the compaction
+ * input budget. Only the newest user row of the request counts, never an older compact command.
+ */
+export function isCompactionRequestTurn(
+  agentId: string | undefined,
+  muxMetadata: MuxMessageMetadata | undefined,
+  messages: readonly MuxMessage[]
+): boolean {
+  const latestUserMessage = messages.findLast((message) => message.role === "user");
+  return (
+    agentId === "compact" ||
+    muxMetadata?.type === "compaction-request" ||
+    latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request"
+  );
+}

@@ -16,6 +16,7 @@ import {
   type AgentSessionStreamManager,
 } from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import type { CompactionHandler } from "@/node/services/compactionHandler";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { HistoryService } from "@/node/services/historyService";
@@ -399,4 +400,36 @@ export async function createAgentSessionHarness(
     backgroundProcessManager,
     events,
   };
+}
+
+/** The session's compaction handler, for tests that drive compaction directly. */
+export function sessionCompactionHandler(session: AgentSession): CompactionHandler {
+  return (session as unknown as { contextController: { compaction: CompactionHandler } })
+    .contextController.compaction;
+}
+
+/** Publish a real compaction boundary "boundary" with no tail; it builds its header as usual. */
+export async function compactSessionForTest(
+  session: AgentSession,
+  historyService: HistoryService,
+  workspaceId: string
+): Promise<void> {
+  const handler = sessionCompactionHandler(session);
+  const persisted = await handler.persistContinuousCompaction({
+    preparation: handler.beginPreparation(() => true),
+    publication: {
+      generation: await historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration(),
+    },
+    attachmentMessages: [],
+    messages: [],
+    boundaryMessageId: "boundary",
+    text: "summary",
+    model: "anthropic:claude-sonnet-4-5",
+    tail: [],
+    systemMessageTokens: 0,
+    shouldPersist: () => true,
+  });
+  assert(persisted, "Expected the compaction to persist");
 }

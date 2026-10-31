@@ -1,6 +1,4 @@
-import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
 import type { ModelMessage } from "ai";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import {
   exactJson,
@@ -17,6 +15,7 @@ import {
   type CompactionFollowUpRequest,
   type MuxMessage,
   type MuxMetadata,
+  type PostCompactionContext,
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -28,6 +27,7 @@ import {
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
+import { estimatePostCompactionContextTokens } from "./postCompactionContext";
 
 export interface ContinuousCompactionContext {
   enabled: boolean;
@@ -69,7 +69,7 @@ interface Dependencies {
     preparation: ContinuousCompactionJournal["preparation"];
     systemPrefix: ModelMessage[];
     requestProviderOptions?: Record<string, unknown>;
-    attachments: PostCompactionAttachment[];
+    postCompactionContext: PostCompactionContext | null;
     cacheEnabled: boolean;
   } | null>;
   // Includes usage recording: the generation fence must be AFTER the last await.
@@ -152,6 +152,12 @@ function journalSourceRows(
   partIndex: number
 ): MuxMessage[] {
   return [...rows.slice(0, -1), { ...source, parts: source.parts.slice(0, partIndex) }];
+}
+
+/** The first tool part in a row's first step: the wire anchor of a prefix swap. */
+function firstStepTool(row: MuxMessage | undefined) {
+  const firstStepEnd = row?.metadata?.stepStartPartIndices?.[1] ?? row?.parts.length;
+  return row?.parts.slice(0, firstStepEnd).find((part) => part.type === "dynamic-tool");
 }
 
 /** Background summary + recent pages. Only the short apply is serialized with the turn. */
@@ -535,11 +541,7 @@ export class ContinuousCompactor {
     const retainedLive = tail.at(-1);
     // Rebuild all committed context in the prefix: persisted rows can combine
     // consecutive tool-only steps. Only the current live step supplies a wire anchor.
-    const firstStepEnd =
-      retainedLive?.metadata?.stepStartPartIndices?.[1] ?? retainedLive?.parts.length;
-    const tool = retainedLive?.parts
-      .slice(0, firstStepEnd)
-      .find((part) => part.type === "dynamic-tool");
+    const tool = firstStepTool(retainedLive);
     if (
       retainedLive?.id !== live.messageId ||
       retainedLive.role !== "assistant" ||
@@ -549,14 +551,21 @@ export class ContinuousCompactor {
       return false;
     const prepared = await this.deps.prepareSwap(staged.cut.head);
     if (!prepared || !this.isValid(staged, rows)) return false;
+    // The swapped prefix and every later request render the header from this boundary.
     const { boundary, copies } = this.deps.compactionHandler.buildContinuousCompactionRows({
       messages: rows,
       text: staged.text,
       model: staged.model,
       tail,
       systemMessageTokens: context.systemMessageTokens ?? 0,
-      attachmentTokens: staged.attachmentTokens,
+      postCompactionContext: prepared.postCompactionContext,
     });
+    // The estimate that admitted the summary can lack this header (a timed-out build has
+    // none), and the swapped prefix sends it with no later size check.
+    const headerTokens = estimatePostCompactionContextTokens(
+      boundary.metadata?.postCompactionContext
+    );
+    if (!this.wouldFit({ ...staged, attachmentTokens: headerTokens }, rows, context)) return false;
     const staticCopies = copies.slice(0, -1);
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
@@ -577,11 +586,11 @@ export class ContinuousCompactor {
           partIndex,
           metadataTemplate: liveCopy.metadata,
         },
+        postCompactionAttachments: [],
         prefixSourceRows: [boundary, ...staticCopies],
         systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
         cacheEnabled: prepared.cacheEnabled,
         sourceFingerprint: fingerprint(journalSourceRows(visibleRows, source, partIndex)),
-        postCompactionAttachments: prepared.attachments,
         preparation: prepared.preparation,
         requestProviderOptions:
           prepared.requestProviderOptions == null
@@ -752,10 +761,6 @@ export class ContinuousCompactor {
       model: journal.summaryModel,
       tail: [],
       systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
-      attachmentTokens: injectPostCompactionAttachments(
-        [],
-        journal.postCompactionAttachments
-      ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
       // Sequence assignment must not mutate the exact journal receipt used by cleanup.
       prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
       publication: { generation: journal.publicationGeneration, journal },
@@ -827,7 +832,6 @@ export class ContinuousCompactor {
       model: staged.model,
       tail,
       systemMessageTokens: context.systemMessageTokens ?? 0,
-      attachmentTokens: context.attachmentTokens ?? 0,
       pendingFollowUp,
     });
     if (applied && staged.generation === this.generation) this.reset("applied");

@@ -16,6 +16,7 @@ import {
 } from "@/common/orpc/schemas/continuousCompaction";
 import { extractPreActivatedToolNames } from "@/common/utils/tools/toolCatalog";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { insertPostCompactionContext } from "./postCompactionContext";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import { log } from "./log";
 
@@ -80,9 +81,11 @@ export async function rebuildContinuousPrefix(
       (name) => !deferred.has(name) || referenced.has(name)
     ),
     workspaceId,
-    messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+    // The same header row, at the same place, as assemblePromptPayload builds for later turns.
+    messagesWithSentinel: addInterruptedSentinel(
+      insertPostCompactionContext(prepared.providerRequestMessages)
+    ),
     replayReceiptMessages: prepared.activeContextMessages,
-    postCompactionAttachments: journal.postCompactionAttachments,
     deferLoadingToolNames: deferred,
   });
   const prefix = stripMessageCacheControl(messages);

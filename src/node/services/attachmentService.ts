@@ -25,6 +25,16 @@ import {
 } from "@/node/services/subagentReportArtifacts";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 
+/** One read of a workspace's plan (AttachmentService.readPlan). */
+export interface PlanFileRead {
+  /** The path the plan was read from: planPath, or the legacy path. */
+  planFilePath: string;
+  /** The full content, not truncated. */
+  planContent: string;
+  /** The mtime from a stat taken before the read; null when the caller did not ask for it. */
+  modifiedTimeMs: number | null;
+}
+
 const TRUNCATED_PLAN_NOTE = "\n\n...(truncated)\n";
 
 function truncatePlanContent(planContent: string): string {
@@ -42,50 +52,49 @@ function truncatePlanContent(planContent: string): string {
  */
 export class AttachmentService {
   /**
-   * Generate a plan file reference attachment if the plan file exists.
-   * Mode-agnostic: plan context is valuable in both plan and exec modes.
-   * Falls back to legacy plan path if new path doesn't exist.
+   * Read a workspace's plan once: planPath, else the legacy path (local and container rows; an SSH
+   * row has migrated, planLocation.ts). Unlike readPlanFile, it never moves the legacy file.
+   * Callers that render the plan and baseline it for change detection share this one read, so the
+   * baseline is the content that was rendered.
    */
-  static async generatePlanFileReference(
+  static async readPlan(
     location: PlanFileLocation,
-    runtime: Runtime
-  ): Promise<PlanFileReferenceAttachment | null> {
-    const { planPath: planFilePath, legacyIdPath: legacyPlanPath } = location;
+    runtime: Runtime,
+    options: { statFirst: boolean } = { statFirst: false }
+  ): Promise<PlanFileRead | null> {
     // The plan path is user/agent-writable and this reader runs on every post-compaction turn:
     // a FIFO (or other special file) there must fail like a missing plan instead of blocking the
     // read — and, on Node, a libuv threadpool worker — indefinitely. Same guard as readPlanFile.
     const planReadOptions = { requireRegularFile: true } as const;
-
-    // Try new path first
-    try {
-      const planContent = await readFileString(runtime, planFilePath, undefined, planReadOptions);
-      if (planContent) {
-        return {
-          type: "plan_file_reference",
-          planFilePath,
-          planContent: truncatePlanContent(planContent),
-        };
+    for (const planFilePath of planReadPaths(location)) {
+      try {
+        // Stat before the read: an edit between the two then pairs an older mtime with newer
+        // content, which change detection rereads, never a newer mtime with older content,
+        // which it skips.
+        const modifiedTimeMs = options.statFirst
+          ? (await runtime.stat(planFilePath)).modifiedTime.getTime()
+          : null;
+        const planContent = await readFileString(runtime, planFilePath, undefined, planReadOptions);
+        if (planContent) return { planFilePath, planContent, modifiedTimeMs };
+      } catch {
+        // No readable plan at this path; try the next one.
       }
-    } catch {
-      // Plan file doesn't exist at new path, try legacy
     }
-
-    // Fall back to legacy path (local and container rows; an SSH row has migrated, planLocation.ts)
-    if (legacyPlanPath === undefined) return null;
-    try {
-      const planContent = await readFileString(runtime, legacyPlanPath, undefined, planReadOptions);
-      if (planContent) {
-        return {
-          type: "plan_file_reference",
-          planFilePath: legacyPlanPath,
-          planContent: truncatePlanContent(planContent),
-        };
-      }
-    } catch {
-      // Plan file doesn't exist at legacy path either
-    }
-
     return null;
+  }
+
+  /**
+   * The plan file reference for a plan read with readPlan; null without a plan.
+   * Mode-agnostic: plan context is valuable in both plan and exec modes.
+   */
+  static planFileReference(plan: PlanFileRead | null): PlanFileReferenceAttachment | null {
+    return plan
+      ? {
+          type: "plan_file_reference",
+          planFilePath: plan.planFilePath,
+          planContent: truncatePlanContent(plan.planContent),
+        }
+      : null;
   }
 
   /**
@@ -260,8 +269,8 @@ export class AttachmentService {
   }
 
   /**
-   * Generate all post-compaction attachments.
-   * Returns empty array if no attachments are needed.
+   * Generate all post-compaction attachments, and return the plan read they render.
+   * Returns an empty attachment list if no attachments are needed.
    * @param excludedItems - Set of item IDs to exclude ("plan", "skills", or "file:<path>")
    */
   static async generatePostCompactionAttachments(
@@ -270,16 +279,17 @@ export class AttachmentService {
     loadedSkills: LoadedSkillSnapshot[],
     runtime: Runtime,
     excludedItems: Set<string> = new Set<string>()
-  ): Promise<PostCompactionAttachment[]> {
+  ): Promise<{ attachments: PostCompactionAttachment[]; plan: PlanFileRead | null }> {
     const attachments: PostCompactionAttachment[] = [];
 
-    // Plan file reference (skip if excluded)
-    let planRef: PlanFileReferenceAttachment | null = null;
-    if (!excludedItems.has("plan")) {
-      planRef = await this.generatePlanFileReference(planLocation, runtime);
-      if (planRef) {
-        attachments.push(planRef);
-      }
+    // Plan file reference (skip if excluded). The file-change tracker reads the host filesystem,
+    // so only a local plan gets the mtime its baseline needs.
+    const plan = excludedItems.has("plan")
+      ? null
+      : await this.readPlan(planLocation, runtime, { statFirst: runtime.location === "local" });
+    const planRef = this.planFileReference(plan);
+    if (planRef) {
+      attachments.push(planRef);
     }
 
     const loadedSkillsAttachment = this.generateLoadedSkillsAttachment(loadedSkills, excludedItems);
@@ -299,6 +309,6 @@ export class AttachmentService {
       attachments.push(editedFilesRef);
     }
 
-    return attachments;
+    return { attachments, plan };
   }
 }

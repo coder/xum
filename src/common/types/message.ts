@@ -903,6 +903,25 @@ export function isContextBudgetWarningMessage(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === "context-budget-warning";
 }
 
+const POST_COMPACTION_CONTEXT_ID_PREFIX = "post-compaction-context-";
+
+/** The request-only user row that renders a boundary's postCompactionContext. */
+export function postCompactionContextMessageId(boundaryId: string): string {
+  return `${POST_COMPACTION_CONTEXT_ID_PREFIX}${boundaryId}`;
+}
+
+/**
+ * The post-compaction context row is context for the whole window, never a turn's request. Request
+ * rows placed before it would change the bytes right after the boundary.
+ */
+export function isPostCompactionContextMessage(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    message.metadata?.synthetic === true &&
+    message.id.startsWith(POST_COMPACTION_CONTEXT_ID_PREFIX)
+  );
+}
+
 export function isRolloverBoundary(message: MuxMessage): boolean {
   return (
     message.metadata?.contextBoundaryKind === "reset" &&
@@ -1032,6 +1051,27 @@ export function hasTokenUsage(
 export interface PluginHookContextEntry {
   pluginId: string;
   text: string;
+}
+
+/** MuxMetadata.postCompactionContext: the rendered attachments of one compaction boundary. */
+export interface PostCompactionContext {
+  text: string;
+  /** Skills that `text` already loads, so path-based activation does not load them again. */
+  skillNames: string[];
+  /**
+   * Set when the header pushed a request over the context window (#1932). Requests whose
+   * requestHistorySequence is at least this value leave the header out.
+   */
+  omittedFromRequestSequence?: number;
+  /** The plan file that `text` carries, as the file-change tracker baseline for its window. */
+  plan?: PostCompactionPlan;
+}
+
+/** PostCompactionContext.plan: a local plan file as compaction read it. */
+export interface PostCompactionPlan {
+  path: string;
+  content: string;
+  modifiedTimeMs: number;
 }
 
 /**
@@ -1222,6 +1262,13 @@ export interface MuxMetadata {
   compactionPublicationGeneration?: string | null;
   /** Durable provider-context boundary kind. Existing compaction rows are also boundaries via compactionBoundary. */
   contextBoundaryKind?: PersistedContextBoundaryKind;
+  /**
+   * Post-compaction context (plan, todo, edited files, loaded skills) that compaction rendered
+   * for this boundary row. Requests insert it right after the boundary
+   * (insertPostCompactionContext); it never changes, so the request prefix stays byte-stable.
+   * Backend only: MuxMessageSchema strips it on the wire.
+   */
+  postCompactionContext?: PostCompactionContext;
   toolPolicy?: ToolPolicy; // Tool policy active when this message was sent (user messages only)
   disableWorkspaceAgents?: boolean; // Whether workspace-local agent files were disabled for this user turn
   /** Snapshot of send options used for this user turn (for startup retry recovery). */

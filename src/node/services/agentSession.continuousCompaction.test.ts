@@ -415,7 +415,7 @@ describe("AgentSession continuous compaction wiring", () => {
           effectiveThinkingLevel: "off",
           toolNamesForSentinel: ["bash"],
         },
-        attachments: [],
+        postCompactionContext: null,
         systemPrefix: [],
         cacheEnabled: false,
       });
@@ -672,7 +672,10 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(await deps.prepareSwap([])).toBeNull();
     // A real send captures them for its live turn.
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
-    expect(await deps.prepareSwap([])).toMatchObject({ attachments: [], cacheEnabled: false });
+    expect(await deps.prepareSwap([])).toMatchObject({
+      postCompactionContext: null,
+      cacheEnabled: false,
+    });
   });
 
   test("resumeless continuous fold cannot divert a later legacy compaction's saved follow-up", async () => {
@@ -696,7 +699,6 @@ describe("AgentSession continuous compaction wiring", () => {
         model,
         tail: [retained],
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         shouldPersist: () => true,
       })
     ).toBe(true);
@@ -1106,7 +1108,6 @@ describe("AgentSession continuous compaction wiring", () => {
                 tail: history.slice(-1),
                 pendingFollowUp: followUp,
                 systemMessageTokens: 0,
-                attachmentTokens: 0,
                 shouldPersist: () => true,
               });
               failRead = true;
