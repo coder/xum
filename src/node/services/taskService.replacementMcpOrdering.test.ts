@@ -24,6 +24,7 @@ import {
   sendMessage,
 } from "../../../tests/ipc/helpers";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { HistoryService } from "@/node/services/historyService";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { UNSANITIZED_TASK_CHECKOUT_CODE } from "@/node/services/unsanitizedTaskCheckout";
 
@@ -591,8 +592,17 @@ describe("unsanitized task checkout whose reclaim failed", () => {
       await cleanupTempGitRepo(repoPath);
     }
   }, 120_000);
+});
 
-  test("a direct create whose sanitize fails leaves a retained row that refuses sends and discovery", async () => {
+/**
+ * A direct `TaskService.create` launches like a workflow replacement: it returns at the
+ * reservation, and the launch keeps the row `starting` until its own first send. No MCP server
+ * may start in the checkout before sanitize returns (#4742): a generic send in that window is
+ * refused before it expands a slash-invoked MCP prompt, a prompt-catalog request parks on the
+ * launch's init, and a sanitize failure reclaims the row and the checkout.
+ */
+describe("direct create: MCP after sanitize", () => {
+  test("a sanitize failure reclaims the row and checkout, starts nothing in it and tells the parent", async () => {
     const env = await createTestEnvironment();
     const repoPath = await createTempGitRepo();
     const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
@@ -606,6 +616,10 @@ describe("unsanitized task checkout whose reclaim failed", () => {
           return "fixture: sanitize failed";
         }
       );
+      // Recorded, not delivered: delivering the wake would resume the parent with a model turn.
+      const wakes = spyOn(env.services.taskService, "enqueueTerminalAttention").mockResolvedValue(
+        undefined
+      );
       const created = await env.services.taskService.create({
         parentWorkspaceId: parentId,
         kind: "agent",
@@ -613,40 +627,47 @@ describe("unsanitized task checkout whose reclaim failed", () => {
         prompt: "Summarize durable workflows",
         title: "Direct",
       });
-      expect(created.success).toBe(false);
+      assert(
+        created.success,
+        `create must reserve the task: ${created.success ? "" : created.error}`
+      );
+      const taskId = created.data.taskId;
+      await env.services.taskService.reservedLaunchesSettled();
       assert(checkout, "the direct task's sanitize must have run");
-      const taskRow = env.config
-        .loadConfigOrDefault()
-        .projects.get(repoPath)
-        ?.workspaces.find((w) => w.parentWorkspaceId === parentId && w.id !== "retiredmcp");
-      assert(taskRow?.id, "the direct create retains its interrupted row");
-      expectRefusedAfterRestart(env, taskRow.id, parentId);
 
-      const sent = await sendMessage(env, taskRow.id, "continue", { model: HAIKU_MODEL });
-      expect(sent).toMatchObject({
-        success: false,
-        error: { type: UNSANITIZED_TASK_CHECKOUT_CODE },
-      });
-      expectTypedPromptRefusal(await listPrompts(env, taskRow.id));
+      expect(
+        env.config
+          .loadConfigOrDefault()
+          .projects.get(repoPath)
+          ?.workspaces.some((w) => w.id === taskId)
+      ).toBe(false);
+      expect(await fs.stat(checkout).catch(() => null)).toBeNull();
       expect((await readRecord(recordFile)).filter((e) => e.cwd === checkout)).toEqual([]);
+      // The reclaim removed the row, so the launch's plan names the parent to tell.
+      const parentHistory = await new HistoryService(env.config).getHistoryFromLatestBoundary(
+        parentId
+      );
+      assert(parentHistory.success, "the parent's history must be readable");
+      const failures = parentHistory.data
+        .flatMap((message) => message.parts)
+        .flatMap((part) => (part.type === "text" ? [part.text] : []))
+        .filter((text) => text.includes(`<task_id>${taskId}</task_id>`));
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toContain("fixture: sanitize failed");
+      expect(wakes).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ownerWorkspaceId: parentId,
+          sourceId: taskId,
+          terminalOutcome: "failed",
+        })
+      );
     } finally {
       await cleanupTestEnvironment(env);
       await cleanupTempGitRepo(repoPath);
     }
   }, 120_000);
-});
 
-/**
- * #4742: a direct `TaskService.create` persists its row as `running` before it sanitizes the
- * checkout. A send admitted in that window expands its slash-invoked MCP prompt (the prompt
- * snapshot) before the turn's init wait. That expansion must not start the prompt's server in
- * the checkout before sanitize returns. It cannot today: `MCPServerManager.getPrompt` only
- * serves a workspace whose options an earlier tool or prompt listing recorded, both listings
- * wait for init, and the launch completes init only after sanitize. This pins that chain for
- * the direct path: a listing that served before sanitize, or a cold-starting getPrompt, fails it.
- */
-describe("direct create: MCP prompt snapshot before sanitize", () => {
-  test("a send racing the direct create starts no MCP server before the checkout is sanitized", async () => {
+  test("a send racing the direct create is refused and starts no MCP server before the checkout is sanitized", async () => {
     const env = await createTestEnvironment();
     const repoPath = await createTempGitRepo();
     const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
@@ -684,8 +705,8 @@ describe("direct create: MCP prompt snapshot before sanitize", () => {
           .loadConfigOrDefault()
           .projects.get(repoPath)
           ?.workspaces.find((w) => w.id === held.taskId);
-      // The window: the row is persisted as running while its sanitize is held.
-      expect(row()?.taskStatus).toBe("running");
+      // The window: the row is published as starting while its sanitize is held.
+      expect(row()?.taskStatus).toBe("starting");
 
       // A renderer's prompt catalog request parks on the launch's init until sanitize is done;
       // a listing that served now would record options that let the send below start MCP.
@@ -709,9 +730,9 @@ describe("direct create: MCP prompt snapshot before sanitize", () => {
           ],
         },
       });
-      // The send reached the prompt snapshot, and its expansion started nothing.
-      expect(getPrompt.mock.calls.some((call) => call[0] === held.taskId)).toBe(true);
+      // Refused before its prompt snapshot: nothing was expanded, and nothing started.
       expect(racing.success).toBe(false);
+      expect(getPrompt.mock.calls.some((call) => call[0] === held.taskId)).toBe(false);
       expect((await readRecord(recordFile)).filter((e) => e.cwd === held.checkout)).toEqual([]);
 
       releaseSanitize.resolve();

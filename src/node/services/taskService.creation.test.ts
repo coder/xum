@@ -408,11 +408,11 @@ describe("TaskService", () => {
     const reservationEntered = new Promise<void>((resolve) => {
       reservationStarted = resolve;
     });
-    const reserve = desktop.withReservation.bind(desktop);
-    const reservationSpy = spyOn(desktop, "withReservation").mockImplementation(
-      (owner, borrower, persist) => {
+    const reserve = desktop.withReservations.bind(desktop);
+    const reservationSpy = spyOn(desktop, "withReservations").mockImplementation(
+      (reservations, commit) => {
         reservationStarted();
-        return reserve(owner, borrower, persist);
+        return reserve(reservations, commit);
       }
     );
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
@@ -492,8 +492,12 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     sendMessage.mockResolvedValueOnce(Err("launch refused"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // create() returns at the reservation: the refused send fails the launch after it.
     const failed = await createAgentTask(taskService, parentId, "First", { desktop: "shared" });
-    expect(failed.success).toBe(false);
+    assert(failed.success);
+    const failedRow = findWorkspaceInConfig(config, failed.data.taskId);
+    expect(failedRow?.taskStatus).toBe("interrupted");
+    expect(failedRow?.taskLaunchError).toBe("launch refused");
     const next = await createAgentTask(taskService, parentId, "Second", { desktop: "shared" });
     assert(next.success);
     expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
@@ -1999,8 +2003,10 @@ describe("TaskService", () => {
 
       expect(result.success).toBe(true);
       assert(result.success, "Expected shared-workspace task to be created");
-      expect(result.data.status).toBe("running");
+      // create() reports the reservation's status; the settled launch then started the task.
+      expect(result.data.status).toBe("starting");
       expect(result.data.taskId).toBe(childTaskId);
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("running");
 
       // No fork and no init: the sub-agent reuses the parent's live checkout.
       expect(forkSpy).not.toHaveBeenCalled();
@@ -3203,15 +3209,16 @@ describe("TaskService", () => {
     );
     const { taskService } = createTaskServiceHarness(config);
 
+    // create() reports the reservation's status: a slot reserves the task as `starting`.
     const first = await createAgentTask(taskService, parentId, "task 1");
     expect(first.success).toBe(true);
     if (!first.success) return;
-    expect(first.data.status).toBe("running");
+    expect(first.data.status).toBe("starting");
 
     const second = await createAgentTask(taskService, parentId, "task 2");
     expect(second.success).toBe(true);
     if (!second.success) return;
-    expect(second.data.status).toBe("running");
+    expect(second.data.status).toBe("starting");
 
     const third = await createAgentTask(taskService, parentId, "task 3");
     expect(third.success).toBe(true);

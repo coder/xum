@@ -133,7 +133,8 @@ describe("TaskService", () => {
         taskId: childId,
         desktopOwnerWorkspaceId: childId,
         kind: "agent",
-        status: "running",
+        // The reservation's status: create() returns before the launch starts the task.
+        status: "starting",
         modelString: "anthropic:claude-opus-4-6",
         thinkingLevel: "high",
       })
