@@ -45,7 +45,10 @@ import {
 } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import {
+  getAgentAiSettingsBases,
+  resolveWorkspaceAiSettingsForAgent,
+} from "@/browser/utils/workspaceModeAi";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getCreationDraftScopeId,
@@ -905,7 +908,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           message: creationNameMessage,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
-          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+          agentBaseById: getAgentAiSettingsBases(agents),
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -1175,7 +1178,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // otherwise send the first prompt with the ambient model and Pro gated off
     // until WorkspaceModeAISync corrects the workspace.
     const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    const agentBaseById = getAgentAiSettingsBases(agents);
     const {
       resolvedModel,
       resolvedThinking,

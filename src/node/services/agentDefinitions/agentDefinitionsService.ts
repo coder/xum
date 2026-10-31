@@ -15,7 +15,10 @@ import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
-import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
+import {
+  applySettingsBaseChain,
+  collectDefinitionLayers,
+} from "@/common/utils/ai/agentAncestorLayers";
 import {
   execBuffered,
   readFileString,
@@ -620,6 +623,7 @@ async function readAgentDescriptorFromFile(
       uiSelectable: selectable,
       uiColor: parsed.frontmatter.ui?.color,
       subagentRunnable: parsed.frontmatter.subagent?.runnable ?? false,
+      ...backgroundHintField(parsed.frontmatter),
       base: parsed.frontmatter.base,
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
@@ -640,6 +644,13 @@ async function readAgentDescriptorFromFile(
   }
 }
 
+/** `backgroundHint: true` for an agent whose frontmatter sets the hint; omitted otherwise. */
+export function backgroundHintField(
+  frontmatter: Pick<AgentDefinitionPackage["frontmatter"], "subagent">
+): { backgroundHint?: true } {
+  return frontmatter.subagent?.background_hint === true ? { backgroundHint: true } : {};
+}
+
 function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
   const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
 
@@ -651,6 +662,7 @@ function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescr
     uiSelectable: selectable,
     uiColor: pkg.frontmatter.ui?.color,
     subagentRunnable: pkg.frontmatter.subagent?.runnable ?? false,
+    ...backgroundHintField(pkg.frontmatter),
     base: pkg.frontmatter.base,
     aiDefaults: pkg.frontmatter.ai,
     tools: pkg.frontmatter.tools,
@@ -1421,25 +1433,43 @@ export async function listAgentDefinitions(
           }
         );
         const resolvedFrontmatter = resolvedDefinition.definition.frontmatter;
-        if (
-          isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
-          input.includeDisabled !== true
-        )
-          return null;
         return {
           descriptor,
           resolvedFrontmatter,
-          aiLayers: collectDefinitionLayers(descriptor.id, resolvedDefinition.aiChain),
+          aiChain: resolvedDefinition.aiChain,
+          hidden:
+            isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
+            input.includeDisabled !== true,
         };
       } catch {
         return { descriptor };
       }
     })
   );
+  // A settings base resolves from every listed agent, disabled ones included: a run reads a
+  // disabled agent's definition too (resolveAgentAiSettingsChain).
+  const aiChainsById = new Map(
+    resolved.flatMap((entry) =>
+      entry.aiChain != null ? [[entry.descriptor.id, entry.aiChain] as const] : []
+    )
+  );
   return resolved.flatMap((entry) => {
-    if (entry == null) return [];
     if (entry.resolvedFrontmatter == null) return [entry.descriptor];
+    if (entry.hidden) return [];
     const frontmatter = entry.resolvedFrontmatter;
+    const id = entry.descriptor.id;
+    const settingsBase = frontmatter.ai?.settingsBase;
+    const settingsBaseResult =
+      settingsBase != null
+        ? applySettingsBaseChain(id, entry.aiChain, aiChainsById.get(settingsBase) ?? null)
+        : undefined;
+    if (settingsBaseResult?.ignored != null) {
+      log.warn("settingsBase ignored", {
+        agentId: id,
+        settingsBase,
+        reason: settingsBaseResult.ignored,
+      });
+    }
     return [
       {
         ...entry.descriptor,
@@ -1448,9 +1478,13 @@ export async function listAgentDefinitions(
         uiSelectable: resolveAgentVisibility(frontmatter.ui).selectable,
         uiColor: frontmatter.ui?.color,
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
+        ...backgroundHintField(frontmatter),
         base: frontmatter.base,
+        ...(settingsBaseResult != null && settingsBaseResult.ignored == null
+          ? { aiSettingsBase: settingsBase }
+          : {}),
         aiDefaults: frontmatter.ai,
-        aiLayers: entry.aiLayers,
+        aiLayers: collectDefinitionLayers(id, settingsBaseResult?.chain ?? entry.aiChain),
         tools: frontmatter.tools,
       },
     ];

@@ -465,7 +465,7 @@ function buildPromptCacheTtlProps(input: {
         input.listedAgents.map((agent) => [
           agent.id,
           {
-            base: agent.base,
+            base: agent.aiSettingsBase ?? agent.base,
             // A resolved agent's aiDefaults merge its bases' frontmatter, which the backend
             // ranks below those bases' Settings, so the walk takes only its own layer.
             definitionAiDefaults: agent.aiLayers
@@ -932,7 +932,8 @@ export function TasksSection() {
     let modelString: string | undefined;
     let reasoningMode: OpenAIReasoningMode | undefined;
     while (modelString === undefined || reasoningMode === undefined) {
-      const base = agentsById.get(cursor)?.base ?? (cursor === "plan" ? "plan" : "exec");
+      const agent = agentsById.get(cursor);
+      const base = agent?.aiSettingsBase ?? agent?.base ?? (cursor === "plan" ? "plan" : "exec");
       if (base === cursor || visited.has(base)) {
         break;
       }

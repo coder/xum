@@ -364,6 +364,7 @@ function resolvedAgentResultFor(
       agentDiscoveryPath: metadata.projectPath,
       isSubagentWorkspace: false,
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
+      agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
       effectiveMode: "exec",
       taskSettings: DEFAULT_TASK_SETTINGS,

@@ -18,6 +18,16 @@ export type WorkspaceAISettingsCache = Partial<
   >
 >;
 
+/**
+ * Agent id -> the agent its AI settings inherit from: an applied settings base, else `base`
+ * (Cursor plugin RFC, D11). Every agent base map of the AI-settings readers comes from here.
+ */
+export function getAgentAiSettingsBases(
+  agents: ReadonlyArray<{ id: string; base?: string; aiSettingsBase?: string }>
+): Map<string, string | undefined> {
+  return new Map(agents.map((agent) => [agent.id, agent.aiSettingsBase ?? agent.base]));
+}
+
 function normalizeAgentId(agentId: string): string {
   return normalizeWorkspaceAgentId(agentId, "exec");
 }

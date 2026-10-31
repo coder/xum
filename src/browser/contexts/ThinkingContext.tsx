@@ -23,6 +23,7 @@ import { useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { KEYBINDS, matchesKeybind, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 
@@ -63,7 +64,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const selection = useWorkspaceAiSelection(
     scopeId,
     agentContext?.agentId,
-    agentContext && new Map(agentContext.agents.map((agent) => [agent.id, agent.base]))
+    agentContext && getAgentAiSettingsBases(agentContext.agents)
   );
   const scopedModel = useScopedAiDefault(defaultsScopeId, "model");
   const scopedThinkingLevel = useScopedAiDefault(defaultsScopeId, "thinkingLevel");

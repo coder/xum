@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getAgentBases, setAgentBases } from "./aiSelectionIntent";
 import { resolveConfiguredAiDefaults, resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
@@ -447,5 +448,19 @@ describe("resolveConfiguredAiDefaults Auto flags", () => {
     });
     expect(configured.autoModelRouting).toBeUndefined();
     expect(configured.autoThinkingLevel).toBeUndefined();
+  });
+});
+
+describe("resolveConfiguredAiDefaults with a settings base (Cursor model: fast)", () => {
+  test("an agent's applied settings base replaces its base in the loaded agent bases", () => {
+    setAgentBases("settings-base-scope", [
+      { id: "ci-watcher", base: "exec", aiSettingsBase: "explore" },
+    ]);
+    const configured = resolveConfiguredAiDefaults(
+      "ci-watcher",
+      { explore: { modelString: "custom:m-explore" }, exec: { modelString: "custom:m-exec" } },
+      getAgentBases("settings-base-scope")
+    );
+    expect(configured.modelString).toBe("custom:m-explore");
   });
 });

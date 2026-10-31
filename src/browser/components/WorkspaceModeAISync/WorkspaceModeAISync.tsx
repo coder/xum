@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useAgent } from "@/browser/contexts/AgentContext";
+import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
 import { recordWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -27,7 +28,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     prevAgentIdRef.current = normalizedAgentId;
     prevWorkspaceIdRef.current = workspaceId;
 
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    const agentBaseById = getAgentAiSettingsBases(agents);
     if (isExplicitAgentSwitch) {
       // Each agent resolves its own model, so the switch itself is the explicit model change.
       recordWorkspaceModelChange(

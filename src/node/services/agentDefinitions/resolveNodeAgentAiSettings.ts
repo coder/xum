@@ -20,7 +20,10 @@ import type {
   ParsedThinkingInput,
   ThinkingLevel,
 } from "@/common/types/thinking";
-import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
+import {
+  applySettingsBaseChain,
+  collectDefinitionLayers,
+} from "@/common/utils/ai/agentAncestorLayers";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import {
   resolveAgentAiSettings,
@@ -28,11 +31,18 @@ import {
 } from "@/common/utils/ai/resolveAgentAiSettings";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 
-import { readAgentDefinition } from "./agentDefinitionsService";
-import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+import { readAgentDefinition, type AgentDefinitionRequestCache } from "./agentDefinitionsService";
+import {
+  resolveAgentInheritanceChain,
+  type AgentForInheritance,
+} from "./resolveAgentInheritanceChain";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 /** Checkout context for reading agent definitions; omit when unavailable. */
@@ -87,6 +97,58 @@ export function resolveChainAgentCacheTtl(
   })?.value;
 }
 
+/**
+ * The chain an agent's AI settings resolve over (Cursor plugin RFC, D11): its inheritance chain
+ * with `ai.settingsBase` applied by applySettingsBaseChain. Tool policy keeps the inheritance
+ * chain. The settings base is the closest hop's, the value of the base-merged frontmatter that
+ * agents.list reads, so a run and the listed agent agree. Reads the settings-base agent the way
+ * the inheritance walk reads a base: an unreadable or aborted read throws, a missing one is
+ * ignored with a warning (D26).
+ */
+export async function resolveAgentAiSettingsChain(
+  agentId: string,
+  chain: AgentForInheritance[],
+  context: NodeAgentDefinitionContext & {
+    cache?: AgentDefinitionRequestCache;
+    abortSignal?: AbortSignal;
+  }
+): Promise<AgentForInheritance[]> {
+  const settingsBase = chain.find((entry) => entry.ai?.settingsBase != null)?.ai?.settingsBase;
+  if (settingsBase == null) return chain;
+
+  const readOptions = {
+    cache: context.cache,
+    projectPluginsTrusted: context.projectPluginsTrusted,
+    runtimeFactory: context.runtimeFactory,
+    ...(context.abortSignal != null ? { abortSignal: context.abortSignal } : {}),
+  };
+  let settingsBaseChain: AgentForInheritance[] | null = null;
+  try {
+    const agentDefinition = await readAgentDefinition(
+      context.runtime,
+      context.workspacePath,
+      settingsBase,
+      readOptions
+    );
+    settingsBaseChain = await resolveAgentInheritanceChain({
+      runtime: context.runtime,
+      workspacePath: context.workspacePath,
+      agentId: agentDefinition.id,
+      agentDefinition,
+      workspaceId: context.workspaceId,
+      ...readOptions,
+    });
+  } catch (error) {
+    if (context.abortSignal?.aborted === true || isRuntimeReadFailure(error)) throw error;
+  }
+
+  const result = applySettingsBaseChain(agentId, chain, settingsBaseChain);
+  if (result.ignored != null) {
+    log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
+  }
+  return result.chain;
+}
+
 /** Definition-derived resolver layers for one agent (target defaults + declared ancestors). */
 export interface AgentDefinitionAiLayers {
   targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
@@ -131,7 +193,10 @@ export async function loadAgentDefinitionAiLayers(
       projectPluginsTrusted: context.projectPluginsTrusted,
       runtimeFactory: context.runtimeFactory,
     });
-    return collectDefinitionLayers(agentId, chain);
+    return collectDefinitionLayers(
+      agentId,
+      await resolveAgentAiSettingsChain(agentId, chain, { ...context, abortSignal })
+    );
   };
 
   let removeAbortListener: (() => void) | undefined;

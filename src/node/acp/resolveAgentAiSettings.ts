@@ -65,7 +65,10 @@ export async function resolveAcpAgentAiSettings(
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
   const agentDefsById = new Map<string, AgentAncestorDescriptor>(
-    agents.map((agent) => [agent.id, { base: agent.base, definitionAiDefaults: agent.aiDefaults }])
+    agents.map((agent) => [
+      agent.id,
+      { base: agent.aiSettingsBase ?? agent.base, definitionAiDefaults: agent.aiDefaults },
+    ])
   );
 
   return resolveAgentAiSettingsShared({

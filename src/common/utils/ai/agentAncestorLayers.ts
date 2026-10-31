@@ -10,6 +10,7 @@ import type {
   AgentAiAncestorLayer,
   AgentAiDefinitionDefaults,
 } from "@/common/types/agentAiSettings";
+import assert from "@/common/utils/assert";
 
 export interface AgentAncestorDescriptor {
   base?: string;
@@ -101,4 +102,33 @@ export function collectDefinitionLayers(
     }
   }
   return { targetDefinitionAiDefaults, ancestors };
+}
+
+export type SettingsBaseIgnoredReason = "missing" | "self" | "cycle" | "nested";
+
+/**
+ * The AI-settings chain of an agent with `ai.settingsBase` (Cursor plugin RFC, D11, D26): the
+ * agent's own entries (its same-ID scope refinements), then the settings-base agent's chain in
+ * place of the agent's own bases. Both chains are target first. `settingsBaseChain` is null
+ * when the settings-base agent could not be read. A missing, self, cyclic or nested settings
+ * base (one whose chain sets `ai.settingsBase` again) is ignored: the own chain comes back with
+ * the reason, so every consumer falls back to `base` instead of following settings bases further.
+ */
+export function applySettingsBaseChain<T extends { id: string; ai?: { settingsBase?: string } }>(
+  agentId: string,
+  ownChain: readonly T[],
+  settingsBaseChain: readonly T[] | null
+): { chain: T[]; ignored?: SettingsBaseIgnoredReason } {
+  if (settingsBaseChain === null) return { chain: [...ownChain], ignored: "missing" };
+  assert(settingsBaseChain.length > 0, "applySettingsBaseChain: a read chain starts at its agent");
+  if (settingsBaseChain[0].id === agentId) return { chain: [...ownChain], ignored: "self" };
+  if (settingsBaseChain.some((entry) => entry.id === agentId)) {
+    return { chain: [...ownChain], ignored: "cycle" };
+  }
+  if (settingsBaseChain.some((entry) => entry.ai?.settingsBase != null)) {
+    return { chain: [...ownChain], ignored: "nested" };
+  }
+  const firstBase = ownChain.findIndex((entry) => entry.id !== agentId);
+  const ownEntries = firstBase === -1 ? ownChain : ownChain.slice(0, firstBase);
+  return { chain: [...ownEntries, ...settingsBaseChain] };
 }

@@ -23,6 +23,7 @@ import assert from "@/common/utils/assert";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
 import { parseCreationDraftScopeId } from "@/common/constants/storage";
 import { CreationDraftSchema } from "@/common/orpc/schemas/drafts";
 
@@ -144,10 +145,15 @@ function getSavedRevision(workspaceId: string): number {
  */
 export function setAgentBases(
   scopeId: string,
-  agents: ReadonlyArray<{ id: string; base?: string; scope?: AgentDefinitionScope }>
+  agents: ReadonlyArray<{
+    id: string;
+    base?: string;
+    aiSettingsBase?: string;
+    scope?: AgentDefinitionScope;
+  }>
 ): void {
   agentScopesByScope.set(scopeId, new Map(agents.map((agent) => [agent.id, agent.scope])));
-  const bases = new Map(agents.map((agent) => [agent.id, agent.base]));
+  const bases = getAgentAiSettingsBases(agents);
   const previous = agentBasesByScope.get(scopeId);
   if (previous != null && JSON.stringify([...previous]) === JSON.stringify([...bases])) return;
   agentBasesByScope.set(scopeId, bases);
