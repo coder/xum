@@ -356,11 +356,13 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       await seedOnDisk(
         (projectPath) => [
           projectWorkspace(projectPath, "owner", "owner"),
+          // A valid claim, so the listing spy below is shown to see the creator-directory reads.
+          projectWorkspace(projectPath, "control", "control", claimTag("owner")),
           ...targets.map((target, index) =>
             projectWorkspace(projectPath, target, target, claimTag(claims[index]))
           ),
         ],
-        targets.flatMap((target) => createdAndRunning("owner", target))
+        ["control", ...targets].flatMap((target) => createdAndRunning("owner", target))
       )
     ).taskService;
     const listings = spyOn(
@@ -368,7 +370,7 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       "listWorkspaceTurns"
     );
 
-    for (const target of targets) {
+    for (const target of ["control", ...targets]) {
       expect(await lookup(backendA, target)).toMatchObject({
         taskHandleId: `wst_follow_${target}`,
         ownerWorkspaceId: "owner",

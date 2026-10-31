@@ -1396,18 +1396,14 @@ export class WorkspaceTurnManager {
       );
     }
 
-    const allWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns();
-    const ownerWorkspaceTurns = allWorkspaceTurns.filter(
-      (record) => record.ownerWorkspaceId === ownerWorkspaceId
-    );
-    const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
     // Closures in this function share one scope, and callbacks handed to sendMessage (onCanceled)
-    // can outlive the turn. Capturing allWorkspaceTurns pinned every owner's records, ~82 MB per
-    // copy in a long-lived server (F29). Capture only the records with an active status: the
-    // count skips every other record before its first await, so the result is the same.
-    const statusActiveWorkspaceTurns = allWorkspaceTurns.filter((record) =>
-      isActiveWorkspaceTurnTaskStatus(record.status)
-    );
+    // can outlive the turn. Capturing every owner's records pinned ~82 MB per copy in a long-lived
+    // server (F29). Read only the records with an active status: the count and the active-turn
+    // lookup skip every other record, and the scan reads only these files.
+    const statusActiveWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns({
+      statuses: COUNTED_WORKSPACE_TURN_STATUSES,
+    });
+    const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
     const ensureParallelSlot = async (): Promise<Result<void, string>> => {
       const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(
         statusActiveWorkspaceTurns
@@ -1500,8 +1496,9 @@ export class WorkspaceTurnManager {
 
       // The owner rule. The active-turn lookup reads only the owners it admits
       // (workspaceTurnOwners.ts), so changing it must update that module.
-      const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
-        (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
+      const ownsExistingWorkspaceTurn = await this.taskHandleStore.isWorkspaceOwnedBy(
+        ownerWorkspaceId,
+        existingWorkspaceId
       );
       const ownsDescendantAgentWorkspace =
         args.allowAgentWorkspace === true &&
@@ -1602,7 +1599,7 @@ export class WorkspaceTurnManager {
         : undefined;
       queuedForExistingWorkspace = this.workspaceService.isBusyForMessage(existingWorkspaceId);
       const activeWorkspaceTurn = await this.findActiveWorkspaceTurnForWorkspace(
-        allWorkspaceTurns,
+        statusActiveWorkspaceTurns,
         existingWorkspaceId
       );
       if (!queuedForExistingWorkspace || activeWorkspaceTurn == null) {

@@ -151,27 +151,109 @@ function assertValidWorkspaceTurnTaskId(handleId: string): void {
   );
 }
 
+/**
+ * dev, ino, size, mtime and ctime of a file or directory. Every handle write renames a temp file
+ * over its target, which changes the target's inode and its directory's stamps, so an equal
+ * fingerprint means nothing was written there in between. That holds only for stamps older than
+ * the timestamp granularity at the first stat (git's racy-clean rule): `null` marks an
+ * observation too recent to vouch for anything, and never matches.
+ */
+type Fingerprint = string;
+
+interface HandleScanRow {
+  readonly handleId: string;
+  readonly file: Fingerprint | null;
+  /** null: corrupt, schema-rejected or mismatched. Such a row is never selected. */
+  readonly status: WorkspaceTurnTaskStatus | null;
+}
+
+/**
+ * What the last scan saw in one owner's session directory: its handle rows in readdir order (the
+ * order of createdAt ties) and the fingerprint of the directory that proves them. An owner without
+ * task-handles has no rows, proven by its session directory, which creating task-handles changes.
+ * Only primitives: parsed records would pin every owner's history (F29), and callers mutate the
+ * records a scan returns.
+ */
+type OwnerScanIndex =
+  | {
+      readonly provenBy: "session-dir";
+      readonly proof: Fingerprint | null;
+      readonly rows: readonly [];
+    }
+  | {
+      readonly provenBy: "handle-dir";
+      readonly proof: Fingerprint | null;
+      readonly rows: readonly HandleScanRow[];
+    };
+
+interface ScanContext {
+  /** null selects every status. */
+  readonly statuses: ReadonlySet<WorkspaceTurnTaskStatus> | null;
+  readonly startMs: number;
+}
+
+/** FAT's 2 s stamps are the coarsest local filesystem; 1 s more covers clock slew. */
+const RACY_TIMESTAMP_MARGIN_MS = 3_000;
+
+function fingerprintIfSafe(stats: fs.BigIntStats, scanStartMs: number): Fingerprint | null {
+  const racyFromNs = BigInt(Math.floor(scanStartMs - RACY_TIMESTAMP_MARGIN_MS)) * 1_000_000n;
+  if (stats.mtimeNs >= racyFromNs || stats.ctimeNs >= racyFromNs) return null;
+  return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+}
+
+function isSelected(
+  scan: ScanContext,
+  status: WorkspaceTurnTaskStatus | null
+): status is WorkspaceTurnTaskStatus {
+  return status != null && (scan.statuses == null || scan.statuses.has(status));
+}
+
+async function unlessMissing<T>(pending: Promise<T>): Promise<T | null> {
+  try {
+    return await pending;
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) return null;
+    throw error;
+  }
+}
+
 export class TaskHandleStore {
+  /** The global scan reads only the handle files whose indexed status it selects. */
+  private readonly scanIndex = new Map<string, OwnerScanIndex>();
+  /** Bumped after each write by this store, so a scan that overlapped it does not publish. */
+  private readonly writeGenerations = new Map<string, number>();
+  private readonly now: () => number;
+
   /**
    * `locks` takes the publication lock (phase 4: SessionLocks). The workspace-turn manager passes
-   * its history service's locks; other callers keep the Node default.
+   * its history service's locks; other callers keep the Node default. `now` is the wall clock the
+   * global scan compares file stamps with.
    */
   constructor(
     private readonly config: Config,
-    private readonly locks: SessionLocks = nodeSessionLocks
-  ) {}
+    private readonly locks: SessionLocks = nodeSessionLocks,
+    options: { now?: () => number } = {}
+  ) {
+    this.now = options.now ?? (() => Date.now());
+  }
 
   async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
     this.assertValidRecord(record);
     const dir = this.getOwnerHandleDir(record.ownerWorkspaceId);
     await fsPromises.mkdir(dir, { recursive: true });
-    // Replace atomically. Waiters, task_await and task_list read handles without the settlement
-    // lock, and a truncate-then-write update let them see an empty file, which reads as a missing
-    // handle ("Workspace turn not found or out of scope", coder/xum#4410).
-    await writeFileAtomic(
-      this.getHandlePath(record.ownerWorkspaceId, record.handleId),
-      JSON.stringify(record, null, 2)
-    );
+    try {
+      // Replace atomically. Waiters, task_await and task_list read handles without the settlement
+      // lock, and a truncate-then-write update let them see an empty file, which reads as a missing
+      // handle ("Workspace turn not found or out of scope", coder/xum#4410).
+      await writeFileAtomic(
+        this.getHandlePath(record.ownerWorkspaceId, record.handleId),
+        JSON.stringify(record, null, 2)
+      );
+    } finally {
+      // Also on failure: the rename can land before a failing directory fsync. Stamps alone cannot
+      // prove this write visible, since it can share a timestamp tick with the last scan.
+      this.forgetScannedHandle(record.ownerWorkspaceId, record.handleId);
+    }
   }
 
   /**
@@ -313,6 +395,8 @@ export class TaskHandleStore {
   async scanAllWorkspaceTurns(
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
   ): Promise<{ records: WorkspaceTurnTaskHandleRecord[]; complete: boolean }> {
+    const scanStartMs = this.now();
+    assert(Number.isFinite(scanStartMs), "TaskHandleStore clock must return finite milliseconds");
     let entries: Array<{ isDirectory: () => boolean; name: string }>;
     try {
       entries = await fsPromises.readdir(this.config.sessionsDir, { withFileTypes: true });
@@ -321,29 +405,183 @@ export class TaskHandleStore {
       throw error;
     }
 
+    const scan: ScanContext = {
+      statuses: options.statuses != null ? new Set(options.statuses) : null,
+      startMs: scanStartMs,
+    };
+    const owners = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
     let complete = true;
     const recordsByOwner = await Promise.all(
-      entries
-        .filter((entry) => entry.isDirectory())
-        .map(async (entry) => {
-          try {
-            return await this.listWorkspaceTurns(entry.name, options);
-          } catch (error: unknown) {
-            // Startup reconciliation is best-effort: one unreadable session must not prevent every
-            // other workspace (or the app itself) from loading.
-            log.warn("Skipping unreadable workspace-turn handle directory", {
-              ownerWorkspaceId: entry.name,
-              error,
-            });
-            complete = false;
-            return [];
-          }
-        })
+      owners.map(async (ownerWorkspaceId) => {
+        try {
+          return await this.scanOwnerWorkspaceTurns(ownerWorkspaceId, scan);
+        } catch (error: unknown) {
+          // Startup reconciliation is best-effort: one unreadable session must not prevent every
+          // other workspace (or the app itself) from loading.
+          log.warn("Skipping unreadable workspace-turn handle directory", {
+            ownerWorkspaceId,
+            error,
+          });
+          this.scanIndex.delete(ownerWorkspaceId);
+          complete = false;
+          return [];
+        }
+      })
     );
+    const listed = new Set(owners);
+    for (const ownerWorkspaceId of this.scanIndex.keys()) {
+      if (!listed.has(ownerWorkspaceId)) this.scanIndex.delete(ownerWorkspaceId);
+    }
     return {
       records: recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
       complete,
     };
+  }
+
+  /** One owner's selected records in readdir order. Throws when the owner is unreadable. */
+  private async scanOwnerWorkspaceTurns(
+    ownerWorkspaceId: string,
+    scan: ScanContext
+  ): Promise<WorkspaceTurnTaskHandleRecord[]> {
+    const generation = this.writeGenerations.get(ownerWorkspaceId);
+    const previous = this.scanIndex.get(ownerWorkspaceId);
+    const reusable = await this.reusableRows(ownerWorkspaceId, previous, scan);
+    if (reusable != null) {
+      return await this.readSelectedHandles(ownerWorkspaceId, reusable, scan, new Map());
+    }
+
+    const parsed = new Map<string, WorkspaceTurnTaskHandleRecord>();
+    const index = await this.refreshOwnerScanIndex(ownerWorkspaceId, previous, scan, parsed);
+    if (index == null || this.writeGenerations.get(ownerWorkspaceId) !== generation) {
+      this.scanIndex.delete(ownerWorkspaceId);
+    } else {
+      this.scanIndex.set(ownerWorkspaceId, index);
+    }
+    return index == null
+      ? []
+      : await this.readSelectedHandles(ownerWorkspaceId, index.rows, scan, parsed);
+  }
+
+  /** The indexed rows while the directory that proves them is unchanged, else null. */
+  private async reusableRows(
+    ownerWorkspaceId: string,
+    entry: OwnerScanIndex | undefined,
+    scan: ScanContext
+  ): Promise<readonly HandleScanRow[] | null> {
+    if (entry?.proof == null) return null;
+    const provenDir =
+      entry.provenBy === "handle-dir"
+        ? this.getOwnerHandleDir(ownerWorkspaceId)
+        : path.join(this.config.sessionsDir, ownerWorkspaceId);
+    const stats = await unlessMissing(fsPromises.stat(provenDir, { bigint: true }));
+    return stats != null && fingerprintIfSafe(stats, scan.startMs) === entry.proof
+      ? entry.rows
+      : null;
+  }
+
+  /**
+   * Re-list one owner, re-reading only the handle files whose fingerprint changed, and add the
+   * selected records it read to `parsed`. Each stamp is taken before the content it vouches for,
+   * so a write that lands mid-scan leaves a stale fingerprint and the next scan re-reads. Returns
+   * null when the session directory is gone.
+   */
+  private async refreshOwnerScanIndex(
+    ownerWorkspaceId: string,
+    previous: OwnerScanIndex | undefined,
+    scan: ScanContext,
+    parsed: Map<string, WorkspaceTurnTaskHandleRecord>
+  ): Promise<OwnerScanIndex | null> {
+    const sessionStats = await unlessMissing(
+      fsPromises.stat(path.join(this.config.sessionsDir, ownerWorkspaceId), { bigint: true })
+    );
+    if (sessionStats == null) return null;
+    const handleDir = this.getOwnerHandleDir(ownerWorkspaceId);
+    const dirStats = await unlessMissing(fsPromises.stat(handleDir, { bigint: true }));
+    if (dirStats == null) {
+      const proof = fingerprintIfSafe(sessionStats, scan.startMs);
+      return { provenBy: "session-dir", proof, rows: [] };
+    }
+    const entries = await unlessMissing(fsPromises.readdir(handleDir));
+    if (entries == null) return null;
+
+    const known = new Map(previous?.rows.map((row) => [row.handleId, row]));
+    const rows = await Promise.all(
+      entries
+        .filter((entry) => entry.endsWith(".json"))
+        .map((entry) => entry.slice(0, -".json".length))
+        .filter(isWorkspaceTurnTaskId)
+        .map((handleId) =>
+          this.scanHandleFile(ownerWorkspaceId, handleId, known.get(handleId), scan, parsed)
+        )
+    );
+    const present = rows.filter((row): row is HandleScanRow => row != null);
+    const proof = fingerprintIfSafe(dirStats, scan.startMs);
+    // A racy row needs a re-read next scan, which only a re-list reaches.
+    const proven = present.every((row) => row.file != null);
+    return { provenBy: "handle-dir", proof: proven ? proof : null, rows: present };
+  }
+
+  /** One handle's row: `known` while the file's fingerprint still matches it. Null when gone. */
+  private async scanHandleFile(
+    ownerWorkspaceId: string,
+    handleId: string,
+    known: HandleScanRow | undefined,
+    scan: ScanContext,
+    parsed: Map<string, WorkspaceTurnTaskHandleRecord>
+  ): Promise<HandleScanRow | null> {
+    const stats = await unlessMissing(
+      fsPromises.stat(this.getHandlePath(ownerWorkspaceId, handleId), { bigint: true })
+    );
+    if (stats == null) return null;
+    const file = fingerprintIfSafe(stats, scan.startMs);
+    if (file != null && known?.file === file) return known;
+    const record = await this.readWorkspaceTurnFile(ownerWorkspaceId, handleId);
+    if (record != null && isSelected(scan, record.status)) parsed.set(handleId, record);
+    return { handleId, file, status: record == null ? null : record.status };
+  }
+
+  /**
+   * The selected rows' records: `parsed` when this scan read the file, else a fresh read whose
+   * status is checked again, since the indexed status can predate the file.
+   */
+  private async readSelectedHandles(
+    ownerWorkspaceId: string,
+    rows: readonly HandleScanRow[],
+    scan: ScanContext,
+    parsed: ReadonlyMap<string, WorkspaceTurnTaskHandleRecord>
+  ): Promise<WorkspaceTurnTaskHandleRecord[]> {
+    const records = await Promise.all(
+      rows
+        .filter((row) => isSelected(scan, row.status))
+        .map(
+          async (row) =>
+            parsed.get(row.handleId) ??
+            (await this.readWorkspaceTurnFile(ownerWorkspaceId, row.handleId))
+        )
+    );
+    return records.filter(
+      (record): record is WorkspaceTurnTaskHandleRecord =>
+        record != null && isSelected(scan, record.status)
+    );
+  }
+
+  private forgetScannedHandle(ownerWorkspaceId: string, handleId: string): void {
+    this.writeGenerations.set(
+      ownerWorkspaceId,
+      (this.writeGenerations.get(ownerWorkspaceId) ?? 0) + 1
+    );
+    const entry = this.scanIndex.get(ownerWorkspaceId);
+    if (entry?.provenBy !== "handle-dir") {
+      this.scanIndex.delete(ownerWorkspaceId);
+      return;
+    }
+    // Keep the other rows: their own fingerprints still prove them, so the next scan re-lists the
+    // owner but re-reads only this handle.
+    this.scanIndex.set(ownerWorkspaceId, {
+      provenBy: "handle-dir",
+      proof: null,
+      rows: entry.rows.filter((row) => row.handleId !== handleId),
+    });
   }
 
   async isWorkspaceOwnedBy(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {
