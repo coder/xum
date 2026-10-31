@@ -1886,6 +1886,9 @@ interface DeferredDescendantMessage {
   archivedAtSend: string | null;
 }
 
+/** A trusted descendant message as dispatched: the deferred record before its archive snapshot. */
+type DescendantMessageDeferral = Omit<DeferredDescendantMessage, "archivedAtSend">;
+
 function resolveDescendantMessageStopFence(
   options: TrustedDescendantMessageOptions | undefined,
   captured: ReadonlyMap<string, number>
@@ -10616,123 +10619,203 @@ export class TaskService implements AgentTaskIntegration {
           });
         }
 
-        if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
-          return Err({
-            code: "not_active" as const,
-            taskStatus: entry.workspace.taskStatus ?? "unknown",
-            message:
-              "Task workspace is archived; retry task_send_message to restore and reawaken it.",
-          });
-        }
-
-        // Missing status is a legacy running task. A reported/interrupted agent workspace may also
-        // have an active follow-up workspace-turn execution; its live stream accepts steering here.
-        const previousStatus = entry.workspace.taskStatus ?? "running";
-        if (
-          previousStatus !== "running" &&
-          previousStatus !== "awaiting_report" &&
-          !this.aiService.isStreaming(taskId) &&
-          !continuationActive
-        ) {
-          return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
-        }
-
-        // An active target whose checkout is missing could never run the delivered turn (#4824):
-        // refuse before the durable guidance or any payload row is written, instead of failing
-        // later with runtime_not_ready. Inactive targets are probed by reactivateInactiveAgentTask
-        // after unarchiving (which can restore the checkout); queued targets only edit their prompt.
-        const checkoutError = await getMissingHostLocalCheckoutError(entry);
-        if (checkoutError != null) {
-          return Err({
-            code: "send_failed" as const,
-            message: `Cannot deliver to sub-agent ${taskId}: its checkout is unavailable (${checkoutError}).`,
-          });
-        }
-
-        const guidanceId = randomUUID();
-        await this.editActiveWorkspaceEntry(
-          taskId,
-          (workspace) => {
-            (workspace.taskPendingGuidance ??= []).push({
-              id: guidanceId,
-              // Startup-recovery replay presents reservations as parent guidance, so
-              // non-default labels (sibling messages) must keep their attribution in
-              // the durable record.
-              message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
-              queueDispatchMode,
-            });
-            if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
-              // Persist the legacy implicit-running state so startup recovery can replay this durable
-              // guidance if Xum exits before the replacement turn accepts it.
-              workspace.taskStatus = "running";
-            }
-          },
-          { allowMissing: true }
-        );
-
-        const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
-        const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
-        // Parent guidance continues the delegated execution, rather than superseding it and
-        // stranding its report. Use the normal continuation guards for earlier manual input.
-        const workspaceTurnMuxMetadata =
-          await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-            taskId
-          );
-        const guidance = this.taskGuidanceSendOptions(taskId, guidanceId, previousStatus);
-        const settleFailure = async (status: "interrupted" | "error", reason: string) => {
-          await guidance.onCanceled();
-          if (workspaceTurnMuxMetadata != null) {
-            await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-              taskId,
-              workspaceTurnMuxMetadata,
-              status,
-              reason
-            );
-          }
-        };
-        let accepted = false;
-        // Admission classification: guidance into a live child continues its attempt (no rotation).
-        const sendResult = await this.workspaceService.sendMessage(
-          taskId,
-          // Synthetic metadata avoids treating parent/sibling orchestration as a direct human
-          // intervention in child-only features such as goals and interactive questions.
+        return await this.deliverTrustedGuidance(
+          deferral,
           labeledMessage,
-          {
-            ...buildActiveTaskAiSendOptions(entry.workspace, activeAgentId, activeAiSettings),
-            queueDispatchMode,
-            ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
-          },
-          {
-            ...guidance,
-            workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-            // Sibling messages are agent messages; parent guidance is not (#4804).
-            ...(sender === "sibling" ? { honorRecipientHold: true } : {}),
-            onCanceled: (reason) => settleFailure("interrupted", reason),
-            // Live target: pre-turn rows ride the send through AgentSession
-            // turn admission (queued with the trigger when the target is busy).
-            preTurnMessages: options?.preTurnMessages,
-            // If the replacement turn cannot start, remove the settlement reservation and restore
-            // an idle child to completion recovery instead of leaving it permanently running.
-            onAcceptedPreStreamFailure: (error) =>
-              settleFailure("error", formatSendMessageError(error).message),
-            onAccepted: async () => {
-              await guidance.onAccepted();
-              accepted = true;
-            },
-          }
+          entry,
+          continuationActive
         );
-
-        if (!sendResult.success) {
-          await guidance.onCanceled();
-          return Err({
-            code: "send_failed" as const,
-            message: formatSendMessageError(sendResult.error).message,
-          });
-        }
-
-        return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
     );
+  }
+
+  /**
+   * The live path of a trusted message, under the target's event and tree locks: refuse an
+   * archived target or one that takes no guidance, then reserve and send the guidance.
+   */
+  private async deliverTrustedGuidance(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    continuationActive: boolean
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+      return Err({
+        code: "not_active" as const,
+        taskStatus: entry.workspace.taskStatus ?? "unknown",
+        message: "Task workspace is archived; retry task_send_message to restore and reawaken it.",
+      });
+    }
+
+    // Missing status is a legacy running task. A reported/interrupted agent workspace may also
+    // have an active follow-up workspace-turn execution; its live stream accepts steering here.
+    const previousStatus = entry.workspace.taskStatus ?? "running";
+    if (this.guidanceTargetIsInactive(deferral.taskId, previousStatus, continuationActive)) {
+      return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
+    }
+    return await this.reserveTrustedGuidance(deferral, labeledMessage, entry, previousStatus);
+  }
+
+  /** A target that takes no live guidance: not running or awaiting its report, and not live. */
+  private guidanceTargetIsInactive(
+    taskId: string,
+    previousStatus: AgentTaskStatus,
+    continuationActive: boolean
+  ): boolean {
+    return (
+      previousStatus !== "running" &&
+      previousStatus !== "awaiting_report" &&
+      !this.aiService.isStreaming(taskId) &&
+      !continuationActive
+    );
+  }
+
+  /**
+   * Refuse a target whose checkout is missing, then persist the guidance as a durable reservation
+   * under the desktop gate, then send it.
+   */
+  private async reserveTrustedGuidance(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    previousStatus: AgentTaskStatus
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { taskId, trimmedMessage, queueDispatchMode, options } = deferral;
+    // An active target whose checkout is missing could never run the delivered turn (#4824):
+    // refuse before the durable guidance or any payload row is written, instead of failing
+    // later with runtime_not_ready. Inactive targets are probed by reactivateInactiveAgentTask
+    // after unarchiving (which can restore the checkout); queued targets only edit their prompt.
+    const checkoutError = await getMissingHostLocalCheckoutError(entry);
+    if (checkoutError != null) {
+      return Err({
+        code: "send_failed" as const,
+        message: `Cannot deliver to sub-agent ${taskId}: its checkout is unavailable (${checkoutError}).`,
+      });
+    }
+
+    const guidanceId = randomUUID();
+    await this.editActiveWorkspaceEntry(
+      taskId,
+      (workspace) => {
+        (workspace.taskPendingGuidance ??= []).push({
+          id: guidanceId,
+          // Startup-recovery replay presents reservations as parent guidance, so
+          // non-default labels (sibling messages) must keep their attribution in
+          // the durable record.
+          message: options?.messageLabel != null ? labeledMessage : trimmedMessage,
+          queueDispatchMode,
+        });
+        if (workspace.taskStatus == null || previousStatus === "awaiting_report") {
+          // Persist the legacy implicit-running state so startup recovery can replay this durable
+          // guidance if Xum exits before the replacement turn accepts it.
+          workspace.taskStatus = "running";
+        }
+      },
+      { allowMissing: true }
+    );
+    return await this.sendTrustedGuidance(
+      deferral,
+      labeledMessage,
+      entry,
+      guidanceId,
+      previousStatus
+    );
+  }
+
+  /**
+   * Send the reserved guidance into the live child, in its active continuation when it has one.
+   * A refused send drops the reservation.
+   */
+  private async sendTrustedGuidance(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    guidanceId: string,
+    previousStatus: AgentTaskStatus
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { taskId, queueDispatchMode, sender, options } = deferral;
+    const activeAgentId = resolveTaskAgentIdForResume(entry.workspace);
+    const activeAiSettings = this.resolveWorkspaceAISettings(entry.workspace, activeAgentId);
+    // Parent guidance continues the delegated execution, rather than superseding it and
+    // stranding its report. Use the normal continuation guards for earlier manual input.
+    const workspaceTurnMuxMetadata =
+      await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(taskId);
+    const guidance = this.taskGuidanceSendOptions(taskId, guidanceId, previousStatus);
+    let accepted = false;
+    // Admission classification: guidance into a live child continues its attempt (no rotation).
+    const sendResult = await this.workspaceService.sendMessage(
+      taskId,
+      // Synthetic metadata avoids treating parent/sibling orchestration as a direct human
+      // intervention in child-only features such as goals and interactive questions.
+      labeledMessage,
+      {
+        ...buildActiveTaskAiSendOptions(entry.workspace, activeAgentId, activeAiSettings),
+        queueDispatchMode,
+        ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
+      },
+      {
+        ...guidance,
+        workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+        // Sibling messages are agent messages; parent guidance is not (#4804).
+        ...(sender === "sibling" ? { honorRecipientHold: true } : {}),
+        onCanceled: (reason) =>
+          this.settleGuidanceSendFailure(
+            taskId,
+            guidance,
+            workspaceTurnMuxMetadata,
+            "interrupted",
+            reason
+          ),
+        // Live target: pre-turn rows ride the send through AgentSession
+        // turn admission (queued with the trigger when the target is busy).
+        preTurnMessages: options?.preTurnMessages,
+        // If the replacement turn cannot start, remove the settlement reservation and restore
+        // an idle child to completion recovery instead of leaving it permanently running.
+        onAcceptedPreStreamFailure: (error) =>
+          this.settleGuidanceSendFailure(
+            taskId,
+            guidance,
+            workspaceTurnMuxMetadata,
+            "error",
+            formatSendMessageError(error).message
+          ),
+        onAccepted: async () => {
+          await guidance.onAccepted();
+          accepted = true;
+        },
+      }
+    );
+
+    if (!sendResult.success) {
+      await guidance.onCanceled();
+      return Err({
+        code: "send_failed" as const,
+        message: formatSendMessageError(sendResult.error).message,
+      });
+    }
+
+    return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
+  }
+
+  /** A failed guidance send: drop the reservation, then settle the continuation it rode, if any. */
+  private async settleGuidanceSendFailure(
+    taskId: string,
+    guidance: { onCanceled(): Promise<void> },
+    workspaceTurnMuxMetadata: Awaited<
+      ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
+    >,
+    status: "interrupted" | "error",
+    reason: string
+  ): Promise<void> {
+    await guidance.onCanceled();
+    if (workspaceTurnMuxMetadata != null) {
+      await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+        taskId,
+        workspaceTurnMuxMetadata,
+        status,
+        reason
+      );
+    }
   }
 
   /**
