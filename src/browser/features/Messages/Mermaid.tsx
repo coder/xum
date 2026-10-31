@@ -241,18 +241,33 @@ function isDiagramId(id: string, idPrefix: string): boolean {
 }
 
 /**
- * A CSS value that loads nothing: no escape, comment, at-rule or IE expression, and only
- * PELE_CSS_FUNCTIONS. With an idPrefix, url(#id) may also point at an element of the same
- * diagram, as Pele's fill attribute does. A style attribute gets no idPrefix: there Chromium
- * fetches the page itself for url(#id) in background-image, cursor or border-image-source.
+ * A CSS value that loads nothing: only printable ASCII, tab, LF and CR, no escape, comment,
+ * at-rule or IE expression, and only PELE_CSS_FUNCTIONS. With an idPrefix, url(#id) may also
+ * point at an element of the same diagram, as Pele's fill attribute does. A style attribute gets
+ * no idPrefix: there Chromium fetches the page itself for url(#id) in background-image, cursor or
+ * border-image-source.
  */
 function isPeleCss(value: string, idPrefix: string | null): boolean {
-  const rest = value.replace(/url\(\s*(["']?)#([\w-]+)\1\s*\)/gi, (url, _quote, id: string) =>
-    idPrefix !== null && isDiagramId(id, idPrefix) ? "" : url
+  // Pele writes only ASCII in CSS. Past it, the regexes below read CSS unlike the browser: \s
+  // matches &#160;, but Chromium reads url(&#160;#id) as a relative URL and requests it.
+  if (/[^\t\n\r\x20-\x7e]/.test(value)) return false;
+  // CSS whitespace is space, tab, LF, CR and FF, not \s.
+  const rest = value.replace(
+    /url\([ \t\n\r\f]*(["']?)#([\w-]+)\1[ \t\n\r\f]*\)/gi,
+    (url, _quote, id: string) => (idPrefix !== null && isDiagramId(id, idPrefix) ? "" : url)
   );
-  if (/\\|\/\*|@|expression/i.test(rest)) return false;
-  return Array.from(rest.matchAll(/([\w-]*)\s*\(/g)).every((call) =>
-    PELE_CSS_FUNCTIONS.has(call[1].toLowerCase())
+  return !/\\|\/\*|@|expression/i.test(rest) && usesOnlyPeleFunctions(rest);
+}
+
+/** Every ( in css follows the name of one of PELE_CSS_FUNCTIONS. */
+function usesOnlyPeleFunctions(css: string): boolean {
+  // Names and single characters other than CSS whitespace, so each character is matched once. A
+  // scan that restarts at every character of a run takes seconds on a 50,000-character chart, on
+  // the renderer thread. Skipping whitespace allows SVG's transform syntax, as in rotate (3).
+  const tokens = css.match(/[\w-]+|[^ \t\n\r\f]/g) ?? [];
+  return tokens.every(
+    (token, index) =>
+      token !== "(" || PELE_CSS_FUNCTIONS.has(tokens[index - 1]?.toLowerCase() ?? "")
   );
 }
 
