@@ -29,9 +29,9 @@ export interface CursorManifestResult {
   notApplied: AgentPluginNotApplied[];
 }
 
-const SILENT_CURSOR_KEYS = new Set(["displayName", "logo"]);
-
 const NOT_APPLIED_CURSOR_KEYS = [
+  "displayName",
+  "logo",
   "variables",
   "category",
   "tags",
@@ -42,7 +42,6 @@ const NOT_APPLIED_CURSOR_KEYS = [
 
 const HANDLED_CURSOR_KEYS = new Set<string>([
   ...CLAUDE_METADATA_KEYS,
-  ...SILENT_CURSOR_KEYS,
   ...NOT_APPLIED_CURSOR_KEYS,
   "author",
   "skills",

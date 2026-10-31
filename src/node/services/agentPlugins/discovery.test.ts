@@ -20,6 +20,7 @@ import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 async function writePlugin(
   containerPath: string,
@@ -2240,18 +2241,25 @@ describe("Cursor plugin discovery", () => {
   const skill = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
   const rule = (description: string) => `---\ndescription: ${description}\n---\nBody\n`;
 
+  /** Disposing the result removes the plugin folder, so checks that read it run before that. */
   async function discoverKit(files: Record<string, string>) {
-    using tmp = new DisposableTempDir("cursor-plugins");
-    const container = path.join(tmp.path, "plugins");
-    await writeTree(path.join(container, "kit"), files);
-    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
-    expect(result.plugins).toHaveLength(1);
-    const plugin = result.plugins[0];
-    return {
-      plugin,
-      messages: result.diagnostics.map((d) => d.message),
-      relative: (dir: string) => path.relative(plugin.rootPath, dir),
-    };
+    const tmp = new DisposableTempDir("cursor-plugins");
+    try {
+      const container = path.join(tmp.path, "plugins");
+      await writeTree(path.join(container, "kit"), files);
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(result.plugins).toHaveLength(1);
+      const plugin = result.plugins[0];
+      return {
+        plugin,
+        messages: result.diagnostics.map((d) => d.message),
+        relative: (dir: string) => path.relative(plugin.rootPath, dir),
+        [Symbol.dispose]: () => tmp[Symbol.dispose](),
+      };
+    } catch (error) {
+      tmp[Symbol.dispose]();
+      throw error;
+    }
   }
 
   const ruleSkills = (plugin: { skillsDirs?: Array<{ name?: string; rule?: string }> }) =>
@@ -2260,10 +2268,11 @@ describe("Cursor plugin discovery", () => {
     );
 
   test("a folder with only a Cursor manifest and skills/ loads with its skills", async () => {
-    const { plugin, relative } = await discoverKit({
-      ...cursorManifest({ name: "kit", displayName: "Kit", logo: "assets/logo.png" }),
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
       "skills/alpha/SKILL.md": skill("alpha"),
     });
+    const { plugin, relative } = kit;
     expect(plugin.cursorFallback).toBe(true);
     expect(plugin.name).toBe("kit");
     expect(plugin.skillsDirs?.map((root) => relative(root.dir))).toEqual(["skills"]);
@@ -2271,23 +2280,25 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("a root plugin.json with $schema loads before a Cursor manifest", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "from-root" }),
       ...cursorManifest({ name: "from-cursor" }),
     });
+    const { plugin } = kit;
     expect([plugin.name, plugin.cursorFallback]).toEqual(["from-root", undefined]);
   });
 
   test("a schema-less root plugin.json yields to a Cursor manifest (D21)", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       "plugin.json": JSON.stringify({ name: "from-root" }),
       ...cursorManifest({ name: "from-cursor" }),
     });
+    const { plugin } = kit;
     expect([plugin.name, plugin.cursorFallback]).toEqual(["from-cursor", true]);
   });
 
   test("hooks.js, workflows/, skill scripts and com.openai of a Cursor folder do not load", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({
         name: "kit",
         contributes: { hooks: "hooks.js", workflows: "workflows" },
@@ -2298,6 +2309,7 @@ describe("Cursor plugin discovery", () => {
       "skills/alpha/SKILL.md": skill("alpha"),
       "skills/alpha/workflow.js": "export {};\n",
     });
+    const { plugin } = kit;
     expect(plugin.hooksPath).toBeUndefined();
     expect(plugin.workflowsDir).toBeUndefined();
     expect(plugin.manifest.extensions).toBeUndefined();
@@ -2307,10 +2319,11 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("variables, category and a commands/ folder are listed as not applied", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit", variables: { TOKEN: {} }, category: "developer-tools" }),
       "commands/review.md": "Review\n",
     });
+    const { plugin } = kit;
     expect(plugin.notApplied).toEqual([
       { part: "field", name: "variables", reason: "not applied in Xum" },
       { part: "field", name: "category", reason: "not applied in Xum" },
@@ -2320,13 +2333,18 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("hooks/hooks.json produces no Codex hooks and one not-applied hook entry", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
+      // Cursor's `stop` and a Codex-shaped `Stop`: the Codex loader must read neither.
       "hooks/hooks.json": JSON.stringify({
         version: 1,
-        hooks: { stop: [{ command: "./hooks/stop.sh" }] },
+        hooks: {
+          stop: [{ command: "./hooks/stop.sh" }],
+          Stop: [{ hooks: [{ type: "mcp_tool", server: "s", tool: "t" }] }],
+        },
       }),
     });
+    const { plugin } = kit;
     expect(await loadPluginCodexHooks(plugin)).toEqual({ hooks: [], warnings: [] });
     expect(plugin.notApplied).toEqual([
       {
@@ -2339,34 +2357,37 @@ describe("Cursor plugin discovery", () => {
 
   test("the file that mcpServers names loads in the cursor MCP dialect", async () => {
     const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
-    const { plugin, relative } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./servers.json" }),
       "servers.json": servers,
       "mcp.json": servers,
     });
+    const { plugin, relative } = kit;
     expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
     expect(plugin.mcpConfigDialect).toBe("cursor");
     expect(plugin.notApplied).toEqual([]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {
-    const { plugin, relative } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit", rules: "./my-rules/" }),
       "my-rules/mine.mdc": rule("Mine"),
       "rules/default.mdc": rule("Default"),
     });
+    const { plugin, relative } = kit;
     expect(ruleSkills(plugin)).toEqual([["mine", "mine.mdc"]]);
     expect(plugin.skillsDirs?.map((root) => relative(root.dir))).toEqual(["my-rules"]);
   });
 
   test("rules ending in .mdc, .md and .markdown load as rule skills; other files do not", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       "rules/a.mdc": rule("A"),
       "rules/b.md": rule("B"),
       "rules/c.markdown": rule("C"),
       "rules/notes.txt": "not a rule\n",
     });
+    const { plugin } = kit;
     expect(ruleSkills(plugin)).toEqual([
       ["a", "a.mdc"],
       ["b", "b.md"],
@@ -2375,10 +2396,11 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("a rule without a valid skill name is dropped with a warning", async () => {
-    const { plugin, messages } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       "rules/Bad_Name.mdc": rule("Bad"),
     });
+    const { plugin, messages } = kit;
     expect(ruleSkills(plugin)).toEqual([]);
     expect(messages).toContain(
       "Rule 'Bad_Name.mdc' has no valid skill name (kebab-case); ignoring it"
@@ -2389,11 +2411,12 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("of two rules with one name, the first in byte order wins", async () => {
-    const { plugin, messages } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       "rules/x.mdc": rule("From mdc"),
       "rules/x.md": rule("From md"),
     });
+    const { plugin, messages } = kit;
     expect(ruleSkills(plugin)).toEqual([["x", "x.md"]]);
     expect(messages).toContain("Rule 'x.mdc' is ignored: a skill or rule named 'x' comes first");
     expect(plugin.notApplied).toEqual([
@@ -2402,11 +2425,12 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("a skill wins over a rule of the same name", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       "skills/review/SKILL.md": skill("review"),
       "rules/review.mdc": rule("Review rule"),
     });
+    const { plugin } = kit;
     expect(ruleSkills(plugin)).toEqual([]);
     expect(plugin.notApplied).toEqual([
       { part: "rule", name: "review.mdc", reason: "a skill or rule of the same name comes first" },
@@ -2414,11 +2438,12 @@ describe("Cursor plugin discovery", () => {
   });
 
   test("a rule that does not convert to a skill is listed and does not take its name", async () => {
-    const { plugin, messages } = await discoverKit({
+    using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       "rules/x.md": "---\n: [\n---\nBroken\n",
       "rules/x.mdc": rule("Valid"),
     });
+    const { plugin, messages } = kit;
     expect(ruleSkills(plugin)).toEqual([["x", "x.mdc"]]);
     expect(messages).toContain("Rule 'x.md' has invalid frontmatter; ignoring it");
     expect(plugin.notApplied).toEqual([
@@ -2426,11 +2451,31 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("rules refused at conversion are listed with their own reasons", async () => {
+    // Forty aliases of one anchor in `globs` grow the rewritten frontmatter past the file's own
+    // size, so a file just under the SKILL.md cap is over it once rewritten.
+    const frontmatter = `---\nx: &x "${"a".repeat(200)}"\nglobs: [${Array(40).fill("*x").join(", ")}]\n---\n`;
+    const overCap = `${frontmatter}${"p".repeat(MAX_FILE_SIZE - 100 - frontmatter.length)}`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/broken.mdc": "---\n: [\n---\nBroken\n",
+      "rules/huge.mdc": overCap,
+      "rules/ok.mdc": rule("Valid"),
+    });
+    const { plugin } = kit;
+    expect(ruleSkills(plugin)).toEqual([["ok", "ok.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "broken.mdc", reason: "invalid frontmatter" },
+      { part: "rule", name: "huge.mdc", reason: "too large once rewritten as a skill" },
+    ]);
+  });
+
   test("other package kinds list nothing as not applied", async () => {
-    const { plugin } = await discoverKit({
+    using kit = await discoverKit({
       ".claude-plugin/plugin.json": JSON.stringify({ name: "kit", category: "tools" }),
       "rules/a.mdc": rule("A"),
     });
+    const { plugin } = kit;
     expect(plugin.claudeFallback).toBe(true);
     expect(plugin.notApplied).toEqual([]);
     expect(ruleSkills(plugin)).toEqual([]);
