@@ -2240,7 +2240,6 @@ describe("Cursor plugin discovery", () => {
   const skill = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
   const rule = (description: string) => `---\ndescription: ${description}\n---\nBody\n`;
 
-  /** The one plugin of a container holding `files` in `kit/`, and the discovery diagnostics. */
   async function discoverKit(files: Record<string, string>) {
     using tmp = new DisposableTempDir("cursor-plugins");
     const container = path.join(tmp.path, "plugins");

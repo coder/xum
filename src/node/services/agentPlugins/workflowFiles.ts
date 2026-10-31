@@ -74,7 +74,6 @@ export async function listPluginSkillScripts(plugin: {
   return scripts;
 }
 
-/** The `workflow.js` of each skill folder of one skills root (listPluginSkillScripts). */
 async function skillsRootScripts(
   pluginRoot: string,
   skillsRoot: PluginSkillsRoot

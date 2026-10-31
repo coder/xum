@@ -251,7 +251,6 @@ function listHookEntries(
   return { entries: pointer.slice(0, MAX_HOOK_POINTER_ENTRIES), defaultFileListed: false };
 }
 
-/** A hooks file parsed as JSON, or undefined (with a warning) when it cannot be read or parsed. */
 async function readHooksDocument(
   rootPath: string,
   relativePath: string,

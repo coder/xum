@@ -8,7 +8,6 @@ import { convertCursorRule, cursorRuleSkillMarkdown } from "./cursorRules";
 
 const SKILL_DESCRIPTION_CAP = 1024;
 
-/** A rule file as the skill Xum loads: converted, then parsed like any plugin SKILL.md. */
 function ruleSkill(name: string, content: string) {
   const markdown = cursorRuleSkillMarkdown({ name, file: `${name}.mdc` }, content);
   return parseSkillMarkdown({
@@ -175,8 +174,6 @@ describe("invalid Cursor rules", () => {
   });
 });
 
-// Review Finding 11: YAML aliases expand when the frontmatter is written again, and the scan sites
-// parse the converted text with the original file's size, so the conversion itself enforces the cap.
 describe("Cursor rule size cap", () => {
   const anchored = "a".repeat(200);
   const aliases = Array.from({ length: 40 }, () => "*x").join(", ");

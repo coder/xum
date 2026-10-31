@@ -1,13 +1,5 @@
 /**
- * Cursor plugin manifest (`.cursor-plugin/plugin.json`) normalizer (Cursor plugin RFC section 1).
- *
- * Source: https://cursor.com/docs/reference/plugins.md. Discovery reads this manifest only when
- * no root `plugin.json` with `$schema`, no Codex and no Claude manifest exists (D21), and
- * rewrites it into the Agent Plugins 1.0.0 shape before the regular validator runs, as
- * normalizeClaudeManifest does for Claude. A manifest path replaces folder discovery for its
- * component. Xum applies folder paths only (D24): a glob, a file path or a path outside the plugin
- * folder is listed in `notApplied`, and the component then loads nothing. Fields Xum has no part
- * for are listed too, so the install review shows every part Xum does not apply (Goal 7).
+ * Source: https://cursor.com/docs/reference/plugins.md.
  *
  * SECURITY AUDIT: a Cursor package was not written for Xum, so it gets no Xum-only behavior. Only
  * the mapped keys below survive: repository-provided `contributes` (slash commands, hooks.js and
@@ -27,17 +19,15 @@ import type { AgentPluginNotApplied } from "./discovery";
 const CURSOR_MANIFEST_LABEL = ".cursor-plugin/plugin.json";
 
 export interface CursorManifestResult {
-  /** The Agent Plugins manifest that validatePluginManifest reads. */
   manifest: unknown;
   warnings: string[];
   /** Rule folders in declared order. Default `["rules"]`; empty when `rules` names no folder. */
   ruleDirs: string[];
-  /** A hooks file path or an inline hooks object. Default `hooks/hooks.json`. */
+  /** Default `hooks/hooks.json`. */
   hooks?: string | Record<string, unknown>;
   notApplied: AgentPluginNotApplied[];
 }
 
-/** Metadata keys that map one to one onto the Agent Plugins manifest. */
 const CURSOR_METADATA_KEYS = [
   "name",
   "version",
@@ -48,10 +38,8 @@ const CURSOR_METADATA_KEYS = [
   "keywords",
 ] as const;
 
-/** Display fields that the Agent Plugins manifest has no member for. Xum drops them silently. */
 const SILENT_CURSOR_KEYS = new Set(["displayName", "logo"]);
 
-/** Fields that Xum lists as not applied: no Xum part reads them. */
 const NOT_APPLIED_CURSOR_KEYS = [
   "variables",
   "category",
@@ -76,7 +64,6 @@ const HANDLED_CURSOR_KEYS = new Set<string>([
 
 const GLOB_CHARACTERS = /[*?[]/;
 
-/** Why a component path is not applied, or undefined for a folder path inside the plugin. */
 function folderPathRefusal(entry: string): string | undefined {
   const normalized = claudeComponentPath(entry);
   if (normalized === undefined) return "path is outside the plugin folder";
@@ -86,11 +73,6 @@ function folderPathRefusal(entry: string): string | undefined {
     : undefined;
 }
 
-/**
- * The folder paths of `skills`, `rules` or `agents`, in declared order and without repeats, at
- * most MAX_SKILLS_ROOTS of them. Undefined when the field is absent, or when the value is not a
- * path or a list of paths: such a field is dropped with a warning, and the default folder applies.
- */
 function readFolderPaths(
   field: string,
   value: unknown,
@@ -111,7 +93,6 @@ function readFolderPaths(
   return appliedFolders(field, entries.slice(0, MAX_SKILLS_ROOTS), notApplied);
 }
 
-/** The folder paths among `entries`, normalized and without repeats; the rest are listed. */
 function appliedFolders(
   field: string,
   entries: string[],
@@ -131,14 +112,13 @@ function appliedFolders(
 }
 
 /**
- * A declared folder list as a `contributes` member. A field that names no folder replaces the
- * default folder with nothing, so the inert path keeps the default from loading in its place.
+ * A field that names no folder replaces the default folder with nothing, so the inert path keeps
+ * the default from loading in its place.
  */
 function declaredFolders(folders: string[]): string[] {
   return folders.length > 0 ? folders : [INERT_COMPONENT_PATH];
 }
 
-/** `contributes.agents`: Cursor reads every agents path, Xum one agents folder. */
 function agentsFolder(
   folders: string[] | undefined,
   notApplied: AgentPluginNotApplied[]
@@ -155,11 +135,6 @@ function agentsFolder(
   return { agents: first };
 }
 
-/**
- * Cursor `mcpServers`: a path to an MCP file (the `contributes.mcp` member), or an inline config,
- * which Xum does not apply. A declared form that Xum does not apply replaces the default file, so
- * the inert path keeps it from loading.
- */
 function mcpFile(
   value: unknown,
   warnings: string[],
@@ -191,10 +166,7 @@ function mcpFile(
 /** Until Cursor hooks run (Cursor plugin RFC PR 8), every Cursor hook is listed with this reason. */
 export const CURSOR_HOOKS_REASON = "Cursor hooks run in a later Xum build";
 
-/**
- * Cursor `hooks`: a hooks file path or an inline object. Default `hooks/hooks.json`. Inline hooks
- * are listed here; discovery lists a hooks file that exists.
- */
+/** Inline hooks are listed here; discovery lists a hooks file that exists. */
 function readHooks(
   value: unknown,
   warnings: string[],
@@ -218,7 +190,6 @@ function readHooks(
   return { hooks: "hooks/hooks.json" };
 }
 
-/** The metadata half of the manifest (with a synthesized `$schema`), warning on unknown keys. */
 function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<string, unknown> {
   const manifest: Record<string, unknown> = { $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0 };
   for (const key of CURSOR_METADATA_KEYS) {
@@ -233,7 +204,6 @@ function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<
   return manifest;
 }
 
-/** The fields Xum lists as not applied. `commands` is a component, so its part is `command`. */
 function notAppliedFields(raw: Record<string, unknown>): AgentPluginNotApplied[] {
   const entries: AgentPluginNotApplied[] = [];
   if (raw.commands !== undefined) {
@@ -248,9 +218,8 @@ function notAppliedFields(raw: Record<string, unknown>): AgentPluginNotApplied[]
 
 /**
  * Rewrite a `.cursor-plugin/plugin.json` document into the Agent Plugins 1.0.0 shape. `skills`
- * and `agents` become `contributes` members (the inert path when the field names no folder, so
- * the default folder does not load in its place), `mcpServers` becomes `contributes.mcp`, and
- * rules and hooks, which have no `contributes` member, come back beside the manifest.
+ * and `agents` become `contributes` members, `mcpServers` becomes `contributes.mcp`, and rules
+ * and hooks, which have no `contributes` member, come back beside the manifest.
  */
 export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   const warnings: string[] = [];

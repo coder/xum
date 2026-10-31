@@ -115,7 +115,6 @@ export function quoteBracketedArgumentHint(yaml: string): string {
   });
 }
 
-/** The skill schema's description cap: the longest description Xum derives from a body line. */
 export const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
 
 /**

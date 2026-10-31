@@ -349,13 +349,11 @@ interface AgentSkillScanCandidate {
   singleSkillName?: string;
   /** Agent Plugins only: the single skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
-  /** Agent Plugins only: the single skill is a Cursor rule, the file `<root>/<ruleFile>` (cursorRules.ts). */
   ruleFile?: string | undefined;
   /** Agent Plugins only: the plugin is skills-only (a generated Skills install): no scripts run. */
   skillsOnlyPlugin?: true | undefined;
   /** Agent Plugins only: the plugin is a Claude Code package (AgentPluginInfo.claudeFallback). */
   claudePackagePlugin?: true | undefined;
-  /** Agent Plugins only: the plugin is a Cursor package (AgentPluginInfo.cursorFallback). */
   cursorPackagePlugin?: true | undefined;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
@@ -812,17 +810,12 @@ async function lookupCandidateSkillDir(
   return canonicalIsDirectory ? skillDir : candidateSkillDir(candidate, resolvedRoot, alias);
 }
 
-/** Which plugin skill file a candidate reads (claudeCommands.ts PluginSkillFileKind). */
 function candidateFileKind(
   candidate: Pick<AgentSkillScanCandidate, "commandSkill" | "ruleFile">
 ): PluginSkillFileKind {
   return { command: candidate.commandSkill, rule: candidate.ruleFile };
 }
 
-/**
- * The Markdown file of skill `name` in `skillDir`: SKILL.md, a Claude command's `<name>.md`, or a
- * Cursor rule's file.
- */
 function candidateSkillFile(
   candidate: Pick<AgentSkillScanCandidate, "runtime" | "commandSkill" | "ruleFile">,
   skillDir: string,
@@ -1010,7 +1003,6 @@ async function readSkillDescriptorFromDir(
     skillConsent?: PluginSkillConsentGate;
     /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
     commandSkill?: true | undefined;
-    /** A Cursor rule: read this file as SKILL.md text (plugin skills only). */
     ruleFile?: string | undefined;
   }
 ): Promise<AgentSkillDescriptor | null> {
@@ -1464,7 +1456,6 @@ async function readAgentSkillFromDir(
   scope: AgentSkillScope,
   pluginRoot: string | undefined,
   skillConsent: PluginSkillConsentGate | undefined,
-  /** A Claude command or a Cursor rule: read its file as SKILL.md text (plugin skills only). */
   fileKind: Pick<AgentSkillScanCandidate, "commandSkill" | "ruleFile">,
   pluginFs: PluginFs | undefined,
   /** The candidate's host filesystem (AgentSkillScanCandidate.hostFs). */

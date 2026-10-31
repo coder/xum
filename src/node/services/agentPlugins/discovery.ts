@@ -91,7 +91,6 @@ export const CODEX_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".codex-plugin", "p
  * both keeps its Agent Plugin or Codex reading.
  */
 export const CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".claude-plugin", "plugin.json");
-/** Cursor manifest, read only when none of the manifests above exists (a schema-less root yields). */
 export const CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".cursor-plugin", "plugin.json");
 /** Codex MCP config, the default only when the root mcp.json is absent. */
 export const CODEX_MCP_CONFIG_RELATIVE_PATH = ".mcp.json";
@@ -368,10 +367,6 @@ export interface AgentPluginContainer {
   registryPath?: string;
 }
 
-/**
- * A part of a plugin that Xum does not apply, for the install review and the plugin detail
- * (Cursor plugin RFC Goal 7). Only a Cursor package lists parts today.
- */
 export interface AgentPluginNotApplied {
   part: "field" | "rule" | "agent" | "hook" | "mcp" | "command";
   name: string;
@@ -423,7 +418,6 @@ export interface AgentPluginInfo {
    * `extensions`. Its hooks and MCP servers do not run yet; they are listed in `notApplied`.
    */
   cursorFallback?: true;
-  /** Every part of the plugin that Xum does not apply. Empty for every package kind but Cursor. */
   notApplied: AgentPluginNotApplied[];
   /**
    * The plugin.json carries an `extensions.mux.generatedFrom` marker other than a well-formed
@@ -479,8 +473,7 @@ export type PluginSkillsRoot =
    * `dir` is the commands folder and its name is valid. Command roots follow every skills root,
    * so a skill of the same name wins; discovery drops such a command with a warning.
    * `rule`: a Cursor rule instead, the file `<dir>/<rule>` (cursorRules.ts), for example
-   * `prefer-const.mdc`. Rule roots follow the same rules as command roots. `command` and `rule`
-   * are never both set.
+   * `prefer-const.mdc`. Rule roots follow the same rules as command roots.
    */
   | { dir: string; single: true; name: string; command?: true; rule?: string };
 
@@ -965,7 +958,6 @@ async function resolveCommandRoots(args: {
   return roots;
 }
 
-/** The rule files of a rules folder with their rule names, in byte order of the file name. */
 async function listRuleFiles(dir: string): Promise<Array<{ file: string; name: string }>> {
   const entries = await pluginFs()
     .readdir(dir)
@@ -982,8 +974,8 @@ async function listRuleFiles(dir: string): Promise<Array<{ file: string; name: s
 }
 
 /**
- * Why a rule does not load as a skill, or undefined when it does. The rule is read and converted
- * here, as the scan sites do, so a refused rule is listed in `notApplied` and no scan site sees it.
+ * The rule is read and converted here, as the scan sites do, so a refused rule is listed in
+ * `notApplied` and no scan site sees it.
  */
 async function ruleRefusal(args: {
   dir: string;
@@ -1009,13 +1001,6 @@ async function ruleRefusal(args: {
   return "warning" in converted ? converted : undefined;
 }
 
-/**
- * A Cursor package's rules as single rule roots (PluginSkillsRoot `rule`), from the manifest's
- * rule folders (default `rules/`). As for Claude commands, an invalid name, a name that a skill
- * or an earlier rule already has, and a rule past MAX_PLUGIN_COMMANDS are dropped with a warning,
- * and so is a rule that does not convert to a skill. Each dropped rule but those past the cap is
- * listed in `notApplied`.
- */
 async function resolveRuleRoots(args: {
   ruleDirs: string[];
   skillsDirs: PluginSkillsRoot[];
@@ -1064,7 +1049,6 @@ async function resolveRuleRoots(args: {
   return { roots, notApplied };
 }
 
-/** The first of `candidates` that exists under `rootReal` (any entry kind), or undefined. */
 async function firstExisting(rootReal: string, candidates: string[]): Promise<string | undefined> {
   for (const candidate of candidates) {
     const entry = await pluginFs()
@@ -1076,10 +1060,8 @@ async function firstExisting(rootReal: string, candidates: string[]): Promise<st
 }
 
 /**
- * The parts of a Cursor package that discovery finds on disk and does not apply yet: the MCP file
- * the manifest names (or `mcp.json`, else `.mcp.json`), the hooks file, and a `commands/` folder
- * when the manifest has no `commands` field (that field lists itself). The normalizer lists
- * inline hooks and inline MCP servers.
+ * A declared `commands` field lists itself, and the normalizer lists inline hooks and inline MCP
+ * servers.
  */
 async function cursorPackageNotApplied(args: {
   rootReal: string;
@@ -1117,14 +1099,9 @@ async function cursorPackageNotApplied(args: {
   return entries;
 }
 
-/**
- * A Cursor package's rule roots and every part of it that Xum does not apply. Another package
- * kind (no `cursor` result) has neither.
- */
 async function resolveCursorParts(args: {
   cursor: CursorManifestResult | undefined;
   rawManifest: unknown;
-  /** `contributes.mcp` of the normalized manifest. */
   declaredMcp: string | undefined;
   skillsDirs: PluginSkillsRoot[];
   resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
@@ -1223,11 +1200,7 @@ async function resolvePluginMcpConfig(args: {
     : { mcpConfigPath };
 }
 
-/**
- * The MCP file a package kind loads. A skills-only package has none, and the MCP servers of a
- * Cursor package load in a later Xum build (Cursor plugin RFC PR 3). A Codex or Claude package's
- * file is in its manifest's dialect.
- */
+/** The MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3). */
 async function resolvePackageMcpConfig(args: {
   packageKind: {
     skillsOnly: boolean;
@@ -1447,7 +1420,6 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
-/** The selected manifest in the Agent Plugins shape, by the file it came from. */
 function normalizeSelectedManifest(
   manifestRelative: string,
   raw: unknown
@@ -1544,7 +1516,6 @@ async function discoverPluginAt(args: {
     claude: normalized.claude,
   });
 
-  // Not written for Xum (xumComponentGate).
   const foreign = claudePackage || cursorFallback || skillsOnly;
   const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
     rootReal,
@@ -1609,7 +1580,6 @@ async function discoverPluginAt(args: {
         },
       })
     : [];
-  // Cursor rules load as skills, after every skills root (a skill wins).
   const cursorParts = await resolveCursorParts({
     cursor,
     rawManifest,

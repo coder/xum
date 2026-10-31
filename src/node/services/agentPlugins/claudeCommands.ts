@@ -8,7 +8,6 @@
  * scan sites read `<name>.md` instead of SKILL.md (PluginSkillsRoot `command`) and turn it into
  * SKILL.md text here, before the regular parser runs. Everything after that (the consent
  * fingerprint of the parsed frontmatter, approved copies, `$ARGUMENTS`) is the skill path.
- * A Cursor rule (PluginSkillsRoot `rule`) takes the same path through cursorRules.ts.
  */
 import YAML from "yaml";
 
@@ -27,20 +26,16 @@ import {
 import { cursorRuleSkillMarkdown } from "./cursorRules";
 import { isPlainObject } from "./manifest";
 
-/** Which file a plugin skill is: SKILL.md, a Claude command, or a Cursor rule (never both). */
 export interface PluginSkillFileKind {
   command?: true | undefined;
-  /** The rule's file name in its folder, for example `prefer-const.mdc`. */
   rule?: string | undefined;
 }
 
-/** The Markdown file of plugin skill `name` in its folder: SKILL.md, `<name>.md` or the rule file. */
 export function pluginSkillFileName(name: string, root: PluginSkillFileKind): string {
   if (root.rule !== undefined) return root.rule;
   return root.command === true ? `${name}.md` : SKILL_FILENAME;
 }
 
-/** The SKILL.md text of a plugin skill file: a command or a rule gets its skill frontmatter. */
 export function pluginSkillMarkdown(
   name: string,
   content: string,

@@ -186,10 +186,10 @@ function workflowSkillContainment(input: ResolveWorkflowScriptInput, projectSear
 }
 
 /**
- * Why a plugin skill runs no workflow scripts, or undefined when it can. A Claude command's skill
- * directory is its plugin's commands folder, and a Cursor rule's is its rules folder: a script
- * there is not part of the skill. A Skills install loads skills only (installMethods.ts), and a
- * Claude Code or Cursor package runs no Xum code (docs/agents/agent-skills.mdx).
+ * A Claude command's skill directory is its plugin's commands folder, and a Cursor rule's is its
+ * rules folder: a script there is not part of the skill. A Skills install loads skills only
+ * (installMethods.ts), and a Claude Code or Cursor package runs no Xum code
+ * (docs/agents/agent-skills.mdx).
  */
 function noWorkflowScriptsReason(
   skill: Pick<

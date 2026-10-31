@@ -3,7 +3,6 @@ import { agentConsentFingerprint } from "@/node/services/agentPlugins/componentC
 import { parseAgentDefinitionMarkdown } from "./parseAgentDefinitionMarkdown";
 import { mapForeignPluginAgentFrontmatter } from "./pluginAgentFormat";
 
-/** A Cursor agent file as the runtime parses it: plugin format mapping, then the schema. */
 function parsePluginAgent(frontmatterYaml: string) {
   const content = `---\n${frontmatterYaml}---\nReview the diff and report findings.\n`;
   return parseAgentDefinitionMarkdown({

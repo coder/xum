@@ -78,7 +78,6 @@ interface ListedSkillsRoot {
   singleSkillName?: string;
   /** Plugin roots only: that skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
-  /** Plugin roots only: that skill is a Cursor rule, the file `<root>/<ruleFile>` (cursorRules.ts). */
   ruleFile?: string | undefined;
   /** Plugin roots only: snake_case folders load under kebab-case names (pluginSkillNameOfFolder). */
   plugin?: true;

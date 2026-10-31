@@ -2,10 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { normalizeCursorManifest } from "./cursorManifest";
 import { INERT_COMPONENT_PATH, validatePluginManifest } from "./manifest";
 
-/**
- * Normalize a `.cursor-plugin/plugin.json` document and run the result through the validator
- * that discovery runs next, so each assertion reads the manifest Xum actually loads.
- */
 function load(raw: Record<string, unknown>) {
   const result = normalizeCursorManifest({ name: "cursor-kit", ...raw });
   const validation = validatePluginManifest(result.manifest);
@@ -86,8 +82,6 @@ describe("normalizeCursorManifest metadata", () => {
     expect(loaded.contributes?.slashCommands).toBeUndefined();
   });
 
-  // SECURITY: a Cursor package was not written for Xum, so repository-provided Xum fields must
-  // not reach the loaded manifest (hooks.js, workflows, slash commands, extension grants).
   test("never passes Xum-only contributes or extensions through", () => {
     const { loaded } = load({
       contributes: {

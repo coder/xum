@@ -350,7 +350,6 @@ export function mapForeignPluginAgentFrontmatter(
     ui: { hidden: true },
     subagent: { runnable: true },
     // `readonly` agents get Explore's prompt before their own body (Cursor plugin RFC, D13).
-    // Other agents keep append: false.
     prompt: { append: raw.readonly === true },
     ...(Object.keys(ai).length > 0 ? { ai } : {}),
     // Replaces the Claude list. Kept in the mapped frontmatter, so the install

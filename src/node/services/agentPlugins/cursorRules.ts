@@ -1,14 +1,8 @@
 /**
- * Cursor plugin rules (`rules/<name>.mdc`, `.md`, `.markdown`) as plugin skills (Cursor plugin
- * RFC section 2).
- *
  * Xum does not add rules to the system prompt: every rule, an always-apply one included, loads as
- * a skill that the model reads on request. The scan sites read the rule file instead of SKILL.md
- * (PluginSkillsRoot `rule`) and turn it into SKILL.md text here, the way claudeCommands.ts turns
- * a Claude command into a skill. Everything after that (the consent fingerprint of the converted
- * frontmatter, approved copies) is the skill path. The rule type is in
- * `metadata.cursor-rule-type`, so the fingerprint changes, and asks for a new review, when a
- * change to `alwaysApply` or `globs` changes the type (D14).
+ * a skill that the model reads on request. The rule type is in `metadata.cursor-rule-type`, so the
+ * fingerprint changes, and asks for a new review, when a change to `alwaysApply` or `globs`
+ * changes the type (D14).
  */
 import YAML from "yaml";
 
@@ -27,16 +21,13 @@ import { isPlainObject } from "./manifest";
 
 export const CURSOR_RULE_EXTENSIONS = [".md", ".mdc", ".markdown"] as const;
 
-/** Precedence: `alwaysApply: true` wins over `globs`, and `globs` over `description` only. */
 export type CursorRuleType = "always-apply" | "description" | "glob" | "manual";
 
-/** The rule name of a file (the file name without its extension), or undefined for another file. */
 export function cursorRuleName(file: string): string | undefined {
   const extension = CURSOR_RULE_EXTENSIONS.find((candidate) => file.endsWith(candidate));
   return extension === undefined ? undefined : file.slice(0, -extension.length);
 }
 
-/** The frontmatter mapping of a rule, or undefined when it does not parse as one. */
 function parseRuleFrontmatter(yaml: string): Record<string, unknown> | undefined {
   if (yaml.trim().length === 0) return {};
   try {
@@ -47,7 +38,6 @@ function parseRuleFrontmatter(yaml: string): Record<string, unknown> | undefined
   }
 }
 
-/** Cursor `globs`: one pattern or a list of them. Empty values do not count. */
 function ruleGlobs(value: unknown): string[] {
   const entries = Array.isArray(value) ? value : [value];
   return entries
@@ -70,9 +60,8 @@ function cursorRuleType(
 }
 
 /**
- * The skill description: the rule's `description`, else its first body line, else a name-based
- * one, with the globs appended. It is cut to the skill schema's cap, keeping the globs, so a long
- * description never stops the rule from loading.
+ * Cut to the skill schema's cap, keeping the globs, so a long description never stops the rule
+ * from loading.
  */
 function ruleSkillDescription(args: {
   name: string;
@@ -87,18 +76,15 @@ function ruleSkillDescription(args: {
   return `${base.slice(0, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
-/** Why a rule file does not load as a skill: the `notApplied` reason and the warning. */
 export interface CursorRuleRefusal {
   reason: string;
   warning: string;
 }
 
 /**
- * A rule file as SKILL.md text, or why it does not load. The frontmatter is written from scratch
- * (name, description, the user-only flag for a manual rule, the rule type), and the body stays
- * unchanged. A rule whose frontmatter does not parse as a mapping is refused. So is one whose
- * text is over the SKILL.md cap once rewritten: YAML aliases in `globs` or `description` expand
- * when the frontmatter is written again, and the scan sites parse the text with the file's size.
+ * A rule whose text is over the SKILL.md cap once rewritten is refused: YAML aliases in `globs` or
+ * `description` expand when the frontmatter is written again, and the scan sites parse the text
+ * with the file's size.
  */
 export function convertCursorRule(
   rule: { name: string; file: string },
@@ -133,7 +119,6 @@ export function convertCursorRule(
   }
 }
 
-/** convertCursorRule for the scan sites: a refused rule throws AgentSkillParseError. */
 export function cursorRuleSkillMarkdown(
   rule: { name: string; file: string },
   content: string

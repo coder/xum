@@ -206,7 +206,6 @@ describe("skillConsentFingerprint", () => {
 });
 
 describe("Cursor rule skill consent (D14)", () => {
-  /** The skill fingerprint of a rule file, through the conversion the scan sites run. */
   function ruleFingerprint(text: string): string {
     const content = cursorRuleSkillMarkdown(
       { name: "prefer-const", file: "prefer-const.mdc" },

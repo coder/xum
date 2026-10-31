@@ -25,7 +25,6 @@ export function splitFrontmatter(text: string): { yaml: string; body: string } |
   return { yaml: lines.slice(1, end).join("\n"), body: lines.slice(end + 1).join("\n") };
 }
 
-/** The first non-empty line of `text`, trimmed. */
 export function firstNonEmptyLine(text: string): string | undefined {
   return text
     .split("\n")
