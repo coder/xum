@@ -1,5 +1,6 @@
 import { peleRenderOptions, sanitizeMermaidSvg } from "./Mermaid";
 import { PELE_SAMPLES } from "./Mermaid.sanitization.fixtures";
+import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 
@@ -493,16 +494,35 @@ describe("sanitizeMermaidSvg", () => {
     ["a string that a form feed ends", "font-family:'X&#12;"],
     ["a comment", "fill:/*X*/"],
     ["a quote in an unquoted url()", "fill:url(x')"],
+    // A ) closes the ( above the [.
+    ["an open [", "fill:["],
   ])("keeps a style of 9 functions in a row after %s", (_case, before) => {
     const style = [before, ...Array<string>(9).fill("fill:rgb(1 2 3)")].join(";");
 
     expect(sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX)).toContain("<rect");
   });
 
-  it("keeps a deeply nested value in an attribute that the browser never reads as CSS", () => {
-    const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
+  it.each(["data-x", "class"])(
+    "keeps an SVG with a deeply nested value in %s, which the browser never reads as CSS",
+    (name) => {
+      const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
 
-    expect(sanitizeMermaidSvg(svgWith(`<g data-id="${label}"/>`), ID_PREFIX)).toContain(label);
+      expect(sanitizeMermaidSvg(svgWith(`<g ${name}="${label}"/>`), ID_PREFIX)).not.toBeNull();
+    }
+  );
+
+  // CSS reads an escape unlike the scan, so past one the scan counts every ( and no ).
+  it("counts every ( after an escape and no )", () => {
+    const svg = (opened: number, after: string) =>
+      svgWith(`<rect style="fill:${"f(".repeat(opened)}\\x${after}"/>`);
+
+    expect(sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING, ""), ID_PREFIX)).not.toBeNull();
+    expect(
+      sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING - 1, " g()"), ID_PREFIX)
+    ).not.toBeNull();
+    expect(
+      sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING - 1, " g() g()"), ID_PREFIX)
+    ).toBeNull();
   });
 
   // Pele escapes &, so only a Pele bug writes these, but the XML parser turns them into ( before
@@ -633,9 +653,8 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
     expect(elapsed).toBeLessThan(200);
   });
 
-  // MAX_ATTRIBUTE_NESTING in Mermaid.tsx. nope(1) adds a level, and Pele writes rx:var(--_r)
-  // before the fill of the rect.
-  it("keeps a rect whose parentheses nest 8 deep and returns null at 9", () => {
+  // nope(1) adds a level, and Pele writes rx:var(--_r) before the fill of the rect.
+  it("keeps a rect nested MERMAID_MAX_ATTRIBUTE_NESTING deep and returns null one deeper", () => {
     const sanitizeRect = (depth: number) =>
       sanitizeMermaidSvg(
         renderPele(
@@ -645,8 +664,8 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
         ID_PREFIX
       );
 
-    expect(sanitizeRect(7)).not.toBeNull();
-    expect(sanitizeRect(8)).toBeNull();
+    expect(sanitizeRect(MERMAID_MAX_ATTRIBUTE_NESTING - 1)).not.toBeNull();
+    expect(sanitizeRect(MERMAID_MAX_ATTRIBUTE_NESTING)).toBeNull();
   });
 
   // Pele copies these labels into data-id.
