@@ -645,7 +645,6 @@ async function readAgentDescriptorFromFile(
   }
 }
 
-/** `backgroundHint: true` for an agent whose frontmatter sets the hint; omitted otherwise. */
 export function backgroundHintField(
   frontmatter: Pick<AgentDefinitionPackage["frontmatter"], "subagent">
 ): { backgroundHint?: true } {
@@ -1407,7 +1406,7 @@ export async function resolveAgentDiscoveryContext(
 
 /**
  * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26), from the read
- * chains of every listed agent: the same chains a run reads, so a run and the list agree.
+ * chains of every discovered agent: the same chains a run reads, so a run and the list agree.
  */
 function listedAgentAiSettings(
   agentId: AgentId,
@@ -1470,7 +1469,7 @@ export async function listAgentDefinitions(
       }
     })
   );
-  // A settings base resolves from every listed agent, disabled ones included: a run reads a
+  // A settings base resolves from every discovered agent, disabled ones included: a run reads a
   // disabled agent's definition too (resolveAgentAiSettingsChain).
   const aiChainsById = new Map(
     resolved.flatMap((entry) =>

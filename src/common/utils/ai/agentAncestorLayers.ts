@@ -104,7 +104,7 @@ export function collectDefinitionLayers(
   return { targetDefinitionAiDefaults, ancestors };
 }
 
-/** An agent's AI-settings base: its applied `aiSettingsBase`, else `base` (Cursor plugin RFC, D11). */
+/** AI-settings walks follow this in place of `base` (Cursor plugin RFC, D11). */
 export function aiSettingsBaseOf(agent: { base?: string; aiSettingsBase?: string }) {
   return agent.aiSettingsBase ?? agent.base;
 }
@@ -113,7 +113,6 @@ export interface ListedAgentAiAncestry {
   id: string;
   base?: string;
   aiSettingsBase?: string;
-  /** The layers a run resolves (agents.list `aiLayers`). */
   aiLayers?: { ancestors: readonly AgentAiAncestorLayer[] };
 }
 
@@ -140,7 +139,6 @@ export function collectUnlistedAncestorHops(
   return hops;
 }
 
-/** Agent ID -> AI-settings base, for the declared-base walks (collectDeclaredAncestorLayers). */
 export function getAgentAiSettingsBases(
   agents: readonly ListedAgentAiAncestry[]
 ): Map<string, string | undefined> {
@@ -150,7 +148,7 @@ export function getAgentAiSettingsBases(
   ]);
 }
 
-/** The settings base a read chain declares: its closest hop's, as in the base-merged frontmatter. */
+/** The closest hop wins, as in the base-merged frontmatter. */
 export function chainSettingsBase(
   chain: ReadonlyArray<{ ai?: { settingsBase?: string } }>
 ): string | undefined {

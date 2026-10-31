@@ -34,7 +34,6 @@ describe("applySettingsBaseChain", () => {
     });
   });
 
-  // Xum follows one settings base: one set anywhere in the settings base's chain is not followed.
   test.each([
     ["the settings base", 0],
     ["a base of the settings base", 1],

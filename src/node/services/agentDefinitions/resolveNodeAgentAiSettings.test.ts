@@ -411,7 +411,6 @@ describe("resolveNodeAgentAiSettings with ai.settingsBase (Cursor model: fast)",
     expect(resolved.selected.model).toBe(MODEL_C);
   });
 
-  // `helper` sets a settings base of its own: neither its base nor its settings base is followed.
   const HELPER = { helper: "base: exec\nai:\n  settingsBase: explore\n" };
 
   it.each([

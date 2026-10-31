@@ -403,7 +403,6 @@ describe("agentDefinitionsService", () => {
   );
 
   describe("ai.settingsBase (Cursor model: fast)", () => {
-    /** Lists the agents of a project whose Xum home holds an unmanaged plugin `kit`. */
     async function listWithPluginAgent(
       agentFile: string,
       agentAiDefaults?: AgentAiDefaults,
