@@ -2,7 +2,7 @@ import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
-import { TaskHandleStore } from "@/node/services/taskHandleStore";
+import { TaskHandleStore, isActiveWorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 import { createWorkspaceTurnManagerHarness } from "@/node/services/workspaceTurnManager.testHarness";
 import { Ok, type Result } from "@/common/types/result";
 import {
@@ -11,6 +11,7 @@ import {
   makeWorkspaceTurnCreateMock,
   saveLocalParentWorkspace,
   stubStableIds,
+  workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
 
 /**
@@ -54,14 +55,22 @@ describe("WorkspaceTurnManager.createWorkspaceTurn retention", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    // createWorkspaceTurn's own unfiltered listing is the only call without options here.
-    const listedRefs: Array<WeakRef<object>> = [];
+    // Settled records are every owner's history. With one on disk, a listing that holds all
+    // records holds a settled one, and the callback must not keep such a listing alive.
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "settled-child", "wst_settled", "completed")
+    );
+    let listings = 0;
+    const historyRefs: Array<WeakRef<object>> = [];
     // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
     const listAll = TaskHandleStore.prototype.listAllWorkspaceTurns;
     const listSpy = spyOn(TaskHandleStore.prototype, "listAllWorkspaceTurns").mockImplementation(
       async function (this: TaskHandleStore, ...args: Parameters<typeof listAll>) {
         const records = await listAll.apply(this, args);
-        if (args[0] == null) listedRefs.push(new WeakRef(records));
+        listings += 1;
+        if (records.some((record) => !isActiveWorkspaceTurnTaskStatus(record.status))) {
+          historyRefs.push(new WeakRef(records));
+        }
         return records;
       }
     );
@@ -74,7 +83,7 @@ describe("WorkspaceTurnManager.createWorkspaceTurn retention", () => {
         workspace: { mode: "new" },
       });
       expect(result.success).toBe(true);
-      expect(listedRefs).toHaveLength(1);
+      expect(listings).toBeGreaterThan(0);
       const internal = (sendMessage.mock.calls[0] as unknown[])[3] as { onCanceled?: unknown };
       const onCanceled = internal.onCanceled;
       expect(typeof onCanceled).toBe("function");
@@ -82,7 +91,7 @@ describe("WorkspaceTurnManager.createWorkspaceTurn retention", () => {
       sendMessage.mockClear();
       listSpy.mockClear();
 
-      expect(await collected(listedRefs[0])).toBe(true);
+      for (const ref of historyRefs) expect(await collected(ref)).toBe(true);
       // Keep the callback reachable until after the collection check.
       expect(typeof onCanceled).toBe("function");
     } finally {
