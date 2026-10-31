@@ -27,9 +27,10 @@ export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
 
 /**
  * Freshness contract of that fetch. A worktree creation runs `git fetch origin <branch>` unless a
- * fetch of the same branch in the same repository is still running or finished less than this
- * long ago; then it uses that fetch's outcome (a failure or timeout too, so it falls back to
- * local refs). Reuse never extends the window, so a later burst fetches again. Each creation
+ * fetch of the same branch from the same repository and origin URL is still running, or
+ * finished successfully less than this long ago; then it uses that fetch. Creations that wait
+ * on a fetch that fails share the failure and fall back to local refs, but the next creation
+ * fetches again. Reuse never extends the window, so a later burst fetches again. Each creation
  * still reads the local and origin refs itself, so the parent's unpushed commits win.
  */
 export const WORKTREE_CREATE_FETCH_REUSE_MS = 10 * 1000;

@@ -1975,12 +1975,12 @@ describe("WorktreeManager.createWorkspace", () => {
   async function createBranchHead(
     fixture: Awaited<ReturnType<typeof createWorktreeManagerFixture>>,
     branchName: string,
-    trunkBranch = "main"
+    projectPath = fixture.projectPath
   ): Promise<string> {
     const result = await fixture.manager.createWorkspace({
-      projectPath: fixture.projectPath,
+      projectPath,
       branchName,
-      trunkBranch,
+      trunkBranch: "main",
       trusted: true,
       initLogger: fixture.initLogger,
     });
@@ -2017,24 +2017,19 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
-  it("joins concurrent creations to one in-flight origin fetch", async () => {
+  it("joins concurrent new-branch creations to one in-flight origin fetch", async () => {
     const fixture = await createWorktreeManagerFixture();
     try {
       const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
       const uploadPackRuns = await countOriginUploadPacks(fixture, 1);
-      // Existing branches: `worktree add -b` writes upstream config, and concurrent writers
-      // fail on .git/config.lock.
-      const branches = ["joined-1", "joined-2", "joined-3"];
-      for (const branchName of branches) {
-        execFileSync("git", ["branch", branchName], { cwd: fixture.projectPath });
-      }
+      const branches = Array.from({ length: 12 }, (_, index) => `joined-${index}`);
 
       const heads = await Promise.all(
         branches.map((branchName) => createBranchHead(fixture, branchName))
       );
 
       expect(await uploadPackRuns()).toBe(1);
-      expect(heads).toEqual([remoteHead, remoteHead, remoteHead]);
+      expect(heads).toEqual(branches.map(() => remoteHead));
     } finally {
       await fixture.cleanup();
     }
@@ -2066,23 +2061,95 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
-  it("shares a failed origin fetch and bases each creation on the local trunk", async () => {
+  it("shares a failing origin fetch with its waiters and fetches again for the next creation", async () => {
     const fixture = await createWorktreeManagerFixture();
     try {
-      addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
-      execFileSync("git", ["branch", "never-pushed"], { cwd: fixture.projectPath });
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
       const uploadPackRuns = await countOriginUploadPacks(fixture);
+      const countFile = path.join(fixture.rootDir, "upload-pack-runs");
+      await fsPromises.writeFile(
+        path.join(fixture.rootDir, "counting-upload-pack.sh"),
+        `#!/bin/sh\necho run >> "${countFile}"\nsleep 1\nexit 1\n`
+      );
       const localHead = gitRevParseHead(fixture.projectPath);
 
-      const heads = [
-        await createBranchHead(fixture, "unpushed-1", "never-pushed"),
-        await createBranchHead(fixture, "unpushed-2", "never-pushed"),
-      ];
-
+      const failedHeads = await Promise.all([
+        createBranchHead(fixture, "offline-1"),
+        createBranchHead(fixture, "offline-2"),
+      ]);
       expect(await uploadPackRuns()).toBe(1);
-      expect(heads).toEqual([localHead, localHead]);
+      expect(failedHeads).toEqual([localHead, localHead]);
+
+      await countOriginUploadPacks(fixture);
+      expect(await createBranchHead(fixture, "back-online")).toBe(remoteHead);
+      expect(await uploadPackRuns()).toBe(2);
     } finally {
       await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("fetches again after origin moves to another remote", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      expect(await createBranchHead(fixture, "from-first-remote")).toBe(remoteHead);
+      const secondRemote = path.join(fixture.rootDir, "second-remote");
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync("git", args, { cwd, stdio: "ignore" });
+      git(fixture.rootDir, "clone", "--quiet", path.join(fixture.rootDir, "remote"), secondRemote);
+      git(
+        secondRemote,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "--quiet",
+        "-m",
+        "only on the second remote"
+      );
+      git(fixture.projectPath, "remote", "set-url", "origin", secondRemote);
+
+      expect(await createBranchHead(fixture, "from-second-remote")).toBe(
+        gitRevParseHead(secondRemote)
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keys the shared fetch on the repository a project path resolves to", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const other = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      const alias = path.join(fixture.rootDir, "repo-alias");
+      await fsPromises.symlink(fixture.projectPath, alias, "dir");
+      const linkedTree = path.join(fixture.rootDir, "linked-tree");
+      execFileSync("git", ["worktree", "add", "--quiet", "-b", "linked", linkedTree], {
+        cwd: fixture.projectPath,
+      });
+      const aliasHeads = [
+        await createBranchHead(fixture, "via-project"),
+        await createBranchHead(fixture, "via-symlink", alias),
+        await createBranchHead(fixture, "via-linked-worktree", linkedTree),
+      ];
+      expect(await uploadPackRuns()).toBe(1);
+      expect(aliasHeads).toEqual([remoteHead, remoteHead, remoteHead]);
+
+      const { remoteHead: otherRemoteHead } = addOriginAheadOfLocalRef(other, {
+        fetchOnce: false,
+      });
+      await fsPromises.unlink(alias);
+      await fsPromises.symlink(other.projectPath, alias, "dir");
+      expect(await createBranchHead(fixture, "via-retargeted-symlink", alias)).toBe(
+        otherRemoteHead
+      );
+    } finally {
+      await fixture.cleanup();
+      await other.cleanup();
     }
   }, 20_000);
 
