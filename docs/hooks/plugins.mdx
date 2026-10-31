@@ -5,14 +5,15 @@ description: Hooks that Agent Plugins ship, how you trust them, and the contract
 
 <Note>Plugin hooks are experimental. Expect breaking changes while we iterate.</Note>
 
-An [Agent Plugin](/agents/agent-skills#agent-plugins) can ship hooks in two formats:
+An [Agent Plugin](/agents/agent-skills#agent-plugins) can ship hooks in three formats:
 
-| Format       | File                          | Runs as                                         | Trust step                        |
-| ------------ | ----------------------------- | ----------------------------------------------- | --------------------------------- |
-| Codex format | `hooks/hooks.json`            | A call to a tool on the plugin's own MCP server | You trust each hook in Settings   |
-| Xum-native   | `hooks.js` in the plugin root | JavaScript in a QuickJS sandbox                 | Project Trust for project plugins |
+| Format        | File                                                      | Runs as                                         | Trust step                        |
+| ------------- | --------------------------------------------------------- | ----------------------------------------------- | --------------------------------- |
+| Codex format  | `hooks/hooks.json`                                        | A call to a tool on the plugin's own MCP server | You trust each hook in Settings   |
+| Cursor format | `hooks/hooks.json` of a Cursor plugin, or its `hooks` key | A shell command on the Xum host                 | You trust each hook in Settings   |
+| Xum-native    | `hooks.js` in the plugin root                             | JavaScript in a QuickJS sandbox                 | Project Trust for project plugins |
 
-A [Claude Code plugin](/agents/agent-skills#claude-code-plugins) ships `hooks/hooks.json` too. Xum lists those hooks and never runs them. See [Claude Code plugin hooks](#claude-code-plugin-hooks).
+A [Claude Code plugin](/agents/agent-skills#claude-code-plugins) ships `hooks/hooks.json` too. Xum lists those hooks and never runs them. See [Claude Code plugin hooks](#claude-code-plugin-hooks). In a [Cursor plugin](/agents/agent-skills#cursor-plugins), Xum reads `hooks/hooks.json` in the Cursor format only. See [Cursor hooks](#cursor-hooks).
 
 For hooks in your own repository, use [tool hooks](/hooks/tools) instead.
 
@@ -132,6 +133,8 @@ Per-event fields:
 | `UserPromptSubmit` | `prompt`. It has no `turn_id` and no `model`.                                               |
 | `Stop`             | `turn_id` (the assistant message ID), `model`, `stop_hook_active`, `last_assistant_message` |
 
+`last_assistant_message` is the reply's trailing text, after its last tool call, cut to its last 16,384 characters. It is `null` when the reply ends on a tool call or has no trailing text.
+
 `model` is Xum's provider-qualified model string, for example `openai:gpt-5.2`. Codex sends the bare model name. A tool call outside a model turn has no `turn_id` and no `model`.
 
 ### Tool names and the Bash contract
@@ -164,7 +167,7 @@ The hook's MCP tool returns its output as JSON text. Xum joins the text blocks o
 
 A `UserPromptSubmit` block applies only to a message you send (typed, edited, queued, or plan-review feedback). Automatic sends (goal and task continuations, wakes, follow-ups) ignore every block, because their sender would retry the same message in a loop. They keep the context of the other hooks. A hook whose output both blocks and adds context loses its own context. The prompt that a `Stop` block queues is different: no `UserPromptSubmit` hook runs for it at all, as in Codex. A `UserPromptSubmit` guard cannot check it.
 
-Each `Stop` hook continues one message at most 3 times, and all hooks together at most 50 times. Each continuation shows the notice "plugin continued turn n of 50". For a turn that an ACP client or `xum run` owns, Xum runs the `Stop` hooks but never continues the turn. For a goal turn, Xum continues only while the goal can take another turn: not after it is paused or replaced, or after it reaches its turn, cost, or budget limit.
+Each `Stop` hook continues one message at most 3 times, and all hooks together at most 50 times. When a hook continues the turn, Xum shows the notice "Plugin `<name>`: plugin continued turn n of 50". A newer notice replaces one that is still waiting to show, so a long loop does not queue 50 notices. Xum's own TODO and status nudges also count toward the 50, but show no notice. [Cursor hooks](#cursor-hooks) share these limits. For a turn that an ACP client or `xum run` owns, Xum runs the `Stop` hooks but never continues the turn. For a goal turn, Xum continues only while the goal can take another turn: not after it is paused or replaced, or after it reaches its turn, cost, or budget limit.
 
 `hookSpecificOutput` must have `hookEventName` set to the event name. `Stop` has no `hookSpecificOutput`.
 
@@ -204,13 +207,132 @@ Xum cuts the joined tool-event text at 32 KiB and adds `[plugin hook context cut
 - `UserPromptSubmit` has no `turn_id` and no `model`.
 - Only `bash` and MCP tools have Codex names. Hooks match file edits, `task`, and other tools by their Xum names.
 
+## Cursor hooks
+
+A [Cursor plugin](/agents/agent-skills#cursor-plugins) ships hooks in the [Cursor hooks format](https://cursor.com/docs/hooks): `hooks/hooks.json`, or the path or inline object of the `hooks` key in `.cursor-plugin/plugin.json`. Xum runs each `command` hook as a shell command. Xum runs three events and lists every other hook as "Never runs". The [size limits](#size-limits) for one `hooks.json` file and for hooks per plugin apply.
+
+```json hooks/hooks.json
+{
+  "version": 1,
+  "hooks": {
+    "stop": [
+      { "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/stop-hook.sh\"", "timeout": 10, "loop_limit": 5 }
+    ]
+  }
+}
+```
+
+### Where they run
+
+Only managed plugins run Cursor hooks. Xum runs none in these cases:
+
+- The project is not trusted.
+- The workspace is not a local or worktree workspace, for example an SSH, Docker, devcontainer, or Coder workspace. Every Cursor hook shows "Does not run in remote workspaces (SSH, Docker and devcontainer)." Local multi-project workspaces do run them.
+- The chat is a `/side` chat.
+- `XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS`, or `XUM_DISABLE_PROJECT_AUTOMATION` is set to `1`.
+
+<Warning>
+  A Cursor hook runs as your OS user on the Xum host, with no sandbox. Trust only hooks whose
+  commands and files you have read.
+</Warning>
+
+### Trust a hook
+
+Trust works as for [Codex-format hooks](#trust-a-hook): select **Hooks** on the plugin, read each hook, and select **Trust**. If Xum cut a long entry, select **Show full entry** first. Xum trusts the entry exactly as declared, including fields that Xum does not use. A change to any field, or a move to another place in the list, asks for trust again. The panel shows each value as declared: a hook with `loop_limit: 80` shows 80 and stops at the ceiling of 50.
+
+Trust covers the entry, not the scripts it runs. A hook can run any file in the plugin, so Xum reviews the files instead:
+
+- When a plugin first has a hook that can run, the install preview lists every file of the plugin under **Files**, as `file <path> added`. An update that adds the plugin's first such hook lists every file among its changes.
+- Later updates list each file that the update adds, changes, or removes.
+- A UTF-8 text file of at most 64 KiB shows its text. A symlink shows its link text. Any other file shows only the row, with "(contents not shown: binary or larger than 64 KiB)".
+- Xum marks invisible and bidi control characters in file paths, file texts, and the preview's warnings as `<U+XXXX>`, for example `<U+202E>`.
+- If Xum cut a long text, Xum does not install or update the plugin until you select **Show full text** on it.
+- A review too large to show fails with "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
+
+A file that changes on disk outside an update runs without a new review.
+
+While no command hook of the plugin is trusted, the **Hooks** panel lists every file of the plugin under **Files**, and **Trust** stays off until you select **Show full text** on each cut text. If the files change before you trust the hook, Xum refuses with "This plugin's files changed since you reviewed them. Review them again."
+
+### Events
+
+| Cursor event         | When Xum runs it                                                             | Working folder     |
+| -------------------- | ---------------------------------------------------------------------------- | ------------------ |
+| `afterFileEdit`      | After a `file_edit_replace_string` or `file_edit_insert` call that succeeded | The plugin folder  |
+| `afterAgentResponse` | When a turn finishes normally                                                | The plugin folder  |
+| `stop`               | When a turn finishes normally, after the plugin's `afterAgentResponse` hooks | The workspace root |
+
+`afterAgentResponse` and `stop` run when Codex `Stop` hooks run, with the same exceptions: not after an interrupted or failed turn, a compaction, a sub-agent turn, or a delegated workspace turn, and not when input is already queued. After a user Stop, no hook runs, and Xum kills a hook that is running. Edits through `bash` run no `afterFileEdit` hook.
+
+These hooks never run, and the install review lists them under **Not applied in Xum**:
+
+- A hook on any other event ("event not applied in Xum").
+- A hook with a `matcher` ("matcher not applied in Xum").
+- A hook with `type: "prompt"` ("prompt hooks are not applied in Xum").
+
+A hook that Xum drops while it reads the hooks file, for example one without a `command` string or with a `loop_limit` that is not a whole number or `null`, also appears under **Not applied in Xum** with its reason. Xum lists at most 50 such hooks.
+
+### The command
+
+Xum runs `command` with `bash` through the workspace runtime, as written. On Windows that is Git Bash. Xum does not rewrite a leading `./`, so `./hooks/x.sh` in a `stop` hook looks in the workspace root, as in Cursor. Name the script from the plugin folder instead, as in the example above. `timeout` is in seconds: the default is 10 and the cap is 30, as for Codex-format hooks.
+
+The process gets a minimal environment, not your shell's:
+
+| Variable                                   | Value                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------- |
+| `CURSOR_PROJECT_DIR`, `CLAUDE_PROJECT_DIR` | The workspace root                                                     |
+| `CURSOR_PLUGIN_ROOT`                       | The plugin folder                                                      |
+| `CURSOR_TRANSCRIPT_PATH`                   | The workspace's `chat.jsonl`. It is not in Cursor's transcript format. |
+| `CURSOR_VERSION`                           | `xum-<version>`, not a Cursor version                                  |
+| `PATH`, `HOME`                             | From the Xum process. Xum removes its own `bin` folder from `PATH`.    |
+
+Xum also passes the same host variables as for a [plugin MCP server](/config/mcp-servers#plugin-server-environment), such as `USER`, `LANG`, `TMPDIR`, and the CA bundle paths, and the variables it sets for every command so that tools do not wait for input.
+
+The input on stdin has these fields:
+
+| Field             | Value                                                                                                                  |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `conversation_id` | The Xum workspace ID                                                                                                   |
+| `generation_id`   | The turn ID, when there is one                                                                                         |
+| `model`           | Xum's provider-qualified model string, when there is one                                                               |
+| `hook_event_name` | The event                                                                                                              |
+| `cursor_version`  | The same value as `CURSOR_VERSION`                                                                                     |
+| `workspace_roots` | A list with the workspace root                                                                                         |
+| `user_email`      | Always `null`                                                                                                          |
+| `transcript_path` | The same value as `CURSOR_TRANSCRIPT_PATH`                                                                             |
+| `text`            | `afterAgentResponse`: the reply text as in Codex `last_assistant_message` (see [Event fields](#event-fields)), or `""` |
+| `status`          | `stop`: always `"completed"`                                                                                           |
+| `loop_count`      | `stop`: the continuations of this user turn so far, from any hook or Xum nudge                                         |
+| `file_path`       | `afterFileEdit`: the absolute path of the edited file                                                                  |
+| `edits`           | `afterFileEdit`: `[{ old_string, new_string }]` from the tool input. An insert has an empty `old_string`.              |
+
+### Output and failures
+
+A `stop` hook can print `{ "followup_message": "..." }`. Xum then continues the turn with that text as the next prompt. Each `stop` hook continues one user turn at most 3 times. Set `loop_limit` to a whole number to change that, or to `null` for no limit of its own. All hooks together stop at 50 continuations per user turn, and your next message starts a new count. See the notice in [Outputs Xum honors](#outputs-xum-honors).
+
+The other two events cannot change anything. Xum checks only that their output is valid. No Cursor event can block, so every failure fails open. Xum logs it, skips the hook's output, and shows "Plugin `<name>`: hook `<event>` failed (`<reason>`). Turn the hook off in Settings > Plugins." Xum shows that notice once per hook in each workspace. It shows the notice again after the set of trusted hooks that the workspace runs changes in any plugin (also when you remove the project's trust and restore it), after you archive and unarchive the workspace, or after Xum restarts.
+
+| Result                                                  | Reason in the notice                                                                    |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Exit 0 with empty stdout                                | No failure                                                                              |
+| Exit 0 with stdout that is not a JSON object            | `invalid output: not JSON` or `invalid output: not a JSON object`                       |
+| A `stop` hook's `followup_message` that is not a string | `its followup_message is not a string`                                                  |
+| Exit 2, or `permission: "deny"`                         | `exit code 2; this event cannot block`, or `permission "deny"; this event cannot block` |
+| Exit 127                                                | `` `<command>`: a command or one of its dependencies was not found (exit 127) ``        |
+| Another exit code                                       | `exit code <n>`                                                                         |
+| No exit within the timeout                              | `timed out after <n>s`                                                                  |
+| Stdout over 64 KiB                                      | `invalid output: over 65536 bytes`                                                      |
+| Input over 64 KiB                                       | `its input is over 65536 characters`. Xum skips the call.                               |
+| Xum cannot read its hook trust store                    | `Xum cannot read its hook trust store`. Xum skips the call.                             |
+
+Other failures name their cause. Xum reads no stderr. Exit 127 means that the command, or a command it runs such as `jq`, was not found. `failClosed` has no effect on these events.
+
 ## Claude Code plugin hooks
 
 A Claude Code plugin's `hooks/hooks.json`, and each file that the `hooks` key of `.claude-plugin/plugin.json` names, has the same shape as a Codex hooks file. Xum reads them and lists every hook in Settings as "Never runs", on every Claude Code event and for every handler type, `mcp_tool` included. Claude Code matchers name Claude Code tools, which Xum does not map. Xum warns about and ignores inline hooks objects in the manifest and `http` handlers.
 
 ## Xum-native hooks
 
-A plugin can ship `hooks.js` in its root, or at the path that `contributes.hooks` in `plugin.json` names. Xum loads `hooks.js` from global plugins, and from project plugins in a trusted project. A package with only `.codex-plugin/plugin.json` or `.claude-plugin/plugin.json` gets no `hooks.js`. Xum has no per-hook trust step for `hooks.js`. The install preview discloses it.
+A plugin can ship `hooks.js` in its root, or at the path that `contributes.hooks` in `plugin.json` names. Xum loads `hooks.js` from global plugins, and from project plugins in a trusted project. A package with only `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json` or `.cursor-plugin/plugin.json` gets no `hooks.js`. Xum has no per-hook trust step for `hooks.js`. The install preview discloses it.
 
 `hooks.js` is a script that evaluates to an object of hook functions. It runs in a QuickJS sandbox and cannot call tools. A function can be `async`. Each call has 5 seconds.
 
