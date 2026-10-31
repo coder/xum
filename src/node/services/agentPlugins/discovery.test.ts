@@ -10,6 +10,7 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  MAX_PLUGIN_MANIFEST_BYTES,
   pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
@@ -18,6 +19,7 @@ import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } fro
 import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { loadPluginMcpServers } from "./mcpConfig";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -2355,21 +2357,123 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
-  test("mcp.json produces no MCP config and one not-applied MCP entry", async () => {
+  test("the file that mcpServers names loads in the cursor MCP dialect", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./servers.json" }),
+      "servers.json": servers,
+      "mcp.json": servers,
+    });
+    const { plugin, relative } = kit;
+    expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
+    expect(plugin.mcpConfigDialect).toBe("cursor");
+    expect(plugin.notApplied).toEqual([]);
+  });
+
+  test("MCP servers that need values, and auth and placement fields, are listed as not applied", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
-      "mcp.json": JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } }),
+      "mcp.json": JSON.stringify({
+        mcpServers: {
+          brevo: {
+            type: "http",
+            url: "https://mcp.brevo.example/mcp",
+            headers: { Authorization: "Bearer ${BREVO_MCP_TOKEN}" },
+          },
+          x: { type: "http", url: "https://api.x.example/mcp", auth: { CLIENT_ID: "fixed-id" } },
+          trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" },
+          github: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
+          // Skipped for its url, so its auth block is not listed as well.
+          salesforce: { type: "http", url: "${SALESFORCE_MCP_URL}", auth: { CLIENT_ID: "x" } },
+          attio: { type: "http", url: "https://mcp.attio.example/mcp" },
+        },
+      }),
     });
     const { plugin } = kit;
-    expect(plugin.mcpConfigPath).toBeUndefined();
-    expect(plugin.mcpConfigDialect).toBeUndefined();
     expect(plugin.notApplied).toEqual([
       {
         part: "mcp",
-        name: "mcp.json",
-        reason: "MCP servers of Cursor plugins load in a later Xum build",
+        name: "brevo",
+        reason: "needs values not supported in Xum (${BREVO_MCP_TOKEN})",
+      },
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+      { part: "mcp", name: "trello", reason: "placement not applied in Xum" },
+      {
+        part: "mcp",
+        name: "github",
+        reason: "needs values not supported in Xum (${env:GITHUB_TOKEN})",
+      },
+      {
+        part: "mcp",
+        name: "salesforce",
+        reason: "needs values not supported in Xum (${SALESFORCE_MCP_URL})",
       },
     ]);
+    // The loader skips exactly the servers listed as needing values.
+    using xumHome = new DisposableTempDir("cursor-plugins-home");
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: xumHome.path });
+    expect(Object.values(servers).map((server) => server.plugin?.serverName)).toEqual([
+      "x",
+      "trello",
+      "attio",
+    ]);
+  });
+
+  test("without mcpServers, a Cursor package loads mcp.json and never .mcp.json", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using codexSibling = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ".mcp.json": servers,
+    });
+    expect(codexSibling.plugin.mcpConfigPath).toBeUndefined();
+    using cursorDefault = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "mcp.json": servers,
+      ".mcp.json": servers,
+    });
+    const { plugin, relative } = cursorDefault;
+    expect([relative(plugin.mcpConfigPath ?? ""), plugin.mcpConfigDialect]).toEqual([
+      "mcp.json",
+      "cursor",
+    ]);
+  });
+
+  test("an unterminated ${ in a Cursor MCP file is read in linear time", async () => {
+    const value = "${".repeat(2) + "a".repeat(MAX_PLUGIN_MANIFEST_BYTES / 2);
+    const started = performance.now();
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: { slow: { command: "node", args: [value] } } }),
+    });
+    // A backtracking pattern took over 20 s on half this size; a scan takes milliseconds.
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(kit.plugin.notApplied).toEqual([]);
+  });
+
+  test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      // JSON.parse makes `__proto__` an own key, as reading the file does. The loader refuses it.
+      "mcp.json":
+        '{"__proto__": {"url": "https://${HOST}/mcp"}, ' +
+        '"x": {"url": "https://api.x.example/mcp", "auth": {"CLIENT_ID": "fixed-id"}}}',
+    });
+    expect(kit.plugin.notApplied).toEqual([
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+    ]);
+  });
+
+  test("an MCP file over the size cap lists no MCP entries", async () => {
+    const servers = {
+      brevo: { url: "https://mcp.brevo.example/mcp", headers: { Authorization: "${TOKEN}" } },
+      pad: { url: `https://x.example/${"a".repeat(MAX_PLUGIN_MANIFEST_BYTES)}` },
+    };
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: servers }),
+    });
+    expect(kit.plugin.mcpConfigDialect).toBe("cursor");
+    expect(kit.plugin.notApplied).toEqual([]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {

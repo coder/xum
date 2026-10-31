@@ -21,9 +21,9 @@ export interface CursorManifestResult {
   /** Default `hooks/hooks.json`. */
   hooks?: string | Record<string, unknown>;
   /**
-   * The `mcpServers` file path; the inert path when the field names no file Xum applies. Kept out
-   * of `contributes.mcp` until Cursor MCP servers load (Cursor plugin RFC PR 3): the sign-out
-   * pass reads a declared `contributes.mcp` that resolves to no file as an unreadable MCP file.
+   * The `mcpServers` file path; the inert path when the field names no file Xum applies. A real
+   * path is `contributes.mcp` too, so the sign-out pass reads a missing declared file as an
+   * unreadable one: restored, its servers would load with an old sign-in.
    */
   mcpConfigPath?: string;
   notApplied: AgentPluginNotApplied[];
@@ -218,15 +218,19 @@ export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   const read = (field: string) => readFolderPaths(field, raw[field], warnings, notApplied);
   const skills = read("skills");
   const rules = read("rules");
+  const mcp = mcpFile(raw.mcpServers, warnings, notApplied);
   manifest.contributes = {
     ...(skills !== undefined ? { skills: declaredFolders(skills) } : {}),
     ...agentsFolder(read("agents"), notApplied),
+    ...(mcp.mcpConfigPath !== undefined && mcp.mcpConfigPath !== INERT_COMPONENT_PATH
+      ? { mcp: mcp.mcpConfigPath }
+      : {}),
   };
   return {
     manifest,
     warnings,
     ruleDirs: rules ?? ["rules"],
-    ...mcpFile(raw.mcpServers, warnings, notApplied),
+    ...mcp,
     ...readHooks(raw.hooks, warnings, notApplied),
     notApplied,
   };

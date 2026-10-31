@@ -754,6 +754,39 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(card.querySelector('[data-component="ProModeToggle"]')).not.toBeNull();
   });
 
+  test("gates Pro on the settings base's model, not a base pin the settings base replaced", async () => {
+    // A Cursor `model: fast` agent on Exec, where a project exec.md pins a pro-capable model. A
+    // run resolves [ci-watcher, explore, exec], so Explore's Settings model outranks that pin,
+    // while the base-merged aiDefaults still carry it.
+    const view = renderTasksSection({
+      agents: [
+        {
+          id: "ci-watcher",
+          scope: "global",
+          name: "CI Watcher",
+          uiSelectable: false,
+          subagentRunnable: true,
+          base: "exec",
+          aiSettingsBase: "explore",
+          aiDefaults: { model: "openai:gpt-6-luna", settingsBase: "explore" },
+          aiLayers: {
+            ancestors: [
+              { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+              { agentId: "exec", definitionAiDefaults: { model: "openai:gpt-6-luna" } },
+            ],
+          },
+        },
+      ],
+      agentAiDefaults: { explore: { modelString: "anthropic:foo" } },
+    });
+
+    await view.findByText("CI Watcher");
+    const card = getAgentCardByName(view, "CI Watcher");
+    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+    expect(within(card).getByRole("listbox", { name: "Reasoning effort" })).toBeTruthy();
+    expect(card.querySelector('[data-component="ProModeToggle"]')).toBeNull();
+  });
+
   test("hides the Pro mode toggle on the Name Workspace card even for pro-capable models", async () => {
     // Name generation runs raw streamText (workspaceTitleGenerator) and never
     // applies reasoningMode, same headless class as Dream.

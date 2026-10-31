@@ -76,3 +76,32 @@ describe("readonly agent consent fingerprint", () => {
     expect(fingerprint(first)).toBe(fingerprint(second));
   });
 });
+
+describe("Cursor model: fast and is_background", () => {
+  test("model: fast resolves AI settings through Explore and keeps the Exec base", () => {
+    const fast = parsePluginAgent("description: Watches CI\nmodel: fast\neffort: low\n");
+    expect(fast.base).toBe("exec");
+    expect(fast.ai).toEqual({ settingsBase: "explore", thinkingLevel: "low" });
+  });
+
+  test("is_background: true writes the background hint; background: true writes nothing", () => {
+    expect(parsePluginAgent("description: Watches CI\nis_background: true\n").subagent).toEqual({
+      runnable: true,
+      background_hint: true,
+    });
+    expect(parsePluginAgent("description: Watches CI\nbackground: true\n").subagent).toEqual({
+      runnable: true,
+    });
+  });
+
+  test("each written field changes the consent fingerprint", () => {
+    const plain = fingerprint(parsePluginAgent("description: Watches CI\n"));
+    expect(fingerprint(parsePluginAgent("description: Watches CI\nmodel: fast\n"))).not.toBe(plain);
+    expect(
+      fingerprint(parsePluginAgent("description: Watches CI\nis_background: true\n"))
+    ).not.toBe(plain);
+    expect(fingerprint(parsePluginAgent("description: Watches CI\nbackground: true\n"))).toBe(
+      plain
+    );
+  });
+});
