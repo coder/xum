@@ -11,6 +11,8 @@ import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import {
+  MERMAID_BUTTON_HEIGHT,
+  MERMAID_BUTTON_INSET,
   MERMAID_CONTAINER_STYLE,
   MERMAID_FRAME_STYLE,
   MERMAID_PENDING_STYLE,
@@ -329,10 +331,12 @@ function normalizeDiagramZoom(value: number): number {
 
 // Common button styles
 const getButtonStyle = (disabled = false): CSSProperties => ({
-  background: disabled ? "rgba(255, 255, 255, 0.05)" : "rgba(255, 255, 255, 0.1)",
-  border: "1px solid rgba(255, 255, 255, 0.2)",
+  // Theme tokens, not fixed white, so the buttons stay visible in the light themes (#7821).
+  background: "var(--color-background)",
+  border: "1px solid var(--color-border-subtle)",
   color: disabled ? "var(--color-text-secondary)" : "var(--color-text)",
-  padding: "6px 10px",
+  height: `${MERMAID_BUTTON_HEIGHT}px`,
+  padding: "0 10px",
   cursor: disabled ? "not-allowed" : "pointer",
   borderRadius: "4px",
   fontSize: "16px",
@@ -390,8 +394,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
             position: "absolute",
             top: "16px",
             right: "16px",
-            background: "rgba(255, 255, 255, 0.1)",
-            border: "1px solid rgba(255, 255, 255, 0.2)",
+            background: "var(--color-background)",
+            border: "1px solid var(--color-border-subtle)",
             color: "var(--color-text)",
             padding: "8px 16px",
             cursor: "pointer",
@@ -500,8 +504,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           style={{
             position: "absolute",
-            top: "8px",
-            right: "8px",
+            top: `${MERMAID_BUTTON_INSET}px`,
+            right: `${MERMAID_BUTTON_INSET}px`,
             display: "flex",
             gap: "4px",
           }}
