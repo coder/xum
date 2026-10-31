@@ -257,7 +257,8 @@ describe("PreToolUse", () => {
           await runTurnStopHooks(stop.spine, workspaceId, {
             messageId: "a1",
             lastAssistantMessage: "done",
-            stopHookActive: false,
+            turnContinuations: 0,
+            hookContinuations: new Map(),
           })
         ).toEqual({ kind: "none" });
         expect([post, stop].flatMap((h) => h.notices)).toEqual([]);
@@ -331,7 +332,8 @@ describe("PreToolUse", () => {
         await runTurnStopHooks(stop.spine, workspaceId, {
           messageId: "a1",
           lastAssistantMessage: "done",
-          stopHookActive: false,
+          turnContinuations: 0,
+          hookContinuations: new Map(),
         })
       ).toEqual({ kind: "none" });
 
