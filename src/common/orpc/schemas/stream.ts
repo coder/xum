@@ -700,6 +700,11 @@ export const PluginHookNoticeEventSchema = z.object({
   workspaceId: z.string(),
   plugin: z.string(),
   message: z.string(),
+  /**
+   * `info`: a routine notice (a Stop continuation), shown as an info toast that a newer one replaces
+   * while it waits. Absent: a hook's systemMessage, shown as an error toast.
+   */
+  severity: z.literal("info").optional(),
 });
 
 /** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
