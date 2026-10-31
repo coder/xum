@@ -976,25 +976,27 @@ describe("TaskService", () => {
         attentionPolicy: "notify_on_terminal",
       })
     );
-    const listOwner = store.listWorkspaceTurns.bind(store);
-    let ownerReadable = false;
-    const listWorkspaceTurns = spyOn(store, "listWorkspaceTurns").mockImplementation(
-      (ownerWorkspaceId, options) =>
-        ownerWorkspaceId === parentId && !ownerReadable
-          ? Promise.reject(
-              Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
-            )
-          : listOwner(ownerWorkspaceId, options)
-    );
+    const scanOwners = store.scanAllWorkspaceTurns.bind(store);
+    const scansComplete: boolean[] = [];
+    spyOn(store, "scanAllWorkspaceTurns").mockImplementation(async (options) => {
+      const scan = await scanOwners(options);
+      scansComplete.push(scan.complete);
+      return scan;
+    });
+    // A regular file where the handle directory belongs: readdir fails with ENOTDIR.
+    const handleDir = path.join(config.sessionsDir, parentId, "task-handles");
+    await fsPromises.rename(handleDir, `${handleDir}.hidden`);
+    await fsPromises.writeFile(handleDir, "");
 
     await taskService.recoverInterruptedTasks();
     await taskService.maybeStartQueuedTasks();
-    expect(listWorkspaceTurns.mock.calls.some((call) => call[0] === parentId)).toBe(true);
+    expect(scansComplete).toContain(false);
+
+    await fsPromises.rm(handleDir);
+    await fsPromises.rename(`${handleDir}.hidden`, handleDir);
     expect(await store.getWorkspaceTurn(parentId, "wst_stale_root")).toMatchObject({
       status: "running",
     });
-
-    ownerReadable = true;
     await taskService.maybeStartQueuedTasks();
     await flushTerminalAttentionDrains(taskService);
 

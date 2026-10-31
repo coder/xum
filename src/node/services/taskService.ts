@@ -14023,10 +14023,13 @@ export class TaskService implements AgentTaskIntegration {
             executionId
           );
         } else {
+          // Only an active record changes the checks below, so the scan reads only those files.
           continuationRecord =
-            (await this.getWorkspaceTurnManager().listAllWorkspaceTurns()).find(
-              (record) => record.handleId === executionId
-            ) ?? null;
+            (
+              await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
+                statuses: ["queued", "starting", "running"],
+              })
+            ).find((record) => record.handleId === executionId) ?? null;
         }
       }
       const continuationActive = isActiveWorkspaceTurnTaskStatus(continuationRecord?.status);
