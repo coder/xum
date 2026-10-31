@@ -997,7 +997,8 @@ const PreviewConsent: React.FC<{
           {props.preview.warnings.map((warning) => (
             <div key={warning} className="text-warning flex items-start gap-2 text-xs">
               <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="min-w-0 break-words">{warning}</span>
+              {/* The hook warnings quote plugin text (event names, paths): controls are marked. */}
+              <span className="min-w-0 break-words">{showOneLineControls(warning)}</span>
             </div>
           ))}
         </div>
