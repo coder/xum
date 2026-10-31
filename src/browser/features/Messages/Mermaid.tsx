@@ -230,12 +230,26 @@ function asciiLowerCase(name: string): string {
   return name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 }
 
-// The CSS functions in Pele's output, plus the color functions a chart's styles can use.
+// The CSS functions in Pele's output, plus the color and math functions that chart styles can
+// use and that load nothing. Pele passes almost any function into style and classDef, so this
+// list is the check: element(), paint(), attr(), cross-fade() and gradients stay out.
 const PELE_CSS_FUNCTIONS = new Set([
   "calc",
+  "clamp",
+  "color",
   "color-mix",
+  "contrast-color",
+  "device-cmyk",
   "hsl",
   "hsla",
+  "hwb",
+  "lab",
+  "lch",
+  "light-dark",
+  "max",
+  "min",
+  "oklab",
+  "oklch",
   "rgb",
   "rgba",
   "rotate",
