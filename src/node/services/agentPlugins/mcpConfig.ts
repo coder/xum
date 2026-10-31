@@ -32,6 +32,14 @@ import {
 import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
+  CURSOR_AUTH_REASON,
+  cursorValuePlaceholder,
+  folderAliases,
+  needsValuesReason,
+  xumStdioEntry,
+  type McpDialect,
+} from "./mcpDialects";
+import {
   envNameKey,
   isReservedPluginEnvName,
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
@@ -332,61 +340,6 @@ function stdioEnvError(
   return undefined;
 }
 
-type McpDialect = NonNullable<AgentPluginInfo["mcpConfigDialect"]>;
-type XumFolderName = "PLUGIN_ROOT" | "PLUGIN_DATA";
-type FolderAliases = Partial<Record<Exclude<keyof PluginPlaceholderValues, XumFolderName>, XumFolderName>>;
-
-/**
- * The other names a dialect gives the plugin folder and its data folder. Cursor documents only its
- * two roots, so a Cursor data name stays a user value (Cursor plugin RFC D29).
- */
-const DIALECT_FOLDER_ALIASES: Record<McpDialect, FolderAliases> = {
-  codex: {},
-  claude: { CLAUDE_PLUGIN_ROOT: "PLUGIN_ROOT", CLAUDE_PLUGIN_DATA: "PLUGIN_DATA" },
-  cursor: { CURSOR_PLUGIN_ROOT: "PLUGIN_ROOT", CLAUDE_PLUGIN_ROOT: "PLUGIN_ROOT" },
-};
-
-function folderAliases(plugin: AgentPluginInfo): FolderAliases {
-  return plugin.mcpConfigDialect === undefined ? {} : DIALECT_FOLDER_ALIASES[plugin.mcpConfigDialect];
-}
-
-/**
- * A stdio entry with its dialect's folder names in Xum's spelling:
- * - A command of exactly `${<root alias>}/<path>` becomes `./<path>`, so it goes through the same
- *   `./` checks (containment, a file, executable). Every other form, including a quoted or
- *   absolute one, stays unchanged and classifyCommandToken refuses it.
- * - A cwd anchored at an alias is anchored at the matching Xum name, so the cwd form and
- *   containment checks apply unchanged.
- * Args and env values expand the aliases through the placeholder values instead.
- */
-function xumStdioEntry(
-  entry: Record<string, unknown>,
-  aliases: FolderAliases
-): Record<string, unknown> {
-  const { command, cwd } = entry;
-  const rewritten = { ...entry };
-  for (const [alias, folder] of Object.entries(aliases)) {
-    const token = `\${${alias}}`;
-    const commandPrefix = `${token}/`;
-    if (
-      folder === "PLUGIN_ROOT" &&
-      typeof command === "string" &&
-      command.startsWith(commandPrefix) &&
-      command.length > commandPrefix.length
-    ) {
-      rewritten.command = `./${command.slice(commandPrefix.length)}`;
-    }
-    if (
-      typeof cwd === "string" &&
-      cwd.startsWith(token) &&
-      (cwd.length === token.length || cwd[token.length] === "/")
-    ) {
-      rewritten.cwd = `\${${folder}}${cwd.slice(token.length)}`;
-    }
-  }
-  return rewritten;
-}
-
 /** Placeholder values for a plugin's MCP file: the aliases expand only in their dialect. */
 function pluginPlaceholderValues(
   plugin: AgentPluginInfo,
@@ -396,43 +349,19 @@ function pluginPlaceholderValues(
   return {
     ...folders,
     ...Object.fromEntries(
-      Object.entries(folderAliases(plugin)).map(([alias, folder]) => [alias, folders[folder]])
+      Object.entries(folderAliases(plugin.mcpConfigDialect)).map(([alias, folder]) => [
+        alias,
+        folders[folder],
+      ])
     ),
   };
-}
-
-// A `${NAME}` or `${NAME:-default}`: how a Cursor `mcp.json` asks for a user value.
-const PLACEHOLDER_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g;
-
-/**
- * The first placeholder in `values` that Xum leaves as written, by name only: a default can be a
- * secret. Only an exact `${NAME}` of a `supplied` name expands (expandPluginPlaceholders).
- */
-function unexpandedPlaceholder(
-  values: readonly unknown[],
-  supplied: Record<string, string>
-): string | undefined {
-  for (const value of values) {
-    if (typeof value !== "string") continue;
-    for (const [whole, name] of value.matchAll(PLACEHOLDER_PATTERN)) {
-      if (whole !== `\${${name}}` || !Object.hasOwn(supplied, name)) return `\${${name}}`;
-    }
-  }
-  return undefined;
-}
-
-/** Cursor dialect: Xum has no Cursor `variables`, so a server that asks for a value is skipped. */
-function needsValuesSkip(placeholder: string | undefined): { skip: string } | undefined {
-  return placeholder === undefined
-    ? undefined
-    : { skip: `needs values not supported in Xum (${placeholder})` };
 }
 
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
 async function normalizeStdioEntry(
   entry: Record<string, unknown>,
   ctx: NormalizeContext
-): Promise<{ info: MCPStdioServerInfo } | { error: string } | { skip: string }> {
+): Promise<{ info: MCPStdioServerInfo } | { error: string }> {
   for (const key of Object.keys(entry)) {
     if (!STDIO_ENTRY_KEYS.has(key)) {
       return { error: `unknown field '${key}' in stdio server entry` };
@@ -482,14 +411,6 @@ async function normalizeStdioEntry(
     // Fail with a precise diagnostic instead of the misleading fs error the
     // containment resolution below would raise for a NUL-bearing path.
     return { error: "'cwd' must not contain NUL bytes" };
-  }
-  if (ctx.plugin.mcpConfigDialect === "cursor") {
-    // After the form checks, so a cwd at a Cursor data name fails as a cwd form error (D29).
-    const skip = needsValuesSkip(
-      unexpandedPlaceholder([command], {}) ??
-        unexpandedPlaceholder([...args, ...Object.values(env), cwd], supplied)
-    );
-    if (skip !== undefined) return skip;
   }
 
   const rootPath = ctx.plugin.rootPath;
@@ -615,12 +536,6 @@ function normalizeRemoteEntry(
       return { error: `unknown field '${key}' in remote server entry` };
     }
   }
-  if (ctx.plugin.mcpConfigDialect === "cursor") {
-    // Before the url and headers checks, which would refuse the placeholder for another reason.
-    const headers = isPlainObject(entry.headers) ? Object.values(entry.headers) : [];
-    const skip = needsValuesSkip(unexpandedPlaceholder([entry.url, ...headers], {}));
-    if (skip !== undefined) return skip;
-  }
 
   const url = entry.url;
   if (typeof url !== "string") {
@@ -711,16 +626,33 @@ async function normalizeServerEntry(
     return normalizeRemoteEntry(entry, ctx);
   if (entry.type !== "stdio")
     return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
-  const result = await normalizeStdioEntry(xumStdioEntry(entry, folderAliases(ctx.plugin)), ctx);
+  const result = await normalizeStdioEntry(
+    xumStdioEntry(entry, folderAliases(ctx.plugin.mcpConfigDialect)),
+    ctx
+  );
   if ("info" in result && translated.forwardEnv !== undefined)
     result.info.forwardEnv = translated.forwardEnv;
   return result;
 }
 
+/** Why a dialect skips an entry before translation. */
+function dialectEntrySkip(
+  rawEntry: Record<string, unknown>,
+  dialect: McpDialect | undefined
+): string | undefined {
+  // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+  // infer a transport for it as the Codex dialect does.
+  if (dialect === "claude" && rawEntry.type === undefined && rawEntry.url !== undefined)
+    return "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json";
+  if (dialect !== "cursor") return undefined;
+  const placeholder = cursorValuePlaceholder(rawEntry);
+  return placeholder === undefined ? undefined : needsValuesReason(placeholder);
+}
+
 /**
- * A server entry in the Agent Plugins shape. A Cursor entry's `auth` block is not translated
- * (Cursor plugin RFC D19): it is dropped and named, and sign-in uses discovery and dynamic client
- * registration. A Cursor server must not forward the folder aliases that Xum supplies to it.
+ * A server entry in the Agent Plugins shape. A Cursor entry's `auth` block is dropped and named
+ * (CURSOR_AUTH_REASON), and a Cursor server must not forward the folder aliases that Xum supplies
+ * to it.
  */
 function translateDialectEntry(
   rawEntry: Record<string, unknown>,
@@ -730,8 +662,8 @@ function translateDialectEntry(
     return { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
   if (dialect !== "cursor") return translateCodexMcpEntry(rawEntry);
   const { auth, ...entry } = rawEntry;
-  const translated = translateCodexMcpEntry(entry, Object.keys(DIALECT_FOLDER_ALIASES.cursor));
-  if (auth !== undefined) translated.warnings.push("auth not applied in Xum");
+  const translated = translateCodexMcpEntry(entry, Object.keys(folderAliases("cursor")));
+  if (auth !== undefined) translated.warnings.push(CURSOR_AUTH_REASON);
   return translated;
 }
 
@@ -822,7 +754,7 @@ export async function loadPluginMcpServers(
   // from the lexical selection (a contained symlink keeps the dialect); a
   // root mcp.json stays strict. A Claude `.mcp.json` and a Cursor `mcp.json`
   // have the Codex shape, plus their names for the plugin folders
-  // (DIALECT_FOLDER_ALIASES).
+  // (mcpDialects.ts).
   const codexDialect = plugin.mcpConfigDialect !== undefined;
   // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
   const doc: Record<string, unknown> =
@@ -887,17 +819,9 @@ export async function loadPluginMcpServers(
       continue;
     }
     const { rawEntry } = shape;
-    // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
-    // infer a transport for it as the Codex dialect does.
-    if (
-      plugin.mcpConfigDialect === "claude" &&
-      rawEntry.type === undefined &&
-      rawEntry.url !== undefined
-    ) {
-      reportEntry(
-        "warning",
-        "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json"
-      );
+    const dialectSkip = dialectEntrySkip(rawEntry, plugin.mcpConfigDialect);
+    if (dialectSkip !== undefined) {
+      reportEntry("warning", dialectSkip);
       continue;
     }
     const codex = translateDialectEntry(rawEntry, plugin.mcpConfigDialect);

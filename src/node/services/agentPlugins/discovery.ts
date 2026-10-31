@@ -41,6 +41,7 @@ import {
   type CursorManifestResult,
 } from "./cursorManifest";
 import { convertCursorRule, cursorRuleName, type CursorRuleRefusal } from "./cursorRules";
+import { cursorMcpNotApplied } from "./mcpDialects";
 import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
@@ -1195,6 +1196,27 @@ async function resolvePluginMcpConfig(args: {
     : { mcpConfigPath };
 }
 
+/**
+ * A Cursor MCP file's servers that need values and its `auth` blocks, so the plugin lists them
+ * after install too. An unreadable or invalid file lists nothing: the MCP loader reports it.
+ */
+async function cursorMcpFileNotApplied(
+  rootReal: string,
+  mcpConfigPath: string
+): Promise<AgentPluginNotApplied[]> {
+  try {
+    const { content } = await pluginFs().readFileCapped({
+      filePath: mcpConfigPath,
+      pluginRoot: rootReal,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: path.basename(mcpConfigPath),
+    });
+    return cursorMcpNotApplied(JSON.parse(content) as unknown);
+  } catch {
+    return [];
+  }
+}
+
 async function resolvePackageMcpConfig(args: {
   packageKind: {
     skillsOnly: boolean;
@@ -1599,6 +1621,10 @@ async function discoverPluginAt(args: {
     declared: cursor !== undefined ? cursor.mcpConfigPath : contributes?.mcp,
     resolveComponent,
   });
+  const mcpNotApplied =
+    mcp.mcpConfigDialect === "cursor" && mcp.mcpConfigPath !== undefined
+      ? await cursorMcpFileNotApplied(rootReal, mcp.mcpConfigPath)
+      : [];
   const { agentsDir: resolvedAgentsDir, ...xumComponents } = await resolveXumComponents({
     allowed: xumComponentGate({ codexFallback, foreign, skillsOnly }),
     contributes,
@@ -1624,7 +1650,7 @@ async function discoverPluginAt(args: {
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(cursorFallback ? { cursorFallback: true } : {}),
-    notApplied: cursorParts.notApplied,
+    notApplied: [...cursorParts.notApplied, ...mcpNotApplied],
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,

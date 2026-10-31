@@ -18,6 +18,7 @@ import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } fro
 import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { loadPluginMcpServers } from "./mcpConfig";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -2366,6 +2367,46 @@ describe("Cursor plugin discovery", () => {
     expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
     expect(plugin.mcpConfigDialect).toBe("cursor");
     expect(plugin.notApplied).toEqual([]);
+  });
+
+  test("MCP servers that need values and auth blocks are listed as not applied", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({
+        mcpServers: {
+          brevo: {
+            type: "http",
+            url: "https://mcp.brevo.example/mcp",
+            headers: { Authorization: "Bearer ${BREVO_MCP_TOKEN}" },
+          },
+          x: { type: "http", url: "https://api.x.example/mcp", auth: { CLIENT_ID: "fixed-id" } },
+          // Skipped for its url, so its auth block is not listed as well.
+          salesforce: { type: "http", url: "${SALESFORCE_MCP_URL}", auth: { CLIENT_ID: "x" } },
+          attio: { type: "http", url: "https://mcp.attio.example/mcp" },
+        },
+      }),
+    });
+    const { plugin } = kit;
+    expect(plugin.notApplied).toEqual([
+      {
+        part: "mcp",
+        name: "brevo",
+        reason: "needs values not supported in Xum (${BREVO_MCP_TOKEN})",
+      },
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+      {
+        part: "mcp",
+        name: "salesforce",
+        reason: "needs values not supported in Xum (${SALESFORCE_MCP_URL})",
+      },
+    ]);
+    // The loader skips exactly the servers listed as needing values.
+    using xumHome = new DisposableTempDir("cursor-plugins-home");
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: xumHome.path });
+    expect(Object.values(servers).map((server) => server.plugin?.serverName)).toEqual([
+      "x",
+      "attio",
+    ]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {

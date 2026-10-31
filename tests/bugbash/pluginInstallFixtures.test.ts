@@ -114,14 +114,15 @@ test("cursor-stdio-mcp's echo server starts from ${CURSOR_PLUGIN_ROOT} and echoe
   expect(diagnostics).toEqual([]);
   const [echo] = Object.values(servers);
   if (echo?.transport !== "stdio") throw new Error("echo is not a stdio server");
-  expect([echo.command, ...echo.args]).toEqual(["node", path.join(plugin.rootPath, "server.mjs")]);
+  const args = echo.args ?? [];
+  expect([echo.command, ...args]).toEqual(["node", path.join(plugin.rootPath, "server.mjs")]);
 
   const requests = [
     { id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {} } },
     { method: "notifications/initialized" },
     { id: 2, method: "tools/call", params: { name: "echo", arguments: { text: "hi" } } },
   ];
-  const run = spawnSync(echo.command, echo.args, {
+  const run = spawnSync(echo.command, args, {
     cwd: echo.cwd,
     env: { ...process.env, ...echo.env },
     input: requests.map((request) => JSON.stringify({ jsonrpc: "2.0", ...request })).join("\n"),
