@@ -989,6 +989,22 @@ function rowRefusesReactivation(ws: WorkspaceConfigEntry, plan: ReactivationPlan
 }
 
 /**
+ * Why a reactivation refuses this row: a workflow retired its attempt (that wins) or a removal
+ * began. Undefined when neither.
+ */
+function attemptRowRefusalMessage(
+  row: Pick<WorkspaceConfigEntry, "taskAttemptRetiredBy" | "pendingRemoval"> | undefined
+): string | undefined {
+  if (row?.taskAttemptRetiredBy != null) {
+    return retiredAttemptMessage(row.taskAttemptRetiredBy);
+  }
+  if (row?.pendingRemoval != null) {
+    return pendingRemovalAdmissionMessage(row.pendingRemoval);
+  }
+  return undefined;
+}
+
+/**
  * The model fields of a send into an active task: the active agent's settings first, then the
  * row's task model and thinking level, then the default model.
  */
@@ -9946,7 +9962,7 @@ export class TaskService implements AgentTaskIntegration {
      */
     stopFence: ReadonlyMap<string, number> | null;
   }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
-    const { ancestorWorkspaceId, taskId } = params;
+    const { taskId } = params;
     assert(
       params.stopFence?.has(taskId) ?? true,
       "reactivateInactiveAgentTask: stopFence must cover the task"
@@ -9964,6 +9980,18 @@ export class TaskService implements AgentTaskIntegration {
     if (marker != null) {
       return Err({ code: "send_failed" as const, message: pendingRemovalAdmissionMessage(marker) });
     }
+    return await this.unarchiveForReactivation(params, statusAtDecision);
+  }
+
+  /**
+   * Unarchive the ancestry, re-read the row and check its checkout, then plan the AI settings.
+   * The refusal, or the staged reactivation's result.
+   */
+  private async unarchiveForReactivation(
+    params: ReactivationParams,
+    statusAtDecision: WorkspaceConfigEntry["taskStatus"]
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId } = params;
     const unarchiveResult = await this.unarchiveAgentTaskAncestry(ancestorWorkspaceId, taskId);
     if (!unarchiveResult.success) {
       return Err({ code: "send_failed" as const, message: unarchiveResult.error });
@@ -9982,6 +10010,21 @@ export class TaskService implements AgentTaskIntegration {
     }
     // Plan (no awaits, no writes) before any family rows or attempt ownership change, so a
     // refusal here leaves the task untouched. The settings commit later, with the claim.
+    const aiPlan = this.planReactivationAi(params);
+    if (!aiPlan.success) {
+      return aiPlan;
+    }
+    return await this.stageReactivation(params, statusAtDecision, refreshedEntry, aiPlan.data);
+  }
+
+  /**
+   * The AI settings an ancestor send re-resolves for the turn (undefined keeps the frozen path),
+   * or the refusal when the row is gone or its settings changed since the caller prepared them.
+   */
+  private planReactivationAi(
+    params: ReactivationParams
+  ): Result<AgentTaskTurnAi | undefined, SendAgentTaskMessageError> {
+    const { taskId } = params;
     let agentTaskAi: AgentTaskTurnAi | undefined;
     if (params.aiRefresh != null) {
       const planConfig = this.config.loadConfigOrDefault();
@@ -10004,6 +10047,20 @@ export class TaskService implements AgentTaskIntegration {
         agentTaskAi = { snapshot: plan.snapshot, inputsKey: plan.inputsKey, contextKey };
       }
     }
+    return Ok(agentTaskAi);
+  }
+
+  /**
+   * Append the pre-turn rows, refuse a retired or removing row, then pause the goal and evaluate
+   * the lineage. The snapshots read here, before those awaits, go to the commit.
+   */
+  private async stageReactivation(
+    params: ReactivationParams,
+    statusAtDecision: WorkspaceConfigEntry["taskStatus"],
+    refreshedEntry: ReactivationPlan["refreshedEntry"],
+    agentTaskAi: AgentTaskTurnAi | undefined
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { taskId } = params;
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event
     // locks held there, so no task-driven turn admission can be in flight
@@ -10016,17 +10073,9 @@ export class TaskService implements AgentTaskIntegration {
         return appendOutcome;
       }
     }
-    if (refreshedEntry.workspace.taskAttemptRetiredBy != null) {
-      return Err({
-        code: "send_failed" as const,
-        message: retiredAttemptMessage(refreshedEntry.workspace.taskAttemptRetiredBy),
-      });
-    }
-    if (refreshedEntry.workspace.pendingRemoval != null) {
-      return Err({
-        code: "send_failed" as const,
-        message: pendingRemovalAdmissionMessage(refreshedEntry.workspace.pendingRemoval),
-      });
+    const rowRefusal = attemptRowRefusalMessage(refreshedEntry.workspace);
+    if (rowRefusal != null) {
+      return Err({ code: "send_failed" as const, message: rowRefusal });
     }
     // Admission classification: reactivation = new OWNED attempt. The CAS publishes the fresh id
     // before any turn exists; once committed the new identity is kept in config and memory
@@ -10158,11 +10207,8 @@ export class TaskService implements AgentTaskIntegration {
     return Err({
       code: "send_failed" as const,
       message:
-        latest?.taskAttemptRetiredBy != null
-          ? retiredAttemptMessage(latest.taskAttemptRetiredBy)
-          : latest?.pendingRemoval != null
-            ? pendingRemovalAdmissionMessage(latest.pendingRemoval)
-            : "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
+        attemptRowRefusalMessage(latest) ??
+        "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
     });
   }
 
