@@ -332,6 +332,17 @@ describe("sanitizeMermaidSvg", () => {
     expect(htmlParts(sanitized).filter((part) => /fill|stroke/.test(part))).toEqual([]);
   });
 
+  // Pele passes these into a style, but they can paint other content or run a worklet.
+  it.each(["element(#app)", "paint(worklet)", "attr(data-x)", "linear-gradient(red, blue)"])(
+    "removes a style that uses %s",
+    (call) => {
+      const sanitized =
+        sanitizeMermaidSvg(svgWith(`<rect style="fill:${call};stroke:red"/>`), ID_PREFIX) ?? "";
+
+      expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
+    }
+  );
+
   it("keeps a url(#id) attribute but no url() declaration", () => {
     const sanitized = sanitizeMermaidSvg(
       svgWith(

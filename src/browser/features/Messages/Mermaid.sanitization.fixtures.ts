@@ -31,6 +31,11 @@ export const PELE_SAMPLES: Record<DiagramType, readonly string[]> = {
     align row src1 src2 src3`,
   ],
   block: [
+    `block-beta
+  a b c
+  style a fill:hwb(194 0% 0%),stroke-width:max(1px, 2px)
+  style b fill:color(display-p3 1 0 0)
+  style c fill:light-dark(#fff, #000),stroke:device-cmyk(0 0 0 1)`,
     `block
 columns 1
   db(("DB"))
@@ -91,6 +96,9 @@ columns 1
   UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")`,
   ],
   class: [
+    `classDiagram
+  class A
+  style A fill:contrast-color(red)`,
     `classDiagram
     namespace Company.Engineering.Backend {
         class Developer {
@@ -340,6 +348,14 @@ Bio-conversion,Gas,81.144`,
   end`,
   ],
   state: [
+    // Pele passes CSS color and math functions through style and classDef. These make it emit
+    // every function that PELE_CSS_FUNCTIONS allows beyond the 669 examples.
+    `stateDiagram-v2
+  [*] --> A
+  A --> B
+  style A fill:oklch(70% 0.1 200),stroke:oklab(0.5 0.1 0.1),stroke-width:clamp(1px, 2px, 3px)
+  classDef c fill:lab(50% 40 59),stroke:lch(52% 72 56),stroke-width:min(2px, 3px)
+  class B c`,
     `stateDiagram-v2
     stateId`,
   ],
