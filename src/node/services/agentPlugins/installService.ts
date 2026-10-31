@@ -601,6 +601,26 @@ function treeEntryContent(record: PluginTreeRecord): string {
   return record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "";
 }
 
+function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
+  return a.kind === b.kind && a.mode === b.mode && treeEntryContent(a) === treeEntryContent(b);
+}
+
+/** One file review row: an added row has only `after`, a removed row only `before`. */
+function fileReviewRow(
+  filePath: string,
+  was: PluginTreeRecord | undefined,
+  now: PluginTreeRecord | undefined
+): AgentPluginCapabilityChange {
+  const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
+  const before = fileReviewText(was);
+  const after = fileReviewText(now);
+  return {
+    summary: `file ${showOneLineControls(filePath)} ${verb}`,
+    ...(before !== undefined ? { before } : {}),
+    ...(after !== undefined ? { after } : {}),
+  };
+}
+
 /**
  * The file review (D1, D30): one row per file or symlink that differs between two plugin trees.
  * `before: null` is the empty tree, so every file is an added row. A directory gets no row; the
@@ -619,25 +639,9 @@ function fileReviewRows(
   return [...new Set([...old.keys(), ...next.keys()])].sort().flatMap((filePath) => {
     const was = old.get(filePath);
     const now = next.get(filePath);
-    if (
-      was !== undefined &&
-      now !== undefined &&
-      was.kind === now.kind &&
-      was.mode === now.mode &&
-      treeEntryContent(was) === treeEntryContent(now)
-    ) {
-      return [];
-    }
-    const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
-    const beforeText = fileReviewText(was);
-    const afterText = fileReviewText(now);
-    return [
-      {
-        summary: `file ${showOneLineControls(filePath)} ${verb}`,
-        ...(beforeText !== undefined ? { before: beforeText } : {}),
-        ...(afterText !== undefined ? { after: afterText } : {}),
-      },
-    ];
+    return was !== undefined && now !== undefined && sameTreeEntry(was, now)
+      ? []
+      : [fileReviewRow(filePath, was, now)];
   });
 }
 
@@ -2310,6 +2314,24 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * The file review rows of a staged plugin with a runnable Cursor command hook; none for any
+   * other plugin. D30: an installed tree (or none) without such a hook never had a file review,
+   * so the staged tree is compared with the empty tree and every file is listed.
+   */
+  private async fileReviewChanges(
+    staged: AgentPluginInfo,
+    installed: AgentPluginInfo | null
+  ): Promise<AgentPluginCapabilityChange[]> {
+    if (!runsCursorCommands((await loadPluginHooks(staged)).hooks)) return [];
+    const reviewed =
+      installed !== null && runsCursorCommands((await loadPluginHooks(installed)).hooks);
+    return fileReviewRows(
+      reviewed ? await this.fileReviewRecords(installed.rootPath) : null,
+      await this.fileReviewRecords(staged.rootPath)
+    );
+  }
+
+  /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
    * allow twice the checkout quota (bytes AND file count — loose objects can
    * mirror the checkout's file count). The watchdog aborts git mid-transfer —
@@ -3162,18 +3184,7 @@ export class AgentPluginInstallService {
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
     );
-    if (runsCursorCommands((await loadPluginHooks(stagedPlugin)).hooks)) {
-      // D30: an installed tree without a runnable Cursor command hook never had a file review, so
-      // the staged tree is compared with the empty tree and every file is listed.
-      const reviewed =
-        currentPlugin !== null && runsCursorCommands((await loadPluginHooks(currentPlugin)).hooks);
-      changes.push(
-        ...fileReviewRows(
-          reviewed ? await this.fileReviewRecords(installedPath) : null,
-          await this.fileReviewRecords(stagedPlugin.rootPath)
-        )
-      );
-    }
+    changes.push(...(await this.fileReviewChanges(stagedPlugin, currentPlugin)));
     assertReviewFits(changes);
     return changes;
   }
@@ -3786,9 +3797,7 @@ export class AgentPluginInstallService {
     const hook = this.collectHook(plugin);
     const codexHooks = await loadPluginHooks(plugin);
     warnings.push(...codexHooks.warnings);
-    const fileChanges = runsCursorCommands(codexHooks.hooks)
-      ? fileReviewRows(null, await this.fileReviewRecords(stagedDir))
-      : [];
+    const fileChanges = await this.fileReviewChanges(plugin, null);
     assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
