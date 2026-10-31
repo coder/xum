@@ -132,25 +132,7 @@ export class CodexPluginHookService {
     const loaded = await Promise.all(
       plugins.map(async (plugin) => ({ plugin, ...(await loadPluginHooks(plugin)) }))
     );
-    // Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
-    // catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
-    // per-call gate still refuses a revoked hook, and this refresh runs on every send and turn,
-    // so a newly trusted hook registers on the next one (the fingerprint changes).
-    const projectTrusted = args.isProjectTrusted();
-    const runnable = (
-      await Promise.all(
-        loaded.map(async (entry) => {
-          if (!projectTrusted) return { ...entry, hooks: [] };
-          const trust = await readPluginHookTrust(args.xumHome, instanceIdOf(entry.plugin));
-          return {
-            ...entry,
-            hooks: entry.hooks.filter(
-              (hook) => hook.status === "runnable" && isPluginHookTrusted(trust, hook)
-            ),
-          };
-        })
-      )
-    ).filter((entry) => entry.hooks.length > 0);
+    const runnable = await trustedRunnableHooks(loaded, args);
     // Key and hash: the per-call gate matches both, so a hook that only moved (new key, same
     // hash) must re-register or its stale key is refused forever.
     const fingerprint = JSON.stringify(
@@ -163,16 +145,7 @@ export class CodexPluginHookService {
     if (existing?.fingerprint === fingerprint) return;
     existing?.unregister();
     const unregisters = runnable.map((entry, order) =>
-      entry.plugin.cursorFallback === true
-        ? this.registerCursorHooks(entry.plugin, entry.hooks, order, args)
-        : registerCodexPluginHooks(this.spine, {
-            workspaceId: args.workspaceId,
-            pluginName: entry.plugin.name,
-            pluginInstanceId: instanceIdOf(entry.plugin),
-            order,
-            hooks: entry.hooks,
-            deps: this.depsFor(entry.plugin, args),
-          })
+      this.registerPluginHooks(entry.plugin, entry.hooks, order, args)
     );
     const promptTimeouts: number[] = [];
     for (const hook of runnable.flatMap((entry) => entry.hooks)) {
@@ -253,6 +226,24 @@ export class CodexPluginHookService {
     return plugins.filter((plugin) => plugin.componentPolicy !== undefined);
   }
 
+  /** Each plugin's hooks go to the runner of its format. */
+  private registerPluginHooks(
+    plugin: AgentPluginInfo,
+    hooks: PluginHookDefinition[],
+    order: number,
+    args: EnsureCodexHooksArgs
+  ): () => void {
+    if (plugin.cursorFallback === true) return this.registerCursorHooks(plugin, hooks, order, args);
+    return registerCodexPluginHooks(this.spine, {
+      workspaceId: args.workspaceId,
+      pluginName: plugin.name,
+      pluginInstanceId: instanceIdOf(plugin),
+      order,
+      hooks,
+      deps: this.depsFor(plugin, args),
+    });
+  }
+
   private registerCursorHooks(
     plugin: AgentPluginInfo,
     hooks: PluginHookDefinition[],
@@ -302,6 +293,32 @@ export class CodexPluginHookService {
       notifyUser: (message) => args.notifyUser(plugin.name, message),
     };
   }
+}
+
+/**
+ * Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
+ * catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
+ * per-call gate still refuses a revoked hook, and the refresh runs on every send and turn, so a
+ * newly trusted hook registers on the next one (the fingerprint changes). Plugins left with no
+ * hook are dropped.
+ */
+async function trustedRunnableHooks(
+  loaded: Array<{ plugin: AgentPluginInfo; hooks: PluginHookDefinition[] }>,
+  args: EnsureCodexHooksArgs
+): Promise<Array<{ plugin: AgentPluginInfo; hooks: PluginHookDefinition[] }>> {
+  if (!args.isProjectTrusted()) return [];
+  const entries = await Promise.all(
+    loaded.map(async (entry) => {
+      const trust = await readPluginHookTrust(args.xumHome, instanceIdOf(entry.plugin));
+      return {
+        plugin: entry.plugin,
+        hooks: entry.hooks.filter(
+          (hook) => hook.status === "runnable" && isPluginHookTrusted(trust, hook)
+        ),
+      };
+    })
+  );
+  return entries.filter((entry) => entry.hooks.length > 0);
 }
 
 /**

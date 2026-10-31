@@ -23,6 +23,7 @@ import type {
   EventSpine,
   ToolExecuteContext,
   TurnStopContext,
+  TurnStopContinueReason,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
 import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
@@ -83,9 +84,10 @@ type CallResult =
 interface CallContext {
   /** The workspace root: CURSOR_PROJECT_DIR, `workspace_roots`, and the working folder of stop. */
   workspaceRoot: string;
-  generationId?: string;
-  model?: string;
-  abortSignal?: AbortSignal;
+  /** Absent outside a model turn; JSON.stringify then leaves the field out of the input. */
+  generationId: string | undefined;
+  model: string | undefined;
+  abortSignal: AbortSignal | undefined;
 }
 
 /** Register one plugin's runnable Cursor hooks on the spine. Returns the unregister function. */
@@ -156,8 +158,8 @@ async function runTurnStopHooks(
   const call: CallContext = {
     workspaceRoot: ctx.cwd,
     generationId: ctx.messageId,
-    ...(ctx.model !== undefined ? { model: ctx.model } : {}),
-    ...(ctx.abortSignal !== undefined ? { abortSignal: ctx.abortSignal } : {}),
+    model: ctx.model,
+    abortSignal: ctx.abortSignal,
   };
   for (const hook of afterResponse) {
     // A turn that ends on a tool part has no reply text (#6067): Cursor's field is then empty.
@@ -165,29 +167,31 @@ async function runTurnStopHooks(
   }
   for (const hook of stop) {
     // loop_count: continuations of this user turn from any source (RFC section 6).
-    const result = await runHook(
-      hook,
-      { status: "completed", loop_count: ctx.turnContinuations },
-      call,
-      runner
-    );
-    if (result.kind !== "output") continue;
-    const followup = result.output.followup_message;
-    if (followup === undefined) continue;
-    if (typeof followup !== "string") {
-      reportFailure(hook, "its followup_message is not a string", runner);
-      continue;
-    }
-    if (followup.trim().length === 0) continue;
-    const handler = hook.handler;
-    assert(handler.type === "cursor-command", "only command hooks register");
-    ctx.continueReasons.push({
-      text: followup,
-      pluginName: runner.registration.pluginName,
-      hookKey: `${runner.registration.pluginInstanceId}:${hook.key}`,
-      ...(handler.loopLimit !== undefined ? { loopLimit: handler.loopLimit } : {}),
-    });
+    const fields = { status: "completed", loop_count: ctx.turnContinuations };
+    const reason = continueReasonOf(hook, await runHook(hook, fields, call, runner), runner);
+    if (reason !== undefined) ctx.continueReasons.push(reason);
   }
+}
+
+/** A stop hook's continuation: a non-empty `followup_message` string, under the hook's limit. */
+function continueReasonOf(
+  hook: PluginHookDefinition,
+  result: CallResult,
+  runner: Runner
+): TurnStopContinueReason | undefined {
+  if (result.kind !== "output") return undefined;
+  const followup = result.output.followup_message;
+  if (typeof followup !== "string") {
+    if (followup !== undefined) reportFailure(hook, "its followup_message is not a string", runner);
+    return undefined;
+  }
+  if (followup.trim().length === 0) return undefined;
+  return {
+    text: followup,
+    pluginName: runner.registration.pluginName,
+    hookKey: `${runner.registration.pluginInstanceId}:${hook.key}`,
+    loopLimit: commandOf(hook).loopLimit,
+  };
 }
 
 /** Cursor's `edits` for the two edit tools Xum maps (D25); null for any other call. */
@@ -214,10 +218,9 @@ async function runAfterFileEditHooks(
   if (edit === null) return;
   const call: CallContext = {
     workspaceRoot: ctx.host.cwd,
-    ...(ctx.host.turn !== undefined
-      ? { generationId: ctx.host.turn.turnId, model: ctx.host.turn.model }
-      : {}),
-    ...(ctx.abortSignal !== undefined ? { abortSignal: ctx.abortSignal } : {}),
+    generationId: ctx.host.turn?.turnId,
+    model: ctx.host.turn?.model,
+    abortSignal: ctx.abortSignal,
   };
   for (const hook of hooks) {
     await runHook(hook, { file_path: edit.filePath, edits: edit.edits }, call, runner);
@@ -234,19 +237,25 @@ async function runHook(
   call: CallContext,
   runner: Runner
 ): Promise<CallResult> {
-  const result = await startAndRead(hook, eventFields, call, runner.registration);
+  const result =
+    (await refusedStart(hook, call, runner.registration)) ??
+    (await startAndRead(hook, eventFields, call, runner.registration));
   if (result.kind === "failed") reportFailure(hook, result.reason, runner);
   return result;
 }
 
-async function startAndRead(
-  hook: PluginHookDefinition,
-  eventFields: Record<string, unknown>,
-  call: CallContext,
-  registration: CursorHookRegistration
-): Promise<CallResult> {
+function commandOf(hook: PluginHookDefinition) {
   const handler = hook.handler;
   assert(handler.type === "cursor-command", "only command hooks register");
+  return handler;
+}
+
+/** The start conditions of RFC 5.4 before any input is built: undefined when the call may start. */
+async function refusedStart(
+  hook: PluginHookDefinition,
+  call: CallContext,
+  registration: CursorHookRegistration
+): Promise<CallResult | undefined> {
   const blocked = startBlocker(registration);
   if (blocked !== undefined) {
     log.debug(`Cursor hooks: not starting '${registration.pluginName}' ${hook.event}`, {
@@ -258,15 +267,28 @@ async function startAndRead(
   }
   if (isAborted(call.abortSignal)) return { kind: "aborted" };
   const gate = await registration.deps.checkHook(hook);
+  // A Stop during the trust read: the call must not start after it.
   if (isAborted(call.abortSignal)) return { kind: "aborted" };
-  if (gate === "trust-store-unreadable") {
-    return { kind: "failed", reason: "Xum cannot read its hook trust store" };
-  }
-  if (gate === "refused") return { kind: "skipped" };
+  return GATE_RESULTS[gate];
+}
+
+const GATE_RESULTS: Record<CursorHookGate, CallResult | undefined> = {
+  allowed: undefined,
+  refused: { kind: "skipped" },
+  "trust-store-unreadable": { kind: "failed", reason: "Xum cannot read its hook trust store" },
+};
+
+async function startAndRead(
+  hook: PluginHookDefinition,
+  eventFields: Record<string, unknown>,
+  call: CallContext,
+  registration: CursorHookRegistration
+): Promise<CallResult> {
+  const handler = commandOf(hook);
   const input = JSON.stringify({
     conversation_id: registration.workspaceId,
-    ...(call.generationId !== undefined ? { generation_id: call.generationId } : {}),
-    ...(call.model !== undefined ? { model: call.model } : {}),
+    generation_id: call.generationId,
+    model: call.model,
     hook_event_name: hook.event,
     cursor_version: registration.cursorVersion,
     workspace_roots: [call.workspaceRoot],
@@ -290,7 +312,8 @@ async function startAndRead(
   // Stop wins over everything the process did: an aborted call applies nothing.
   if (isAborted(call.abortSignal) || exit.kind === "aborted") return { kind: "aborted" };
   if (exit.kind === "failed") return exit;
-  return readOutput(exit.exitCode, exit.stdout, handler.command, seconds);
+  const failure = exitFailure(exit.exitCode, handler.command, seconds);
+  return failure !== undefined ? { kind: "failed", reason: failure } : parseOutput(exit.stdout);
 }
 
 /** Why no hook process may start in this process at all, or undefined (D6, D7). */
@@ -377,25 +400,26 @@ async function writeInput(stdin: WritableStream<Uint8Array>, input: string): Pro
   }
 }
 
-/** The failure table of RFC 5.5 for a process that exited. */
-function readOutput(
-  exitCode: number,
-  stdout: string,
-  command: string,
-  seconds: number
-): CallResult {
-  if (exitCode === EXIT_CODE_TIMEOUT)
-    return { kind: "failed", reason: `timed out after ${seconds}s` };
-  if (exitCode === EXIT_CODE_NOT_FOUND) {
-    // The shell gives 127 for a missing command and for a missing command inside it (jq, bun),
-    // and Xum keeps no stderr to tell them apart, so the reason names both.
-    return {
-      kind: "failed",
-      reason: `\`${command}\`: a command or one of its dependencies was not found (exit 127)`,
-    };
+/** Why an exit code is a failure (RFC 5.5), or undefined for exit 0. */
+function exitFailure(exitCode: number, command: string, seconds: number): string | undefined {
+  switch (exitCode) {
+    case 0:
+      return undefined;
+    case EXIT_CODE_TIMEOUT:
+      return `timed out after ${seconds}s`;
+    case EXIT_CODE_NOT_FOUND:
+      // The shell gives 127 for a missing command and for a missing command inside it (jq, bun),
+      // and Xum keeps no stderr to tell them apart, so the reason names both.
+      return `\`${command}\`: a command or one of its dependencies was not found (exit 127)`;
+    case 2:
+      return "exit code 2; this event cannot block";
+    default:
+      return `exit code ${exitCode}`;
   }
-  if (exitCode === 2) return { kind: "failed", reason: "exit code 2; this event cannot block" };
-  if (exitCode !== 0) return { kind: "failed", reason: `exit code ${exitCode}` };
+}
+
+/** The output of a hook that exited 0: empty, or one JSON object that does not ask to deny. */
+function parseOutput(stdout: string): CallResult {
   if (Buffer.byteLength(stdout, "utf8") > HOOK_OUTPUT_MAX_BYTES) {
     return { kind: "failed", reason: `invalid output: over ${HOOK_OUTPUT_MAX_BYTES} bytes` };
   }
@@ -406,8 +430,9 @@ function readOutput(
   } catch {
     return { kind: "failed", reason: "invalid output: not JSON" };
   }
-  if (!isPlainObject(parsed))
+  if (!isPlainObject(parsed)) {
     return { kind: "failed", reason: "invalid output: not a JSON object" };
+  }
   if (parsed.permission === "deny") {
     return { kind: "failed", reason: 'permission "deny"; this event cannot block' };
   }

@@ -329,7 +329,7 @@ describe("start conditions", () => {
     }
   });
 
-  test.each(switches)("%s=1 starts no process", async (name) => {
+  test.each(switches.map((name) => [name]))("%s=1 starts no process", async (name) => {
     process.env[name] = "1";
     const runtime = fakeRuntime({ "./s.sh": followup("again") });
     const h = harness({ hooks: await hooksOf({ stop: [{ command: "./s.sh" }] }), runtime });

@@ -8524,8 +8524,7 @@ export class AgentSession {
     ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
-    // A user Stop ends the turn.stop hooks too: their host processes must not outlive it.
-    if (options?.soft !== true) this.turnStopHooksAbort?.abort();
+    this.abortTurnStopHooksOnHardStop(options);
     const settled = Promise.withResolvers<boolean>();
     const initiallySettled = Promise.withResolvers<Result<void>>();
     let physicallyStopped = false;
@@ -10830,6 +10829,12 @@ export class AgentSession {
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
     });
+  }
+
+  /** A user Stop (a hard interrupt) ends the turn.stop hooks: their processes must not outlive it. */
+  private abortTurnStopHooksOnHardStop(options: { soft?: boolean } | undefined): void {
+    if (options?.soft === true) return;
+    this.turnStopHooksAbort?.abort();
   }
 
   // dry-duplicate-ok: field resets of unrelated state (stream, file tracking) only share a shape

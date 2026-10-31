@@ -122,22 +122,31 @@ function errorCode(error: unknown): unknown {
   return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 }
 
+/** The `hooks` map of a version 1 document, or undefined (with a warning). */
+function hooksMapOf(
+  document: unknown,
+  source: string,
+  warnings: HookWarnings
+): Record<string, unknown> | undefined {
+  if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
+    warnings.push(`${source}: expected { "version": 1, "hooks": { <event>: [...] } }; ignoring it`);
+    return undefined;
+  }
+  if (document.version !== undefined && document.version !== 1) {
+    warnings.push(`${source}: only hooks.json version 1 is supported; ignoring it`);
+    return undefined;
+  }
+  return document.hooks;
+}
+
 /** Up to MAX_PLUGIN_HOOKS + 1 hooks, so the caller can tell that the file holds more. */
 function parseCursorHooksDocument(
   document: unknown,
   source: string,
   warnings: HookWarnings
 ): PluginHookDefinition[] {
-  if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
-    warnings.push(`${source}: expected { "version": 1, "hooks": { <event>: [...] } }; ignoring it`);
-    return [];
-  }
-  if (document.version !== undefined && document.version !== 1) {
-    warnings.push(`${source}: only hooks.json version 1 is supported; ignoring it`);
-    return [];
-  }
   const hooks: PluginHookDefinition[] = [];
-  for (const [event, entries] of Object.entries(document.hooks)) {
+  for (const [event, entries] of Object.entries(hooksMapOf(document, source, warnings) ?? {})) {
     if (!Array.isArray(entries)) {
       warnings.push(`${source}: '${event}' must be an array of hooks; ignoring it`);
       continue;
@@ -151,57 +160,92 @@ function parseCursorHooksDocument(
   return hooks;
 }
 
+interface EntryPlace {
+  source: string;
+  event: string;
+  index: number;
+}
+
+/** One entry as a hook, or undefined with a warning that names it. */
 function parseEntry(
   raw: unknown,
-  where: { source: string; event: string; index: number },
+  where: EntryPlace,
   warnings: HookWarnings
 ): PluginHookDefinition | undefined {
-  const name = `hook ${where.event}[${where.index}]`;
-  const drop = (problem: string) => {
-    warnings.push(`${where.source}: ${name}: ${problem}; ignoring this hook`);
+  const label = `${where.source}: hook ${where.event}[${where.index}]`;
+  const parsed = readEntry(raw, where, label, warnings);
+  if (typeof parsed === "string") {
+    warnings.push(`${label}: ${parsed}; ignoring this hook`);
     return undefined;
-  };
-  if (!isPlainObject(raw)) return drop("an entry must be an object");
-  const type = raw.type ?? "command";
-  if (type !== "command" && type !== "prompt") return drop("type must be command or prompt");
-  if (raw.matcher != null && typeof raw.matcher !== "string") {
-    return drop("matcher must be a string");
   }
-  const matcher = typeof raw.matcher === "string" ? raw.matcher : undefined;
+  return withStatus(parsed);
+}
+
+/** The hook of one entry, or why Xum drops it. */
+function readEntry(
+  raw: unknown,
+  where: EntryPlace,
+  label: string,
+  warnings: HookWarnings
+): Omit<PluginHookDefinition, "status"> | string {
+  const shape = readEntryShape(raw);
+  if (typeof shape === "string") return shape;
+  const { type, matcher, raw: entry } = shape;
   let hash: string;
   let declared: string;
   try {
-    hash = hashHookDefinition(where.event, matcher, raw);
-    declared = canonicalJson(raw);
+    hash = hashHookDefinition(where.event, matcher, entry);
+    declared = canonicalJson(entry);
   } catch (error) {
-    return drop(getErrorMessage(error));
+    return getErrorMessage(error);
   }
-  const base = {
+  const handler =
+    type === "prompt"
+      ? ({ type: "cursor-prompt", declared } as const)
+      : commandHandler(entry, declared, label, warnings);
+  if (typeof handler === "string") return handler;
+  return {
     key: `cursor:${where.source}#${where.event}[${where.index}]`,
     hash,
     event: where.event,
     ...(matcher !== undefined ? { matcher } : {}),
+    handler,
     source: where.source,
   };
-  if (type === "prompt") {
-    return withStatus({ ...base, handler: { type: "cursor-prompt", declared } });
-  }
+}
+
+/** The fields that decide what an entry is, or why Xum drops it. */
+function readEntryShape(
+  raw: unknown
+): { raw: Record<string, unknown>; type: "command" | "prompt"; matcher?: string } | string {
+  if (!isPlainObject(raw)) return "an entry must be an object";
+  const type = raw.type ?? "command";
+  if (type !== "command" && type !== "prompt") return "type must be command or prompt";
+  if (raw.matcher == null) return { raw, type };
+  if (typeof raw.matcher !== "string") return "matcher must be a string";
+  return { raw, type, matcher: raw.matcher };
+}
+
+/** A `command` entry's handler, or why Xum drops it. */
+function commandHandler(
+  raw: Record<string, unknown>,
+  declared: string,
+  label: string,
+  warnings: HookWarnings
+): Extract<PluginHookDefinition["handler"], { type: "cursor-command" }> | string {
   if (typeof raw.command !== "string" || raw.command.trim().length === 0) {
-    return drop("an entry needs a command string");
+    return "an entry needs a command string";
   }
   const loopLimit = readLoopLimit(raw);
-  if (loopLimit === "invalid") return drop("loop_limit must be a whole number or null");
-  return withStatus({
-    ...base,
-    handler: {
-      type: "cursor-command",
-      command: raw.command,
-      ...readTimeout(raw, `${where.source}: ${name}`, warnings),
-      ...(loopLimit !== undefined ? { loopLimit } : {}),
-      ...readFailClosed(raw, `${where.source}: ${name}`, warnings),
-      declared,
-    },
-  });
+  if (loopLimit === "invalid") return "loop_limit must be a whole number or null";
+  return {
+    type: "cursor-command",
+    command: raw.command,
+    ...readTimeout(raw, label, warnings),
+    ...(loopLimit !== undefined ? { loopLimit } : {}),
+    ...readFailClosed(raw, label, warnings),
+    declared,
+  };
 }
 
 function withStatus(hook: Omit<PluginHookDefinition, "status">): PluginHookDefinition {
