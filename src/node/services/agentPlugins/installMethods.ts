@@ -293,9 +293,9 @@ export interface DetectedInstallMethods {
 
 /**
  * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude or a
- * Cursor manifest. It uses discovery's own reader, which follows a symlink inside the tree and refuses
- * one that leaves it, so the method always names the manifest discovery loads. A refused or
- * unreadable file stays the own manifest: discovery then reports its error.
+ * Cursor manifest. It uses discovery's own reader, which follows a symlink inside the tree and
+ * refuses one that leaves it, so the method always names the manifest discovery loads. A refused
+ * or unreadable file stays the own manifest: discovery then reports its error.
  */
 async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
   return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
