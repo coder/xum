@@ -876,8 +876,8 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
 }
 
 /**
- * Claude's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no `skills`
- * key loads as one skill (the caller passes "." as the declared skills path).
+ * Claude's and Cursor's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no
+ * `skills` key loads as one skill (the caller passes "." as the declared skills path).
  */
 async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
   if (
@@ -1198,6 +1198,27 @@ async function resolvePluginMcpConfig(args: {
   return args.declared === undefined && !rootMcpJson
     ? { mcpConfigPath, mcpConfigDialect: "codex" }
     : { mcpConfigPath };
+}
+
+/**
+ * Cursor reads `.mdc` and `.markdown` agents too, but every plugin agent scan site reads `.md`
+ * files only (pluginAgentIdOf), so a Cursor package lists the others instead of dropping them
+ * without a word.
+ */
+async function cursorAgentFilesNotApplied(
+  cursor: CursorManifestResult | undefined,
+  agentsDir: string | undefined
+): Promise<AgentPluginNotApplied[]> {
+  if (cursor === undefined || agentsDir === undefined) return [];
+  const entries = await pluginFs()
+    .readdir(agentsDir)
+    .catch(() => []);
+  return entries
+    .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .filter((name) => /\.(mdc|markdown)$/i.test(name))
+    .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map((name) => ({ part: "agent", name, reason: "only .md agent files are applied in Xum" }));
 }
 
 /** The MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3). */
@@ -1562,7 +1583,9 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      (claudePackage && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
+      ((claudePackage || cursorFallback) && (await isClaudeRootSkill(rootReal))
+        ? ["."]
+        : undefined),
     rootReal,
     pluginName: manifest.name,
     resolveComponent,
@@ -1623,7 +1646,10 @@ async function discoverPluginAt(args: {
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(cursorFallback ? { cursorFallback: true } : {}),
-    notApplied: cursorParts.notApplied,
+    notApplied: [
+      ...cursorParts.notApplied,
+      ...(await cursorAgentFilesNotApplied(cursor, agentsDir)),
+    ],
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,

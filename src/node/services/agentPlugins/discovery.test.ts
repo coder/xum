@@ -2474,6 +2474,40 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("a root SKILL.md is one skill only without skills/ and a skills field", async () => {
+    using rootSkill = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+    });
+    expect(rootSkill.plugin.skillsDirs).toEqual([
+      { dir: rootSkill.plugin.rootPath, single: true, name: "kit" },
+    ]);
+    using withFolder = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      "skills/alpha/SKILL.md": skill("alpha"),
+    });
+    expect(withFolder.plugin.skillsDirs?.map((root) => withFolder.relative(root.dir))).toEqual([
+      "skills",
+    ]);
+  });
+
+  test("agents in .mdc and .markdown files are listed; .md agents load", async () => {
+    const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nBody\n`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "agents/ok.md": agent("ok"),
+      "agents/rules.mdc": agent("rules"),
+      "agents/long.markdown": agent("long"),
+    });
+    const { plugin, relative } = kit;
+    expect(plugin.agentsDir === undefined ? undefined : relative(plugin.agentsDir)).toBe("agents");
+    expect(plugin.notApplied).toEqual([
+      { part: "agent", name: "long.markdown", reason: "only .md agent files are applied in Xum" },
+      { part: "agent", name: "rules.mdc", reason: "only .md agent files are applied in Xum" },
+    ]);
+  });
+
   test("other package kinds list nothing as not applied", async () => {
     using kit = await discoverKit({
       ".claude-plugin/plugin.json": JSON.stringify({ name: "kit", category: "tools" }),
