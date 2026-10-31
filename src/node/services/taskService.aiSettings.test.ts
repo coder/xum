@@ -2766,7 +2766,7 @@ describe("TaskService agent reads over an unreachable runtime (#4829, #4831)", (
   });
 
   async function createTaskWhile(
-    failingRead: "loadAgentDefinitionAiLayers" | "resolveAgentFrontmatter"
+    failingRead: "loadAgentDefinitionAiLayers" | "resolveAgentDefinition"
   ): Promise<{ created: Awaited<ReturnType<typeof createAgentTask>>; sendCalls: number }> {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
@@ -2797,7 +2797,7 @@ describe("TaskService agent reads over an unreachable runtime (#4829, #4831)", (
   });
 
   test("reports an unreachable runtime instead of an unknown agentId", async () => {
-    const { created, sendCalls } = await createTaskWhile("resolveAgentFrontmatter");
+    const { created, sendCalls } = await createTaskWhile("resolveAgentDefinition");
     expect(created.success).toBe(false);
     if (!created.success) {
       expect(created.error).toStartWith(

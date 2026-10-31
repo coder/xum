@@ -1,6 +1,8 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
-// Characterization tests for paths of TaskService.create (createUnderTaskTreeLifecycleLock) that
-// the other suites do not reach: they pin today's behavior before that method is split into steps.
+// Tests for paths of TaskService.create that the other suites do not reach: what it refuses
+// before anything is written, and how the launch it schedules ends. create() returns once the
+// task's row is reserved, so each launch outcome is read after the launch settles (the
+// createAgentTask helper waits for it).
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert";
 import { existsSync } from "node:fs";
@@ -9,12 +11,9 @@ import * as path from "node:path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { Ok, Err } from "@/common/types/result";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import * as resolveNodeAgentAiSettingsModule from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
-import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -37,7 +36,6 @@ interface Internals {
     attemptSettlementByTaskId: Map<string, { phase: "closing" | "settled"; source: string }>;
   };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
-  rollbackFailedTaskCreate: (...args: unknown[]) => Promise<{ checkoutRemoved: boolean }>;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -50,7 +48,7 @@ function workspaceIds(config: Config): string[] {
   );
 }
 
-describe("TaskService.create paths before the split", () => {
+describe("TaskService.create paths", () => {
   let rootDir: string;
   let config: Config;
   // The background inits that launches started. The host mocks' registerExternalBackgroundInit
@@ -253,11 +251,12 @@ describe("TaskService.create paths before the split", () => {
     expect(next.success).toBe(true);
   });
 
-  test("a queued task needs the parent's branch", async () => {
-    // A parent whose metadata names no workspace: on a local runtime its branch is unknown.
+  test("a task whose parent names no workspace is refused before anything is written", async () => {
+    // A parent whose metadata names no workspace: on a local runtime its branch is unknown, so
+    // the row would have no trunk branch.
     const { parentId, taskService } = await setupRowlessParent({ queue: true, parentName: "" });
     const created = await createAgentTask(taskService, parentId, "go");
-    expect(created).toEqual(Err("Task.create: parent workspace name missing (cannot queue task)"));
+    expect(created).toEqual(Err("Task.create: parent workspace name missing"));
     expect(workspaceIds(config)).toEqual(["sibling111"]);
   });
 
@@ -285,43 +284,11 @@ describe("TaskService.create paths before the split", () => {
     expect(emit).not.toHaveBeenCalledWith(TASK_ID);
   });
 
-  test("a failed fork returns its error and persists nothing", async () => {
-    const { parentId, host, taskService } = await setup();
-    spyOn(forkOrchestrator, "orchestrateFork").mockResolvedValue(Err("no space left"));
-    const rollback = spyOn(internals(taskService), "rollbackFailedTaskCreate");
-    const created = await createAgentTask(taskService, parentId, "go");
-    expect(created).toEqual(Err("Task fork failed: no space left"));
-    expect(workspaceIds(config)).toEqual([parentId]);
-    expect(rollback).not.toHaveBeenCalled();
-    expect(host.sendMessage).not.toHaveBeenCalled();
-  });
-
-  test("a fork that updates a parent row the persist cannot find rolls the checkout back", async () => {
-    const { parentId, projectPath, host, taskService } = await setupRowlessParent();
-    spyOn(forkOrchestrator, "orchestrateFork").mockResolvedValue(
-      Ok({
-        workspacePath: projectPath,
-        trunkBranch: "main",
-        forkedRuntimeConfig: { type: "local" },
-        targetRuntime: createRuntime({ type: "local" }, { projectPath }),
-        forkedFromSource: true,
-        sourceRuntimeConfigUpdate: { type: "local" },
-        sourceRuntimeConfigUpdated: true,
-      })
-    );
-    const rollback = spyOn(internals(taskService), "rollbackFailedTaskCreate");
-    const created = await createAgentTask(taskService, parentId, "go");
-    expect(created).toEqual(Err(`Workspace ${parentId} not found in config`));
-    expect(rollback).toHaveBeenCalledTimes(1);
-    expect(workspaceIds(config)).toEqual([]);
-    expect(host.sendMessage).not.toHaveBeenCalled();
-  });
-
   test("a launched task whose project row was removed meanwhile recreates it", async () => {
     const { parentId, projectPath, host, taskService } = await setupRowlessParent();
     removeProjectBeforeNextWrite(projectPath);
     const created = await createAgentTask(taskService, parentId, "go");
-    expect(created.success && created.data.status).toBe("running");
+    expect(created.success && created.data.status).toBe("starting");
     expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([
       expect.objectContaining({ id: TASK_ID, taskStatus: "running", parentWorkspaceId: parentId }),
     ]);
@@ -342,13 +309,14 @@ describe("TaskService.create paths before the split", () => {
       args[0] === TASK_ID && sendFailed ? Promise.reject(new Error("config locked")) : edit(...args)
     );
     const created = await createAgentTask(taskService, "1111111111", "go");
-    expect(created).toEqual(Err("provider unavailable"));
-    // Fail closed: no durable marker, no stop, and no settlement against a row of unknown state.
-    expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({ taskStatus: "running" });
+    expect(created.success).toBe(true);
+    // Fail closed: no durable marker and no settlement against a row of unknown state. The row
+    // keeps its reservation until startup recovery requeues it.
+    expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({ taskStatus: "starting" });
     expect(findWorkspaceInConfig(config, TASK_ID)?.taskLaunchError).toBeUndefined();
     expect(
-      internals(taskService).attemptLedger.attemptSettlementByTaskId.get(TASK_ID)
-    ).toMatchObject({ phase: "closing", source: "launch-failed" });
+      internals(taskService).attemptLedger.attemptSettlementByTaskId.get(TASK_ID)?.phase
+    ).not.toBe("settled");
   });
 
   test("a row that stopped being an agent task before the launch send fails the launch unsent", async () => {
@@ -362,45 +330,13 @@ describe("TaskService.create paths before the split", () => {
       return emit(id);
     });
     const created = await createAgentTask(taskService, parentId, "go");
-    expect(created.success).toBe(false);
-    if (created.success) return;
+    expect(created.success).toBe(true);
     expect(host.sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({
       taskStatus: "interrupted",
-      taskLaunchError: created.error,
+      taskLaunchError: "Task launch refused: the task record is no longer an agent task",
     });
     expect(svc.attemptLedger.attemptSettlementByTaskId.get(TASK_ID)?.phase).toBe("settled");
-  });
-
-  test("a superseded launch failure settles its attempt when its admitted send's turn is no longer live", async () => {
-    let racingToken: TurnAdmissionToken | undefined;
-    const host = createWorkspaceServiceMocks({
-      sendMessage: mock(async (workspaceId: string) => {
-        // A user send admitted under this launch's attempt, whose turn already ended...
-        const admission = taskService.admitTaskWorkspaceTurn(workspaceId, {
-          acceptanceOrigin: "manual",
-        });
-        assert(admission.kind === "admitted", "the racing send must be admitted");
-        racingToken = admission.token;
-        racingToken.onAdmitted(Symbol("ended-turn"));
-        // ...and another writer re-admitted the row under its own attempt.
-        await editRow(workspaceId, (row) => (row.taskAttemptId = "att_00000000000000b2"));
-        return Err("provider unavailable");
-      }),
-      getActiveTurnGeneration: mock(() => undefined),
-    });
-    const { taskService } = await setup({ workspaceService: host });
-    const created = await createAgentTask(taskService, "1111111111", "go");
-    expect(created).toEqual(Err("provider unavailable"));
-    expect(racingToken).toBeDefined();
-    // The other writer's row is untouched, and nothing runs under this attempt: settled.
-    expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({
-      taskStatus: "running",
-      taskAttemptId: "att_00000000000000b2",
-    });
-    expect(
-      internals(taskService).attemptLedger.attemptSettlementByTaskId.get(TASK_ID)
-    ).toMatchObject({ phase: "settled", source: "launch-failed" });
   });
 
   // The built-in explore agent's definition sets subagent.skip_init_hook: true; exec's does not.
@@ -423,7 +359,7 @@ describe("TaskService.create paths before the split", () => {
         await fs.writeFile(hookPath, `#!/usr/bin/env bash\necho ran > ${JSON.stringify(marker)}\n`);
         await fs.chmod(hookPath, 0o755);
         const created = await createAgentTask(taskService, parentId, "go", { agentType });
-        expect(created.success && created.data.status).toBe("running");
+        expect(created.success && created.data.status).toBe("starting");
         expect(backgroundInits).toHaveLength(1);
         await settleBackgroundInits();
         expect(existsSync(marker)).toBe(runsHook);

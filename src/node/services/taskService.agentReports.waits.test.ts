@@ -1152,7 +1152,8 @@ describe("TaskService", () => {
 
     const created = await createAgentTask(taskService, parentId, "do the thing");
 
-    expect(created.success).toBe(false);
+    // create() returned at the reservation; the send failed in the launch after it.
+    expect(created.success).toBe(true);
 
     // The entry was persisted and announced before the send: the workspace is published, so a
     // launch failure ends it as an interrupted workspace with its launch error (removable like
@@ -1168,7 +1169,7 @@ describe("TaskService", () => {
     await fsPromises.access(workspacePath);
   }, 20_000);
 
-  test("rolls back a forked checkout when persistence throws after the fork", async () => {
+  test("a reservation whose config commit throws leaves no row, no checkout and a free desktop", async () => {
     const config = await createTestConfig(rootDir);
     const childTaskId = "cccccccccc";
     stubStableIds(config, [childTaskId, "dddddddddd"], childTaskId);
@@ -1200,12 +1201,11 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const { workspaceService, sendMessage, discardExtensionMetadataEntry } =
-      createWorkspaceServiceMocks();
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    // Deterministic post-fork failure: the transform that registers the child entry throws, so
-    // the checkout already exists on disk while nothing was persisted.
+    // The transform that registers the child entry throws: the reservation commit, which runs
+    // before any fork.
     const editConfig = config.editConfig.bind(config);
     const persistSpy = spyOn(config, "editConfig").mockImplementation((transform) =>
       editConfig((cfg) => {
@@ -1226,7 +1226,6 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
-    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith(childTaskId);
     const forkedPath = runtime.getWorkspacePath(projectPath, `agent_explore_${childTaskId}`);
     expect(existsSync(forkedPath)).toBe(false);
 
