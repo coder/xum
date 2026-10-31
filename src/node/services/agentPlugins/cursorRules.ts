@@ -6,9 +6,9 @@
  */
 import YAML from "yaml";
 
+import { MAX_SKILL_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentSkill";
 import {
   AgentSkillParseError,
-  MAX_SKILL_DESCRIPTION_LENGTH,
   rewrittenSkillMarkdown,
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import {

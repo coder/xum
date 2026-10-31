@@ -11,8 +11,8 @@
  */
 import YAML from "yaml";
 
+import { MAX_SKILL_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentSkill";
 import {
-  MAX_SKILL_DESCRIPTION_LENGTH,
   quoteBracketedArgumentHint,
   rewrittenSkillMarkdown,
 } from "@/node/services/agentSkills/parseSkillMarkdown";

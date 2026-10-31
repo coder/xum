@@ -64,6 +64,20 @@ const HANDLED_CURSOR_KEYS = new Set<string>([
 
 const GLOB_CHARACTERS = /[*?[]/;
 
+/**
+ * A known field of the wrong type is dropped, so its default applies. It is listed as well as
+ * warned about: a warning shows only in the preview, and the plugin detail must still show it.
+ */
+function invalidField(
+  field: string,
+  type: string,
+  warnings: string[],
+  notApplied: AgentPluginNotApplied[]
+): void {
+  warnings.push(`'${field}' must be ${type}; ignoring it`);
+  notApplied.push({ part: "field", name: field, reason: `must be ${type}` });
+}
+
 function folderPathRefusal(entry: string): string | undefined {
   const normalized = claudeComponentPath(entry);
   if (normalized === undefined) return "path is outside the plugin folder";
@@ -82,7 +96,7 @@ function readFolderPaths(
   if (value === undefined) return undefined;
   const entries = Array.isArray(value) ? value : [value];
   if (!entries.every((entry): entry is string => typeof entry === "string")) {
-    warnings.push(`'${field}' must be a path or a list of paths; ignoring it`);
+    invalidField(field, "a path or a list of paths", warnings, notApplied);
     return undefined;
   }
   if (entries.length > MAX_SKILLS_ROOTS) {
@@ -159,7 +173,7 @@ function mcpFile(
     });
     return { mcp: INERT_COMPONENT_PATH };
   }
-  warnings.push("'mcpServers' must be a path, an object or a list; ignoring it");
+  invalidField("mcpServers", "a path, an object or a list", warnings, notApplied);
   return {};
 }
 
@@ -186,7 +200,7 @@ function readHooks(
     notApplied.push({ part: "hook", name: "hooks", reason: CURSOR_HOOKS_REASON });
     return { hooks: value };
   }
-  if (value !== undefined) warnings.push("'hooks' must be a path or an object; ignoring it");
+  if (value !== undefined) invalidField("hooks", "a path or an object", warnings, notApplied);
   return { hooks: "hooks/hooks.json" };
 }
 

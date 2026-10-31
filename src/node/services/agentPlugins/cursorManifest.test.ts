@@ -144,11 +144,25 @@ describe("normalizeCursorManifest skills", () => {
   });
 
   test("a value of the wrong type warns, is dropped, and the default applies", () => {
-    const { loaded, warnings, notApplied } = load({ skills: 3 });
+    const { loaded, warnings } = load({ skills: 3 });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/^'skills' must be .+; ignoring it$/);
     expect(loaded.contributes?.skills).toBeUndefined();
-    expect(notApplied).toEqual([]);
+  });
+});
+
+describe("normalizeCursorManifest fields of the wrong type", () => {
+  test.each<[string, unknown]>([
+    ["skills", 3],
+    ["agents", { dir: "x" }],
+    ["rules", [true]],
+    ["mcpServers", 7],
+    ["hooks", ["hooks.json"]],
+  ])("a wrong-typed %s is listed as a not-applied field", (field, value) => {
+    const { notApplied } = load({ [field]: value });
+    expect(notApplied).toEqual([
+      { part: "field", name: field, reason: expect.stringMatching(/^must be /) },
+    ]);
   });
 });
 

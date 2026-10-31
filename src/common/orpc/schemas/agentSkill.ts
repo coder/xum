@@ -54,9 +54,12 @@ function metadataValueProblem(value: unknown, ancestors = new Set<object>()): st
   return problem;
 }
 
+/** The longest skill description; Xum cuts the descriptions it derives (commands, rules) to it. */
+export const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
-  description: z.string().min(1).max(1024),
+  description: z.string().min(1).max(MAX_SKILL_DESCRIPTION_LENGTH),
   license: z.string().optional(),
   compatibility: z.string().min(1).max(500).optional(),
   // agentskills.io says string values, but skills-ref (the spec's own validator)

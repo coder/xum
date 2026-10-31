@@ -115,8 +115,6 @@ export function quoteBracketedArgumentHint(yaml: string): string {
   });
 }
 
-export const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
-
 /**
  * SKILL.md text written from a frontmatter object and a body, for plugin files that Xum reads as
  * skills (Claude commands, Cursor rules). YAML aliases can repeat one large value many times, so

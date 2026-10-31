@@ -475,7 +475,8 @@ export type PluginSkillsRoot =
    * `rule`: a Cursor rule instead, the file `<dir>/<rule>` (cursorRules.ts), for example
    * `prefer-const.mdc`. Rule roots follow the same rules as command roots.
    */
-  | { dir: string; single: true; name: string; command?: true; rule?: string };
+  | { dir: string; single: true; name: string; command?: true; rule?: undefined }
+  | { dir: string; single: true; name: string; command?: undefined; rule: string };
 
 /**
  * The skill name of a plugin skill folder. Claude Code and Codex name a skill by its SKILL.md
