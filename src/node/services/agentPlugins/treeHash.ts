@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import assert from "@/common/utils/assert";
 import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
 
 /**
@@ -25,9 +24,17 @@ interface PluginTreeWalkOptions {
    * the file, so a review shows exactly the hashed bytes and never opens the file a second time.
    */
   keepBytesUpTo?: number;
+  /**
+   * The most bytes all kept files may hold together; past it the walk throws KeptBytesLimitError.
+   * A review that large fails its size cap anyway, so the walk stops before it holds the quota.
+   */
+  maxKeptBytes?: number;
   /** Skip the top-level `.git` entry: a staged clone keeps it until promotion. */
   skipRootGit?: boolean;
 }
+
+/** The kept bytes of a walk passed `maxKeptBytes`. */
+export class KeptBytesLimitError extends Error {}
 
 const treeChanged = () =>
   new Error(
@@ -44,14 +51,14 @@ function sameStat(
 
 /**
  * Hashes one regular file of the walk through an O_NOFOLLOW handle whose identity matches the
- * walk's lstat, and fails when the file changes while it is read.
+ * walk's lstat, and fails when the file changes while it is read. `keep` receives every chunk.
  */
 async function hashWalkedFile(
   rootReal: string,
   file: string,
   stat: Stats,
-  keepBytesUpTo: number | undefined
-): Promise<{ hash: string; bytes?: Buffer }> {
+  keep: ((chunk: Buffer) => void) | undefined
+): Promise<string> {
   const handle = await fs.open(
     file,
     fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
@@ -61,36 +68,98 @@ async function hashWalkedFile(
     if (!opened.isFile() || !sameStat(opened, stat, ["dev", "ino", "size"])) throw treeChanged();
     await ensurePathContained(rootReal, file);
     const hash = createHash("sha256");
-    const kept: Buffer[] | undefined =
-      keepBytesUpTo !== undefined && stat.size <= keepBytesUpTo ? [] : undefined;
     const buffer = Buffer.alloc(Math.min(64 * 1024, stat.size));
-    let offset = 0;
-    while (offset < stat.size) {
-      const { bytesRead } = await handle.read(
-        buffer,
-        0,
-        Math.min(buffer.length, stat.size - offset),
-        offset
-      );
+    for (let offset = 0; offset < stat.size; ) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
       if (bytesRead === 0) throw treeChanged();
-      hash.update(buffer.subarray(0, bytesRead));
-      kept?.push(Buffer.from(buffer.subarray(0, bytesRead)));
-      offset += bytesRead;
+      const chunk = buffer.subarray(0, Math.min(bytesRead, stat.size - offset));
+      hash.update(chunk);
+      keep?.(Buffer.from(chunk));
+      offset += chunk.length;
     }
     if (!sameStat(await handle.stat(), stat, ["size", "mtimeMs", "ctimeMs"])) throw treeChanged();
-    return {
-      hash: hash.digest("hex"),
-      ...(kept !== undefined ? { bytes: Buffer.concat(kept) } : {}),
-    };
+    return hash.digest("hex");
   } finally {
     await handle.close();
   }
 }
 
 /**
- * Walks the tree without following any symlink: a link contributes its link text. The records
- * include the root folder itself (path "").
+ * One walk of a plugin tree, without following any symlink: a link contributes its link text.
+ * The records include the root folder itself (path "").
  */
+class PluginTreeWalk {
+  readonly records: PluginTreeRecord[] = [];
+  private entries = 0;
+  private bytes = 0;
+  private keptBytes = 0;
+
+  constructor(
+    readonly rootReal: string,
+    private readonly quota: PluginTreeQuota,
+    private readonly options: PluginTreeWalkOptions
+  ) {}
+
+  async run(): Promise<void> {
+    const skipped =
+      this.options.skipRootGit === true ? path.join(this.rootReal, ".git") : undefined;
+    const pending = [this.rootReal];
+    for (let current = pending.pop(); current !== undefined; current = pending.pop()) {
+      pending.push(...(await this.visit(current, skipped)));
+    }
+  }
+
+  /** Records one entry and returns the children still to visit. */
+  private async visit(current: string, skipped: string | undefined): Promise<string[]> {
+    const stat = await fs.lstat(current);
+    const relative = path.relative(this.rootReal, current).split(path.sep).join("/");
+    if (stat.isSymbolicLink()) {
+      const target = await fs.readlink(current);
+      this.records.push({ kind: "symlink", path: relative, mode: stat.mode, target });
+      return [];
+    }
+    await ensurePathContained(this.rootReal, current);
+    if (stat.isDirectory()) {
+      this.records.push({ kind: "directory", path: relative, mode: stat.mode });
+      return this.children(current, skipped);
+    }
+    if (!stat.isFile())
+      throw new Error(`Installed plugin contains an unsupported file: ${relative}`);
+    await this.visitFile(current, relative, stat);
+    return [];
+  }
+
+  private async children(current: string, skipped: string | undefined): Promise<string[]> {
+    const children: string[] = [];
+    for await (const entry of await fs.opendir(current)) {
+      const child = path.join(current, entry.name);
+      if (child === skipped) continue;
+      if (++this.entries > this.quota.maxFiles)
+        throw new Error("Installed plugin exceeds the component review file limit.");
+      children.push(child);
+    }
+    return children;
+  }
+
+  private async visitFile(current: string, relative: string, stat: Stats): Promise<void> {
+    this.bytes += stat.size;
+    if (this.bytes > this.quota.maxBytes)
+      throw new Error("Installed plugin exceeds the component review size limit.");
+    const kept = this.keeps(stat.size) ? ([] as Buffer[]) : undefined;
+    const hash = await hashWalkedFile(this.rootReal, current, stat, kept && ((c) => kept.push(c)));
+    const file = { kind: "file", path: relative, mode: stat.mode, hash } as const;
+    this.records.push(kept !== undefined ? { ...file, bytes: Buffer.concat(kept) } : file);
+  }
+
+  /** Whether the walk keeps a file of this size, counting it against `maxKeptBytes`. */
+  private keeps(size: number): boolean {
+    if (this.options.keepBytesUpTo === undefined || size > this.options.keepBytesUpTo) return false;
+    this.keptBytes += size;
+    if (this.keptBytes > (this.options.maxKeptBytes ?? Infinity)) throw new KeptBytesLimitError();
+    return true;
+  }
+}
+
 async function walkPluginTree(
   root: string,
   quota: PluginTreeQuota,
@@ -98,47 +167,10 @@ async function walkPluginTree(
 ): Promise<{ rootReal: string; records: PluginTreeRecord[] }> {
   const rootReal = await fs.realpath(root);
   if (!(await fs.lstat(rootReal)).isDirectory()) throw treeChanged();
-  const skipped = options.skipRootGit === true ? path.join(rootReal, ".git") : undefined;
-  const pending = [rootReal];
-  const records: PluginTreeRecord[] = [];
-  let entries = 0;
-  let bytes = 0;
-  while (pending.length > 0) {
-    const current = pending.pop();
-    assert(current !== undefined, "walkPluginTree: queue underflow");
-    const stat = await fs.lstat(current);
-    const relative = path.relative(rootReal, current).split(path.sep).join("/");
-    if (stat.isSymbolicLink()) {
-      records.push({
-        kind: "symlink",
-        path: relative,
-        mode: stat.mode,
-        target: await fs.readlink(current),
-      });
-      continue;
-    }
-    await ensurePathContained(rootReal, current);
-    if (stat.isDirectory()) {
-      for await (const entry of await fs.opendir(current)) {
-        const child = path.join(current, entry.name);
-        if (child === skipped) continue;
-        if (++entries > quota.maxFiles)
-          throw new Error("Installed plugin exceeds the component review file limit.");
-        pending.push(child);
-      }
-      records.push({ kind: "directory", path: relative, mode: stat.mode });
-    } else if (stat.isFile()) {
-      bytes += stat.size;
-      if (bytes > quota.maxBytes)
-        throw new Error("Installed plugin exceeds the component review size limit.");
-      const hashed = await hashWalkedFile(rootReal, current, stat, options.keepBytesUpTo);
-      records.push({ kind: "file", path: relative, mode: stat.mode, ...hashed });
-    } else {
-      throw new Error(`Installed plugin contains an unsupported file: ${relative}`);
-    }
-  }
+  const walk = new PluginTreeWalk(rootReal, quota, options);
+  await walk.run();
   if ((await fs.realpath(root)) !== rootReal) throw treeChanged();
-  return { rootReal, records };
+  return { rootReal, records: walk.records };
 }
 
 /** What a record compares besides its kind and mode: the content hash, the link text, or "". */

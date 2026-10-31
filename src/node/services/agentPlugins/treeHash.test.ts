@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hashPluginTree, listPluginTreeRecords, type PluginTreeRecord } from "./treeHash";
+import {
+  KeptBytesLimitError,
+  hashPluginTree,
+  listPluginTreeRecords,
+  type PluginTreeRecord,
+} from "./treeHash";
 
 const quota = { maxBytes: 10 * 1024 * 1024, maxFiles: 1_000 };
 const options = { keepBytesUpTo: 64 * 1024, skipRootGit: true };
@@ -99,6 +104,16 @@ describe("plugin tree records", () => {
     expect(bytesOf("hooks/lib.sh")?.toString("utf8")).toBe("echo lib\n");
     const withoutBytes = await listPluginTreeRecords(first, quota, { skipRootGit: true });
     expect(withoutBytes.some((record) => record.kind === "file" && "bytes" in record)).toBe(false);
+  });
+
+  test("kept bytes past maxKeptBytes end the walk instead of filling memory", async () => {
+    // The fixture keeps 56 bytes: stop.sh 26, lib.sh 9 and SKILL.md 21.
+    await expect(
+      listPluginTreeRecords(first, quota, { ...options, maxKeptBytes: 55 })
+    ).rejects.toBeInstanceOf(KeptBytesLimitError);
+    expect(await listPluginTreeRecords(first, quota, { ...options, maxKeptBytes: 56 })).toEqual(
+      await listPluginTreeRecords(first, quota, options)
+    );
   });
 
   test("skipRootGit drops only the top-level .git entry", async () => {

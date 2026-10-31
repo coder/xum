@@ -157,6 +157,7 @@ import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registr
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import {
   hashPluginTree,
+  KeptBytesLimitError,
   listPluginTreeRecords,
   pluginTreeRecordContent,
   type PluginTreeRecord,
@@ -571,11 +572,13 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
     0
   );
-  if (size > MAX_REVIEW_TEXT_CHARS) {
-    throw new Error(
-      "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
-    );
-  }
+  if (size > MAX_REVIEW_TEXT_CHARS) throw reviewTooLargeError();
+}
+
+function reviewTooLargeError(): Error {
+  return new Error(
+    "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
+  );
 }
 
 /** A file larger than this shows only its row in the file review, like a binary file. */
@@ -2311,11 +2314,20 @@ export class AgentPluginInstallService {
   }
 
   /** The records a file review compares, with the bytes that their hash read. */
-  private fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
-    return listPluginTreeRecords(dir, this.stagingQuota(), {
-      keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
-      skipRootGit: true,
-    });
+  private async fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
+    try {
+      return await listPluginTreeRecords(dir, this.stagingQuota(), {
+        keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
+        // A UTF-16 unit takes at least one byte and at most three in UTF-8 (a 4-byte character is
+        // two units), so more kept bytes than this always render past the review's size cap.
+        // The walk then stops before it holds the whole staged-tree quota in memory.
+        maxKeptBytes: 3 * MAX_REVIEW_TEXT_CHARS,
+        skipRootGit: true,
+      });
+    } catch (error) {
+      if (error instanceof KeptBytesLimitError) throw reviewTooLargeError();
+      throw error;
+    }
   }
 
   /**
