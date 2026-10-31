@@ -43,6 +43,21 @@ describe("BackupService against a real repository", () => {
     });
   }
 
+  /** A service whose safety snapshot runs `afterSnapshot` once it is written. */
+  function createServiceRacingSnapshot(afterSnapshot: () => Promise<void>): BackupService {
+    const payload = createBackupPayloadStore({ config });
+    return new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payload,
+        async writeSafetySnapshot(snapshotRoot, contents) {
+          await payload.writeSafetySnapshot(snapshotRoot, contents);
+          await afterSnapshot();
+        },
+      },
+    });
+  }
+
   async function pushOrThrow(target: BackupService = service) {
     const pushed = await target.push(settings);
     if (!pushed.success) throw new Error(pushed.error.message);
@@ -462,17 +477,9 @@ describe("BackupService against a real repository", () => {
     await fs.rm(linkPath, { recursive: true });
     await fs.symlink(sharedSkill, linkPath);
 
-    const payload = createBackupPayloadStore({ config });
-    const racing = new BackupService(config, {
-      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
-      payload: {
-        ...payload,
-        async writeSafetySnapshot(snapshotRoot, contents) {
-          await payload.writeSafetySnapshot(snapshotRoot, contents);
-          await fs.rm(linkPath);
-          await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
-        },
-      },
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
     });
 
     const restored = await racing.restore(settings);
@@ -524,17 +531,9 @@ describe("BackupService against a real repository", () => {
   it("leaves a skipped symlinked memory folder alone when it becomes a folder after the snapshot", async () => {
     const { memoryDir } = await linkMatchedProjectMemory();
     const linkPath = path.join(muxRoot, memoryDir);
-    const payload = createBackupPayloadStore({ config });
-    const racing = new BackupService(config, {
-      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
-      payload: {
-        ...payload,
-        async writeSafetySnapshot(snapshotRoot, contents) {
-          await payload.writeSafetySnapshot(snapshotRoot, contents);
-          await fs.rm(linkPath);
-          await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "written after snapshot\n");
-        },
-      },
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "written after snapshot\n");
     });
 
     const restored = await racing.restore(settings);
@@ -545,7 +544,8 @@ describe("BackupService against a real repository", () => {
     );
   });
 
-  it("previews and restores around a pinned artifact whose local shelf entry is now a symlink", async () => {
+  /** A global pin pushed as a real shelf entry whose local entry folder is now a link. */
+  async function linkPinnedShelfEntry(): Promise<{ entryPath: string; sharedEntry: string }> {
     const shelfRoot = path.join(muxRoot, "artifacts");
     const pinned = await pinToShelf({
       shelfRoot,
@@ -570,25 +570,48 @@ describe("BackupService against a real repository", () => {
     await fs.rename(entryPath, sharedEntry);
     await writeFixtureFile(sharedEntry, "report.md", "shared report\n");
     await fs.symlink(sharedEntry, entryPath);
+    return { entryPath, sharedEntry };
+  }
+
+  const PINNED_ENTRY_FILES = [
+    "artifacts/global/report.md/meta.json",
+    "artifacts/global/report.md/report.md",
+  ];
+
+  it("previews and restores around a pinned artifact whose local shelf entry is now a symlink", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
     await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
-    const skipped = [
-      "artifacts/global/report.md/meta.json",
-      "artifacts/global/report.md/report.md",
-    ];
 
     const preview = await service.preview(settings);
     if (!preview.success) throw new Error(preview.error.message);
-    expect(preview.data.symlinkSkipped).toEqual(skipped);
-    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(skipped[1]);
+    expect(preview.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      PINNED_ENTRY_FILES[1]
+    );
 
     const restored = await service.restore(settings);
     if (!restored.success) throw new Error(restored.error.message);
-    expect(restored.data.symlinkSkipped).toEqual(skipped);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
       "global instructions\n"
     );
     expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
+  it("leaves a skipped symlinked shelf entry alone when it becomes a folder after the snapshot", async () => {
+    const { entryPath } = await linkPinnedShelfEntry();
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath);
+      await writeFixtureFile(entryPath, "report.md", "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(await fs.readFile(path.join(entryPath, "report.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
   });
 
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
