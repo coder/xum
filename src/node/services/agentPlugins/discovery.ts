@@ -877,16 +877,20 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
 
 /**
  * Claude's and Cursor's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no
- * `skills` key loads as one skill (the caller passes "." as the declared skills path).
+ * `skills` key loads as one skill (the caller passes "." as the declared skills path). Any entry
+ * named `skills` turns the layout off for Claude. Cursor turns it off only for a `skills/` folder.
  */
-async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
-  if (
-    (await pluginFs()
-      .lstat(path.join(rootReal, "skills"))
-      .catch(() => null)) !== null
-  ) {
-    return false;
-  }
+async function isClaudeRootSkill(
+  rootReal: string,
+  options: { onlySkillsFolderCounts: boolean }
+): Promise<boolean> {
+  const skillsPath = path.join(rootReal, "skills");
+  const skillsEntry = options.onlySkillsFolderCounts
+    ? await isPluginSkillDirectory(pluginFs().stat(skillsPath))
+    : (await pluginFs()
+        .lstat(skillsPath)
+        .catch(() => null)) !== null;
+  if (skillsEntry) return false;
   const skillFile = await pluginFs()
     .lstat(path.join(rootReal, SKILL_FILENAME))
     .catch(() => null);
@@ -1257,11 +1261,12 @@ async function cursorAgentFilesNotApplied(
 }
 
 /**
- * Cursor plugin names may contain periods (`prompts.chat`), and skill names may not, so a Cursor
- * root skill loads under the name with `-` for `.`. Its SKILL.md `name` becomes the display name.
+ * Cursor plugin names may contain periods (`prompts.chat`, `foo.-bar`), and skill names may not, so
+ * a Cursor root skill loads under the name with one `-` for each run of `.` and `-`. Its SKILL.md
+ * `name` becomes the display name.
  */
 function cursorRootSkillName(pluginName: string): string {
-  return pluginName.replaceAll(".", "-");
+  return pluginName.replace(/[.-]+/g, "-");
 }
 
 /** The MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3). */
@@ -1626,7 +1631,8 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      ((claudePackage || cursorFallback) && (await isClaudeRootSkill(rootReal))
+      ((claudePackage || cursorFallback) &&
+      (await isClaudeRootSkill(rootReal, { onlySkillsFolderCounts: cursorFallback }))
         ? ["."]
         : undefined),
     rootReal,

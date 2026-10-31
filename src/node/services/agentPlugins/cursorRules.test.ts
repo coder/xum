@@ -154,6 +154,18 @@ describe("Cursor rule conversion", () => {
     expect(frontmatter.description).toEndWith("\n\nApplies to files matching: **/*.ts");
   });
 
+  test("aliased long globs fill the description only up to the cap", () => {
+    const glob = `src/${"g".repeat(200_000)}`;
+    const aliases = Array.from({ length: 50 }, () => "*g").join(", ");
+    const { frontmatter } = ruleSkill(
+      "big-globs",
+      `---\ng: &g "${glob}"\nglobs: [${aliases}]\n---\nBody\n`
+    );
+    expect(ruleType(frontmatter)).toBe("glob");
+    expect(frontmatter.description).toHaveLength(1024);
+    expect(frontmatter.description).toStartWith("\n\nApplies to files matching: src/ggg");
+  });
+
   test("cuts a long first body line to the skill description cap", () => {
     const { frontmatter } = ruleSkill("long", `${"w".repeat(3000)}\n`);
     expect(frontmatter.description.length).toBeLessThanOrEqual(SKILL_DESCRIPTION_CAP);

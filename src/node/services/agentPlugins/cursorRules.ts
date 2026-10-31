@@ -44,7 +44,7 @@ function ruleGlobs(value: unknown): string[] {
   const entries = Array.isArray(value) ? value : [value];
   return entries
     .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim())
+    .map((entry) => entry.slice(0, MAX_SKILL_DESCRIPTION_LENGTH).trim())
     .filter((entry) => entry.length > 0);
 }
 
@@ -65,6 +65,20 @@ function cursorRuleType(
  * Cut to the skill schema's cap, keeping the globs, so a long description never stops the rule
  * from loading.
  */
+/**
+ * The globs part of the description, built only up to the description cap: YAML aliases can repeat
+ * one long glob many times, and joining them all would allocate far more than the cap keeps.
+ */
+function globsSuffix(globs: readonly string[]): string {
+  if (globs.length === 0) return "";
+  let suffix = "\n\nApplies to files matching: ";
+  for (const [index, glob] of globs.entries()) {
+    if (suffix.length >= MAX_SKILL_DESCRIPTION_LENGTH) break;
+    suffix += `${index > 0 ? ", " : ""}${glob}`;
+  }
+  return suffix.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
+}
+
 function ruleSkillDescription(args: {
   name: string;
   description: string | undefined;
@@ -72,8 +86,7 @@ function ruleSkillDescription(args: {
   globs: readonly string[];
 }): string {
   const base = args.description ?? firstNonEmptyLine(args.body) ?? `Cursor rule ${args.name}`;
-  const suffix =
-    args.globs.length > 0 ? `\n\nApplies to files matching: ${args.globs.join(", ")}` : "";
+  const suffix = globsSuffix(args.globs);
   const room = Math.max(0, MAX_SKILL_DESCRIPTION_LENGTH - suffix.length);
   return `${base.slice(0, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
 }
