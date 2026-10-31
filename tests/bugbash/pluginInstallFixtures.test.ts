@@ -5,12 +5,15 @@
  * paid bug-bash run.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import type { AgentPluginSourcePreview } from "../../src/common/orpc/schemas/agentPlugins";
 import { Config } from "../../src/node/config";
+import { discoverAgentPlugins } from "../../src/node/services/agentPlugins/discovery";
 import { AgentPluginInstallService } from "../../src/node/services/agentPlugins/installService";
+import { loadPluginMcpServers } from "../../src/node/services/agentPlugins/mcpConfig";
 import { writeInstallSources } from "./pluginInstallFixtures";
 
 let tmpRoot: string;
@@ -97,4 +100,42 @@ test("snake-case-skills offers each snake_case skill folder under its kebab-case
     "egm-review-loop",
   ]);
   expect(plugin.warnings).toEqual([]);
+});
+
+test("cursor-stdio-mcp's echo server starts from ${CURSOR_PLUGIN_ROOT} and echoes its text", async () => {
+  const source = sources.get("cursor-stdio-mcp");
+  if (source == null) throw new Error("no fixture cursor-stdio-mcp");
+  const discovered = await discoverAgentPlugins([{ path: path.dirname(source), scope: "global" }]);
+  const plugin = discovered.plugins.find((candidate) => candidate.name === "cursor-stdio-mcp");
+  if (plugin == null) throw new Error("cursor-stdio-mcp was not discovered");
+  const { servers, diagnostics } = await loadPluginMcpServers(plugin, {
+    xumHome: path.join(tmpRoot, "xum"),
+  });
+  expect(diagnostics).toEqual([]);
+  const [echo] = Object.values(servers);
+  if (echo?.transport !== "stdio") throw new Error("echo is not a stdio server");
+  const args = echo.args ?? [];
+  expect([echo.command, ...args]).toEqual(["node", path.join(plugin.rootPath, "server.mjs")]);
+
+  const requests = [
+    { id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {} } },
+    { method: "notifications/initialized" },
+    { id: 2, method: "tools/call", params: { name: "echo", arguments: { text: "hi" } } },
+  ];
+  const run = spawnSync(echo.command, args, {
+    cwd: echo.cwd,
+    env: { ...process.env, ...echo.env },
+    input: requests.map((request) => JSON.stringify({ jsonrpc: "2.0", ...request })).join("\n"),
+    encoding: "utf8",
+  });
+  expect(run.status).toBe(0);
+  const replies = run.stdout
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as unknown);
+  expect(replies[1]).toEqual({
+    jsonrpc: "2.0",
+    id: 2,
+    result: { content: [{ type: "text", text: "hi" }] },
+  });
 });
