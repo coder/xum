@@ -1103,7 +1103,6 @@ async function cursorPackageNotApplied(args: {
 async function resolveCursorParts(args: {
   cursor: CursorManifestResult | undefined;
   rawManifest: unknown;
-  declaredMcp: string | undefined;
   skillsDirs: PluginSkillsRoot[];
   resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
   rootReal: string;
@@ -1121,7 +1120,7 @@ async function resolveCursorParts(args: {
   const onDisk = await cursorPackageNotApplied({
     rootReal: args.rootReal,
     hooks: cursor.hooks,
-    declaredMcp: args.declaredMcp,
+    declaredMcp: cursor.mcpConfigPath,
     declaresCommands: isPlainObject(args.rawManifest) && args.rawManifest.commands !== undefined,
   });
   return {
@@ -1584,7 +1583,6 @@ async function discoverPluginAt(args: {
   const cursorParts = await resolveCursorParts({
     cursor,
     rawManifest,
-    declaredMcp: contributes?.mcp,
     skillsDirs,
     resolveComponent,
     rootReal,

@@ -2015,6 +2015,51 @@ describe("agentSkillsService agent plugins", () => {
     expect((await read("deploy")).package.frontmatter.description).toBe("skill wins");
   });
 
+  test("a managed Cursor rule loads as reviewed; a rule type change needs a review, prose does not", async () => {
+    using tmp = new DisposableTempDir("plugin-cursor-rule-consent");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "kit");
+    await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    await fs.mkdir(path.join(pluginDir, "rules"));
+    const rule = path.join(pluginDir, "rules", "imports.mdc");
+    const writeRule = (frontmatter: string, body: string) =>
+      fs.writeFile(rule, `---\ndescription: Keep imports on top\n${frontmatter}---\n${body}\n`);
+    await writeRule("alwaysApply: true\n", "No inline imports.");
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry(
+            "kit",
+            undefined,
+            await reviewedComponentConsent({ pluginDir })
+          ),
+        ],
+      })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const loaded = async () =>
+      (await discoverAgentSkills(runtime, tmp.path, { roots, runtimeFactory })).skills
+        .filter((skill) => skill.pluginName === "kit")
+        .map((skill) => skill.name);
+
+    expect(await loaded()).toEqual(["imports"]);
+    await writeRule("alwaysApply: true\n", "Never inline imports.");
+    expect(await loaded()).toEqual(["imports"]);
+    await writeRule("", "Never inline imports.");
+    expect(await loaded()).toEqual([]);
+  });
+
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");

@@ -245,13 +245,14 @@ describe("normalizeCursorManifest agents", () => {
 
 describe("normalizeCursorManifest mcpServers", () => {
   test("a string path becomes the MCP config path", () => {
-    const { loaded, notApplied } = load({ mcpServers: "./config/mcp.json" });
-    expect(loaded.contributes?.mcp).toBe("config/mcp.json");
+    const { loaded, mcpConfigPath, notApplied } = load({ mcpServers: "./config/mcp.json" });
+    expect(mcpConfigPath).toBe("config/mcp.json");
+    expect(loaded.contributes?.mcp).toBeUndefined();
     expect(notApplied).toEqual([]);
   });
 
   test("an inline object is listed and keeps the default mcp.json from loading", () => {
-    const { loaded, notApplied } = load({
+    const { loaded, mcpConfigPath, notApplied } = load({
       mcpServers: { github: { command: "npx", args: ["github-mcp"] } },
     });
     expect(notApplied).toEqual([
@@ -261,11 +262,12 @@ describe("normalizeCursorManifest mcpServers", () => {
         reason: "inline mcpServers is not applied in Xum; use a ./mcp.json file",
       },
     ]);
-    expect(loaded.contributes?.mcp).toBe(INERT_COMPONENT_PATH);
+    expect(mcpConfigPath).toBe(INERT_COMPONENT_PATH);
+    expect(loaded.contributes?.mcp).toBeUndefined();
   });
 
   test("an inline list is listed the same way", () => {
-    const { loaded, notApplied } = load({ mcpServers: [{ command: "npx" }] });
+    const { loaded, mcpConfigPath, notApplied } = load({ mcpServers: [{ command: "npx" }] });
     expect(notApplied).toEqual([
       {
         part: "mcp",
@@ -273,7 +275,8 @@ describe("normalizeCursorManifest mcpServers", () => {
         reason: "inline mcpServers is not applied in Xum; use a ./mcp.json file",
       },
     ]);
-    expect(loaded.contributes?.mcp).toBe(INERT_COMPONENT_PATH);
+    expect(mcpConfigPath).toBe(INERT_COMPONENT_PATH);
+    expect(loaded.contributes?.mcp).toBeUndefined();
   });
 });
 

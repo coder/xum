@@ -25,6 +25,12 @@ export interface CursorManifestResult {
   ruleDirs: string[];
   /** Default `hooks/hooks.json`. */
   hooks?: string | Record<string, unknown>;
+  /**
+   * The `mcpServers` file path; the inert path when the field names no file Xum applies. Kept out
+   * of `contributes.mcp` until Cursor MCP servers load (Cursor plugin RFC PR 3): the sign-out
+   * pass reads a declared `contributes.mcp` that resolves to no file as an unreadable MCP file.
+   */
+  mcpConfigPath?: string;
   notApplied: AgentPluginNotApplied[];
 }
 
@@ -153,17 +159,17 @@ function mcpFile(
   value: unknown,
   warnings: string[],
   notApplied: AgentPluginNotApplied[]
-): { mcp?: string } {
+): Pick<CursorManifestResult, "mcpConfigPath"> {
   if (value === undefined) return {};
   if (typeof value === "string") {
     const normalized = claudeComponentPath(value);
-    if (normalized !== undefined) return { mcp: normalized };
+    if (normalized !== undefined) return { mcpConfigPath: normalized };
     notApplied.push({
       part: "mcp",
       name: `mcpServers: ${value}`,
       reason: "path is outside the plugin folder",
     });
-    return { mcp: INERT_COMPONENT_PATH };
+    return { mcpConfigPath: INERT_COMPONENT_PATH };
   }
   if (isPlainObject(value) || Array.isArray(value)) {
     notApplied.push({
@@ -171,7 +177,7 @@ function mcpFile(
       name: "mcpServers",
       reason: "inline mcpServers is not applied in Xum; use a ./mcp.json file",
     });
-    return { mcp: INERT_COMPONENT_PATH };
+    return { mcpConfigPath: INERT_COMPONENT_PATH };
   }
   invalidField("mcpServers", "a path, an object or a list", warnings, notApplied);
   return {};
@@ -232,8 +238,8 @@ function notAppliedFields(raw: Record<string, unknown>): AgentPluginNotApplied[]
 
 /**
  * Rewrite a `.cursor-plugin/plugin.json` document into the Agent Plugins 1.0.0 shape. `skills`
- * and `agents` become `contributes` members, `mcpServers` becomes `contributes.mcp`, and rules
- * and hooks, which have no `contributes` member, come back beside the manifest.
+ * and `agents` become `contributes` members. Rules, hooks and the MCP file come back beside the
+ * manifest.
  */
 export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   const warnings: string[] = [];
@@ -246,12 +252,12 @@ export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   manifest.contributes = {
     ...(skills !== undefined ? { skills: declaredFolders(skills) } : {}),
     ...agentsFolder(read("agents"), notApplied),
-    ...mcpFile(raw.mcpServers, warnings, notApplied),
   };
   return {
     manifest,
     warnings,
     ruleDirs: rules ?? ["rules"],
+    ...mcpFile(raw.mcpServers, warnings, notApplied),
     ...readHooks(raw.hooks, warnings, notApplied),
     notApplied,
   };
