@@ -1,8 +1,8 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 /**
- * Claude Code marketplaces through the install service, against real local git "remotes": the
- * preview lists the entries, the user installs one entry per install, and updates read the entry
- * again from marketplace.json at the new commit.
+ * Claude Code and Cursor marketplaces through the install service, against real local git
+ * "remotes": the preview lists the entries, the user installs one entry per install, and updates
+ * read the entry again from marketplace.json at the new commit.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -12,6 +12,8 @@ import * as path from "node:path";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
+  AgentPluginNotApplied,
 } from "@/common/orpc/schemas/agentPlugins";
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -27,6 +29,8 @@ const skillMd = (name: string) => `---\nname: ${name}\ndescription: The ${name} 
 
 /** The scratch clone of anthropics/skills, when this machine has it (no network needed). */
 const ANTHROPIC_SKILLS_CLONE = "/home/coder/.mux/sessions/912d5d0f95/scratch/as";
+/** The scratch clone of cursor/plugins, when this machine has it (no network needed). */
+const CURSOR_PLUGINS_CLONE = "/home/coder/.xum/sessions/58dd3a349d/scratch/cursor-plugins";
 
 async function initRepo(dir: string): Promise<void> {
   await fsPromises.mkdir(dir, { recursive: true });
@@ -47,7 +51,15 @@ async function commit(dir: string, message: string): Promise<void> {
   await git(dir, "commit", "-q", "-m", message);
 }
 
-describe("AgentPluginInstallService Claude marketplaces", () => {
+/** The rows of a listing whose names each file lists once, as the name and its only build. */
+function singleBuildRows(listing: AgentPluginMarketplaceListing) {
+  return listing.entries.map((entry) => {
+    expect(entry.builds.length).toBe(1);
+    return { name: entry.name, ...entry.builds[0] };
+  });
+}
+
+describe("AgentPluginInstallService marketplaces", () => {
   let tmpRoot: string;
   let xumRoot: string;
   let marketDir: string;
@@ -72,6 +84,45 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
 
   async function previewEntry(entry: string): Promise<AgentPluginInstallPreview> {
     return service.preview({ input: marketDir, method: { kind: "claude-marketplace", entry } });
+  }
+
+  async function previewCursorEntry(entry: string): Promise<AgentPluginInstallPreview> {
+    return service.preview({ input: marketDir, method: { kind: "cursor-marketplace", entry } });
+  }
+
+  async function listMarketplace(): Promise<AgentPluginMarketplaceListing> {
+    const listed = await service.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    return listed.marketplace;
+  }
+
+  /**
+   * Shaped like cursor/plugins: the Cursor file lists bare folder names, and the Claude file
+   * lists `pstack` from another folder.
+   */
+  async function writeCursorMarketplace(): Promise<void> {
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        owner: { name: "Cursor" },
+        plugins: [
+          { name: "pstack", source: "pstack", description: "Cursor pstack" },
+          { name: "kit", source: "kit" },
+          { name: "bare", source: "bare" },
+        ],
+      }),
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "pstack", source: "./harness/pstack/claude-code", description: "Claude pstack" },
+      ]),
+      "pstack/.cursor-plugin/plugin.json": JSON.stringify({ name: "pstack" }),
+      "pstack/skills/go-deep/SKILL.md": skillMd("go-deep"),
+      "harness/pstack/claude-code/.claude-plugin/plugin.json": JSON.stringify({ name: "pstack" }),
+      "harness/pstack/claude-code/skills/claude-only/SKILL.md": skillMd("claude-only"),
+      "kit/.cursor-plugin/plugin.json": JSON.stringify({ name: "kit", variables: { TOKEN: "x" } }),
+      "kit/skills/lint/SKILL.md": skillMd("lint"),
+      "bare/skills/loose/SKILL.md": skillMd("loose"),
+    });
+    await commit(marketDir, "cursor marketplace");
   }
 
   async function install(preview: AgentPluginInstallPreview): Promise<void> {
@@ -131,7 +182,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     expect(listed.marketplace.name).toBe("acme-market");
     expect(listed.marketplace.methods).toEqual([{ kind: "skills" }]);
     expect(
-      listed.marketplace.entries.map((entry) => [entry.name, entry.skillCount, entry.installable])
+      singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount, row.installable])
     ).toEqual([
       ["docs", 2, true],
       ["examples", 1, true],
@@ -139,7 +190,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     ]);
     // The plugin-only API names the marketplace instead.
     await expect(service.preview({ input: marketDir })).rejects.toThrow(
-      "is the Claude Code marketplace 'acme-market'"
+      "is the plugin marketplace 'acme-market'"
     );
 
     const docs = await previewEntry("docs");
@@ -204,7 +255,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
     expect(
-      listed.marketplace.entries.map((entry) => [entry.name, entry.installable, entry.reason])
+      singleBuildRows(listed.marketplace).map((row) => [row.name, row.installable, row.reason])
     ).toEqual([
       ["docs", true, undefined],
       ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
@@ -224,7 +275,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
 
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-    expect(listed.marketplace.entries.map((entry) => [entry.name, entry.skillCount])).toEqual([
+    expect(singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount])).toEqual([
       ["docs", 2],
       ["api", 0],
     ]);
@@ -351,7 +402,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     await commit(marketDir, "none");
     const listed = await service.previewSource({ input: marketDir });
     if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-    expect(listed.marketplace.entries.map((entry) => entry.skillCount)).toEqual([0]);
+    expect(singleBuildRows(listed.marketplace).map((row) => row.skillCount)).toEqual([0]);
     expect((await previewEntry("none")).skills).toEqual([]);
   });
 
@@ -470,7 +521,7 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     try {
       const listed = await service.previewSource({ input: marketDir });
       if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-      expect(listed.marketplace.entries.every((entry) => entry.skillCount === 1)).toBe(true);
+      expect(singleBuildRows(listed.marketplace).every((row) => row.skillCount === 1)).toBe(true);
     } finally {
       spy.mockRestore();
     }
@@ -502,6 +553,238 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     expect(await installedSkills("tool-repo")).toEqual(["remote"]);
     await expect(previewEntry("empty")).rejects.toThrow("no SKILL.md files");
   });
+
+  test("both files list one row per name; a shared name has the Cursor build, then the Claude one", async () => {
+    await writeCursorMarketplace();
+    const listing = await listMarketplace();
+    // The header is the Cursor file's.
+    expect([listing.name, listing.owner]).toEqual(["cursor-market", "Cursor"]);
+    expect(listing.warnings).toEqual([]);
+    expect(
+      listing.entries.map((entry) => [
+        entry.name,
+        entry.description,
+        entry.builds.map((build) => [build.file, build.source, build.installable]),
+      ])
+    ).toEqual([
+      [
+        "pstack",
+        "Cursor pstack",
+        [
+          ["cursor", "pstack", true],
+          ["claude", "harness/pstack/claude-code", true],
+        ],
+      ],
+      ["kit", undefined, [["cursor", "kit", true]]],
+      ["bare", undefined, [["cursor", "bare", true]]],
+    ]);
+  });
+
+  test("each build of a name previews its own file's folder through that folder's manifest", async () => {
+    await writeCursorMarketplace();
+    const cursor = await previewCursorEntry("pstack");
+    expect(cursor.source.subpath).toBe("pstack");
+    // The Cursor entry installs through its own manifest, never as a marketplace entry.
+    expect(cursor.method).toEqual({ kind: "cursor-plugin" });
+    expect(cursor.methods).toEqual([{ kind: "cursor-plugin" }]);
+    expect(cursor.skills.map((skill) => skill.name)).toEqual(["go-deep"]);
+
+    const claude = await previewEntry("pstack");
+    expect(claude.source.subpath).toBe("harness/pstack/claude-code");
+    expect(claude.method).toEqual({ kind: "claude-plugin" });
+    expect(claude.skills.map((skill) => skill.name)).toEqual(["claude-only"]);
+  });
+
+  test("only one build of a name installs: the second is refused until the first is uninstalled", async () => {
+    await writeCursorMarketplace();
+    await install(await previewCursorEntry("pstack"));
+    expect(await installedSkills("pstack")).toEqual(["go-deep"]);
+    const collision = "A managed plugin named 'pstack' is already installed. Uninstall it first.";
+    const claude = await previewEntry("pstack");
+    expect(claude.installBlockedReason).toBe(collision);
+    await expect(install(claude)).rejects.toThrow(collision);
+    expect(await installedSkills("pstack")).toEqual(["go-deep"]);
+  });
+
+  test("a Cursor entry without a manifest in its folder is refused; install never takes a Cursor entry", async () => {
+    await writeCursorMarketplace();
+    await expect(previewCursorEntry("bare")).rejects.toThrow(
+      "The Cursor marketplace entry 'bare' has no plugin manifest in its folder. Xum does not install it."
+    );
+    const preview = await previewCursorEntry("pstack");
+    await expect(
+      service.install({
+        source: preview.source,
+        method: { kind: "cursor-marketplace", entry: "pstack" },
+        expectedSha: preview.lockedSha,
+        expectedConsentDigest: preview.consentDigest,
+      })
+    ).rejects.toThrow("cannot be installed as Cursor marketplace entry");
+    expect((await service.list()).map((item) => item.name)).toEqual([]);
+  });
+
+  test("an installed Cursor entry lists its not-applied parts and updates by its folder", async () => {
+    await writeCursorMarketplace();
+    const variables: AgentPluginNotApplied = {
+      part: "field",
+      name: "variables",
+      reason: "not applied in Xum",
+    };
+    const preview = await previewCursorEntry("kit");
+    expect(preview.notApplied).toEqual([variables]);
+    await install(preview);
+    const listed = (await service.list()).find((item) => item.name === "kit");
+    expect(listed?.notApplied).toEqual([variables]);
+
+    await writeFiles(marketDir, { "kit/skills/format/SKILL.md": skillMd("format") });
+    await commit(marketDir, "kit gets format");
+    const head = (await git(marketDir, "rev-parse", "HEAD")).trim();
+    const review = await service.previewUpdate({ name: "kit" });
+    expect(review.toSha).toBe(head);
+    expect(review.notApplied).toEqual([variables]);
+    await updateWithReview("kit");
+    expect(await installedSkills("kit")).toEqual(["format", "lint"]);
+    const updated = (await service.list()).find((item) => item.name === "kit");
+    expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
+  });
+
+  test("a plugin without not-applied parts carries no list", async () => {
+    await writeCursorMarketplace();
+    const preview = await previewCursorEntry("pstack");
+    expect(preview.notApplied).toEqual([]);
+    await install(preview);
+    const listed = (await service.list()).find((item) => item.name === "pstack");
+    expect(listed?.notApplied).toBeUndefined();
+  });
+
+  test("rule skills carry their rule type; an ordinary skill never does", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, {
+      "kit/rules/a.mdc": "---\nalwaysApply: true\n---\nAlways\n",
+      "kit/rules/b.mdc": '---\nglobs: "*.ts"\n---\nTypeScript\n',
+      // The rule type key in an ordinary skill's metadata is not a rule.
+      "kit/skills/lint/SKILL.md":
+        "---\nname: lint\ndescription: Lint\nmetadata:\n  cursor-rule-type: glob\n---\nBody\n",
+    });
+    await commit(marketDir, "kit rules");
+    const preview = await previewCursorEntry("kit");
+    const ruleTypes = (skills: Array<{ name: string; ruleType?: string }>) =>
+      skills.map((skill) => [skill.name, skill.ruleType]).sort();
+    const expected = [
+      ["a", "always-apply"],
+      ["b", "glob"],
+      ["lint", undefined],
+    ];
+    expect(ruleTypes(preview.skills)).toEqual(expected);
+    await install(preview);
+    expect(ruleTypes((await service.getComponents({ name: "kit" })).skills)).toEqual(expected);
+  });
+
+  test("a readonly Cursor agent is listed as one", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, {
+      "kit/agents/reviewer.md":
+        "---\nname: reviewer\ndescription: R\nreadonly: true\n---\nReview\n",
+      "kit/agents/writer.md": "---\nname: writer\ndescription: W\n---\nWrite\n",
+      // Xum format: `readonly` is no Xum field, so the agent keeps its tools.
+      "kit/agents/xum.md": "---\nname: xum\nbase: exec\nreadonly: true\n---\nXum\n",
+    });
+    await commit(marketDir, "kit agents");
+    const preview = await previewCursorEntry("kit");
+    expect(preview.agents).toEqual(["reviewer.md", "writer.md", "xum.md"]);
+    expect(preview.readonlyAgents).toEqual(["reviewer.md"]);
+  });
+
+  test("a root with its own Cursor manifest previews that plugin, not the listing", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, {
+      ".cursor-plugin/plugin.json": JSON.stringify({ name: "root-kit" }),
+    });
+    await commit(marketDir, "root manifest");
+    const result = await service.previewSource({ input: marketDir });
+    if (result.kind !== "plugin") throw new Error("expected a plugin preview");
+    expect(result.preview.method).toEqual({ kind: "cursor-plugin" });
+    expect(result.preview.manifest.name).toBe("root-kit");
+  });
+
+  test("a broken Cursor file beside a good Claude file lists the Claude entries and warns", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, { ".cursor-plugin/marketplace.json": "{ not json" });
+    await commit(marketDir, "break the Cursor file");
+    const listing = await listMarketplace();
+    expect(listing.name).toBe("acme-market");
+    expect(singleBuildRows(listing).map((row) => [row.name, row.file])).toEqual([
+      ["pstack", "claude"],
+    ]);
+    expect(listing.warnings.length).toBe(1);
+    expect(listing.warnings[0]).toStartWith(".cursor-plugin/marketplace.json is not valid JSON");
+  });
+
+  test("a refused Cursor build does not refuse the Claude build of the same name", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        plugins: [{ name: "pstack", source: { source: "npm", package: "@cursor/pstack" } }],
+      }),
+    });
+    await commit(marketDir, "an npm Cursor entry");
+    const listing = await listMarketplace();
+    expect(listing.entries.map((entry) => entry.name)).toEqual(["pstack"]);
+    expect(
+      listing.entries[0].builds.map((build) => [build.file, build.installable, build.reason])
+    ).toEqual([
+      ["cursor", false, "Xum does not install npm packages. Only git sources install."],
+      ["claude", true, undefined],
+    ]);
+  });
+
+  test("an installed Cursor plugin read without its manifest stays a managed install that uninstalls", async () => {
+    await writeCursorMarketplace();
+    await install(await previewCursorEntry("pstack"));
+    // An older build reads no Cursor manifest; this is the folder as it sees it.
+    const installed = path.join(xumRoot, "plugins", "pstack");
+    await fsPromises.rm(path.join(installed, ".cursor-plugin"), { recursive: true });
+    const listed = (await service.list()).find((item) => item.name === "pstack");
+    expect(listed?.managed).toBe(true);
+    await service.uninstall({ name: "pstack", deletePluginData: true });
+    expect(await service.list()).toEqual([]);
+    expect(existsSync(installed)).toBe(false);
+  });
+
+  test.skipIf(!existsSync(CURSOR_PLUGINS_CLONE))(
+    "cursor/plugins: 128 plugins, pstack and origin-apps with both builds",
+    async () => {
+      const copy = path.join(tmpRoot, "cursor-plugins");
+      await fsPromises.cp(CURSOR_PLUGINS_CLONE, copy, {
+        recursive: true,
+        filter: (source) => path.basename(source) !== ".git",
+      });
+      await initRepo(copy);
+      await commit(copy, "copy");
+      const listed = await service.previewSource({ input: copy });
+      if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+      const entries = listed.marketplace.entries;
+      expect(entries.length).toBe(128);
+      expect(
+        entries
+          .filter((entry) => entry.builds.length > 1)
+          .map((entry) => [entry.name, entry.builds.map((build) => build.file)])
+          .sort()
+      ).toEqual([
+        ["origin-apps", ["cursor", "claude"]],
+        ["pstack", ["cursor", "claude"]],
+      ]);
+      expect(entries.every((entry) => entry.builds[0].file === "cursor")).toBe(true);
+      expect(listed.marketplace.warnings).toEqual([]);
+      // pstack's folder has a root plugin.json with $schema next to its Cursor manifest.
+      const pstack = await service.preview({
+        input: copy,
+        method: { kind: "cursor-marketplace", entry: "pstack" },
+      });
+      expect([pstack.method, pstack.source.subpath]).toEqual([{ kind: "agent-plugin" }, "pstack"]);
+    }
+  );
 
   test.skipIf(!existsSync(ANTHROPIC_SKILLS_CLONE))(
     "anthropics/skills: document-skills previews /pdf",
