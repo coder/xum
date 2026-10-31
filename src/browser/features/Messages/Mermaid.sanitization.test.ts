@@ -1,10 +1,19 @@
-import { sanitizeMermaidSvg } from "./Mermaid";
+import { peleRenderOptions, sanitizeMermaidSvg } from "./Mermaid";
+import { PELE_SAMPLES } from "./Mermaid.sanitization.fixtures";
+import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { Window } from "happy-dom";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { parseFragment, type DefaultTreeAdapterMap } from "parse5";
+import { detectType, render as renderPele } from "pele";
 
 const testWindow = new Window();
 globalThis.DOMParser = testWindow.DOMParser as unknown as typeof DOMParser;
+
+const ID_PREFIX = "mermaid-r1";
 
 /**
  * Node names after the HTML parse that inserts the sanitizer output. parse5 follows the
@@ -23,9 +32,48 @@ function htmlNodeNames(markup: string): string[] {
   return names;
 }
 
+/**
+ * The elements, attributes and style declarations that the HTML parse builds from markup, as
+ * lines such as `<rect> fill="red"` and `<rect> style stroke:blue`.
+ */
+function htmlParts(markup: string): string[] {
+  const parts: string[] = [];
+  const visit = (nodes: Array<DefaultTreeAdapterMap["childNode"]>) => {
+    for (const node of nodes) {
+      if (!("tagName" in node)) continue;
+      parts.push(`<${node.tagName}>`);
+      for (const { prefix, name, value } of node.attrs) {
+        if (name === "style") {
+          parts.push(
+            ...value.split(";").map((declaration) => `<${node.tagName}> style ${declaration}`)
+          );
+        } else {
+          parts.push(`<${node.tagName}> ${prefix ? `${prefix}:` : ""}${name}="${value}"`);
+        }
+      }
+      visit(node.childNodes);
+    }
+  };
+  visit(parseFragment(markup).childNodes);
+  return parts;
+}
+
+/** A CSS variable as renderMermaidSvg reads it from the theme. */
+function themeVariable(name: string): string {
+  const css = readFileSync(path.join(import.meta.dir, "../../styles/theme-dark.css"), "utf8");
+  const value = new RegExp(`${name}:([^;]+);`).exec(css)?.[1].trim();
+  if (value === undefined) throw new Error(`theme-dark.css sets no ${name}`);
+  return value;
+}
+
 describe("sanitizeMermaidSvg", () => {
   it("returns null for malformed SVG", () => {
-    expect(sanitizeMermaidSvg("<svg><g></svg")).toBeNull();
+    expect(sanitizeMermaidSvg("<svg><g></svg", ID_PREFIX)).toBeNull();
+  });
+
+  it("returns null for an svg root outside the SVG namespace", () => {
+    expect(sanitizeMermaidSvg('<svg xmlns="urn:x"><rect/></svg>', ID_PREFIX)).toBeNull();
+    expect(sanitizeMermaidSvg("<svg><rect/></svg>", ID_PREFIX)).toBeNull();
   });
 
   it("removes active content, foreignObject and unsafe attributes", () => {
@@ -34,21 +82,17 @@ describe("sanitizeMermaidSvg", () => {
       "<script>alert(1)</script>" +
       '<foreignObject><div onclick="evil()">label</div></foreignObject>' +
       '<a href="javascript:alert(1)"><text>link</text></a>' +
-      '<a xlink:href="java&#10;script:alert(3)"><text>split-link</text></a>' +
-      '<a href="java&#1114112;script:alert(4)"><text>invalid-codepoint</text></a>' +
       '<image src="javascript:alert(2)" />' +
       '<rect width="10" height="10" onclick="steal()" />' +
       "</svg>";
 
-    const sanitized = sanitizeMermaidSvg(input);
+    const sanitized = sanitizeMermaidSvg(input, ID_PREFIX);
 
     expect(sanitized).not.toBeNull();
     expect(sanitized).not.toContain("<script");
     expect(sanitized).not.toContain("onload=");
     expect(sanitized).not.toContain("onclick=");
     expect(sanitized).not.toContain("javascript:");
-    expect(sanitized).not.toContain("java&#10;script:");
-    expect(sanitized).not.toContain("&#1114112;");
     expect(sanitized).not.toContain("xlink:href=");
     expect(sanitized).not.toContain("href=");
     expect(sanitized).toContain("<svg");
@@ -57,6 +101,7 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("label");
   });
 
+  const SVG = "http://www.w3.org/2000/svg";
   const XHTML = "http://www.w3.org/1999/xhtml";
   const MATHML = "http://www.w3.org/1998/Math/MathML";
   const MATH = `<math xmlns="${MATHML}" display="block"><semantics><msup><mi>x</mi><mn>2</mn></msup><annotation encoding="application/x-tex">x^2</annotation></semantics></math>`;
@@ -69,7 +114,7 @@ describe("sanitizeMermaidSvg", () => {
     `<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/>${label}</svg>`;
 
   it("keeps Pele's MathML labels", () => {
-    const sanitized = sanitizeMermaidSvg(svgWith(peleMathLabel()));
+    const sanitized = sanitizeMermaidSvg(svgWith(peleMathLabel()), ID_PREFIX);
 
     expect(sanitized).toContain('<foreignObject class="pele-math"');
     expect(sanitized).toContain("<msup><mi>x</mi><mn>2</mn></msup>");
@@ -101,7 +146,7 @@ describe("sanitizeMermaidSvg", () => {
       `<foreignObject class="pele-math"><style xmlns="${XHTML}" style="">${MATH}</style></foreignObject>`,
     ],
   ])("removes a foreignObject with %s", (_case, label) => {
-    const sanitized = sanitizeMermaidSvg(svgWith(label));
+    const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX);
 
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toContain("foreignObject");
@@ -132,12 +177,312 @@ describe("sanitizeMermaidSvg", () => {
     // The HTML parser ends the <svg> at an SVG-namespace <p>, so the <link> after it loads.
     ["an SVG p before a link", '<p/><link rel="stylesheet" href="https://example.com/x.css"/>'],
     ["an unknown element", "<unknown><text>label</text></unknown>"],
+    // Pele writes no namespace prefix. The HTML parser knows no s:foreignobject, so a serializer
+    // that keeps the prefix lets the label's div leave the <svg>.
+    ["a prefixed element", `<s:rect xmlns:s="${SVG}" width="5"/>`],
+    [
+      "a prefixed math label",
+      peleMathLabel()
+        .replaceAll("foreignObject", "s:foreignObject")
+        .replace("<s:foreignObject", `<s:foreignObject xmlns:s="${SVG}"`),
+    ],
+    [
+      "a math label with a prefixed wrapper",
+      peleMathLabel()
+        .replace("<foreignObject", `<foreignObject xmlns:h="${XHTML}"`)
+        .replace("<div", "<h:div")
+        .replace("</div>", "</h:div>"),
+    ],
+    [
+      "a math label with a prefixed MathML element",
+      peleMathLabel(MATH.replace("<mi>x</mi>", `<m:mi xmlns:m="${MATHML}">x</m:mi>`)),
+    ],
   ])("removes %s", (_case, label) => {
-    const sanitized = sanitizeMermaidSvg(svgWith(label)) ?? "";
+    const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX) ?? "";
     const injected = ["#comment", "img", "style", "a", "set", "animate", "p", "link", "unknown"];
 
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toMatch(/<!--|<\?|<!\[CDATA\[|javascript:/);
-    expect(htmlNodeNames(sanitized).filter((name) => injected.includes(name))).toEqual([]);
+    expect(
+      htmlNodeNames(sanitized).filter((name) => injected.includes(name) || name.includes(":"))
+    ).toEqual([]);
+  });
+
+  // Inserted without the sanitizer, every payload but the gradient hrefs, cross-fade(), @import,
+  // expression() and xml:base makes Chromium 156 request this URL.
+  const REMOTE = "https://attacker.example/x";
+  const svgRoot = (rootAttributes: string) =>
+    `<svg xmlns="http://www.w3.org/2000/svg" ${rootAttributes}><rect width="10" height="10"/></svg>`;
+  it.each([
+    ["a style mask-image url()", svgWith(`<rect style="mask-image:url(${REMOTE})"/>`)],
+    ["a CSS escape in a style url()", svgWith(`<rect style="fill:u\\72l(${REMOTE})"/>`)],
+    ["a style fill url()", svgWith(`<rect style="fill:url(${REMOTE}#a)"/>`)],
+    ["a style filter url()", svgWith(`<rect style="filter:url(${REMOTE}#f)"/>`)],
+    ["a fill url()", svgWith(`<rect fill="url(${REMOTE}#a)"/>`)],
+    ["a filter url()", svgWith(`<rect filter="url(${REMOTE}#f)"/>`)],
+    ["a mask url()", svgWith(`<rect mask="url(${REMOTE}#m)"/>`)],
+    ["a clip-path url()", svgWith(`<rect clip-path="url(${REMOTE}#c)"/>`)],
+    ["a marker-end url()", svgWith(`<path d="M0 0L5 5" marker-end="url(${REMOTE}#m)"/>`)],
+    ["a gradient href", svgWith(`<defs><linearGradient id="g" href="${REMOTE}#g"/></defs>`)],
+    [
+      "a gradient xlink:href",
+      svgWith(
+        `<defs><linearGradient xmlns:xlink="http://www.w3.org/1999/xlink" id="g" xlink:href="${REMOTE}#g"/></defs>`
+      ),
+    ],
+    ["a root style url()", svgRoot(`style="background-image:url(${REMOTE})"`)],
+    [
+      "a url() with quotes and spaces",
+      svgWith(`<rect fill="url( &quot;${REMOTE}&quot; )" style="stroke:url( '${REMOTE}' )"/>`),
+    ],
+    ["an uppercase URL()", svgWith(`<rect style="fill:URL(${REMOTE})"/>`)],
+    ["an image-set()", svgWith(`<rect style="fill:red;background:image-set('${REMOTE}' 1x)"/>`)],
+    ["a cross-fade()", svgWith(`<rect style="background:cross-fade('${REMOTE}' 50%, red)"/>`)],
+    ["a custom property url()", svgWith(`<rect style="--x:url(${REMOTE});fill:var(--x)"/>`)],
+    ["an @import", svgWith(`<rect style="fill:red;@import '${REMOTE}'"/>`)],
+    ["an expression()", svgWith(`<rect style="width:expression(fetch('${REMOTE}'))"/>`)],
+    ["an xml:base", svgWith(`<g xml:base="${REMOTE}/"><rect fill="url(#a)"/></g>`)],
+    // XML attribute names are case-sensitive, but the HTML parser lowercases FILL to fill.
+    ["an uppercase attribute name", svgWith(`<rect FILL="url(${REMOTE}#a)"/>`)],
+  ])("removes %s", (_case, svg) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(sanitized).not.toContain("attacker.example");
+    expect(htmlParts(sanitized).filter((part) => part.includes("attacker"))).toEqual([]);
+  });
+
+  it("removes a style with a failing declaration whole", () => {
+    expect(
+      sanitizeMermaidSvg(svgRoot(`style="fill:red;mask:url(${REMOTE});stroke:blue"`), ID_PREFIX)
+    ).not.toContain("style=");
+    expect(sanitizeMermaidSvg(svgRoot(`style="mask:url(${REMOTE})"`), ID_PREFIX)).not.toContain(
+      "style="
+    );
+  });
+
+  // A ; inside a quoted string does not end the declaration.
+  it.each([
+    ["single", `font-family:'a;background:url(${REMOTE})';fill:red`],
+    ["double", `font-family:&quot;a;background:url(${REMOTE})&quot;;fill:red`],
+  ])("removes a style with a %s-quoted ;", (_case, style) => {
+    const sanitized = sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
+  });
+
+  // CSS reads \" in a string as an escaped quote and skips comments, so the text between the
+  // quotes or inside the comment is inert. A sanitizer that reads it as declarations makes it live.
+  const hidden = "position:fixed;inset:0;width:100vw;height:100vh;background:red";
+  const withDivStyle = (style: string) =>
+    svgWith(peleMathLabel().replace('style="display:flex"', `style="${style}"`));
+  it.each([
+    [
+      "Q1",
+      svgWith(`<rect style="font-family:&quot;a\\&quot;;fill:red&quot;;stroke:blue"/>`),
+      "fill:red",
+    ],
+    ["Q2", svgWith(`<rect style="font-family:&quot;\\&quot;;${hidden};x:&quot;"/>`), hidden],
+    ["Q3", svgWith(`<rect style="font-family:'a\\';fill:red';stroke:blue"/>`), "fill:red"],
+    ["Q13", svgRoot(`style="font-family:&quot;\\&quot;;${hidden};x:&quot;"`), hidden],
+    ["Q14", withDivStyle(`font-family:&quot;\\&quot;;${hidden};x:&quot;`), hidden],
+    ["a comment", svgWith(`<rect style="font-family:a/*;${hidden};*/"/>`), hidden],
+  ])("keeps no declaration that CSS reads as text in %s", (_case, svg, text) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+    const pieces = text.split(";");
+
+    expect(sanitized).toContain("<rect");
+    expect(pieces.filter((piece) => sanitized.includes(piece))).toEqual([]);
+    expect(
+      htmlParts(sanitized).filter(
+        (part) => part.includes("position") || pieces.some((piece) => part.includes(piece))
+      )
+    ).toEqual([]);
+  });
+
+  it("keeps an id list with whitespace around its ids", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgRoot(`aria-describedby=" mermaid-r1-desc " aria-labelledby=" "`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain('aria-describedby=" mermaid-r1-desc "');
+    expect(htmlParts(sanitized).filter((part) => part.includes("aria-"))).toEqual([
+      '<svg> aria-describedby=" mermaid-r1-desc "',
+    ]);
+  });
+
+  it("removes an id with whitespace in it", () => {
+    const sanitized =
+      sanitizeMermaidSvg(svgWith(`<g id=" mermaid-r1-a"/><g id="mermaid-r1-b api"/>`), ID_PREFIX) ??
+      "";
+
+    expect(htmlParts(sanitized).filter((part) => part.includes("id="))).toEqual([]);
+  });
+
+  it("reads url(#id) only as a whole function name", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(`<rect fill="xurl(#mermaid-r1-a)" stroke="-url(#mermaid-r1-a)"/>`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(htmlParts(sanitized).filter((part) => /fill|stroke/.test(part))).toEqual([]);
+  });
+
+  // Pele passes these into a style, but they can paint other content or run a worklet.
+  it.each(["element(#app)", "paint(worklet)", "attr(data-x)", "linear-gradient(red, blue)"])(
+    "removes a style that uses %s",
+    (call) => {
+      const sanitized =
+        sanitizeMermaidSvg(svgWith(`<rect style="fill:${call};stroke:red"/>`), ID_PREFIX) ?? "";
+
+      expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
+    }
+  );
+
+  it("keeps a url(#id) attribute but no url() declaration", () => {
+    const sanitized = sanitizeMermaidSvg(
+      svgWith(
+        `<rect fill="url(#mermaid-r1-a)" stroke="url( '#mermaid-r1-b' )" style="background-image:url(#mermaid-r1-c)"/>`
+      ),
+      ID_PREFIX
+    );
+
+    expect(sanitized).toContain(`fill="url(#mermaid-r1-a)" stroke="url( '#mermaid-r1-b' )"`);
+    // In a declaration Chromium fetches the page itself for url(#id).
+    expect(sanitized).not.toContain("url(#mermaid-r1-c)");
+  });
+
+  // CSS whitespace is only space, tab, LF, CR and FF. Chromium reads url(&#160;#id) as a relative
+  // URL and requests /%C2%A0 from the page's origin.
+  it.each([
+    ["W1", svgWith(`<rect fill="url(&#160;#mermaid-r1-g)"/>`), "fill"],
+    ["W2", svgWith(`<rect stroke="url(&#xFEFF;#mermaid-r1-g)"/>`), "stroke"],
+    ["W3", svgWith(`<rect fill="url(&#x3000;#mermaid-r1-g)"/>`), "fill"],
+    ["W4", svgWith(`<rect fill="url(&#x2028;#mermaid-r1-g)"/>`), "fill"],
+    [
+      "W5",
+      svgWith(peleMathLabel(MATH.replace("<mi>", `<mi mathcolor="url(&#160;#mermaid-r1-g)">`))),
+      "mathcolor",
+    ],
+    ["W29", svgWith(`<rect fill="url(&#160;'#mermaid-r1-g')"/>`), "fill"],
+    ["a vertical tab", svgWith(`<rect fill="red&#11;"/>`), "fill"],
+    ["a NEL", svgWith(`<rect fill="red&#133;"/>`), "fill"],
+    ["a non-ASCII font name", svgWith(`<rect style="font-family:Café"/>`), "style"],
+  ])("removes a CSS value with a character outside printable ASCII in %s", (_case, svg, name) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(sanitized).not.toContain(` ${name}=`);
+    expect(htmlParts(sanitized).filter((part) => part.includes(`> ${name}`))).toEqual([]);
+  });
+
+  // Pele's source limit is 50,000 characters, and Pele renders on the renderer thread.
+  it.each([
+    ["a long name", `font-family:${"a".repeat(49_000)}`],
+    ["a long whitespace run", `fill:${" ".repeat(49_000)}`],
+    ["many parentheses", `fill:${"rgb(".repeat(12_250)}`],
+  ])("checks a near-limit style with %s in linear time", (_case, style) => {
+    const svg = svgWith(`<rect style="${style}"/>`);
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toContain("<rect");
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it("keeps only the text of title and desc", () => {
+    const sanitized = sanitizeMermaidSvg(
+      svgWith("<title>tip<rect/><text>x</text></title><desc>about<g><rect/></g></desc>"),
+      ID_PREFIX
+    );
+
+    expect(htmlNodeNames(sanitized ?? "")).toEqual([
+      "svg",
+      "rect",
+      "title",
+      "#text",
+      "desc",
+      "#text",
+    ]);
+  });
+
+  it("keeps only ids, id references and url(#id) that start with its idPrefix", () => {
+    const sanitized = sanitizeMermaidSvg(
+      svgRoot(
+        `aria-labelledby="mermaid-r1-title" aria-describedby="mermaid-r1-desc&#9;review-immersive-root"`
+      ).replace(
+        "</svg>",
+        `<title id="mermaid-r1-title">t</title><desc id="api">d</desc>` +
+          `<defs><linearGradient id="mermaid-r2-g"/></defs>` +
+          `<rect fill="url(#mermaid-r1-g)" stroke="url(#mermaid-r2-g)"/></svg>`
+      ),
+      ID_PREFIX
+    );
+
+    expect(sanitized).toContain('aria-labelledby="mermaid-r1-title"');
+    expect(sanitized).toContain('<title id="mermaid-r1-title">');
+    expect(sanitized).toContain('fill="url(#mermaid-r1-g)"');
+    // window.api, an app element and another diagram's gradient.
+    expect(sanitized).not.toMatch(/"api"|review-immersive-root|mermaid-r2/);
+  });
+});
+
+describe("sanitizeMermaidSvg on Pele's output", () => {
+  let measure: { mockRestore(): void };
+  let originalXMLSerializer: typeof globalThis.XMLSerializer;
+
+  beforeAll(() => {
+    saveDomGlobals();
+    originalXMLSerializer = globalThis.XMLSerializer;
+    globalThis.document = testWindow.document as unknown as Document;
+    globalThis.XMLSerializer = chromiumMathSerializer(
+      testWindow.XMLSerializer as unknown as typeof XMLSerializer
+    );
+    // happy-dom has no layout, and Pele shows the TeX source of a 0x0 formula. happy-dom parses
+    // <math> as an HTMLUnknownElement.
+    measure = spyOn(testWindow.HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new testWindow.DOMRect(0, 0, 24, 18)
+    );
+  });
+
+  afterAll(() => {
+    measure.mockRestore();
+    globalThis.XMLSerializer = originalXMLSerializer;
+    restoreDomGlobals();
+  });
+
+  const fonts = {
+    fontFamily: themeVariable("--font-primary"),
+    fontFamilyMono: themeVariable("--font-monospace"),
+  };
+  const samples = Object.entries(PELE_SAMPLES).flatMap(([type, charts]) =>
+    charts.map((chart, index) => [`${type} ${index + 1}`, type, chart] as const)
+  );
+
+  // A Pele upgrade that emits a new element, attribute or CSS function fails here, and the
+  // removed parts name what to review.
+  it.each(samples)("removes nothing from %s", (_name, type, chart) => {
+    expect<string | null>(detectType(chart)).toBe(type);
+    // At the narrow width Pele turns wide layouts vertical.
+    for (const maxWidth of [undefined, 390]) {
+      const { svg } = renderPele(
+        chart,
+        peleRenderOptions({ idPrefix: ID_PREFIX, maxWidth, ...fonts })
+      );
+      const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement
+        .outerHTML;
+      const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+
+      expect(svg).not.toContain("$$");
+      const kept = new Set(htmlParts(sanitized ?? ""));
+      expect([...new Set(htmlParts(parsed))].filter((part) => !kept.has(part))).toEqual([]);
+      expect(sanitized).toBe(parsed);
+    }
   });
 });
