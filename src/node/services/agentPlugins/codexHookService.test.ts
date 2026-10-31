@@ -611,6 +611,25 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     );
   const followup = `echo '{"followup_message":"again"}'`;
 
+  const writeRegistry = (lockedSha: string) =>
+    fs.writeFile(
+      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
+      JSON.stringify({ plugins: [{ ...createTestPluginInstallEntry("ralph"), lockedSha }] })
+    );
+
+  /** Trust as the hooks panel records it: bound to the commit whose files the user reviewed. */
+  async function trustRalph(reviewedSha: string | undefined) {
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+    for (const hook of plugin?.cursorHooks?.hooks ?? []) {
+      await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
+        key: hook.key,
+        hash: hook.hash,
+        state: "trusted",
+        ...(reviewedSha !== undefined ? { reviewedSha } : {}),
+      });
+    }
+  }
+
   async function installRalph() {
     await fs.mkdir(path.join(root(), ".cursor-plugin"), { recursive: true });
     await fs.mkdir(path.join(root(), "hooks"), { recursive: true });
@@ -619,18 +638,8 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
       JSON.stringify({ name: "ralph" })
     );
     await writeHooks(followup);
-    await fs.writeFile(
-      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
-      JSON.stringify({ plugins: [createTestPluginInstallEntry("ralph")] })
-    );
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
-    for (const hook of plugin?.cursorHooks?.hooks ?? []) {
-      await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
-        key: hook.key,
-        hash: hook.hash,
-        state: "trusted",
-      });
-    }
+    await writeRegistry("a".repeat(40));
+    await trustRalph("a".repeat(40));
   }
 
   const args = (overrides: Partial<EnsureCodexHooksArgs> = {}): EnsureCodexHooksArgs => ({
@@ -672,6 +681,23 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     await service.ensureWorkspaceHooks(args());
     expect((await stop()).kind).toBe("continue");
     await writeHooks(`${followup} # changed`);
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
+  test("trust bound to another commit, or to none, does not run the hook", async () => {
+    // An older build updated the plugin: the registry moved on, the binding did not (Codex P1).
+    await writeRegistry("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect(await stop()).toEqual({ kind: "none" });
+    // Trust recorded without a binding covers files nobody reviewed either.
+    await trustRalph(undefined);
+    await service.ensureWorkspaceHooks(args());
+    expect(await stop()).toEqual({ kind: "none" });
+    await trustRalph("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect((await stop()).kind).toBe("continue");
+    // The per-call gate reads the registry again: a move after registration stops the next call.
+    await writeRegistry("c".repeat(40));
     expect(await stop()).toEqual({ kind: "none" });
   });
 
