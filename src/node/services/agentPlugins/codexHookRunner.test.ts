@@ -62,7 +62,6 @@ function setup(hooks: PluginHookDefinition[], answer: (input: Record<string, unk
 
 const json = (value: unknown) => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
 
-/** The model-visible error of a blocked call; undefined when the call was not blocked. */
 function blockedError(ctx: ToolExecuteContext): unknown {
   return (ctx.blocked?.result as { error?: unknown } | undefined)?.error;
 }
@@ -156,7 +155,7 @@ describe("PreToolUse", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("an error, a timeout or a missing server fails open (Codex): the tool still runs", async () => {
+  test("an error, a timeout or a missing server fails open (Codex) with no notice", async () => {
     const failing = setup([hook("PreToolUse")], () => {
       throw new Error("server crashed");
     });
@@ -175,7 +174,6 @@ describe("PreToolUse", () => {
       Promise.reject(new Error("MCP server 'guard' is not running"))
     );
     expect((await runTool(missingServer.spine, "bash", {})).executed).toBe(true);
-    // Only a malformed output blocks with a notice (D8); these failures stay quiet.
     expect([failing, slow, isError, missingServer].flatMap((h) => h.notices)).toEqual([]);
 
     const gateFails = setup([hook("PreToolUse")], () => deny);
@@ -249,8 +247,8 @@ describe("PreToolUse", () => {
           canBlock: true,
         })
       ).toEqual({ kind: "none" });
-      // An invalid output too: a block without a reason.
-      const stop = setup([hook("Stop")], () => json({ decision: "block" }));
+      const blockWithoutReason = json({ decision: "block" });
+      const stop = setup([hook("Stop")], () => blockWithoutReason);
       expect(
         await runTurnStopHooks(stop.spine, workspaceId, {
           messageId: "a1",
@@ -295,8 +293,6 @@ describe("PreToolUse", () => {
       });
     }
 
-    // An allow with updatedInput: null is an allow without a rewrite, which Codex does not
-    // support (output_parser.rs): an invalid output, so the call is blocked (D8).
     const allow = setup([hook("PreToolUse")], () =>
       json({
         hookSpecificOutput: {
@@ -418,7 +414,6 @@ describe("PreToolUse", () => {
     const pre = setup([hook("PreToolUse")], () =>
       json({ decision: "block", reason: "x", suppressOutput: "yes" })
     );
-    // The output's own block reason does not apply: the deny names the malformed field.
     expect(blockedError(await runTool(pre.spine, "bash", {}))).toContain(
       "suppressOutput is not a boolean"
     );
@@ -555,7 +550,6 @@ describe("PreToolUse", () => {
     const cases: Array<[unknown, unknown, unknown]> = [
       [rewrite("allow", { command: "ls" }), schema, { script: "ls" }],
     ];
-    // updatedInput without allow is an invalid output: the call is blocked (D8).
     const noAllow = setup([hook("PreToolUse")], () =>
       json({ hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { script: "ls" } } })
     );
@@ -1343,7 +1337,6 @@ describe("Codex output rules (output_parser.rs)", () => {
         },
       })
     );
-    // The deny next to it does not apply: the call is blocked as malformed.
     expect(blockedError(await runTool(pre.spine, "bash", {}))).toContain(
       'invalid decision "invalid"'
     );

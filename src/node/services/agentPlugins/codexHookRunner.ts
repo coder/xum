@@ -9,7 +9,8 @@
  *
  * Failure rule: every event fails OPEN, with one exception: a PreToolUse output that is malformed
  * or fails its schema check blocks the call (Cursor plugin RFC, D8). An updatedInput that fails
- * the tool's schema also blocks (blockRewrite).
+ * the tool's schema also blocks (blockRewrite), as does an input too large for the hook to check
+ * (inputTooLarge).
  *
  * Within one plugin, matching hooks run one after another in declaration order (Codex launches
  * them concurrently). Plugins run in discovery order (spine `order`), except PostToolUse: it runs
@@ -570,10 +571,6 @@ async function invoke<T extends { systemMessage?: string; invalid?: string }>(
   }
 }
 
-/**
- * The hook's decision. An output that `parse` rejects or marks `invalid` returns
- * `malformed(detail)` when it is set (PreToolUse); otherwise Xum warns and ignores it.
- */
 function applyOutput<T extends { systemMessage?: string; invalid?: string }>(
   result: unknown,
   parse: (result: unknown) => T | null,

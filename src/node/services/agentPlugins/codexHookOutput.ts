@@ -2,8 +2,7 @@
  * Reads a Codex `mcp_tool` hook's output into one decision per event, with Codex's rules
  * (openai/codex codex-rs/hooks/src/engine/output_parser.rs and hooks/src/events/*.rs).
  *
- * Two failure kinds. The runner blocks a PreToolUse call on either (Cursor plugin RFC, D8), and
- * every other event fails open:
+ * Two failure kinds:
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
  *   `additionalProperties: false`), a wrong type or a value outside an enum. Nothing of it applies.
