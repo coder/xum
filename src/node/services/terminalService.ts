@@ -40,6 +40,7 @@ import { SerializeAddon } from "@xterm/addon-serialize";
 import { NO_OSC_IDLE_FALLBACK_MS } from "@/constants/terminalActivity";
 import { getErrorMessage } from "@/common/utils/errors";
 import { shellQuote } from "@/common/utils/shell";
+import { isTerminalsDisabled } from "@/node/utils/agentToolsDisabled";
 
 /** One shell command string for terminals that take ssh as a string, not an argv. */
 function toShellCommand(argv: string[]): string {
@@ -72,7 +73,7 @@ type NativeTerminalConfig =
  * explorer model that follows injected text from an AI reply could otherwise type host commands.
  */
 function assertTerminalsEnabled(): void {
-  if (process.env.XUM_DISABLE_TERMINALS === "1") {
+  if (isTerminalsDisabled()) {
     throw new Error("Terminals are disabled on this server (XUM_DISABLE_TERMINALS=1)");
   }
 }

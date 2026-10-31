@@ -167,10 +167,6 @@ function mcpFile(
   return {};
 }
 
-/** Until Cursor hooks run (Cursor plugin RFC PR 8), every Cursor hook is listed with this reason. */
-export const CURSOR_HOOKS_REASON = "Cursor hooks run in a later Xum build";
-
-/** Inline hooks are listed here; discovery lists a hooks file that exists. */
 function readHooks(
   value: unknown,
   warnings: string[],
@@ -179,6 +175,9 @@ function readHooks(
   if (typeof value === "string") {
     const normalized = claudeComponentPath(value);
     if (normalized !== undefined) return { hooks: normalized };
+    warnings.push(
+      `'hooks' path ${JSON.stringify(value)} is outside the plugin folder; ignoring it`
+    );
     notApplied.push({
       part: "field",
       name: `hooks: ${value}`,
@@ -186,10 +185,7 @@ function readHooks(
     });
     return {};
   }
-  if (isPlainObject(value)) {
-    notApplied.push({ part: "hook", name: "hooks", reason: CURSOR_HOOKS_REASON });
-    return { hooks: value };
-  }
+  if (isPlainObject(value)) return { hooks: value };
   if (value !== undefined) invalidField("hooks", "a path or an object", warnings, notApplied);
   return { hooks: "hooks/hooks.json" };
 }

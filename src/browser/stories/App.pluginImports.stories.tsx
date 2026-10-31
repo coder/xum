@@ -44,6 +44,7 @@ const preview: AgentPluginInstallPreview = {
   consentDigest: "c".repeat(64),
   reviewedComponents: [],
   codexHooks: [],
+  fileChanges: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
   notApplied: [],

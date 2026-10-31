@@ -27,7 +27,11 @@ import type {
 } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
-import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
+import {
+  HOOK_INPUT_MAX_CHARS,
+  PLUGIN_HOOK_ORDER_BASE,
+  effectiveHookTimeoutSeconds,
+} from "@/constants/pluginHooks";
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
@@ -40,11 +44,6 @@ import {
   type HookEventName,
   type PreToolUseOutput,
 } from "./codexHookOutput";
-
-/** Spine order of discovery index 0; below the default order 0 of the shell hook middleware. */
-const CODEX_HOOK_ORDER_BASE = -1_000_000;
-/** Expanded `input` larger than this (as JSON) is not sent (PreToolUse then denies the call). */
-const HOOK_INPUT_MAX_CHARS = 64 * 1024;
 
 export interface CodexHookRunnerDeps {
   /** Per-call gate: plugin still installed, project trusted, this exact hash still trusted. */
@@ -97,7 +96,7 @@ export function registerCodexPluginHooks(
   // the tool runs with.
   const scope = {
     workspaceId: registration.workspaceId,
-    order: CODEX_HOOK_ORDER_BASE + registration.order,
+    order: PLUGIN_HOOK_ORDER_BASE + registration.order,
   };
   const unregisters: Array<() => void> = [];
   const pre = forEvent("PreToolUse");

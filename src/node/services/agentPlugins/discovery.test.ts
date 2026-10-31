@@ -2334,7 +2334,7 @@ describe("Cursor plugin discovery", () => {
     expect(plugin.skillsDirs).toBeUndefined();
   });
 
-  test("hooks/hooks.json produces no Codex hooks and one not-applied hook entry", async () => {
+  test("hooks/hooks.json produces no Codex hooks; discovery parses it as Cursor hooks", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       // Cursor's `stop` and a Codex-shaped `Stop`: the Codex loader must read neither.
@@ -2348,12 +2348,12 @@ describe("Cursor plugin discovery", () => {
     });
     const { plugin } = kit;
     expect(await loadPluginCodexHooks(plugin)).toEqual({ hooks: [], warnings: [] });
+    expect(plugin.cursorHooks?.hooks.map((hook) => [hook.key, hook.status])).toEqual([
+      ["cursor:hooks/hooks.json#stop[0]", "runnable"],
+    ]);
+    // The Codex-shaped entry has no command string: the Cursor parser drops it and says so.
     expect(plugin.notApplied).toEqual([
-      {
-        part: "hook",
-        name: "hooks/hooks.json",
-        reason: "Cursor hooks run in a later Xum build",
-      },
+      { part: "hook", name: "Stop[0]", reason: "an entry needs a command string" },
     ]);
   });
 
