@@ -9268,7 +9268,9 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     // The review lists no directories, so the user could not see this change anyway.
     await install();
     const shown = await service.getHooks({ name: "looper" });
-    await fsPromises.chmod(path.join(muxRoot, "plugins", "looper", "skills"), 0o700);
+    const skills = path.join(muxRoot, "plugins", "looper", "skills");
+    const { mode } = await fsPromises.stat(skills);
+    await fsPromises.chmod(skills, (mode & 0o777) === 0o755 ? 0o700 : 0o755);
     const [stop] = shown.hooks;
     await service.setHookTrust({
       name: "looper",
