@@ -139,7 +139,7 @@ Body
         description: "Delegate",
         base: "exec",
         ui: { hidden: true },
-        subagent: { runnable: true },
+        subagent: { runnable: true, background_hint: true },
         prompt: { append: false },
       });
     });
