@@ -53,10 +53,8 @@ import { assertTaskAttemptId, isTaskAttemptId } from "@/node/utils/taskAttemptId
 
 /**
  * Bound on waiting for an owned predecessor's in-flight settlement write before deciding a
- * successor's lineage (evaluateAttemptLineage), and on a failed direct launch's wait for the
- * owners its stop cascade captured before its rollback (TaskService.create). Elapsing the bound
- * is a decision — unproven lineage, deferred rollback — not an error; the write or the cascade
- * keeps its own ownership and completes on its own.
+ * successor's lineage (evaluateAttemptLineage). Elapsing the bound is a decision (unproven
+ * lineage), not an error; the write keeps its own ownership and completes on its own.
  */
 export const ATTEMPT_CLOSURE_SETTLE_WAIT_MS = 5_000;
 

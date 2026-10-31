@@ -60,14 +60,6 @@ export class DesktopInputCoordinator {
     return this.resolveFromConfig(this.config.loadConfigOrDefault(), workspaceId);
   }
 
-  withReservation<T>(
-    ownerWorkspaceId: string,
-    borrowerWorkspaceId: string,
-    reserve: () => Promise<T>
-  ): Promise<T> {
-    return this.withReservations([{ ownerWorkspaceId, borrowerWorkspaceId }], reserve);
-  }
-
   async withReservations<T>(
     reservations: ReadonlyArray<{ ownerWorkspaceId: string; borrowerWorkspaceId: string }>,
     reserve: () => Promise<T>

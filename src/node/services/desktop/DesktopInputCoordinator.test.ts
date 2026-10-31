@@ -185,7 +185,10 @@ describe("DesktopInputCoordinator", () => {
           "admit"
         );
         expect(
-          await coordinator.withReservation("owner", "next", () => Promise.resolve("reserved"))
+          await coordinator.withReservations(
+            [{ ownerWorkspaceId: "owner", borrowerWorkspaceId: "next" }],
+            () => Promise.resolve("reserved")
+          )
         ).toBe("reserved");
         // The archived requester itself stays denied.
         expect(coordinator.withInput("child", () => Promise.resolve())).rejects.toThrow("archived");
@@ -295,7 +298,10 @@ describe("DesktopInputCoordinator", () => {
         const admission =
           mode === "admission"
             ? other.withAdmission("child", admit)
-            : other.withReservation("owner", "child", admit);
+            : other.withReservations(
+                [{ ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" }],
+                admit
+              );
         try {
           // Flush the independent coordinator's local gate; it must still wait for owner input.
           await Promise.resolve();
@@ -318,23 +324,32 @@ describe("DesktopInputCoordinator", () => {
       const entered = deferred();
       const release = deferred();
       let losingCallback = false;
-      const first = coordinator.withReservation("owner", "first", async () => {
-        entered.resolve();
-        await release.promise;
-        await write([owner, borrower("first", { taskStatus: "queued" })]);
-      });
+      const first = coordinator.withReservations(
+        [{ ownerWorkspaceId: "owner", borrowerWorkspaceId: "first" }],
+        async () => {
+          entered.resolve();
+          await release.promise;
+          await write([owner, borrower("first", { taskStatus: "queued" })]);
+        }
+      );
       await entered.promise;
-      const second = coordinator.withReservation("owner", "second", () => {
-        losingCallback = true;
-        return Promise.resolve();
-      });
+      const second = coordinator.withReservations(
+        [{ ownerWorkspaceId: "owner", borrowerWorkspaceId: "second" }],
+        () => {
+          losingCallback = true;
+          return Promise.resolve();
+        }
+      );
       const rejected = second.catch((error: unknown) => error);
       release.resolve();
       await first;
       expect(String(await rejected)).toContain("controlled by");
       expect(losingCallback).toBe(false);
       expect(
-        await coordinator.withReservation("owner", "first", () => Promise.resolve("same"))
+        await coordinator.withReservations(
+          [{ ownerWorkspaceId: "owner", borrowerWorkspaceId: "first" }],
+          () => Promise.resolve("same")
+        )
       ).toBe("same");
     });
   });
