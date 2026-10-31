@@ -3589,10 +3589,13 @@ export class AgentPluginInstallService {
     method: AgentPluginInstallMethod | null | undefined
   ): Promise<AgentPluginMarketplaceListing | undefined> {
     if (method != null || source.subpath !== undefined) return undefined;
-    const contents = {
-      cursor: await this.readMarketplaceAtCommit(staged.dir, staged.sha, "cursor"),
-      claude: await this.readMarketplaceAtCommit(staged.dir, staged.sha, "claude"),
-    };
+    // A read error waits for the manifest guard: a root plugin still previews beside a marketplace
+    // file that is not a regular file or is too large.
+    const read = (file: MarketplaceFile) =>
+      this.readMarketplaceAtCommit(staged.dir, staged.sha, file).catch((error: unknown) =>
+        error instanceof Error ? error : new Error(getErrorMessage(error))
+      );
+    const contents = { cursor: await read("cursor"), claude: await read("claude") };
     if (contents.cursor === undefined && contents.claude === undefined) return undefined;
     const { methods } = await detectInstallMethods(staged.dir);
     if (methods.some(isOwnManifestMethod)) return undefined;

@@ -526,13 +526,13 @@ export interface ParsedMarketplaces {
 }
 
 /**
- * Parse the marketplace files of a root (undefined: the commit has no such file; at least one
- * exists). One file alone fails the listing when it does not parse, as before Cursor files
- * existed. With both, a broken file becomes a warning and the other file still lists; only two
- * broken files fail.
+ * Parse the marketplace files of a root (undefined: the commit has no such file; an Error: the
+ * file could not be read; at least one exists). One file alone fails the listing when it does
+ * not parse, as before Cursor files existed. With both, a broken file becomes a warning and the
+ * other file still lists; only two broken files fail.
  */
 export function parseMarketplaces(
-  contents: Record<MarketplaceFile, string | undefined>
+  contents: Record<MarketplaceFile, string | Error | undefined>
 ): ParsedMarketplaces {
   const files: ParsedMarketplaces["files"] = { cursor: null, claude: null };
   const errors: string[] = [];
@@ -542,6 +542,7 @@ export function parseMarketplaces(
     if (content === undefined) continue;
     present++;
     try {
+      if (content instanceof Error) throw content;
       files[file] = parseClaudeMarketplace(content, MARKETPLACE_RELATIVE_PATHS[file]);
     } catch (error) {
       errors.push(getErrorMessage(error));

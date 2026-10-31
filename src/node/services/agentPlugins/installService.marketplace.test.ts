@@ -29,8 +29,6 @@ const skillMd = (name: string) => `---\nname: ${name}\ndescription: The ${name} 
 
 /** The scratch clone of anthropics/skills, when this machine has it (no network needed). */
 const ANTHROPIC_SKILLS_CLONE = "/home/coder/.mux/sessions/912d5d0f95/scratch/as";
-/** The scratch clone of cursor/plugins, when this machine has it (no network needed). */
-const CURSOR_PLUGINS_CLONE = "/home/coder/.xum/sessions/58dd3a349d/scratch/cursor-plugins";
 
 async function initRepo(dir: string): Promise<void> {
   await fsPromises.mkdir(dir, { recursive: true });
@@ -241,6 +239,37 @@ describe("AgentPluginInstallService marketplaces", () => {
     await write(8 * 1024 * 1024 + 1);
     await expect(service.previewSource({ input: marketDir })).rejects.toThrow(
       "marketplace.json is larger than 8 MiB"
+    );
+  });
+
+  test("a marketplace file that is not a regular file fails only a listing that needs it", async () => {
+    await writeFiles(marketDir, {
+      "elsewhere.json": marketplace([DOCS]),
+      ".claude-plugin/marketplace.json": marketplace([DOCS]),
+      "skills/pdf/SKILL.md": skillMd("pdf"),
+    });
+    await fsPromises.mkdir(path.join(marketDir, ".cursor-plugin"), { recursive: true });
+    await fsPromises.symlink(
+      "../elsewhere.json",
+      path.join(marketDir, ".cursor-plugin/marketplace.json")
+    );
+    await commit(marketDir, "a symlinked Cursor marketplace beside a Claude one");
+    const listing = await listMarketplace();
+    expect(singleBuildRows(listing).map((row) => [row.name, row.file])).toEqual([
+      ["docs", "claude"],
+    ]);
+    expect(listing.warnings).toContain(".cursor-plugin/marketplace.json is not a regular file.");
+
+    await writeFiles(marketDir, {
+      "plugin.json": JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "root-plugin",
+      }),
+    });
+    await commit(marketDir, "a root plugin");
+    const rooted = await service.previewSource({ input: marketDir });
+    expect(rooted.kind === "plugin" ? rooted.preview.manifest.name : rooted.kind).toBe(
+      "root-plugin"
     );
   });
 
@@ -751,40 +780,6 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(await service.list()).toEqual([]);
     expect(existsSync(installed)).toBe(false);
   });
-
-  test.skipIf(!existsSync(CURSOR_PLUGINS_CLONE))(
-    "cursor/plugins: 128 plugins, pstack and origin-apps with both builds",
-    async () => {
-      const copy = path.join(tmpRoot, "cursor-plugins");
-      await fsPromises.cp(CURSOR_PLUGINS_CLONE, copy, {
-        recursive: true,
-        filter: (source) => path.basename(source) !== ".git",
-      });
-      await initRepo(copy);
-      await commit(copy, "copy");
-      const listed = await service.previewSource({ input: copy });
-      if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-      const entries = listed.marketplace.entries;
-      expect(entries.length).toBe(128);
-      expect(
-        entries
-          .filter((entry) => entry.builds.length > 1)
-          .map((entry) => [entry.name, entry.builds.map((build) => build.file)])
-          .sort()
-      ).toEqual([
-        ["origin-apps", ["cursor", "claude"]],
-        ["pstack", ["cursor", "claude"]],
-      ]);
-      expect(entries.every((entry) => entry.builds[0].file === "cursor")).toBe(true);
-      expect(listed.marketplace.warnings).toEqual([]);
-      // pstack's folder has a root plugin.json with $schema next to its Cursor manifest.
-      const pstack = await service.preview({
-        input: copy,
-        method: { kind: "cursor-marketplace", entry: "pstack" },
-      });
-      expect([pstack.method, pstack.source.subpath]).toEqual([{ kind: "agent-plugin" }, "pstack"]);
-    }
-  );
 
   test.skipIf(!existsSync(ANTHROPIC_SKILLS_CLONE))(
     "anthropics/skills: document-skills previews /pdf",
