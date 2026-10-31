@@ -273,6 +273,19 @@ describe("failures warn once and never block", () => {
     ]);
   });
 
+  test("the exit 127 notice marks a bidi override in the command", async () => {
+    // U+202E would draw the rest of the notice right to left: "hs.x" could read as "x.sh".
+    const command = "./hooks/\u202Ehs.x";
+    const h = harness({
+      hooks: await hooksOf({ stop: [{ command }] }),
+      runtime: fakeRuntime({ [command]: { exitCode: 127 } }),
+    });
+    await h.stop();
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0]).toContain("`./hooks/<U+202E>hs.x`: a command");
+    expect(h.notices[0]).not.toContain("\u202E");
+  });
+
   test("failClosed: true changes nothing for stop: a crash adds no reason and one notice", async () => {
     const h = harness({
       hooks: await hooksOf({ stop: [{ command: "./s.sh", failClosed: true }] }),

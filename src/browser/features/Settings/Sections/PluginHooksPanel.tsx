@@ -286,7 +286,7 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                     }
                   />
                 )}
-                <p className="text-muted break-all">{hook.source}</p>
+                <p className="text-muted break-all">{showOneLineControls(hook.source)}</p>
                 {isCursorHookHandler(hook.handler) && (
                   <p className="text-muted">{CURSOR_HOOK_REMOTE_NOTE}</p>
                 )}
@@ -346,7 +346,8 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
         <ul className="text-warning space-y-1 text-xs">
           {data.warnings.map((warning) => (
             <li key={warning} className="break-words">
-              {warning}
+              {/* A warning quotes plugin text (paths, event names): its controls are marked. */}
+              {showOneLineControls(warning)}
             </li>
           ))}
         </ul>
