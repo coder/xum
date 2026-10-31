@@ -282,12 +282,13 @@ marked "(Dn)" at the step it changes.
 | D27 | The sub-agent header shows the model only, not where it came from (T11). | 7, PR 4 |
 | D28 | A Cursor hook failure logs a warning and shows one chat notice per workspace and hook. The hooks panel shows no failure state. | 5.5, PR 8 |
 | D29 | The `cursor` MCP dialect has the Codex shape: `type: "http"` and a `url` without `type` both become `streamable-http`. Only the two plugin roots expand, so `${CURSOR_PLUGIN_DATA}` counts as a user value. | 4, PR 3 |
+| D30 | A plugin's first file review lists every file. When the staged tree has a runnable Cursor command hook and the installed tree is missing or has none, the review compares the staged tree with an empty tree. That covers a first install and an update that adds the first such hook. | 5.1, PR 8 |
 
 After the Goldfish review, the owner delegated the remaining trade-offs
-(2026-10-31). The final set is D1-D29: the owner decided D1-D21, and the Stage 9
-re-audit added D22-D29 under the same delegation. The rule for D22-D29: build
-what the 128 marketplace plugins use today, track the rest, and prefer the
-smaller and more secure option.
+(2026-10-31). The final set is D1-D30: the owner decided D1-D21, the Stage 9
+re-audit added D22-D29, and the review of this RFC added D30, all under the
+same delegation. The rule for D22-D30: build what the 128 marketplace plugins
+use today, track the rest, and prefer the smaller and more secure option.
 
 ### Shape of the change
 
@@ -452,48 +453,82 @@ flowchart LR
 
 ### 5. Hooks
 
+Sections 5.1 to 5.6 are the contract for Cursor hooks: what runs, its input and
+output, and the rules it must keep. PR 8 builds the contract under its own
+security review and settles each mechanism there. PR 8.7 has a test for each
+rule.
+
 #### 5.1 Parse, list and trust
 
-*   A new `cursorHooks.ts` parses Cursor `hooks.json`:
+*   Format: a new `cursorHooks.ts` parses Cursor `hooks.json`:
     `{version: 1, hooks: {<event>: [{command, type?, matcher?, timeout?,
     loop_limit?, failClosed?}]}}`, from `hooks/hooks.json` or the manifest's
-    `hooks` value. Invalid entries drop with a warning, as in `codexHooks.ts`.
-*   Schema: `PluginHookHandlerSchema`
-    (`src/common/orpc/schemas/agentPlugins.ts:57-72`) gains a variant
-    `{type: "cursor-command", command: string, timeoutSeconds?: number,
-    loopLimit?: number | null, failClosed?: boolean}`. `AgentPluginHookSchema`
-    is unchanged. The trust hash stays `hashHookDefinition` over the event, the
-    matcher and the handler entry as declared, so a change to `command`,
-    `timeout`, `loop_limit` or `failClosed` asks for trust again. `runnable`
-    now also means a `cursor-command` handler on a mapped event.
-*   Loader: the Codex loader (`loadPluginCodexHooks`, `codexHooks.ts:171`)
-    returns no hooks for a Cursor package, so only `cursorHooks.ts` reads its
-    `hooks/hooks.json`. Trust keys use the source `cursor:hooks/hooks.json`, so
-    they cannot collide with Codex keys.
-*   Each hook gets a status from the existing enum
-    (`common/orpc/schemas/agentPlugins.ts:79-84`): `runnable` for a mapped
-    event with a `command` handler and no `matcher`, `ignored-event` for an
-    unmapped event or a hook with a `matcher` (D9), `unsupported-handler` for
-    `type: "prompt"`.
-*   Trust reuses `pluginHookTrust.ts` (`{hash, state}` per hook) and today's
+    `hooks` value (a path or an inline object). Invalid entries drop with a
+    warning, as in `codexHooks.ts`. The Codex loader (`loadPluginCodexHooks`)
+    returns no hooks for a Cursor package, so only `cursorHooks.ts` reads them.
+*   Hook-source reads: Xum reads a hooks file only inside the plugin folder. A
+    path that leaves the folder, through `..` or a symlink, gives no hooks and
+    a warning. The read keeps the Codex loader's caps: 256 KiB per file
+    (`MAX_HOOKS_FILE_BYTES`), 256 hooks (`MAX_PLUGIN_HOOKS`) and 50 kept
+    warnings (`MAX_HOOK_WARNINGS`, `codexHooks.ts:116-131`).
+*   Keys: each hook's trust key is `cursor:<source>#<event>[<index>]`, where
+    `<source>` is the hooks file path or `plugin.json#hooks`. A Cursor key
+    cannot collide with a Codex key.
+*   Trust (D1): `pluginHookTrust.ts` (`{hash, state}` per hook) with today's
     hash, `hashHookDefinition` (`codexHooks.ts:696-699`): the event, the
-    matcher and the handler entry exactly as declared (D1). The hash covers the
+    matcher and the handler entry exactly as declared. A change to any declared
+    field, unknown fields included, asks for trust again. The hash covers the
     `hooks.json` entry only, not the scripts that the command runs.
-*   Update review of hook scripts (D1): for a plugin with at least one runnable
-    Cursor command hook, the update review lists every file that the update
-    adds, removes or changes, inside skill, rule, agent and workflow folders
-    too. A hook can run or source any file in the plugin. A skill row shows
-    only the frontmatter and directive lines (`componentConsent.ts:238-246`),
-    and an agent row only the frontmatter (`:310-319`). Neither shows the
-    body or a helper such as `skills/foo/lib.sh`. The review compares the
-    per-file records that `hashPluginTree` (`treeHash.ts:12-97`) already
-    builds for the installed tree and the staged tree: path, mode and content
-    hash. A small text file shows its before and after text, taken from the
-    same `O_NOFOLLOW`, identity-checked read that hashes it, so Xum reads no
-    file a second time. A symlink shows its link text, never its target. Any
-    other file shows "changed". The review keeps
-    its size cap (`assertReviewFits`, `installService.ts:586-597`). This runs
-    once per update, not on each hook run.
+*   Trust display: the trust prompt and the hooks panel show every field that
+    the hook hash covers. That is the event, the matcher and the entry as
+    declared, with its unknown fields and the declared value of each field
+    that Xum clamps. A hook with `loop_limit: 80` shows 80 and runs with 50.
+    Two entries with different hashes never look the same. Invisible and bidi
+    controls in the entry show as visible marks, as in every review.
+*   Status: each hook gets one from the existing enum
+    (`common/orpc/schemas/agentPlugins.ts:79-84`). `runnable` is a mapped event
+    with a `command` handler and no `matcher`. `ignored-event` is an unmapped
+    event or a hook with a `matcher` (D9). `unsupported-handler` is
+    `type: "prompt"`. A hook that does not run has one reason: "prompt hooks
+    are not applied in Xum", "event not applied in Xum" or "matcher not applied
+    in Xum". The install review, the plugin card and the hooks panel show that
+    reason. The hooks panel never shows the shared Codex status note for a
+    Cursor hook, because that note describes Codex handlers and events.
+*   File review (D1, D30): a hook can run or source any file in the plugin, so
+    a plugin whose staged tree has a runnable Cursor command hook gets a review
+    of its files.
+    *   An update review lists every file that the update adds, removes or
+        changes. It skips no folder, so files under skill, rule, agent and
+        workflow folders are listed too. A skill row shows only the frontmatter
+        and directive lines (`componentConsent.ts:238-246`), and an agent row
+        only the frontmatter (`:310-319`). Neither shows a body or a helper
+        such as `skills/foo/lib.sh`, and a component root can be the plugin
+        root.
+    *   First file review (D30): when the installed tree is missing or has no
+        runnable Cursor command hook, the review compares the staged tree with
+        an empty tree, so it lists every staged file as added. That covers a
+        first install and an update that adds the plugin's first runnable hook.
+        The user sees every file of the plugin before any of its hooks can be
+        trusted.
+    *   Rows: a UTF-8 text file of at most 64 × 1024 bytes shows its text (the
+        new text of an added file, the old text of a removed one, both for a
+        change), with invisible controls marked as in every review. A symlink
+        shows its link text, never its target. Any other file shows only
+        "added", "removed" or "changed".
+    *   Change detection compares per-file records: the path relative to the
+        plugin folder, the mode, and the content hash or link text. A record
+        does not depend on the folder that the tree sits in, so an unchanged
+        file compares equal between the installed tree and the staged tree.
+    *   Reads: Xum opens a file for the review only when it is a regular file
+        inside the plugin folder, never through a symlink. The text shown is
+        the text hashed, and a file that changes during the walk fails the
+        review. Every file counts against the staged-tree quota
+        (`STAGED_TREE_MAX_BYTES`, `STAGED_TREE_MAX_FILES`). No byte from
+        outside the plugin folder reaches a review.
+    *   Size: the review keeps its cap (`assertReviewFits`,
+        `installService.ts:586-597`). A review too large to show fails closed
+        with its existing message, at install and at update.
+    *   The review runs once per install or update, not on each hook run.
     *   Accepted risk: a script edited on disk after install, outside an update
         (`stop-hook.sh`, the `lib.sh` it sources, a `bun` import), runs on the
         host with no new review.
@@ -501,6 +536,10 @@ flowchart LR
         the Xum home can also change Xum's config and the hook trust file, so a
         check before each run does not stop that attacker. The check also costs a
         folder walk on every hook run.
+    *   Accepted gap: a Cursor plugin installed by a build that has PR 2 and
+        not PR 8 got no file review. After the upgrade its hooks show as `new`,
+        and its next update review lists only the files that the update
+        changes. Reinstalling the plugin shows the first file review.
     *   Rejected: hashing the whole plugin folder before each run, and hashing
         each script a command names. See Alternatives Considered.
 *   Kill switches (D6): the runner refuses to start any hook process when
@@ -541,24 +580,48 @@ tool events in T1.
 
 #### 5.4 The runner
 
-*   A new `cursorHookRunner.ts` registers on the spine beside the Codex runner
-    (`codexHookService.ts:94-125`). It shares these parts with the Codex runner:
-    the per-call trust check (`isHookAllowed`, `codexHookService.ts:215-218`,
-    which reloads the hooks in the plugin's own format, 8.3), the
-    project-trust gate, spine registration and order, and the chat notice
-    route (`deps.notifyUser`, `plugin.hook.notice`). New code covers only the
-    process start, the environment, the input JSON and the failure table (5.5).
-*   It starts one process per hook call through the workspace runtime's
-    `exec`, with the hook input as JSON on stdin and JSON read from stdout. In
-    local and worktree workspaces `exec` starts a host process. Remote
-    workspaces run no Cursor hooks (5.6). Today plugin code starts two kinds of
-    processes: the install-time `git` call (`installService.ts:1031`) and
-    plugin stdio MCP servers (`prepareStdioLaunch`,
-    `mcpServerManager.ts:1026-1036`, with `hostEnv: "minimal"`). This runner is
-    the first to run a plugin command on a hook event. It builds its
-    environment with the same minimal-environment option.
-*   `CURSOR_PLUGIN_ROOT` is the install folder. Xum never sets
-    `CURSOR_CODE_REMOTE`, because Cursor hooks do not run in remote workspaces.
+*   Hook points: a new `cursorHookRunner.ts` runs `afterAgentResponse` and then
+    `stop` on `turn.stop`, and `afterFileEdit` on `tool.execute` after the tool
+    runs (D25). A failed tool call runs no hook. Matching hooks run in
+    sequence, as Codex hooks do. The runner shares the Codex runner's spine
+    registration, its project-trust gate and its chat notice route
+    (`plugin.hook.notice`).
+*   Process: each hook call starts one process through the workspace runtime's
+    `exec`, with the input JSON on stdin and the output JSON read from stdout.
+    Today plugin code starts two kinds of processes: the install-time `git`
+    call (`installService.ts:1031`) and plugin stdio MCP servers
+    (`prepareStdioLaunch`, `mcpServerManager.ts:1026-1036`, with
+    `hostEnv: "minimal"`). This runner is the first to run a plugin command on
+    a hook event. It uses the same minimal host environment.
+*   Start conditions: a hook process starts only when all of these hold at the
+    time of the call. A call that fails one starts no process. Only the
+    input-size and trust-store cases warn (5.5). The others show no notice,
+    because bug-bash runs set the kill switches and the hooks panel shows the
+    remote and trust state.
+    *   No kill switch is set (D6, 5.1).
+    *   The workspace is local or a worktree (D7). SSH, Docker and devcontainer
+        workspaces start no Cursor hook process (5.6).
+    *   The chat is not a `/side` chat, and plugin MCP is allowed, as for Codex
+        hooks (`canRunCodexHooks`, `codexHookService.ts:67-70`).
+    *   The project-trust gate that Codex hooks use passes.
+    *   The user trusts the hook, and the plugin still declares it with the
+        same key and hash. The check rereads the hooks in the plugin's own
+        format on every call (PR 8.3), so a trusted Cursor hook passes and a
+        changed entry fails.
+    *   The input fits `HOOK_INPUT_MAX_CHARS`, and Xum can read its trust store
+        (5.5).
+    *   No user Stop has landed (see Cancellation).
+*   Cancellation: a user Stop at any time before or during a hook call kills
+    the hook's process group and applies nothing. A call that has not started a
+    process when Stop lands never starts one. That holds at every point: before
+    the `turn.stop` chain starts, between two hooks, while `exec` prepares the
+    process, and while the process runs. An aborted call shows no notice. Both
+    hook points carry an abort signal that a user Stop aborts. `tool.execute`
+    has one today (`eventSpine.ts:94`), and `turn.stop` gets one in PR 8.
+*   Output capture: Xum reads stdout and stderr while the hook runs. It keeps
+    at most 64 × 1024 bytes of stdout and no stderr, and it discards the rest
+    without blocking the hook, so a hook that writes past a cap never stalls on
+    a full pipe. Stdout of more than 64 × 1024 bytes is invalid output (5.5).
 *   Exit code 127 (command not found) is a failure (5.5) with the reason
     "`<command>` not found in this workspace". A machine without `jq` or `bun`
     gives this result.
@@ -571,14 +634,6 @@ tool events in T1.
     `effectiveHookTimeoutSeconds` (`src/constants/pluginHooks.ts:2-7`): a
     declared `timeout` in seconds, else 10 s, capped at 30 s, the same as Codex
     hooks. A timeout counts as a crash under the failure rules (5.5).
-*   Cancellation: a user Stop aborts a running hook. The runner passes the
-    event's abort signal to `exec` (`abortSignal`, `Runtime.ts:76-77`), and
-    the local runtime then kills the process group
-    (`LocalBaseRuntime.ts:376-381`). An aborted call applies nothing and shows
-    no notice. `tool.execute` has the signal today (`eventSpine.ts:94`).
-    `turn.stop` gets one in PR 8. A Stop that lands after the stream ends and
-    before the hooks start gives them an already aborted signal (PR 8.2), so
-    no hook process starts.
 *   Working folder: the plugin folder, except `stop` (and, later,
     `subagentStop`), which run from the workspace root, as Cursor documents.
 *   `command` runs as written (D17). Xum does not
@@ -594,7 +649,8 @@ tool events in T1.
     [hooks.md](https://cursor.com/docs/hooks.md).
     `CURSOR_PROJECT_DIR` and `CLAUDE_PROJECT_DIR` are the workspace root.
     `CURSOR_PLUGIN_ROOT` is the plugin folder. `PATH` and `HOME` pass through.
-    `CURSOR_USER_EMAIL` is never set.
+    `CURSOR_USER_EMAIL` is never set. Xum never sets `CURSOR_CODE_REMOTE`,
+    because Cursor hooks do not run in remote workspaces.
 *   `CURSOR_VERSION` and the transcript (D18):
     *   `CURSOR_VERSION` is `xum-<version>`. A hook that parses it as a Cursor
         version fails visibly instead of trusting a fake one. No marketplace
@@ -620,8 +676,11 @@ tool events in T1.
         A turn that ends on a tool part still gives `null` (#6067), and Xum
         then passes `text: ""`.
     *   `stop`: `status` is `"completed"` (D5: no stop hook runs after a user
-        Stop or an error) and `loop_count` follows section 6: the hook's own
-        count, read from the `turn.stop` context before the hook runs.
+        Stop or an error). `loop_count` is `turnContinuations` (section 6), the
+        number of continuations in this user turn from any source, a plugin
+        hook or a Xum nudge. An observer hook that never continues the turn
+        therefore sees a nonzero count on every continued turn. Each hook's
+        limit still counts only its own continuations (`hookContinuations`).
     *   `afterFileEdit` (D25): `file_path` is the tool's resolved `path`
         (absolute). For `file_edit_replace_string`, `edits` is
         `[{old_string, new_string}]` from the tool input. For
@@ -704,15 +763,21 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         TODO or status nudges shows no notice, and still counts toward n.
 *   Counting scope (D4): per user turn, for
     every hook source, as today. Each hook's count and the 50 ceiling reset
-    when a user turn starts, and stay in memory. `loop_count` in the hook input
-    is that hook's own count in the current user turn. Xum puts every hook's
-    count on the `turn.stop` context before the chain runs, because a Cursor
-    hook builds its input while the chain runs.
+    when a user turn starts, and stay in memory. `loop_count` in a Cursor
+    `stop` hook's input is `turnContinuations`, the number of continuations in
+    the current user turn from any source, a plugin hook or a Xum nudge. A
+    hook's limit counts only that hook's own continuations
+    (`hookContinuations`). Xum puts both counts on the `turn.stop` context
+    before the chain runs, because a Cursor hook builds its input while the
+    chain runs.
     *   Reason: Cursor's own plugins expect this, although Cursor's docs say
         "for this conversation". Continual-learning counts a stop as a user
         turn only when `loop_count === 0` (`continual-learning-stop.ts:137-139`),
         and advisor expects to nudge again after the user answers
         (`stop-hook.sh:32-37`). Both break if the count never resets.
+        Continual-learning also breaks if a continuation by another hook or a
+        nudge leaves its count at 0, because it then treats each continued
+        turn as a new user turn and repeats its transcript work.
     *   A Codex hook continues a user turn at most 3 times, as today, but the
         count is that hook's own. A nudge or another hook does not count
         against it, so one user turn can have more than 3 continuations
@@ -860,7 +925,7 @@ Each one needs a line in the release notes.
 
 | Risk | Failure mode | Mitigation | Owner |
 | --- | --- | --- | --- |
-| Hook scripts run on the host | A script changed by an upstream update, or by a local edit, runs on the host. | The update review lists every changed file (5.1). A local edit outside an update is an accepted risk. | D1 |
+| Hook scripts run on the host | A script changed by an upstream update, or by a local edit, runs on the host. | The first file review lists every file, and each update review lists every changed file (5.1). A local edit outside an update is an accepted risk. | D1, D30 |
 | Cost of stop loops | A `loop_limit: null` hook continues up to 50 paid turns per user message. After a user Stop the loop stays active (CUJ 3), so each later message can spend up to 50 more until the plugin ends it. | The ceiling of 50, the chat notice on each continuation, and the user Stop. | D2, D4 |
 | Hook process load | One process per hook call. Matching hooks run in sequence (`codexHookRunner.ts:17-19`), and each call is capped at 30 s. | The shared timeout rule. The kill switches stop all hook processes. | D16 |
 | A broken Codex guard blocks the agent | Malformed output from a Codex `PreToolUse` hook blocks every matching tool call. | One chat line names the plugin, the hook and how to turn it off (5.5). | D8 |
@@ -1171,7 +1236,8 @@ and names the decision that rejected it.
     and this design does not change how they start.
     *   A hook runs only after the user trusts its exact `hooks.json` entry.
     *   The update review lists every changed file of a plugin with a runnable
-        Cursor command hook (D1).
+        Cursor command hook (D1), and the first file review lists every file
+        (D30).
     *   Cursor hooks run only in local and worktree workspaces (D7).
     *   All three `XUM_DISABLE_*` switches stop every hook process. This RFC does
         not change whether the switches stop plugin stdio MCP servers.
@@ -1192,9 +1258,15 @@ and names the decision that rejected it.
         (`agentDefinition.ts:21-42`).
     *   An older build skips a folder whose only manifest is a Cursor manifest,
         as at `0f82063e7e`, so an installed Cursor plugin loads nothing there.
-        A registry entry with the new method `cursor-plugin` is one an older
-        build cannot parse, and it still owns its name
-        (`installService.ts:3791-3800`).
+    *   The registry entry of a Cursor install stays readable by an older
+        build. The entry records no install method
+        (`AgentPluginInstallEntrySchema`, `agentPluginInstalls.ts:81-122` at
+        `85abd10b10`), and this design adds no field to it. The `cursor-plugin`
+        kind exists only in preview and install requests. Xum detects the
+        Cursor format from the plugin's files each time it loads or updates the
+        plugin (`selectManifest`, `detectInstallMethods`). After a downgrade the
+        older build lists the plugin as a managed install with a missing folder
+        (`installService.ts:5391`), and the user can uninstall it there.
     *   Xum writes no generated manifest or marker for Cursor plugins (D23).
     *   The changes to shipped behavior are listed in section 8.
 
@@ -1621,7 +1693,9 @@ whose folder has no manifest is refused.
         `z.object({kind: z.literal("cursor-marketplace"), entry:
         z.string().min(1)})` to `AgentPluginInstallMethodSchema` (line 168). The
         doc comment says `cursor-marketplace` is a preview selector that
-        install never gets back.
+        install never gets back. Neither kind is stored. The registry entry
+        records no install method, and PR 2 adds no field to
+        `AgentPluginInstallEntrySchema` (Non-Functional Requirements).
     *   Add `builds` to `AgentPluginMarketplaceEntrySchema` (lines 242-266):
         `z.array(z.object({file: z.enum(["cursor", "claude"]), sourceKind,
         source, skillCount, installable, reason})).min(1)`, one element per
@@ -1730,6 +1804,9 @@ whose folder has no manifest is refused.
     *   a preview of a Cursor folder with `rules/a.mdc` (`alwaysApply: true`),
         `rules/b.mdc` (`globs`) and one skill gives the rules the `ruleType`
         values `always-apply` and `glob`, and the skill none.
+    *   An installed Cursor plugin whose `.cursor-plugin/plugin.json` is
+        removed, which is the folder as an older build reads it, is still
+        listed as a managed install and uninstalls.
 *   `src/browser/features/Settings/Sections/PluginsSettingsSection.stories.tsx`
     (Modify): a story with a two-build row and a `notApplied` list, at desktop
     and phone widths (AGENTS.md mobile rule).
@@ -1792,9 +1869,15 @@ Files: `src/node/services/agentPlugins/mcpConfig.ts`,
         remove the `auth` key from the entry and add "auth not applied in Xum"
         to the server's `ignored` list, which the consent preview shows as the
         server's warning (line 616-629). The server still connects.
-    *   `openaiMcpAuth.ts`: add `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT`
-        to `RESERVED_ENV_NAMES` (line 285), so a plugin's `env_vars` cannot
-        forward them.
+    *   Reserved names (`cursor` dialect only): Xum supplies
+        `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` to a Cursor server, so the
+        server must not set them in `env` or forward them in `env_vars`.
+        `stdioEnvError` already refuses a supplied name in `env`
+        (`mcpConfig.ts:313`). `readCodexEnvVars` (`openaiMcpAuth.ts:326`) also
+        refuses a forwarded name that the dialect supplies, with its
+        reserved-variable error (line 338). `RESERVED_ENV_NAMES` (line 285)
+        does not change, so Codex and Agent Plugin servers can still set or
+        forward both names.
 
 #### 3.2 Tests for PR 3
 
@@ -1814,6 +1897,9 @@ Files: `src/node/services/agentPlugins/mcpConfig.ts`,
         "auth not applied in Xum";
     *   the `claude` and `codex` dialects keep their results for the same
         inputs (their existing tests pass unchanged).
+    *   A `cursor` server that forwards `CURSOR_PLUGIN_ROOT` in `env_vars` is
+        skipped with the reserved-variable error. A `codex` server that
+        forwards it, or sets `CLAUDE_PLUGIN_ROOT` in `env`, still loads.
 *   `src/node/services/agentPlugins/expansion.test.ts` (Modify):
     `${CURSOR_PLUGIN_ROOT}` expands only when supplied.
 *   `tests/bugbash/pluginInstallFixtures.ts` (Modify): add the fixture
@@ -2148,9 +2234,9 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         continuations in this user turn, all sources) and
         `hookContinuations: ReadonlyMap<string, number>` (the continuations
         per `hookKey` in this user turn). Both are set before `spine.run`, so
-        a hook reads its own count while the chain runs. `stopHookActive` is
-        `turnContinuations > 0`. A
-        Cursor `stop` hook sends it as `loop_count` (5.4, PR 8).
+        a hook reads both counts while the chain runs. `stopHookActive` is
+        `turnContinuations > 0`. A Cursor `stop` hook sends
+        `turnContinuations` as `loop_count` (5.4, PR 8).
     *   `CodexHookRegistration` (`codexHookRunner.ts:72-79`) gains
         `instanceId`. `codexHookService.ts` sets it from
         `instanceIdOf(entry.plugin)` where it registers each plugin (line 125).
@@ -2184,7 +2270,10 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         of `aiService.runTurnStopHooks`, the call in `readTurnStopContinuation`
         (line 10852). The hooks then see the counts before they run.
     *   After the increment, emit `plugin.hook.notice` "plugin continued turn
-        <n> of 50", where `<n>` is `stopHookContinuations`.
+        <n> of 50", where `<n>` is `stopHookContinuations`, only when the
+        continuation keeps at least one plugin hook's reason (`hookKeys` is not
+        empty). A continuation of Xum's TODO or status nudge alone counts
+        toward `<n>` and emits no notice (section 6, rule 4).
     *   The reads at lines 10857 and 10876 keep reading
         `stopHookContinuations > 0`. A continuation refused at admission
         (`admissionStale`, line 10827) keeps the counts, as the single counter
@@ -2210,12 +2299,16 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         `loop_limit` continues 3 times;
     *   each continuation emits "plugin continued turn <n> of 50" with
         `<n>` = 1, 2, 3.
+    *   a continuation made only of Xum's TODO nudge counts toward `<n>` and
+        emits no notice.
 
 ### PR 8: Cursor hooks: parse, trust, update review and runner (security review)
 
 Files: `src/common/orpc/schemas/agentPlugins.ts`,
+`src/constants/pluginHooks.ts`,
 `src/node/services/agentPlugins/cursorHooks.ts` (Create),
 `src/node/services/agentPlugins/cursorHookRunner.ts` (Create),
+`src/node/services/agentPlugins/codexHookRunner.ts`,
 `src/node/services/agentPlugins/codexHookService.ts`,
 `src/node/services/agentPlugins/discovery.ts`,
 `src/node/services/agentPlugins/treeHash.ts`,
@@ -2223,270 +2316,273 @@ Files: `src/common/orpc/schemas/agentPlugins.ts`,
 `src/node/services/events/eventSpine.ts`,
 `src/node/services/agentPlugins/promptHooks.ts`,
 `src/node/services/aiService.ts`, `src/node/services/agentSession.ts`,
+`src/node/runtime/LocalBaseRuntime.ts`,
 `src/node/utils/agentToolsDisabled.ts`, `src/node/services/terminalService.ts`,
 `src/browser/features/Settings/Sections/PluginHooksPanel.tsx`,
+`src/browser/features/Settings/Sections/PluginsSettingsSection.tsx`,
 `src/node/runtime/fakeRuntime.testHarness.ts` (all Modify unless marked), and
 the tests in 8.7.
+
+Section 5 is the contract for this PR. The PR builds it, and its security review
+settles each mechanism. The subsections below say what each file must provide.
+8.7 states each test as an input and the expected result.
 
 #### 8.0 `src/common/orpc/schemas/agentPlugins.ts` (Modify)
 
 *   **Type / Scope**: oRPC schemas.
-*   **Proposed Changes**: Add the variant `z.object({type:
-    z.literal("cursor-command"), command: z.string(), timeoutSeconds:
-    z.number().optional(), loopLimit: z.number().int().nullable().optional(),
-    failClosed: z.boolean().optional()})` to `PluginHookHandlerSchema` (lines
-    57-72). `"cursor-command"` is a new discriminator value. The existing
-    `"command"` value stays for Codex command handlers, which never run. Update
-    the `PluginHookStatusSchema` doc comment (lines 74-78): `runnable` also
-    covers a `cursor-command` handler on a mapped event.
+*   **Proposed Changes**:
+    *   `PluginHookHandlerSchema` gains the variant `{type: "cursor-command",
+        command: string, timeoutSeconds?: number, loopLimit?: number | null,
+        failClosed?: boolean, declared: string}`. `declared` is the handler
+        entry as the canonical JSON that `hashHookDefinition` hashes, so the
+        hooks panel can show every field that the hash covers (5.1). The size
+        cap of its source bounds it. `"cursor-command"` is a new discriminator
+        value. The existing `"command"` value stays for Codex command handlers,
+        which never run.
+    *   The `PluginHookStatusSchema` doc comment says that `runnable` also
+        covers a `cursor-command` handler on a mapped event.
+    *   `AgentPluginInstallPreviewSchema` gains `fileChanges:
+        z.array(AgentPluginCapabilityChangeSchema)`, the rows of the first file
+        review (D30). The list is empty for a plugin without a runnable Cursor
+        command hook. The update review keeps its rows in its existing
+        `changes` list.
 
 #### 8.1 `src/node/services/agentPlugins/cursorHooks.ts` (Create)
 
 *   **Type / Scope**: TypeScript module.
 *   **Proposed Changes**:
-    *   `loadPluginCursorHooks(plugin)` reads the hooks source from
-        `normalizeCursorManifest` (a path, default `hooks/hooks.json`, or an
-        inline object) and parses `{version: 1, hooks: {<event>: [{command,
-        type?, matcher?, timeout?, loop_limit?, failClosed?}]}}` into
-        `AgentPluginHookSchema` entries. Discovery calls it for Cursor
+    *   `loadPluginCursorHooks(plugin)` reads the hooks source that
+        `normalizeCursorManifest` names (a path, default `hooks/hooks.json`, or
+        an inline object) under the read rules of 5.1. It parses the source
+        into `AgentPluginHookSchema` entries. Discovery calls it for Cursor
         packages, in place of the PR 1 `notApplied` entry.
     *   `type` defaults to `"command"`. A `command` entry becomes a
         `cursor-command` handler. `type: "prompt"` gets the status
         `unsupported-handler`.
-    *   `key`: `cursor:<source>#<event>[<index>]`, where `<source>` is the
-        hooks file path or `plugin.json#hooks`. `source`: the same path.
-        `hash`: `hashHookDefinition(event, matcher, raw)` (`codexHooks.ts:696`),
-        with `raw` the entry as declared (D1).
-    *   Status: `runnable` for `afterFileEdit`, `afterAgentResponse` and `stop`
-        with no `matcher`; `ignored-event` for any other event or any hook
-        with a `matcher` (D9); `unsupported-handler` for `type: "prompt"`.
-        Each non-runnable hook gets a `notApplied` entry with part `hook` and
-        one reason, checked in this order: "prompt hooks are not applied in
-        Xum", "event not applied in Xum", "matcher not applied in Xum".
+    *   `key`, `hash`, `status` and `declared` follow 5.1 and 8.0. `source` is
+        the hooks file path or `plugin.json#hooks`.
+    *   Each hook that does not run gets a `notApplied` entry with part `hook`
+        and one reason from 5.1, checked in this order: "prompt hooks are not
+        applied in Xum", "event not applied in Xum", "matcher not applied in
+        Xum".
     *   `loop_limit` rules: a whole number from 0 to 50 is the limit, and 0
-        means the hook never continues. A value above 50 is stored as 50.
-        `null` is stored as `null`. A negative number, a fraction or a
-        non-number drops the hook with the warning "hook <event>[<index>]:
-        loop_limit must be a whole number or null; ignoring this hook".
+        means the hook never continues. A value above 50 runs as 50, and
+        `declared` keeps the value as written. `null` is stored as `null`. A
+        negative number, a fraction or a non-number drops the hook with the
+        warning "hook <event>[<index>]: loop_limit must be a whole number or
+        null; ignoring this hook".
     *   `timeout`: a positive number of seconds, else the warning "timeout must
         be a positive number" and the shared default. An entry without a string
         `command` is dropped with a warning.
 
 #### 8.2 `src/node/services/agentPlugins/cursorHookRunner.ts` (Create)
 
-*   **Type / Scope**: TypeScript module.
+*   **Type / Scope**: TypeScript module, and the `turn.stop` hook point.
 *   **Proposed Changes**:
-    *   Register on `turn.stop`: `afterAgentResponse` first, then `stop`. A
-        `stop` hook's `loop_count` is `ctx.hookContinuations.get(hookKey) ?? 0`
-        (7.2), with `hookKey` as in step 7.
-    *   Register on `tool.execute`, after the tool runs (the `next()` call of
-        the middleware), for `file_edit_replace_string` and `file_edit_insert`
-        only: `afterFileEdit` (D25). Input: for `file_edit_replace_string`,
-        `file_path` is the tool's resolved `path` and `edits` is
-        `[{old_string: input.old_string, new_string: input.new_string}]`. For
-        `file_edit_insert`, `edits` is `[{old_string: "", new_string:
-        input.content}]`. A tool call that failed runs no hook.
-    *   For each call, in order:
-        1.  Skip unless `canRunCodexHooks` (`codexHookService.ts:68-70`) is
-            true: no `/side` chat, plugin MCP allowed, and
-            `XUM_DISABLE_AGENT_TOOLS` unset. Also skip when
-            `isTerminalsDisabled()` or `projectAutomationDisabled()`
-            (`src/node/utils/projectAutomation.ts:20-24`) is true (D6). Add
-            `isTerminalsDisabled()` to `src/node/utils/agentToolsDisabled.ts`
-            (`process.env.XUM_DISABLE_TERMINALS === "1"`), and use it at
-            `terminalService.ts:75`. A skipped hook logs one `log.debug` line
-            and shows no notice, because bug-bash runs set the switches.
-        2.  Skip unless `runtime.location === "local"` (`Runtime.ts:466`):
-            devcontainer and remote runtimes run no Cursor hooks (D7).
-        3.  Recheck trust with `deps.isHookAllowed(hook)`, as the Codex runner
-            does (`codexHookRunner.ts:521`). An untrusted hook never starts.
-        4.  Get the runtime with `createRuntimeForWorkspace`
-            (`src/node/runtime/runtimeHelpers.ts:157`).
-        5.  Run the command as written (D17) through `Runtime.exec`
-            (`src/node/runtime/Runtime.ts:506`), with `cwd` per section 5.4,
-            `hostEnv: "minimal"`, the environment of section 5.4 and D18 in
-            `env`, `timeout: effectiveHookTimeoutSeconds(timeoutSeconds)`
-            (D16), and `abortSignal: ctx.abortSignal`, the signal of the
-            `turn.stop` or `tool.execute` context.
-        6.  Start reading stdout and stderr, then write the JSON input to
-            `ExecStream.stdin` and close it. Wait for the write, both reads and
-            `exitCode` together. Both reads use `streamToStringCapped`
-            (`src/node/runtime/streamUtils.ts:107`), which drains and discards
-            the bytes past its cap, so a hook never blocks on a full pipe.
-            Stdout keeps at most 64 × 1024 + 1 bytes, and more than 64 × 1024
-            bytes counts as invalid output. Stderr keeps nothing (cap 0).
-        7.  Apply the failure table (5.5). For `stop`, a non-empty
-            `followup_message` string becomes `{text, hookKey, loopLimit:
-            handler.loopLimit}` on `continueReasons`, where `hookKey` joins the
-            registration's `instanceId`, `:` and `hook.key` (7.2). An aborted
-            call (`EXIT_CODE_ABORTED`) applies nothing and shows no notice.
-        8.  A failure logs `log.warn` and, once per workspace and hook key,
-            emits `plugin.hook.notice` (D28): "<plugin>: hook <event> failed
-            (<reason>). Turn the hook off in Settings > Plugins." Exit 127 uses
-            the reason "`<command>` not found in this workspace". The
-            once-per-key set lives in the runner registration's memory.
-    *   Cancellation (5.4): `TurnStopContext` (`eventSpine.ts:188-203`) gains
-        `abortSignal?: AbortSignal`, as `ToolExecuteContext` has (`:94`), and
-        the input `Pick`s of 7.2 add it. `readTurnStopContinuation`
-        (`agentSession.ts:10847`) creates an `AbortController`, keeps it in a
-        field while the chain runs, and passes its signal in the input. A hard
-        `interruptStream` (`agentSession.ts:8518`, `soft` unset), which is the
-        path of a user Stop from `WorkspaceService`, aborts it. A Stop can
-        also land after the stream ends and before the controller exists,
-        when there is nothing to abort. For that case,
-        `readTurnStopContinuation` checks
-        `stoppedSince(provenance.admissionStopEpoch)` (line 10835) right after
-        it stores the controller, with no `await` between, and before it calls
-        `runTurnStopHooks`. When the check is true, it aborts the controller.
-        The runner starts no further hook once the signal is aborted.
+    *   The runner registers on `turn.stop` (`afterAgentResponse`, then
+        `stop`) and on `tool.execute` after the tool runs (`afterFileEdit`,
+        D25). It builds each event's input and environment as 5.4 says.
+    *   A hook process starts only when every start condition of 5.4 holds,
+        checked on each call.
+    *   For `stop`, a non-empty `followup_message` string becomes one
+        continuation reason with the key `<plugin instance id>:<hook key>` and
+        the hook's `loopLimit` (section 6, 7.2).
+    *   Output capture, failures and notices follow 5.4 and 5.5. A failure
+        warns once per workspace and hook key (D28).
+    *   Cancellation (5.4): the `turn.stop` context gains an abort signal, as
+        `tool.execute` has, through `eventSpine.ts`, `promptHooks.ts`,
+        `aiService.ts` and `agentSession.ts`. A user Stop, which is a hard
+        `interruptStream`, aborts it. A Stop that lands after the stream ends
+        and before the chain starts gives the chain an aborted signal.
+    *   The local `Runtime.exec` honors an abort at any point of the call. At
+        `0f82063e7e` it checks the signal before it awaits the working-folder
+        check (`LocalBaseRuntime.ts:235-245`) and adds its listener after the
+        spawn (`:381`). An abort between the two lets the process run to its
+        end.
+    *   `XUM_DISABLE_TERMINALS` is read in one place. `agentToolsDisabled.ts`
+        exports the check, and `terminalService.ts` uses it.
     *   `HOOK_INPUT_MAX_CHARS` (`codexHookRunner.ts:47`) moves to
-        `src/constants/pluginHooks.ts` and is exported, so both runners use it.
+        `src/constants/pluginHooks.ts`, so both runners use one limit.
 
 #### 8.3 `src/node/services/agentPlugins/codexHookService.ts` and `discovery.ts` (Modify)
 
 *   **Type / Scope**: Hook registration.
 *   **Proposed Changes**:
-    *   Register the Cursor runner beside the Codex runner in the per-workspace
-        step (lines 94-125), with the same `isHookAllowed` gate (lines
-        215-228).
-    *   The gate's declaration check reloads the hooks with
-        `loadPluginCodexHooks(now)` (line 223), which returns no hooks for a
-        Cursor package (1.4). Without a change, every Cursor hook fails the
-        check and never starts. The check reloads with the plugin's own format
-        instead:
-        `loadPluginCursorHooks(now)` when `now` is a Cursor package
-        (`cursorFallback`), else `loadPluginCodexHooks(now)`. It still matches
-        both `key` and `hash`.
-    *   Discovery calls `loadPluginCursorHooks` for Cursor packages and stores
-        the hooks where it stores Codex hooks, so the hooks panel lists them.
+    *   The Cursor runner registers beside the Codex runner in the
+        per-workspace step, behind the same `isHookAllowed` gate.
+    *   The gate's declaration check rereads the hooks in the plugin's own
+        format: `loadPluginCursorHooks` for a Cursor package, else
+        `loadPluginCodexHooks`. It still matches both `key` and `hash`. The
+        Codex loader returns no hooks for a Cursor package (1.4), so a check
+        through it alone fails every Cursor hook.
+    *   Discovery stores Cursor hooks where it stores Codex hooks, so the hooks
+        panel lists them.
 
 #### 8.4 `src/node/services/agentPlugins/treeHash.ts` (Modify)
 
 *   **Type / Scope**: Plugin tree hash.
-*   **Proposed Changes**: Move the walk of `hashPluginTree` (lines 13-97) into
-    `listPluginTreeRecords(root, quota, keepBytesUpTo?: number):
-    Promise<Array<[string, number, string, Buffer?]>>` (path, mode, content
-    hash or link text, file bytes). With `keepBytesUpTo`, the record of a
-    regular file of at most that many bytes also carries its bytes, from the
-    walk's own read (lines 50-83: the `O_NOFOLLOW` open and the identity
-    checks before and after the read). A symlink record never carries bytes.
-    `hashPluginTree` passes no `keepBytesUpTo` and hashes the first three
-    fields as before, so its result does not change.
+*   **Proposed Changes**: `treeHash.ts` gives the file review its per-file
+    records (5.1) from the walk that `hashPluginTree` does. The review then
+    shows the bytes that the walk hashed and opens no file through a symlink.
+    A record names its path relative to the plugin folder, never the folder.
+    `hashPluginTree` keeps its result for every folder.
 
 #### 8.5 `src/node/services/agentPlugins/installService.ts` (Modify)
 
-*   **Type / Scope**: Update review (D1).
-*   **Proposed Changes**: In the update-review change list (lines 3090-3111),
-    when the staged plugin has at least one `runnable` `cursor-command` hook:
-    *   compare `listPluginTreeRecords` of the installed tree and the staged
-        tree, with the quota of `STAGED_TREE_MAX_BYTES` and
-        `STAGED_TREE_MAX_FILES` (lines 1192-1193);
-    *   skip no path. Paths under the skills roots, rule roots, agent folder
-        and `workflows/` are listed too: the skill and agent rows do not show
-        bodies or helper files, and a component root can be the plugin root;
-    *   for each added, removed or changed path, add a change with component
-        `"hooks"` and summary "file <path> added", "removed" or "changed".
-        Both walks set `keepBytesUpTo` to 64 × 1024 (8.4). For a record whose
-        bytes decode as UTF-8 without replacement characters (`new
-        TextDecoder("utf-8", {fatal: true})`), `before` and `after` are that
-        text through `showInvisibleControls` (line 561), the function
-        `reviewText` (lines 540-542) applies to its display. Xum opens no file a second
-        time. For a symlink, `before` and `after` are its link text. Any other
-        file has no `before` or `after`;
-    *   the list still goes through `assertReviewFits` (lines 586-597), so an
-        update too large to review fails with its existing message.
+*   **Type / Scope**: Install preview and update review (D1, D30).
+*   **Proposed Changes**: For a staged plugin with at least one `runnable`
+    `cursor-command` hook, the install preview and the update review carry the
+    file review of 5.1.
+    *   The install preview lists every staged file as an added row in
+        `fileChanges`.
+    *   The update review adds a row to `changes` for each file that the update
+        adds, removes or changes. When the installed tree has no runnable Cursor
+        command hook, every staged file is an added row.
+    *   Each row has the summary "file <path> added", "file <path> removed" or
+        "file <path> changed". The rows stay within the quota of
+        `STAGED_TREE_MAX_BYTES` and `STAGED_TREE_MAX_FILES` and the cap of
+        `assertReviewFits`. A review over the cap fails with its existing
+        message.
 
-#### 8.6 `src/browser/features/Settings/Sections/PluginHooksPanel.tsx` (Modify)
+#### 8.6 `src/browser/features/Settings/Sections/PluginHooksPanel.tsx` and `PluginsSettingsSection.tsx` (Modify)
 
 *   **Type / Scope**: Renderer.
-*   **Proposed Changes**: Show Cursor hooks with their status notes
-    (`PLUGIN_HOOK_STATUS_NOTE`, line 87). Add the note "does not run in remote
-    workspaces" (SSH, Docker and devcontainer) to each Cursor hook. Add "runs a command in
-    your workspace" to the trust prompt of a `cursor-command` hook.
+*   **Proposed Changes**:
+    *   The hooks panel lists Cursor hooks. A Cursor hook that does not run
+        shows its own reason from 5.1, not the shared Codex note
+        (`PLUGIN_HOOK_STATUS_NOTE`, `PluginHooksPanel.tsx:87`). PR 8 derives
+        the reason from the hook or carries it in the schema.
+    *   Each Cursor hook shows its `declared` entry beside its event and
+        matcher, with invisible and bidi controls marked, so the user sees
+        every field that the hash covers (5.1).
+    *   Each Cursor hook shows the note "does not run in remote workspaces"
+        (SSH, Docker and devcontainer). The trust prompt of a `cursor-command`
+        hook says "runs a command in your workspace".
+    *   `PreviewDisclosures` (`PluginsSettingsSection.tsx`) shows the install
+        preview's `fileChanges` rows, as `UpdateReviewPanel` shows its file
+        rows.
 
 #### 8.7 Tests for PR 8
 
+Each case names its input and the expected result.
+
 *   `src/node/services/agentPlugins/cursorHooks.test.ts` (Create):
     *   ralph-loop's `hooks.json` gives two `runnable` hooks, and `stop` has
-        `loopLimit: null`;
+        `loopLimit: null`.
     *   advisor's `hooks.json` gives three `runnable` hooks and one
         `ignored-event` (`subagentStop`) with the reason "event not applied in
-        Xum";
-    *   reformatting the file keeps every hash, and changing `loop_limit` from
-        3 to 4 changes that hook's hash;
-    *   `loop_limit: 80` is stored as 50, `-1` and `1.5` drop the hook with the
-        warning;
-    *   a `preToolUse` hook gets `ignored-event` and the reason "event not
+        Xum".
+    *   A reformatted file keeps every hash. Changing `loop_limit` from 3 to 4
+        changes that hook's hash.
+    *   `loop_limit: 80` runs as 50, and its `declared` shows 80.
+        `loop_limit: 90` gives a different `declared` value. `-1` and `1.5`
+        drop the hook with the warning.
+    *   An unknown field in an entry appears in `declared`, and changing it
+        changes the hash.
+    *   A `preToolUse` hook gets `ignored-event` and the reason "event not
         applied in Xum".
+    *   A manifest `hooks` path with `..`, and a `hooks/hooks.json` that is a
+        symlink to a file outside the plugin, each give no hooks and one
+        warning.
+    *   A hooks file over 256 KiB gives no hooks and one warning. A file with
+        300 hooks keeps the first 256 and warns.
 *   `src/node/runtime/fakeRuntime.testHarness.ts` (Modify): accept `hostEnv`
-    (refused at lines 86-116) and record what is written to stdin (a no-op at
-    line 129).
+    and record what is written to stdin.
 *   `src/node/services/agentPlugins/cursorHookRunner.test.ts` (Create), with
-    that fake runtime:
+    that fake runtime unless a case names the local runtime:
     *   stdin has `conversation_id`, `generation_id`, `hook_event_name`,
-        `cursor_version`, `workspace_roots` and `transcript_path`;
-    *   the environment has `CURSOR_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`,
+        `cursor_version`, `workspace_roots` and `transcript_path`.
+    *   The environment has `CURSOR_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`,
         `CURSOR_PLUGIN_ROOT`, `CURSOR_TRANSCRIPT_PATH`, `CURSOR_VERSION`,
-        `PATH` and `HOME`, and no `CURSOR_USER_EMAIL` or `CURSOR_CODE_REMOTE`;
+        `PATH` and `HOME`, and no `CURSOR_USER_EMAIL` or `CURSOR_CODE_REMOTE`.
     *   `stop` runs in the workspace root, and `afterAgentResponse` and
-        `afterFileEdit` in the plugin folder;
+        `afterFileEdit` run in the plugin folder.
     *   `afterFileEdit` runs after `file_edit_replace_string` with its
-        `old_string` and `new_string`, after `file_edit_insert` with
-        `old_string: ""`, and not after `bash` or a failed edit;
+        `old_string` and `new_string`, and after `file_edit_insert` with
+        `old_string: ""`. It does not run after `bash` or a failed edit.
     *   `stop` output `{"followup_message": "again"}` adds one reason with the
-        key `<instance id>:<hook key>` and the hook's `loopLimit`, and empty
-        stdout adds none;
-    *   `stop` input `loop_count` is the context's count for that key: 0 with
-        an empty `hookContinuations`, 1 after one continuation;
-    *   a context `abortSignal` that aborts while `stop` runs reaches `exec`,
-        and the call adds no reason and shows no notice;
-    *   exit 2, `{"permission": "deny"}`, invalid JSON, `{"followup_message":
-        3}` and exit 1 from `stop` each add no reason and one notice;
-    *   exit 127 shows the "not found in this workspace" notice once for two
-        calls;
-    *   a hook that sleeps past its timeout is killed, and the turn proceeds;
-    *   `stop` stdout of 64 × 1024 + 1 bytes adds no reason and one notice;
-    *   with the local runtime instead of the fake, a `stop` hook that writes
-        1 MiB to stderr and then prints `{"followup_message": "again"}` adds
-        its reason before its timeout;
-    *   each of `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and
-        `XUM_DISABLE_PROJECT_AUTOMATION=1` starts no process;
-    *   a devcontainer or remote runtime starts no process;
-    *   an untrusted hook starts no process, and revoking trust between two
-        calls stops the second call;
-    *   with `failClosed: true`, a crash in `stop` adds no reason and one
-        notice;
-    *   an input over `HOOK_INPUT_MAX_CHARS` and an unreadable trust store each
-        skip the call with one notice;
-    *   after a user Stop, no Cursor hook runs (D5).
+        key `<instance id>:<hook key>` and the hook's `loopLimit`. Empty stdout
+        adds none.
+    *   `stop` input `loop_count` is 0 on the first stop of a user turn. After
+        another hook or a Xum nudge continued the turn once, `loop_count` is 1
+        (the context's `turnContinuations`), and this hook's
+        `hookContinuations` entry is still 0.
+    *   A context `abortSignal` that aborts while `stop` runs reaches `exec`.
+        The call adds no reason and shows no notice.
+    *   A Stop that lands while the first of two `stop` hooks runs starts no
+        process for the second.
+    *   With the local runtime, a `stop` hook whose command sleeps 1 s and then
+        writes a marker file is aborted at three points: before the call, while
+        `exec` prepares the process, and while the process runs. In each case,
+        once the call settles, the marker file does not exist, and the call
+        adds no reason and shows no notice.
+    *   Exit 2, `{"permission": "deny"}`, invalid JSON,
+        `{"followup_message": 3}` and exit 1 from `stop` each add no reason and
+        show one notice.
+    *   Exit 127 shows the "not found in this workspace" notice once for two
+        calls.
+    *   A hook that sleeps past its timeout is killed, and the turn proceeds.
+    *   `stop` stdout of 64 × 1024 + 1 bytes adds no reason and shows one
+        notice.
+    *   With the local runtime, a `stop` hook that writes 1 MiB to stderr and
+        then prints `{"followup_message": "again"}` adds its reason before its
+        timeout.
+    *   With the local runtime, a `stop` hook that writes 1 MiB to stdout exits
+        before its timeout. It adds no reason, and its notice names invalid
+        output, not a timeout.
+    *   Each of `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and
+        `XUM_DISABLE_PROJECT_AUTOMATION=1` starts no process.
+    *   A devcontainer or remote runtime starts no process.
+    *   An untrusted hook starts no process, and revoking trust between two
+        calls stops the second call.
+    *   With `failClosed: true`, a crash in `stop` adds no reason and shows one
+        notice.
+    *   An input over `HOOK_INPUT_MAX_CHARS` and an unreadable trust store each
+        skip the call with one notice.
+    *   After a user Stop, no Cursor hook runs (D5).
 *   `src/node/services/agentPlugins/codexHookService.test.ts` (Modify): for a
     Cursor package, `isHookAllowed` allows a trusted hook that
     `hooks/hooks.json` still declares, and refuses it after the entry's
     `command` changes on disk.
 *   `src/node/services/agentSession.turnStopHooks.test.ts` (Modify):
-    *   a hard `interruptStream` while the `turn.stop` chain runs aborts the
-        context's `abortSignal`;
-    *   a Stop that changes the stop epoch after the stream ends and before
-        the chain starts gives the chain an already aborted `abortSignal`.
-*   `src/node/services/agentPlugins/treeHash.test.ts` (Create): for a fixed
-    fixture tree, `hashPluginTree` returns the hash that the code at
-    `0f82063e7e` returns (compute it once with that code and write it into the
-    test), and `listPluginTreeRecords` lists each path once.
+    *   A hard `interruptStream` while the `turn.stop` chain runs aborts the
+        context's `abortSignal`.
+    *   A Stop that changes the stop epoch after the stream ends and before the
+        chain starts gives the chain an already aborted `abortSignal`.
+*   `src/node/services/agentPlugins/treeHash.test.ts` (Create): one fixture
+    tree copied into two temporary folders gives equal file records. A change
+    to one file's bytes, mode or link text changes only that file's record.
+    Two `hashPluginTree` calls on one folder give the same value. The test
+    writes no expected hash value.
 *   `src/node/services/agentPlugins/installService.test.ts` (Modify), for a
     plugin with a runnable `cursor-command` hook:
-    *   an update that changes `hooks/lib.sh` lists "file hooks/lib.sh changed"
-        with its before and after text;
-    *   an added and a removed file under `hooks/` are listed as "added" and
-        "removed";
-    *   a changed binary file is listed with no text;
-    *   a staged `hooks/lib.sh` that is a symlink to a file outside the plugin
+    *   A first install preview lists every file of the plugin as added in
+        `fileChanges`, with the text of `hooks/stop.sh` and of a helper under
+        `skills/`.
+    *   An update that adds the plugin's first runnable hook lists every staged
+        file as added, the files that the update does not change included.
+    *   An update that changes `hooks/lib.sh` lists "file hooks/lib.sh changed"
+        with its before and after text.
+    *   An added and a removed file under `hooks/` are listed as "added" and
+        "removed".
+    *   A changed binary file is listed with no text.
+    *   A staged `hooks/lib.sh` that is a symlink to a file outside the plugin
         is listed with its link text as `after`, and the target's content
-        appears nowhere in the review;
-    *   a prose-only change to `skills/a/SKILL.md` and a changed
-        `skills/a/lib.sh` each get a file row, beside any skill row;
-    *   a plugin without a runnable Cursor hook lists no file changes;
-    *   an update with more text than `assertReviewFits` allows fails with its
-        message.
+        appears nowhere in the review.
+    *   A prose-only change to `skills/a/SKILL.md` and a changed
+        `skills/a/lib.sh` each get a file row, beside any skill row.
+    *   An unchanged file gets no row, although the installed tree and the
+        staged tree sit in different folders.
+    *   A plugin without a runnable Cursor hook gets no file rows at install or
+        update.
+    *   An install preview or an update with more text than `assertReviewFits`
+        allows fails with its message.
+*   `src/browser/features/Settings/Sections/PluginHooksPanel.test.ts`
+    (Modify): a Cursor `type: "prompt"` hook, a `stop` hook with a `matcher`
+    and a `subagentStop` hook show "prompt hooks are not applied in Xum",
+    "matcher not applied in Xum" and "event not applied in Xum". None of them
+    shows the Codex note "Xum runs only mcp_tool hooks". A Cursor hook shows
+    its `declared` entry.
 *   `tests/bugbash/pluginHookFixtures.ts` (Modify): add the fixture
     `ralph-loop-cursor`, copied from cursor/plugins `ralph-loop` at `4dd1d05`
     (`.cursor-plugin/plugin.json`, `hooks/hooks.json`, `hooks/stop-hook.sh`,
@@ -2518,8 +2614,8 @@ Files: `docs/hooks/plugins.mdx`, `docs/config/mcp-servers.mdx`,
         review;
     *   "Hooks": `afterFileEdit`, `afterAgentResponse` and `stop` run in local
         and worktree workspaces after the user trusts them; the failure table of
-        5.5; the update review lists changed files of a plugin with command
-        hooks;
+        5.5; the install review lists every file of a plugin with command
+        hooks, and the update review lists its changed files;
     *   "Stop-loop limits": the default of 3 per hook, `loop_limit`, and the
         ceiling of 50 per user turn;
     *   "Codex hooks": a `PreToolUse` hook with malformed output blocks the
@@ -2570,8 +2666,9 @@ navigation.
         same model for `ci-watcher`, and the `task` tool's agent list to show
         `ci-watcher` with "[meant to run in the background
         (run_in_background=true)]" (success test 3, CUJ 2).
-    4.  PR 7 and PR 8: install the `ralph-loop-cursor` fixture, trust both
-        hooks, and run a loop to its promise. Expect "plugin continued turn n of
+    4.  PR 7 and PR 8: install the `ralph-loop-cursor` fixture, and expect
+        the install review to list each of its files as added (D30). Trust
+        both hooks, and run a loop to its promise. Expect "plugin continued turn n of
         50" until the promise, then no continuation. Press the user Stop
         mid-loop and expect no continuation. Run `cancel-ralph`, send a
         message, and expect no continuation (success test 4, CUJ 3).
