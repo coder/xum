@@ -36,8 +36,8 @@ const CHILD_IDS = ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3"];
 const CHILD = CHILD_IDS[0];
 const SIBLING = "bbbbbbbbb1";
 const QUEUED = "ccccccccc1";
-const SEND_MS = 500;
 const GATE_MS = 1_000;
+const OVERLAP_WAIT_MS = 3_000;
 
 type SendMock = (
   workspaceId: string,
@@ -128,12 +128,16 @@ describe("TaskService.create: the first send runs after the create locks are rel
     } satisfies WorkspaceConfigEntry;
   }
 
-  async function setup(send: SendMock, rows: WorkspaceConfigEntry[] = []) {
+  async function setup(
+    send: SendMock,
+    rows: WorkspaceConfigEntry[] = [],
+    settings = testTaskSettings(8, 3)
+  ) {
     await saveWorkspaces(
       config,
       projectPath,
       [workspace(PARENT_A), workspace(PARENT_B), workspace(PARENT_C), ...rows],
-      testTaskSettings(8, 3)
+      settings
     );
     const host = createWorkspaceServiceMocks({ sendMessage: mock(send) });
     return createTaskServiceHarness(config, { workspaceService: host.workspaceService });
@@ -142,32 +146,37 @@ describe("TaskService.create: the first send runs after the create locks are rel
   test.each([
     ["one parent", [PARENT_A, PARENT_A, PARENT_A]],
     ["three parents", [PARENT_A, PARENT_B, PARENT_C]],
-  ])("concurrent creates under %s overlap their first sends in wall time", async (_, parents) => {
-    const sends: Array<{ startedAt: number; endedAt: number }> = [];
-    const { taskService } = await setup(async () => {
-      const startedAt = performance.now();
-      await sleep(SEND_MS);
-      sends.push({ startedAt, endedAt: performance.now() });
-      return Ok(undefined);
-    });
+  ])(
+    "concurrent creates under %s overlap their first sends in wall time",
+    async (_, parents) => {
+      const sends: Array<{ startedAt: number; endedAt: number }> = [];
+      let started = 0;
+      const { taskService } = await setup(async () => {
+        const startedAt = performance.now();
+        started++;
+        // Each send lasts until every send started (bounded), so the sends overlap unless a
+        // create waits for another create's send.
+        await waitFor(() => started === parents.length, OVERLAP_WAIT_MS);
+        sends.push({ startedAt, endedAt: performance.now() });
+        return Ok(undefined);
+      });
 
-    const startedAt = performance.now();
-    const created = await Promise.all(
-      parents.map((parentId, index) => createAgentTask(taskService, parentId, `part ${index}`))
-    );
-    const elapsedMs = performance.now() - startedAt;
+      const created = await Promise.all(
+        parents.map((parentId, index) => createAgentTask(taskService, parentId, `part ${index}`))
+      );
 
-    expect(created.map((result) => result.success && result.data.status)).toEqual([
-      "running",
-      "running",
-      "running",
-    ]);
-    expect(sends).toHaveLength(3);
-    expect(Math.max(...sends.map((send) => send.startedAt))).toBeLessThan(
-      Math.min(...sends.map((send) => send.endedAt))
-    );
-    expect(elapsedMs).toBeLessThan(2 * SEND_MS);
-  });
+      expect(created.map((result) => result.success && result.data.status)).toEqual([
+        "running",
+        "running",
+        "running",
+      ]);
+      expect(sends).toHaveLength(3);
+      expect(Math.max(...sends.map((send) => send.startedAt))).toBeLessThan(
+        Math.min(...sends.map((send) => send.endedAt))
+      );
+    },
+    4 * OVERLAP_WAIT_MS
+  );
 
   test("a parent Stop issued while the create holds its locks refuses the brief it captured", async () => {
     let stopping: Promise<string[]> | undefined;
@@ -264,6 +273,46 @@ describe("TaskService.create: the first send runs after the create locks are rel
     ]);
     expect(await failureNotices(historyService, PARENT_A)).toHaveLength(0);
     expect(wakes).not.toHaveBeenCalled();
+  });
+
+  test("a first send that fails after the release starts the task queued behind it", async () => {
+    const [failing, queued] = CHILD_IDS;
+    const entered = Promise.withResolvers<void>();
+    const failSend = Promise.withResolvers<void>();
+    let queuedSent = false;
+    const { taskService } = await setup(
+      async (workspaceId) => {
+        if (workspaceId === queued) {
+          queuedSent = true;
+          return Ok(undefined);
+        }
+        entered.resolve();
+        await failSend.promise;
+        return Err({ type: "unknown", raw: "provider unavailable" });
+      },
+      [],
+      testTaskSettings(1, 3)
+    );
+
+    const creating = createAgentTask(taskService, PARENT_A, "go");
+    try {
+      await entered.promise;
+      const next = await withinGate(
+        "a create under the full limit",
+        createAgentTask(taskService, PARENT_B, "next")
+      );
+      expect(next.success && next.data).toMatchObject({ taskId: queued, status: "queued" });
+      // The drain the queued create scheduled has run and found the slot taken.
+      await taskService.maybeStartQueuedTasks();
+      expect(queuedSent).toBe(false);
+    } finally {
+      failSend.resolve();
+    }
+
+    expect(await creating).toEqual(Err("provider unavailable"));
+    expect(row(failing)).toMatchObject({ taskStatus: "interrupted" });
+    expect(await waitFor(() => queuedSent)).toBe(true);
+    await taskService.queueDrainSettled();
   });
 
   test("reawaken, queue drain and the task-creation lock do not wait for another task's first send", async () => {

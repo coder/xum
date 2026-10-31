@@ -9801,6 +9801,9 @@ export class TaskService implements AgentTaskIntegration {
             preservePhysicalWorkspace: plan.useSharedWorkspace,
           });
         }
+        // A create that ran during this send counted the task as running and may have queued its
+        // own: the freed slot starts it, as after markTaskLaunchFailed.
+        this.scheduleMaybeStartQueuedTasks();
         return Err(message);
       }
       return Ok({
