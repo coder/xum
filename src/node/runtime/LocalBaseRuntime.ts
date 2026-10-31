@@ -195,6 +195,12 @@ export function localRuntimeTempRoot(): string {
   return process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
 }
 
+function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new RuntimeErrorClass("Operation aborted before execution", "exec");
+  }
+}
+
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
  *
@@ -214,12 +220,6 @@ export function localRuntimeTempRoot(): string {
  * - renameWorkspace()
  * - forkWorkspace()
  */
-
-function throwIfAbortedBeforeExec(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new RuntimeErrorClass("Operation aborted before execution", "exec");
-  }
-}
 
 export abstract class LocalBaseRuntime implements Runtime {
   /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
