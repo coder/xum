@@ -243,7 +243,7 @@ function isDiagramId(id: string, idPrefix: string): boolean {
 /**
  * A CSS value that loads nothing: no escape, comment, at-rule or IE expression, and only
  * PELE_CSS_FUNCTIONS. With an idPrefix, url(#id) may also point at an element of the same
- * diagram, as Pele's fill attribute does. A style declaration gets no idPrefix: there Chromium
+ * diagram, as Pele's fill attribute does. A style attribute gets no idPrefix: there Chromium
  * fetches the page itself for url(#id) in background-image, cursor or border-image-source.
  */
 function isPeleCss(value: string, idPrefix: string | null): boolean {
@@ -254,16 +254,6 @@ function isPeleCss(value: string, idPrefix: string | null): boolean {
   return Array.from(rest.matchAll(/([\w-]*)\s*\(/g)).every((call) =>
     PELE_CSS_FUNCTIONS.has(call[1].toLowerCase())
   );
-}
-
-/** Removes the declarations that fail isPeleCss, and keeps Pele's exact text when none does. */
-function sanitizeStyle(style: string): string | null {
-  // A ; inside a quoted string does not end the declaration. isPeleCss rejects every backslash,
-  // so no quote is escaped, and an unclosed quote runs to the end of the style.
-  const declarations = style.match(/(?:[^;"']|"[^"]*(?:"|$)|'[^']*(?:'|$))+/g) ?? [];
-  const kept = declarations.filter((declaration) => isPeleCss(declaration, null));
-  if (kept.length === declarations.length) return style;
-  return kept.some((declaration) => declaration.trim() !== "") ? kept.join(";") : null;
 }
 
 /** An id, or an id list such as aria-labelledby, kept only when every id is the diagram's own. */
@@ -286,8 +276,10 @@ function keptAttributeValue(
   if (rules.textAttributes.has(name)) return value;
   if (rules.idAttributes.has(name)) return keptIdValue(name, value, idPrefix);
   if (!rules.cssAttributes.has(name)) return null;
-  if (name === "style") return sanitizeStyle(value);
-  return isPeleCss(value, idPrefix) ? value : null;
+  // A style is kept or removed whole, never split into declarations: a splitter that tokenizes
+  // quotes, escapes or comments unlike the browser turns an inert string into live declarations.
+  // Pele writes no style that fails, so its diagrams lose nothing.
+  return isPeleCss(value, name === "style" ? null : idPrefix) ? value : null;
 }
 
 /** Applies PELE_OUTPUT to the attributes of an element that removeUnknownElements kept. */

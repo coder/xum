@@ -252,27 +252,24 @@ describe("sanitizeMermaidSvg", () => {
     expect(htmlParts(sanitized).filter((part) => part.includes("attacker"))).toEqual([]);
   });
 
-  it("keeps the style declarations it does not remove", () => {
+  it("removes a style with a failing declaration whole", () => {
     expect(
       sanitizeMermaidSvg(svgRoot(`style="fill:red;mask:url(${REMOTE});stroke:blue"`), ID_PREFIX)
-    ).toContain('style="fill:red;stroke:blue"');
+    ).not.toContain("style=");
     expect(sanitizeMermaidSvg(svgRoot(`style="mask:url(${REMOTE})"`), ID_PREFIX)).not.toContain(
       "style="
     );
   });
 
-  // A ; inside a quoted string does not end the declaration. Chromium reads a string that the
-  // sanitizer cut open to the end of the attribute, so fill:red would be lost.
+  // A ; inside a quoted string does not end the declaration.
   it.each([
     ["single", `font-family:'a;background:url(${REMOTE})';fill:red`],
     ["double", `font-family:&quot;a;background:url(${REMOTE})&quot;;fill:red`],
-  ])("removes a declaration with a %s-quoted ;", (_case, style) => {
+  ])("removes a style with a %s-quoted ;", (_case, style) => {
     const sanitized = sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX) ?? "";
 
-    expect(sanitized).toContain('<rect style="fill:red"');
-    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([
-      "<rect> style fill:red",
-    ]);
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
   });
 
   // CSS reads \" in a string as an escaped quote and skips comments, so the text between the
