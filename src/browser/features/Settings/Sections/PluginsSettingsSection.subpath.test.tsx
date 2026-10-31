@@ -58,6 +58,7 @@ test("the installed row and the consent preview show the monorepo plugin folder"
         slashCommands: [],
         reviewedComponents: [],
         codexHooks: [],
+        fileChanges: [],
         warnings: [],
         notApplied: [],
         targetPath: "~/.mux/plugins/pstack-next",

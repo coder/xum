@@ -68,8 +68,9 @@ export const AgentPluginPreviewHookSchema = z.object({
 });
 
 /**
- * One Codex-format plugin hook handler (hooks.json). Only `mcp_tool` can run; `command`,
- * `prompt` and `agent` are parsed and shown, never run.
+ * One plugin hook handler (hooks.json). Codex format: only `mcp_tool` can run; `command`, `prompt`
+ * and `agent` are parsed and shown, never run. Cursor format: `cursor-command` runs a command on
+ * the host (local and worktree workspaces only), `cursor-prompt` never runs.
  */
 export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
   z.object({
@@ -83,12 +84,28 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
     statusMessage: z.string().optional(),
   }),
   z.object({ type: z.enum(["command", "prompt", "agent"]), summary: z.string() }),
+  z.object({
+    type: z.literal("cursor-command"),
+    command: z.string(),
+    /** Declared positive `timeout` in seconds; absent means the runner default. */
+    timeoutSeconds: z.number().optional(),
+    /** The declared `loop_limit`, at most 50 (the per-user-turn ceiling); null: no own limit. */
+    loopLimit: z.number().int().nullable().optional(),
+    failClosed: z.boolean().optional(),
+    /**
+     * The entry as declared, as the canonical JSON that the hook hash covers (clamped values and
+     * unknown fields included), so the review shows every field the user trusts.
+     */
+    declared: z.string(),
+  }),
+  z.object({ type: z.literal("cursor-prompt"), declared: z.string() }),
 ]);
 
 /**
- * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
- * agent handler. `ignored-event`: a Codex event Xum does not map. `claude-plugin`: any hook of a
- * Claude Code plugin (Xum lists them and never runs them).
+ * `runnable`: an mcp_tool handler on a mapped Codex event, or a `cursor-command` handler on a mapped
+ * Cursor event without a matcher. `unsupported-handler`: a Codex command, prompt or agent handler,
+ * or a Cursor prompt hook. `ignored-event`: an event Xum does not map, or a Cursor hook with a
+ * matcher. `claude-plugin`: any hook of a Claude Code plugin (Xum lists them and never runs them).
  */
 export const PluginHookStatusSchema = z.enum([
   "runnable",
@@ -115,11 +132,6 @@ export const AgentPluginHookSchema = z.object({
   /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
   source: z.string(),
   review: PluginHookReviewStateSchema,
-});
-
-export const AgentPluginHooksSchema = z.object({
-  hooks: z.array(AgentPluginHookSchema),
-  warnings: z.array(z.string()),
 });
 
 /** Composer slash command declared by the manifest (data-driven expansion). */
@@ -203,6 +215,45 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
 ]);
 export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
 
+/**
+ * One consent-relevant difference between the installed tree and a staged
+ * update (see installService capabilitySurface). `before`/`after` carry the
+ * human-readable value on each side so the user can judge the change instead
+ * of only being told that something changed; additions have no `before`.
+ */
+/**
+ * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
+ * renderer sends the shown refs back on confirm, and the backend records only refs that still
+ * match, so a component that changed after the review never gets consent.
+ */
+export const AgentPluginComponentRefSchema = z.object({
+  kind: AgentPluginComponentKindSchema,
+  name: z.string(),
+  fingerprint: z.string(),
+});
+
+export const AgentPluginCapabilityChangeSchema = z.object({
+  summary: z.string(),
+  before: z.string().optional(),
+  after: z.string().optional(),
+  /** Set for a skill or MCP server change: what confirming the review approves. */
+  component: AgentPluginComponentRefSchema.optional(),
+});
+
+export const AgentPluginHooksSchema = z.object({
+  hooks: z.array(AgentPluginHookSchema),
+  warnings: z.array(z.string()),
+  /**
+   * D30 at the first trust: every file of the plugin, as the install preview lists them. Set
+   * while the plugin runs a Cursor command hook and none of its Cursor hooks is trusted: a plugin
+   * installed by a build without the file review never showed its files. Trusting a Cursor
+   * command hook then needs `digest`, so the trust covers exactly the files shown.
+   */
+  fileReview: z
+    .object({ changes: z.array(AgentPluginCapabilityChangeSchema), digest: z.string() })
+    .optional(),
+});
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
   /** The method this preview used. Install gets it back. */
@@ -231,6 +282,12 @@ export const AgentPluginInstallPreviewSchema = z.object({
    * trusts it in Settings (Codex trust per hash).
    */
   codexHooks: z.array(AgentPluginHookSchema.omit({ review: true })),
+  /**
+   * The first file review (Cursor plugin RFC D30): one added row per file of a plugin with a
+   * runnable Cursor command hook, because such a hook can run any file of the plugin. Empty for
+   * every other plugin.
+   */
+  fileChanges: z.array(AgentPluginCapabilityChangeSchema),
   /** Agent definition files (agents/*.md) that become selectable agents. */
   agents: z.array(z.string()),
   /**
@@ -385,31 +442,6 @@ export const AgentPluginUpdateCheckSchema = z.object({
   remoteSha: z.string().optional(),
   /** Error detail when status is "error". */
   message: z.string().optional(),
-});
-
-/**
- * One consent-relevant difference between the installed tree and a staged
- * update (see installService capabilitySurface). `before`/`after` carry the
- * human-readable value on each side so the user can judge the change instead
- * of only being told that something changed; additions have no `before`.
- */
-/**
- * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
- * renderer sends the shown refs back on confirm, and the backend records only refs that still
- * match, so a component that changed after the review never gets consent.
- */
-export const AgentPluginComponentRefSchema = z.object({
-  kind: AgentPluginComponentKindSchema,
-  name: z.string(),
-  fingerprint: z.string(),
-});
-
-export const AgentPluginCapabilityChangeSchema = z.object({
-  summary: z.string(),
-  before: z.string().optional(),
-  after: z.string().optional(),
-  /** Set for a skill or MCP server change: what confirming the review approves. */
-  component: AgentPluginComponentRefSchema.optional(),
 });
 
 /** Ties an update confirmation to the exact trees the user reviewed. */

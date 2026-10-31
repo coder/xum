@@ -44,6 +44,7 @@ import type {
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
 import {
@@ -161,7 +162,13 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
-import { hashPluginTree } from "./treeHash";
+import {
+  hashPluginTree,
+  KeptBytesLimitError,
+  listPluginTreeRecords,
+  pluginTreeRecordContent,
+  type PluginTreeRecord,
+} from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -169,12 +176,14 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
-import { loadPluginCodexHooks } from "./codexHooks";
+import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   readPluginHookTrust,
+  rebindPluginHookTrust,
   removePluginHookTrust,
   reviewStateOf,
   setPluginHookTrust,
+  type PluginHookTrustRecord,
   type PluginHookTrustState,
 } from "./pluginHookTrust";
 import {
@@ -549,30 +558,6 @@ function reviewText(item: ReviewTextSource): string {
 }
 
 /**
- * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
- * default-ignorable code point (zero-width and joiner characters, variation selectors such as
- * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
- * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
- * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
- * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
- * as comment text in the review while the fingerprint approves it.
- */
-const REVIEW_TEXT_CONTROLS =
-  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
-
-/**
- * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
- * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
- * from the character itself.
- */
-function showInvisibleControls(text: string): string {
-  return text.replace(
-    REVIEW_TEXT_CONTROLS,
-    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
-  );
-}
-
-/**
  * Upper bound on the text of one review. Frontmatter fields have no size limit, so a crafted
  * package could make a review too large to send and render. Over the bound, Xum refuses the review
  * (fails closed) instead of truncating text the user would approve.
@@ -596,11 +581,146 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
     0
   );
-  if (size > MAX_REVIEW_TEXT_CHARS) {
-    throw new Error(
-      "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
+  if (size > MAX_REVIEW_TEXT_CHARS) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+}
+
+const REVIEW_TOO_LARGE_MESSAGE =
+  "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher.";
+
+/** A file larger than this shows only its row in the file review, like a binary file. */
+const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
+
+/**
+ * A Cursor command hook can run or source any file of its plugin, so a plugin with one gets a
+ * review of its files (Cursor plugin RFC D1).
+ */
+function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
+  return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
+}
+
+/**
+ * Whether the user trusted a current Cursor hook of the plugin, at any hash, for the installed
+ * commit. Trusting the first one took the full file review (firstTrustFileReview), and every
+ * update this build applied since reviewed its changed files and moved the binding along
+ * (rebindPluginHookTrust). Trust of a hook the plugin no longer has does not count, and neither
+ * does trust bound to another commit (the read drops that binding).
+ */
+function trustsCursorHook(
+  hooks: readonly PluginHookDefinition[],
+  trust: PluginHookTrustRecord
+): boolean {
+  return hooks.some((hook) => {
+    const entry = getOwn(trust, hook.key);
+    return (
+      hook.handler.type === "cursor-command" &&
+      entry?.state === "trusted" &&
+      entry.reviewedSha !== undefined
     );
+  });
+}
+
+/**
+ * The rows as shown, plus each entry's kind, mode and content hash (Codex review): a binary or
+ * large file's row shows no bytes, so the rows alone would not change when such a file does.
+ */
+function fileReviewDigest(
+  changes: readonly AgentPluginCapabilityChange[],
+  records: readonly PluginTreeRecord[]
+): string {
+  // The rows leave directories out, so a directory's mode change must not void the review either.
+  const entries = records
+    .filter((record) => record.kind !== "directory")
+    .map((record) => [record.path, record.kind, record.mode, pluginTreeRecordContent(record)]);
+  return createHash("sha256")
+    .update(JSON.stringify([changes, entries]))
+    .digest("hex");
+}
+
+function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
+  if (record?.kind === "symlink") return showOneLineControls(record.target);
+  if (record?.kind !== "file" || record.bytes === undefined) return undefined;
+  try {
+    // ignoreBOM keeps a leading BOM in the text, so the review marks it instead of dropping it.
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(record.bytes);
+    return showInvisibleControls(text);
+  } catch {
+    return undefined;
   }
+}
+
+function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
+  return (
+    a.kind === b.kind &&
+    a.mode === b.mode &&
+    pluginTreeRecordContent(a) === pluginTreeRecordContent(b)
+  );
+}
+
+function fileReviewRow(
+  filePath: string,
+  was: PluginTreeRecord | undefined,
+  now: PluginTreeRecord | undefined
+): AgentPluginCapabilityChange {
+  const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
+  const before = fileReviewText(was);
+  const after = fileReviewText(now);
+  // A row without the text of a side must say so: an empty row reads as a harmless change.
+  const hidden = textHidden(was, before) || textHidden(now, after);
+  return {
+    summary: `${treeEntryNoun(was, now)} ${showOneLineControls(filePath)} ${verb}${modeNote(was, now)}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
+    ...(before !== undefined ? { before } : {}),
+    ...(after !== undefined ? { after } : {}),
+  };
+}
+
+const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+/**
+ * "file" or "symlink" (Codex review): a symlink's text is its target, so an added symlink must not
+ * read as a file holding that text. A row whose entry changes kind names both.
+ */
+function treeEntryNoun(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined) {
+  const noun = (record: PluginTreeRecord) => (record.kind === "symlink" ? "symlink" : "file");
+  const newest = now ?? was;
+  assert(newest !== undefined, "a review row has a side");
+  if (was === undefined || now === undefined) return noun(newest);
+  return noun(was) === noun(now) ? noun(now) : `${noun(was)} → ${noun(now)}`;
+}
+
+/** A permission change is consent-relevant (sameTreeEntry), and a chmod alone shows no text change. */
+function modeNote(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined): string {
+  const bits = (record: PluginTreeRecord) => (record.mode & 0o7777).toString(8);
+  // A symlink's own mode means nothing on most systems: only a file's bits are shown.
+  if (was?.kind !== "file" || now?.kind !== "file" || bits(was) === bits(now)) return "";
+  return ` (mode ${bits(was)} → ${bits(now)})`;
+}
+
+function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
+  return record?.kind === "file" && text === undefined;
+}
+
+/**
+ * The file review (D1, D30): one row per file or symlink that differs between two plugin trees.
+ * `before: null` is the empty tree, so every file is an added row. A directory gets no row; the
+ * files under it do.
+ */
+function fileReviewRows(
+  before: readonly PluginTreeRecord[] | null,
+  after: readonly PluginTreeRecord[]
+): AgentPluginCapabilityChange[] {
+  const entries = (records: readonly PluginTreeRecord[]) =>
+    new Map(
+      records.filter((record) => record.kind !== "directory").map((record) => [record.path, record])
+    );
+  const old = entries(before ?? []);
+  const next = entries(after);
+  return [...new Set([...old.keys(), ...next.keys()])].sort().flatMap((filePath) => {
+    const was = old.get(filePath);
+    const now = next.get(filePath);
+    return was !== undefined && now !== undefined && sameTreeEntry(was, now)
+      ? []
+      : [fileReviewRow(filePath, was, now)];
+  });
 }
 
 /** Display form: names come from the plugin's files, so they get the agent names' marks (#6629). */
@@ -2298,6 +2418,40 @@ export class AgentPluginInstallService {
     );
   }
 
+  private async fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
+    try {
+      return await listPluginTreeRecords(dir, this.stagingQuota(), {
+        keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
+        // A UTF-16 unit takes at least one byte and at most three in UTF-8 (a 4-byte character is
+        // two units), so more kept bytes than this always render past the review's size cap.
+        // The walk then stops before it holds the whole staged-tree quota in memory.
+        maxKeptBytes: 3 * MAX_REVIEW_TEXT_CHARS,
+        skipRootGit: true,
+      });
+    } catch (error) {
+      if (error instanceof KeptBytesLimitError) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+      throw error;
+    }
+  }
+
+  /**
+   * The file review rows of a staged plugin with a runnable Cursor command hook; none for any
+   * other plugin. D30: an installed tree (or none) without such a hook never had a file review,
+   * so the staged tree is compared with the empty tree and every file is listed.
+   */
+  private async fileReviewChanges(
+    staged: AgentPluginInfo,
+    installed: AgentPluginInfo | null
+  ): Promise<AgentPluginCapabilityChange[]> {
+    if (!runsCursorCommands((await loadPluginHooks(staged)).hooks)) return [];
+    const reviewed =
+      installed !== null && runsCursorCommands((await loadPluginHooks(installed)).hooks);
+    return fileReviewRows(
+      reviewed ? await this.fileReviewRecords(installed.rootPath) : null,
+      await this.fileReviewRecords(staged.rootPath)
+    );
+  }
+
   /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
    * allow twice the checkout quota (bytes AND file count — loose objects can
@@ -3156,6 +3310,7 @@ export class AgentPluginInstallService {
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
     );
+    changes.push(...(await this.fileReviewChanges(stagedPlugin, currentPlugin)));
     assertReviewFits(changes);
     return changes;
   }
@@ -3790,8 +3945,10 @@ export class AgentPluginInstallService {
       warnings
     );
     const hook = this.collectHook(plugin);
-    const codexHooks = await loadPluginCodexHooks(plugin);
+    const codexHooks = await loadPluginHooks(plugin);
     warnings.push(...codexHooks.warnings);
+    const fileChanges = await this.fileReviewChanges(plugin, null);
+    assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
     // Display only: the names a user reads before Install show invisible controls (#6629).
@@ -3847,6 +4004,7 @@ export class AgentPluginInstallService {
       mcpServers,
       ...(hook !== undefined ? { hook } : {}),
       codexHooks: codexHooks.hooks,
+      fileChanges,
       agents,
       readonlyAgents,
       workflows,
@@ -4757,17 +4915,42 @@ export class AgentPluginInstallService {
     // The hook load and the trust read are two reads: an update from another process between
     // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
     // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
-    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+    const { hooks, warnings, trust, fileReview } = await this.readInsideDiscoveryGate(
       "Plugin files changed during hook review. Refresh the hook review.",
-      async () => ({
-        ...(await this.loadManagedPluginHooks(args.name)),
-        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
-      })
+      async () => {
+        const { plugin, ...loaded } = await this.loadManagedPluginHooks(args.name);
+        const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+        return {
+          ...loaded,
+          trust,
+          fileReview: await this.firstTrustFileReview(plugin, loaded.hooks, trust),
+        };
+      }
     );
     return {
       hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
       warnings,
+      ...(fileReview !== undefined ? { fileReview } : {}),
     };
+  }
+
+  /**
+   * D30 at the first trust (Codex review of the RFC, P1): a plugin installed by a build without
+   * the file review never showed its files, and later updates show only changed ones. So while
+   * no Cursor hook of the plugin is trusted, trusting one needs the install preview's review of
+   * every file. Xum keeps no record of which install showed the files, so a plugin installed with
+   * the review shows it once more here.
+   */
+  private async firstTrustFileReview(
+    plugin: AgentPluginInfo,
+    hooks: readonly PluginHookDefinition[],
+    trust: PluginHookTrustRecord
+  ): Promise<AgentPluginHooks["fileReview"]> {
+    if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
+    const records = await this.fileReviewRecords(plugin.rootPath);
+    const changes = fileReviewRows(null, records);
+    assertReviewFits(changes);
+    return { changes, digest: fileReviewDigest(changes, records) };
   }
 
   /**
@@ -4780,11 +4963,13 @@ export class AgentPluginInstallService {
     key: string;
     hash: string;
     state: PluginHookTrustState | null;
+    /** getHooks' `fileReview.digest`, when it showed one. */
+    fileReviewDigest?: string;
   }): Promise<void> {
     // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
     // the trust file between this check and the write, which would recreate it.
     return this.runExclusive(async () => {
-      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const { entry, plugin, hooks } = await this.loadManagedPluginHooks(args.name);
       const hook = hooks.find((candidate) => candidate.key === args.key);
       if (hook?.hash !== args.hash) {
         throw new Error("This hook changed since you reviewed it. Review it again.");
@@ -4792,8 +4977,43 @@ export class AgentPluginInstallService {
       if (args.state === "trusted" && hook.status !== "runnable") {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
-      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+      const instanceId = this.instanceIdFor(args.name);
+      if (args.state === "trusted") {
+        await this.assertFilesReviewed({ plugin, hooks, hook, instanceId }, args.fileReviewDigest);
+      }
+      await setPluginHookTrust(this.config.rootDir, instanceId, {
+        key: args.key,
+        hash: args.hash,
+        state: args.state,
+        // The files of this commit are the ones reviewed: at install, an update, or just above.
+        ...(hook.handler.type === "cursor-command" ? { reviewedSha: entry.lockedSha } : {}),
+      });
     });
+  }
+
+  /**
+   * Before a Cursor command hook's trust: while getHooks shows the first-trust file review, the
+   * trust needs the digest of that review, read again here, not taken from the caller: the trust
+   * covers the files as they are now.
+   */
+  private async assertFilesReviewed(
+    target: {
+      plugin: AgentPluginInfo;
+      hooks: readonly PluginHookDefinition[];
+      hook: PluginHookDefinition;
+      instanceId: string;
+    },
+    fileReviewDigest: string | undefined
+  ): Promise<void> {
+    if (target.hook.handler.type !== "cursor-command") return;
+    const trust = await readPluginHookTrust(this.config.rootDir, target.instanceId);
+    const review = await this.firstTrustFileReview(target.plugin, target.hooks, trust);
+    if (review === undefined || review.digest === fileReviewDigest) return;
+    throw new Error(
+      fileReviewDigest === undefined
+        ? "Review this plugin's files before you trust its first hook."
+        : "This plugin's files changed since you reviewed them. Review them again."
+    );
   }
 
   /**
@@ -4829,13 +5049,13 @@ export class AgentPluginInstallService {
   }
 
   private async loadManagedPluginHooks(name: string) {
-    await this.findOwnRegistryEntry(name);
+    const entry = await this.findOwnRegistryEntry(name);
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
-    return loadPluginCodexHooks(plugin);
+    return { entry, plugin, ...(await loadPluginHooks(plugin)) };
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
@@ -6989,6 +7209,18 @@ export class AgentPluginInstallService {
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
+        // This update reviewed every changed file a Cursor hook can run: trust bound to the old
+        // commit moves to the new one. A failure only asks the user to review again.
+        await rebindPluginHookTrust(
+          this.config.rootDir,
+          this.instanceIdFor(entry.name),
+          entry.lockedSha
+        ).catch((error: unknown) => {
+          log.warn("Failed to move hook trust to the updated plugin commit", {
+            name: entry.name,
+            error: getErrorMessage(error),
+          });
+        });
         await this.sweepApprovedCopies(updated);
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`

@@ -473,6 +473,7 @@ export const AddPluginConsentPreview: Story = {
               },
             ],
             codexHooks: GRILL_HOOKS.hooks.map(({ review: _review, ...hook }) => hook),
+            fileChanges: [],
             warnings: ["Unknown top-level field 'hooks' ignored"],
             notApplied: [],
             targetPath: "~/.mux/plugins/grill",
@@ -563,6 +564,23 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             slashCommands: [],
             reviewedComponents: [],
             codexHooks: [],
+            fileChanges: [
+              {
+                summary: "file hooks/hooks.json added",
+                after: '{"version":1,"hooks":{"stop":[{"command":"bash hooks/stop.sh"}]}}',
+              },
+              { summary: "file hooks/lib.sh added", after: "/opt/shared/lib.sh" },
+              {
+                summary: "file hooks/stop.sh added",
+                after: `#!/usr/bin/env bash\nsource hooks/lib.sh\ncurl -fsSL https://example.com/${MAX_LENGTH_NAME}/report\n`,
+              },
+              { summary: "file hooks/a<U+202E>h.sh added", after: "echo <U+202E>hidden\n" },
+              { summary: "file assets/logo.png added" },
+              {
+                summary: `file skills/${MAX_LENGTH_NAME}/helper.sh added`,
+                after: "echo helper\n",
+              },
+            ],
             warnings: [],
             notApplied: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
@@ -835,6 +853,101 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
     const trust = await canvas.findByRole("button", { name: /^Trust / });
     if (!trust.hasAttribute("disabled")) throw new Error("Trust is on before the full input");
     await canvas.findByRole("button", { name: /^Show full input \(\d+ KB\)$/ });
+    const panel = (await canvas.findByText(/A hook runs only after you trust it/)).parentElement;
+    if (panel instanceof HTMLElement && panel.scrollWidth > panel.clientWidth + 1) {
+      throw new Error("Hook review panel overflows at phone width");
+    }
+  },
+};
+
+const cursorHooksOptions = (): MockORPCClientOptions => {
+  const hook = (
+    event: string,
+    entry: Record<string, unknown>,
+    status: AgentPluginHooks["hooks"][number]["status"]
+  ): AgentPluginHooks["hooks"][number] => ({
+    key: `cursor:hooks/hooks.json#${event}[0]`,
+    hash: event.padEnd(64, "0"),
+    event,
+    ...(typeof entry.matcher === "string" ? { matcher: entry.matcher } : {}),
+    handler: {
+      type: "cursor-command",
+      command: String(entry.command),
+      ...(typeof entry.loop_limit === "number"
+        ? { loopLimit: Math.min(entry.loop_limit, 50) }
+        : {}),
+      declared: JSON.stringify(entry),
+    },
+    status,
+    source: "hooks/hooks.json",
+    review: "new",
+  });
+  return {
+    agentPlugins: {
+      items: [MANAGED_ITEM],
+      hooks: {
+        grill: {
+          hooks: [
+            hook("stop", { command: "./hooks/stop-hook.sh", loop_limit: 80 }, "runnable"),
+            hook("afterAgentResponse", { command: "./hooks/capture-response.sh" }, "runnable"),
+            hook(
+              "subagentStop",
+              { command: "./hooks/subagent-stop.sh", matcher: "^ralph-.*$" },
+              "ignored-event"
+            ),
+          ],
+          warnings: [],
+        },
+      },
+    },
+  };
+};
+
+/** Cursor hooks review: each entry as declared, its Cursor reason, and the remote-workspace note. */
+export const CursorHooksReview: Story = {
+  // Out of Pixel snapshots, like HooksReview (snapshot budget).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={cursorHooksOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openHooksReview(canvasElement);
+    // The declared loop_limit shows as declared, though the runner clamps it to 50.
+    await canvas.findByText('{"command":"./hooks/stop-hook.sh","loop_limit":80}');
+    await canvas.findByText(/Never runs: event not applied in Xum/);
+    if (canvas.queryByText(/Xum runs only mcp_tool hooks/) !== null) {
+      throw new Error("A Cursor hook shows the Codex status note");
+    }
+    const trust = await canvas.findAllByRole("button", { name: /^Trust / });
+    if (trust.length !== 2) throw new Error(`Expected two Trust buttons, got ${trust.length}`);
+    const remote = await canvas.findAllByText(/does not run in remote workspaces/i);
+    if (remote.length !== 3) throw new Error(`Expected three remote notes, got ${remote.length}`);
+  },
+};
+
+/** Phone width (390 px): declared entries and the trust notes must wrap inside the card. */
+export const CursorHooksReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    // Out of Pixel snapshots, like HooksReview (snapshot budget).
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={cursorHooksOptions()}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openHooksReview(canvasElement);
     const panel = (await canvas.findByText(/A hook runs only after you trust it/)).parentElement;
     if (panel instanceof HTMLElement && panel.scrollWidth > panel.clientWidth + 1) {
       throw new Error("Hook review panel overflows at phone width");
@@ -1276,6 +1389,7 @@ const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
   slashCommands: [],
   reviewedComponents: [],
   codexHooks: [],
+  fileChanges: [],
   warnings: [],
   notApplied: [],
   targetPath: "~/.mux/plugins/review-kit",

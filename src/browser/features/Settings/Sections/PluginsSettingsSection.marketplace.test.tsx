@@ -63,6 +63,7 @@ const remotePreview: AgentPluginInstallPreview = {
   slashCommands: [],
   reviewedComponents: [],
   codexHooks: [],
+  fileChanges: [],
   warnings: [],
   notApplied: [],
   consentDigest: "c".repeat(64),
