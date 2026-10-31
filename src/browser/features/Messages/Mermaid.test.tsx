@@ -9,6 +9,7 @@ import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as PeleModule from "pele";
+import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
 
 const INVALID_CHART = "graph TD\nA-->";
 
@@ -39,7 +40,7 @@ describe("Mermaid layout stability", () => {
     globalThis.document = domWindow.document;
     globalThis.DOMParser = domWindow.DOMParser;
     globalThis.HTMLElement = domWindow.HTMLElement;
-    globalThis.XMLSerializer = domWindow.XMLSerializer;
+    globalThis.XMLSerializer = chromiumMathSerializer(domWindow.XMLSerializer);
   });
 
   afterEach(() => {
@@ -243,13 +244,22 @@ describe("Mermaid layout stability", () => {
     // fonts.ready alone resolves before a face that nothing on the page uses yet has loaded.
     document.documentElement.style.setProperty("--font-primary", "Geist");
     const fontLoad = Promise.withResolvers<FontFace[]>();
+    const requested: string[] = [];
     Object.defineProperty(document, "fonts", {
-      value: { ready: Promise.resolve(), load: () => fontLoad.promise },
+      value: {
+        ready: Promise.resolve(),
+        load: (font: string) => {
+          requested.push(font);
+          return fontLoad.promise;
+        },
+      },
     });
 
     const view = renderMermaid();
     // A macrotask drains every promise chain that does not wait on the font.
     await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    // The theme sets no --font-monospace here, so only the primary font loads.
+    expect(requested).toEqual(["14px Geist"]);
     expect(view.container.querySelector(".mermaid-container svg")).toBeNull();
     expect(view.container.querySelector(".mermaid-container")?.textContent).toBe(
       "Rendering diagram..."
@@ -286,7 +296,7 @@ describe("Mermaid layout stability", () => {
       const withForeignObject =
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/>' +
         '<foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><p>label</p><script>alert(1)</script></div></foreignObject></svg>';
-      const out = sanitizeMermaidSvg(withForeignObject);
+      const out = sanitizeMermaidSvg(withForeignObject, "mermaid-r1");
       expect(out).toContain("<rect");
       expect(out).not.toContain("foreignObject");
       expect(out).not.toContain("label");
@@ -297,24 +307,24 @@ describe("Mermaid layout stability", () => {
       const malicious = `<svg xmlns="http://www.w3.org/2000/svg">
         <a href="javascript:alert(1)" onclick="alert(2)"><rect width="10" height="10"/></a>
       </svg>`;
-      const out = sanitizeMermaidSvg(malicious);
+      const out = sanitizeMermaidSvg(malicious, "mermaid-r1");
       expect(out).not.toBeNull();
       expect(out).not.toContain("javascript:");
       expect(out).not.toContain("onclick");
     });
 
     test("rejects input that contains no <svg> root", () => {
-      expect(sanitizeMermaidSvg("<div>not an svg</div>")).toBeNull();
-      expect(sanitizeMermaidSvg("")).toBeNull();
+      expect(sanitizeMermaidSvg("<div>not an svg</div>", "mermaid-r1")).toBeNull();
+      expect(sanitizeMermaidSvg("", "mermaid-r1")).toBeNull();
     });
 
     test("rejects malformed SVG instead of repairing it", () => {
-      expect(sanitizeMermaidSvg("<svg><g></svg>")).toBeNull();
-      expect(sanitizeMermaidSvg("<svg><rect></svg>")).toBeNull();
+      expect(sanitizeMermaidSvg("<svg><g></svg>", "mermaid-r1")).toBeNull();
+      expect(sanitizeMermaidSvg("<svg><rect></svg>", "mermaid-r1")).toBeNull();
       // HTML void elements inside foreignObject are not well-formed XML either.
       const htmlLabel =
         '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><p>a<br>b</p></foreignObject></svg>';
-      expect(sanitizeMermaidSvg(htmlLabel)).toBeNull();
+      expect(sanitizeMermaidSvg(htmlLabel, "mermaid-r1")).toBeNull();
     });
   });
 
@@ -502,6 +512,7 @@ describe("Mermaid layout stability", () => {
         expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
       );
       const label = view.container.querySelector(".mermaid-container foreignObject.pele-math");
+      expect(label).not.toBeNull();
       expect(label?.querySelector("math msup")).not.toBeNull();
       expect(view.container.querySelector(".mermaid-container")?.textContent).not.toContain("$$");
     } finally {

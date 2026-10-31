@@ -166,6 +166,11 @@ flowchart TD
     // Math labels.
     `flowchart LR
   A["$$x^2 + \\alpha$$"] --> B["$$\\frac{a}{b}$$"]`,
+    // A click target and an image node. Pele adds <a> and <image> for them unless peleRenderOptions
+    // turns links and images off, and the sanitizer removes both.
+    `flowchart LR
+  A[Docs] --> B@{ img: "https://example.com/pic.png", label: "Picture", pos: "t", h: 40 }
+  click A "https://example.com" "Open the docs"`,
     // Label tags: <sub> and <sup> set baseline-shift, <u> and <ins> set text-decoration.
     `flowchart LR
   A["<b>bold</b> <i>italic</i> <code>code</code> H<sub>2</sub>O x<sup>2</sup> <u>under</u> <ins>ins</ins>"] --> B`,
@@ -176,11 +181,13 @@ flowchart TD
   classDef all fill:#f96,fill-opacity:0.5,stroke:#333,stroke-width:2px,stroke-dasharray:5 5,stroke-dashoffset:2,stroke-linecap:round,stroke-linejoin:round,stroke-opacity:0.8,opacity:0.9,rx:4,ry:4,color:#fff,font-size:16px,font-family:serif,font-weight:bold,font-style:italic,text-decoration:underline,letter-spacing:1px,word-spacing:2px
   style B fill:#9f9,stroke:#060
   linkStyle 1 stroke:#ff3,stroke-width:3px,stroke-dasharray:3 3,opacity:0.7`,
-    // Every MathML attribute KaTeX sets with trust: false, including the style of \fcolorbox and \pmb.
+    // Every MathML attribute KaTeX sets with trust: false, including the style of \fcolorbox and
+    // \pmb and the class of a numbered gather.
     `flowchart LR
   A["$$\\fcolorbox{red}{yellow}{x} \\pmb{y} \\color{blue}{z} \\colorbox{pink}{w} \\cancel{c}$$"] --> B["$$\\hat{x} \\overbrace{a+b}^{n} \\left( f(a, b) \\right) \\smallint \\xrightarrow{t} \\frac{1}{2} \\sqrt[3]{v}$$"]
   B --> D["$$\\binom{n}{k} \\underbrace{c+d}_{m} \\Huge{h} \\left( a \\middle| b \\right) \\smash[b]{y} \\big[ q \\big] \\underline{u}$$"]
   D --> E["$$a \\\\ b$$"]
+  E --> F["$$\\begin{gather}a\\end{gather}$$"]
   B --> C["$$\\begin{array}{c|c} \\mathbb{R} & \\mathrm{d} \\\\ \\hline \\raisebox{0.2em}{r} & \\rule{1em}{1pt} \\end{array} \\tag{1}$$"]`,
   ],
   gantt: [

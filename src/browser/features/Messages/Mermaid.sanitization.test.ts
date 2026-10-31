@@ -1,5 +1,6 @@
 import { peleRenderOptions, sanitizeMermaidSvg } from "./Mermaid";
 import { PELE_SAMPLES } from "./Mermaid.sanitization.fixtures";
+import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
@@ -11,6 +12,8 @@ import { detectType, render as renderPele } from "pele";
 
 const testWindow = new Window();
 globalThis.DOMParser = testWindow.DOMParser as unknown as typeof DOMParser;
+
+const ID_PREFIX = "mermaid-r1";
 
 /**
  * Node names after the HTML parse that inserts the sanitizer output. parse5 follows the
@@ -65,7 +68,12 @@ function themeVariable(name: string): string {
 
 describe("sanitizeMermaidSvg", () => {
   it("returns null for malformed SVG", () => {
-    expect(sanitizeMermaidSvg("<svg><g></svg")).toBeNull();
+    expect(sanitizeMermaidSvg("<svg><g></svg", ID_PREFIX)).toBeNull();
+  });
+
+  it("returns null for an svg root outside the SVG namespace", () => {
+    expect(sanitizeMermaidSvg('<svg xmlns="urn:x"><rect/></svg>', ID_PREFIX)).toBeNull();
+    expect(sanitizeMermaidSvg("<svg><rect/></svg>", ID_PREFIX)).toBeNull();
   });
 
   it("removes active content, foreignObject and unsafe attributes", () => {
@@ -74,21 +82,17 @@ describe("sanitizeMermaidSvg", () => {
       "<script>alert(1)</script>" +
       '<foreignObject><div onclick="evil()">label</div></foreignObject>' +
       '<a href="javascript:alert(1)"><text>link</text></a>' +
-      '<a xlink:href="java&#10;script:alert(3)"><text>split-link</text></a>' +
-      '<a href="java&#1114112;script:alert(4)"><text>invalid-codepoint</text></a>' +
       '<image src="javascript:alert(2)" />' +
       '<rect width="10" height="10" onclick="steal()" />' +
       "</svg>";
 
-    const sanitized = sanitizeMermaidSvg(input);
+    const sanitized = sanitizeMermaidSvg(input, ID_PREFIX);
 
     expect(sanitized).not.toBeNull();
     expect(sanitized).not.toContain("<script");
     expect(sanitized).not.toContain("onload=");
     expect(sanitized).not.toContain("onclick=");
     expect(sanitized).not.toContain("javascript:");
-    expect(sanitized).not.toContain("java&#10;script:");
-    expect(sanitized).not.toContain("&#1114112;");
     expect(sanitized).not.toContain("xlink:href=");
     expect(sanitized).not.toContain("href=");
     expect(sanitized).toContain("<svg");
@@ -109,7 +113,7 @@ describe("sanitizeMermaidSvg", () => {
     `<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/>${label}</svg>`;
 
   it("keeps Pele's MathML labels", () => {
-    const sanitized = sanitizeMermaidSvg(svgWith(peleMathLabel()));
+    const sanitized = sanitizeMermaidSvg(svgWith(peleMathLabel()), ID_PREFIX);
 
     expect(sanitized).toContain('<foreignObject class="pele-math"');
     expect(sanitized).toContain("<msup><mi>x</mi><mn>2</mn></msup>");
@@ -141,7 +145,7 @@ describe("sanitizeMermaidSvg", () => {
       `<foreignObject class="pele-math"><style xmlns="${XHTML}" style="">${MATH}</style></foreignObject>`,
     ],
   ])("removes a foreignObject with %s", (_case, label) => {
-    const sanitized = sanitizeMermaidSvg(svgWith(label));
+    const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX);
 
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toContain("foreignObject");
@@ -173,7 +177,7 @@ describe("sanitizeMermaidSvg", () => {
     ["an SVG p before a link", '<p/><link rel="stylesheet" href="https://example.com/x.css"/>'],
     ["an unknown element", "<unknown><text>label</text></unknown>"],
   ])("removes %s", (_case, label) => {
-    const sanitized = sanitizeMermaidSvg(svgWith(label)) ?? "";
+    const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX) ?? "";
     const injected = ["#comment", "img", "style", "a", "set", "animate", "p", "link", "unknown"];
 
     expect(sanitized).toContain("<rect");
@@ -218,7 +222,7 @@ describe("sanitizeMermaidSvg", () => {
     // XML attribute names are case-sensitive, but the HTML parser lowercases FILL to fill.
     ["an uppercase attribute name", svgWith(`<rect FILL="url(${REMOTE}#a)"/>`)],
   ])("removes %s", (_case, svg) => {
-    const sanitized = sanitizeMermaidSvg(svg) ?? "";
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
 
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toContain("attacker.example");
@@ -227,24 +231,30 @@ describe("sanitizeMermaidSvg", () => {
 
   it("keeps the style declarations it does not remove", () => {
     expect(
-      sanitizeMermaidSvg(svgRoot(`style="fill:red;mask:url(${REMOTE});stroke:blue"`))
+      sanitizeMermaidSvg(svgRoot(`style="fill:red;mask:url(${REMOTE});stroke:blue"`), ID_PREFIX)
     ).toContain('style="fill:red;stroke:blue"');
-    expect(sanitizeMermaidSvg(svgRoot(`style="mask:url(${REMOTE})"`))).not.toContain("style=");
+    expect(sanitizeMermaidSvg(svgRoot(`style="mask:url(${REMOTE})"`), ID_PREFIX)).not.toContain(
+      "style="
+    );
   });
 
   it("keeps a url(#id) attribute but no url() declaration", () => {
     const sanitized = sanitizeMermaidSvg(
-      svgWith(`<rect fill="url(#a)" stroke="url( '#b' )" style="background-image:url(#c)"/>`)
+      svgWith(
+        `<rect fill="url(#mermaid-r1-a)" stroke="url( '#mermaid-r1-b' )" style="background-image:url(#mermaid-r1-c)"/>`
+      ),
+      ID_PREFIX
     );
 
-    expect(sanitized).toContain(`fill="url(#a)" stroke="url( '#b' )"`);
-    // In a declaration Chromium fetches the page itself for url(#c).
-    expect(sanitized).not.toContain("url(#c)");
+    expect(sanitized).toContain(`fill="url(#mermaid-r1-a)" stroke="url( '#mermaid-r1-b' )"`);
+    // In a declaration Chromium fetches the page itself for url(#id).
+    expect(sanitized).not.toContain("url(#mermaid-r1-c)");
   });
 
   it("keeps only the text of title and desc", () => {
     const sanitized = sanitizeMermaidSvg(
-      svgWith("<title>tip<rect/><text>x</text></title><desc>about<g><rect/></g></desc>")
+      svgWith("<title>tip<rect/><text>x</text></title><desc>about<g><rect/></g></desc>"),
+      ID_PREFIX
     );
 
     expect(htmlNodeNames(sanitized ?? "")).toEqual([
@@ -256,6 +266,26 @@ describe("sanitizeMermaidSvg", () => {
       "#text",
     ]);
   });
+
+  it("keeps only ids, id references and url(#id) that start with its idPrefix", () => {
+    const sanitized = sanitizeMermaidSvg(
+      svgRoot(
+        `aria-labelledby="mermaid-r1-title" aria-describedby="mermaid-r1-desc&#9;review-immersive-root"`
+      ).replace(
+        "</svg>",
+        `<title id="mermaid-r1-title">t</title><desc id="api">d</desc>` +
+          `<defs><linearGradient id="mermaid-r2-g"/></defs>` +
+          `<rect fill="url(#mermaid-r1-g)" stroke="url(#mermaid-r2-g)"/></svg>`
+      ),
+      ID_PREFIX
+    );
+
+    expect(sanitized).toContain('aria-labelledby="mermaid-r1-title"');
+    expect(sanitized).toContain('<title id="mermaid-r1-title">');
+    expect(sanitized).toContain('fill="url(#mermaid-r1-g)"');
+    // window.api, an app element and another diagram's gradient.
+    expect(sanitized).not.toMatch(/"api"|review-immersive-root|mermaid-r2/);
+  });
 });
 
 describe("sanitizeMermaidSvg on Pele's output", () => {
@@ -266,18 +296,9 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
     saveDomGlobals();
     originalXMLSerializer = globalThis.XMLSerializer;
     globalThis.document = testWindow.document as unknown as Document;
-    // happy-dom builds <math> as an HTML element, so its XMLSerializer declares the XHTML
-    // namespace before KaTeX's MathML xmlns attribute, and the label fails the MathML check.
-    // Chromium builds a MathML element and writes only KaTeX's xmlns.
-    globalThis.XMLSerializer = class extends testWindow.XMLSerializer {
-      serializeToString(
-        ...args: Parameters<Window["XMLSerializer"]["prototype"]["serializeToString"]>
-      ) {
-        return super
-          .serializeToString(...args)
-          .replace(/^<math xmlns="http:\/\/www\.w3\.org\/1999\/xhtml" /, "<math ");
-      }
-    } as unknown as typeof XMLSerializer;
+    globalThis.XMLSerializer = chromiumMathSerializer(
+      testWindow.XMLSerializer as unknown as typeof XMLSerializer
+    );
     // happy-dom has no layout, and Pele shows the TeX source of a 0x0 formula. happy-dom parses
     // <math> as an HTMLUnknownElement.
     measure = spyOn(testWindow.HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
@@ -307,11 +328,11 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
     for (const maxWidth of [undefined, 390]) {
       const { svg } = renderPele(
         chart,
-        peleRenderOptions({ idPrefix: "mermaid-r1", maxWidth, ...fonts })
+        peleRenderOptions({ idPrefix: ID_PREFIX, maxWidth, ...fonts })
       );
       const parsed = new DOMParser().parseFromString(svg, "image/svg+xml").documentElement
         .outerHTML;
-      const sanitized = sanitizeMermaidSvg(svg);
+      const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
 
       expect(svg).not.toContain("$$");
       const kept = new Set(htmlParts(sanitized ?? ""));

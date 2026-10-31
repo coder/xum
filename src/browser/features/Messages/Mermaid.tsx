@@ -27,116 +27,280 @@ const ZOOM_STEP = 0.1;
 // the height clamp that would shrink a tall layout until its labels are unreadable.
 const NARROW_DIAGRAM_WIDTH = 640;
 
-function decodeNumericCodePoint(codePoint: number): string {
-  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
-    // Treat invalid numeric entities as empty content to avoid parser crashes
-    // and collapse obfuscated scheme separators.
-    return "";
-  }
-
-  try {
-    return String.fromCodePoint(codePoint);
-  } catch {
-    return "";
-  }
-}
-
-function decodeEntity(entityBody: string): string | null {
-  if (entityBody.startsWith("#x") || entityBody.startsWith("#X")) {
-    const parsed = Number.parseInt(entityBody.slice(2), 16);
-    return Number.isNaN(parsed) ? "" : decodeNumericCodePoint(parsed);
-  }
-
-  if (entityBody.startsWith("#")) {
-    const parsed = Number.parseInt(entityBody.slice(1), 10);
-    return Number.isNaN(parsed) ? "" : decodeNumericCodePoint(parsed);
-  }
-
-  const named: Record<string, string> = {
-    tab: "\t",
-    newline: "\n",
-    colon: ":",
-    nbsp: " ",
-  };
-
-  return named[entityBody.toLowerCase()] ?? null;
-}
-
-function canonicalizeUrlForSchemeCheck(value: string): string {
-  // Normalize encoded and obfuscated schemes before comparison so payloads like
-  // java&#10;script:, java%0Ascript:, or java\nscript: reduce to javascript:.
-  let normalized = value.toLowerCase();
-
-  normalized = normalized.replace(/&([^;\s]+);?/g, (fullMatch, entityBody: string) => {
-    return decodeEntity(entityBody) ?? fullMatch;
-  });
-
-  normalized = normalized.replace(/%([0-9a-f]{2})/gi, (fullMatch, hex: string) => {
-    const parsed = Number.parseInt(hex, 16);
-    return Number.isNaN(parsed) ? fullMatch : String.fromCodePoint(parsed);
-  });
-
-  let canonical = "";
-  for (const char of normalized) {
-    const charCode = char.charCodeAt(0);
-    const isAsciiControl = charCode <= 0x1f || charCode === 0x7f;
-    // The HTML parser turns an invalid numeric reference (java&#1114112;script:) into U+FFFD
-    // before this check sees the value. Drop it like the other separators, so the check fails
-    // closed and never depends on how a parser decodes such a reference.
-    const isReplacementChar = charCode === 0xfffd;
-    if (isAsciiControl || isReplacementChar || /\s/.test(char)) {
-      continue;
-    }
-
-    canonical += char;
-  }
-
-  return canonical;
-}
-
+const SVG_NS = "http://www.w3.org/2000/svg";
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
-// The elements KaTeX's MathML output uses (MathNodeType in katex/src/mathMLTree.ts), minus
-// mglyph, which loads an image. The name matters, not only the namespace: inside <mtext> the
-// HTML parser that inserts the SVG builds HTML elements, so a MathML-namespace <img> there
-// becomes a real image.
-const MATHML_LABEL_ELEMENTS = new Set([
-  "math",
-  "semantics",
-  "annotation",
-  "mrow",
-  "mi",
-  "mn",
-  "mo",
-  "mtext",
-  "mspace",
-  "msup",
-  "msub",
-  "msubsup",
-  "mfrac",
-  "mroot",
-  "msqrt",
-  "mover",
-  "munder",
-  "munderover",
-  "mtable",
-  "mtr",
-  "mtd",
-  "mlabeledtr",
-  "menclose",
-  "mstyle",
-  "mpadded",
-  "mphantom",
+
+/** What Pele emits in one namespace. Names are lowercase, like the HTML parser makes them. */
+interface PeleNamespace {
+  elements: ReadonlySet<string>;
+  /** HTML integration points: the HTML parser would build their element children as HTML. */
+  textOnlyElements: ReadonlySet<string>;
+  /** Their values must pass isPeleCss. Most are presentation attributes, which are CSS. */
+  cssAttributes: ReadonlySet<string>;
+  /** Ids and id lists. Each id must start with the diagram's idPrefix. */
+  idAttributes: ReadonlySet<string>;
+  /** Names and label text, which the browser never reads as CSS. */
+  textAttributes: ReadonlySet<string>;
+}
+
+/**
+ * Everything Pele 1.9 emits with peleRenderOptions. The sanitizer removes every other element and
+ * attribute, every value that fails isPeleCss, and every id outside the diagram's idPrefix. A
+ * blocklist leaks: <set> can write a javascript: href, the HTML parser ends the <svg> at an
+ * SVG-namespace <p>, and fill, mask or marker-end can load a url(). Mermaid.sanitization.test.ts
+ * fails when the sanitizer removes anything from a sample of every diagram type, so run it after
+ * a Pele or KaTeX upgrade.
+ */
+const PELE_OUTPUT = new Map<string | null, PeleNamespace>([
+  [
+    SVG_NS,
+    {
+      // Pele also emits <a> and <image>, but only with the links and images that
+      // peleRenderOptions turns off.
+      elements: new Set([
+        "circle",
+        "defs",
+        "desc",
+        "ellipse",
+        "g",
+        "lineargradient",
+        "path",
+        "polygon",
+        "rect",
+        "stop",
+        "svg",
+        "text",
+        "title",
+        "tspan",
+      ]),
+      textOnlyElements: new Set(["desc", "title"]),
+      cssAttributes: new Set([
+        "baseline-shift",
+        "cx",
+        "cy",
+        "d",
+        "fill",
+        "fill-opacity",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-weight",
+        "gradientunits",
+        "height",
+        "offset",
+        "opacity",
+        "overflow",
+        "points",
+        "r",
+        "rx",
+        "ry",
+        "stop-color",
+        "stroke",
+        "stroke-dasharray",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-width",
+        "style",
+        "text-anchor",
+        "text-decoration",
+        "transform",
+        "viewbox",
+        "width",
+        "x",
+        "x1",
+        "x2",
+        "y",
+      ]),
+      // An id outside the diagram's idPrefix could shadow an app global such as window.api, or
+      // an element the app looks up with getElementById, or another diagram's gradient.
+      idAttributes: new Set(["aria-describedby", "aria-labelledby", "id"]),
+      // data-id holds label text such as "feat(api): add".
+      textAttributes: new Set([
+        "aria-roledescription",
+        "class",
+        "data-icon",
+        "data-id",
+        "role",
+        "xml:space",
+        "xmlns",
+      ]),
+    },
+  ],
+  // The <div> that Pele wraps around each math label.
+  [
+    XHTML_NS,
+    {
+      elements: new Set(["div"]),
+      textOnlyElements: new Set(),
+      cssAttributes: new Set(["style"]),
+      idAttributes: new Set(),
+      textAttributes: new Set(["xmlns"]),
+    },
+  ],
+  [
+    MATHML_NS,
+    {
+      // KaTeX's MathML output (MathNodeType in katex/src/mathMLTree.ts), minus mglyph, which
+      // loads an image. The name matters, not only the namespace: inside <mtext> the HTML parser
+      // that inserts the SVG builds HTML elements, so a MathML-namespace <img> there becomes a
+      // real image.
+      elements: new Set([
+        "math",
+        "semantics",
+        "annotation",
+        "mrow",
+        "mi",
+        "mn",
+        "mo",
+        "mtext",
+        "mspace",
+        "msup",
+        "msub",
+        "msubsup",
+        "mfrac",
+        "mroot",
+        "msqrt",
+        "mover",
+        "munder",
+        "munderover",
+        "mtable",
+        "mtr",
+        "mtd",
+        "mlabeledtr",
+        "menclose",
+        "mstyle",
+        "mpadded",
+        "mphantom",
+      ]),
+      textOnlyElements: new Set(),
+      // What KaTeX's MathML builders set (setAttribute in katex/src), minus href, which
+      // `trust: false` turns off.
+      cssAttributes: new Set([
+        "accent",
+        "accentunder",
+        "columnalign",
+        "columnlines",
+        "columnspacing",
+        "depth",
+        "display",
+        "displaystyle",
+        "encoding",
+        "fence",
+        "height",
+        "largeop",
+        "linebreak",
+        "linethickness",
+        "lspace",
+        "mathbackground",
+        "mathcolor",
+        "mathsize",
+        "mathvariant",
+        "maxsize",
+        "minsize",
+        "notation",
+        "rowlines",
+        "rowspacing",
+        "rspace",
+        "scriptlevel",
+        "separator",
+        "stretchy",
+        "style",
+        "voffset",
+        "width",
+      ]),
+      idAttributes: new Set(),
+      // A numbered environment gives its mtd cells a class.
+      textAttributes: new Set(["class", "xmlns"]),
+    },
+  ],
 ]);
+
+function peleNamespace(namespace: string | null): PeleNamespace {
+  const rules = PELE_OUTPUT.get(namespace);
+  assert(rules, `Pele emits no element in namespace ${String(namespace)}`);
+  return rules;
+}
+
+// The CSS functions in Pele's output, plus the color functions a chart's styles can use.
+const PELE_CSS_FUNCTIONS = new Set([
+  "calc",
+  "color-mix",
+  "hsl",
+  "hsla",
+  "rgb",
+  "rgba",
+  "rotate",
+  "translate",
+  "var",
+]);
+
+/** Pele derives every id from idPrefix, such as `${idPrefix}-title` for an accTitle. */
+function isDiagramId(id: string, idPrefix: string): boolean {
+  return id.startsWith(`${idPrefix}-`);
+}
+
+/**
+ * A CSS value that loads nothing: no escape, comment, at-rule or IE expression, and only
+ * PELE_CSS_FUNCTIONS. With an idPrefix, url(#id) may also point at an element of the same
+ * diagram, as Pele's fill attribute does. A style declaration gets no idPrefix: there Chromium
+ * fetches the page itself for url(#id) in background-image, cursor or border-image-source.
+ */
+function isPeleCss(value: string, idPrefix: string | null): boolean {
+  const rest = value.replace(/url\(\s*(["']?)#([\w-]+)\1\s*\)/gi, (url, _quote, id: string) =>
+    idPrefix !== null && isDiagramId(id, idPrefix) ? "" : url
+  );
+  if (/\\|\/\*|@|expression/i.test(rest)) return false;
+  return Array.from(rest.matchAll(/([\w-]*)\s*\(/g)).every((call) =>
+    PELE_CSS_FUNCTIONS.has(call[1].toLowerCase())
+  );
+}
+
+/** Removes the declarations that fail isPeleCss, and keeps Pele's exact text when none does. */
+function sanitizeStyle(style: string): string | null {
+  const declarations = style.split(";");
+  const kept = declarations.filter((declaration) => isPeleCss(declaration, null));
+  if (kept.length === declarations.length) return style;
+  return kept.some((declaration) => declaration.trim() !== "") ? kept.join(";") : null;
+}
+
+/** The value to keep for an attribute, or null to remove the attribute. */
+function keptAttributeValue(
+  rules: PeleNamespace,
+  name: string,
+  value: string,
+  idPrefix: string
+): string | null {
+  if (rules.textAttributes.has(name)) return value;
+  if (rules.idAttributes.has(name)) {
+    // The browser splits an id list at any whitespace, including the tab that &#9; writes.
+    return value.split(/\s+/).every((id) => isDiagramId(id, idPrefix)) ? value : null;
+  }
+  if (!rules.cssAttributes.has(name)) return null;
+  if (name === "style") return sanitizeStyle(value);
+  return isPeleCss(value, idPrefix) ? value : null;
+}
+
+/** Applies PELE_OUTPUT to the attributes of an element that removeUnknownElements kept. */
+function sanitizeAttributes(element: Element, idPrefix: string): void {
+  const rules = peleNamespace(element.namespaceURI);
+  for (const attribute of Array.from(element.attributes)) {
+    // Lowercase like the HTML parser, which turns an XML FILL attribute into fill.
+    const name = attribute.name.toLowerCase();
+    const value = keptAttributeValue(rules, name, attribute.value, idPrefix);
+    if (value === null) element.removeAttributeNode(attribute);
+    else attribute.value = value;
+  }
+}
 
 /** A <math> tree that holds only the elements KaTeX emits. */
 function isKatexMathml(math: Element | null): boolean {
+  // mutation-equivalent: isPeleMathLabel passes a div's only child, so math is never null
   if (math?.localName.toLowerCase() !== "math") return false;
+  const { elements } = peleNamespace(MATHML_NS);
   // Lowercase like the HTML parser does with MathML tag names.
   return [math, ...Array.from(math.querySelectorAll("*"))].every(
-    (element) =>
-      element.namespaceURI === MATHML_NS &&
-      MATHML_LABEL_ELEMENTS.has(element.localName.toLowerCase())
+    (element) => element.namespaceURI === MATHML_NS && elements.has(element.localName.toLowerCase())
   );
 }
 
@@ -146,47 +310,31 @@ function isPeleMathLabel(foreignObject: Element): boolean {
   return (
     foreignObject.getAttribute("class") === "pele-math" &&
     foreignObject.childElementCount === 1 &&
+    // mutation-equivalent: the check above leaves foreignObject one child, so div is never null
     div?.namespaceURI === XHTML_NS &&
-    div.localName === "div" &&
+    peleNamespace(XHTML_NS).elements.has(div.localName) &&
     div.childElementCount === 1 &&
     Array.from(div.attributes, (attribute) => attribute.name).join() === "xmlns,style" &&
     isKatexMathml(div.firstElementChild)
   );
 }
 
-const SVG_NS = "http://www.w3.org/2000/svg";
-// Every SVG element Pele 1.9 emitted for the pele.run examples of all 33 diagram types. It also
-// emits <a> and <image>, but only with the links and images that renderMermaidSvg turns off.
-// Diagrams lose any element missing here, so re-check the list when Pele is upgraded.
-// Lowercase, because the HTML parser that inserts the output lowercases tag names.
-const PELE_SVG_ELEMENTS = new Set([
-  "circle",
-  "defs",
-  "desc",
-  "ellipse",
-  "g",
-  "lineargradient",
-  "path",
-  "polygon",
-  "rect",
-  "stop",
-  "svg",
-  "text",
-  "title",
-  "tspan",
-]);
-
 /**
- * Removes every element that Pele does not emit, keeping only Pele's math labels as
- * foreignObject. A blocklist leaks: <set> can write a javascript: href, and the HTML parser
- * ends the <svg> at an SVG-namespace <p>, so the elements after it become HTML.
+ * Removes every SVG element that Pele does not emit and the element children of its text-only
+ * elements, keeping only Pele's math labels as foreignObject.
  */
 function removeUnknownElements(parent: Element): void {
+  const svg = peleNamespace(SVG_NS);
   for (const child of Array.from(parent.children)) {
     const svgName = child.namespaceURI === SVG_NS ? child.localName.toLowerCase() : "";
     if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
-    if (PELE_SVG_ELEMENTS.has(svgName)) removeUnknownElements(child);
-    else child.remove();
+    if (!svg.elements.has(svgName)) {
+      child.remove();
+    } else if (svg.textOnlyElements.has(svgName)) {
+      for (const element of Array.from(child.children)) element.remove();
+    } else {
+      removeUnknownElements(child);
+    }
   }
 }
 
@@ -205,7 +353,9 @@ function removeNonElementNodes(elements: Element[]): void {
   }
 }
 
-export function sanitizeMermaidSvg(svg: string): string | null {
+/** Sanitizes the SVG that Pele rendered with idPrefix. Null when it is not well-formed SVG. */
+export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null {
+  assert(/^[\w-]+$/.test(idPrefix), "idPrefix is a plain id, as Mermaid builds it");
   // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
   // fail closed.
   const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
@@ -213,37 +363,15 @@ export function sanitizeMermaidSvg(svg: string): string | null {
     return null;
   }
   const svgRoot = xmlDoc.documentElement;
-  if (svgRoot.tagName.toLowerCase() !== "svg") {
+  if (svgRoot.namespaceURI !== SVG_NS || svgRoot.tagName.toLowerCase() !== "svg") {
     return null;
   }
 
-  // Defense in depth: keep only the elements and text Pele emits, and sanitize the remaining
-  // attributes.
+  // Defense in depth: keep only the elements, text and attribute values Pele emits.
   removeUnknownElements(svgRoot);
-
-  const urlAttributes = new Set(["href", "xlink:href", "src", "action", "formaction"]);
-  const blockedSchemes = ["javascript:", "vbscript:", "data:text/html"];
-
-  const elementsToScan: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
-  removeNonElementNodes(elementsToScan);
-  elementsToScan.forEach((element) => {
-    for (const attribute of Array.from(element.attributes)) {
-      const attributeName = attribute.name.toLowerCase();
-      const canonicalUrlValue = canonicalizeUrlForSchemeCheck(attribute.value.trim());
-
-      if (attributeName.startsWith("on")) {
-        element.removeAttribute(attribute.name);
-        continue;
-      }
-
-      if (
-        urlAttributes.has(attributeName) &&
-        blockedSchemes.some((scheme) => canonicalUrlValue.startsWith(scheme))
-      ) {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  });
+  const elements: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
+  removeNonElementNodes(elements);
+  for (const element of elements) sanitizeAttributes(element, idPrefix);
 
   return svgRoot.outerHTML;
 }
@@ -327,7 +455,7 @@ async function renderMermaidSvg(
     peleRenderOptions({ idPrefix, maxWidth, fontFamily, fontFamilyMono })
   );
 
-  const sanitizedSvg = sanitizeMermaidSvg(svg);
+  const sanitizedSvg = sanitizeMermaidSvg(svg, idPrefix);
   if (!sanitizedSvg) {
     throw new Error("Diagram renderer returned invalid SVG output");
   }
