@@ -227,7 +227,7 @@ export const WorkspaceConfigSchema = z.object({
   }),
   taskCheckoutUnsanitized: z.boolean().optional().meta({
     description:
-      "The task's checkout is not known to be sanitized: set when the task is reserved for a checkout of its own, cleared only by a successful sanitize of that checkout, and kept when the sanitize fails. MCP and sends refuse the task while it is set; persisted so a Stop, a crash or a restart keeps refusing (#4674).",
+      "The task's checkout is not known to be sanitized: set right before its launch forks or reuses a checkout of the task's own, cleared only by a successful sanitize of that checkout, and kept when the sanitize fails. MCP and sends refuse the task while it is set; persisted so a Stop, a crash or a restart keeps refusing (#4674).",
   }),
   taskTimeoutFinalizationTokens: z.array(z.string().min(1)).optional().meta({
     description:

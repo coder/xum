@@ -19,6 +19,8 @@ import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import type { CoderService } from "@/node/services/coderService";
 import type { HistoryService } from "@/node/services/historyService";
 import { InitStateManager } from "@/node/services/initStateManager";
+import * as subagentFailureArtifacts from "@/node/services/subagentFailureArtifacts";
+import { newTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { TaskService } from "@/node/services/taskService";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
@@ -268,7 +270,7 @@ describe("a sub-agent launch after create() returned", () => {
     }, 20_000);
   });
 
-  test("a task is quarantined from its reservation until its launch sanitizes its checkout", async () => {
+  test("a task is quarantined while its checkout waits for its sanitize", async () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const host = createWorkspaceServiceMocks();
     const sanitizing = Promise.withResolvers<void>();
@@ -291,12 +293,8 @@ describe("a sub-agent launch after create() returned", () => {
       title: "Quarantined until sanitized",
     });
     assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
-    // Before the reservation returned, and still while the sanitize runs: a restart at either
-    // point keeps refusing the task.
-    expect(
-      new InitStateManager(config).getUnsanitizedCheckoutError(created.data.taskId)
-    ).toBeDefined();
     await sanitizing.promise;
+    // A restart at this point keeps refusing the task.
     expect(
       new InitStateManager(config).getUnsanitizedCheckoutError(created.data.taskId)
     ).toBeDefined();
@@ -432,6 +430,140 @@ describe("a sub-agent launch after create() returned", () => {
 
     expect(findWorkspaceInConfig(config, created.data.taskId)).toBeUndefined();
     expect(await waitAtRemoval).toBe(failure);
+  });
+
+  test("a task stopped before its launch forks stays resumable", async () => {
+    const projectPath = await createTestProject(rootDir, "fork-queue-project");
+    const parentId = "forkqueueparent";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          id: parentId,
+          name: "main",
+          path: projectPath,
+          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+        },
+      ],
+      testTaskSettings(3)
+    );
+    const firstForkEntered = Promise.withResolvers<void>();
+    const firstForkMayEnd = Promise.withResolvers<void>();
+    gates.push(firstForkMayEnd.resolve);
+    const fork = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(async () => {
+      firstForkEntered.resolve();
+      await firstForkMayEnd.promise;
+      return Err("fixture: fork failed");
+    });
+    const { taskService } = harness();
+    const spawn = (title: string) =>
+      taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "Read the repository",
+        title,
+      });
+
+    const first = await spawn("Holds the project's fork");
+    assert(first.success, `the spawn must be reserved: ${first.success ? "" : first.error}`);
+    await firstForkEntered.promise;
+    // Forks in one project run one at a time, so this launch cannot fork before the Stop.
+    const second = await spawn("Stopped before its fork");
+    assert(second.success, `the spawn must be reserved: ${second.success ? "" : second.error}`);
+    const stopped = await taskService.stopDescendantAgentTask(parentId, second.data.taskId);
+    assert(stopped.success, JSON.stringify(stopped));
+    firstForkMayEnd.resolve();
+    await taskService.reservedLaunchesSettled();
+
+    expect(fork).toHaveBeenCalledTimes(1);
+    expect(findWorkspaceInConfig(config, second.data.taskId)?.taskStatus).toBe("interrupted");
+    expect(
+      new InitStateManager(config).getUnsanitizedCheckoutError(second.data.taskId)
+    ).toBeUndefined();
+  });
+
+  test("a sanitize failure whose record does not read back keeps the task's row and error", async () => {
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const host = createWorkspaceServiceMocks();
+    const failure = "Cannot sanitize stale plugin override";
+    spyOn(host.workspaceService, "sanitizeMaterializedTaskWorkspace").mockResolvedValue(failure);
+    // The write only logs a failed write, as for an unwritable session dir.
+    spyOn(subagentFailureArtifacts, "upsertSubagentFailureArtifact").mockResolvedValue(undefined);
+    const { taskService } = harness({ workspaceService: host.workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "Read the repository",
+      title: "Child whose failure record is lost",
+    });
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    await taskService.reservedLaunchesSettled();
+
+    expect(findWorkspaceInConfig(config, created.data.taskId)).toMatchObject({
+      taskStatus: "interrupted",
+      taskLaunchError: failure,
+      taskCheckoutUnsanitized: true,
+    });
+    const waited = await taskService
+      .waitForAgentReport(created.data.taskId, { requestingWorkspaceId: parentId })
+      .then(
+        () => "reported",
+        (error: unknown) => getErrorMessage(error)
+      );
+    expect(waited).toBe(failure);
+  });
+
+  test("a launch failure is not reported for an attempt another writer re-admitted", async () => {
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        (workspaceId: string): Promise<Result<void, SendMessageError>> =>
+          Promise.resolve(
+            workspaceId === parentId ? Ok(undefined) : Err({ type: "unknown", raw: SEND_FAILURE })
+          )
+      ),
+    });
+    const { taskService, historyService } = harness({ workspaceService });
+    const wakes = spyOn(taskService, "enqueueTerminalAttention");
+    // Another backend re-admits the row under its own attempt right after the failure's edit.
+    let readmitted = false;
+    const emit = taskService.emitWorkspaceMetadata.bind(taskService);
+    spyOn(taskService, "emitWorkspaceMetadata").mockImplementation(async (workspaceId) => {
+      const failedRow = findWorkspaceInConfig(config, workspaceId);
+      if (!readmitted && failedRow?.taskLaunchError?.includes(SEND_FAILURE) === true) {
+        readmitted = true;
+        await config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            for (const ws of project.workspaces) {
+              if (ws.id !== workspaceId) continue;
+              ws.taskStatus = "running";
+              ws.taskAttemptId = newTaskAttemptId();
+            }
+          }
+          return cfg;
+        });
+      }
+      await emit(workspaceId);
+    });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "Survey the repository",
+      title: "Survey",
+    });
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    await taskService.reservedLaunchesSettled();
+
+    expect(readmitted).toBe(true);
+    expect(await failureMessages(historyService, parentId)).toEqual([]);
+    expect(wakes).not.toHaveBeenCalled();
   });
 
   test("a foreground spawn whose launch fails with no waiter pending still reaches the parent", async () => {

@@ -1653,18 +1653,6 @@ function nonOwningTaskRuntimeConfig(runtimeConfig: RuntimeConfig): RuntimeConfig
 }
 
 /**
- * SECURITY: a task row reserved for a checkout of its own starts quarantined (#4674), before
- * that checkout exists. Sends, resumes and MCP refuse a quarantined task, and only a successful
- * sanitize of the checkout lifts it (clearCheckoutQuarantine). So a Stop, a resume or reactivation
- * that supersedes the launch, a crash or a restart at any point leaves the task quarantined, never
- * runnable in an unsanitized checkout. A task that shares its parent's checkout is not
- * quarantined here; if it has to fork after all, its launch quarantines it first.
- */
-function reservedCheckoutQuarantine(plan: { sharedWorkspacePath?: string }): true | undefined {
-  return plan.sharedWorkspacePath != null ? undefined : true;
-}
-
-/**
  * Marks the refusal of a batch whose prepared inputs changed before the mutex. Such a refusal
  * owns and writes nothing, so create() prepares again (MAX_CREATE_PREPARATION_RETRIES times).
  */
@@ -7480,7 +7468,6 @@ export class TaskService implements AgentTaskIntegration {
           taskAiPins: plan.taskAiPins ?? {},
           taskOnRefusal: plan.onRefusal,
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
-          taskCheckoutUnsanitized: reservedCheckoutQuarantine(plan),
           taskAttentionPolicy: plan.attentionPolicy,
           taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
           projects: plan.parentMeta.projects,
@@ -7935,6 +7922,10 @@ export class TaskService implements AgentTaskIntegration {
       entry.workspace
     );
     if (existing) {
+      // A checkout of the task's own that a crashed launch left (see quarantineBeforeFork).
+      if (entry.workspace.taskIsolation !== "none") {
+        await this.markCheckoutQuarantined(plan.taskId);
+      }
       taskQueueDebug("TaskService.startReservedAgentTask reusing materialized workspace", {
         taskId: plan.taskId,
         workspacePath: existing.workspacePath,
@@ -7948,17 +7939,8 @@ export class TaskService implements AgentTaskIntegration {
       if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
-      // SECURITY: the fresh checkout is quarantined before it exists (reservedCheckoutQuarantine).
-      // A shared task whose parent checkout is gone, or a row an older version reserved, is not
-      // yet.
-      if (entryBeforeFork?.workspace.taskCheckoutUnsanitized !== true) {
-        await this.editWorkspaceEntry(
-          plan.taskId,
-          (ws) => {
-            ws.taskCheckoutUnsanitized = true;
-          },
-          { allowMissing: true }
-        );
+      if (!(await this.quarantineBeforeFork(plan))) {
+        return null;
       }
 
       const forkResult = await orchestrateFork(
@@ -7981,6 +7963,39 @@ export class TaskService implements AgentTaskIntegration {
         reusedExistingCheckout: false,
       };
     });
+  }
+
+  /**
+   * SECURITY: quarantines the task (#4674) right before its launch forks a checkout of its own,
+   * in a CAS on this plan's `starting` row; the launch forks only when it landed. Sends, resumes
+   * and MCP refuse a quarantined task, and only a successful sanitize of the checkout lifts it
+   * (clearCheckoutQuarantine). So a Stop, a resume or reactivation that supersedes the launch, a
+   * crash or a restart after this write leaves the task quarantined, never runnable in an
+   * unsanitized checkout, while a task stopped before it has no checkout and stays resumable.
+   */
+  private async quarantineBeforeFork(plan: TaskLaunchPlan): Promise<boolean> {
+    let quarantined = false;
+    await this.editWorkspaceEntry(
+      plan.taskId,
+      (ws) => {
+        if (ws.taskStatus !== "starting" || this.launchSuperseded(plan, ws)) return;
+        ws.taskCheckoutUnsanitized = true;
+        quarantined = true;
+      },
+      { allowMissing: true }
+    );
+    return quarantined;
+  }
+
+  /** Quarantines a task whose checkout already exists, whatever its row reads now. */
+  private async markCheckoutQuarantined(taskId: string): Promise<void> {
+    await this.editWorkspaceEntry(
+      taskId,
+      (ws) => {
+        ws.taskCheckoutUnsanitized = true;
+      },
+      { allowMissing: true }
+    );
   }
 
   private scheduleReservedTaskLaunch(plan: TaskLaunchPlan): void {
@@ -8171,6 +8186,14 @@ export class TaskService implements AgentTaskIntegration {
     }
   ): Promise<void> {
     if (failure.failedRow != null && !failure.transitionedToInterrupted) return;
+    // A writer that re-admitted the row after the failure's own edit gave it a new attempt, whose
+    // outcome this failure is not.
+    if (
+      failure.failedRow != null &&
+      this.currentTaskAttemptId(taskId) !== this.currentTaskAttemptId(taskId, failure.failedRow)
+    ) {
+      return;
+    }
     const child = failure.failedRow ?? failure.launch;
     if (child == null) return;
     await this.maybeResumeParentAfterTerminalChildFailure(
@@ -8185,16 +8208,18 @@ export class TaskService implements AgentTaskIntegration {
    * A launch whose reclaim unpublishes the task's row (an unsanitized checkout) leaves no row
    * that names the task. So its failure is persisted for each ancestor first, as a terminal
    * stream failure's is: task_await and waitForAgentReport read the row before the artifacts, so
-   * a wait that no longer finds the row finds this failure, never "Task not found".
-   * Workflow-owned children report failures through their step result instead.
+   * a wait that no longer finds the row finds this failure, never "Task not found". Returns
+   * whether the parent's copy reads back (the write itself only logs a failed write), and only
+   * then may the reclaim unpublish the row. Workflow-owned children report failures through their
+   * step result instead.
    */
   private async persistLaunchFailureArtifacts(
     taskId: string,
     message: string,
     child: TerminalFailureChild & Pick<TaskLaunchPlan, "taskModelString">
-  ): Promise<void> {
+  ): Promise<boolean> {
     const parentWorkspaceId = child.parentWorkspaceId;
-    if (parentWorkspaceId == null || child.workflowTask != null) return;
+    if (parentWorkspaceId == null || child.workflowTask != null) return true;
     const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
     const ancestorWorkspaceIds = [
       parentWorkspaceId,
@@ -8235,6 +8260,11 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    const readBack = await readSubagentFailureArtifactStrict(
+      path.join(this.config.sessionsDir, parentWorkspaceId),
+      taskId
+    );
+    return readBack.kind === "found";
   }
 
   /**
@@ -8562,7 +8592,7 @@ export class TaskService implements AgentTaskIntegration {
    * sanitized all the same, before its init ends and releases the requests parked on it. This
    * holds when a resume or a reactivation superseded the launch meanwhile too: neither prepares a
    * checkout, and the checkout's safety does not depend on the attempt. Until a sanitize succeeds
-   * the task stays quarantined (reservedCheckoutQuarantine), so sends and MCP refuse it (#4674).
+   * the task stays quarantined (quarantineBeforeFork), so sends and MCP refuse it (#4674).
    * A shared parent checkout is not the task's to sanitize.
    */
   private async sanitizeStoppedLaunchCheckout(
@@ -8590,14 +8620,8 @@ export class TaskService implements AgentTaskIntegration {
         error: sanitizeError,
       });
       this.initStateManager.markCheckoutUnsanitized(plan.taskId);
-      // The reservation already quarantined the row; a row an older version reserved was not.
-      await this.editWorkspaceEntry(
-        plan.taskId,
-        (ws) => {
-          ws.taskCheckoutUnsanitized = true;
-        },
-        { allowMissing: true }
-      );
+      // The fork's quarantine already holds; a row an older version launched has none.
+      await this.markCheckoutQuarantined(plan.taskId);
     } finally {
       checkout.initLogger.logComplete(-1);
     }
@@ -8636,23 +8660,30 @@ export class TaskService implements AgentTaskIntegration {
       if (sanitizeError !== undefined) {
         // Before any reclaim or init completion: MCP and sends refuse this checkout (#4674).
         this.initStateManager.markCheckoutUnsanitized(plan.taskId);
-        // Before the reclaim can unpublish the row, so no wait sees neither.
-        await this.persistLaunchFailureArtifacts(plan.taskId, sanitizeError, plan);
+        // Before the reclaim can unpublish the row, so no wait sees neither. A failure that does
+        // not read back keeps the row, where markTaskLaunchFailed records it.
+        const failurePersisted = await this.persistLaunchFailureArtifacts(
+          plan.taskId,
+          sanitizeError,
+          plan
+        );
         // Reclaim the just-materialized worktree/session before failing the
         // launch: the throw reaches scheduleReservedTaskLaunch, which only
         // marks the task interrupted — without this cleanup the physical
         // checkout would accumulate and collide with later same-name forks.
         let reclaimed = false;
         try {
-          reclaimed = (
-            await this.reclaimUnsanitizedTaskCheckout(
-              checkout.runtimeForTaskWorkspace,
-              plan.parentMeta.projectPath,
-              plan.workspaceName,
-              plan.taskId,
-              plan.attemptId
-            )
-          ).rowUnpublished;
+          reclaimed =
+            failurePersisted &&
+            (
+              await this.reclaimUnsanitizedTaskCheckout(
+                checkout.runtimeForTaskWorkspace,
+                plan.parentMeta.projectPath,
+                plan.workspaceName,
+                plan.taskId,
+                plan.attemptId
+              )
+            ).rowUnpublished;
         } finally {
           // SECURITY: init ends only after the reclaim attempt. Ending it releases every
           // request parked in waitForInit (MCP prompt discovery among them); released while
@@ -8674,7 +8705,7 @@ export class TaskService implements AgentTaskIntegration {
     await this.initReservedLaunchWorkspace(plan, checkout);
   }
 
-  /** Lifts a task's quarantine (reservedCheckoutQuarantine) once its checkout is sanitized. */
+  /** Lifts a task's quarantine (quarantineBeforeFork) once its checkout is sanitized. */
   private async clearCheckoutQuarantine(taskId: string): Promise<void> {
     await this.editWorkspaceEntry(
       taskId,
