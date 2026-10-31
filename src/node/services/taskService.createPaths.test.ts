@@ -225,7 +225,6 @@ describe("TaskService.create paths", () => {
     editParentDuringPreparations(parentId, 1);
     const created = await createAgentTask(taskService, parentId, "go");
     assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
-    // The second preparation read the edit.
     expect(created.data.modelString).toBe("openai:gpt-5.2");
   });
 

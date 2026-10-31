@@ -616,6 +616,7 @@ describe("direct create: MCP after sanitize", () => {
           return "fixture: sanitize failed";
         }
       );
+      // Recorded, not delivered: delivering the wake would resume the parent with a model turn.
       const wakes = spyOn(env.services.taskService, "enqueueTerminalAttention").mockResolvedValue(
         undefined
       );

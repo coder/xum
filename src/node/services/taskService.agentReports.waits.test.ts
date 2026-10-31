@@ -1210,13 +1210,13 @@ describe("TaskService", () => {
         const registersChild = Array.from(next.projects.values()).some((project) =>
           project.workspaces.some((workspace) => workspace.id === childTaskId)
         );
-        if (registersChild) throw new Error("config persistence failed after fork");
+        if (registersChild) throw new Error("reservation commit failed");
         return next;
       })
     );
     try {
       const failed = await createAgentTask(taskService, parentId, "Inspect", { desktop: "shared" });
-      expect(failed).toEqual(Err("config persistence failed after fork"));
+      expect(failed).toEqual(Err("reservation commit failed"));
     } finally {
       persistSpy.mockRestore();
     }

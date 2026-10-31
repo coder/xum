@@ -350,7 +350,9 @@ function markEndedTasksInterrupted(
 ): PendingTaskInfo[] {
   return tasks.map((task, index) => {
     const outcome = outcomes[index];
-    return outcome != null && endedWithoutReport(outcome) ? { ...task, status: "interrupted" } : task;
+    return outcome != null && endedWithoutReport(outcome)
+      ? { ...task, status: "interrupted" }
+      : task;
   });
 }
 

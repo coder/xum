@@ -492,11 +492,11 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     sendMessage.mockResolvedValueOnce(Err("launch refused"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const failed = await createAgentTask(taskService, parentId, "First", { desktop: "shared" });
-    assert(failed.success);
-    const failedRow = findWorkspaceInConfig(config, failed.data.taskId);
-    expect(failedRow?.taskStatus).toBe("interrupted");
-    expect(failedRow?.taskLaunchError).toBe("launch refused");
+    const first = await createAgentTask(taskService, parentId, "First", { desktop: "shared" });
+    assert(first.success);
+    const firstRow = findWorkspaceInConfig(config, first.data.taskId);
+    expect(firstRow?.taskStatus).toBe("interrupted");
+    expect(firstRow?.taskLaunchError).toBe("launch refused");
     const next = await createAgentTask(taskService, parentId, "Second", { desktop: "shared" });
     assert(next.success);
     expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
