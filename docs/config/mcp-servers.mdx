@@ -100,11 +100,11 @@ A [Cursor plugin](/agents/agent-skills#cursor-plugins) declares its servers in `
 
 - **Transport**: `type: "http"`, or a `url` without `type`, connects over streamable HTTP. `type: "sse"` stays SSE. A `command` starts a stdio server.
 - **Plugin folder**: `${CURSOR_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` become the plugin's install folder in `args`, `env` and `cwd`, as `${PLUGIN_ROOT}` does. `${PLUGIN_DATA}` works too. A `command` can be `${CURSOR_PLUGIN_ROOT}/<path>` or `${CLAUDE_PLUGIN_ROOT}/<path>`. A stdio server also gets `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` in its environment.
-- **Values**: any other `${...}` placeholder, for example `${API_KEY}`, `${API_KEY:-default}` or `${env:API_KEY}`, asks for a value that Xum cannot supply. Xum skips that server and lists it as "needs values not supported in Xum (`${API_KEY}`)". Xum does not read the value from your environment and does not use the default. The check covers `command`, `args`, `env`, `cwd`, `url` and `headers`. Xum has no Cursor data folder, so `${CURSOR_PLUGIN_DATA}` and `${CLAUDE_PLUGIN_DATA}` count as values too, in a `cwd` as well.
+- **Values**: any other `${...}` placeholder, for example `${API_KEY}`, `${API_KEY:-default}` or `${env:API_KEY}`, asks for a value that Xum cannot supply. Xum skips that server and lists it as "needs values not supported in Xum (`${API_KEY}`)". For the `env:` form the reason names `${env:API_KEY}`. Xum does not read the value from your environment and does not use the default. The check covers `command`, `args`, `env`, `cwd`, `url` and `headers`. Xum has no Cursor data folder, so `${CURSOR_PLUGIN_DATA}` and `${CLAUDE_PLUGIN_DATA}` count as values too, in a `cwd` as well.
 - **`auth`**: Xum does not apply a Cursor `auth` block and lists "auth not applied in Xum". The server still loads. Sign-in uses OAuth discovery and dynamic client registration, not the client in the `auth` block.
 - **`placement`**: Xum lists "placement not applied in Xum" and connects to the server directly.
 
-The install preview and the update review show each skipped server as a warning, and the **Not applied in Xum** list names it with its reason. A skipped server never appears in **Settings → MCP**. A remote server with fixed `headers` does not load in any plugin format, because Xum cannot stop a redirect from sending the headers to another origin. The preview shows that as a warning only.
+The install preview and the update review show each skipped server as a warning. The **Not applied in Xum** list also names each server that needs values, with its reason. A skipped server never appears in **Settings → MCP**. A remote server with fixed `headers` does not load in any plugin format. The preview shows that as a warning only.
 
 ## Tool search
 

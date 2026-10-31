@@ -106,14 +106,14 @@ Xum reads one MCP file: an `mcpServers` path replaces `.mcp.json` instead of add
 
 Xum also reads a plugin whose manifest is `.cursor-plugin/plugin.json`, and **Settings → Plugins** installs one as a **Cursor plugin**. A `.codex-plugin/plugin.json`, a `.claude-plugin/plugin.json` or a root `plugin.json` with `$schema` in the same folder wins over the Cursor manifest. A root `plugin.json` without `$schema` yields to it. For a marketplace, see [Cursor marketplaces](#cursor-marketplaces).
 
-| Cursor component                                         | In Xum                                                                                                                                |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `skills/`, or the `skills` folders                       | Skills. The `skills` folders replace `skills/`.                                                                                       |
-| `rules/`, or the `rules` folders                         | Skills that the model reads on request. See [Cursor rules](#cursor-rules).                                                            |
-| `agents/`, or the first `agents` folder                  | [Agents](/agents#plugin-agents-in-claude-code-or-cursor-format). Xum loads `.md` files only.                                          |
-| `mcp.json`, or the `mcpServers` file                     | MCP servers. See [Cursor plugin servers](/config/mcp-servers#cursor-plugin-servers).                                                  |
-| `hooks/hooks.json`, or the `hooks` file or inline object | `afterFileEdit`, `afterAgentResponse` and `stop` hooks run after you trust each one. See [Cursor hooks](/hooks/plugins#cursor-hooks). |
-| `commands` and `commands/`                               | Not applied.                                                                                                                          |
+| Cursor component                                         | In Xum                                                                                                                                                                                                                           |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skills/`, or the `skills` folders                       | Skills. The `skills` folders replace `skills/`.                                                                                                                                                                                  |
+| `rules/`, or the `rules` folders                         | Skills that the model reads on request. See [Cursor rules](#cursor-rules).                                                                                                                                                       |
+| `agents/`, or the first `agents` folder                  | [Agents](/agents#plugin-agents-in-claude-code-or-cursor-format). Xum loads `.md` files only.                                                                                                                                     |
+| `mcp.json`, or the `mcpServers` file                     | MCP servers. See [Cursor plugin servers](/config/mcp-servers#cursor-plugin-servers).                                                                                                                                             |
+| `hooks/hooks.json`, or the `hooks` file or inline object | `afterFileEdit`, `afterAgentResponse` and `stop` command hooks without a `matcher` run after you trust each one. Only a plugin that **Settings → Plugins** installed runs them. See [Cursor hooks](/hooks/plugins#cursor-hooks). |
+| `commands` and `commands/`                               | Not applied.                                                                                                                                                                                                                     |
 
 The `skills`, `rules` and `agents` fields take folder paths inside the plugin. Xum does not apply a glob, a file path or a path outside the plugin. A field with paths replaces its default folder. When Xum refuses all of its paths, the field loads nothing, not even the default folder. A plugin without a `skills` field and without a `skills/` folder can have a `SKILL.md` at its root. That file is one skill, named after the plugin, with each run of `.` and `-` turned into one `-`.
 
@@ -123,7 +123,7 @@ The install preview, the update review and the card of a global plugin in **Sett
 
 ##### Cursor rules
 
-Xum loads each rule file (`.md`, `.mdc` or `.markdown`) as a skill. Xum never adds a rule to the system prompt. An always-apply rule therefore applies only when the model reads it, and a glob rule does not attach to the files it names.
+Xum loads each rule file (`.md`, `.mdc` or `.markdown`) directly in a rules folder as a skill. Xum does not read rule files in subfolders. Xum never adds a rule to the system prompt. An always-apply rule therefore applies only when the model reads it, and a glob rule does not attach to the files it names.
 
 | Rule frontmatter    | Skill                                                                                                                                      | Label in the install review                 |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- |

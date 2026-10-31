@@ -112,7 +112,7 @@ The rules follow Claude Code:
 - A specifier such as `Bash(git push *)` in `disallowedTools` removes the whole tool, as in Claude Code. In `tools`, Xum cannot limit a tool to some of its calls, so it does not grant a tool with a specifier. `Agent(worker)` is the exception: Claude Code ignores its type list in sub-agents, so it grants the task tools. Commas inside a specifier do not split the list.
 - MCP entries (`mcp__<server>`, `mcp__<server>__<tool>`) are not translated yet. In `tools` they grant nothing. In `disallowedTools`, Xum skips the agent with a warning.
 
-A changed list changes the agent's definition, so a plugin update that changes it asks for consent again. The same holds for a change to `readonly`, `model: fast` or `is_background: true`. This Xum version maps those three fields to new Xum fields, so each installed plugin agent that sets one needs one review after the upgrade.
+A changed list changes the agent's definition, so a plugin update that changes it asks for consent again. The same holds for a change to `readonly`, `model: fast` or `is_background: true`. This Xum version changes how it maps those three fields, so each installed plugin agent that sets one needs one review after the upgrade.
 
 #### `model: fast`
 
@@ -122,7 +122,7 @@ A plugin agent with `model: fast` takes its model, thinking level and prompt cac
 2. The agent's own entry in **Settings → Agents**, then its frontmatter (a Claude Code `effort` lands here).
 3. Explore's entry in **Settings → Agents**, then Explore's definition.
 4. Exec's entry in **Settings → Agents**, then Exec's definition.
-5. The parent's model and thinking level.
+5. At spawn, the parent's model and thinking level. A reawakened agent keeps its current model and thinking level instead.
 
 With no Explore model in Settings, a fast agent runs on Exec's model from Settings, else on the parent's model. The built-in Explore agent sets a 5-minute prompt cache, so a fast agent keeps 5 minutes unless its own card or Explore's card sets another value. `Fast` and other spellings are not `fast`: they use the inherited model.
 

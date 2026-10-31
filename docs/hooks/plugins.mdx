@@ -209,7 +209,7 @@ Xum cuts the joined tool-event text at 32 KiB and adds `[plugin hook context cut
 
 ## Cursor hooks
 
-A [Cursor plugin](/agents/agent-skills#cursor-plugins) ships hooks in the [Cursor hooks format](https://cursor.com/docs/hooks): `hooks/hooks.json`, or the path or inline object of the `hooks` key in `.cursor-plugin/plugin.json`. Each hook runs a shell command. Xum runs three events and lists every other hook as "Never runs". The [size limits](#size-limits) for one `hooks.json` file and for hooks per plugin apply.
+A [Cursor plugin](/agents/agent-skills#cursor-plugins) ships hooks in the [Cursor hooks format](https://cursor.com/docs/hooks): `hooks/hooks.json`, or the path or inline object of the `hooks` key in `.cursor-plugin/plugin.json`. Xum runs each `command` hook as a shell command. Xum runs three events and lists every other hook as "Never runs". The [size limits](#size-limits) for one `hooks.json` file and for hooks per plugin apply.
 
 ```json hooks/hooks.json
 {
@@ -229,7 +229,7 @@ Only managed plugins run Cursor hooks. Xum runs none in these cases:
 - The project is not trusted.
 - The workspace is not a local or worktree workspace, for example an SSH, Docker, devcontainer, or Coder workspace. Every Cursor hook shows "Does not run in remote workspaces (SSH, Docker and devcontainer)." Local multi-project workspaces do run them.
 - The chat is a `/side` chat.
-- `XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS`, or `XUM_DISABLE_PROJECT_AUTOMATION` is set.
+- `XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS`, or `XUM_DISABLE_PROJECT_AUTOMATION` is set to `1`.
 
 <Warning>
   A Cursor hook runs as your OS user on the Xum host, with no sandbox. Trust only hooks whose
@@ -279,7 +279,7 @@ The process gets a minimal environment, not your shell's:
 | `CURSOR_PLUGIN_ROOT`                       | The plugin folder                                                      |
 | `CURSOR_TRANSCRIPT_PATH`                   | The workspace's `chat.jsonl`. It is not in Cursor's transcript format. |
 | `CURSOR_VERSION`                           | `xum-<version>`, not a Cursor version                                  |
-| `PATH`, `HOME`                             | From the Xum process                                                   |
+| `PATH`, `HOME`                             | From the Xum process. Xum removes its own `bin` folder from `PATH`.    |
 
 Xum also passes the same host variables as for a [plugin MCP server](/config/mcp-servers#plugin-server-environment), such as `USER`, `LANG`, `TMPDIR`, and the CA bundle paths, and the variables it sets for every command so that tools do not wait for input.
 
@@ -305,22 +305,22 @@ The input on stdin has these fields:
 
 A `stop` hook can print `{ "followup_message": "..." }`. Xum then continues the turn with that text as the next prompt. Each `stop` hook continues one user turn at most 3 times. Set `loop_limit` to a whole number to change that, or to `null` for no limit of its own. All hooks together stop at 50 continuations per user turn, and your next message starts a new count. See the notice in [Outputs Xum honors](#outputs-xum-honors).
 
-The other two events cannot change anything. Xum checks only that their output is valid. No Cursor event can block, so every failure fails open. Xum logs it, skips the hook's output, and shows "Plugin `<name>`: hook `<event>` failed (`<reason>`). Turn the hook off in Settings > Plugins." Xum shows that notice once per hook in each workspace, until the set of trusted hooks changes or Xum restarts.
+The other two events cannot change anything. Xum checks only that their output is valid. No Cursor event can block, so every failure fails open. Xum logs it, skips the hook's output, and shows "Plugin `<name>`: hook `<event>` failed (`<reason>`). Turn the hook off in Settings > Plugins." Xum shows that notice once per hook in each workspace. It shows the notice again only after the workspace's trusted hooks change in any plugin, after you archive and unarchive the workspace, or after Xum restarts.
 
-| Result                                       | Reason in the notice                                                                    |
-| -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Exit 0 with empty stdout                     | No failure                                                                              |
-| Exit 0 with stdout that is not a JSON object | `invalid output: not JSON` or `invalid output: not a JSON object`                       |
-| A `followup_message` that is not a string    | `its followup_message is not a string`                                                  |
-| Exit 2, or `permission: "deny"`              | `exit code 2; this event cannot block`, or `permission "deny"; this event cannot block` |
-| Exit 127                                     | `` `<command>`: a command or one of its dependencies was not found (exit 127) ``        |
-| Another exit code                            | `exit code <n>`                                                                         |
-| No exit within the timeout                   | `timed out after <n>s`                                                                  |
-| Stdout over 64 KiB                           | `invalid output: over 65536 bytes`                                                      |
-| Input over 64 KiB                            | `its input is over 65536 characters`. Xum skips the call.                               |
-| Xum cannot read its hook trust store         | `Xum cannot read its hook trust store`. Xum skips the call.                             |
+| Result                                                  | Reason in the notice                                                                    |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Exit 0 with empty stdout                                | No failure                                                                              |
+| Exit 0 with stdout that is not a JSON object            | `invalid output: not JSON` or `invalid output: not a JSON object`                       |
+| A `stop` hook's `followup_message` that is not a string | `its followup_message is not a string`                                                  |
+| Exit 2, or `permission: "deny"`                         | `exit code 2; this event cannot block`, or `permission "deny"; this event cannot block` |
+| Exit 127                                                | `` `<command>`: a command or one of its dependencies was not found (exit 127) ``        |
+| Another exit code                                       | `exit code <n>`                                                                         |
+| No exit within the timeout                              | `timed out after <n>s`                                                                  |
+| Stdout over 64 KiB                                      | `invalid output: over 65536 bytes`                                                      |
+| Input over 64 KiB                                       | `its input is over 65536 characters`. Xum skips the call.                               |
+| Xum cannot read its hook trust store                    | `Xum cannot read its hook trust store`. Xum skips the call.                             |
 
-Other failures name their cause. Xum reads no stderr. Exit 127 means that the command, or a command it runs such as `jq`, was not found. `failClosed` has no effect on these events, as in Cursor.
+Other failures name their cause. Xum reads no stderr. Exit 127 means that the command, or a command it runs such as `jq`, was not found. `failClosed` has no effect on these events.
 
 ## Claude Code plugin hooks
 
