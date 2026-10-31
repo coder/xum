@@ -702,9 +702,6 @@ function coerceGoalId(value: unknown): string | undefined {
 const PDF_MEDIA_TYPE = "application/pdf";
 const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
 
-type StopHookContinuation = TurnStopContinuation &
-  Pick<Extract<TurnStopHookOutcome, { kind: "continue" }>, "hookKeys" | "pluginNames">;
-
 /** The ended stream's provenance that its turn.stop continuation keeps. */
 interface StopContinuationProvenance {
   goalKind?: GoalSyntheticMessageKind;
@@ -10837,7 +10834,7 @@ export class AgentSession {
     this.stopHookCountsByKey.clear();
   }
 
-  private countAndAnnounceStopHookContinuation(continuation: StopHookContinuation): void {
+  private countAndAnnounceStopHookContinuation(continuation: TurnStopContinuation): void {
     this.stopHookContinuations++;
     for (const key of continuation.hookKeys) {
       this.stopHookCountsByKey.set(key, (this.stopHookCountsByKey.get(key) ?? 0) + 1);
@@ -10869,7 +10866,7 @@ export class AgentSession {
     payload: StreamEndEvent,
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
-  ): Promise<StopHookContinuation | null> {
+  ): Promise<TurnStopContinuation | null> {
     const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
       this.workspaceId,
       {
@@ -10880,14 +10877,10 @@ export class AgentSession {
         hookContinuations: this.stopHookCountsByKey,
       }
     )) ?? { kind: "none" };
-    const continuation = mergeTurnStopContinuation({
-      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
+    return mergeTurnStopContinuation({
+      hookReasons: hookOutcome.kind === "continue" ? hookOutcome.reasons : [],
       nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
     });
-    if (continuation == null) return null;
-    return hookOutcome.kind === "continue"
-      ? { ...continuation, hookKeys: hookOutcome.hookKeys, pluginNames: hookOutcome.pluginNames }
-      : { ...continuation, hookKeys: [], pluginNames: [] };
   }
 
   /** Xum's turn-end nudges for the continuation, TODO first (see readTurnStopContinuation). */

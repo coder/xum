@@ -137,11 +137,8 @@ export type TurnStopHookOutcome =
   | { kind: "halted" }
   | {
       kind: "continue";
-      prompt: string;
-      /** The hookKey of each hook whose reason the prompt carries, each once. */
-      hookKeys: string[];
-      /** Those hooks' plugins, each once, in chain order. */
-      pluginNames: string[];
+      /** Trimmed, in chain order, each hook under its limit. joinTurnStopReasons builds the prompt. */
+      reasons: TurnStopContinueReason[];
     };
 
 export type TurnStopHookInput = Pick<
@@ -181,15 +178,34 @@ export async function runTurnStopHooks(
     .filter(
       (reason) => reason.text.length > 0 && hasContinuationsLeft(reason, input.hookContinuations)
     );
-  if (kept.length === 0) return { kind: "none" };
+  return kept.length > 0 ? { kind: "continue", reasons: kept } : { kind: "none" };
+}
+
+const REASON_SEPARATOR = "\n\n";
+
+/**
+ * The reasons' prompt, cut to `maxChars`, and the hooks it continues: only those with some text
+ * left after the cut, so a hook whose whole reason was cut away neither counts nor is named.
+ */
+export function joinTurnStopReasons(
+  reasons: readonly TurnStopContinueReason[],
+  maxChars: number
+): { prompt: string; hookKeys: string[]; pluginNames: string[] } {
+  // slice(0, negative) would cut from the end: no room means no reason text at all.
+  const prompt = reasons
+    .map((reason) => reason.text)
+    .join(REASON_SEPARATOR)
+    .slice(0, Math.max(0, maxChars));
+  let start = 0;
+  const inPrompt = reasons.filter((reason) => {
+    const kept = start < prompt.length;
+    start += reason.text.length + REASON_SEPARATOR.length;
+    return kept;
+  });
   return {
-    kind: "continue",
-    prompt: kept
-      .map((reason) => reason.text)
-      .join("\n\n")
-      .slice(0, TURN_STOP_PROMPT_MAX_CHARS),
-    hookKeys: [...new Set(kept.map((reason) => reason.hookKey))],
-    pluginNames: [...new Set(kept.map((reason) => reason.pluginName))],
+    prompt,
+    hookKeys: [...new Set(inPrompt.map((reason) => reason.hookKey))],
+    pluginNames: [...new Set(inPrompt.map((reason) => reason.pluginName))],
   };
 }
 

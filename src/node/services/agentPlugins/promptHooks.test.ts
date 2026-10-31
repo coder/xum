@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventSpine } from "@/node/services/events/eventSpine";
-import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
+import { joinTurnStopReasons, runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const input = { text: "hello", origin: "user" as const, canBlock: true };
@@ -206,9 +206,31 @@ describe("runTurnStopHooks", () => {
 
     expect(await runTurnStopHooks(spine, "ws", stopInput)).toEqual({
       kind: "continue",
-      prompt: "Run the tests again.",
-      hookKeys: ["tests:hooks/hooks.json#Stop[0][0]"],
-      pluginNames: ["tests"],
+      reasons: [reason("tests", "Run the tests again.")],
     });
   });
+});
+
+describe("joinTurnStopReasons", () => {
+  const reasons = [
+    { text: "aaaa", pluginName: "a", hookKey: "a:k" },
+    { text: "bbbb", pluginName: "b", hookKey: "b:k" },
+  ];
+  for (const row of [
+    { maxChars: 10, prompt: "aaaa\n\nbbbb", hooks: ["a", "b"] },
+    // A reason cut mid-way still reached the model, so its hook counts.
+    { maxChars: 7, prompt: "aaaa\n\nb", hooks: ["a", "b"] },
+    // Only the separator before b survives: none of b's text did.
+    { maxChars: 6, prompt: "aaaa\n\n", hooks: ["a"] },
+    { maxChars: 4, prompt: "aaaa", hooks: ["a"] },
+    { maxChars: 0, prompt: "", hooks: [] },
+  ]) {
+    test(`cut to ${row.maxChars} characters, it continues ${row.hooks.length} hook(s)`, () => {
+      expect(joinTurnStopReasons(reasons, row.maxChars)).toEqual({
+        prompt: row.prompt,
+        hookKeys: row.hooks.map((name) => `${name}:k`),
+        pluginNames: row.hooks,
+      });
+    });
+  }
 });

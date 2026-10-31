@@ -1012,9 +1012,13 @@ describe("UserPromptSubmit and Stop", () => {
     );
     expect(await runTurnStopHooks(more.spine, workspaceId, input)).toEqual({
       kind: "continue",
-      prompt: "Run the tests again.",
-      hookKeys: ["guard:hooks/hooks.json#Stop[0][0]"],
-      pluginNames: ["guard"],
+      reasons: [
+        {
+          text: "Run the tests again.",
+          pluginName: "guard",
+          hookKey: "guard:hooks/hooks.json#Stop[0][0]",
+        },
+      ],
     });
     expect(more.calls).toEqual([{ last: "done" }]);
 

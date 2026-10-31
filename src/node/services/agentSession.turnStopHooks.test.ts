@@ -417,6 +417,42 @@ describe("turn.stop", () => {
     );
   });
 
+  for (const row of [
+    // The first reason fills the prompt: none of the second hook's text reaches the model.
+    {
+      cut: "wholly",
+      firstChars: TURN_STOP_PROMPT_MAX_CHARS,
+      plugins: ["guard", "guard, tidy", "guard"],
+    },
+    // Part of the second hook's text survives the cut, so that hook continued the turn.
+    {
+      cut: "mid-way",
+      firstChars: TURN_STOP_PROMPT_MAX_CHARS - 5,
+      plugins: ["guard, tidy", "guard", "guard"],
+    },
+  ]) {
+    test(`a reason cut ${row.cut} by the prompt cap counts only if some of it is in the prompt`, async () => {
+      let stops = 0;
+      addConsumer((ctx) => {
+        ctx.continueReasons.push(
+          stopReason(++stops === 1 ? "x".repeat(row.firstChars) : "First."),
+          stopReason("Second.", {
+            pluginName: "tidy",
+            hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+            loopLimit: 1,
+          })
+        );
+      });
+      const { h } = await setup({ session: { captureEvents: true } });
+
+      await h.session.sendMessage("fix the tests", options);
+      await settle(h);
+
+      // tidy's one continuation goes to the first prompt that holds its text.
+      expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual(row.plugins);
+    });
+  }
+
   test("the notice names only the plugins whose reasons the continuation kept", async () => {
     addConsumer((ctx) => {
       ctx.continueReasons.push(
@@ -998,6 +1034,36 @@ describe("todo turn-end nudge", () => {
 
     expect(streams()).toBe(2);
     expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
+  test("a reason the nudge pushes out of the prompt neither counts nor is named", async () => {
+    // Without the nudge both reasons fit; the nudge's room cuts the second one away.
+    expect(TODO_TURN_END_NUDGE.length).toBeGreaterThan(20);
+    let stops = 0;
+    addConsumer((ctx) => {
+      ctx.continueReasons.push(
+        stopReason(++stops === 1 ? "x".repeat(TURN_STOP_PROMPT_MAX_CHARS - 20) : "First."),
+        stopReason("Second.", {
+          pluginName: "tidy",
+          hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+          loopLimit: 1,
+        })
+      );
+    });
+    const { h } = await setup({ parts: todoWriteThenReply, session: { captureEvents: true } });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, nudged] = await userTexts(h);
+    expect(nudged.endsWith(TODO_TURN_END_NUDGE)).toBe(true);
+    expect(nudged).not.toContain("Second.");
+    expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual([
+      "guard",
+      "guard, tidy",
+      "guard",
+    ]);
   });
 
   test("a continuation of the nudge alone shows no plugin notice", async () => {

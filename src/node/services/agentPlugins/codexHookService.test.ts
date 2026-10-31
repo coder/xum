@@ -224,9 +224,9 @@ describe("CodexPluginHookService", () => {
       })
     ).toEqual({
       kind: "continue",
-      prompt: "Again.",
-      hookKeys: [`${instanceId("ralph")}:${hook.key}`],
-      pluginNames: ["ralph"],
+      reasons: [
+        { text: "Again.", pluginName: "ralph", hookKey: `${instanceId("ralph")}:${hook.key}` },
+      ],
     });
   });
 
