@@ -28,7 +28,7 @@ function ToolStoryShell(props: { children: ReactNode }) {
   );
 }
 
-/** task cards in queued/running workflow states */
+/** task cards in queued/starting/running workflow states */
 export const TaskWorkflowStates: Story = {
   render: () => (
     <ToolStoryShell>
@@ -45,6 +45,23 @@ export const TaskWorkflowStates: Story = {
           modelString: "anthropic:claude-opus-5",
           thinkingLevel: "high",
           note: "Use task_await to monitor progress.",
+        }}
+        status="completed"
+      />
+
+      <TaskToolCall
+        args={{
+          subagent_type: "explore",
+          prompt: "Map the IPC routes in src/node/orpc/ and list their callers.",
+          title: "Route Mapper",
+          run_in_background: true,
+        }}
+        result={{
+          status: "starting",
+          taskId: "task-ipc-003",
+          modelString: "anthropic:claude-opus-5",
+          thinkingLevel: "high",
+          note: "Task started in background. Use task_await to monitor progress.",
         }}
         status="completed"
       />
