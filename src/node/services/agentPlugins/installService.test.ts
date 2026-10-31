@@ -8984,7 +8984,7 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     ]);
   });
 
-  test("a changed binary file or a changed large file is listed with no text", async () => {
+  test("a changed binary file or a changed large file is listed with no text and says so", async () => {
     await writeFiles({
       "hooks/tool.bin": Buffer.from([0xff, 0xfe, 0x00, 0x01]),
       "hooks/big.txt": "a".repeat(64 * 1024 + 1),
@@ -8998,9 +8998,24 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     await commitAll(remoteDir, "change binary");
 
     expect(await fileRows()).toEqual([
-      { summary: "file hooks/big.txt changed" },
-      { summary: "file hooks/tool.bin changed" },
+      { summary: "file hooks/big.txt changed (contents not shown: binary or larger than 64 KiB)" },
+      { summary: "file hooks/tool.bin changed (contents not shown: binary or larger than 64 KiB)" },
     ]);
+  });
+
+  test("the install preview labels the files whose contents it does not show", async () => {
+    await writeFiles({
+      "hooks/tool.bin": Buffer.from([0xff, 0xfe, 0x00, 0x01]),
+      "hooks/big.txt": "a".repeat(64 * 1024 + 1),
+      "hooks/small.txt": "a".repeat(64 * 1024),
+    });
+    await commitAll(remoteDir, "binary");
+    const preview = await service.preview({ input: remoteDir });
+    const rows = new Map(preview.fileChanges.map((change) => [change.summary, change.after]));
+    const hidden = " (contents not shown: binary or larger than 64 KiB)";
+    expect(rows.has(`file hooks/tool.bin added${hidden}`)).toBe(true);
+    expect(rows.has(`file hooks/big.txt added${hidden}`)).toBe(true);
+    expect(rows.get("file hooks/small.txt added")).toBe("a".repeat(64 * 1024));
   });
 
   test("a symlink to a file outside the plugin shows its link text, never the target", async () => {

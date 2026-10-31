@@ -624,11 +624,19 @@ function fileReviewRow(
   const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
   const before = fileReviewText(was);
   const after = fileReviewText(now);
+  // A row without the text of a side must say so: an empty row reads as a harmless change.
+  const hidden = textHidden(was, before) || textHidden(now, after);
   return {
-    summary: `file ${showOneLineControls(filePath)} ${verb}`,
+    summary: `file ${showOneLineControls(filePath)} ${verb}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
     ...(before !== undefined ? { before } : {}),
     ...(after !== undefined ? { after } : {}),
   };
+}
+
+const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
+  return record?.kind === "file" && text === undefined;
 }
 
 /**
