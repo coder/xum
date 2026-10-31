@@ -97,10 +97,12 @@ test("a cut file text must be shown in full before the plugin can be installed (
     skills: [],
     mcpServers: [],
     agents: [],
+    readonlyAgents: [],
     workflows: [],
     slashCommands: [],
     reviewedComponents: [],
     codexHooks: [],
+    notApplied: [],
     fileChanges: [
       { summary: "file hooks/lib.sh added", after: padded },
       { summary: "file hooks/stop.sh added", after: "source hooks/lib.sh\n" },
