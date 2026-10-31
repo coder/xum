@@ -166,6 +166,24 @@ function hooksIntro(data: AgentPluginHooks | null): string {
     : "Hooks from hooks.json. A hook runs only after you trust it, and only while it stays unchanged.";
 }
 
+/** A hook's hashed text, with the "Show full" control while it is cut. */
+const HookReviewDetailText: React.FC<{
+  detail: PluginHookReviewDetail;
+  expanded: boolean;
+  onExpand: () => void;
+}> = (props) => (
+  <>
+    <pre className="text-muted bg-background rounded p-1 font-mono break-all whitespace-pre-wrap">
+      {props.expanded && props.detail.full !== null ? props.detail.full : props.detail.shown}
+    </pre>
+    {props.detail.full !== null && !props.expanded && (
+      <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={props.onExpand}>
+        Show full {props.detail.noun} ({kilobytes(props.detail.full)} KB)
+      </Button>
+    )}
+  </>
+);
+
 export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> = (props) => {
   const { api } = useAPI();
   const [data, setData] = useState<AgentPluginHooks | null>(null);
@@ -269,21 +287,13 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                 </div>
                 <p className="text-foreground font-mono break-all">{summary}</p>
                 {detail !== null && (
-                  <pre className="text-muted bg-background rounded p-1 font-mono break-all whitespace-pre-wrap">
-                    {expanded && detail.full !== null ? detail.full : detail.shown}
-                  </pre>
-                )}
-                {mustExpand && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-xs"
-                    onClick={() =>
+                  <HookReviewDetailText
+                    detail={detail}
+                    expanded={expanded}
+                    onExpand={() =>
                       setExpandedInputs((previous) => new Set(previous).add(expandKey))
                     }
-                  >
-                    Show full {detail.noun} ({kilobytes(detail.full ?? "")} KB)
-                  </Button>
+                  />
                 )}
                 <p className="text-muted break-all">{hook.source}</p>
                 {isCursorHookHandler(hook.handler) && (
