@@ -278,7 +278,7 @@ marked "(Dn)" at the step it changes.
 | D23 | `cursor-marketplace` is a preview selector only. A Cursor entry installs through its folder's own manifest, with no generated manifest or `generatedFrom` marker. An entry without a manifest is refused. | 3, PR 2 |
 | D24 | Cursor manifest component paths (`skills`, `rules`, `agents`) are folder paths. Globs and file paths are listed as not applied (T10). | 1, PR 1 |
 | D25 | `afterFileEdit` runs after `file_edit_replace_string` and `file_edit_insert` only. `edits` comes from the tool input. | 5.2, 5.4, PR 8 |
-| D26 | An `ai.settingsBase` that names a missing agent, the agent itself, or an agent whose chain contains the agent is ignored with a warning. | 7, PR 4 |
+| D26 | An `ai.settingsBase` that names a missing agent, the agent itself, an agent whose chain contains the agent, or an agent whose chain declares its own `ai.settingsBase` is ignored with a warning. Xum follows one settings base, never a second. | 7, PR 4 |
 | D27 | The sub-agent header shows the model only, not where it came from (T11). | 7, PR 4 |
 | D28 | A Cursor hook failure logs a warning and shows one chat notice per workspace and hook. The hooks panel shows no failure state. | 5.5, PR 8 |
 | D29 | The `cursor` MCP dialect has the Codex shape: `type: "http"` and a `url` without `type` both become `streamable-http`. Only the two plugin roots expand, so `${CURSOR_PLUGIN_DATA}` counts as a user value. | 4, PR 3 |
@@ -624,8 +624,10 @@ tool events in T1.
     without blocking the hook, so a hook that writes past a cap never stalls on
     a full pipe. Stdout of more than 64 × 1024 bytes is invalid output (5.5).
 *   Exit code 127 (command not found) is a failure (5.5) with the reason
-    "`<command>` not found in this workspace". A machine without `jq` or `bun`
-    gives this result.
+    "`<command>`: a command or one of its dependencies was not found (exit
+    127)". The shell gives 127 both when the declared command is missing and
+    when a command it runs (`jq`, `bun`) is missing, and Xum keeps no stderr,
+    so the reason names both causes.
 *   Shell (D15): `runtime.exec` on every
     platform. On Windows, local `exec` runs through Git Bash (`getBashPath`,
     `LocalBaseRuntime.ts:250`, `:631`), so there is no Windows-only path. A
@@ -640,8 +642,8 @@ tool events in T1.
 *   `command` runs as written (D17). Xum does not
     rewrite a leading `./`. A `./hooks/x.sh` in a `stop` hook therefore looks
     in the workspace root, is not found (exit 127), counts as a crash under the
-    failure rules (5.5), and shows "`./hooks/x.sh` not found in this
-    workspace" once. This matches Cursor's real behavior (cursor/plugins
+    failure rules (5.5), and shows the exit-127 reason for `./hooks/x.sh`
+    once. This matches Cursor's real behavior (cursor/plugins
     PR #315, advisor hook paths). Published ralph-loop is affected: its
     `afterAgentResponse` hook runs (it runs from the plugin folder), but its
     `stop` hook is not found, so the loop never continues, as in Cursor.
@@ -871,9 +873,10 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         `AgentDefinitionSubagentSchema` are `.strip()` at `85abd10b10`
         (`src/common/orpc/schemas/agentDefinition.ts:21-42`), so an older build
         drops the new fields instead of rejecting the file.
-    *   An `ai.settingsBase` that names a missing agent, the agent itself, or an
-        agent whose chain contains the agent is ignored with a warning, and the
-        agent resolves as without it (D26).
+    *   An `ai.settingsBase` that names a missing agent, the agent itself, an
+        agent whose chain contains the agent, or an agent whose chain declares
+        its own `ai.settingsBase` is ignored with a warning, and the agent
+        resolves as without it (D26).
     *   The sub-agent header shows the resolved model, as for every sub-agent.
         It does not name where the model came from (D27, T11).
     *   `model: inherit` and every other `model` value keep today's behavior.
@@ -1683,8 +1686,11 @@ whose folder has no manifest is refused.
     *   `sameInstallMethod` (lines 337-347) adds `case "cursor-plugin"` to the
         kinds compared by kind only, and `case "cursor-marketplace"` compared by
         kind and entry.
-    *   The update method list (lines 378-391) needs no change: Cursor installs
-        never have a `generatedFrom` marker.
+    *   `chooseUpdateMethod` (lines 376-391): when `generated` is undefined,
+        the own-manifest choices become `["claude-plugin", "cursor-plugin"]`.
+        Cursor installs never have a `generatedFrom` marker, and the staged
+        tree of a Cursor plugin detects only `cursor-plugin`, so without this
+        an update finds no method and fails validation.
 
 #### 2.4 `src/common/orpc/schemas/agentPlugins.ts` and `src/common/constants/agentPluginInstallMethods.ts` (Modify)
 
@@ -1779,7 +1785,9 @@ whose folder has no manifest is refused.
     *   a folder with a schema-less root `plugin.json` and a Cursor manifest
         gets `[cursor-plugin]`;
     *   `sameInstallMethod` matches two `cursor-marketplace` selectors only
-        with the same entry.
+        with the same entry;
+    *   an `update` request with no `generatedFrom` over methods
+        `[cursor-plugin]` returns `cursor-plugin`.
 *   `src/node/services/agentPlugins/installService.marketplace.test.ts`
     (Modify):
     *   a repository with both files previews a listing with `pstack` once and
@@ -1963,12 +1971,17 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     have the shape `collectDefinitionLayers` (line 79) takes
     (`{id, ai?}[]`, target first). `settingsBaseChain` is `null` when the
     settings-base agent could not be read. It returns
-    `{chain, ignored?: "missing" | "self" | "cycle"}`:
+    `{chain, ignored?: "missing" | "self" | "cycle" | "nested"}`:
     1.  `settingsBaseChain === null`: own chain, `ignored: "missing"`.
     2.  `settingsBaseChain[0].id === agentId`: own chain, `ignored: "self"`.
     3.  `agentId` appears anywhere in `settingsBaseChain`: own chain,
         `ignored: "cycle"`.
-    4.  Otherwise: the leading entries of `ownChain` whose `id` equals
+    4.  An entry of `settingsBaseChain` has `ai.settingsBase`: own chain,
+        `ignored: "nested"`. Xum does not follow a second settings base. A
+        run, the descriptor list and the walks in 4.9 then agree: every
+        honored settings base leads to a chain that only follows `base`, and
+        a loop made only of `settingsBase` links is ignored at its first hop.
+    5.  Otherwise: the leading entries of `ownChain` whose `id` equals
         `agentId` (the agent and its same-ID scope refinements), then all of
         `settingsBaseChain`. For `explore` that chain is `[explore, exec]`, so
         Exec's layers stay after Explore's, as in an Explore run.
@@ -2088,6 +2101,8 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
         `ignored: "self"`;
     *   a settings-base chain that contains the agent's ID later: own chain,
         `ignored: "cycle"`;
+    *   a settings-base chain `[b, c]` where `b` or `c` has
+        `ai.settingsBase`: own chain, `ignored: "nested"`;
     *   own chain `[a(project), a(plugin), exec]` with settings-base chain
         `[explore, exec]`: result `[a(project), a(plugin), explore, exec]`.
 *   `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.test.ts`
@@ -2118,7 +2133,9 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     *   with Explore disabled, that agent still has
         `aiSettingsBase: "explore"`;
     *   an agent with `base: exec` and `settingsBase: "missing-agent"` has no
-        `aiSettingsBase`, and its `aiLayers.ancestors` start with `exec`.
+        `aiSettingsBase`, and its `aiLayers.ancestors` start with `exec`;
+    *   agents `a` (`settingsBase: b`) and `b` (`settingsBase: a`) both have
+        no `aiSettingsBase`.
 *   `src/browser/utils/workspaceModeAi.test.ts` (Modify): after
     `setAgentBases` with a descriptor `{id: "ci-watcher", base: "exec",
     aiSettingsBase: "explore"}`, `resolveConfiguredAiDefaults("ci-watcher",
@@ -2248,8 +2265,12 @@ Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
         before `spine.run`. After the run, it drops a reason whose hook has
         reached its limit: `hookContinuations.get(hookKey) ?? 0` is at least
         `loopLimit ?? MAX_STOP_HOOK_CONTINUATIONS`, and `loopLimit === null`
-        never reaches a limit. It returns `{kind: "continue", prompt,
-        hookKeys}` with the keys of the kept reasons, each key once.
+        never reaches a limit. It builds the prompt from the kept reasons with
+        the existing cut at `TURN_STOP_PROMPT_MAX_CHARS`, and keeps each
+        reason's key beside its text through that cut. It returns
+        `{kind: "continue", prompt, hookKeys}` with the key of each kept
+        reason that has some text in the final prompt, each key once. A reason
+        cut off entirely does not count toward its hook's limit.
     *   The input `Pick` of the `aiService.runTurnStopHooks` contract
         (`agentSession.ts:1075-1078`) and of its implementation
         (`aiService.ts:608-616`) adds `hookContinuations`.
@@ -2520,8 +2541,7 @@ Each case names its input and the expected result.
     *   Exit 2, `{"permission": "deny"}`, invalid JSON,
         `{"followup_message": 3}` and exit 1 from `stop` each add no reason and
         show one notice.
-    *   Exit 127 shows the "not found in this workspace" notice once for two
-        calls.
+    *   Exit 127 shows the exit-127 notice once for two calls.
     *   A hook that sleeps past its timeout is killed, and the turn proceeds.
     *   `stop` stdout of 64 × 1024 + 1 bytes adds no reason and shows one
         notice.
