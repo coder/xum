@@ -124,7 +124,7 @@ async function readSettingsBaseChain(
       settingsBase,
       readOptions
     );
-    return await resolveAgentInheritanceChain({
+    const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
       workspacePath: context.workspacePath,
       agentId: agentDefinition.id,
@@ -132,6 +132,9 @@ async function readSettingsBaseChain(
       workspaceId: context.workspaceId,
       ...readOptions,
     });
+    // A chain that stops at a missing or cyclic base does not resolve in agents.list either, so
+    // the run ignores it too instead of resolving over part of it.
+    return chain.at(-1)?.base == null ? chain : null;
   } catch (error) {
     if (context.abortSignal?.aborted === true || isRuntimeReadFailure(error)) throw error;
     return null;

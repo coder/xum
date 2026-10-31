@@ -3731,6 +3731,38 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     });
 
+    test("a Cursor plugin's declared MCP file that is missing keeps a broken record (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const file = path.join(muxRoot, "plugin-sign-outs-pending.json");
+      await fsPromises.writeFile(file, "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      const kit = path.join(pluginsDir(), "cursor-kit");
+      await fsPromises.mkdir(path.join(kit, ".cursor-plugin"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(kit, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "cursor-kit", mcpServers: "./servers.json" })
+      );
+      // Restored later, servers.json would load with the old sign-in.
+      await expect(restarted.signOutPluginServers()).rejects.toThrow(
+        /MCP file that plugin 'cursor-kit' declares/
+      );
+      expect(await pathExists(file)).toBe(true);
+      await fsPromises.writeFile(
+        path.join(kit, "servers.json"),
+        JSON.stringify({ mcpServers: { docs: { url: serverUrl } } })
+      );
+      await restarted.signOutPluginServers();
+      expect(await pathExists(file)).toBe(false);
+      await oauth.dispose();
+    });
+
     test("a record of an unknown version is kept, and discovery stays closed", async () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
