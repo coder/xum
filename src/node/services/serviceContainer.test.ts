@@ -819,6 +819,30 @@ describe("ServiceContainer", () => {
     expect(closeAll).toHaveBeenCalledTimes(1);
   });
 
+  it("dispose joins a launch that task creation scheduled", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // A spawn returned at its reservation; its launch is still forking or sending.
+    const launch = Promise.withResolvers<void>();
+    const launchesSettled = spyOn(services.taskService, "reservedLaunchesSettled").mockReturnValue(
+      launch.promise
+    );
+    const closeAll = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+
+    await services.initializeCore();
+    const disposed = services.dispose();
+    while (launchesSettled.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(closeAll).not.toHaveBeenCalled();
+    launch.resolve();
+    await disposed;
+    expect(closeAll).toHaveBeenCalledTimes(1);
+  });
+
   it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
     services = new ServiceContainer(stores);
     spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>

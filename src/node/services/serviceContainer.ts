@@ -943,8 +943,10 @@ export class ServiceContainer {
       this.startupHousekeepingSettled,
       this.taskRecoverySettled,
       // Recovery schedules its queue drain instead of awaiting it (see
-      // TaskService.recoverInterruptedTasks), so its launches are joined separately.
+      // TaskService.recoverInterruptedTasks), so its launches are joined separately, and so are
+      // the launches task creation scheduled.
       this.taskService.queueDrainSettled(),
+      this.taskService.reservedLaunchesSettled(),
     ]);
     await shutdownStep("startupHousekeeping.join", async () => {
       const joined = await raceWithAbortAndTimeout(housekeepingSettled, {

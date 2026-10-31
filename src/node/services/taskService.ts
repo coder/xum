@@ -1782,6 +1782,12 @@ type ReservationLaunchPlan = TaskLaunchPlan & {
   sharedWorkspacePath?: string;
 };
 
+/** What the parent's failure delivery reads of a child that ended without a report. */
+type TerminalFailureChild = Pick<
+  WorkspaceConfigEntry,
+  "parentWorkspaceId" | "agentType" | "workflowTask"
+>;
+
 /** The launch leases of a batch's `starting` plans (see holdLaunchLeases). */
 type HeldLaunchLeases = Awaited<ReturnType<typeof holdLaunchLeases>>;
 
@@ -3590,6 +3596,8 @@ export class TaskService implements AgentTaskIntegration {
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
+  // createMany's launches, each until it settles (see reservedLaunchesSettled).
+  private readonly reservedLaunches = new Set<Promise<void>>();
   // Terminal attention scheduling and bookkeeping: notify_on_terminal persists, drain chains, idle
   // waits, fresh sub-agent edges and wake-group send backoff. The drain itself stays here.
   private readonly terminalAttention: TerminalAttentionNotifier;
@@ -8073,9 +8081,9 @@ export class TaskService implements AgentTaskIntegration {
 
   private scheduleReservedTaskLaunch(plan: TaskLaunchPlan): void {
     assert(plan.taskId.length > 0, "scheduleReservedTaskLaunch requires taskId");
-    void this.enqueueReservedTaskLaunch(plan).catch((error: unknown) => {
+    const launch = this.enqueueReservedTaskLaunch(plan).catch(async (error: unknown) => {
       log.error("Failed to launch reserved task", { taskId: plan.taskId, error });
-      void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan).catch(
+      await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan).catch(
         (markError: unknown) => {
           // A rejected config write here would otherwise be an unhandled rejection (#4444).
           log.error("Failed to record reserved task launch failure", {
@@ -8085,6 +8093,16 @@ export class TaskService implements AgentTaskIntegration {
         }
       );
     });
+    this.reservedLaunches.add(launch);
+    void launch.finally(() => this.reservedLaunches.delete(launch));
+  }
+
+  /**
+   * Settles (never rejects) once every launch createMany scheduled so far has settled, its
+   * failure recorded. Shutdown joins it next to the queue drain's launches (queueDrainSettled).
+   */
+  reservedLaunchesSettled(): Promise<void> {
+    return Promise.all(this.reservedLaunches).then(() => undefined);
   }
 
   /**
@@ -8116,7 +8134,8 @@ export class TaskService implements AgentTaskIntegration {
      * fence never admitted the send (sendAdmitted still false). Without it the attempt settles in
      * memory only, as before receipts existed.
      */
-    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted" | "abortSignal">
+    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted" | "abortSignal"> &
+      TerminalFailureChild
   ): Promise<void> {
     assert(taskId.length > 0, "markTaskLaunchFailed requires taskId");
     // A reserved launch that fails once shutdown has latched the sessions is not a task failure
@@ -8145,6 +8164,7 @@ export class TaskService implements AgentTaskIntegration {
     let transitionedToInterrupted = false;
     let superseded = false;
     let parentWorkspaceId: string | undefined;
+    let failedRow: WorkspaceConfigEntry | undefined;
     try {
       await this.editWorkspaceEntry(
         taskId,
@@ -8157,6 +8177,7 @@ export class TaskService implements AgentTaskIntegration {
           }
           transitionedToInterrupted = ws.taskStatus !== "interrupted";
           parentWorkspaceId = ws.parentWorkspaceId;
+          failedRow = ws;
           ws.taskStatus = "interrupted";
           markChildGoalPauseOwed(ws);
           ws.taskLaunchError = message;
@@ -8196,6 +8217,9 @@ export class TaskService implements AgentTaskIntegration {
       launch.sendAdmitted !== true &&
       launch.attemptId != null &&
       launch.attemptId === ownedAttempt?.attemptId;
+    // Before rejectWaiters consumes them: a pending waiter means the parent's turn already sees
+    // this failure.
+    const hadForegroundWaiters = this.waiters.hasPendingWaiters(taskId);
     // Before any await below (the receipt write, the metadata emit): a successor's waiter
     // registered meanwhile must not be rejected as this attempt's.
     this.rejectWaiters(taskId, new Error(message));
@@ -8211,6 +8235,41 @@ export class TaskService implements AgentTaskIntegration {
     }
     await this.emitWorkspaceMetadata(taskId);
     this.scheduleMaybeStartQueuedTasks();
+    await this.deliverLaunchFailureToParent(taskId, message, {
+      failedRow,
+      transitionedToInterrupted,
+      launch,
+      hadForegroundWaiters,
+    });
+  }
+
+  /**
+   * A launch failure ends the child's attempt without a report, so the parent learns of it the way
+   * it learns of a terminal stream failure: a failure message in its history and a terminal
+   * wake. Without it a background child whose launch fails stays silent, since its launch runs
+   * after the task tool returned. A row this failure did not move to interrupted was already
+   * ended by a Stop or an earlier failure, which gave its own notice. A row the launch itself
+   * unpublished (an unsanitized checkout's reclaim) is described by the launch's plan.
+   */
+  private async deliverLaunchFailureToParent(
+    taskId: string,
+    message: string,
+    failure: {
+      failedRow: WorkspaceConfigEntry | undefined;
+      transitionedToInterrupted: boolean;
+      launch: TerminalFailureChild | undefined;
+      hadForegroundWaiters: boolean;
+    }
+  ): Promise<void> {
+    if (failure.failedRow != null && !failure.transitionedToInterrupted) return;
+    const child = failure.failedRow ?? failure.launch;
+    if (child == null) return;
+    await this.maybeResumeParentAfterTerminalChildFailure(
+      taskId,
+      child,
+      { errorType: "launch_failed", errorMessage: message },
+      failure.hadForegroundWaiters
+    );
   }
 
   /**
@@ -21509,7 +21568,7 @@ export class TaskService implements AgentTaskIntegration {
 
     await this.maybeResumeParentAfterTerminalChildFailure(
       workspaceId,
-      entry,
+      entry.workspace,
       failure,
       hadForegroundWaiters
     );
@@ -21531,11 +21590,11 @@ export class TaskService implements AgentTaskIntegration {
    */
   private async maybeResumeParentAfterTerminalChildFailure(
     childWorkspaceId: string,
-    childEntry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    child: TerminalFailureChild,
     failure: { errorType: string; errorMessage: string },
     hadForegroundWaiters: boolean
   ): Promise<void> {
-    const parentWorkspaceId = childEntry.workspace.parentWorkspaceId;
+    const parentWorkspaceId = child.parentWorkspaceId;
     if (!parentWorkspaceId) {
       return;
     }
@@ -21547,7 +21606,7 @@ export class TaskService implements AgentTaskIntegration {
     }
     // Workflow-owned children propagate failures through the WorkflowRunner
     // step result; do not also resume the parent from a child-level failure row.
-    if (childEntry.workspace.workflowTask != null) {
+    if (child.workflowTask != null) {
       return;
     }
 
@@ -21565,7 +21624,7 @@ export class TaskService implements AgentTaskIntegration {
       "user",
       formatSubagentFailureUserMessage({
         childWorkspaceId,
-        agentType: coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent",
+        agentType: coerceNonEmptyString(child.agentType) ?? "agent",
         errorType: failure.errorType,
         errorMessage: failure.errorMessage,
       }),
