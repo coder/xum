@@ -66,10 +66,24 @@ export function xumStdioEntry(
   return rewritten;
 }
 
-// Any `${...}`: Cursor interpolates `${NAME}`, `${NAME:-default}`, `${env:NAME}` (names such as
-// `api-key` included), `${userHome}` and `${/}`. The captured name stops before a `:` other than
-// `env:`, so the reported text never includes a default.
-const PLACEHOLDER_PATTERN = /\$\{((?:env:)?[^}:]*)[^}]*\}/g;
+/**
+ * Each `${...}` in `value` as `[whole, name]`. Cursor interpolates `${NAME}`, `${NAME:-default}`,
+ * `${env:NAME}` (names such as `api-key` included), `${userHome}` and `${/}`. The name stops before
+ * a `:` other than `env:`, so the reported text never includes a default. A scan, not a regex: a
+ * plugin's `mcp.json` is read before consent, and an unterminated `${` must stay linear-time.
+ */
+function* placeholders(value: string): Generator<[whole: string, name: string]> {
+  let from = 0;
+  for (;;) {
+    const start = value.indexOf("${", from);
+    const end = start === -1 ? -1 : value.indexOf("}", start + 2);
+    if (end === -1) return;
+    const body = value.slice(start + 2, end);
+    const prefix = body.startsWith("env:") ? "env:" : "";
+    yield [value.slice(start, end + 1), prefix + body.slice(prefix.length).split(":")[0]];
+    from = end + 1;
+  }
+}
 
 /**
  * The first placeholder in `values` that Xum leaves as written, by name only: a default can be a
@@ -82,7 +96,7 @@ function unexpandedPlaceholder(
 ): string | undefined {
   for (const value of values) {
     if (typeof value !== "string") continue;
-    for (const [whole, name] of value.matchAll(PLACEHOLDER_PATTERN)) {
+    for (const [whole, name] of placeholders(value)) {
       if (whole !== `\${${name}}` || !expanded.has(name)) return `\${${name}}`;
     }
   }

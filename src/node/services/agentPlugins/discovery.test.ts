@@ -2438,6 +2438,18 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("an unterminated ${ in a Cursor MCP file is read in linear time", async () => {
+    const value = "${".repeat(2) + "a".repeat(MAX_PLUGIN_MANIFEST_BYTES / 2);
+    const started = performance.now();
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: { slow: { command: "node", args: [value] } } }),
+    });
+    // A backtracking pattern took over 20 s on half this size; a scan takes milliseconds.
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(kit.plugin.notApplied).toEqual([]);
+  });
+
   test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
