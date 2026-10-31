@@ -1774,6 +1774,35 @@ interface ReservationAgentDefinition
     ReservationPlacement,
     Readonly<Pick<PreparedTaskReservation, "skipInitHook" | "definitionSource" | "frontmatter">> {}
 
+/** A plan createMany reserved, with the status it was reserved in. */
+type ReservationLaunchPlan = TaskLaunchPlan & {
+  status: "queued" | "starting";
+  sharedWorkspacePath?: string;
+};
+
+/** The launch leases of a batch's `starting` plans (see holdLaunchLeases). */
+type HeldLaunchLeases = Awaited<ReturnType<typeof holdLaunchLeases>>;
+
+/** createManyUnderTaskTreeLifecycleLocks' arguments, as its steps read them. */
+interface ReservationRun {
+  readonly options: TaskCreateManyOptions;
+  readonly signal: AbortSignal | undefined;
+  readonly progress: TaskReservationProgress;
+  /** The cancellation result, at the stage progress names. */
+  readonly interrupted: () => Result<never, string>;
+}
+
+/** The reserved plans and the caller's results, in the same order. */
+interface ReservationBatch {
+  readonly plans: ReservationLaunchPlan[];
+  readonly results: TaskCreateResult[];
+}
+
+/** What the commit's mutator saw: set by its callback inside the config edit, read after it. */
+interface ReservationCommitState {
+  canceledInsideCommit: boolean;
+}
+
 interface MaterializedTaskLaunch {
   workspacePath: string;
   trunkBranch: string;
@@ -6957,7 +6986,8 @@ export class TaskService implements AgentTaskIntegration {
     progress: TaskReservationProgress
   ): Promise<Result<TaskCreateResult[], string>> {
     const signal = options.abortSignal;
-    const interrupted = (): Result<TaskCreateResult[], string> => Err(progress.interruptedError());
+    const interrupted = (): Result<never, string> => Err(progress.interruptedError());
+    const run: ReservationRun = { options, signal, progress, interrupted };
 
     // Stage: read-only preparation, before the global mutex. Cancellable between plans; a result
     // computed after the abort is discarded.
@@ -7137,7 +7167,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
     progress.enter("desktop-gate");
-    let canceledInsideCommit = false;
+    const commitState: ReservationCommitState = { canceledInsideCommit: false };
     const commit = async (): Promise<Result<TaskCreateResult[], string> | null> => {
       // Checkpoint entry is the LAST cancellation point: an abort observed here leaves nothing
       // durable. Once a callback is entered it is owned to completion (the runner checks the
@@ -7179,7 +7209,7 @@ export class TaskService implements AgentTaskIntegration {
           plans,
           signal,
           () => {
-            canceledInsideCommit = true;
+            commitState.canceledInsideCommit = true;
           },
           options.retires
         );
@@ -7215,70 +7245,114 @@ export class TaskService implements AgentTaskIntegration {
       return Err(getErrorMessage(error));
     }
     if (commitOutcome != null) return commitOutcome;
+    return await this.finishReservations(run, { plans, results }, launchLeases, commitState);
+  }
 
-    progress.enter("launch");
-    for (const result of results) {
+  /**
+   * createMany after its commit, under the mutex and the launch leases: the emits, then either
+   * the post-commit fence or the launches.
+   */
+  private async finishReservations(
+    run: ReservationRun,
+    batch: ReservationBatch,
+    launchLeases: HeldLaunchLeases,
+    commitState: ReservationCommitState
+  ): Promise<Result<TaskCreateResult[], string>> {
+    run.progress.enter("launch");
+    for (const result of batch.results) {
       await this.emitWorkspaceMetadata(result.taskId);
     }
 
     // Post-commit fence, after the last await and immediately before scheduling: an abort that
     // landed after the mutator ran reconciles the live reservations to interrupted with an OWNED
     // write (never detached).
-    if (canceledInsideCommit || signal?.aborted) {
-      this.closeReservedAttempts(plans, "reservation-canceled");
-      // The first fence write that rejected; thrown once every plan was handled (#5028).
-      let fenceFailure: { error: unknown } | undefined;
-      for (const plan of plans) {
-        const ownedAttempt = this.attemptLedger.ownedAttempt(plan.taskId);
-        const fence: ReservationRowFence = {
-          transitioned: canceledInsideCommit,
-          superseded: false,
-          rowMoved: false,
-        };
-        if (!canceledInsideCommit) {
-          try {
-            await this.fenceReservationRow(plan, TASK_RESERVATION_CANCELED_MESSAGE, fence);
-          } catch (error: unknown) {
-            // Nothing launches this row now (#5028), unless the row already moved on (another
-            // writer's attempt, whose waiters this cancel must not touch).
-            if (!fence.rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
-            fenceFailure ??= { error };
-            continue;
-          }
-        }
-        if (fence.transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
-        if (fence.transitioned) await this.settleChildGoalPause(plan.taskId);
-        // Waiters are keyed by the stable task id: once another writer re-admitted the row under
-        // its own attempt they are that attempt's (its task_await must not read this cancel).
-        // Rejected BEFORE the receipt write's await, which a successor's new waiter could
-        // otherwise register during and then be rejected as this attempt's.
-        if (!fence.superseded) {
-          this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
-        }
-        // Canceled before any launch was scheduled: nothing ran under the attempt.
-        await this.attemptLedger.persistOwnedAttemptSettlement(
-          plan.taskId,
-          ownedAttempt,
-          "reservation-canceled",
-          "reservation-canceled"
-        );
-        await this.emitWorkspaceMetadata(plan.taskId);
-      }
-      if (fenceFailure != null) throw fenceFailure.error;
-      return interrupted();
+    if (commitState.canceledInsideCommit || run.signal?.aborted) {
+      return await this.fenceCanceledReservations(run, batch.plans, commitState);
     }
+    return this.scheduleReservedLaunches(batch, launchLeases);
+  }
 
+  /** The post-commit fence of a canceled batch: fences every plan, then reports the cancel. */
+  private async fenceCanceledReservations(
+    run: ReservationRun,
+    plans: readonly ReservationLaunchPlan[],
+    commitState: ReservationCommitState
+  ): Promise<Result<TaskCreateResult[], string>> {
+    this.closeReservedAttempts(plans, "reservation-canceled");
+    // The first fence write that rejected; thrown once every plan was handled (#5028).
+    let fenceFailure: { error: unknown } | undefined;
     for (const plan of plans) {
+      // Awaited before the `??=`, which would skip the fence of every later plan once one failed.
+      const failure = await this.fenceCanceledReservation(plan, commitState);
+      fenceFailure ??= failure;
+    }
+    if (fenceFailure != null) throw fenceFailure.error;
+    return run.interrupted();
+  }
+
+  /**
+   * One plan of the post-commit fence: its owned `interrupted` write (unless the commit already
+   * wrote it), its waiters and its receipt. Returns the fence write's failure, if any.
+   */
+  private async fenceCanceledReservation(
+    plan: ReservationLaunchPlan,
+    commitState: ReservationCommitState
+  ): Promise<{ error: unknown } | undefined> {
+    const ownedAttempt = this.attemptLedger.ownedAttempt(plan.taskId);
+    const fence: ReservationRowFence = {
+      transitioned: commitState.canceledInsideCommit,
+      superseded: false,
+      rowMoved: false,
+    };
+    if (!commitState.canceledInsideCommit) {
+      try {
+        await this.fenceReservationRow(plan, TASK_RESERVATION_CANCELED_MESSAGE, fence);
+      } catch (error: unknown) {
+        // Nothing launches this row now (#5028), unless the row already moved on (another
+        // writer's attempt, whose waiters this cancel must not touch).
+        if (!fence.rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
+        return { error };
+      }
+    }
+    if (fence.transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+    if (fence.transitioned) await this.settleChildGoalPause(plan.taskId);
+    // Waiters are keyed by the stable task id: once another writer re-admitted the row under
+    // its own attempt they are that attempt's (its task_await must not read this cancel).
+    // Rejected BEFORE the receipt write's await, which a successor's new waiter could
+    // otherwise register during and then be rejected as this attempt's.
+    if (!fence.superseded) {
+      this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
+    }
+    // Canceled before any launch was scheduled: nothing ran under the attempt.
+    await this.attemptLedger.persistOwnedAttemptSettlement(
+      plan.taskId,
+      ownedAttempt,
+      "reservation-canceled",
+      "reservation-canceled"
+    );
+    await this.emitWorkspaceMetadata(plan.taskId);
+    return undefined;
+  }
+
+  /**
+   * The launches of a batch that was not canceled, in the tick that checked: sync, so each
+   * launch's sync prefix runs under the mutex. A `starting` plan takes its launch lease.
+   */
+  private scheduleReservedLaunches(
+    batch: ReservationBatch,
+    launchLeases: HeldLaunchLeases
+  ): Result<TaskCreateResult[], string> {
+    for (const plan of batch.plans) {
       if (plan.status === "starting") {
         plan.launchLease = launchLeases.take(plan.taskId);
         this.scheduleReservedTaskLaunch(plan);
       }
     }
-    if (plans.some((plan) => plan.status === "queued")) {
+    if (batch.plans.some((plan) => plan.status === "queued")) {
       this.scheduleMaybeStartQueuedTasks();
     }
 
-    return Ok(results);
+    return Ok(batch.results);
   }
 
   /** The reservation's owned config write (see createManyUnderTaskTreeLifecycleLocks). */
