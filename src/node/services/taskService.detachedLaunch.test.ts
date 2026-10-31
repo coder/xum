@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
@@ -147,8 +148,25 @@ describe("a sub-agent launch after create() returned", () => {
   });
 
   describe("a task stopped while its checkout forks", () => {
+    /** What a test does to the stopped task, and what the launch's sanitize returns. */
+    interface StoppedLaunchScenario {
+      sanitizeResult: string | undefined;
+      /** Runs after the Stop, before the fork returns. */
+      beforeForkReturns?: (taskService: TaskService, taskId: string) => Promise<void>;
+      /** Runs while the launch sanitizes the stopped task's checkout. */
+      whileSanitizing?: (taskService: TaskService, taskId: string) => Promise<void>;
+    }
+
+    /** A resume of the stopped task, as a user's send makes before the send itself. */
+    async function resume(taskService: TaskService, taskId: string) {
+      const resumed = await taskService.reawakenInterruptedTask(taskId);
+      expect(resumed.kind).toBe("reawakened");
+      // Nothing can run the task yet: sends and MCP refuse it, also after a restart.
+      expect(new InitStateManager(config).getUnsanitizedCheckoutError(taskId)).toBeDefined();
+    }
+
     /** Forks a real worktree, stops the task while the fork returns, and lets the launch end. */
-    async function stopTaskDuringFork(sanitizeResult: string | undefined) {
+    async function stopTaskDuringFork(scenario: StoppedLaunchScenario) {
       const projectPath = await createTestProject(rootDir, "worktree-project");
       const parentId = "wtparent";
       stubStableIds(config, ["stoppedchild"]);
@@ -177,16 +195,20 @@ describe("a sub-agent launch after create() returned", () => {
         return result;
       });
       const host = createWorkspaceServiceMocks();
-      const sanitize = spyOn(
-        host.workspaceService,
-        "sanitizeMaterializedTaskWorkspace"
-      ).mockResolvedValue(sanitizeResult);
       const initStateManager = new InitStateManager(config);
       spyOn(initStateManager, "startInit").mockImplementation(() => undefined);
       spyOn(initStateManager, "endInit").mockResolvedValue(undefined);
       const { taskService } = harness({
         workspaceService: host.workspaceService,
         initStateManager,
+      });
+      const reserved = Promise.withResolvers<string>();
+      const sanitize = spyOn(
+        host.workspaceService,
+        "sanitizeMaterializedTaskWorkspace"
+      ).mockImplementation(async () => {
+        await scenario.whileSanitizing?.(taskService, await reserved.promise);
+        return scenario.sanitizeResult;
       });
 
       const created = await taskService.create({
@@ -200,27 +222,133 @@ describe("a sub-agent launch after create() returned", () => {
         created.success,
         `the spawn must be reserved: ${created.success ? "" : created.error}`
       );
+      const taskId = created.data.taskId;
+      reserved.resolve(taskId);
       await forked.promise;
-      const stopped = await taskService.stopDescendantAgentTask(parentId, created.data.taskId);
+      const stopped = await taskService.stopDescendantAgentTask(parentId, taskId);
       assert(stopped.success, JSON.stringify(stopped));
+      await scenario.beforeForkReturns?.(taskService, taskId);
       release.resolve();
       await taskService.reservedLaunchesSettled();
-      return { taskId: created.data.taskId, host, sanitize, initStateManager };
+      return { taskId, host, sanitize, initStateManager };
     }
 
-    test("gets that checkout sanitized all the same", async () => {
-      const { taskId, host, sanitize } = await stopTaskDuringFork(undefined);
+    test("gets that checkout sanitized all the same, which lifts its quarantine", async () => {
+      const { taskId, host, sanitize } = await stopTaskDuringFork({ sanitizeResult: undefined });
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
       expect(sanitize).toHaveBeenCalledWith(taskId, expect.any(String), expect.anything());
       expect(host.sendMessage.mock.calls.some(([id]) => id === taskId)).toBe(false);
+      expect(new InitStateManager(config).getUnsanitizedCheckoutError(taskId)).toBeUndefined();
     }, 20_000);
 
     test("keeps a checkout that fails to sanitize quarantined, also after a restart", async () => {
-      const { taskId, initStateManager } = await stopTaskDuringFork("fixture: sanitize failed");
+      const { taskId, initStateManager } = await stopTaskDuringFork({
+        sanitizeResult: "fixture: sanitize failed",
+      });
       expect(initStateManager.getUnsanitizedCheckoutError(taskId)).toBeDefined();
       expect(findWorkspaceInConfig(config, taskId)?.taskCheckoutUnsanitized).toBe(true);
       expect(new InitStateManager(config).getUnsanitizedCheckoutError(taskId)).toBeDefined();
     }, 20_000);
+
+    test("gets that checkout sanitized when a resume superseded the launch before the fork returned", async () => {
+      const { taskId, sanitize } = await stopTaskDuringFork({
+        sanitizeResult: undefined,
+        beforeForkReturns: resume,
+      });
+      expect(sanitize).toHaveBeenCalledTimes(1);
+      expect(new InitStateManager(config).getUnsanitizedCheckoutError(taskId)).toBeUndefined();
+    }, 20_000);
+
+    test("keeps the quarantine across a restart when a resume lands while a failing sanitize runs", async () => {
+      const { taskId } = await stopTaskDuringFork({
+        sanitizeResult: "fixture: sanitize failed",
+        whileSanitizing: resume,
+      });
+      expect(new InitStateManager(config).getUnsanitizedCheckoutError(taskId)).toBeDefined();
+    }, 20_000);
+  });
+
+  test("a task is quarantined from its reservation until its launch sanitizes its checkout", async () => {
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const host = createWorkspaceServiceMocks();
+    const sanitizing = Promise.withResolvers<void>();
+    const sanitizeMayPass = Promise.withResolvers<void>();
+    gates.push(sanitizeMayPass.resolve);
+    spyOn(host.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+      async () => {
+        sanitizing.resolve();
+        await sanitizeMayPass.promise;
+        return undefined;
+      }
+    );
+    const { taskService } = harness({ workspaceService: host.workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "Read the repository",
+      title: "Quarantined until sanitized",
+    });
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    // Before the reservation returned, and still while the sanitize runs: a restart at either
+    // point keeps refusing the task.
+    expect(
+      new InitStateManager(config).getUnsanitizedCheckoutError(created.data.taskId)
+    ).toBeDefined();
+    await sanitizing.promise;
+    expect(
+      new InitStateManager(config).getUnsanitizedCheckoutError(created.data.taskId)
+    ).toBeDefined();
+
+    sanitizeMayPass.resolve();
+    await taskService.reservedLaunchesSettled();
+    expect(findWorkspaceInConfig(config, created.data.taskId)?.taskStatus).toBe("running");
+    expect(
+      new InitStateManager(config).getUnsanitizedCheckoutError(created.data.taskId)
+    ).toBeUndefined();
+  });
+
+  test("a foreground spawn backgrounded while it sanitizes still gets its launch failure delivered", async () => {
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const host = createWorkspaceServiceMocks();
+    const sanitizing = Promise.withResolvers<void>();
+    const sanitizeMayFail = Promise.withResolvers<void>();
+    gates.push(sanitizeMayFail.resolve);
+    spyOn(host.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+      async () => {
+        sanitizing.resolve();
+        await sanitizeMayFail.promise;
+        return "Cannot sanitize stale plugin override";
+      }
+    );
+    const { taskService, historyService } = harness({ workspaceService: host.workspaceService });
+    const wakes = spyOn(taskService, "enqueueTerminalAttention");
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "Read the repository",
+      title: "Backgrounded while sanitizing",
+      attentionPolicy: "blocking_until_terminal",
+    });
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    const foregroundWait = taskService
+      .waitForAgentReport(created.data.taskId, {
+        requestingWorkspaceId: parentId,
+        backgroundOnMessageQueued: true,
+      })
+      .catch(() => undefined);
+    await sanitizing.promise;
+    // A message queued for the parent sends its foreground waits to the background.
+    expect(taskService.backgroundForegroundWaitsForWorkspace(parentId)).toBe(1);
+    await foregroundWait;
+
+    sanitizeMayFail.resolve();
+    await taskService.reservedLaunchesSettled();
+    expect(await failureMessages(historyService, parentId)).toHaveLength(1);
+    expect(wakes).toHaveBeenCalledTimes(1);
   });
 
   test("task_await returns the launch error of a task whose reclaim removed its row", async () => {
@@ -263,7 +391,50 @@ describe("a sub-agent launch after create() returned", () => {
     });
   });
 
-  test("a foreground spawn's launch failure reaches the parent once, through its wait", async () => {
+  test("a wait that starts as the reclaim removes the task's row gets the launch error", async () => {
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const host = createWorkspaceServiceMocks();
+    const failure = "Cannot sanitize stale plugin override";
+    spyOn(host.workspaceService, "sanitizeMaterializedTaskWorkspace").mockResolvedValue(failure);
+    const { taskService } = harness({ workspaceService: host.workspaceService });
+    const taskRowIds = () =>
+      Array.from(config.loadConfigOrDefault().projects.values())
+        .flatMap((project) => project.workspaces)
+        .flatMap((ws) => (ws.parentWorkspaceId === parentId && ws.id != null ? [ws.id] : []));
+    // The wait starts right after the config edit that removes the task's row, and the launch
+    // goes on only once the wait settled.
+    let waitAtRemoval: Promise<string> | undefined;
+    const editConfig = config.editConfig.bind(config);
+    spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      const idsBefore = taskRowIds();
+      await editConfig(...args);
+      const removedId = idsBefore.find((id) => !taskRowIds().includes(id));
+      if (removedId != null && waitAtRemoval == null) {
+        waitAtRemoval = taskService
+          .waitForAgentReport(removedId, { requestingWorkspaceId: parentId })
+          .then(
+            () => "reported",
+            (error: unknown) => getErrorMessage(error)
+          );
+        await waitAtRemoval;
+      }
+    });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "Read the repository",
+      title: "Child whose sanitize fails",
+    });
+    assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
+    await taskService.reservedLaunchesSettled();
+
+    expect(findWorkspaceInConfig(config, created.data.taskId)).toBeUndefined();
+    expect(await waitAtRemoval).toBe(failure);
+  });
+
+  test("a foreground spawn whose launch fails with no waiter pending still reaches the parent", async () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const { workspaceService } = createWorkspaceServiceMocks({
       sendMessage: mock(
@@ -285,30 +456,31 @@ describe("a sub-agent launch after create() returned", () => {
       attentionPolicy: "blocking_until_terminal",
     });
     assert(created.success, `the spawn must be reserved: ${created.success ? "" : created.error}`);
-    // The launch fails before the tool waits, as a best-of member's can while the tool still
-    // creates the other members.
+    // The launch fails before any wait, as after a restart, where no wait of the parent's turn
+    // survives: like a stream failure, it then reaches the parent's history and wakes it.
     await taskService.reservedLaunchesSettled();
+    expect(await failureMessages(historyService, parentId)).toHaveLength(1);
+    expect(wakes).toHaveBeenCalledTimes(1);
+
+    // A wait started later still gets the launch error.
     const waited = taskService.waitForAgentReport(created.data.taskId, {
       requestingWorkspaceId: parentId,
       backgroundOnMessageQueued: true,
     });
-
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see
     await expect(waited).rejects.toThrow(SEND_FAILURE);
-    expect(await failureMessages(historyService, parentId)).toEqual([]);
-    expect(wakes).not.toHaveBeenCalled();
   });
 });
 
 describe("a Coder parent's task whose fork does not finish", () => {
   // A parent on a Coder workspace that Xum created: removing a workspace with this runtime
   // config deletes the Coder workspace itself (CoderSSHRuntime.deleteWorkspace).
-  const DEDICATED_CODER_RUNTIME: RuntimeConfig = {
+  const DEDICATED_CODER_RUNTIME = {
     type: "ssh",
     host: "mux-parent.coder",
     srcBaseDir: "~/mux",
     coder: { workspaceName: "mux-parent", existingWorkspace: false },
-  };
+  } satisfies RuntimeConfig;
   const PARENT_ID = "1111111111";
 
   /** Reads the local project for the parent; a task's checkout path does not exist yet. */
@@ -374,17 +546,17 @@ describe("a Coder parent's task whose fork does not finish", () => {
     return { taskService, taskId: created.data.taskId };
   }
 
-  /** The Coder workspaces a forced removal of the task's row deletes (as task_remove does). */
-  async function coderWorkspacesDeletedByRemoving(taskId: string): Promise<unknown[]> {
-    const row = findWorkspaceInConfig(config, taskId);
+  /** The Coder workspaces a forced removal of a workspace's row deletes (as task_remove does). */
+  async function coderWorkspacesDeletedByRemoving(workspaceId: string): Promise<unknown[]> {
+    const row = findWorkspaceInConfig(config, workspaceId);
     assert(
       row?.runtimeConfig != null && row.name != null,
-      "the task's row must have a runtime config and a name"
+      "the workspace's row must have a runtime config and a name"
     );
     const deleteWorkspaceEventually = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
-    // The SSH cleanup of the task's own directory is not under test.
+    // The SSH cleanup of the workspace's own directory is not under test.
     spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
       success: true,
       deletedPath: row.path,
@@ -409,8 +581,12 @@ describe("a Coder parent's task whose fork does not finish", () => {
     expect(await coderWorkspacesDeletedByRemoving(taskId)).toEqual([]);
   });
 
-  test("a Stop during the fork leaves a row whose removal keeps the parent's Coder workspace", async () => {
-    const forkedRuntime: RuntimeConfig = {
+  /**
+   * Stops the task while its fork runs, then lets the fork finish as a Coder fork does: both the
+   * task and the parent share the parent's Coder workspace. Returns once the launch ended.
+   */
+  async function stopTaskDuringFork(): Promise<string> {
+    const sharedRuntime: RuntimeConfig = {
       ...DEDICATED_CODER_RUNTIME,
       coder: { workspaceName: "mux-parent", existingWorkspace: true },
     };
@@ -422,8 +598,8 @@ describe("a Coder parent's task whose fork does not finish", () => {
       return Ok({
         workspacePath: path.join(rootDir, "never-forked", "child"),
         trunkBranch: "main",
-        forkedRuntimeConfig: forkedRuntime,
-        sourceRuntimeConfigUpdate: forkedRuntime,
+        forkedRuntimeConfig: sharedRuntime,
+        sourceRuntimeConfigUpdate: sharedRuntime,
         targetRuntime: new LocalRuntime(rootDir),
         forkedFromSource: true,
         sourceRuntimeConfigUpdated: true,
@@ -437,9 +613,20 @@ describe("a Coder parent's task whose fork does not finish", () => {
       forkMayFinish.resolve();
       await taskService.reservedLaunchesSettled();
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
-      expect(await coderWorkspacesDeletedByRemoving(taskId)).toEqual([]);
+      return taskId;
     } finally {
       forkMayFinish.resolve();
     }
+  }
+
+  test("a Stop during the fork leaves a row whose removal keeps the parent's Coder workspace", async () => {
+    const taskId = await stopTaskDuringFork();
+    expect(await coderWorkspacesDeletedByRemoving(taskId)).toEqual([]);
+  });
+
+  test("a Stop during the fork leaves a parent whose removal keeps the task's Coder workspace", async () => {
+    await stopTaskDuringFork();
+    // The stopped task keeps its checkout in the parent's Coder workspace.
+    expect(await coderWorkspacesDeletedByRemoving(PARENT_ID)).toEqual([]);
   });
 });

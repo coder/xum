@@ -283,9 +283,13 @@ describe("task launch races", () => {
       const realLoad = s.config.loadConfigOrDefault.bind(s.config);
       spyOn(s.config, "loadConfigOrDefault").mockImplementation((options) => {
         if (!failNextStrictRead) return realLoad(options);
-        failNextStrictRead = false;
         // What an unreadable config.json does: a strict read throws, a lenient one reads empty.
-        if (options?.throwOnError === true) throw new Error("config.json is unreadable");
+        // It stays unreadable until the recheck's strict read: the quarantine's clearing edit
+        // reads it first.
+        if (options?.throwOnError === true) {
+          failNextStrictRead = false;
+          throw new Error("config.json is unreadable");
+        }
         return { ...realLoad(options), projects: new Map() };
       });
 
@@ -329,8 +333,6 @@ describe("task launch races", () => {
       /** Arms the unreadable spell right before the read under test (or a setUp hook does). */
       arm?: (s: Setup, unreadable: () => void) => void;
       armInHook?: "beforeLaunch" | "materialize";
-      /** The checkout exists and its sanitize step has not run. */
-      forked?: true;
     }> = [
       { name: "the start check", armInHook: "beforeLaunch" },
       {
@@ -342,10 +344,9 @@ describe("task launch races", () => {
         arm: (s, unreadable) =>
           armAfter(s.taskService, "getExistingMaterializedTaskLaunch", unreadable),
       },
-      { name: "the check after the fork", armInHook: "materialize", forked: true },
+      { name: "the check after the fork", armInHook: "materialize" },
       {
         name: "the check before the sanitize step",
-        forked: true,
         arm: (s, unreadable) => {
           // The first publication after the launch recorded the fork's checkout on the row. Only
           // that one: the failure recording publishes the row again, and a second spell there
@@ -410,11 +411,10 @@ describe("task launch races", () => {
         );
         expect(s.inits.length).toBe(0);
         expect(s.sendMessage).not.toHaveBeenCalled();
-        // A forked checkout whose sanitize step never ran is quarantined, not left resumable: a
-        // resume would send into it without that launch-only step.
-        expect(findWorkspaceInConfig(s.config, CHILD)?.taskCheckoutUnsanitized).toBe(
-          site.forked === true ? true : undefined
-        );
+        // The row was reserved quarantined, and a launch that fails before its sanitize step
+        // leaves it so, forked or not: a resume would send into a checkout that this launch-only
+        // step never prepared.
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskCheckoutUnsanitized).toBe(true);
       });
     }
   });

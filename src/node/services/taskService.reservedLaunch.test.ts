@@ -465,7 +465,7 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
     expect(row(CHILD)?.taskLaunchError).toBe(undefined);
   });
 
-  test("a row a Stop ended after the materialize step stops the launch before the parent's runtime update", async () => {
+  test("a row a Stop ended after the materialize step stops the launch, and the parent still records the fork", async () => {
     const s = await setup([child({ taskStatus: "queued" })]);
     s.hooks.materialized = async (launch) => {
       await patchChild({ taskStatus: "interrupted" });
@@ -478,7 +478,8 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
 
     await s.drain();
 
-    expect(row(PARENT_ID)?.runtimeConfig).toEqual({ type: "local" });
+    // The stopped task keeps the checkout the fork made, so the parent records the fork's change.
+    expect(row(PARENT_ID)?.runtimeConfig).toEqual({ type: "worktree", srcBaseDir: config.srcDir });
     expect(s.initLogExitCodes()).toEqual([-1]);
     expect(s.registeredInits()).toBe(0);
     expect(s.sends()).toBe(0);
@@ -553,7 +554,7 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
   });
 
   describe("a row another writer re-admits under its own attempt", () => {
-    test("during the checkout persist keeps its fields and is not sanitized", async () => {
+    test("during the checkout persist keeps its fields, and the checkout is still sanitized", async () => {
       const s = await setup([child({ taskStatus: "queued" })]);
       s.hooks.materialized = (launch) => {
         s.hooks.nextRowEdit = () => patchChild({ taskAttemptId: FOREIGN_ATTEMPT_ID });
@@ -562,14 +563,15 @@ describe("TaskService reserved launch: exits, cancellations and refusals", () =>
 
       await s.drain();
 
-      // The row and its checkout are the other writer's: the persist skips the row, and the
-      // launch stops before the sanitize step without a cleanup or a failure mark.
+      // The row is the other writer's: the persist skips it, and the launch stops without a
+      // cleanup or a failure mark. It still sanitizes the checkout it forked, since a writer that
+      // re-admits a row never prepares a checkout.
       expect(row(CHILD)).toMatchObject({
         taskStatus: "starting",
         taskAttemptId: FOREIGN_ATTEMPT_ID,
       });
       expect(row(CHILD)?.taskBaseCommitShaByProjectPath).toBe(undefined);
-      expect(s.sanitized()).toBe(0);
+      expect(s.sanitized()).toBe(1);
       expect(s.initLogExitCodes()).toEqual([-1]);
       expect(s.registeredInits()).toBe(0);
       expect(s.cleanups()).toEqual([]);
