@@ -28,6 +28,7 @@ import {
 import {
   pluginSkillFileName,
   pluginSkillMarkdown,
+  type PluginSkillFileKind,
 } from "@/node/services/agentPlugins/claudeCommands";
 import type { PluginSkillConsentGate } from "@/node/services/agentPlugins/componentConsent";
 import {
@@ -77,6 +78,7 @@ interface ListedSkillsRoot {
   singleSkillName?: string;
   /** Plugin roots only: that skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  ruleFile?: string | undefined;
   /** Plugin roots only: snake_case folders load under kebab-case names (pluginSkillNameOfFolder). */
   plugin?: true;
 }
@@ -205,7 +207,7 @@ async function readSkillDescriptor(
   scope: "global" | "project",
   containmentRoot: string,
   skillConsent?: PluginSkillConsentGate,
-  commandSkill?: true
+  fileKind: PluginSkillFileKind = {}
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
@@ -219,7 +221,7 @@ async function readSkillDescriptor(
     directoryName,
     scope,
     containmentRoot,
-    pluginSkillFileName(directoryName, commandSkill)
+    pluginSkillFileName(directoryName, fileKind)
   );
   if (file === null) return null;
 
@@ -229,7 +231,7 @@ async function readSkillDescriptor(
       skillConsent,
       skillDir,
       parseSkillMarkdown({
-        content: pluginSkillMarkdown(directoryName, file.content, commandSkill),
+        content: pluginSkillMarkdown(directoryName, file.content, fileKind),
         byteSize: file.byteSize,
         directoryName,
         // Agree with discovery; the display name stays out of this model-facing output.
@@ -412,6 +414,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillConsent,
               singleSkillName: skillsRoot.name,
               commandSkill: skillsRoot.command,
+              ruleFile: skillsRoot.rule,
               plugin: true as const,
             }))
           );
@@ -427,6 +430,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillConsent,
           singleSkillName,
           commandSkill,
+          ruleFile,
           plugin,
         } of roots) {
           let skillsRootReal: string;
@@ -465,7 +469,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               scope,
               containmentRoot,
               skillConsent,
-              commandSkill
+              { command: commandSkill, rule: ruleFile }
             );
             if (!descriptor) {
               continue;

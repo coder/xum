@@ -11,49 +11,38 @@
  */
 import YAML from "yaml";
 
+import { MAX_SKILL_DESCRIPTION_LENGTH } from "@/common/orpc/schemas/agentSkill";
 import {
-  AgentSkillParseError,
   quoteBracketedArgumentHint,
+  rewrittenSkillMarkdown,
 } from "@/node/services/agentSkills/parseSkillMarkdown";
-import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
-import { normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
+import {
+  firstNonEmptyLine,
+  normalizeNewlines,
+  splitFrontmatter,
+  stripUtf8Bom,
+} from "@/node/utils/markdownFrontmatter";
+import { cursorRuleSkillMarkdown } from "./cursorRules";
 import { isPlainObject } from "./manifest";
 
-/** Longest description Xum takes from a command body's first line (the skill schema's cap). */
-const MAX_DESCRIPTION_LENGTH = 1024;
-
-/** The Markdown file of plugin skill `name` in its folder: SKILL.md, or `<name>.md` for a command. */
-export function pluginSkillFileName(name: string, command: boolean | undefined): string {
-  return command === true ? `${name}.md` : SKILL_FILENAME;
+export interface PluginSkillFileKind {
+  command?: true | undefined;
+  rule?: string | undefined;
 }
 
-/** The SKILL.md text of a plugin skill file: a command gets its skill frontmatter (below). */
+export function pluginSkillFileName(name: string, root: PluginSkillFileKind): string {
+  if (root.rule !== undefined) return root.rule;
+  return root.command === true ? `${name}.md` : SKILL_FILENAME;
+}
+
 export function pluginSkillMarkdown(
   name: string,
   content: string,
-  command: boolean | undefined
+  root: PluginSkillFileKind
 ): string {
-  return command === true ? claudeCommandSkillMarkdown(name, content) : content;
-}
-
-/** The frontmatter YAML text and the body of a Markdown file; no frontmatter: empty YAML. */
-function splitFrontmatter(text: string): { yaml: string; body: string } | null {
-  const lines = text.split("\n");
-  if ((lines[0] ?? "").trim() !== "---") return { yaml: "", body: text };
-  const end = lines.findIndex((line, index) => index > 0 && line.trim() === "---");
-  // An unclosed block: the parser reports it on the unchanged text.
-  if (end === -1) return null;
-  return { yaml: lines.slice(1, end).join("\n"), body: lines.slice(end + 1).join("\n") };
-}
-
-/** Claude's default description: the body's first non-empty line, cut to the schema's cap. */
-function firstLineDescription(name: string, body: string): string {
-  const line = body
-    .split("\n")
-    .map((text) => text.trim())
-    .find((text) => text.length > 0);
-  return (line ?? `Command /${name}`).slice(0, MAX_DESCRIPTION_LENGTH);
+  if (root.rule !== undefined) return cursorRuleSkillMarkdown({ name, file: root.rule }, content);
+  return root.command === true ? claudeCommandSkillMarkdown(name, content) : content;
 }
 
 /**
@@ -80,16 +69,11 @@ export function claudeCommandSkillMarkdown(name: string, content: string): strin
     description:
       typeof description === "string" && description.trim().length > 0
         ? description
-        : firstLineDescription(name, parts.body),
+        : (firstNonEmptyLine(parts.body) ?? `Command /${name}`).slice(
+            0,
+            MAX_SKILL_DESCRIPTION_LENGTH
+          ),
     "disable-model-invocation": true,
   };
-  const rewritten = `---\n${YAML.stringify(frontmatter)}---\n${parts.body}`;
-  // YAML aliases can repeat one large value many times, so the rewritten text can be far bigger
-  // than the file. Every caller parses it with the file's byteSize, so check the same cap here.
-  if (Buffer.byteLength(rewritten, "utf8") > MAX_FILE_SIZE) {
-    throw new AgentSkillParseError(
-      `Command /${name} is larger than ${MAX_FILE_SIZE} bytes once its frontmatter is rewritten as a skill; it does not load.`
-    );
-  }
-  return rewritten;
+  return rewrittenSkillMarkdown(frontmatter, parts.body, `Command /${name}`);
 }
