@@ -74,6 +74,7 @@ type OriginFetchOutcome =
   | { kind: "failed"; message: string };
 
 interface SharedOriginFetch {
+  readonly remote: string;
   readonly outcome: Promise<OriginFetchOutcome>;
   settledAtMs?: number;
   waiters: number;
@@ -91,14 +92,15 @@ function sweepOriginFetches(now: number): void {
 }
 
 /**
- * Keys a fetch by what it reads: the repository's common git dir, so symlinked paths and linked
- * worktrees of one repository share a fetch, and origin's URL, so a changed origin fetches again.
+ * Keys a fetch by the ref it writes, refs/remotes/origin/<branch> in the repository's common git
+ * dir, so symlinked paths and linked worktrees of one repository share a fetch. `remote` is the
+ * origin it reads, so a changed origin fetches again.
  */
-async function originFetchKey(
+async function originFetchTarget(
   projectPath: string,
   trunkBranch: string,
   signal: AbortSignal | undefined
-): Promise<string> {
+): Promise<{ key: string; remote: string }> {
   const options = signal ? { signal } : undefined;
   using repoProc = execFileAsync(
     "git",
@@ -124,7 +126,10 @@ async function originFetchKey(
       () => ""
     ),
   ]);
-  return JSON.stringify([repository, originRemoteIdentity(originUrl, worktree), trunkBranch]);
+  return {
+    key: JSON.stringify([repository, trunkBranch]),
+    remote: originRemoteIdentity(originUrl, worktree),
+  };
 }
 
 /**
@@ -870,12 +875,16 @@ export class WorktreeManager {
     initLogger: InitLogger,
     callerSignal: AbortSignal | undefined
   ): Promise<OriginFetchOutcome> {
-    const key = await originFetchKey(projectPath, trunkBranch, callerSignal);
+    const { key, remote } = await originFetchTarget(projectPath, trunkBranch, callerSignal);
     callerSignal?.throwIfAborted();
     const now = performance.now();
     sweepOriginFetches(now);
-    const entry = originFetches.get(key) ?? this.startOriginFetch(key, projectPath, trunkBranch);
-    originFetches.set(key, entry);
+    let entry = originFetches.get(key);
+    // A fetch from another origin wrote the same ref, so its result says nothing about this one.
+    if (entry?.remote !== remote) {
+      entry = this.startOriginFetch(key, remote, projectPath, trunkBranch);
+      originFetches.set(key, entry);
+    }
     entry.waiters += 1;
     try {
       initLogger.logStep(
@@ -896,6 +905,7 @@ export class WorktreeManager {
 
   private startOriginFetch(
     key: string,
+    remote: string,
     projectPath: string,
     trunkBranch: string
   ): SharedOriginFetch {
@@ -934,12 +944,17 @@ export class WorktreeManager {
       outcome: run().then((outcome) => {
         entry.settledAtMs = performance.now();
         // Only a success is reused. After a failure the next creation fetches again, so a burst
-        // never branches from local refs once the network is back.
-        if (outcome.kind !== "fetched" && originFetches.get(key) === entry) {
+        // never branches from local refs once the network is back. A fetch from another origin
+        // that finished first no longer describes the ref this one just wrote.
+        const published = originFetches.get(key);
+        if (
+          published === entry ? outcome.kind !== "fetched" : published?.settledAtMs !== undefined
+        ) {
           originFetches.delete(key);
         }
         return outcome;
       }),
+      remote,
       waiters: 0,
       controller,
     };
