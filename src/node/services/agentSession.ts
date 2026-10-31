@@ -702,7 +702,6 @@ function coerceGoalId(value: unknown): string | undefined {
 const PDF_MEDIA_TYPE = "application/pdf";
 const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
 
-/** A turn.stop continuation and the plugin hooks it counts against (none for nudges alone). */
 type StopHookContinuation = TurnStopContinuation &
   Pick<Extract<TurnStopHookOutcome, { kind: "continue" }>, "hookKeys" | "pluginNames">;
 
@@ -10831,14 +10830,12 @@ export class AgentSession {
     });
   }
 
-  /** A new user turn for Stop: every hook's count and the ceiling start again. */
   // dry-duplicate-ok: field resets of unrelated state (stream, file tracking) only share a shape
   private resetStopHookCounts(): void {
     this.stopHookContinuations = 0;
     this.stopHookCountsByKey.clear();
   }
 
-  /** Counts a continuation against the ceiling and its hooks' limits, and tells the user. */
   private recordStopHookContinuation(continuation: StopHookContinuation): void {
     this.stopHookContinuations++;
     for (const key of continuation.hookKeys) {

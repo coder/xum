@@ -205,7 +205,6 @@ async function userTexts(h: AgentSessionHarness): Promise<string[]> {
     .map((row) => row.parts.map((part) => (part.type === "text" ? part.text : "")).join(""));
 }
 
-/** A reason from plugin `guard`'s first Stop hook, unless `hook` names another. */
 function stopReason(
   text: string,
   hook: Partial<Omit<TurnStopContinueReason, "text">> = {}
@@ -344,7 +343,6 @@ describe("turn.stop", () => {
       { turn: 6, first: 3, second: 3 },
     ]);
 
-    // A new user message resets both counts.
     await h.session.sendMessage("now lint", options);
     await settle(h);
     expect((await userTexts(h)).slice(7)).toEqual([
