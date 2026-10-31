@@ -938,6 +938,39 @@ function rowReadsInterruptedForReawaken(
   );
 }
 
+/** The row still names `previousAttemptId`, with no retire claim and no pending removal. */
+function rowKeepsAttempt(
+  ws: Pick<WorkspaceConfigEntry, "taskAttemptRetiredBy" | "pendingRemoval" | "taskAttemptId">,
+  previousAttemptId: string | undefined
+): boolean {
+  return (
+    ws.taskAttemptRetiredBy == null &&
+    ws.pendingRemoval == null &&
+    ws.taskAttemptId === previousAttemptId
+  );
+}
+
+/**
+ * The model fields of a send into an active task: the active agent's settings first, then the
+ * row's task model and thinking level, then the default model.
+ */
+function buildActiveTaskAiSendOptions(
+  workspace: Pick<WorkspaceConfigEntry, "taskModelString" | "taskThinkingLevel">,
+  agentId: string,
+  aiSettings: ResolvedWorkspaceAiSettings | undefined
+): Pick<
+  SendMessageOptions,
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "serviceTier"
+> {
+  return {
+    model: coerceNonEmptyString(aiSettings?.model) ?? workspace.taskModelString ?? defaultModel,
+    agentId,
+    thinkingLevel: aiSettings?.thinkingLevel ?? workspace.taskThinkingLevel,
+    reasoningMode: coerceOpenAIReasoningMode(aiSettings?.reasoningMode),
+    serviceTier: ServiceTierSchema.safeParse(aiSettings?.serviceTier).data,
+  };
+}
+
 /** This process settled exactly the attempt the row still names. */
 function settlementNamesRowAttempt(
   settled: AttemptSettlementEntry | undefined,
@@ -1061,6 +1094,13 @@ interface TaskLaunchPlan {
    * launch (startReservedAgentTask), which takes it over and releases it when it settles.
    */
   launchLease?: WorkspaceUseLease;
+}
+
+/** What fenceReservationRow's row mutator saw; its callers read it after the edit settles. */
+interface ReservationRowFence {
+  transitioned: boolean;
+  superseded: boolean;
+  rowMoved: boolean;
 }
 
 /** A Task.create request after validation, read before the global mutex is taken. */
@@ -7124,41 +7164,29 @@ export class TaskService implements AgentTaskIntegration {
       let fenceFailure: { error: unknown } | undefined;
       for (const plan of plans) {
         const ownedAttempt = this.attemptLedger.ownedAttempt(plan.taskId);
-        let transitioned = canceledInsideCommit;
-        let superseded = false;
+        const fence: ReservationRowFence = {
+          transitioned: canceledInsideCommit,
+          superseded: false,
+          rowMoved: false,
+        };
         if (!canceledInsideCommit) {
-          let rowMoved = false;
           try {
-            await this.editWorkspaceEntry(
-              plan.taskId,
-              (ws) => {
-                superseded = rowSupersedes(ws, plan.attemptId);
-                if (ws.taskStatus !== plan.status || superseded) {
-                  rowMoved = true;
-                  return;
-                }
-                ws.taskStatus = "interrupted";
-                markChildGoalPauseOwed(ws);
-                ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
-                transitioned = true;
-              },
-              { allowMissing: true }
-            );
+            await this.fenceReservationRow(plan, TASK_RESERVATION_CANCELED_MESSAGE, fence);
           } catch (error: unknown) {
             // Nothing launches this row now (#5028), unless the row already moved on (another
             // writer's attempt, whose waiters this cancel must not touch).
-            if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
+            if (!fence.rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
             fenceFailure ??= { error };
             continue;
           }
         }
-        if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
-        if (transitioned) await this.settleChildGoalPause(plan.taskId);
+        if (fence.transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+        if (fence.transitioned) await this.settleChildGoalPause(plan.taskId);
         // Waiters are keyed by the stable task id: once another writer re-admitted the row under
         // its own attempt they are that attempt's (its task_await must not read this cancel).
         // Rejected BEFORE the receipt write's await, which a successor's new waiter could
         // otherwise register during and then be rejected as this attempt's.
-        if (!superseded) {
+        if (!fence.superseded) {
           this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
         }
         // Canceled before any launch was scheduled: nothing ran under the attempt.
@@ -7360,29 +7388,17 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
       if (committed) {
-        let rowMoved = false;
+        const fence: ReservationRowFence = {
+          transitioned: false,
+          superseded: false,
+          rowMoved: false,
+        };
         try {
-          let transitioned = false;
-          let superseded = false;
-          await this.editWorkspaceEntry(
-            plan.taskId,
-            (ws) => {
-              superseded = rowSupersedes(ws, plan.attemptId);
-              if (ws.taskStatus !== plan.status || superseded) {
-                rowMoved = true;
-                return;
-              }
-              ws.taskStatus = "interrupted";
-              markChildGoalPauseOwed(ws);
-              ws.taskLaunchError = message;
-              transitioned = true;
-            },
-            { allowMissing: true }
-          );
-          if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
-          if (transitioned) await this.settleChildGoalPause(plan.taskId);
+          await this.fenceReservationRow(plan, message, fence);
+          if (fence.transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+          if (fence.transitioned) await this.settleChildGoalPause(plan.taskId);
           // A row another writer re-admitted: its waiters belong to that attempt (see above).
-          if (!superseded) this.rejectWaiters(plan.taskId, new Error(message));
+          if (!fence.superseded) this.rejectWaiters(plan.taskId, new Error(message));
           await this.emitWorkspaceMetadata(plan.taskId);
         } catch (fenceError: unknown) {
           log.warn("Task reservation failed and its committed record could not be fenced", {
@@ -7390,7 +7406,7 @@ export class TaskService implements AgentTaskIntegration {
             error: fenceError,
           });
           // Nothing launches this row now (#5028), unless it already moved on (see above).
-          if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
+          if (!fence.rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
           continue;
         }
       }
@@ -7403,6 +7419,34 @@ export class TaskService implements AgentTaskIntegration {
         "reservation-failed"
       );
     }
+  }
+
+  /**
+   * The fence write of a reserved row that will not launch (createManyUnderTaskTreeLifecycleLocks'
+   * post-commit fence, settleFailedReservations): `interrupted` with `message`, unless the row
+   * moved on (another status, or another writer's attempt). Sync: it returns the edit's promise
+   * for the caller to await, so sharing it adds no await. `fence` records what the mutator saw.
+   */
+  private fenceReservationRow(
+    plan: TaskLaunchPlan & { status: "queued" | "starting" },
+    message: string,
+    fence: ReservationRowFence
+  ): Promise<boolean> {
+    return this.editWorkspaceEntry(
+      plan.taskId,
+      (ws) => {
+        fence.superseded = rowSupersedes(ws, plan.attemptId);
+        if (ws.taskStatus !== plan.status || fence.superseded) {
+          fence.rowMoved = true;
+          return;
+        }
+        ws.taskStatus = "interrupted";
+        markChildGoalPauseOwed(ws);
+        ws.taskLaunchError = message;
+        fence.transitioned = true;
+      },
+      { allowMissing: true }
+    );
   }
 
   /**
@@ -10001,9 +10045,7 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         (ws) => {
           if (
-            ws.taskAttemptRetiredBy != null ||
-            ws.pendingRemoval != null ||
-            ws.taskAttemptId !== previousAttemptId ||
+            !rowKeepsAttempt(ws, previousAttemptId) ||
             // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
             // before the refresh above read the id. Only that flip refuses: the unarchive above
             // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
@@ -10491,14 +10533,7 @@ export class TaskService implements AgentTaskIntegration {
           // intervention in child-only features such as goals and interactive questions.
           labeledMessage,
           {
-            model:
-              coerceNonEmptyString(activeAiSettings?.model) ??
-              entry.workspace.taskModelString ??
-              defaultModel,
-            agentId: activeAgentId,
-            thinkingLevel: activeAiSettings?.thinkingLevel ?? entry.workspace.taskThinkingLevel,
-            reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-            serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
+            ...buildActiveTaskAiSendOptions(entry.workspace, activeAgentId, activeAiSettings),
             queueDispatchMode,
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
@@ -11569,14 +11604,7 @@ export class TaskService implements AgentTaskIntegration {
     const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
     const activeAiSettings = this.resolveWorkspaceAISettings(targetEntry.workspace, activeAgentId);
     return {
-      model:
-        coerceNonEmptyString(activeAiSettings?.model) ??
-        targetEntry.workspace.taskModelString ??
-        defaultModel,
-      agentId: activeAgentId,
-      thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
-      reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-      serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
+      ...buildActiveTaskAiSendOptions(targetEntry.workspace, activeAgentId, activeAiSettings),
       muxMetadata: triggerMuxMetadata,
     };
   }
@@ -18514,11 +18542,7 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       return false;
     }
-    return (
-      ws.taskAttemptRetiredBy == null &&
-      ws.pendingRemoval == null &&
-      ws.taskAttemptId === plan.previousAttemptId
-    );
+    return rowKeepsAttempt(ws, plan.previousAttemptId);
   }
 
   /** After the CAS: own the fresh attempt only if the durable row still names it. */
