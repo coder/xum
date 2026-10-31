@@ -20,6 +20,7 @@ import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
 import type {
+  AgentPluginCapabilityChange,
   AgentPluginComponentRef,
   AgentPluginComponents,
   AgentPluginInstallMethod,
@@ -965,84 +966,100 @@ const PreviewConsent: React.FC<{
    * Back takes the focus (as the list's picked radio does on the way back).
    */
   focusBack: boolean;
-}> = (props) => (
-  <>
-    <PreviewHeader preview={props.preview} />
+}> = (props) => {
+  const expansion = useCutTextExpansion(props.preview.fileChanges);
+  return (
+    <>
+      <PreviewHeader preview={props.preview} />
 
-    {props.preview.warnings.length > 0 && (
-      <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
-        {props.preview.warnings.map((warning) => (
-          <div key={warning} className="text-warning flex items-start gap-2 text-xs">
-            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span className="min-w-0 break-words">{warning}</span>
-          </div>
-        ))}
-      </div>
-    )}
+      {props.preview.warnings.length > 0 && (
+        <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
+          {props.preview.warnings.map((warning) => (
+            <div key={warning} className="text-warning flex items-start gap-2 text-xs">
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="min-w-0 break-words">{warning}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
-    <ComponentChooser
-      inventory={props.preview}
-      selected={props.selected}
-      disabled={props.busy}
-      onChange={props.onSelect}
-    />
-    <p className="text-warning text-xs">
-      {props.selected.skills.length + props.selected.mcpServers.length === 0
-        ? "No skills or MCP servers selected. "
-        : ""}
-      Selection does not affect agents, workflows, slash commands, or hooks below: these remain part
-      of the install, even when neither group is selected. Skipped files stay on disk; this is not a
-      filesystem sandbox.
-    </p>
-
-    <PreviewDisclosures preview={props.preview} />
-
-    {props.error && (
-      <div
-        role="alert"
-        className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-      >
-        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span className="min-w-0 break-words">{props.error}</span>
-      </div>
-    )}
-
-    {/* A name collision blocks only this method; the Install as choice above stays usable. */}
-    {props.preview.installBlockedReason !== undefined && (
-      <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
-        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span className="min-w-0 break-words">
-          Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
-          {props.preview.installBlockedReason}
-        </span>
-      </div>
-    )}
-
-    <div className="flex gap-2">
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={props.onBack}
+      <ComponentChooser
+        inventory={props.preview}
+        selected={props.selected}
         disabled={props.busy}
-        autoFocus={props.focusBack}
-      >
-        <ArrowLeft className="h-3.5 w-3.5" />
-        Back
-      </Button>
-      <Button
-        size="sm"
-        onClick={props.onInstall}
-        disabled={props.busy || props.preview.installBlockedReason !== undefined}
-      >
-        {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-        {props.busy ? "Installing…" : "Install"}
-      </Button>
-    </div>
-  </>
-);
+        onChange={props.onSelect}
+      />
+      <p className="text-warning text-xs">
+        {props.selected.skills.length + props.selected.mcpServers.length === 0
+          ? "No skills or MCP servers selected. "
+          : ""}
+        Selection does not affect agents, workflows, slash commands, or hooks below: these remain
+        part of the install, even when neither group is selected. Skipped files stay on disk; this
+        is not a filesystem sandbox.
+      </p>
+
+      <PreviewDisclosures preview={props.preview} expansion={expansion} />
+
+      {props.error && (
+        <div
+          role="alert"
+          className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+        >
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">{props.error}</span>
+        </div>
+      )}
+
+      {expansion.mustExpand.length > 0 && (
+        <p className="text-warning text-xs">
+          Show the full text of each cut file to review it before you install.
+        </p>
+      )}
+
+      {/* A name collision blocks only this method; the Install as choice above stays usable. */}
+      {props.preview.installBlockedReason !== undefined && (
+        <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">
+            Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
+            {props.preview.installBlockedReason}
+          </span>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={props.onBack}
+          disabled={props.busy}
+          autoFocus={props.focusBack}
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back
+        </Button>
+        <Button
+          size="sm"
+          onClick={props.onInstall}
+          disabled={
+            props.busy ||
+            props.preview.installBlockedReason !== undefined ||
+            expansion.mustExpand.length > 0
+          }
+        >
+          {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          {props.busy ? "Installing…" : "Install"}
+        </Button>
+      </div>
+    </>
+  );
+};
 
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
-const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
+const PreviewDisclosures: React.FC<{
+  preview: AgentPluginInstallPreview;
+  expansion: CutTextExpansion;
+}> = (props) => (
   <>
     {props.preview.agents.length > 0 && (
       <div>
@@ -1116,6 +1133,28 @@ const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (pr
             .
           </span>
         </p>
+      </div>
+    )}
+
+    {props.preview.fileChanges.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          Files ({props.preview.fileChanges.length})
+        </h4>
+        <p className="text-muted mb-1 text-xs">
+          A command hook of this plugin can run any of these files.
+        </p>
+        <ul className="space-y-2">
+          {props.preview.fileChanges.map((change, index) => (
+            <ReviewChangeRow
+              key={`${index}:${change.summary}`}
+              change={change}
+              index={index}
+              isExpanded={props.expansion.isExpanded}
+              onExpand={props.expansion.expand}
+            />
+          ))}
+        </ul>
       </div>
     )}
   </>
@@ -1247,9 +1286,9 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
-/** The keys of a review's texts that the panel shows cut (`<row>:before|after`). */
-function cutReviewTextKeys(review: AgentPluginUpdateReview): string[] {
-  return review.changes.flatMap((change, index) =>
+/** The keys of the review texts that a row list shows cut (`<row>:before|after`). */
+function cutReviewTextKeys(changes: readonly AgentPluginCapabilityChange[]): string[] {
+  return changes.flatMap((change, index) =>
     (["before", "after"] as const).flatMap((field) => {
       const text = change[field];
       return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
@@ -1258,25 +1297,26 @@ function cutReviewTextKeys(review: AgentPluginUpdateReview): string[] {
 }
 
 /**
- * Which cut texts of a review the user expanded (#6629). Keys are valid only for the review object
- * they were expanded in: a new review (same plugin, other rows) starts with nothing expanded.
+ * Which cut texts of a row list the user expanded (#6629). Keys are valid only for the list they
+ * were expanded in: a new review or preview (same plugin, other rows) starts with nothing expanded.
  */
-function useCutTextExpansion(review: AgentPluginUpdateReview) {
+function useCutTextExpansion(changes: readonly AgentPluginCapabilityChange[]) {
   const [expansion, setExpansion] = useState<{
-    review: AgentPluginUpdateReview | null;
+    changes: readonly AgentPluginCapabilityChange[] | null;
     keys: ReadonlySet<string>;
-  }>({ review: null, keys: new Set() });
-  const keys = expansion.review === review ? expansion.keys : new Set<string>();
+  }>({ changes: null, keys: new Set() });
+  const keys = expansion.changes === changes ? expansion.keys : new Set<string>();
   return {
     isExpanded: (key: string) => keys.has(key),
-    mustExpand: cutReviewTextKeys(review).filter((key) => !keys.has(key)),
+    mustExpand: cutReviewTextKeys(changes).filter((key) => !keys.has(key)),
     expand: (key: string) =>
       setExpansion((previous) => ({
-        review,
-        keys: new Set(previous.review === review ? previous.keys : []).add(key),
+        changes,
+        keys: new Set(previous.changes === changes ? previous.keys : []).add(key),
       })),
   };
 }
+type CutTextExpansion = ReturnType<typeof useCutTextExpansion>;
 
 /** One review row: its summary and its before/after texts. */
 const ReviewChangeRow: React.FC<{
@@ -1350,7 +1390,7 @@ const UpdateReviewPanel: React.FC<{
   onCancel: () => void;
 }> = (props) => {
   const copy = REVIEW_PANEL_COPY[props.mode];
-  const expansion = useCutTextExpansion(props.review);
+  const expansion = useCutTextExpansion(props.review.changes);
   const mustExpand = expansion.mustExpand;
   return (
     <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">

@@ -561,7 +561,26 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             slashCommands: [],
             reviewedComponents: [],
             codexHooks: [],
-            fileChanges: [],
+            // The first file review of a plugin with a runnable Cursor command hook (D30): a text
+            // file, a symlink (its link text), a binary file (no text), a marked bidi control and
+            // a separator-free path that must wrap.
+            fileChanges: [
+              {
+                summary: "file hooks/hooks.json added",
+                after: '{"version":1,"hooks":{"stop":[{"command":"bash hooks/stop.sh"}]}}',
+              },
+              { summary: "file hooks/lib.sh added", after: "/opt/shared/lib.sh" },
+              {
+                summary: "file hooks/stop.sh added",
+                after: `#!/usr/bin/env bash\nsource hooks/lib.sh\ncurl -fsSL https://example.com/${MAX_LENGTH_NAME}/report\n`,
+              },
+              { summary: "file hooks/a<U+202E>h.sh added", after: "echo <U+202E>hidden\n" },
+              { summary: "file assets/logo.png added" },
+              {
+                summary: `file skills/${MAX_LENGTH_NAME}/helper.sh added`,
+                after: "echo helper\n",
+              },
+            ],
             warnings: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
             consentDigest: "c".repeat(64),
