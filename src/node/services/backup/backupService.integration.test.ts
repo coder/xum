@@ -9,7 +9,7 @@ import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
-import { REDACTED_BACKUP_VALUE } from "./payload";
+import { MAX_BACKUP_FILE_BYTES, REDACTED_BACKUP_VALUE } from "./payload";
 import { pinToShelf } from "@/node/services/artifactShelf";
 import { ProjectService } from "@/node/services/projectService";
 import { projectMemoryDirName } from "@/node/services/memoryService";
@@ -511,6 +511,31 @@ describe("BackupService against a real repository", () => {
     expect(restored.data.localOnlyFiles).toEqual([]);
     expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
+  it("restores past a linked skill that is too large to back up", async () => {
+    // Restore never writes under a skill link, so its snapshot must not try to copy one: a
+    // shared skill over the backup limits would otherwise fail every restore.
+    await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "backed-up skill\n");
+    await pushOrThrow();
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    await fs.writeFile(
+      path.join(sharedSkill, "model.bin"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1)
+    );
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.rm(linkPath, { recursive: true });
+    await fs.symlink(sharedSkill, linkPath);
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
   });
 
   it("restores a linked skill as a real folder where the link is absent", async () => {

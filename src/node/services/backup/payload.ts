@@ -151,6 +151,8 @@ export interface CreateBackupPayloadOptions {
   reportSecrets?: boolean;
   /** Keep the local MCP file verbatim for the safety snapshot used to undo a restore. */
   keepLocalSecrets?: boolean;
+  /** Push only: see `collectAllowlistedFiles`. */
+  followSkillLinks?: boolean;
 }
 
 export interface RestoreBackupPayloadOptions {
@@ -946,14 +948,28 @@ async function linkedSkillSources(root: BackupRoot): Promise<CollectionSource[]>
   return sources;
 }
 
-async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<BackupRoot | null> {
-  let target: BackupRoot;
+const SKIPPED_SKILL_LINK_ERRORS = ["ENOENT", "ENOTDIR", "ELOOP"] as const;
+
+/**
+ * Null for a dangling or looping link, which is not a skill folder. Anything else (EACCES, EIO,
+ * EMFILE) aborts the push: skipping it would publish a backup without the skill and delete the
+ * last good remote copy.
+ */
+async function realpathOfSkillLink(linkPath: string): Promise<string | null> {
   try {
-    target = await resolveRoot(linkPath);
-  } catch {
-    // Dangling, looping, or not a directory: not a skill folder, so skipped like any link.
-    return null;
+    return await fs.realpath(linkPath);
+  } catch (error) {
+    if (SKIPPED_SKILL_LINK_ERRORS.some((code) => isErrnoWithCode(error, code))) return null;
+    throw error;
   }
+}
+
+async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<BackupRoot | null> {
+  const canonical = await realpathOfSkillLink(linkPath);
+  if (canonical === null) return null;
+  const stat = await fs.lstat(canonical);
+  if (!stat.isDirectory()) return null;
+  const target: BackupRoot = { path: canonical, dev: stat.dev, ino: stat.ino };
   // A link to the Xum root or a folder above it (`skills/all -> ~`) would export sessions and
   // everything else beside the settings, so no stray SKILL.md there makes it a skill folder.
   const relative = path.relative(target.path, root.path);
@@ -961,10 +977,17 @@ async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<B
   return (await isRegularFile(absolutePathOf(target.path, "SKILL.md"))) ? target : null;
 }
 
-/** The local files in the selected categories, for export and for the restore's local view. */
+/**
+ * The local files in the selected categories, for export and for the restore's local view.
+ *
+ * `followSkillLinks` is for a push only. Restore never writes under a skill link, so its
+ * snapshot and local view leave linked skills out: a shared skill over the backup limits
+ * must not fail a restore that cannot touch it.
+ */
 export async function collectAllowlistedFiles(
   muxRoot: string,
-  contents: BackupContents
+  contents: BackupContents,
+  options: { followSkillLinks?: boolean } = {}
 ): Promise<BackupFile[]> {
   const root = await resolveRoot(muxRoot);
   const collector = createBackupFileCollector(root);
@@ -979,7 +1002,8 @@ export async function collectAllowlistedFiles(
   }
   if (contents.includeSkills) {
     await collector.collectDirectory("skills", () => true);
-    for (const source of await linkedSkillSources(root)) {
+    const sources = options.followSkillLinks === true ? await linkedSkillSources(root) : [];
+    for (const source of sources) {
       await collector.collectLinkedSkill(source);
     }
   }
@@ -1733,7 +1757,9 @@ export function backupSecretApprovalDigest(
 export async function createBackupPayload(
   options: CreateBackupPayloadOptions
 ): Promise<BackupPayload> {
-  const files = await collectAllowlistedFiles(options.muxRoot, options.contents);
+  const files = await collectAllowlistedFiles(options.muxRoot, options.contents, {
+    followSkillLinks: options.followSkillLinks,
+  });
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
