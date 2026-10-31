@@ -7,6 +7,7 @@ import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
 import * as submoduleSync from "@/node/runtime/submoduleSync";
+import { WORKTREE_CREATE_FETCH_REUSE_MS } from "@/constants/terminationTimeouts";
 import { WorktreeManager } from "./WorktreeManager";
 
 function initGitRepo(projectPath: string): void {
@@ -129,6 +130,30 @@ async function installStalledOriginFetch(fixture: { rootDir: string; projectPath
       throw new Error("stalled upload-pack shim did not start");
     },
   };
+}
+
+/** Routes the fixture's origin fetches through an upload-pack shim that counts its runs. */
+async function countOriginUploadPacks(
+  fixture: { rootDir: string; projectPath: string },
+  delaySeconds = 0
+): Promise<() => Promise<number>> {
+  const countFile = path.join(fixture.rootDir, "upload-pack-runs");
+  const shim = path.join(fixture.rootDir, "counting-upload-pack.sh");
+  await fsPromises.writeFile(
+    shim,
+    `#!/bin/sh\necho run >> "${countFile}"\nsleep ${delaySeconds}\nexec git upload-pack "$@"\n`,
+    "utf-8"
+  );
+  await fsPromises.chmod(shim, 0o755);
+  execFileSync("git", ["config", "remote.origin.uploadpack", shim], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+  return () =>
+    fsPromises.readFile(countFile, "utf-8").then(
+      (content) => content.split("\n").filter(Boolean).length,
+      () => 0
+    );
 }
 
 async function isProcessGone(pid: number): Promise<boolean> {
@@ -1947,6 +1972,165 @@ describe("WorktreeManager.createWorkspace", () => {
       }
     }, 20_000);
   }
+
+  async function createBranchHead(
+    fixture: Awaited<ReturnType<typeof createWorktreeManagerFixture>>,
+    branchName: string,
+    trunkBranch = "main"
+  ): Promise<string> {
+    const result = await fixture.manager.createWorkspace({
+      projectPath: fixture.projectPath,
+      branchName,
+      trunkBranch,
+      trusted: true,
+      initLogger: fixture.initLogger,
+    });
+    if (!result.success || !result.workspacePath) {
+      throw new Error(`Expected ${branchName}: ${result.error ?? "no workspace path"}`);
+    }
+    return gitRevParseHead(result.workspacePath);
+  }
+
+  function commitOnRemote(fixture: { rootDir: string }, message: string): string {
+    const remotePath = path.join(fixture.rootDir, "remote");
+    execFileSync("git", ["commit", "--quiet", "--allow-empty", "-m", message], {
+      cwd: remotePath,
+      stdio: "ignore",
+    });
+    return gitRevParseHead(remotePath);
+  }
+
+  it("runs one origin fetch for a burst of sequential creations and bases each on it", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+
+      const heads: string[] = [];
+      for (const branchName of ["burst-1", "burst-2", "burst-3", "burst-4"]) {
+        heads.push(await createBranchHead(fixture, branchName));
+      }
+
+      expect(await uploadPackRuns()).toBe(1);
+      expect(heads).toEqual([remoteHead, remoteHead, remoteHead, remoteHead]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("joins concurrent creations to one in-flight origin fetch", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture, 1);
+      // Existing branches: `worktree add -b` writes upstream config, and concurrent writers
+      // fail on .git/config.lock with or without a shared fetch.
+      const branches = ["joined-1", "joined-2", "joined-3"];
+      for (const branchName of branches) {
+        execFileSync("git", ["branch", branchName], { cwd: fixture.projectPath });
+      }
+
+      const heads = await Promise.all(
+        branches.map((branchName) => createBranchHead(fixture, branchName))
+      );
+
+      expect(await uploadPackRuns()).toBe(1);
+      expect(heads).toEqual([remoteHead, remoteHead, remoteHead]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("fetches again once the first fetch settled the reuse window ago, however often it was reused", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const realNow = performance.now.bind(performance);
+    let clockOffsetMs = 0;
+    const nowSpy = spyOn(performance, "now").mockImplementation(() => realNow() + clockOffsetMs);
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      expect(await createBranchHead(fixture, "window-first")).toBe(remoteHead);
+      const laterHead = commitOnRemote(fixture, "pushed after the first fetch");
+
+      clockOffsetMs = WORKTREE_CREATE_FETCH_REUSE_MS - 3_000;
+      const reusedHead = await createBranchHead(fixture, "window-reused");
+      expect(await uploadPackRuns()).toBe(1);
+      expect(reusedHead).toBe(remoteHead);
+
+      clockOffsetMs = WORKTREE_CREATE_FETCH_REUSE_MS;
+      const expiredHead = await createBranchHead(fixture, "window-expired");
+      expect(await uploadPackRuns()).toBe(2);
+      expect(expiredHead).toBe(laterHead);
+    } finally {
+      nowSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("shares a failed origin fetch and bases each creation on the local trunk", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      execFileSync("git", ["branch", "never-pushed"], { cwd: fixture.projectPath });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      const localHead = gitRevParseHead(fixture.projectPath);
+
+      const heads = [
+        await createBranchHead(fixture, "unpushed-1", "never-pushed"),
+        await createBranchHead(fixture, "unpushed-2", "never-pushed"),
+      ];
+
+      expect(await uploadPackRuns()).toBe(1);
+      expect(heads).toEqual([localHead, localHead]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps a shared origin fetch running until every creation waiting on it is cancelled", async () => {
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 30_000 });
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const start = (branchName: string) => {
+        const controller = new AbortController();
+        const steps: string[] = [];
+        const stderr: string[] = [];
+        const result = fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          abortSignal: controller.signal,
+          initLogger: {
+            ...fixture.initLogger,
+            logStep: (message) => steps.push(message),
+            logStderr: (line) => stderr.push(line),
+          },
+        });
+        return { controller, steps, stderr, result };
+      };
+
+      const first = start("feature-first-waiter");
+      const pids = await stall.waitForPids();
+      const second = start("feature-second-waiter");
+      while (!second.steps.includes("Fetching latest from origin/main...")) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      first.controller.abort();
+      expect((await first.result).success).toBe(false);
+      expect(first.stderr).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(await Promise.all(pids.map(isProcessGone))).toEqual([false, false]);
+
+      second.controller.abort();
+      expect((await second.result).success).toBe(false);
+      expect(second.stderr).toEqual([]);
+      expect(await waitForProcessesToExit(pids)).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
 
   it("uses a sanitized directory for slash branch names and persists the mapping", async () => {
     const fixture = await createWorktreeManagerFixture();

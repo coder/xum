@@ -26,6 +26,16 @@ export const WORKTREE_DELETE_GIT_TIMEOUT_MS = 60 * 1000;
 export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
 
 /**
+ * Freshness contract of that fetch. A worktree creation runs `git fetch origin <branch>` unless a
+ * fetch of the same branch in the same repository is still running or finished less than this
+ * long ago; then it uses that fetch's outcome (a failure or timeout too, so it falls back to
+ * local refs). Reuse never extends the window, so a later burst fetches again. Each creation
+ * still reads the local and origin refs itself, so the parent's unpushed commits win as before.
+ * This lets a burst of sub-agent forks from one parent share one fetch instead of one each.
+ */
+export const WORKTREE_CREATE_FETCH_REUSE_MS = 10 * 1000;
+
+/**
  * Bounds the backend's naming of a worktree workspace created before its name existed: the init
  * hook waits for the name to rename the branch, so a slow or unreachable naming model must not
  * hold setup longer than an origin fetch can.

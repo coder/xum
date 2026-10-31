@@ -1794,6 +1794,108 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
+  // create is the direct launch (the task tool's n loop); createMany launches reserved tasks.
+  for (const launch of ["create", "createMany"] as const) {
+    test(`a burst of forks from one parent (${launch}) runs one origin fetch and bases every child on it`, async () => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"], "eeeeeeeeee");
+      const projectPath = await createTestProject(rootDir);
+      const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+      const runtime = createRuntime(runtimeConfig, { projectPath });
+      const parentName = "parent";
+      await runtime.createWorkspace({
+        projectPath,
+        branchName: parentName,
+        trunkBranch: "main",
+        directoryName: parentName,
+        initLogger: createNullInitLogger(),
+      });
+
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync("git", ["-C", cwd, ...args])
+          .toString()
+          .trim();
+      const originPath = path.join(rootDir, "origin.git");
+      execFileSync("git", ["clone", "--quiet", "--bare", projectPath, originPath]);
+      const remoteOnly = git(
+        originPath,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit-tree",
+        `${parentName}^{tree}`,
+        "-p",
+        parentName,
+        "-m",
+        "pushed to the parent branch by someone else"
+      );
+      git(originPath, "update-ref", `refs/heads/${parentName}`, remoteOnly);
+      const countFile = path.join(rootDir, "upload-pack-runs");
+      const uploadPack = path.join(rootDir, "counting-upload-pack.sh");
+      await fsPromises.writeFile(
+        uploadPack,
+        `#!/bin/sh\necho run >> "${countFile}"\nexec git upload-pack "$@"\n`,
+        { mode: 0o755 }
+      );
+      git(projectPath, "remote", "add", "origin", originPath);
+      git(projectPath, "config", "remote.origin.uploadpack", uploadPack);
+
+      const parentId = "1111111111";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: runtime.getWorkspacePath(projectPath, parentName),
+            id: parentId,
+            name: parentName,
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+          },
+        ],
+        testTaskSettings(4, 3)
+      );
+      const { taskService } = createTaskServiceHarness(config);
+
+      const prompts = ["task 1", "task 2", "task 3", "task 4"];
+      const taskIds: string[] = [];
+      if (launch === "create") {
+        for (const prompt of prompts) {
+          const created = await createAgentTask(taskService, parentId, prompt);
+          assert(created.success, `create failed: ${created.success ? "" : created.error}`);
+          taskIds.push(created.data.taskId);
+        }
+      } else {
+        const created = await taskService.createMany(
+          prompts.map((prompt) => ({
+            parentWorkspaceId: parentId,
+            kind: "agent" as const,
+            agentId: "explore",
+            prompt,
+            title: "Test task",
+          }))
+        );
+        assert(created.success, `createMany failed: ${created.success ? "" : created.error}`);
+        for (const task of created.data) {
+          await waitForWorkspaceTaskStatus(config, task.taskId, "running");
+          taskIds.push(task.taskId);
+        }
+      }
+      const childHeads = taskIds.map((taskId) => {
+        const childPath = findWorkspaceInConfig(config, taskId)?.path;
+        assert(childPath, "the child has a checkout");
+        return git(childPath, "rev-parse", "HEAD");
+      });
+
+      const uploadPackRuns = (await fsPromises.readFile(countFile, "utf-8"))
+        .split("\n")
+        .filter(Boolean).length;
+      expect(uploadPackRuns).toBe(1);
+      expect(childHeads).toEqual([remoteOnly, remoteOnly, remoteOnly, remoteOnly]);
+    }, 30_000);
+  }
+
   test("configures MultiProjectRuntime envResolver before queued task background init", async () => {
     const config = await createTestConfig(rootDir);
 
