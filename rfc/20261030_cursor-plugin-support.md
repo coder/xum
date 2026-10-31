@@ -344,7 +344,8 @@ flowchart LR
 
 | Cursor field | Xum field | Rule |
 | --- | --- | --- |
-| `name`, `displayName`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords`, `logo` | plugin metadata | Same handling as Claude. `logo` uses the existing logo path checks. |
+| `name`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` | plugin metadata | Same handling as Claude. |
+| `displayName`, `logo` | none | Listed as not applied. The Agent Plugins manifest has no field for them, and the Plugins tab shows the plugin `name`. |
 | `skills` (string or list of folder paths) | `skillsDirs` | Replaces the default `skills/` scan, as Cursor does. Without the field, Xum scans `skills/`. |
 | `commands` (string or list) | none | Listed as not applied (T9). No marketplace plugin names `commands` or ships a `commands/` folder. |
 | `rules` (string or list of folder paths) | `skillsDirs`, one rule root per file | Replaces the default `rules/` scan. Files `.md`, `.mdc`, `.markdown`. See section 2. |
