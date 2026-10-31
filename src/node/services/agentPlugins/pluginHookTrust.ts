@@ -230,6 +230,7 @@ export async function setPluginHookTrust(
         ...(decision.reviewedSha !== undefined ? { reviewedSha: decision.reviewedSha } : {}),
       };
     }
+    return true;
   });
 }
 
@@ -247,9 +248,14 @@ export async function rebindPluginHookTrust(
     xumHome,
     instanceId,
     (hooks, lockedSha) => {
+      let moved = false;
       for (const [key, entry] of Object.entries(hooks)) {
-        if (entry.reviewedSha === fromSha) hooks[key] = { ...entry, reviewedSha: lockedSha };
+        if (entry.reviewedSha !== fromSha) continue;
+        hooks[key] = { ...entry, reviewedSha: lockedSha };
+        moved = true;
       }
+      // Most updates move nothing (no Cursor hook trusted): they write no trust file.
+      return moved;
     },
     fromSha
   );
@@ -257,12 +263,13 @@ export async function rebindPluginHookTrust(
 
 /**
  * Read, edit and write this install's record under the file's lock. `readAt` is the commit whose
- * bindings the read keeps (default: the registry's `lockedSha`).
+ * bindings the read keeps (default: the registry's `lockedSha`). `edit` returns whether it
+ * changed anything; nothing is written when it did not.
  */
 async function editTrustFile(
   xumHome: string,
   instanceId: string,
-  edit: (hooks: PluginHookTrustRecord, lockedSha: string) => void,
+  edit: (hooks: PluginHookTrustRecord, lockedSha: string) => boolean,
   readAt?: string
 ): Promise<void> {
   const file = getPluginHookTrustPath(xumHome, instanceId);
@@ -281,7 +288,7 @@ async function editTrustFile(
   }
   // An unreadable file holds no decision Xum can keep: the write replaces it (self-healing).
   const hooks = trust === "unreadable" ? {} : { ...trust };
-  edit(hooks, identity.lockedSha);
+  if (!edit(hooks, identity.lockedSha)) return;
   await writeStateFile(
     path.join(xumHome, TRUST_DIR),
     file,
