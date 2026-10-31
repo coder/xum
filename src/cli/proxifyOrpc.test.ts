@@ -7,6 +7,7 @@ import { z } from "zod";
 import * as zod4Core from "zod/v4/core";
 import * as schemas from "@/common/orpc/schemas";
 import { Ok } from "@/common/types/result";
+import type { ORPCContext } from "@/node/orpc/context";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 
@@ -235,9 +236,14 @@ describe("proxifyOrpc calls against a running server", () => {
       const { port } = server.address() as AddressInfo;
       const proxied = proxifyOrpc(router(), { baseUrl: `http://127.0.0.1:${port}` });
 
-      const output = await call(proxied.workspace.interruptStream, { workspaceId: "ws-1" });
+      // The proxy forwards over HTTP and never reads the server context.
+      const output = await call(
+        proxied.workspace.interruptStream,
+        { workspaceId: "ws-1" },
+        { context: {} as ORPCContext }
+      );
 
-      expect(output).toEqual({ success: true });
+      expect(output).toEqual({ success: true, data: undefined });
       expect(calls).toBe(1);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
