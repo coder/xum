@@ -4,27 +4,52 @@ import { useEffect, useRef } from "react";
  * Error toasts addressed to a workspace's chat input (a child exhausting the parent's goal budget,
  * a Stop the backend could not record). Retained until that input has shown and dismissed them: the
  * error can land after the user switched workspaces (a Stop settles asynchronously), when no input
- * for that workspace is mounted, and the input renders a single toast at a time.
+ * for that workspace is mounted, and the input renders a single toast at a time. Info notices
+ * (publishChatInfo) share this queue.
  */
-const pendingByWorkspace = new Map<string, string[]>();
+interface PendingChatToast {
+  type: "error" | "info";
+  message: string;
+}
+const pendingByWorkspace = new Map<string, PendingChatToast[]>();
 const listenersByWorkspace = new Map<string, Set<() => void>>();
 
 export function publishChatError(workspaceId: string, message: string): void {
-  const pending = pendingByWorkspace.get(workspaceId) ?? [];
-  pending.push(message);
-  pendingByWorkspace.set(workspaceId, pending);
+  publish(workspaceId, (pending) => [...pending, { type: "error", message }]);
+}
+
+/**
+ * A routine notice (a plugin's Stop continuation), shown as a non-error toast. It replaces any info
+ * notice still waiting, so a loop of 50 continuations leaves one notice to show, not 50.
+ */
+export function publishChatInfo(workspaceId: string, message: string): void {
+  publish(workspaceId, (pending) => [
+    ...pending.filter((toast) => toast.type !== "info"),
+    { type: "info", message },
+  ]);
+}
+
+function publish(
+  workspaceId: string,
+  update: (pending: PendingChatToast[]) => PendingChatToast[]
+): void {
+  pendingByWorkspace.set(workspaceId, update(pendingByWorkspace.get(workspaceId) ?? []));
   for (const listener of listenersByWorkspace.get(workspaceId) ?? []) {
     listener();
   }
 }
 
-export function peekChatError(workspaceId: string): string | undefined {
+function peekChatToast(workspaceId: string): PendingChatToast | undefined {
   return pendingByWorkspace.get(workspaceId)?.[0];
+}
+
+export function peekChatError(workspaceId: string): string | undefined {
+  return peekChatToast(workspaceId)?.message;
 }
 
 export function dismissChatError(workspaceId: string, message: string): void {
   const pending = pendingByWorkspace.get(workspaceId);
-  const index = pending?.indexOf(message) ?? -1;
+  const index = pending?.findIndex((toast) => toast.message === message) ?? -1;
   if (pending == null || index < 0) return;
   pending.splice(index, 1);
   if (pending.length === 0) pendingByWorkspace.delete(workspaceId);
@@ -40,7 +65,7 @@ export function dismissChatError(workspaceId: string, message: string): void {
 export function useChatErrorToasts(
   workspaceId: string | null,
   visibleToastMessage: string | null,
-  pushToast: (toast: { type: "error"; message: string }) => void
+  pushToast: (toast: PendingChatToast) => void
 ): void {
   const pushedRef = useRef<{ message: string; displayed: boolean } | null>(null);
   useEffect(() => {
@@ -56,10 +81,10 @@ export function useChatErrorToasts(
     pushedRef.current = null;
     const showNext = () => {
       if (pushedRef.current != null) return;
-      const message = peekChatError(workspaceId);
-      if (message == null) return;
-      pushedRef.current = { message, displayed: false };
-      pushToast({ type: "error", message });
+      const next = peekChatToast(workspaceId);
+      if (next == null) return;
+      pushedRef.current = { message: next.message, displayed: false };
+      pushToast(next);
     };
     const listeners = listenersByWorkspace.get(workspaceId) ?? new Set<() => void>();
     listenersByWorkspace.set(workspaceId, listeners);

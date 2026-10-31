@@ -125,6 +125,7 @@ export class CodexPluginHookService {
       registerCodexPluginHooks(this.spine, {
         workspaceId: args.workspaceId,
         pluginName: entry.plugin.name,
+        pluginInstanceId: instanceIdOf(entry.plugin),
         order,
         hooks: entry.hooks,
         deps: this.depsFor(entry.plugin, args),

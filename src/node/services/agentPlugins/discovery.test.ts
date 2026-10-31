@@ -10,6 +10,7 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  MAX_PLUGIN_MANIFEST_BYTES,
   pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
@@ -18,6 +19,7 @@ import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } fro
 import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { loadPluginMcpServers } from "./mcpConfig";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -2355,21 +2357,123 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
-  test("mcp.json produces no MCP config and one not-applied MCP entry", async () => {
+  test("the file that mcpServers names loads in the cursor MCP dialect", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./servers.json" }),
+      "servers.json": servers,
+      "mcp.json": servers,
+    });
+    const { plugin, relative } = kit;
+    expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
+    expect(plugin.mcpConfigDialect).toBe("cursor");
+    expect(plugin.notApplied).toEqual([]);
+  });
+
+  test("MCP servers that need values, and auth and placement fields, are listed as not applied", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
-      "mcp.json": JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } }),
+      "mcp.json": JSON.stringify({
+        mcpServers: {
+          brevo: {
+            type: "http",
+            url: "https://mcp.brevo.example/mcp",
+            headers: { Authorization: "Bearer ${BREVO_MCP_TOKEN}" },
+          },
+          x: { type: "http", url: "https://api.x.example/mcp", auth: { CLIENT_ID: "fixed-id" } },
+          trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" },
+          github: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
+          // Skipped for its url, so its auth block is not listed as well.
+          salesforce: { type: "http", url: "${SALESFORCE_MCP_URL}", auth: { CLIENT_ID: "x" } },
+          attio: { type: "http", url: "https://mcp.attio.example/mcp" },
+        },
+      }),
     });
     const { plugin } = kit;
-    expect(plugin.mcpConfigPath).toBeUndefined();
-    expect(plugin.mcpConfigDialect).toBeUndefined();
     expect(plugin.notApplied).toEqual([
       {
         part: "mcp",
-        name: "mcp.json",
-        reason: "MCP servers of Cursor plugins load in a later Xum build",
+        name: "brevo",
+        reason: "needs values not supported in Xum (${BREVO_MCP_TOKEN})",
+      },
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+      { part: "mcp", name: "trello", reason: "placement not applied in Xum" },
+      {
+        part: "mcp",
+        name: "github",
+        reason: "needs values not supported in Xum (${env:GITHUB_TOKEN})",
+      },
+      {
+        part: "mcp",
+        name: "salesforce",
+        reason: "needs values not supported in Xum (${SALESFORCE_MCP_URL})",
       },
     ]);
+    // The loader skips exactly the servers listed as needing values.
+    using xumHome = new DisposableTempDir("cursor-plugins-home");
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: xumHome.path });
+    expect(Object.values(servers).map((server) => server.plugin?.serverName)).toEqual([
+      "x",
+      "trello",
+      "attio",
+    ]);
+  });
+
+  test("without mcpServers, a Cursor package loads mcp.json and never .mcp.json", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using codexSibling = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ".mcp.json": servers,
+    });
+    expect(codexSibling.plugin.mcpConfigPath).toBeUndefined();
+    using cursorDefault = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "mcp.json": servers,
+      ".mcp.json": servers,
+    });
+    const { plugin, relative } = cursorDefault;
+    expect([relative(plugin.mcpConfigPath ?? ""), plugin.mcpConfigDialect]).toEqual([
+      "mcp.json",
+      "cursor",
+    ]);
+  });
+
+  test("an unterminated ${ in a Cursor MCP file is read in linear time", async () => {
+    const value = "${".repeat(2) + "a".repeat(MAX_PLUGIN_MANIFEST_BYTES / 2);
+    const started = performance.now();
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: { slow: { command: "node", args: [value] } } }),
+    });
+    // A backtracking pattern took over 20 s on half this size; a scan takes milliseconds.
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(kit.plugin.notApplied).toEqual([]);
+  });
+
+  test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      // JSON.parse makes `__proto__` an own key, as reading the file does. The loader refuses it.
+      "mcp.json":
+        '{"__proto__": {"url": "https://${HOST}/mcp"}, ' +
+        '"x": {"url": "https://api.x.example/mcp", "auth": {"CLIENT_ID": "fixed-id"}}}',
+    });
+    expect(kit.plugin.notApplied).toEqual([
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+    ]);
+  });
+
+  test("an MCP file over the size cap lists no MCP entries", async () => {
+    const servers = {
+      brevo: { url: "https://mcp.brevo.example/mcp", headers: { Authorization: "${TOKEN}" } },
+      pad: { url: `https://x.example/${"a".repeat(MAX_PLUGIN_MANIFEST_BYTES)}` },
+    };
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: servers }),
+    });
+    expect(kit.plugin.mcpConfigDialect).toBe("cursor");
+    expect(kit.plugin.notApplied).toEqual([]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {
@@ -2471,6 +2575,99 @@ describe("Cursor plugin discovery", () => {
     expect(plugin.notApplied).toEqual([
       { part: "rule", name: "broken.mdc", reason: "invalid frontmatter" },
       { part: "rule", name: "huge.mdc", reason: "too large once rewritten as a skill" },
+    ]);
+  });
+
+  test("refused rules count toward the rule cap", async () => {
+    const broken = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        `rules/r${String(index).padStart(3, "0")}.mdc`,
+        "---\n: [\n---\nBroken\n",
+      ])
+    );
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ...broken,
+      "rules/valid.mdc": rule("Valid"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([]);
+    expect(plugin.notApplied).toHaveLength(256);
+    expect(messages).toContain("More than 256 rules; ignoring the rest");
+  });
+
+  test("a rule that links to an earlier rule's file is refused without a second read", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/a.mdc": rule("A"),
+    });
+    await fs.symlink("a.mdc", path.join(kit.plugin.rootPath, "rules", "b.mdc"));
+    const rediscovered = await discoverAgentPlugins([
+      { path: kit.plugin.containerPath, scope: "global" },
+    ]);
+    const [plugin] = rediscovered.plugins;
+    expect(ruleSkills(plugin)).toEqual([["a", "a.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "b.mdc", reason: "the same file as an earlier rule" },
+    ]);
+  });
+
+  test("a root SKILL.md is one skill only without skills/ and a skills field", async () => {
+    using rootSkill = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+    });
+    expect(rootSkill.plugin.skillsDirs).toEqual([
+      { dir: rootSkill.plugin.rootPath, single: true, name: "kit" },
+    ]);
+    using withFolder = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      "skills/alpha/SKILL.md": skill("alpha"),
+    });
+    expect(withFolder.plugin.skillsDirs?.map((root) => withFolder.relative(root.dir))).toEqual([
+      "skills",
+    ]);
+  });
+
+  test.each([
+    ["prompts.chat", "prompts-chat"],
+    ["foo.-bar", "foo-bar"],
+    ["a.-.b", "a-b"],
+  ])("a %s plugin's root skill is named %s", async (pluginName, skillName) => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: pluginName }),
+      "SKILL.md": skill(skillName),
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: skillName },
+    ]);
+  });
+
+  test("a skills entry that is not a folder leaves the root skill on", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      skills: "not a folder\n",
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: "kit" },
+    ]);
+  });
+
+  test("agents in .mdc and .markdown files are listed; .md agents load", async () => {
+    const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nBody\n`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "agents/ok.md": agent("ok"),
+      "agents/rules.mdc": agent("rules"),
+      "agents/long.markdown": agent("long"),
+    });
+    const { plugin, relative } = kit;
+    expect(plugin.agentsDir === undefined ? undefined : relative(plugin.agentsDir)).toBe("agents");
+    expect(plugin.notApplied).toEqual([
+      { part: "agent", name: "long.markdown", reason: "only .md agent files are applied in Xum" },
+      { part: "agent", name: "rules.mdc", reason: "only .md agent files are applied in Xum" },
     ]);
   });
 
