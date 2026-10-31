@@ -806,6 +806,10 @@ function isAgentRunnableAsChild(
   return params.workflowOwned && frontmatter.subagent?.workflow_runnable === true;
 }
 
+/** Task.create refused because the parent's stop latch is held (a Stop is still settling). */
+export const TASK_CREATE_PARENT_STOPPING_ERROR =
+  "Task.create: cannot spawn new tasks while the parent workspace is being stopped";
+
 export interface TaskCreateResult {
   desktopOwnerWorkspaceId?: string;
   taskId: string;

@@ -22,7 +22,11 @@ import {
 import { Ok, Err } from "@/common/types/result";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
-import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
+import {
+  ForegroundWaitBackgroundedError,
+  TASK_CREATE_PARENT_STOPPING_ERROR,
+  type TaskService,
+} from "@/node/services/taskService";
 
 function expectQueuedOrRunningTaskToolResult(
   result: unknown,
@@ -66,6 +70,45 @@ interface ReportPage {
 
 // The task tool requires a TaskService up front, but workspace-turn launches never call it.
 const unusedTaskService = {} as unknown as TaskService;
+
+type CreateResult = Awaited<ReturnType<TaskService["create"]>>;
+
+function spawnedChild(index: number): CreateResult {
+  return Ok({ taskId: `child-task-${index + 1}`, kind: "agent", status: "running" });
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * A TaskService.create mock whose calls stay pending until the test settles them. Once the test
+ * settled one, later calls settle at once, so a caller that awaits each create before starting
+ * the next cannot hang the test.
+ */
+function heldCreates(outcome: (index: number) => Promise<CreateResult>) {
+  const held: Array<ReturnType<typeof Promise.withResolvers<CreateResult>>> = [];
+  let released = false;
+  const create = mock((): Promise<CreateResult> => {
+    const index = held.length;
+    const call = Promise.withResolvers<CreateResult>();
+    held.push(call);
+    if (released) call.resolve(outcome(index));
+    return call.promise;
+  });
+  return {
+    create,
+    /** Settles the call at `index` if it was made, then lets the tool react. */
+    async settle(index: number): Promise<void> {
+      released = true;
+      held[index]?.resolve(outcome(index));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+  };
+}
 
 describe("task tool", () => {
   // Local children share the parent's directory; forked runtimes only see committed state.
@@ -1119,6 +1162,210 @@ describe("task tool", () => {
       { taskId: "child-task-2", status: "running" },
     ]);
     expect(typeof obj.note).toBe("string");
+  });
+
+  it("starts every best-of create before any create settles and keeps launch order", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-concurrent-start");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const events: TaskCreatedEvent[] = [];
+    const creates = heldCreates((index) => Promise.resolve(spawnedChild(index)));
+    const tool = createTaskTool({
+      ...baseConfig,
+      emitChatEvent: (event) => {
+        if (event.type === "task-created") events.push(event);
+      },
+      taskService: { create: creates.create } as unknown as TaskService,
+    });
+
+    const result = Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: true,
+          n: 3,
+        },
+        mockToolCallOptions
+      )
+    );
+    await waitUntil(() => creates.create.mock.calls.length === 3);
+    const enteredBeforeAnySettled = creates.create.mock.calls.length;
+    for (const index of [2, 1, 0]) await creates.settle(index);
+
+    expect(enteredBeforeAnySettled).toBe(3);
+    const taskIds = ["child-task-1", "child-task-2", "child-task-3"];
+    expectGroupedQueuedOrRunningTaskToolResult(await result, { status: "running", taskIds });
+    expect(events.map((event) => event.taskId)).toEqual(taskIds);
+  });
+
+  it("lists every spawned sibling when a middle create fails", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-middle-failure");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const create = mock((args: { bestOf?: { index: number } }) => {
+      const index = args.bestOf?.index ?? 0;
+      return index === 1 ? Err("workspace creation failed") : spawnedChild(index);
+    });
+    const waitForAgentReport = mock(() => Promise.resolve({ reportMarkdown: "ignored" }));
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create, waitForAgentReport } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: false,
+          n: 3,
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+    expectGroupedQueuedOrRunningTaskToolResult(result, {
+      status: "running",
+      taskIds: ["child-task-1", "child-task-3"],
+    });
+    const note = (result as { note: string }).note;
+    expect(note).toContain("2 of 3");
+    expect(note).toContain("workspace creation failed");
+  });
+
+  it("throws Interrupted when a later sibling is refused because the parent is stopping", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-parent-stopping");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const create = mock((args: { bestOf?: { index: number } }) =>
+      args.bestOf?.index === 0 ? spawnedChild(0) : Err(TASK_CREATE_PARENT_STOPPING_ERROR)
+    );
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const executing = Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: true,
+          n: 3,
+        },
+        mockToolCallOptions
+      )
+    );
+
+    await expect(executing).rejects.toThrow("Interrupted");
+  });
+
+  it("throws the first failure in launch order when no create spawns", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-no-spawn");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const firstFailure = new Error("first create threw");
+    const creates = heldCreates((index) =>
+      index === 0 ? Promise.reject(firstFailure) : Promise.resolve(Err(`create ${index} failed`))
+    );
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create: creates.create } as unknown as TaskService,
+    });
+
+    let toolSettled = false;
+    const outcome = Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: true,
+          n: 3,
+        },
+        mockToolCallOptions
+      )
+    ).then(
+      () => {
+        toolSettled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        toolSettled = true;
+        return error;
+      }
+    );
+    await waitUntil(() => creates.create.mock.calls.length === 3);
+    const enteredBeforeAnySettled = creates.create.mock.calls.length;
+    // The launch-order first failure settles first; the tool must still wait for the others.
+    const pendingAfterEachSettle: boolean[] = [];
+    for (const index of [0, 2]) {
+      await creates.settle(index);
+      pendingAfterEachSettle.push(!toolSettled);
+    }
+    await creates.settle(1);
+
+    expect(enteredBeforeAnySettled).toBe(3);
+    expect(pendingAfterEachSettle).toEqual([true, true]);
+    expect(await outcome).toBe(firstFailure);
+  });
+
+  it("keeps a single create's own error when the abort lands during that create", async () => {
+    using tempDir = new TestTempDir("test-task-tool-abort-during-failed-create");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const controller = new AbortController();
+    const create = mock(() => {
+      controller.abort();
+      return Err("unrelated failure");
+    });
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const executing = Promise.resolve(
+      tool.execute!(
+        { subagent_type: "explore", prompt: "do it", title: "Child task", run_in_background: true },
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )
+    );
+
+    await expect(executing).rejects.toThrow("unrelated failure");
+  });
+
+  it("returns the spawned sibling when the abort lands during an unrelated sibling failure", async () => {
+    using tempDir = new TestTempDir("test-task-tool-abort-during-sibling-failure");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const controller = new AbortController();
+    const create = mock((args: { bestOf?: { index: number } }) => {
+      if (args.bestOf?.index === 0) return spawnedChild(0);
+      controller.abort();
+      return Err("unrelated failure");
+    });
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare two approaches",
+          title: "Best of 2",
+          run_in_background: true,
+          n: 2,
+        },
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )
+    );
+
+    expectGroupedQueuedOrRunningTaskToolResult(result, {
+      status: "running",
+      taskIds: ["child-task-1"],
+    });
   });
 
   it("returns one completed report per best-of task when run in foreground", async () => {

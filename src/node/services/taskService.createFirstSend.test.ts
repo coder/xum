@@ -9,7 +9,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
-import type { TaskService } from "@/node/services/taskService";
+import { TASK_CREATE_PARENT_STOPPING_ERROR, type TaskService } from "@/node/services/taskService";
 import {
   createAgentTask,
   createTaskServiceHarness,
@@ -36,6 +36,7 @@ const CHILD_IDS = ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3"];
 const CHILD = CHILD_IDS[0];
 const SIBLING = "bbbbbbbbb1";
 const QUEUED = "ccccccccc1";
+const INTERMEDIATE = "ddddddddd1";
 const GATE_MS = 1_000;
 const OVERLAP_WAIT_MS = 3_000;
 // How long a probe waits for an operation that must not run before the brief's turn is admitted.
@@ -117,6 +118,10 @@ describe("TaskService.create: the first send runs after the create locks are rel
   });
 
   const row = (id: string) => findWorkspaceInConfig(config, id);
+  const childRows = (parentId: string) =>
+    Array.from(config.loadConfigOrDefault().projects.values())
+      .flatMap((project) => project.workspaces)
+      .filter((workspace) => workspace.parentWorkspaceId === parentId);
 
   function workspace(id: string, overrides: Partial<WorkspaceConfigEntry> = {}) {
     return {
@@ -132,7 +137,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
   async function setup(
     send: SendMock,
     rows: WorkspaceConfigEntry[] = [],
-    settings = testTaskSettings(8, 3)
+    settings = testTaskSettings(8, 3),
+    hostOverrides: Parameters<typeof createWorkspaceServiceMocks>[0] = {}
   ) {
     await saveWorkspaces(
       config,
@@ -140,7 +146,7 @@ describe("TaskService.create: the first send runs after the create locks are rel
       [workspace(PARENT_A), workspace(PARENT_B), workspace(PARENT_C), ...rows],
       settings
     );
-    const host = createWorkspaceServiceMocks({ sendMessage: mock(send) });
+    const host = createWorkspaceServiceMocks({ ...hostOverrides, sendMessage: mock(send) });
     return createTaskServiceHarness(config, { workspaceService: host.workspaceService });
   }
 
@@ -464,6 +470,93 @@ describe("TaskService.create: the first send runs after the create locks are rel
     expect(order.slice(1).sort()).toEqual([
       "named the child, brief done: true",
       "queued on the lock, brief done: true",
+    ]);
+  });
+
+  test("refuses a direct create while the parent's stop latch is held", async () => {
+    const sends: string[] = [];
+    const { taskService } = await setup(async (workspaceId, _message, _options, internal) => {
+      sends.push(workspaceId);
+      admitTurn(internal);
+      return Ok(undefined);
+    });
+
+    const releaseStop = taskService.latchHardInterruptCascade(PARENT_A);
+    let refused: Awaited<ReturnType<typeof createAgentTask>>;
+    try {
+      refused = await createAgentTask(taskService, PARENT_A, "go");
+    } finally {
+      releaseStop();
+    }
+
+    expect(refused).toEqual(Err(TASK_CREATE_PARENT_STOPPING_ERROR));
+    expect(childRows(PARENT_A)).toEqual([]);
+    expect(sends).toEqual([]);
+    expect(await createAgentTask(taskService, PARENT_A, "go")).toMatchObject({
+      success: true,
+      data: { status: "running" },
+    });
+  });
+
+  test("an ancestor's Stop between queued sibling creates leaves no child it did not stop", async () => {
+    // INTERMEDIATE is a reawakened task (active execution mirror) whose turn issued the creates:
+    // its stop latch stays held until that turn settles, which the test does after the creates.
+    const intermediateTurn = Symbol("intermediate turn");
+    const settledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
+    let stopping: Promise<string[]> | undefined;
+    const harness = await setup(
+      async (workspaceId, _message, _options, internal) => {
+        // The ancestor's Stop arrives while the first sibling holds create's locks, so its Phase A
+        // queues on the mutex ahead of the sibling creates queued on the tree lock.
+        if (workspaceId === CHILD) {
+          stopping ??= harness.taskService.terminateAllDescendantAgentTasks(PARENT_A);
+        }
+        admitTurn(internal);
+        return Ok(undefined);
+      },
+      [
+        workspace(INTERMEDIATE, {
+          parentWorkspaceId: PARENT_A,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskExecutionStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings(8, 3),
+      {
+        getActiveTurnGeneration: mock((workspaceId: string) =>
+          workspaceId === INTERMEDIATE ? intermediateTurn : undefined
+        ),
+        onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+          settledListeners.add(listener);
+          return () => settledListeners.delete(listener);
+        }),
+      }
+    );
+    const { taskService } = harness;
+
+    let created: Array<Awaited<ReturnType<typeof createAgentTask>>>;
+    try {
+      created = await Promise.all(
+        CHILD_IDS.map((_, index) => createAgentTask(taskService, INTERMEDIATE, `part ${index}`))
+      );
+    } finally {
+      for (const listener of settledListeners) listener(INTERMEDIATE, intermediateTurn);
+    }
+    const stopped = (await stopping) ?? [];
+
+    expect(
+      childRows(INTERMEDIATE).map((child) => ({
+        id: child.id,
+        stopped: stopped.some((id) => id === child.id),
+        taskStatus: child.taskStatus,
+      }))
+    ).toEqual([{ id: CHILD, stopped: true, taskStatus: "interrupted" }]);
+    expect(created.slice(1)).toEqual([
+      Err(TASK_CREATE_PARENT_STOPPING_ERROR),
+      Err(TASK_CREATE_PARENT_STOPPING_ERROR),
     ]);
   });
 });
