@@ -382,17 +382,18 @@ function checkFieldTypes(
 }
 
 /**
- * The output object in JSON text, or undefined for plain text. Text that looks like JSON but does
- * not parse, and JSON that is not an object (`[]`, `42`, `"note"`, `null`), is a malformed output:
- * a PreToolUse guard that answers with a list of findings must not let the call through (D8).
+ * The output object in JSON text, or undefined for plain text. Codex's looks_like_json rule: text
+ * that starts with `{` or `[` must be a JSON object, so a PreToolUse guard that answers with a
+ * list of findings cannot let the call through (D8). Other text, a bare JSON scalar such as `true`
+ * included, is plain text.
  */
 function parseText(text: string, event: HookEventName): Record<string, unknown> | undefined {
+  if (!looksLikeJson(text)) return undefined;
   let value: unknown;
   try {
     value = JSON.parse(text);
   } catch {
-    if (looksLikeJson(text)) throw new Error(`returned invalid ${event} JSON output`);
-    return undefined;
+    throw new Error(`returned invalid ${event} JSON output`);
   }
   if (!isPlainObject(value)) throw new Error(`returned ${event} JSON output that is not an object`);
   return value;

@@ -220,20 +220,22 @@ describe("PreToolUse", () => {
     expect(notices[0]).toContain(detail);
   });
 
-  test("JSON that is not an object blocks the call with one notice; plain text does not", async () => {
+  test("text that starts with { or [ and is not a JSON object blocks with one notice", async () => {
     const text = (value: string) => ({ content: [{ type: "text", text: value }] });
-    for (const output of ["[]", '[{"rule":"no-rm"}]', "42", '"note"', "true", "null"]) {
+    for (const output of ["[]", '[{"rule":"no-rm"}]', "{bad", "[INFO] checked 3 files"]) {
       const { spine, notices } = setup([hook("PreToolUse")], () => text(output));
       const ctx = await runTool(spine, "bash", { script: "rm -rf build" });
 
       expect(ctx.executed).toBe(false);
-      expect(blockedError(ctx)).toContain("JSON output that is not an object");
+      expect(blockedError(ctx)).toContain("PreToolUse JSON output");
       expect(notices).toHaveLength(1);
     }
-    // Codex ignores plain text on PreToolUse.
-    const plain = setup([hook("PreToolUse")], () => text("Checked 3 files."));
-    expect((await runTool(plain.spine, "bash", {})).executed).toBe(true);
-    expect(plain.notices).toEqual([]);
+    // Codex's looks_like_json: other text, a bare JSON scalar included, is plain text it ignores.
+    for (const output of ["42", '"ok"', "true", "null", "Checked 3 files."]) {
+      const plain = setup([hook("PreToolUse")], () => text(output));
+      expect((await runTool(plain.spine, "bash", {})).executed).toBe(true);
+      expect(plain.notices).toEqual([]);
+    }
   });
 
   test("JSON that is not an object on PostToolUse or Stop is ignored with a warning", async () => {

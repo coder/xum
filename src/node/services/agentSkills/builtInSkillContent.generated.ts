@@ -7197,7 +7197,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- Is malformed: invalid JSON, a wrong type, or a value outside an enum. A deny in the same output does not apply.",
       "- Fails Codex's schema: an unknown field, or `hookSpecificOutput` tagged for another event. An explicit deny next to an unknown field still applies, with its own reason.",
-      '- Is JSON that is not an object, such as `[]`, a list of findings, `42`, or `"ok"`. Plain text that is not JSON is ignored.',
+      "- Is JSON that is not an object, such as `[]` or a list of findings. Plain text that does not start with `{` or `[` is ignored. Text that starts with `{` or `[` and is not a valid JSON object is malformed.",
       '- Uses a decision or field that Xum does not support: `permissionDecision: "allow"` without `updatedInput`, `permissionDecision: "ask"`, the legacy `decision: "approve"`, `continue: false`, `stopReason`, `suppressOutput`, `updatedInput` without `allow`, or a reason without a decision. Codex runs the call in these cases. Xum blocks it.',
       "- Has a result text over 1 MiB (1,048,576 characters).",
       "",
