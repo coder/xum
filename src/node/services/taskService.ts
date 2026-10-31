@@ -29,6 +29,7 @@ import type { AIService } from "@/node/services/aiService";
 import {
   buildWorkspaceAgentContext,
   workspaceTurnTerminalAttentionSuppressed,
+  type WorkspaceTurnCreateArgs,
   type WorkspaceTurnManager,
 } from "@/node/services/workspaceTurnManager";
 import {
@@ -947,6 +948,43 @@ function rowKeepsAttempt(
     ws.taskAttemptRetiredBy == null &&
     ws.pendingRemoval == null &&
     ws.taskAttemptId === previousAttemptId
+  );
+}
+
+type ReactivationParams = Parameters<TaskService["reactivateInactiveAgentTask"]>[0];
+
+/**
+ * reactivateInactiveAgentTask's inputs to its commit and turn: the caller's params, the snapshots
+ * read before the goal-pause await, the lineage and the fresh attempt id. No step re-reads them.
+ */
+interface ReactivationPlan {
+  readonly params: ReactivationParams;
+  /** The status the reawakening decided on, read in the caller's decision tick. */
+  readonly statusAtDecision: WorkspaceConfigEntry["taskStatus"];
+  /** The row read after the unarchive. */
+  readonly refreshedEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+  readonly agentTaskAi: AgentTaskTurnAi | undefined;
+  readonly previousAttemptId: string | undefined;
+  readonly keptBrief: string | undefined;
+  readonly briefSendId: string | undefined;
+  readonly lineage: { readonly proven: boolean; readonly reason: string };
+  readonly reactivationAttemptId: string;
+}
+
+/** What the identity CAS wrote: set inside its config edit, read after it. */
+interface ReactivationCommit {
+  committedProven: boolean;
+  published: boolean;
+}
+
+/** The identity CAS's row check: true when the row moved since the plan's refresh read it. */
+function rowRefusesReactivation(ws: WorkspaceConfigEntry, plan: ReactivationPlan): boolean {
+  return (
+    !rowKeepsAttempt(ws, plan.previousAttemptId) ||
+    // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
+    // before the refresh read the id. Only that flip refuses: the reactivation's unarchive
+    // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
+    (ws.taskStatus === "running" && plan.statusAtDecision !== "running")
   );
 }
 
@@ -10009,129 +10047,180 @@ export class TaskService implements AgentTaskIntegration {
     await this.settleChildGoalPause(taskId, { force: true });
     const lineage = await this.evaluateAttemptLineage(taskId, refreshedEntry.workspace);
     const reactivationAttemptId = newTaskAttemptId();
-    let committedProven = false;
-    let published = false;
+    return await this.commitReactivationUnderMutex({
+      params,
+      statusAtDecision,
+      refreshedEntry,
+      agentTaskAi,
+      previousAttemptId,
+      keptBrief,
+      briefSendId,
+      lineage,
+      reactivationAttemptId,
+    });
+  }
+
+  /**
+   * reactivateInactiveAgentTask's critical section: the refusals, the identity CAS and the
+   * ownership install. The lock releases when the block closes, before the turn starts.
+   */
+  private async commitReactivationUnderMutex(
+    plan: ReactivationPlan
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { taskId } = plan.params;
+    const commit: ReactivationCommit = { committedProven: false, published: false };
     {
       // Critical section (see markInterruptedTaskRunning): the identity CAS, the row check and
       // the ownership install run under the global mutex every cascade's Phase A holds, so no
       // Stop can capture the fresh id (or the superseded predecessor) between the commit and its
       // owner. Lock order eventLock → mutex is the one createWorkspaceTurn below establishes.
       await using _lock = await this.mutex.acquire();
-      if (this.isWorkspaceStopInProgress(taskId)) {
-        // A cascade already latched this task: publishing an attempt now would leave one the
-        // cascade cannot settle (its record captured the predecessor). Refuse before the write.
-        return Err({
-          code: "send_failed" as const,
-          message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
-        });
-      }
-      // A Stop of the task or an ancestor that ran to completion during the awaits above: the
-      // cascade found nothing live on the idle child and already released its latch, so only the
-      // epochs show it. The reawakening must lose.
-      if (params.stopFence != null && this.reawakeningOvertakenByStop(params.stopFence)) {
-        log.debug("Sub-agent reactivation refused: overtaken by a stop", { taskId });
-        return Err({ code: "send_failed" as const, message: SEND_ADMISSION_STALE_MESSAGE });
-      }
-      // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
-      // lock) may have published and started its own attempt since the caller found the child
-      // inactive: rotating it would supersede that live turn and drop its report.
-      if (this.attemptLedger.hasLiveReawakening(taskId)) {
-        return Err({
-          code: "send_failed" as const,
-          message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
-        });
+      const refusal = this.refuseReactivationUnderMutex(plan);
+      if (refusal != null) {
+        return refusal;
       }
       await this.editWorkspaceEntry(
         taskId,
         (ws) => {
-          if (
-            !rowKeepsAttempt(ws, previousAttemptId) ||
-            // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
-            // before the refresh above read the id. Only that flip refuses: the unarchive above
-            // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
-            (ws.taskStatus === "running" && statusAtDecision !== "running")
-          ) {
+          if (rowRefusesReactivation(ws, plan)) {
             return;
           }
-          ws.taskAttemptId = reactivationAttemptId;
-          // Only the brief this reactivation prepends: a rewrite since the read is its writer's.
-          if (briefSendId != null && ws.taskPrompt === refreshedEntry.workspace.taskPrompt) {
-            ws.taskPromptSendId = briefSendId;
-          }
-          committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
-          if (!committedProven) ws.taskAttemptUnproven = true;
-          published = true;
+          this.applyReactivationCas(ws, plan, commit);
         },
         { allowMissing: true }
       );
-      if (!published) {
+      if (!commit.published) {
         // Nothing was published: the previous attempt (owned or not) stays exactly as it was.
-        const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-        return Err({
-          code: "send_failed" as const,
-          message:
-            latest?.taskAttemptRetiredBy != null
-              ? retiredAttemptMessage(latest.taskAttemptRetiredBy)
-              : latest?.pendingRemoval != null
-                ? pendingRemovalAdmissionMessage(latest.pendingRemoval)
-                : "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
-        });
+        return this.reactivationNotPublished(taskId);
       }
-      // A writer outside this mutex (another backend) may have rotated the row again during the
-      // commit's own awaits: never publish or own an identity the durable row no longer names.
-      const committedRow = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-      if (committedRow?.workspace.taskAttemptId !== reactivationAttemptId) {
-        log.info("[task-attempt] reactivated attempt superseded before it was owned", {
-          taskId,
-          attemptId: reactivationAttemptId,
-          current: committedRow?.workspace.taskAttemptId,
-        });
-        return Err({
-          code: "send_failed" as const,
-          message: "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
-        });
+      const ownRefusal = this.ownReactivatedAttempt(plan, commit);
+      if (ownRefusal != null) {
+        return ownRefusal;
       }
-      this.attemptLedger.publishAttemptRotation(taskId, reactivationAttemptId);
-      if (!committedProven) {
-        log.info("[task-attempt] reactivated attempt is not receipt-eligible", {
-          taskId,
-          attemptId: reactivationAttemptId,
-          reason: lineage.proven ? "unproven marker appeared before the CAS" : lineage.reason,
-        });
-      }
-      this.beginOwnedTaskAttempt(taskId, "reactivation", {
-        attemptId: reactivationAttemptId,
-        receiptEligible: committedProven,
-      });
-      // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
-      this.attemptLedger.beginReawakening(taskId, reactivationAttemptId);
     }
+    // After the block: createWorkspaceTurn takes the same mutex, which is not reentrant.
+    return await this.runReactivationTurn(plan);
+  }
+
+  /** The refusals under the mutex, before the identity CAS: the refusal, or undefined. */
+  private refuseReactivationUnderMutex(
+    plan: ReactivationPlan
+  ): Result<never, SendAgentTaskMessageError> | undefined {
+    const { params } = plan;
+    const { taskId } = params;
+    if (this.isWorkspaceStopInProgress(taskId)) {
+      // A cascade already latched this task: publishing an attempt now would leave one the
+      // cascade cannot settle (its record captured the predecessor). Refuse before the write.
+      return Err({
+        code: "send_failed" as const,
+        message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+      });
+    }
+    // A Stop of the task or an ancestor that ran to completion during the reactivation's awaits:
+    // the cascade found nothing live on the idle child and already released its latch, so only
+    // the epochs show it. The reawakening must lose.
+    if (params.stopFence != null && this.reawakeningOvertakenByStop(params.stopFence)) {
+      log.debug("Sub-agent reactivation refused: overtaken by a stop", { taskId });
+      return Err({ code: "send_failed" as const, message: SEND_ADMISSION_STALE_MESSAGE });
+    }
+    // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
+    // lock) may have published and started its own attempt since the caller found the child
+    // inactive: rotating it would supersede that live turn and drop its report.
+    if (this.attemptLedger.hasLiveReawakening(taskId)) {
+      return Err({
+        code: "send_failed" as const,
+        message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+      });
+    }
+    return undefined;
+  }
+
+  /** The identity CAS's write, inside its config edit once rowRefusesReactivation passed. */
+  private applyReactivationCas(
+    ws: WorkspaceConfigEntry,
+    plan: ReactivationPlan,
+    commit: ReactivationCommit
+  ): void {
+    const { refreshedEntry, briefSendId, lineage } = plan;
+    ws.taskAttemptId = plan.reactivationAttemptId;
+    // Only the brief this reactivation prepends: a rewrite since the read is its writer's.
+    if (briefSendId != null && ws.taskPrompt === refreshedEntry.workspace.taskPrompt) {
+      ws.taskPromptSendId = briefSendId;
+    }
+    commit.committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
+    if (!commit.committedProven) ws.taskAttemptUnproven = true;
+    commit.published = true;
+  }
+
+  /** The refusal when the identity CAS published nothing: the latest row names the reason. */
+  private reactivationNotPublished(taskId: string): Result<never, SendAgentTaskMessageError> {
+    const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    return Err({
+      code: "send_failed" as const,
+      message:
+        latest?.taskAttemptRetiredBy != null
+          ? retiredAttemptMessage(latest.taskAttemptRetiredBy)
+          : latest?.pendingRemoval != null
+            ? pendingRemovalAdmissionMessage(latest.pendingRemoval)
+            : "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
+    });
+  }
+
+  /**
+   * After the CAS: publish and own the fresh attempt, and mark the reawakening live, only if the
+   * durable row still names it. The refusal, or undefined once owned.
+   */
+  private ownReactivatedAttempt(
+    plan: ReactivationPlan,
+    commit: ReactivationCommit
+  ): Result<never, SendAgentTaskMessageError> | undefined {
+    const { params, lineage, reactivationAttemptId } = plan;
+    const { taskId } = params;
+    // A writer outside this mutex (another backend) may have rotated the row again during the
+    // commit's own awaits: never publish or own an identity the durable row no longer names.
+    const committedRow = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (committedRow?.workspace.taskAttemptId !== reactivationAttemptId) {
+      log.info("[task-attempt] reactivated attempt superseded before it was owned", {
+        taskId,
+        attemptId: reactivationAttemptId,
+        current: committedRow?.workspace.taskAttemptId,
+      });
+      return Err({
+        code: "send_failed" as const,
+        message: "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
+      });
+    }
+    this.attemptLedger.publishAttemptRotation(taskId, reactivationAttemptId);
+    if (!commit.committedProven) {
+      log.info("[task-attempt] reactivated attempt is not receipt-eligible", {
+        taskId,
+        attemptId: reactivationAttemptId,
+        reason: lineage.proven ? "unproven marker appeared before the CAS" : lineage.reason,
+      });
+    }
+    this.beginOwnedTaskAttempt(taskId, "reactivation", {
+      attemptId: reactivationAttemptId,
+      receiptEligible: commit.committedProven,
+    });
+    // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
+    this.attemptLedger.beginReawakening(taskId, reactivationAttemptId);
+    return undefined;
+  }
+
+  /**
+   * The reactivation's turn, started after the mutex is released. The reawakening stays live
+   * until createWorkspaceTurn returns or throws.
+   */
+  private async runReactivationTurn(
+    plan: ReactivationPlan
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { params, reactivationAttemptId } = plan;
+    const { taskId } = params;
     let execution: Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
     try {
-      execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
-        ownerWorkspaceId: ancestorWorkspaceId,
-        prompt: keptBrief != null ? `${keptBrief}\n\n${params.message}` : params.message,
-        title:
-          coerceNonEmptyString(refreshedEntry.workspace.title) ??
-          coerceNonEmptyString(refreshedEntry.workspace.name) ??
-          "Sub-agent",
-        workspace: {
-          mode: "existing",
-          workspaceId: taskId,
-          queueDispatchMode: params.queueDispatchMode,
-        },
-        allowAgentWorkspace: true,
-        attentionPolicy: "notify_on_terminal",
-        ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
-        ...(agentTaskAi != null ? { agentTaskAi } : {}),
-        ...(keptBrief != null && briefSendId != null
-          ? {
-              sendIdentities: [
-                { ...taskBriefSendIdentity(keptBrief, briefSendId), unpublished: true },
-              ],
-            }
-          : {}),
-      });
+      execution = await this.getWorkspaceTurnManager().createWorkspaceTurn(
+        this.buildReactivationTurnArgs(plan)
+      );
     } finally {
       this.attemptLedger.endReawakening(taskId, reactivationAttemptId);
     }
@@ -10150,6 +10239,36 @@ export class TaskService implements AgentTaskIntegration {
       delivery: "reactivated" as const,
       executionTaskId: execution.data.taskId,
     });
+  }
+
+  /** The reactivation turn's arguments: the kept brief (if any) precedes the message. */
+  private buildReactivationTurnArgs(plan: ReactivationPlan): WorkspaceTurnCreateArgs {
+    const { params, refreshedEntry, agentTaskAi, keptBrief, briefSendId } = plan;
+    const { ancestorWorkspaceId, taskId } = params;
+    return {
+      ownerWorkspaceId: ancestorWorkspaceId,
+      prompt: keptBrief != null ? `${keptBrief}\n\n${params.message}` : params.message,
+      title:
+        coerceNonEmptyString(refreshedEntry.workspace.title) ??
+        coerceNonEmptyString(refreshedEntry.workspace.name) ??
+        "Sub-agent",
+      workspace: {
+        mode: "existing",
+        workspaceId: taskId,
+        queueDispatchMode: params.queueDispatchMode,
+      },
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
+      ...(agentTaskAi != null ? { agentTaskAi } : {}),
+      ...(keptBrief != null && briefSendId != null
+        ? {
+            sendIdentities: [
+              { ...taskBriefSendIdentity(keptBrief, briefSendId), unpublished: true },
+            ],
+          }
+        : {}),
+    };
   }
 
   /**
