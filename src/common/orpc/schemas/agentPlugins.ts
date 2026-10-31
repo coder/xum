@@ -134,11 +134,6 @@ export const AgentPluginHookSchema = z.object({
   review: PluginHookReviewStateSchema,
 });
 
-export const AgentPluginHooksSchema = z.object({
-  hooks: z.array(AgentPluginHookSchema),
-  warnings: z.array(z.string()),
-});
-
 /** Composer slash command declared by the manifest (data-driven expansion). */
 export const AgentPluginPreviewSlashCommandSchema = z.object({
   name: z.string(),
@@ -243,6 +238,20 @@ export const AgentPluginCapabilityChangeSchema = z.object({
   after: z.string().optional(),
   /** Set for a skill or MCP server change: what confirming the review approves. */
   component: AgentPluginComponentRefSchema.optional(),
+});
+
+export const AgentPluginHooksSchema = z.object({
+  hooks: z.array(AgentPluginHookSchema),
+  warnings: z.array(z.string()),
+  /**
+   * D30 at the first trust: every file of the plugin, as the install preview lists them. Set
+   * while the plugin runs a Cursor command hook and none of its Cursor hooks is trusted: a plugin
+   * installed by a build without the file review never showed its files. Trusting a Cursor
+   * command hook then needs `digest`, so the trust covers exactly the files shown.
+   */
+  fileReview: z
+    .object({ changes: z.array(AgentPluginCapabilityChangeSchema), digest: z.string() })
+    .optional(),
 });
 
 export const AgentPluginInstallPreviewSchema = z.object({

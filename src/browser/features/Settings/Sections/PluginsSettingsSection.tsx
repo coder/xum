@@ -20,7 +20,6 @@ import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
 import type {
-  AgentPluginCapabilityChange,
   AgentPluginComponentRef,
   AgentPluginComponents,
   AgentPluginInstallMethod,
@@ -51,8 +50,9 @@ import {
   hookStatusNote,
   isCursorHookHandler,
   PluginHooksPanel,
-  cutReviewText,
-  kilobytes,
+  ReviewChangeRow,
+  useCutTextExpansion,
+  type CutTextExpansion,
 } from "./PluginHooksPanel";
 import {
   InstallMethodPicker,
@@ -1334,100 +1334,6 @@ const ReviewedDefinitions: React.FC<{
           </li>
         ))}
       </ul>
-    </div>
-  );
-};
-
-function cutReviewTextKeys(changes: readonly AgentPluginCapabilityChange[]): string[] {
-  return changes.flatMap((change, index) =>
-    (["before", "after"] as const).flatMap((field) => {
-      const text = change[field];
-      return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
-    })
-  );
-}
-
-/**
- * Which cut texts of a row list the user expanded (#6629). Keys are valid only for the list they
- * were expanded in: a new review or preview (same plugin, other rows) starts with nothing expanded.
- */
-function useCutTextExpansion(changes: readonly AgentPluginCapabilityChange[]) {
-  const [expansion, setExpansion] = useState<{
-    changes: readonly AgentPluginCapabilityChange[] | null;
-    keys: ReadonlySet<string>;
-  }>({ changes: null, keys: new Set() });
-  const keys = expansion.changes === changes ? expansion.keys : new Set<string>();
-  return {
-    isExpanded: (key: string) => keys.has(key),
-    mustExpand: cutReviewTextKeys(changes).filter((key) => !keys.has(key)),
-    expand: (key: string) =>
-      setExpansion((previous) => ({
-        changes,
-        keys: new Set(previous.changes === changes ? previous.keys : []).add(key),
-      })),
-  };
-}
-type CutTextExpansion = ReturnType<typeof useCutTextExpansion>;
-
-/** One review row: its summary and its before/after texts. */
-const ReviewChangeRow: React.FC<{
-  change: AgentPluginUpdateReview["changes"][number];
-  index: number;
-  isExpanded: (key: string) => boolean;
-  onExpand: (key: string) => void;
-}> = (props) => {
-  const fields = (["before", "after"] as const).flatMap((field) => {
-    const text = props.change[field];
-    return text !== undefined ? [{ field, text, key: `${props.index}:${field}` }] : [];
-  });
-  return (
-    <li className="text-xs">
-      <span className="text-foreground break-words">{props.change.summary}</span>
-      {fields.length > 0 && (
-        <dl className="mt-1 space-y-1">
-          {fields.map((item) => (
-            <ReviewTextField
-              key={item.field}
-              label={item.field === "before" ? "Before" : "After"}
-              text={item.text}
-              expanded={props.isExpanded(item.key)}
-              onExpand={() => props.onExpand(item.key)}
-            />
-          ))}
-        </dl>
-      )}
-    </li>
-  );
-};
-
-/**
- * One before/after text of a review row (#6629). A long text is cut at the display bound, and the
- * user must show all of it before confirming: a plugin can pad a definition and hide the part that
- * matters after the cut.
- */
-const ReviewTextField: React.FC<{
-  label: string;
-  text: string;
-  expanded: boolean;
-  onExpand: () => void;
-}> = (props) => {
-  const view = cutReviewText(props.text);
-  return (
-    <div className="flex gap-2">
-      <dt className="text-muted w-10 shrink-0 text-[11px]">{props.label}</dt>
-      <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-        {view.cut && !props.expanded ? view.shown : props.text}
-        {view.cut && !props.expanded && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-1 h-7 px-2 font-sans text-xs"
-            onClick={props.onExpand}
-          >
-            Show full text ({kilobytes(props.text)} KB)
-          </Button>
-        )}
-      </dd>
     </div>
   );
 };

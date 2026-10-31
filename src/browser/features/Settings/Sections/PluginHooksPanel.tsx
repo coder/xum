@@ -4,6 +4,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
 import { cursorHookNotAppliedReason, effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import type {
+  AgentPluginCapabilityChange,
   AgentPluginHook,
   AgentPluginHooks,
   PluginHookHandler,
@@ -175,6 +176,102 @@ const HookReviewDetailText: React.FC<{
   </>
 );
 
+export function cutReviewTextKeys(changes: readonly AgentPluginCapabilityChange[]): string[] {
+  return changes.flatMap((change, index) =>
+    (["before", "after"] as const).flatMap((field) => {
+      const text = change[field];
+      return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
+    })
+  );
+}
+
+/**
+ * Which cut texts of a row list the user expanded (#6629). Keys are valid only for the list they
+ * were expanded in: a new review or preview (same plugin, other rows) starts with nothing expanded.
+ */
+export function useCutTextExpansion(changes: readonly AgentPluginCapabilityChange[]) {
+  const [expansion, setExpansion] = useState<{
+    changes: readonly AgentPluginCapabilityChange[] | null;
+    keys: ReadonlySet<string>;
+  }>({ changes: null, keys: new Set() });
+  const keys = expansion.changes === changes ? expansion.keys : new Set<string>();
+  return {
+    isExpanded: (key: string) => keys.has(key),
+    mustExpand: cutReviewTextKeys(changes).filter((key) => !keys.has(key)),
+    expand: (key: string) =>
+      setExpansion((previous) => ({
+        changes,
+        keys: new Set(previous.changes === changes ? previous.keys : []).add(key),
+      })),
+  };
+}
+export type CutTextExpansion = ReturnType<typeof useCutTextExpansion>;
+
+/** One review row: its summary and its before/after texts. */
+export const ReviewChangeRow: React.FC<{
+  change: AgentPluginCapabilityChange;
+  index: number;
+  isExpanded: (key: string) => boolean;
+  onExpand: (key: string) => void;
+}> = (props) => {
+  const fields = (["before", "after"] as const).flatMap((field) => {
+    const text = props.change[field];
+    return text !== undefined ? [{ field, text, key: `${props.index}:${field}` }] : [];
+  });
+  return (
+    <li className="text-xs">
+      <span className="text-foreground break-words">{props.change.summary}</span>
+      {fields.length > 0 && (
+        <dl className="mt-1 space-y-1">
+          {fields.map((item) => (
+            <ReviewTextField
+              key={item.field}
+              label={item.field === "before" ? "Before" : "After"}
+              text={item.text}
+              expanded={props.isExpanded(item.key)}
+              onExpand={() => props.onExpand(item.key)}
+            />
+          ))}
+        </dl>
+      )}
+    </li>
+  );
+};
+
+/**
+ * One before/after text of a review row (#6629). A long text is cut at the display bound, and the
+ * user must show all of it before confirming: a plugin can pad a definition and hide the part that
+ * matters after the cut.
+ */
+const ReviewTextField: React.FC<{
+  label: string;
+  text: string;
+  expanded: boolean;
+  onExpand: () => void;
+}> = (props) => {
+  const view = cutReviewText(props.text);
+  return (
+    <div className="flex gap-2">
+      <dt className="text-muted w-10 shrink-0 text-[11px]">{props.label}</dt>
+      <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
+        {view.cut && !props.expanded ? view.shown : props.text}
+        {view.cut && !props.expanded && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-1 h-7 px-2 font-sans text-xs"
+            onClick={props.onExpand}
+          >
+            Show full text ({kilobytes(props.text)} KB)
+          </Button>
+        )}
+      </dd>
+    </div>
+  );
+};
+
+const NO_FILE_CHANGES: readonly AgentPluginCapabilityChange[] = [];
+
 export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> = (props) => {
   const { api } = useAPI();
   const [data, setData] = useState<AgentPluginHooks | null>(null);
@@ -188,6 +285,8 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
   // definition must be expanded again before it can be trusted.
   const [expandedInputs, setExpandedInputs] = useState<ReadonlySet<string>>(() => new Set());
   const name = props.name;
+  const fileReview = data?.fileReview;
+  const fileExpansion = useCutTextExpansion(fileReview?.changes ?? NO_FILE_CHANGES);
 
   useEffect(() => {
     let ignore = false;
@@ -223,6 +322,8 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
         key: hook.key,
         hash: hook.hash,
         state,
+        // The files on screen: the backend refuses the trust if they changed since.
+        ...(fileReview !== undefined ? { fileReviewDigest: fileReview.digest } : {}),
       });
       if (!result.success) setError(result.error);
     } catch (err) {
@@ -248,6 +349,28 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
             </p>
           )
       )}
+      {fileReview !== undefined && (
+        <div>
+          <h4 className="text-foreground mb-1 text-xs font-medium">
+            Files ({fileReview.changes.length})
+          </h4>
+          <p className="text-muted mb-1 text-xs">
+            Read every file before you trust this plugin&apos;s first hook: a command hook can run
+            any of them.
+          </p>
+          <ul className="space-y-2">
+            {fileReview.changes.map((change, index) => (
+              <ReviewChangeRow
+                key={`${index}:${change.summary}`}
+                change={change}
+                index={index}
+                isExpanded={fileExpansion.isExpanded}
+                onExpand={fileExpansion.expand}
+              />
+            ))}
+          </ul>
+        </div>
+      )}
       {data?.hooks.length === 0 && <p className="text-muted text-xs">No hooks.json hooks.</p>}
       {data && data.hooks.length > 0 && (
         <ul className="space-y-2">
@@ -259,6 +382,9 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
             const expandKey = `${hook.key}\0${hook.hash}`;
             const expanded = expandedInputs.has(expandKey);
             // Trust covers the full definition: it waits until the user can have read all of it.
+            // The first trust of a command hook covers the files too (D30).
+            const filesUnread =
+              hook.handler.type === "cursor-command" && fileExpansion.mustExpand.length > 0;
             const mustExpand = detail?.full != null && !expanded;
             return (
               <li
@@ -305,6 +431,11 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                         Show the full {detail.noun} to review it before trusting.
                       </p>
                     )}
+                    {filesUnread && hook.review !== "trusted" && (
+                      <p className="text-muted">
+                        Show the full text of each file above to review it before trusting.
+                      </p>
+                    )}
                     {hook.handler.type === "cursor-command" && hook.review !== "trusted" && (
                       <p className="text-muted">
                         Once trusted, this hook runs a command in your workspace.
@@ -315,7 +446,7 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                         <Button
                           size="sm"
                           className={cn("h-7 px-2 text-xs")}
-                          disabled={busy || mustExpand}
+                          disabled={busy || mustExpand || filesUnread}
                           onClick={() => void decide(hook, "trusted")}
                           aria-label={`Trust ${hook.event} hook ${summary}`}
                         >
