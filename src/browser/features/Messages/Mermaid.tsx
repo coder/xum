@@ -266,6 +266,16 @@ function sanitizeStyle(style: string): string | null {
   return kept.some((declaration) => declaration.trim() !== "") ? kept.join(";") : null;
 }
 
+/** An id, or an id list such as aria-labelledby, kept only when every id is the diagram's own. */
+function keptIdValue(name: string, value: string, idPrefix: string): string | null {
+  // The browser splits an id list at ASCII whitespace, including the tab that &#9; writes, and
+  // skips empty ids. \S+ also splits at other whitespace, such as &#160;, so it is stricter.
+  const ids = value.match(/\S+/g);
+  // An id holds one value, so whitespace there is not a separator but part of the id.
+  if (name === "id" && ids?.[0] !== value) return null;
+  return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
+}
+
 /** The value to keep for an attribute, or null to remove the attribute. */
 function keptAttributeValue(
   rules: PeleNamespace,
@@ -274,12 +284,7 @@ function keptAttributeValue(
   idPrefix: string
 ): string | null {
   if (rules.textAttributes.has(name)) return value;
-  if (rules.idAttributes.has(name)) {
-    // The browser splits an id list at ASCII whitespace, including the tab that &#9; writes, and
-    // skips empty ids. \S+ also splits at other whitespace, such as &#160;, so it is stricter.
-    const ids = value.match(/\S+/g);
-    return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
-  }
+  if (rules.idAttributes.has(name)) return keptIdValue(name, value, idPrefix);
   if (!rules.cssAttributes.has(name)) return null;
   if (name === "style") return sanitizeStyle(value);
   return isPeleCss(value, idPrefix) ? value : null;

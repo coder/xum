@@ -288,6 +288,14 @@ describe("sanitizeMermaidSvg", () => {
     ]);
   });
 
+  it("removes an id with whitespace in it", () => {
+    const sanitized =
+      sanitizeMermaidSvg(svgWith(`<g id=" mermaid-r1-a"/><g id="mermaid-r1-b api"/>`), ID_PREFIX) ??
+      "";
+
+    expect(htmlParts(sanitized).filter((part) => part.includes("id="))).toEqual([]);
+  });
+
   it("keeps a url(#id) attribute but no url() declaration", () => {
     const sanitized = sanitizeMermaidSvg(
       svgWith(
