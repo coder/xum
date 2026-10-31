@@ -1015,9 +1015,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         );
       }
 
+      // Again after the core and memory writes, like the matched memory: an entry turned into
+      // a link meanwhile is left alone instead of failing after the settings changed.
+      const writableShelf = await omitSymlinkedShelfEntries(muxRoot, shelf.entries, shelf.skipped);
       const shelfWritten = await applyShelfRestore({
         xumRoot: muxRoot,
-        entries: shelf.entries,
+        entries: writableShelf.entries,
         snapshotPath: restoreOptions.snapshotPath,
         registeredProjects: registeredProjectDirs(),
       });
@@ -1033,7 +1036,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
+        symlinkSkipped: [
+          ...symlinkSkipped,
+          ...memorySymlinkSkipped,
+          ...shelf.skipped,
+          ...writableShelf.skipped,
+        ].sort(),
         restoredProjectMemory,
       };
     },
