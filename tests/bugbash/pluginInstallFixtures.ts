@@ -286,10 +286,6 @@ function cursorTeamKitMini(): Files {
   };
 }
 
-/**
- * A minimal MCP server over stdio (newline-delimited JSON-RPC, no dependencies): one tool `echo`
- * that returns its `text` argument.
- */
 const ECHO_SERVER = `import { createInterface } from "node:readline";
 
 const tools = [

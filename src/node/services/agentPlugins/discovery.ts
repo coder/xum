@@ -445,8 +445,8 @@ export interface AgentPluginInfo {
   /**
    * "codex": the MCP file is in the Codex `.mcp.json` dialect. "claude": the Codex dialect plus
    * the `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` names. "cursor": the Codex dialect plus
-   * `${CURSOR_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_ROOT}`, an ignored `auth` block, and a skip for any
-   * other `${NAME}` (see loadPluginMcpServers).
+   * `${CURSOR_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_ROOT}`, ignored `auth` and `placement` fields, and a
+   * skip for any other `${NAME}` (see mcpDialects.ts).
    */
   mcpConfigDialect?: "codex" | "claude" | "cursor";
   /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
@@ -1197,7 +1197,7 @@ async function resolvePluginMcpConfig(args: {
 }
 
 /**
- * A Cursor MCP file's servers that need values and its `auth` blocks, so the plugin lists them
+ * A Cursor MCP file's servers that need values and its ignored fields, so the plugin lists them
  * after install too. An unreadable or invalid file lists nothing: the MCP loader reports it.
  */
 async function cursorMcpFileNotApplied(

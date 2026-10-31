@@ -129,7 +129,10 @@ test("cursor-stdio-mcp's echo server starts from ${CURSOR_PLUGIN_ROOT} and echoe
     encoding: "utf8",
   });
   expect(run.status).toBe(0);
-  const replies = run.stdout.trim().split("\n").map((line) => JSON.parse(line) as unknown);
+  const replies = run.stdout
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as unknown);
   expect(replies[1]).toEqual({
     jsonrpc: "2.0",
     id: 2,

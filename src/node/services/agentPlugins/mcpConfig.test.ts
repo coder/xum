@@ -421,7 +421,10 @@ describe("loadPluginMcpServers", () => {
 
   test("a Cursor cwd at a data folder name fails the cwd form check; Claude maps it", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
-    const servers = { stateful: { command: "node", cwd: "${CLAUDE_PLUGIN_DATA}/state" } };
+    const servers = {
+      stateful: { command: "node", cwd: "${CLAUDE_PLUGIN_DATA}/state" },
+      cursorData: { command: "node", cwd: "${CURSOR_PLUGIN_DATA}" },
+    };
     const cursor = await makeCursorPlugin(tmp.path, "cursor", servers);
     const claude: AgentPluginInfo = {
       ...(await makePlugin(tmp.path, "claude", servers, { fileName: ".mcp.json" })),
@@ -432,14 +435,16 @@ describe("loadPluginMcpServers", () => {
     const claudeResult = await loadPluginMcpServers(claude, { xumHome: tmp.path });
 
     expect(cursorResult.servers).toEqual({});
-    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual([
-      [
+    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual(
+      ["stateful", "cursorData"].map((name) => [
         "error",
-        "mcp.json server 'stateful': 'cwd' must be './…', '${PLUGIN_ROOT}[/…]', or '${PLUGIN_DATA}[/…]'; skipping this server",
-      ],
-    ]);
+        `mcp.json server '${name}': 'cwd' must be './…', '\${PLUGIN_ROOT}[/…]', or '\${PLUGIN_DATA}[/…]'; skipping this server`,
+      ])
+    );
     const claudeData = getPluginDataPath(tmp.path, computePluginInstanceId(claude.rootPath));
-    expect(claudeResult.diagnostics).toEqual([]);
+    expect(claudeResult.diagnostics.map((d) => d.message)).toEqual([
+      ".mcp.json server 'cursorData': 'cwd' must be './…', '${PLUGIN_ROOT}[/…]', or '${PLUGIN_DATA}[/…]'; skipping this server",
+    ]);
     expect((Object.values(claudeResult.servers)[0] as MCPStdioServerInfo).cwd).toBe(
       path.join(claudeData, "state")
     );
@@ -451,6 +456,7 @@ describe("loadPluginMcpServers", () => {
       token: { command: "npx", env: { TOKEN: "${BREVO_MCP_TOKEN}" } },
       // D29: only the two roots expand, so a Cursor data folder name is a user value.
       data: { command: "npx", args: ["${CURSOR_PLUGIN_DATA}/cache"] },
+      workspace: { command: "npx", cwd: "${WORKSPACE_DIR}/x" },
       header: {
         type: "http",
         url: "https://x.example/mcp",
@@ -460,6 +466,8 @@ describe("loadPluginMcpServers", () => {
       host: { type: "http", url: "https://${VANTA_MCP_HOST}/mcp" },
       // A default can hold a secret: only the name is reported.
       fallback: { type: "http", url: "https://x.example/${PATH_SEGMENT:-s3cret-default}" },
+      // Cursor reads ${env:NAME} from its environment; Xum never does.
+      hostEnv: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
       plain: { type: "http", url: "https://attio.example/mcp" },
     });
 
@@ -477,6 +485,10 @@ describe("loadPluginMcpServers", () => {
       ],
       [
         "warning",
+        "mcp.json server 'workspace': needs values not supported in Xum (${WORKSPACE_DIR}); skipping this server",
+      ],
+      [
+        "warning",
         "mcp.json server 'header': needs values not supported in Xum (${CLIENT_SECRET}); skipping this server",
       ],
       [
@@ -487,10 +499,14 @@ describe("loadPluginMcpServers", () => {
         "warning",
         "mcp.json server 'fallback': needs values not supported in Xum (${PATH_SEGMENT}); skipping this server",
       ],
+      [
+        "warning",
+        "mcp.json server 'hostEnv': needs values not supported in Xum (${env:GITHUB_TOKEN}); skipping this server",
+      ],
     ]);
   });
 
-  test("the Cursor dialect infers streamable HTTP from a url and ignores an auth block", async () => {
+  test("the Cursor dialect infers streamable HTTP from a url and ignores auth and placement", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makeCursorPlugin(tmp.path, "cursor", {
       gong: { url: "https://x.example/mcp" },
@@ -499,6 +515,13 @@ describe("loadPluginMcpServers", () => {
         url: "https://api.x.example/mcp",
         auth: { CLIENT_ID: "fixed-client", scopes: ["tweet.read"] },
       },
+      trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" },
+      gopuff: {
+        type: "http",
+        url: "https://mcp.gopuff.example/mcp",
+        auth: { CLIENT_ID: "fixed-client" },
+        placement: "server",
+      },
     });
 
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
@@ -506,14 +529,41 @@ describe("loadPluginMcpServers", () => {
     expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
       ["gong", "http"],
       ["x", "http"],
+      ["trello", "http"],
+      ["gopuff", "http"],
     ]);
     // Not translated: sign-in uses discovery and dynamic client registration.
     expect(Object.values(servers).map((s) => s.transport !== "stdio" && s.oauth)).toEqual([
       undefined,
       undefined,
+      undefined,
+      undefined,
     ]);
     expect(diagnostics.map((d) => [d.severity, d.message])).toEqual([
       ["warning", "mcp.json server 'x': auth not applied in Xum"],
+      ["warning", "mcp.json server 'trello': placement not applied in Xum"],
+      ["warning", "mcp.json server 'gopuff': auth not applied in Xum"],
+      ["warning", "mcp.json server 'gopuff': placement not applied in Xum"],
+    ]);
+  });
+
+  test("only the Cursor dialect accepts a placement field", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const codex = await makePlugin(
+      tmp.path,
+      "codex",
+      { trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" } },
+      { fileName: ".mcp.json" }
+    );
+
+    const { servers, diagnostics } = await loadPluginMcpServers(codex, { xumHome: tmp.path });
+
+    expect(servers).toEqual({});
+    expect(diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "error",
+        ".mcp.json server 'trello': unknown field 'placement' in remote server entry; skipping this server",
+      ],
     ]);
   });
 

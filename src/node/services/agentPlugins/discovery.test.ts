@@ -2369,7 +2369,7 @@ describe("Cursor plugin discovery", () => {
     expect(plugin.notApplied).toEqual([]);
   });
 
-  test("MCP servers that need values and auth blocks are listed as not applied", async () => {
+  test("MCP servers that need values, and auth and placement fields, are listed as not applied", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
       "mcp.json": JSON.stringify({
@@ -2380,6 +2380,8 @@ describe("Cursor plugin discovery", () => {
             headers: { Authorization: "Bearer ${BREVO_MCP_TOKEN}" },
           },
           x: { type: "http", url: "https://api.x.example/mcp", auth: { CLIENT_ID: "fixed-id" } },
+          trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" },
+          github: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
           // Skipped for its url, so its auth block is not listed as well.
           salesforce: { type: "http", url: "${SALESFORCE_MCP_URL}", auth: { CLIENT_ID: "x" } },
           attio: { type: "http", url: "https://mcp.attio.example/mcp" },
@@ -2394,6 +2396,12 @@ describe("Cursor plugin discovery", () => {
         reason: "needs values not supported in Xum (${BREVO_MCP_TOKEN})",
       },
       { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+      { part: "mcp", name: "trello", reason: "placement not applied in Xum" },
+      {
+        part: "mcp",
+        name: "github",
+        reason: "needs values not supported in Xum (${env:GITHUB_TOKEN})",
+      },
       {
         part: "mcp",
         name: "salesforce",
@@ -2405,6 +2413,7 @@ describe("Cursor plugin discovery", () => {
     const { servers } = await loadPluginMcpServers(plugin, { xumHome: xumHome.path });
     expect(Object.values(servers).map((server) => server.plugin?.serverName)).toEqual([
       "x",
+      "trello",
       "attio",
     ]);
   });

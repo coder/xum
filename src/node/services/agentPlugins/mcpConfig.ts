@@ -32,9 +32,10 @@ import {
 import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
-  CURSOR_AUTH_REASON,
+  CURSOR_IGNORED_FIELDS,
   cursorValuePlaceholder,
   folderAliases,
+  ignoredFieldReason,
   needsValuesReason,
   xumStdioEntry,
   type McpDialect,
@@ -340,7 +341,6 @@ function stdioEnvError(
   return undefined;
 }
 
-/** Placeholder values for a plugin's MCP file: the aliases expand only in their dialect. */
 function pluginPlaceholderValues(
   plugin: AgentPluginInfo,
   dataPath: string
@@ -635,7 +635,6 @@ async function normalizeServerEntry(
   return result;
 }
 
-/** Why a dialect skips an entry before translation. */
 function dialectEntrySkip(
   rawEntry: Record<string, unknown>,
   dialect: McpDialect | undefined
@@ -649,11 +648,6 @@ function dialectEntrySkip(
   return placeholder === undefined ? undefined : needsValuesReason(placeholder);
 }
 
-/**
- * A server entry in the Agent Plugins shape. A Cursor entry's `auth` block is dropped and named
- * (CURSOR_AUTH_REASON), and a Cursor server must not forward the folder aliases that Xum supplies
- * to it.
- */
 function translateDialectEntry(
   rawEntry: Record<string, unknown>,
   dialect: McpDialect | undefined
@@ -661,9 +655,13 @@ function translateDialectEntry(
   if (dialect === undefined)
     return { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
   if (dialect !== "cursor") return translateCodexMcpEntry(rawEntry);
-  const { auth, ...entry } = rawEntry;
+  const dropped = CURSOR_IGNORED_FIELDS.filter((field) => rawEntry[field] !== undefined);
+  const droppedKeys = new Set<string>(dropped);
+  const entry = Object.fromEntries(
+    Object.entries(rawEntry).filter(([key]) => !droppedKeys.has(key))
+  );
   const translated = translateCodexMcpEntry(entry, Object.keys(folderAliases("cursor")));
-  if (auth !== undefined) translated.warnings.push(CURSOR_AUTH_REASON);
+  translated.warnings.push(...dropped.map(ignoredFieldReason));
   return translated;
 }
 
@@ -752,13 +750,11 @@ export async function loadPluginMcpServers(
   // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
   // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
   // from the lexical selection (a contained symlink keeps the dialect); a
-  // root mcp.json stays strict. A Claude `.mcp.json` and a Cursor `mcp.json`
-  // have the Codex shape, plus their names for the plugin folders
-  // (mcpDialects.ts).
-  const codexDialect = plugin.mcpConfigDialect !== undefined;
+  // root mcp.json stays strict.
+  const codexShape = plugin.mcpConfigDialect !== undefined;
   // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
   const doc: Record<string, unknown> =
-    codexDialect && !("mcpServers" in raw)
+    codexShape && !("mcpServers" in raw)
       ? (({ $schema, ...servers }) => ({
           ...($schema !== undefined ? { $schema } : {}),
           mcpServers: servers,
@@ -773,7 +769,7 @@ export async function loadPluginMcpServers(
   }
   if (
     doc.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
-    !(codexDialect && doc.$schema === undefined)
+    !(codexShape && doc.$schema === undefined)
   ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
