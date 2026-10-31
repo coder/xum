@@ -5,6 +5,9 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -398,6 +401,161 @@ describe("agentDefinitionsService", () => {
       }
     }
   );
+
+  describe("ai.settingsBase (Cursor model: fast)", () => {
+    async function listWithPluginAgent(
+      agentFile: string,
+      agentAiDefaults?: AgentAiDefaults,
+      projectAgents: Record<string, string> = {},
+      globalAgents: Record<string, string> = {}
+    ) {
+      using project = new DisposableTempDir("agent-list-settings-base");
+      using home = new DisposableTempDir("agent-list-settings-base-home");
+      const projectRoot = path.join(project.path, ".xum", "agents");
+      await fs.mkdir(projectRoot, { recursive: true });
+      for (const [id, frontmatter] of Object.entries(projectAgents)) {
+        await fs.writeFile(
+          path.join(projectRoot, `${id}.md`),
+          `---\nname: ${id}\n${frontmatter}---\nBody.`
+        );
+      }
+      await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+      for (const [id, frontmatter] of Object.entries(globalAgents)) {
+        await fs.writeFile(
+          path.join(home.path, "agents", `${id}.md`),
+          `---\nname: ${id}\n${frontmatter}---\nBody.`
+        );
+      }
+      const agentsDir = path.join(home.path, "plugins", "kit", "agents");
+      await fs.mkdir(agentsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(home.path, "plugins", "kit", "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "kit",
+        })
+      );
+      await fs.writeFile(path.join(agentsDir, "ci-watcher.md"), agentFile);
+      const config = new Config(home.path);
+      if (agentAiDefaults != null) {
+        await config.editConfig((cfg) => ({ ...cfg, agentAiDefaults }));
+      }
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = home.path;
+      try {
+        return await listAgentDefinitions(projectListContext(config), {
+          projectPath: project.path,
+        });
+      } finally {
+        if (previousRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousRoot;
+      }
+    }
+
+    const CURSOR_CI_WATCHER =
+      "---\nname: ci-watcher\ndescription: Watch CI\nmodel: fast\nis_background: true\n---\nWatch CI.\n";
+
+    test("a Cursor fast agent lists Explore's layers, its settings base and its background hint", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER);
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher?.pluginName).toBe("kit");
+      expect(watcher?.base).toBe("exec");
+      expect(watcher?.aiSettingsBase).toBe("explore");
+      expect(watcher?.backgroundHint).toBe(true);
+      expect(watcher?.aiLayers?.ancestors.map((layer) => layer.agentId)).toEqual([
+        "explore",
+        "exec",
+      ]);
+    });
+
+    test("keeps the settings base when Explore is disabled, and the renderer still reaches Exec", async () => {
+      const agentAiDefaults: AgentAiDefaults = {
+        explore: { enabled: false },
+        exec: { modelString: "custom:m-exec" },
+      };
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, agentAiDefaults);
+      expect(agents.some((agent) => agent.id === "explore")).toBe(false);
+      expect(agents.find((agent) => agent.id === "ci-watcher")?.aiSettingsBase).toBe("explore");
+      // A run resolves [explore, exec]; the renderer's walk must not stop at the unlisted Explore.
+      expect(
+        resolveConfiguredAiDefaults("ci-watcher", agentAiDefaults, getAgentAiSettingsBases(agents))
+          .modelString
+      ).toBe("custom:m-exec");
+    });
+
+    test("lists a global agent's settings-base layers past a project agent of that ID", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, undefined, {
+        explore: "base: exec\nai:\n  model: custom:m-project\n",
+      });
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher?.scope).toBe("global");
+      expect(watcher?.aiSettingsBase).toBe("explore");
+      // The built-in Explore's layer, not the project explore.md's model.
+      expect(watcher?.aiLayers?.ancestors).toEqual([
+        { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+        { agentId: "exec" },
+      ]);
+    });
+
+    test("leaves out a settings base that names a missing agent", async () => {
+      const agents = await listWithPluginAgent(
+        "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: missing-agent\n---\nWatch CI.\n"
+      );
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher).toBeDefined();
+      expect(watcher?.aiSettingsBase).toBeUndefined();
+      expect(watcher?.backgroundHint).toBeUndefined();
+      expect(watcher?.aiLayers?.ancestors[0]?.agentId).toBe("exec");
+    });
+
+    test("leaves out a nested settings base, so the renderer walk follows base as a run does", async () => {
+      const agentAiDefaults: AgentAiDefaults = {
+        helper: { modelString: "custom:m-helper" },
+        explore: { modelString: "custom:m-explore" },
+        exec: { modelString: "custom:m-exec" },
+      };
+      const warn = spyOn(log, "warn");
+      try {
+        const agents = await listWithPluginAgent(
+          "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: helper\n---\nWatch CI.\n",
+          agentAiDefaults,
+          {},
+          // Global, as the plugin agent is: a global agent's settings base skips project agents.
+          { helper: "base: exec\nai:\n  settingsBase: explore\n" }
+        );
+        const watcher = agents.find((agent) => agent.id === "ci-watcher");
+        expect(watcher?.aiSettingsBase).toBeUndefined();
+        expect(watcher?.aiLayers?.ancestors.map((layer) => layer.agentId)).toEqual(["exec"]);
+        expect(agents.find((agent) => agent.id === "helper")?.aiSettingsBase).toBe("explore");
+        expect(
+          resolveConfiguredAiDefaults(
+            "ci-watcher",
+            agentAiDefaults,
+            getAgentAiSettingsBases(agents)
+          ).modelString
+        ).toBe("custom:m-exec");
+        expect(warn).toHaveBeenCalledWith("settingsBase ignored", {
+          agentId: "ci-watcher",
+          settingsBase: "helper",
+          reason: "nested",
+        });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    test("leaves out both settings bases of a loop made only of settingsBase links", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, undefined, {
+        a: "base: exec\nai:\n  settingsBase: b\n",
+        b: "base: exec\nai:\n  settingsBase: a\n",
+      });
+      for (const id of ["a", "b"]) {
+        const agent = agents.find((listed) => listed.id === id);
+        expect(agent).toBeDefined();
+        expect(agent?.aiSettingsBase).toBeUndefined();
+      }
+    });
+  });
 
   test("project agents override global agents", async () => {
     using project = new DisposableTempDir("agent-defs-project");

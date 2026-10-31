@@ -1,6 +1,6 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat } from "@/common/utils/ai/models";
-import type { AiSettingSource } from "@/common/types/agentAiSettings";
+import type { AiSettingSource, ResolveAgentAiSettingsInput } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -20,6 +20,30 @@ export type WorkspaceAISettingsCache = Partial<
 
 function normalizeAgentId(agentId: string): string {
   return normalizeWorkspaceAgentId(agentId, "exec");
+}
+
+/**
+ * The model an agent's Settings card inherits, its own Settings model left out: the shared
+ * resolver over the layers a run resolves (agents.list `aiLayers`), so each layer's Settings and
+ * frontmatter rank as in the backend, and a settings base has replaced the bases that the merged
+ * `aiDefaults` still hold. Undefined when no Settings entry or definition sets one.
+ */
+export function resolveInheritedLayerModel(
+  agentId: string,
+  layers: Pick<ResolveAgentAiSettingsInput, "targetDefinitionAiDefaults" | "ancestors">,
+  agentAiDefaults: AgentAiDefaults
+): string | undefined {
+  const resolved = resolveAgentAiSettings({
+    targetAgentId: agentId,
+    profile: "interactive",
+    agentAiDefaults: {
+      ...agentAiDefaults,
+      [agentId]: { ...agentAiDefaults[agentId], modelString: undefined },
+    },
+    ...layers,
+  });
+  const tier = resolved.sources.model?.tier;
+  return tier === "config" || tier === "definition" ? resolved.selected.model : undefined;
 }
 
 /**

@@ -1,14 +1,22 @@
-import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+import { describe, expect, it, spyOn } from "bun:test";
 
 import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import { log } from "@/node/services/log";
+import { DisposableTempDir } from "@/node/services/tempDir";
 
+import * as agentDefinitionsService from "./agentDefinitionsService";
 import {
   loadAgentDefinitionAiLayers,
   resolveChainAgentCacheTtl,
   resolveNodeAgentAiSettings,
   resolveNodeAgentAiSettingsWithLayers,
+  type ResolveNodeAgentAiSettingsParams,
 } from "./resolveNodeAgentAiSettings";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
@@ -16,6 +24,7 @@ import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFac
 // Unrecognized providers avoid capability clamping (see resolveAgentAiSettings.test.ts).
 const MODEL_A = "custom:model-a";
 const MODEL_B = "custom:model-b";
+const MODEL_C = "custom:model-c";
 
 describe("collectDefinitionLayers", () => {
   it("merges same-ID scope refinements into the target layer field-wise", () => {
@@ -320,5 +329,195 @@ describe("loadAgentDefinitionAiLayers read failures (#4829)", () => {
       { abortSignal: controller.signal }
     );
     expect(aborted).toBeNull();
+  });
+});
+
+describe("resolveNodeAgentAiSettings with ai.settingsBase (Cursor model: fast)", () => {
+  const FAST = "base: exec\nai:\n  settingsBase: explore\n";
+
+  async function resolveWatcher(
+    frontmatter: string,
+    params: Pick<ResolveNodeAgentAiSettingsParams, "cfg" | "parentRuntime">,
+    otherAgents: Record<string, string> = {}
+  ) {
+    using project = new DisposableTempDir("settings-base-project");
+    using home = new DisposableTempDir("settings-base-home");
+    const agentsRoot = path.join(project.path, ".xum", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    for (const [id, agentFrontmatter] of Object.entries({
+      "ci-watcher": frontmatter,
+      ...otherAgents,
+    })) {
+      await fs.writeFile(
+        path.join(agentsRoot, `${id}.md`),
+        `---\nname: ${id}\n${agentFrontmatter}---\nBody.\n`
+      );
+    }
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      return await resolveNodeAgentAiSettings({
+        agentId: "ci-watcher",
+        profile: "subagent",
+        ...params,
+        definitionContext: {
+          runtime: new LocalRuntime(project.path),
+          workspacePath: project.path,
+          workspaceId: "ws",
+          runtimeFactory,
+        },
+      });
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
+
+  it("takes Explore's Settings model and thinking level", async () => {
+    const resolved = await resolveWatcher(FAST, {
+      cfg: {
+        agentAiDefaults: {
+          explore: { modelString: MODEL_A, thinkingLevel: "low" },
+          exec: { modelString: MODEL_B, thinkingLevel: "high" },
+        },
+      },
+    });
+    expect(resolved.selected.model).toBe(MODEL_A);
+    expect(resolved.selected.thinkingLevel).toBe("low");
+  });
+
+  it("takes the Exec model from Settings when Explore has none", async () => {
+    const resolved = await resolveWatcher(FAST, {
+      cfg: { agentAiDefaults: { exec: { modelString: MODEL_B } } },
+      parentRuntime: { model: MODEL_C },
+    });
+    expect(resolved.selected.model).toBe(MODEL_B);
+  });
+
+  it("takes the parent model when neither Explore nor Exec has one in Settings", async () => {
+    const resolved = await resolveWatcher(FAST, { cfg: {}, parentRuntime: { model: MODEL_C } });
+    expect(resolved.selected.model).toBe(MODEL_C);
+  });
+
+  it("ranks the agent's own Settings entry above Explore's", async () => {
+    const resolved = await resolveWatcher(FAST, {
+      cfg: {
+        agentAiDefaults: {
+          "ci-watcher": { modelString: MODEL_C },
+          explore: { modelString: MODEL_A },
+        },
+      },
+    });
+    expect(resolved.selected.model).toBe(MODEL_C);
+  });
+
+  const HELPER = { helper: "base: exec\nai:\n  settingsBase: explore\n" };
+
+  it.each([
+    ["missing-agent", "missing", {}],
+    ["ci-watcher", "self", {}],
+    ["helper", "nested", HELPER],
+    // agents.list cannot resolve an agent whose base is missing, so a run ignores it as well.
+    ["broken", "incomplete", { broken: "base: missing-base\n" }],
+  ])("ignores settingsBase %s with a warning", async (settingsBase, reason, otherAgents) => {
+    const warn = spyOn(log, "warn");
+    try {
+      const cfg = {
+        agentAiDefaults: {
+          explore: { modelString: MODEL_A },
+          exec: { modelString: MODEL_B },
+          helper: { modelString: MODEL_C },
+        },
+      };
+      const ignored = await resolveWatcher(
+        `base: exec\nai:\n  settingsBase: ${settingsBase}\n`,
+        { cfg },
+        otherAgents
+      );
+      const without = await resolveWatcher("base: exec\n", { cfg }, otherAgents);
+      expect(ignored).toEqual(without);
+      expect(ignored.selected.model).toBe(MODEL_B);
+      expect(warn).toHaveBeenCalledWith("settingsBase ignored", {
+        agentId: "ci-watcher",
+        settingsBase,
+        reason,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("ignores the settings base of an agent whose own base is missing", async () => {
+    const warn = spyOn(log, "warn");
+    try {
+      const cfg = { agentAiDefaults: { explore: { modelString: MODEL_A } } };
+      const params = { cfg, parentRuntime: { model: MODEL_C } };
+      const ignored = await resolveWatcher(
+        "base: missing-base\nai:\n  settingsBase: explore\n",
+        params
+      );
+      expect(ignored).toEqual(await resolveWatcher("base: missing-base\n", params));
+      expect(ignored.selected.model).toBe(MODEL_C);
+      expect(warn).toHaveBeenCalledWith("settingsBase ignored", {
+        agentId: "ci-watcher",
+        settingsBase: "explore",
+        reason: "incomplete",
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads a global agent's settings base past a project agent of that ID", async () => {
+    using project = new DisposableTempDir("settings-base-scope-project");
+    using home = new DisposableTempDir("settings-base-scope-home");
+    await fs.mkdir(path.join(project.path, ".xum", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(project.path, ".xum", "agents", "explore.md"),
+      `---\nname: Explore\nbase: exec\nai:\n  model: ${MODEL_A}\n---\nExplore.\n`
+    );
+    await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(home.path, "agents", "ci-watcher.md"),
+      "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: explore\n---\nWatch CI.\n"
+    );
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const resolved = await resolveNodeAgentAiSettings({
+        agentId: "ci-watcher",
+        profile: "subagent",
+        cfg: {},
+        parentRuntime: { model: MODEL_C },
+        definitionContext: {
+          runtime: new LocalRuntime(project.path),
+          workspacePath: project.path,
+          workspaceId: "ws",
+          runtimeFactory,
+        },
+      });
+      // The built-in Explore sets no model: the project explore.md's model must not reach it.
+      expect(resolved.selected.model).toBe(MODEL_C);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
+  it("rethrows a transport failure while reading the settings-base agent", async () => {
+    const unreachable = new RuntimeError("ssh: Connection reset by peer", "network");
+    const realRead = agentDefinitionsService.readAgentDefinition;
+    const read = spyOn(agentDefinitionsService, "readAgentDefinition").mockImplementation(
+      (runtime, workspacePath, agentId, options) =>
+        agentId === "explore"
+          ? Promise.reject(unreachable)
+          : realRead(runtime, workspacePath, agentId, options)
+    );
+    try {
+      const outcome = await resolveWatcher(FAST, { cfg: {} }).catch((error: unknown) => error);
+      expect(outcome).toBe(unreachable);
+    } finally {
+      read.mockRestore();
+    }
   });
 });
