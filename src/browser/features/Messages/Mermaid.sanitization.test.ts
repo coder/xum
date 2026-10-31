@@ -488,6 +488,11 @@ describe("sanitizeMermaidSvg", () => {
   it.each([
     ["an SVG <style>", `<style>${stylesheet}</style>`],
     ["a prefixed <style>", `<x:style xmlns:x="http://www.w3.org/2000/svg">${stylesheet}</x:style>`],
+    // JavaScript's \s matches U+1680, but XML reads it as part of the prefix.
+    [
+      "a <style> whose prefix holds U+1680",
+      `<x\u1680:style xmlns:x\u1680="http://www.w3.org/2000/svg">${stylesheet}</x\u1680:style>`,
+    ],
     // The HTML parser that inserts the output lowercases tag names, so this becomes a live <style>.
     ["an uppercase <STYLE>", `<STYLE>${stylesheet}</STYLE>`],
     [
@@ -495,8 +500,14 @@ describe("sanitizeMermaidSvg", () => {
       `<foreignObject><style xmlns="${XHTML}">${stylesheet}</style></foreignObject>`,
     ],
     ["a <style> in <desc>", `<desc><style>${stylesheet}</style></desc>`],
-  ])("returns null for %s", (_case, element) => {
-    expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
+  ])("returns null for %s before DOMParser reads it", (_case, element) => {
+    const parse = spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   // Chromium nests each var() when it computes styles after insert, in time that doubles with each

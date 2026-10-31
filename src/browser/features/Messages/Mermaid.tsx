@@ -533,8 +533,9 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
   // that the XML parser read as their data would become live elements.
   if (/<[!?]/.test(svg)) return null;
   // DOMParser parses the text of a <style> too, and the scan below reads only attributes. Pele
-  // writes no <style>, so this refuses one in any namespace or case.
-  if (/<(?:[^\s/<>]*:)?style[\s/>]/i.test(svg)) return null;
+  // writes no <style>, so this refuses one in any namespace or case. The name ends at XML
+  // whitespace, not \s: a prefix such as x\u1680 is one XML name.
+  if (/<(?:[^ \t\n\r/<>]*:)?style[ \t\n\r/>]/i.test(svg)) return null;
   // Chromium parses each style while DOMParser builds the tree, in time that doubles with each
   // color-mix() nested around an invalid value, so this check must run first. Pele passes such
   // values from a chart unchanged.
