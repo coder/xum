@@ -2419,6 +2419,25 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("without mcpServers, a Cursor package loads mcp.json and never .mcp.json", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using codexSibling = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ".mcp.json": servers,
+    });
+    expect(codexSibling.plugin.mcpConfigPath).toBeUndefined();
+    using cursorDefault = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "mcp.json": servers,
+      ".mcp.json": servers,
+    });
+    const { plugin, relative } = cursorDefault;
+    expect([relative(plugin.mcpConfigPath ?? ""), plugin.mcpConfigDialect]).toEqual([
+      "mcp.json",
+      "cursor",
+    ]);
+  });
+
   test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),

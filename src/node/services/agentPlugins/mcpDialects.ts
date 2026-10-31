@@ -66,8 +66,10 @@ export function xumStdioEntry(
   return rewritten;
 }
 
-// A `${NAME}`, `${NAME:-default}` or `${env:NAME}`: how a Cursor `mcp.json` asks for a user value.
-const PLACEHOLDER_PATTERN = /\$\{((?:env:)?[A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}/g;
+// Any `${...}`: Cursor interpolates `${NAME}`, `${NAME:-default}`, `${env:NAME}` (names such as
+// `api-key` included), `${userHome}` and `${/}`. The captured name stops before a `:` other than
+// `env:`, so the reported text never includes a default.
+const PLACEHOLDER_PATTERN = /\$\{((?:env:)?[^}:]*)[^}]*\}/g;
 
 /**
  * The first placeholder in `values` that Xum leaves as written, by name only: a default can be a

@@ -1303,7 +1303,8 @@ async function resolvePackageMcpConfig(args: {
   if (args.cursor !== undefined) {
     const mcp = await resolvePluginMcpConfig({
       rootReal: args.rootReal,
-      declared: args.cursor.mcpConfigPath,
+      // Cursor discovers only `mcp.json`; a `.mcp.json` next to it belongs to another tool.
+      declared: args.cursor.mcpConfigPath ?? "mcp.json",
       manifestDialect: "cursor",
       resolveComponent: args.resolveComponent,
     });

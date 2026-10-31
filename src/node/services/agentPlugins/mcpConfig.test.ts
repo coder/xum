@@ -478,6 +478,8 @@ describe("loadPluginMcpServers", () => {
       fallback: { type: "http", url: "https://x.example/${PATH_SEGMENT:-s3cret-default}" },
       // Cursor reads ${env:NAME} from its environment; Xum never does.
       hostEnv: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
+      hyphenEnv: { command: "npx", env: { API_KEY: "${env:api-key}" } },
+      separator: { command: "npx", args: ["tools${/}server.py"] },
       plain: { type: "http", url: "https://attio.example/mcp" },
     });
 
@@ -512,6 +514,14 @@ describe("loadPluginMcpServers", () => {
       [
         "warning",
         "mcp.json server 'hostEnv': needs values not supported in Xum (${env:GITHUB_TOKEN}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'hyphenEnv': needs values not supported in Xum (${env:api-key}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'separator': needs values not supported in Xum (${/}); skipping this server",
       ],
     ]);
   });
