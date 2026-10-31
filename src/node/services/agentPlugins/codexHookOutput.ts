@@ -5,8 +5,8 @@
  * Two failure kinds:
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
- *   `additionalProperties: false`), a wrong type, a value outside an enum, or JSON text that is
- *   not an object. Nothing of it applies.
+ *   `additionalProperties: false`), a wrong type, a value outside an enum, or text that starts
+ *   with `{` or `[` and is not a JSON object. Nothing of it applies.
  * - A result with `invalid` set parsed but breaks a semantic rule (a reason without a decision, a
  *   field the event does not support). Codex still shows its `systemMessage` and ignores the rest.
  *
