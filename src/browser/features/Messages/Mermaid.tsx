@@ -1,13 +1,18 @@
 import type { CSSProperties, ReactNode } from "react";
 import React, { useContext, useEffect, useId, useRef, useState } from "react";
-import mermaid from "mermaid";
+import katex from "katex";
+import { render as renderPele, type MathMarkup } from "pele";
+import assert from "@/common/utils/assert";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import {
+  MERMAID_BUTTON_HEIGHT,
+  MERMAID_BUTTON_INSET,
   MERMAID_CONTAINER_STYLE,
   MERMAID_FRAME_STYLE,
   MERMAID_PENDING_STYLE,
@@ -18,28 +23,9 @@ const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
-
-mermaid.initialize({
-  startOnLoad: false,
-  theme: "dark",
-  layout: "elk",
-  // Security hardening: Mermaid content is untrusted (comes from markdown),
-  // so keep Mermaid's strict sanitization and disallow scriptable links.
-  securityLevel: "strict",
-  fontFamily: "var(--font-monospace)",
-  darkMode: true,
-  elk: {
-    nodePlacementStrategy: "LINEAR_SEGMENTS",
-    mergeEdges: true,
-  },
-  wrap: true,
-  markdownAutoWrap: true,
-  flowchart: {
-    nodeSpacing: 60,
-    curve: "linear",
-    defaultRenderer: "elk",
-  },
-});
+// Below this container width Pele may turn wide layouts vertical, so the diagram also drops
+// the height clamp that would shrink a tall layout until its labels are unreadable.
+const NARROW_DIAGRAM_WIDTH = 640;
 
 function decodeNumericCodePoint(codePoint: number): string {
   if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
@@ -108,78 +94,138 @@ function canonicalizeUrlForSchemeCheck(value: string): string {
   return canonical;
 }
 
-export function sanitizeMermaidSvg(svg: string): string | null {
-  // Validate the SVG structure strictly so genuinely malformed input still
-  // fails closed. The complication: Mermaid embeds HTML labels inside
-  // <foreignObject> (wrap/markdownAutoWrap), and that HTML legitimately uses
-  // void elements like bare <br>. Strict image/svg+xml DOMParser rejects such
-  // SVG with a parsererror, which used to make every wrapped-label diagram
-  // surface as "Mermaid returned invalid SVG output".
-  //
-  // Approach:
-  //   1. Try strict XML parsing on the original. If it succeeds, the input is
-  //      well-formed SVG; we're done.
-  //   2. Otherwise, replace each <foreignObject>...</foreignObject> subtree
-  //      with a self-closed placeholder and re-parse strictly. If that
-  //      succeeds, the *only* XML invalidity lives inside foreignObject HTML
-  //      (the known idiom we want to tolerate); we then materialize the
-  //      original via the HTML parser, which handles SVG-plus-embedded-HTML
-  //      the same way the browser does when innerHTML'd at the render sink.
-  //   3. If stripping foreignObject doesn't make the outer structure parse,
-  //      the malformed input is outside the wrapped-label case — reject it.
-  //
-  // This keeps the original "reject malformed SVG" contract intact while
-  // accepting Mermaid's legitimate output.
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(svg, "image/svg+xml");
-  const xmlHasError = xmlDoc.querySelector("parsererror") !== null;
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
+// The elements KaTeX's MathML output uses (MathNodeType in katex/src/mathMLTree.ts), minus
+// mglyph, which loads an image. The name matters, not only the namespace: inside <mtext> the
+// HTML parser that inserts the SVG builds HTML elements, so a MathML-namespace <img> there
+// becomes a real image.
+const MATHML_LABEL_ELEMENTS = new Set([
+  "math",
+  "semantics",
+  "annotation",
+  "mrow",
+  "mi",
+  "mn",
+  "mo",
+  "mtext",
+  "mspace",
+  "msup",
+  "msub",
+  "msubsup",
+  "mfrac",
+  "mroot",
+  "msqrt",
+  "mover",
+  "munder",
+  "munderover",
+  "mtable",
+  "mtr",
+  "mtd",
+  "mlabeledtr",
+  "menclose",
+  "mstyle",
+  "mpadded",
+  "mphantom",
+]);
 
-  let svgRoot: Element | null;
-  if (!xmlHasError) {
-    svgRoot =
-      xmlDoc.documentElement.tagName.toLowerCase() === "svg" ? xmlDoc.documentElement : null;
-  } else {
-    // Strip foreignObject subtrees and validate the outer structure strictly.
-    // Non-greedy match; Mermaid does not nest foreignObject, and over-stripping
-    // would only cause us to reject more aggressively (acceptable for a
-    // validation step).
-    const strippedForValidation = svg.replace(
-      /<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi,
-      "<foreignObject/>"
-    );
-    if (strippedForValidation === svg) {
-      // No foreignObject in the input, so the XML error isn't the known idiom.
-      return null;
-    }
-    const revalidated = parser.parseFromString(strippedForValidation, "image/svg+xml");
-    if (revalidated.querySelector("parsererror") !== null) {
-      // Outer structure is still malformed — fail closed.
-      return null;
-    }
-    if (revalidated.documentElement.tagName.toLowerCase() !== "svg") {
-      return null;
-    }
-    // Outer SVG is well-formed XML; only foreignObject HTML was problematic.
-    // Materialize the original tree via the HTML parser so embedded labels
-    // survive intact.
-    const htmlDoc = parser.parseFromString(svg, "text/html");
-    svgRoot = htmlDoc.querySelector("svg");
+/** A <math> tree that holds only the elements KaTeX emits. */
+function isKatexMathml(math: Element | null): boolean {
+  if (math?.localName.toLowerCase() !== "math") return false;
+  // Lowercase like the HTML parser does with MathML tag names.
+  return [math, ...Array.from(math.querySelectorAll("*"))].every(
+    (element) =>
+      element.namespaceURI === MATHML_NS &&
+      MATHML_LABEL_ELEMENTS.has(element.localName.toLowerCase())
+  );
+}
+
+/** Pele wraps the MathML that renderMathLabel returns in exactly this shape. */
+function isPeleMathLabel(foreignObject: Element): boolean {
+  const div = foreignObject.firstElementChild;
+  return (
+    foreignObject.getAttribute("class") === "pele-math" &&
+    foreignObject.childElementCount === 1 &&
+    div?.namespaceURI === XHTML_NS &&
+    div.localName === "div" &&
+    div.childElementCount === 1 &&
+    Array.from(div.attributes, (attribute) => attribute.name).join() === "xmlns,style" &&
+    isKatexMathml(div.firstElementChild)
+  );
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+// Every SVG element Pele 1.9 emitted for the pele.run examples of all 33 diagram types. It also
+// emits <a> and <image>, but only with the links and images that renderMermaidSvg turns off.
+// Diagrams lose any element missing here, so re-check the list when Pele is upgraded.
+// Lowercase, because the HTML parser that inserts the output lowercases tag names.
+const PELE_SVG_ELEMENTS = new Set([
+  "circle",
+  "defs",
+  "desc",
+  "ellipse",
+  "g",
+  "lineargradient",
+  "path",
+  "polygon",
+  "rect",
+  "stop",
+  "svg",
+  "text",
+  "title",
+  "tspan",
+]);
+
+/**
+ * Removes every element that Pele does not emit, keeping only Pele's math labels as
+ * foreignObject. A blocklist leaks: <set> can write a javascript: href, and the HTML parser
+ * ends the <svg> at an SVG-namespace <p>, so the elements after it become HTML.
+ */
+function removeUnknownElements(parent: Element): void {
+  for (const child of Array.from(parent.children)) {
+    const svgName = child.namespaceURI === SVG_NS ? child.localName.toLowerCase() : "";
+    if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
+    if (PELE_SVG_ELEMENTS.has(svgName)) removeUnknownElements(child);
+    else child.remove();
   }
+}
 
-  if (!svgRoot) {
+/**
+ * Keeps only element and text children. Pele emits no comments, processing instructions or
+ * CDATA. The HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`,
+ * so markup that the XML parser read as their data becomes live elements.
+ */
+function removeNonElementNodes(elements: Element[]): void {
+  for (const element of elements) {
+    for (const child of Array.from(element.childNodes)) {
+      if (child.nodeType !== child.ELEMENT_NODE && child.nodeType !== child.TEXT_NODE) {
+        child.remove();
+      }
+    }
+  }
+}
+
+export function sanitizeMermaidSvg(svg: string): string | null {
+  // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
+  // fail closed.
+  const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
+  if (xmlDoc.querySelector("parsererror") !== null) {
+    return null;
+  }
+  const svgRoot = xmlDoc.documentElement;
+  if (svgRoot.tagName.toLowerCase() !== "svg") {
     return null;
   }
 
-  // Defense in depth: remove active content containers and sanitize remaining attributes.
-  // NOTE: Keep <foreignObject> because Mermaid uses it for wrapped node labels.
-  svgRoot.querySelectorAll("script,iframe,object,embed").forEach((node) => {
-    node.remove();
-  });
+  // Defense in depth: keep only the elements and text Pele emits, and sanitize the remaining
+  // attributes.
+  removeUnknownElements(svgRoot);
 
   const urlAttributes = new Set(["href", "xlink:href", "src", "action", "formaction"]);
   const blockedSchemes = ["javascript:", "vbscript:", "data:text/html"];
 
   const elementsToScan: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
+  removeNonElementNodes(elementsToScan);
   elementsToScan.forEach((element) => {
     for (const attribute of Array.from(element.attributes)) {
       const attributeName = attribute.name.toLowerCase();
@@ -202,6 +248,128 @@ export function sanitizeMermaidSvg(svg: string): string | null {
   return svgRoot.outerHTML;
 }
 
+/** Typesets a `$$...$$` label as MathML. Null makes Pele show the TeX source. */
+function renderMathLabel(tex: string, size: number): MathMarkup | null {
+  let markup: string;
+  try {
+    markup = katex.renderToString(tex, { displayMode: true, output: "mathml", throwOnError: true });
+  } catch {
+    return null;
+  }
+
+  const probe = document.createElement("div");
+  probe.style.cssText =
+    "position:absolute;left:-9999px;visibility:hidden;display:inline-block;white-space:nowrap";
+  probe.style.fontSize = `${size}px`;
+  // SECURITY AUDIT: tex is untrusted chart text. KaTeX escapes it, and its default
+  // `trust: false` rejects \href, \url, \includegraphics and \html*. sanitizeMermaidSvg()
+  // still checks the markup Pele embeds.
+  probe.innerHTML = markup;
+  document.body.append(probe);
+  try {
+    const math = probe.querySelector("math");
+    assert(math, "KaTeX MathML output has a <math> element");
+    const { width, height } = math.getBoundingClientRect();
+    // Not outerHTML: sanitizeMermaidSvg() parses the SVG as strict XML, which has no HTML
+    // named entities.
+    return { html: new XMLSerializer().serializeToString(math), width, height };
+  } finally {
+    probe.remove();
+  }
+}
+
+/** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
+async function renderMermaidSvg(
+  chart: string,
+  idPrefix: string,
+  maxWidth: number | undefined
+): Promise<string> {
+  const rootStyle = window.getComputedStyle(document.documentElement);
+  // Measure with the same fonts the .mermaid-container CSS draws with.
+  const fontFamily = rootStyle.getPropertyValue("--font-primary").trim() || undefined;
+  const fontFamilyMono = rootStyle.getPropertyValue("--font-monospace").trim() || undefined;
+  const fontSize = 14;
+
+  // Pele measures labels with canvas when it renders, so the fonts must be loaded first
+  // or boxes are sized for the fallback font. fonts.ready does not start loading a face
+  // that nothing on the page uses yet, so request each family. A failed load falls back
+  // to measuring whatever font is there. happy-dom has no document.fonts.
+  if ("fonts" in document) {
+    const families = [fontFamily, fontFamilyMono].filter((family) => family !== undefined);
+    await Promise.allSettled(
+      families.map((family) => document.fonts.load(`${fontSize}px ${family}`))
+    );
+    await document.fonts.ready;
+  }
+
+  const { svg } = renderPele(chart, {
+    idPrefix,
+    fontFamily,
+    fontFamilyMono,
+    fontSize,
+    maxWidth,
+    directionBreakpoint: NARROW_DIAGRAM_WIDTH,
+    // Diagram text is untrusted model output: no clickable links, and no images,
+    // which would fetch from the network as soon as the SVG is inserted.
+    links: false,
+    images: false,
+    math: renderMathLabel,
+  });
+
+  const sanitizedSvg = sanitizeMermaidSvg(svg);
+  if (!sanitizedSvg) {
+    throw new Error("Diagram renderer returned invalid SVG output");
+  }
+  return sanitizedSvg;
+}
+
+/** Zero width (hidden, or not laid out yet) means unknown: render the natural layout. */
+function diagramLayout(containerSize: { width: number } | null) {
+  const width = containerSize?.width ?? 0;
+  const isNarrow = width > 0 && width < NARROW_DIAGRAM_WIDTH;
+  const style: CSSProperties = isNarrow ? { ["--diagram-max-height" as string]: "none" } : {};
+  return { maxWidth: width > 0 ? width : undefined, style };
+}
+
+/**
+ * Renders chart at the width of the element that containerRef points to, so each frame
+ * (inline and the expand dialog) lays the diagram out for its own width. A chart that
+ * fails to render keeps the last valid diagram on screen.
+ */
+function useDiagramSvg(chart: string, idPrefix: string) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const layout = diagramLayout(useResizeObserver(containerRef));
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [rendered, setRendered] = useState<{ svg: string; chart: string } | null>(null);
+  const [error, setError] = useState<{ chart: string; message: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const renderDiagram = async () => {
+      try {
+        const svg = await renderMermaidSvg(chart, idPrefix, layout.maxWidth);
+        if (cancelled) return;
+
+        setRendered({ svg, chart });
+        setError(null);
+      } catch (err) {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : "Failed to render diagram";
+        setError({ chart, message });
+      }
+    };
+
+    void renderDiagram();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chart, idPrefix, layout.maxWidth]);
+
+  return { containerRef, layoutStyle: layout.style, rendered, error };
+}
+
 function normalizeDiagramZoom(value: number): number {
   if (!Number.isFinite(value)) {
     return DEFAULT_ZOOM;
@@ -212,10 +380,12 @@ function normalizeDiagramZoom(value: number): number {
 
 // Common button styles
 const getButtonStyle = (disabled = false): CSSProperties => ({
-  background: disabled ? "rgba(255, 255, 255, 0.05)" : "rgba(255, 255, 255, 0.1)",
-  border: "1px solid rgba(255, 255, 255, 0.2)",
+  // Theme tokens, not fixed white, so the buttons stay visible in the light themes (#7821).
+  background: "var(--color-background)",
+  border: "1px solid var(--color-border-subtle)",
   color: disabled ? "var(--color-text-secondary)" : "var(--color-text)",
-  padding: "6px 10px",
+  height: `${MERMAID_BUTTON_HEIGHT}px`,
+  padding: "0 10px",
   cursor: disabled ? "not-allowed" : "pointer",
   borderRadius: "4px",
   fontSize: "16px",
@@ -273,8 +443,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
             position: "absolute",
             top: "16px",
             right: "16px",
-            background: "rgba(255, 255, 255, 0.1)",
-            border: "1px solid rgba(255, 255, 255, 0.2)",
+            background: "var(--color-background)",
+            border: "1px solid var(--color-border-subtle)",
             color: "var(--color-text)",
             padding: "8px 16px",
             cursor: "pointer",
@@ -290,24 +460,46 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
   );
 };
 
+/** The expand dialog renders its own copy of an already valid chart, at the dialog's width. */
+const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
+  const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
+  return (
+    <div
+      ref={containerRef}
+      className="mermaid-container mermaid-modal"
+      style={{
+        background: "var(--color-code-bg)",
+        padding: "24px",
+        borderRadius: "8px",
+        minWidth: "80vw",
+        minHeight: "60vh",
+      }}
+      // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
+      dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
+    />
+  );
+};
+
 // Mermaid diagram component
 export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const { isStreaming } = useContext(StreamingContext);
-  const modalContainerRef = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  // Keep the source and SVG together while a newer chart is pending or invalid.
-  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
-    null
-  );
-  const svg = renderedDiagram?.svg ?? "";
-  const stableId = useId();
+  // Each diagram needs its own prefix: inline SVG ids (markers, clip paths) share the document.
+  const idPrefix = `mermaid-${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
 
   // Debounce chart changes to avoid flickering during streaming
   const [debouncedChart, setDebouncedChart] = useState(chart);
+  const {
+    containerRef,
+    layoutStyle,
+    rendered: renderedDiagram,
+    error: renderError,
+  } = useDiagramSvg(debouncedChart, idPrefix);
+  const svg = renderedDiagram?.svg ?? "";
+  // An error belongs to the chart that failed, so a newer chart hides it at once instead of
+  // flashing it at the end of a stream.
+  const error = renderError?.chart === chart ? renderError.message : null;
   useEffect(() => {
-    // Clear stale errors when chart changes - avoids error flash at end of stream
-    setError(null);
     const timer = setTimeout(() => setDebouncedChart(chart), 350);
     return () => clearTimeout(timer);
   }, [chart]);
@@ -335,53 +527,6 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     }
   };
 
-  useEffect(() => {
-    // Use stable ID to avoid ELK layout recalculating from scratch each render
-    const id = `mermaid-${stableId.replace(/:/g, "")}`;
-    let cancelled = false;
-
-    const renderDiagram = async () => {
-      try {
-        // Parse first to validate syntax without rendering
-        await mermaid.parse(debouncedChart);
-
-        // If parse succeeds, render the diagram
-        const { svg: renderedSvg } = await mermaid.render(id, debouncedChart);
-        if (cancelled) return;
-
-        const sanitizedSvg = sanitizeMermaidSvg(renderedSvg);
-        if (!sanitizedSvg) {
-          throw new Error("Mermaid returned invalid SVG output");
-        }
-
-        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
-        setError(null);
-      } catch (err) {
-        if (cancelled) return;
-
-        // Don't remove elements by ID - with stable IDs, we'd remove the last valid render
-        // Mermaid error artifacts are cleaned up by subsequent successful renders
-
-        setError(err instanceof Error ? err.message : "Failed to render diagram");
-        // Don't clear SVG - keep showing last valid render during errors
-      }
-    };
-
-    void renderDiagram();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedChart, stableId]);
-
-  // Update modal container when opened
-  useEffect(() => {
-    if (isModalOpen && modalContainerRef.current && svg) {
-      // SECURITY AUDIT: svg state only stores sanitizeMermaidSvg() output.
-      modalContainerRef.current.innerHTML = svg;
-    }
-  }, [isModalOpen, svg]);
-
   if (error && !isStreaming) {
     return (
       <pre
@@ -408,8 +553,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           style={{
             position: "absolute",
-            top: "8px",
-            right: "8px",
+            top: `${MERMAID_BUTTON_INSET}px`,
+            right: `${MERMAID_BUTTON_INSET}px`,
             display: "flex",
             gap: "4px",
           }}
@@ -433,6 +578,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         <div
           className="mermaid-container"
           ref={(element) => {
+            containerRef.current = element;
             if (!element) return;
             if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
             else transcriptMermaidSources.delete(element);
@@ -440,6 +586,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           style={{
             ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
+            ...layoutStyle,
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
@@ -450,19 +597,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           {showPendingPlaceholder ? MERMAID_PENDING_TEXT : null}
         </div>
       </div>
-      {isModalOpen && (
+      {isModalOpen && renderedDiagram && (
         <DiagramModal onClose={() => setIsModalOpen(false)}>
-          <div
-            ref={modalContainerRef}
-            className="mermaid-container mermaid-modal"
-            style={{
-              background: "var(--color-code-bg)",
-              padding: "24px",
-              borderRadius: "8px",
-              minWidth: "80vw",
-              minHeight: "60vh",
-            }}
-          />
+          <DialogDiagram chart={renderedDiagram.chart} idPrefix={`${idPrefix}-modal`} />
         </DiagramModal>
       )}
     </>

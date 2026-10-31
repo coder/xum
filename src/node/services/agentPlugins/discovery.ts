@@ -873,17 +873,21 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
 }
 
 /**
- * Claude's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no `skills`
- * key loads as one skill (the caller passes "." as the declared skills path).
+ * Claude's and Cursor's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no
+ * `skills` key loads as one skill (the caller passes "." as the declared skills path). Any entry
+ * named `skills` turns the layout off for Claude. Cursor turns it off only for a `skills/` folder.
  */
-async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
-  if (
-    (await pluginFs()
-      .lstat(path.join(rootReal, "skills"))
-      .catch(() => null)) !== null
-  ) {
-    return false;
-  }
+async function isClaudeRootSkill(
+  rootReal: string,
+  options: { onlySkillsFolderCounts: boolean }
+): Promise<boolean> {
+  const skillsPath = path.join(rootReal, "skills");
+  const skillsEntry = options.onlySkillsFolderCounts
+    ? await isPluginSkillDirectory(pluginFs().stat(skillsPath))
+    : (await pluginFs()
+        .lstat(skillsPath)
+        .catch(() => null)) !== null;
+  if (skillsEntry) return false;
   const skillFile = await pluginFs()
     .lstat(path.join(rootReal, SKILL_FILENAME))
     .catch(() => null);
@@ -999,6 +1003,48 @@ async function ruleRefusal(args: {
   return "warning" in converted ? converted : undefined;
 }
 
+/**
+ * Why one rule file does not load, or undefined when it does. A file that an earlier rule of the
+ * plugin already read (through a link) is not read again, so links to one large file cost one read.
+ */
+async function ruleFileRefusal(args: {
+  dir: string;
+  file: string;
+  name: string;
+  rootReal: string;
+  taken: ReadonlySet<string>;
+  readFiles: Set<string>;
+}): Promise<CursorRuleRefusal | undefined> {
+  const { file, name } = args;
+  if (!SkillNameSchema.safeParse(name).success) {
+    return {
+      reason: "not a valid skill name",
+      warning: `Rule '${file}' has no valid skill name (kebab-case); ignoring it`,
+    };
+  }
+  if (args.taken.has(name)) {
+    return {
+      reason: "a skill or rule of the same name comes first",
+      warning: `Rule '${file}' is ignored: a skill or rule named '${name}' comes first`,
+    };
+  }
+  const canonical = await pluginFs()
+    .realpath(path.join(args.dir, file))
+    .catch(() => undefined);
+  if (canonical !== undefined && args.readFiles.has(canonical)) {
+    return {
+      reason: "the same file as an earlier rule",
+      warning: `Rule '${file}' is the same file as an earlier rule; ignoring it`,
+    };
+  }
+  if (canonical !== undefined) args.readFiles.add(canonical);
+  return ruleRefusal(args);
+}
+
+/**
+ * Every rule file counts toward MAX_PLUGIN_COMMANDS, a refused one too: discovery reads and parses
+ * each one before any consent, so a repository must not get past the cap with files that fail.
+ */
 async function resolveRuleRoots(args: {
   ruleDirs: string[];
   skillsDirs: PluginSkillsRoot[];
@@ -1007,37 +1053,30 @@ async function resolveRuleRoots(args: {
   warn: (message: string) => void;
 }): Promise<{ roots: PluginSkillsRoot[]; notApplied: AgentPluginNotApplied[] }> {
   const taken = await listSkillNames(args.skillsDirs, args.rootReal);
+  const readFiles = new Set<string>();
   const roots: PluginSkillsRoot[] = [];
   const notApplied: AgentPluginNotApplied[] = [];
-  const drop = (file: string, refusal: CursorRuleRefusal): void => {
-    args.warn(refusal.warning);
-    notApplied.push({ part: "rule", name: file, reason: refusal.reason });
-  };
+  let examined = 0;
   for (const relative of args.ruleDirs) {
     const dir = await args.resolveComponent(relative, "directory");
     if (dir === undefined) continue;
     for (const { file, name } of await listRuleFiles(dir)) {
-      if (!SkillNameSchema.safeParse(name).success) {
-        drop(file, {
-          reason: "not a valid skill name",
-          warning: `Rule '${file}' has no valid skill name (kebab-case); ignoring it`,
-        });
-        continue;
-      }
-      if (taken.has(name)) {
-        drop(file, {
-          reason: "a skill or rule of the same name comes first",
-          warning: `Rule '${file}' is ignored: a skill or rule named '${name}' comes first`,
-        });
-        continue;
-      }
-      if (roots.length >= MAX_PLUGIN_COMMANDS) {
+      if (examined >= MAX_PLUGIN_COMMANDS) {
         args.warn(`More than ${MAX_PLUGIN_COMMANDS} rules; ignoring the rest`);
         return { roots, notApplied };
       }
-      const refusal = await ruleRefusal({ dir, file, name, rootReal: args.rootReal });
+      examined++;
+      const refusal = await ruleFileRefusal({
+        dir,
+        file,
+        name,
+        rootReal: args.rootReal,
+        taken,
+        readFiles,
+      });
       if (refusal !== undefined) {
-        drop(file, refusal);
+        args.warn(refusal.warning);
+        notApplied.push({ part: "rule", name: file, reason: refusal.reason });
         continue;
       }
       taken.add(name);
@@ -1195,6 +1234,36 @@ async function resolvePluginMcpConfig(args: {
   return args.declared === undefined && !rootMcpJson
     ? { mcpConfigPath, mcpConfigDialect: "codex" }
     : { mcpConfigPath };
+}
+
+/**
+ * Cursor reads `.mdc` and `.markdown` agents too, but every plugin agent scan site reads `.md`
+ * files only (pluginAgentIdOf), so a Cursor package lists the others instead of dropping them
+ * without a word.
+ */
+async function cursorAgentFilesNotApplied(
+  cursor: CursorManifestResult | undefined,
+  agentsDir: string | undefined
+): Promise<AgentPluginNotApplied[]> {
+  if (cursor === undefined || agentsDir === undefined) return [];
+  const entries = await pluginFs()
+    .readdir(agentsDir)
+    .catch(() => []);
+  return entries
+    .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .filter((name) => /\.(mdc|markdown)$/i.test(name))
+    .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map((name) => ({ part: "agent", name, reason: "only .md agent files are applied in Xum" }));
+}
+
+/**
+ * Cursor plugin names may contain periods (`prompts.chat`, `foo.-bar`), and skill names may not, so
+ * a Cursor root skill loads under the name with one `-` for each run of `.` and `-`. Its SKILL.md
+ * `name` becomes the display name.
+ */
+function cursorRootSkillName(pluginName: string): string {
+  return pluginName.replace(/[.-]+/g, "-");
 }
 
 /** The MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3). */
@@ -1559,9 +1628,12 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      (claudePackage && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
+      ((claudePackage || cursorFallback) &&
+      (await isClaudeRootSkill(rootReal, { onlySkillsFolderCounts: cursorFallback }))
+        ? ["."]
+        : undefined),
     rootReal,
-    pluginName: manifest.name,
+    pluginName: cursorFallback ? cursorRootSkillName(manifest.name) : manifest.name,
     resolveComponent,
   });
   // Claude commands load as user-only skills, after every skills root (a skill wins).
@@ -1620,7 +1692,10 @@ async function discoverPluginAt(args: {
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(cursorFallback ? { cursorFallback: true } : {}),
-    notApplied: cursorParts.notApplied,
+    notApplied: [
+      ...cursorParts.notApplied,
+      ...(await cursorAgentFilesNotApplied(cursor, agentsDir)),
+    ],
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,

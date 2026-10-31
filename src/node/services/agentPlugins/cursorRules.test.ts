@@ -5,6 +5,7 @@ import {
 } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { convertCursorRule, cursorRuleSkillMarkdown } from "./cursorRules";
+import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
 
 const SKILL_DESCRIPTION_CAP = 1024;
 
@@ -125,6 +126,15 @@ describe("Cursor rule conversion", () => {
     expect(skillBody).toBe(body);
   });
 
+  test("a line that skill dynamic context would run stays text", () => {
+    const body = "Check the tree:\n!`git status`\n  !`rm -rf .`\n!$1`ls`\nUse `!` for negation.\n";
+    const { body: skillBody } = ruleSkill("tree", `---\ndescription: Tree\n---\n${body}`);
+    expect(skillDynamicDirectiveCommands(skillBody)).toEqual([]);
+    expect(skillBody).toBe(
+      "Check the tree:\n\\!`git status`\n\\  !`rm -rf .`\n\\!$1`ls`\nUse `!` for negation.\n"
+    );
+  });
+
   test("drops rule-only frontmatter keys from the skill", () => {
     const { frontmatter } = ruleSkill(
       "prefer-const",
@@ -142,6 +152,18 @@ describe("Cursor rule conversion", () => {
     expect(frontmatter.description.length).toBeLessThanOrEqual(SKILL_DESCRIPTION_CAP);
     expect(frontmatter.description).toStartWith("ddd");
     expect(frontmatter.description).toEndWith("\n\nApplies to files matching: **/*.ts");
+  });
+
+  test("aliased long globs fill the description only up to the cap", () => {
+    const glob = `src/${"g".repeat(200_000)}`;
+    const aliases = Array.from({ length: 50 }, () => "*g").join(", ");
+    const { frontmatter } = ruleSkill(
+      "big-globs",
+      `---\ng: &g "${glob}"\nglobs: [${aliases}]\n---\nBody\n`
+    );
+    expect(ruleType(frontmatter)).toBe("glob");
+    expect(frontmatter.description).toHaveLength(1024);
+    expect(frontmatter.description).toStartWith("\n\nApplies to files matching: src/ggg");
   });
 
   test("cuts a long first body line to the skill description cap", () => {
