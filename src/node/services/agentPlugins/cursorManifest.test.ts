@@ -249,7 +249,7 @@ describe("normalizeCursorManifest mcpServers", () => {
   test("a string path becomes the MCP config path", () => {
     const { loaded, mcpConfigPath, notApplied } = load({ mcpServers: "./config/mcp.json" });
     expect(mcpConfigPath).toBe("config/mcp.json");
-    expect(loaded.contributes?.mcp).toBeUndefined();
+    expect(loaded.contributes?.mcp).toBe("config/mcp.json");
     expect(notApplied).toEqual([]);
   });
 

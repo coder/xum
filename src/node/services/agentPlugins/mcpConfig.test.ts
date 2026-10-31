@@ -429,7 +429,7 @@ describe("loadPluginMcpServers", () => {
     expect(claudeRoot.cwd).toBe(plugin.rootPath);
   });
 
-  test("a Cursor cwd at a data folder name fails the cwd form check; Claude maps it", async () => {
+  test("a Cursor cwd at a data folder name needs values; Claude maps its own", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const servers = {
       stateful: { command: "node", cwd: "${CLAUDE_PLUGIN_DATA}/state" },
@@ -445,12 +445,17 @@ describe("loadPluginMcpServers", () => {
     const claudeResult = await loadPluginMcpServers(claude, { xumHome: tmp.path });
 
     expect(cursorResult.servers).toEqual({});
-    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual(
-      ["stateful", "cursorData"].map((name) => [
-        "error",
-        `mcp.json server '${name}': 'cwd' must be './…', '\${PLUGIN_ROOT}[/…]', or '\${PLUGIN_DATA}[/…]'; skipping this server`,
-      ])
-    );
+    // D29: Cursor has no data folder alias, so both names are values Xum cannot fill.
+    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "warning",
+        "mcp.json server 'stateful': needs values not supported in Xum (${CLAUDE_PLUGIN_DATA}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'cursorData': needs values not supported in Xum (${CURSOR_PLUGIN_DATA}); skipping this server",
+      ],
+    ]);
     const claudeData = getPluginDataPath(tmp.path, computePluginInstanceId(claude.rootPath));
     expect(claudeResult.diagnostics.map((d) => d.message)).toEqual([
       ".mcp.json server 'cursorData': 'cwd' must be './…', '${PLUGIN_ROOT}[/…]', or '${PLUGIN_DATA}[/…]'; skipping this server",

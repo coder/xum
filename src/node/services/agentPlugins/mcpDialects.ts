@@ -114,9 +114,6 @@ const objectValues = (value: unknown): unknown[] =>
   isPlainObject(value) ? Object.values(value) : [];
 const arrayValues = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
-// D29: a cwd at a Cursor or Claude data folder name fails the cwd form check instead.
-const DATA_FOLDER_CWD = /^\$\{(?:CURSOR|CLAUDE)_PLUGIN_DATA\}/;
-
 /**
  * The first `${NAME}` that a Cursor server entry asks the user for. Xum has no Cursor `variables`,
  * so the server cannot load. Command, url and headers never expand.
@@ -126,11 +123,10 @@ export function cursorValuePlaceholder(rawEntry: Record<string, unknown>): strin
     rawEntry,
     DIALECT_FOLDER_ALIASES.cursor
   );
-  const checkedCwd = typeof cwd === "string" && DATA_FOLDER_CWD.test(cwd) ? [] : [cwd];
   return (
     unexpandedPlaceholder([command], NOTHING_EXPANDS) ??
     unexpandedPlaceholder(
-      [...arrayValues(args), ...objectValues(env), ...checkedCwd],
+      [...arrayValues(args), ...objectValues(env), cwd],
       CURSOR_EXPANDED_NAMES
     ) ??
     unexpandedPlaceholder([url, ...objectValues(headers)], NOTHING_EXPANDS)

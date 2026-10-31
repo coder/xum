@@ -1286,7 +1286,7 @@ function cursorRootSkillName(pluginName: string): string {
   return pluginName.replace(/[.-]+/g, "-");
 }
 
-/** A Cursor package names its MCP file in `mcpServers`, never in `contributes.mcp`. */
+/** A Cursor package's MCP file comes from `mcpServers`, inert when it names no file Xum applies. */
 async function resolvePackageMcpConfig(args: {
   packageKind: { skillsOnly: boolean; claudePackage: boolean; codexFallback: boolean };
   cursor: CursorManifestResult | undefined;
