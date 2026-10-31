@@ -10813,7 +10813,7 @@ export class AgentSession {
       this.resetStopHookCounts();
       return;
     }
-    this.recordStopHookContinuation(continuation);
+    this.countAndAnnounceStopHookContinuation(continuation);
     this.queueMessage(continuation.prompt, this.stopContinuationOptions(options, provenance), {
       acceptanceOrigin: "automatic",
       synthetic: true,
@@ -10836,7 +10836,7 @@ export class AgentSession {
     this.stopHookCountsByKey.clear();
   }
 
-  private recordStopHookContinuation(continuation: StopHookContinuation): void {
+  private countAndAnnounceStopHookContinuation(continuation: StopHookContinuation): void {
     this.stopHookContinuations++;
     for (const key of continuation.hookKeys) {
       this.stopHookCountsByKey.set(key, (this.stopHookCountsByKey.get(key) ?? 0) + 1);
