@@ -315,12 +315,16 @@ describe("loadPluginMcpServers", () => {
       rootParent: { command: "${CLAUDE_PLUGIN_ROOT}/../outside" },
       quoted: { command: '"${CLAUDE_PLUGIN_ROOT}"/bin/tool' },
       bareRoot: { command: "${CLAUDE_PLUGIN_ROOT}/" },
+      // Only a root name becomes `./`: the data folder holds no plugin files.
+      dataCommand: { command: "${CLAUDE_PLUGIN_DATA}/bin/tool" },
       reservedEnv: { command: "node", env: { CLAUDE_PLUGIN_ROOT: "/elsewhere" } },
     };
     const claude: AgentPluginInfo = {
       ...(await makePlugin(tmp.path, "claude", servers, { fileName: ".mcp.json" })),
       mcpConfigDialect: "claude",
     };
+    await fs.mkdir(path.join(claude.rootPath, "bin"));
+    await fs.writeFile(path.join(claude.rootPath, "bin", "tool"), "#!/bin/sh\n", { mode: 0o755 });
     // The Codex dialect has no Claude names: the same command is refused there.
     const codex = await makePlugin(
       tmp.path,
@@ -338,6 +342,12 @@ describe("loadPluginMcpServers", () => {
     expect(claudeResult.diagnostics.map((d) => d.message.split(":")[0])).toEqual(
       Object.keys(servers).map((name) => `.mcp.json server '${name}'`)
     );
+    for (const name of ["bareRoot", "dataCommand"]) {
+      const message = claudeResult.diagnostics.find((d) =>
+        d.message.includes(`'${name}'`)
+      )?.message;
+      expect(message).toContain("executable token");
+    }
     expect(codexResult.servers).toEqual({});
     expect(codexResult.diagnostics[0].message).toContain("executable token");
   });
@@ -503,6 +513,26 @@ describe("loadPluginMcpServers", () => {
         "warning",
         "mcp.json server 'hostEnv': needs values not supported in Xum (${env:GITHUB_TOKEN}); skipping this server",
       ],
+    ]);
+  });
+
+  test("a Cursor root name outside an expanding position needs values", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makeCursorPlugin(tmp.path, "cursor", {
+      expanded: { command: "node", args: ["${CURSOR_PLUGIN_ROOT}/server.mjs"] },
+      // Without the check, each one would load with the literal text.
+      rootCommand: { command: "${CURSOR_PLUGIN_ROOT}" },
+      rootUrl: { type: "http", url: "https://h.example/${CURSOR_PLUGIN_ROOT}/mcp" },
+      rootDefault: { command: "node", args: ["${CURSOR_PLUGIN_ROOT:-/opt/kit}/server.mjs"] },
+    });
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(loadedNames(servers)).toEqual(["expanded"]);
+    expect(diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])).toEqual([
+      ["warning", "rootCommand"],
+      ["warning", "rootUrl"],
+      ["warning", "rootDefault"],
     ]);
   });
 

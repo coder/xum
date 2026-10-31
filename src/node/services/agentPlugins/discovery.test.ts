@@ -10,6 +10,7 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  MAX_PLUGIN_MANIFEST_BYTES,
   pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
@@ -2416,6 +2417,32 @@ describe("Cursor plugin discovery", () => {
       "trello",
       "attio",
     ]);
+  });
+
+  test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      // JSON.parse makes `__proto__` an own key, as reading the file does. The loader refuses it.
+      "mcp.json":
+        '{"__proto__": {"url": "https://${HOST}/mcp"}, ' +
+        '"x": {"url": "https://api.x.example/mcp", "auth": {"CLIENT_ID": "fixed-id"}}}',
+    });
+    expect(kit.plugin.notApplied).toEqual([
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+    ]);
+  });
+
+  test("an MCP file over the size cap lists no MCP entries", async () => {
+    const servers = {
+      brevo: { url: "https://mcp.brevo.example/mcp", headers: { Authorization: "${TOKEN}" } },
+      pad: { url: `https://x.example/${"a".repeat(MAX_PLUGIN_MANIFEST_BYTES)}` },
+    };
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: servers }),
+    });
+    expect(kit.plugin.mcpConfigDialect).toBe("cursor");
+    expect(kit.plugin.notApplied).toEqual([]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {
