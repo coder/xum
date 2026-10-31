@@ -367,6 +367,28 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
       expect(s.sendMessage).not.toHaveBeenCalled();
     });
 
+    // The row is read after the kept-brief check's await: a resume that flips the child to
+    // running meanwhile is what the inactive decision sees.
+    test("a child resumed during the kept-brief check takes live guidance, not a reawakening", async () => {
+      const s = await setup({ taskStatus: "reported" });
+      const internals = s.taskService as unknown as DispatchInternals;
+      spyOn(internals, "dropKeptTaskPromptAlreadyInHistory").mockImplementation(async () => {
+        s.trace.push("drop");
+        await editRow(s.config, CHILD, (row) => (row.taskStatus = "running"));
+      });
+      expect(await s.send()).toStrictEqual(Ok({ delivery: "accepted" }));
+      expect(s.reactivations).toEqual([]);
+      expect(s.sendMessage).toHaveBeenCalledTimes(1);
+      expect(s.trace).toEqual([
+        ...LOCKED,
+        "edit",
+        ...["gate+", "edit", "gate-"],
+        ...["send+", "edit", "send-"],
+        ...["tree-", "event-"],
+      ]);
+      expect([s.row()?.taskStatus, s.row()?.taskPendingGuidance]).toEqual(["running", undefined]);
+    });
+
     test("an archived target under an active continuation is refused, and steered once restored", async () => {
       const s = await setup({ taskStatus: "reported" });
       await startLiveWorkspaceTurn(s.taskService, s.config, {
