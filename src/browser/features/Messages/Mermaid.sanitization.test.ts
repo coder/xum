@@ -69,6 +69,12 @@ function themeVariable(name: string): string {
 describe("sanitizeMermaidSvg", () => {
   it("returns null for malformed SVG", () => {
     expect(sanitizeMermaidSvg("<svg><g></svg", ID_PREFIX)).toBeNull();
+    expect(
+      sanitizeMermaidSvg(
+        '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="red/></svg>',
+        ID_PREFIX
+      )
+    ).toBeNull();
   });
 
   it("returns null for an svg root outside the SVG namespace", () => {
@@ -406,6 +412,18 @@ describe("sanitizeMermaidSvg", () => {
     expect(elapsed).toBeLessThan(200);
   });
 
+  // Pele escapes &, so only a Pele bug writes these, but the XML parser turns them into ( before
+  // Chromium parses the style.
+  it("returns null for nesting written as character references", () => {
+    const svg = (references: string) =>
+      `<svg xmlns="http://www.w3.org/2000/svg" style="${references}"/>`;
+
+    expect(
+      sanitizeMermaidSvg(svg("&#40;".repeat(4) + "&#x28;".repeat(4)), ID_PREFIX)
+    ).not.toBeNull();
+    expect(sanitizeMermaidSvg(svg("&#40;".repeat(5) + "&#x28;".repeat(4)), ID_PREFIX)).toBeNull();
+  });
+
   it("keeps only the text of title and desc", () => {
     const sanitized = sanitizeMermaidSvg(
       svgWith("<title>tip<rect/><text>x</text></title><desc>about<g><rect/></g></desc>"),
@@ -515,6 +533,7 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
     ],
     // CSS reads each ')' as a string, so it closes no function.
     ["a rect with a quoted ) at each level", sequenceRect(nestedColorMix(22, " ')'"))],
+    ["a rect with a double-quoted ) at each level", sequenceRect(nestedColorMix(22, ' ")"'))],
     ["a rect nested 200 deep", sequenceRect(nestedColorMix(200))],
   ])("returns null for CSS functions nested deeply in %s", (_case, chart) => {
     const { svg } = renderPele(chart, peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts }));
@@ -526,6 +545,22 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
 
     expect(sanitized).toBeNull();
     expect(elapsed).toBeLessThan(200);
+  });
+
+  // MAX_ATTRIBUTE_NESTING in Mermaid.tsx. nope(1) adds a level, and Pele writes rx:var(--_r)
+  // before the fill of the rect.
+  it("keeps a rect whose parentheses nest 8 deep and returns null at 9", () => {
+    const sanitizeRect = (depth: number) =>
+      sanitizeMermaidSvg(
+        renderPele(
+          sequenceRect(nestedColorMix(depth)),
+          peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts })
+        ).svg,
+        ID_PREFIX
+      );
+
+    expect(sanitizeRect(7)).not.toBeNull();
+    expect(sanitizeRect(8)).toBeNull();
   });
 
   it("keeps a label with deeply nested parentheses in its text", () => {

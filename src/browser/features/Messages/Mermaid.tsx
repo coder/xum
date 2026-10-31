@@ -398,9 +398,78 @@ function removeNonElementNodes(elements: Element[]): void {
   }
 }
 
+// Pele nests 2 deep. At 8, Chromium parses the slowest nested color-mix() in 0.2 ms.
+const MAX_ATTRIBUTE_NESTING = 8;
+
+const XML_REFERENCE = /&(?:#x([\dA-Fa-f]+)|#(\d+)|(quot|apos|amp|lt|gt));/g;
+const XML_ENTITIES: Record<string, string> = { quot: '"', apos: "'", amp: "&", lt: "<", gt: ">" };
+
+/** An attribute value as the XML parser decodes it, with each non-ASCII character as a space. */
+function decodeXmlAttribute(value: string): string {
+  return value.replace(
+    XML_REFERENCE,
+    (_reference, hex?: string, decimal?: string, name?: string) => {
+      if (name !== undefined) return XML_ENTITIES[name];
+      const code = hex === undefined ? Number(decimal) : parseInt(hex, 16);
+      // mutation-equivalent: cssNestingDepth reads U+0080 and a space alike
+      return code < 0x80 ? String.fromCharCode(code) : " ";
+    }
+  );
+}
+
+/**
+ * How deep ( nests in css, never less than CSS reads it. A ) in a string or a comment, or after a
+ * backslash, closes nothing, so past the first quote, backslash or comment no ) counts.
+ */
+function cssNestingDepth(css: string): number {
+  const firstSkip = css.search(/["'\\]|\/\*/);
+  const closesEnd = firstSkip === -1 ? css.length : firstSkip;
+  let depth = 0;
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  // mutation-equivalent: <= reads css[css.length], which is undefined
+  for (let index = 0; index < css.length; index++) {
+    if (css[index] === "(") deepest = Math.max(deepest, ++depth);
+    // mutation-equivalent: <= adds css[closesEnd], which is a quote, backslash or slash
+    else if (css[index] === ")" && index < closesEnd) depth = Math.max(0, depth - 1);
+  }
+  return deepest;
+}
+
+/**
+ * The deepest nesting in any attribute value of svg, read from the markup in one pass. Pele
+ * quotes every attribute value and writes no comment, CDATA or doctype, so a quote outside a tag
+ * is text, as in a label.
+ */
+function attributeNestingDepth(svg: string): number {
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  // mutation-equivalent: XML allows only whitespace before the first <, so a quote there fails
+  // the parse before any style
+  let inTag = false;
+  // mutation-equivalent: <= reads svg[svg.length], which is undefined
+  for (let index = 0; index < svg.length; index++) {
+    const char = svg[index];
+    if (char === "<" || char === ">") {
+      inTag = char === "<";
+    } else if (inTag && (char === '"' || char === "'")) {
+      const end = svg.indexOf(char, index + 1);
+      const valueEnd = end === -1 ? svg.length : end;
+      const value = decodeXmlAttribute(svg.slice(index + 1, valueEnd));
+      deepest = Math.max(deepest, cssNestingDepth(value));
+      index = valueEnd;
+    }
+  }
+  return deepest;
+}
+
 /** Sanitizes the SVG that Pele rendered with idPrefix. Null when it is not well-formed SVG. */
 export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null {
   assert(/^[\w-]+$/.test(idPrefix), "idPrefix is a plain id, as Mermaid builds it");
+  // Chromium parses each style while DOMParser builds the tree, in time that doubles with each
+  // color-mix() nested around an invalid value, so this check must run first. Pele passes such
+  // values from a chart unchanged.
+  if (attributeNestingDepth(svg) > MAX_ATTRIBUTE_NESTING) return null;
   // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
   // fail closed.
   const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
