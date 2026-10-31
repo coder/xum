@@ -5357,7 +5357,8 @@ export class TaskService implements AgentTaskIntegration {
     // An operation naming a task whose first send is in flight waits for it, as it waited for
     // create's tree lock before. It waits outside the lock (the send's failure path takes the
     // mutex, which comes after the tree lock), and checks again under it: it may have queued on
-    // the lock before the send started.
+    // the lock before the send started. dispatchTrustedMessageUnderTaskLocks waits before it
+    // takes the task's event lock (see there).
     for (;;) {
       const inFlight = this.inFlightFirstSendFor(workspaceIds);
       if (inFlight != null) await inFlight;
@@ -10883,6 +10884,11 @@ export class TaskService implements AgentTaskIntegration {
     labeledMessage: string
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { taskId, sender } = deferral;
+    // Wait for the child's first send here, not inside the event lock: the child's stream end
+    // takes that lock, and a message admitted while that stream end waits reads it as undecided
+    // (stale). The send registered under the mutex that updateQueuedTaskPrompt took, so a send
+    // still in flight is visible here.
+    await this.inFlightFirstSends.get(taskId);
     // Definition I/O never runs under the event or tree lifecycle lock: read the child's
     // definition layers first (inactive candidates only), then plan under the locks.
     let preparedReawakenAi: PreparedReawakenAi | undefined;
