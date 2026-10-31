@@ -2160,6 +2160,33 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("runs one origin fetch per worktree when two linked worktrees share an origin", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      const [firstTree, secondTree] = ["first-tree", "second-tree"].map((name) => {
+        const tree = path.join(fixture.rootDir, name);
+        execFileSync("git", ["worktree", "add", "--quiet", "-b", name, tree], {
+          cwd: fixture.projectPath,
+          stdio: "ignore",
+        });
+        return tree;
+      });
+
+      const firstTreeHeads = [
+        await createBranchHead(fixture, "from-first-tree-1", firstTree),
+        await createBranchHead(fixture, "from-first-tree-2", firstTree),
+      ];
+      expect(await uploadPackRuns()).toBe(1);
+      expect(await createBranchHead(fixture, "from-second-tree", secondTree)).toBe(remoteHead);
+      expect(await uploadPackRuns()).toBe(2);
+      expect(firstTreeHeads).toEqual([remoteHead, remoteHead]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("shares a fetch across paths of one worktree, not across linked worktrees or repositories", async () => {
     const fixture = await createWorktreeManagerFixture();
     const other = await createWorktreeManagerFixture();
