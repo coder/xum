@@ -99,44 +99,42 @@ const TaskIcon: React.FC<{ className?: string; toolName: string }> = ({ classNam
   </Tooltip>
 );
 
+const SUCCESS_BADGE_STYLE = "bg-success/20 text-success-text";
+const PENDING_BADGE_STYLE = "bg-pending/20 text-pending";
+const WARNING_BADGE_STYLE = "bg-warning/20 text-warning";
+const MUTED_BADGE_STYLE = "bg-muted/20 text-muted";
+const INTERRUPTED_BADGE_STYLE = "bg-interrupted/20 text-interrupted";
+const DANGER_BADGE_STYLE = "bg-danger/20 text-danger";
+
+/** Badge style per task status; any other status is muted. */
+const TASK_STATUS_BADGE_STYLES = new Map<string, string>([
+  ["accepted", SUCCESS_BADGE_STYLE],
+  ["retitled", SUCCESS_BADGE_STYLE],
+  ["completed", SUCCESS_BADGE_STYLE],
+  ["reported", SUCCESS_BADGE_STYLE],
+  ["running", PENDING_BADGE_STYLE],
+  ["starting", PENDING_BADGE_STYLE],
+  ["backgrounded", PENDING_BADGE_STYLE],
+  ["awaiting_report", WARNING_BADGE_STYLE],
+  ["rate_limited", WARNING_BADGE_STYLE],
+  ["queued", MUTED_BADGE_STYLE],
+  ["terminated", INTERRUPTED_BADGE_STYLE],
+  // Workflow runs surface "interrupted" (resumable) through task_terminate results and
+  // task_list rows; style it like "terminated" rather than the muted default.
+  ["interrupted", INTERRUPTED_BADGE_STYLE],
+  ["not_found", DANGER_BADGE_STYLE],
+  ["invalid_scope", DANGER_BADGE_STYLE],
+  ["refused", DANGER_BADGE_STYLE],
+  ["error", DANGER_BADGE_STYLE],
+  // Workflow-run terminal failure status (task_list rows).
+  ["failed", DANGER_BADGE_STYLE],
+]);
+
 // Status badge component for task statuses
 const TaskStatusBadge: React.FC<{
   status: string;
   className?: string;
 }> = ({ status, className }) => {
-  const getStatusStyle = () => {
-    switch (status) {
-      case "accepted":
-      case "retitled":
-      case "completed":
-      case "reported":
-        return "bg-success/20 text-success-text";
-      case "running":
-      case "starting":
-      case "backgrounded":
-        return "bg-pending/20 text-pending";
-      case "awaiting_report":
-      case "rate_limited":
-        return "bg-warning/20 text-warning";
-      case "queued":
-        return "bg-muted/20 text-muted";
-      case "terminated":
-      case "interrupted":
-        // Workflow runs surface "interrupted" (resumable) through task_terminate results and
-        // task_list rows; style it like "terminated" rather than the muted default.
-        return "bg-interrupted/20 text-interrupted";
-      case "not_found":
-      case "invalid_scope":
-      case "refused":
-      case "error":
-      case "failed":
-        // Workflow-run terminal failure status (task_list rows).
-        return "bg-danger/20 text-danger";
-      default:
-        return "bg-muted/20 text-muted";
-    }
-  };
-
   const label =
     status === "awaiting_report"
       ? "awaiting report"
@@ -151,7 +149,7 @@ const TaskStatusBadge: React.FC<{
         // Lowercase status labels sit high within the font box, so preserve the compact total
         // height while shifting one pixel of padding from below the text to above it.
         "inline-flex shrink-0 items-center rounded px-1.5 pt-[3px] pb-px text-[10px] leading-none font-medium whitespace-nowrap",
-        getStatusStyle(),
+        TASK_STATUS_BADGE_STYLES.get(status) ?? MUTED_BADGE_STYLE,
         className
       )}
     >
