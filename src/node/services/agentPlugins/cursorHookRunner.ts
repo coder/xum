@@ -377,16 +377,27 @@ async function execHook(
     if (options.abortSignal?.aborted === true) return { kind: "aborted" };
     return { kind: "failed", reason: `it could not start: ${getErrorMessage(error)}` };
   }
+  // Aborting `release` cancels both pipes, which frees their readers and handles.
+  const release = new AbortController();
+  const read = (pipe: ReadableStream<Uint8Array>, maxBytes: number) =>
+    streamToStringCapped(
+      pipe.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal: release.signal }),
+      maxBytes
+    );
   const settled = Promise.all([
     stream.exitCode,
-    streamToStringCapped(stream.stdout, HOOK_OUTPUT_READ_BYTES),
-    streamToStringCapped(stream.stderr, 0),
+    read(stream.stdout, HOOK_OUTPUT_READ_BYTES),
+    read(stream.stderr, 0),
     writeInput(stream.stdin, input),
   ]);
   // The runtime kills the process group at the timeout, but a process that left the group (job
   // control, setsid) can hold the pipes open after it: the call must still end.
   const ended = await settledBy(settled, (options.seconds + OUTPUT_CLOSE_GRACE_SECONDS) * 1000);
   if (ended === undefined) {
+    // Xum cannot kill a process outside the group, but the call stops holding its pipes, so
+    // repeated calls do not pile up readers and handles (Codex review).
+    settled.catch(() => undefined);
+    release.abort();
     return {
       kind: "failed",
       reason: `its output stayed open past its ${options.seconds}s timeout`,
