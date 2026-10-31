@@ -1364,6 +1364,104 @@ describe("task tool", () => {
     expect(typeof obj.note).toBe("string");
   });
 
+  describe("a foreground best-of group whose members' launches fail", () => {
+    const LAUNCH_FAILURE = "Task fork failed: no space left";
+
+    /** n=3 children: `failing` reject their wait with the launch error, the others report. */
+    async function runGroup(failing: ReadonlySet<string>, statusOf: (taskId: string) => unknown) {
+      using tempDir = new TestTempDir("test-task-tool-best-of-launch-failure");
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+      let createCount = 0;
+      const taskService = {
+        create: mock(() => {
+          createCount += 1;
+          return Ok({
+            taskId: `child-task-${createCount}`,
+            kind: "agent" as const,
+            status: "starting" as const,
+          });
+        }),
+        waitForAgentReport: mock((taskId: string) =>
+          failing.has(taskId)
+            ? Promise.reject(new Error(LAUNCH_FAILURE))
+            : Promise.resolve({ reportMarkdown: `report for ${taskId}`, title: `Report ${taskId}` })
+        ),
+        getAgentTaskStatus: mock(statusOf),
+      } as unknown as TaskService;
+      const tool = createTaskTool({ ...baseConfig, taskService });
+      return Promise.resolve(
+        tool.execute!(
+          {
+            subagent_type: "explore",
+            prompt: "compare three approaches",
+            title: "Best of 3",
+            run_in_background: false,
+            n: 3,
+          },
+          mockToolCallOptions
+        )
+      );
+    }
+
+    it("keeps the other members' reports and shows the failed one as interrupted", async () => {
+      // The failed member's row is gone (a reclaimed unsanitized checkout): no live status.
+      const result: unknown = await runGroup(new Set(["child-task-2"]), () => undefined);
+
+      expect(result).toMatchObject({
+        taskIds: ["child-task-1", "child-task-2", "child-task-3"],
+        tasks: [
+          { taskId: "child-task-1", status: "completed" },
+          { taskId: "child-task-2", status: "interrupted" },
+          { taskId: "child-task-3", status: "completed" },
+        ],
+        reports: [
+          { taskId: "child-task-1", reportMarkdown: "report for child-task-1" },
+          { taskId: "child-task-3", reportMarkdown: "report for child-task-3" },
+        ],
+      });
+    });
+
+    it("throws the launch error when every member's launch failed", async () => {
+      const everyChild = new Set(["child-task-1", "child-task-2", "child-task-3"]);
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see
+      await expect(runGroup(everyChild, () => "interrupted")).rejects.toThrow(LAUNCH_FAILURE);
+    });
+  });
+
+  it("reports a background group of starting and queued tasks as starting", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-starting");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const statuses = ["starting", "starting", "queued"] as const;
+    let createCount = 0;
+    const create = mock(() => {
+      const status = statuses[createCount];
+      createCount += 1;
+      return Ok({ taskId: `child-task-${createCount}`, kind: "agent" as const, status });
+    });
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: true,
+          n: 3,
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(result).toMatchObject({
+      status: "starting",
+      tasks: [{ status: "starting" }, { status: "starting" }, { status: "queued" }],
+    });
+  });
+
   it("should allow sub-agent workspaces to spawn nested tasks", async () => {
     using tempDir = new TestTempDir("test-task-tool");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "child-workspace" });

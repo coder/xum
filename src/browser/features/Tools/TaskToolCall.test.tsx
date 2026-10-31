@@ -245,6 +245,37 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).not.toContain("thinking: low");
   });
 
+  test("shows a background spawn that is still starting as backgrounded, not completed", () => {
+    // The spawn returned at its reservation; the child's row is still starting (fork, first send).
+    const workspace = createWorkspaceMetadata({ id: "task-starting-1", taskStatus: "starting" });
+    workspaceContextMock = { workspaceMetadata: new Map([[workspace.id, workspace]]) };
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Survey the repository.",
+      title: "Survey",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "starting",
+            taskId: "task-starting-1",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("backgrounded")).toBeTruthy();
+    expect(view.queryByText("completed")).toBeNull();
+    fireEvent.click(view.getByText("task"));
+    expect(view.getByText("starting").getAttribute("data-component")).toBe("TaskStatusBadge");
+  });
+
   test("prefers linked report settings over the spawn snapshot after cleanup", () => {
     // Workspace already cleaned up; the task_await-linked report carries the exec
     // settings while the spawn result kept the stale plan-phase ones.

@@ -112,6 +112,7 @@ const TaskStatusBadge: React.FC<{
       case "reported":
         return "bg-success/20 text-success-text";
       case "running":
+      case "starting":
       case "backgrounded":
         return "bg-pending/20 text-pending";
       case "awaiting_report":
@@ -325,6 +326,7 @@ interface TaskRowProps {
 function isTaskRowElapsedActive(status: string): boolean {
   return (
     status === "queued" ||
+    status === "starting" ||
     status === "running" ||
     status === "backgrounded" ||
     status === "awaiting_report"
@@ -640,6 +642,7 @@ function getTaskToolWorkspaceStatus(
     case "reported":
       return "completed";
     case "queued":
+    case "starting":
     case "running":
     case "awaiting_report":
     case "interrupted":
@@ -906,8 +909,14 @@ function getAggregateTaskStatus(
   if (displayEntries.every((entry) => entry.status === "completed")) {
     return "completed";
   }
+  // A starting task is launching (fork, first send): as live as a running one.
   if (
-    displayEntries.some((entry) => entry.status === "running" || entry.status === "awaiting_report")
+    displayEntries.some(
+      (entry) =>
+        entry.status === "starting" ||
+        entry.status === "running" ||
+        entry.status === "awaiting_report"
+    )
   ) {
     return "running";
   }

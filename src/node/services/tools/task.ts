@@ -318,8 +318,42 @@ function toAggregatePendingStatus(
   statuses: ReadonlyArray<PendingTaskInfo["status"]>
 ): "queued" | "starting" | "running" {
   if (statuses.every((status) => status === "queued")) return "queued";
-  if (statuses.every((status) => status === "starting")) return "starting";
+  // No member runs yet: the reserved ones are still launching, the rest wait for a slot.
+  if (statuses.every((status) => status === "starting" || status === "queued")) return "starting";
   return "running";
+}
+
+/**
+ * The wait error the tool throws: only when every member's wait failed. A group that still has a
+ * completed, live or backgrounded member returns them instead, so a model that retries does not
+ * duplicate work that still runs.
+ */
+function waitFailureToRethrow(
+  outcomes: readonly ForegroundWaitOutcome[]
+): Extract<ForegroundWaitOutcome, { kind: "error" }> | undefined {
+  const [first] = outcomes;
+  return first?.kind === "error" && outcomes.every((outcome) => outcome.kind === "error")
+    ? first
+    : undefined;
+}
+
+/** A member whose wait ended without its report: interrupted, or its launch or its run failed. */
+function endedWithoutReport(outcome: ForegroundWaitOutcome): boolean {
+  return outcome.kind === "task_interrupted" || outcome.kind === "error";
+}
+
+/**
+ * Members whose wait ended without a report read as interrupted, also when their row is gone (an
+ * unsanitized checkout's launch failure removes it).
+ */
+function markEndedTasksInterrupted(
+  tasks: readonly PendingTaskInfo[],
+  outcomes: readonly ForegroundWaitOutcome[]
+): PendingTaskInfo[] {
+  return tasks.map((task, index) => {
+    const outcome = outcomes[index];
+    return outcome != null && endedWithoutReport(outcome) ? { ...task, status: "interrupted" } : task;
+  });
 }
 
 function serializeCompletedReport(report: CompletedTaskInfo) {
@@ -819,10 +853,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         throw new Error("Interrupted");
       }
 
-      const unexpectedFailure = waitOutcomes.find(
-        (outcome): outcome is Extract<ForegroundWaitOutcome, { kind: "error" }> =>
-          outcome.kind === "error"
-      );
+      const unexpectedFailure = waitFailureToRethrow(waitOutcomes);
       if (unexpectedFailure) {
         throw unexpectedFailure.error;
       }
@@ -840,9 +871,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const wasBackgrounded = waitOutcomes.some((outcome) => outcome.kind === "backgrounded");
       const didTimeOut = waitOutcomes.some((outcome) => outcome.kind === "timed_out");
-      const hadInterruptedTask = waitOutcomes.some(
-        (outcome) => outcome.kind === "task_interrupted"
-      );
+      const hadInterruptedTask = waitOutcomes.some(endedWithoutReport);
 
       // Foreground waits that exceeded their budget but whose tasks keep running become
       // non-blocking: persist notify_on_terminal so the owner is not re-forced to await them.
@@ -858,11 +887,10 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         return parseToolResult(
           TaskToolResultSchema,
           buildPendingTaskResult({
-            tasks: normalizePendingTaskStatuses({
-              taskService,
-              createdTasks,
-              completedReports,
-            }),
+            tasks: markEndedTasksInterrupted(
+              normalizePendingTaskStatuses({ taskService, createdTasks, completedReports }),
+              waitOutcomes
+            ),
             reports: completedReports,
             note: hadInterruptedTask
               ? buildInterruptedTaskNote(createdTasks.length)
