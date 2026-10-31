@@ -41,6 +41,8 @@ const HOOK_OUTPUT_MAX_BYTES = 64 * 1024;
  * cap splits (at most three bytes), and an output over the limit must still read as over it.
  */
 const HOOK_OUTPUT_READ_BYTES = HOOK_OUTPUT_MAX_BYTES + 4;
+/** How long past its timeout a call waits for the hook's pipes to close. */
+const OUTPUT_CLOSE_GRACE_SECONDS = 2;
 /** Cursor's exit code for a command (or a command it runs) that the shell cannot find. */
 const EXIT_CODE_NOT_FOUND = 127;
 const FILE_EDIT_TOOLS = new Set(["file_edit_replace_string", "file_edit_insert"]);
@@ -237,11 +239,27 @@ async function runHook(
   call: CallContext,
   runner: Runner
 ): Promise<CallResult> {
-  const result =
-    (await refusedStart(hook, call, runner.registration)) ??
-    (await startAndRead(hook, eventFields, call, runner.registration));
+  const result = await runGuarded(hook, eventFields, call, runner.registration);
   if (result.kind === "failed") reportFailure(hook, result.reason, runner);
   return result;
+}
+
+/** Fail-soft: a throw (the trust read, a spawn error) is a failed call, never a broken hook point. */
+async function runGuarded(
+  hook: PluginHookDefinition,
+  eventFields: Record<string, unknown>,
+  call: CallContext,
+  registration: CursorHookRegistration
+): Promise<CallResult> {
+  try {
+    return (
+      (await refusedStart(hook, call, registration)) ??
+      (await startAndRead(hook, eventFields, call, registration))
+    );
+  } catch (error) {
+    if (isAborted(call.abortSignal)) return { kind: "aborted" };
+    return { kind: "failed", reason: getErrorMessage(error) };
+  }
 }
 
 function commandOf(hook: PluginHookDefinition) {
@@ -377,16 +395,37 @@ async function execHook(
     if (options.abortSignal?.aborted === true) return { kind: "aborted" };
     return { kind: "failed", reason: `it could not start: ${getErrorMessage(error)}` };
   }
-  const stdout = streamToStringCapped(stream.stdout, HOOK_OUTPUT_READ_BYTES);
-  const stderr = streamToStringCapped(stream.stderr, 0);
-  const [exitCode, output] = await Promise.all([
+  const settled = Promise.all([
     stream.exitCode,
-    stdout,
-    stderr,
+    streamToStringCapped(stream.stdout, HOOK_OUTPUT_READ_BYTES),
+    streamToStringCapped(stream.stderr, 0),
     writeInput(stream.stdin, input),
   ]);
+  // The runtime kills the process group at the timeout, but a process that left the group (job
+  // control, setsid) can hold the pipes open after it: the call must still end.
+  const ended = await settledBy(settled, (options.seconds + OUTPUT_CLOSE_GRACE_SECONDS) * 1000);
+  if (ended === undefined) {
+    return {
+      kind: "failed",
+      reason: `its output stayed open past its ${options.seconds}s timeout`,
+    };
+  }
+  const [exitCode, output] = ended;
   if (exitCode === EXIT_CODE_ABORTED) return { kind: "aborted" };
   return { kind: "exited", exitCode, stdout: output };
+}
+
+/** The promise's value, or undefined once `ms` passed first (the promise is then left alone). */
+async function settledBy<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A hook that exits without reading its input closes the pipe: that is not a failure. */

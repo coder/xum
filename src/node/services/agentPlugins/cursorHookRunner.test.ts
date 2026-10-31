@@ -301,6 +301,22 @@ describe("failures warn once and never block", () => {
     expect(h.notices[0]).toContain("its input is over 65536 characters");
   });
 
+  test("a trust gate that throws fails the call with one notice and runs nothing", async () => {
+    const runtime = fakeRuntime({ "./s.sh": followup("again") });
+    const h = harness({
+      hooks: await hooksOf({ stop: [{ command: "./s.sh" }] }),
+      runtime,
+      gate: () => {
+        throw new Error("registry unreadable");
+      },
+    });
+    expect(await h.stop()).toEqual({ kind: "none" });
+    expect(runtime.execCalls).toEqual([]);
+    expect(h.notices).toEqual([
+      "hook stop failed (registry unreadable). Turn the hook off in Settings > Plugins.",
+    ]);
+  });
+
   test("an unreadable trust store skips the call with one notice", async () => {
     const runtime = fakeRuntime({ "./s.sh": followup("again") });
     const h = harness({
@@ -465,6 +481,20 @@ describe("with the local runtime", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(h.notices).toEqual([
       "hook stop failed (timed out after 1s). Turn the hook off in Settings > Plugins.",
+    ]);
+  }, 10_000);
+
+  test("a process that leaves the group and holds stdout open cannot hold the turn", async () => {
+    // `set -m` gives the background job its own process group, which the kill at exit misses.
+    const h = await localHarness(
+      { command: `set -m; sleep 30 & echo '{"followup_message":"again"}'`, timeout: 1 },
+      await local()
+    );
+    const started = Date.now();
+    expect(await h.stop()).toEqual({ kind: "none" });
+    expect(Date.now() - started).toBeLessThan(6_000);
+    expect(h.notices).toEqual([
+      "hook stop failed (its output stayed open past its 1s timeout). Turn the hook off in Settings > Plugins.",
     ]);
   }, 10_000);
 
