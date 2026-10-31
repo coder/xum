@@ -244,6 +244,25 @@ describe("AgentPluginInstallService marketplaces", () => {
     );
   });
 
+  test("a folder that fits no method names every manifest Xum looked for, the Cursor one too", async () => {
+    const plain = path.join(tmpRoot, "plain");
+    await initRepo(plain);
+    await writeFiles(plain, { "README.md": "Not a plugin\n" });
+    await commit(plain, "no manifest and no skills");
+    const error = await service.previewSource({ input: plain }).then(
+      () => "previewed",
+      (caught: unknown) => (caught instanceof Error ? caught.message : String(caught))
+    );
+    for (const manifest of [
+      "plugin.json",
+      ".codex-plugin/plugin.json",
+      ".claude-plugin/plugin.json",
+      ".cursor-plugin/plugin.json",
+    ]) {
+      expect(error).toContain(manifest);
+    }
+  });
+
   test("a marketplace file that is not a regular file fails only a listing that needs it", async () => {
     await writeFiles(marketDir, {
       "elsewhere.json": marketplace([DOCS]),
