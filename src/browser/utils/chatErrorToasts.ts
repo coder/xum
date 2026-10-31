@@ -4,8 +4,8 @@ import { useEffect, useRef } from "react";
  * Error toasts addressed to a workspace's chat input (a child exhausting the parent's goal budget,
  * a Stop the backend could not record). Retained until that input has shown and dismissed them: the
  * error can land after the user switched workspaces (a Stop settles asynchronously), when no input
- * for that workspace is mounted, and the input renders a single toast at a time. Info notices share
- * the queue but not its retention (publishChatInfo).
+ * for that workspace is mounted, and the input renders a single toast at a time. Info notices
+ * (publishChatInfo) share this queue.
  */
 interface PendingChatToast {
   type: "error" | "info";

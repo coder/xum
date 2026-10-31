@@ -412,7 +412,6 @@ describe("turn.stop", () => {
         workspaceId,
         plugin: "guard",
         message: `plugin continued turn ${n} of 50`,
-        // A routine notice, not a warning: the chat shows it as a non-error toast.
         severity: "info",
       }))
     );

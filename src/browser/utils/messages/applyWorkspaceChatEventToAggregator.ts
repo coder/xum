@@ -131,7 +131,6 @@ function boundPluginHookNotice(message: string): string {
   return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
 }
 
-/** A routine (info) notice replaces the one still waiting; any other notice queues as a warning. */
 function publishPluginHookNotice(event: PluginHookNoticeEvent): void {
   const publish = event.severity === "info" ? publishChatInfo : publishChatError;
   publish(event.workspaceId, `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`);

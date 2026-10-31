@@ -701,8 +701,8 @@ export const PluginHookNoticeEventSchema = z.object({
   plugin: z.string(),
   message: z.string(),
   /**
-   * `info`: a routine notice (a Stop continuation), shown as a non-error toast that the next one
-   * replaces. Absent: a hook's systemMessage, shown as a warning.
+   * `info`: a routine notice (a Stop continuation), shown as an info toast that a newer one replaces
+   * while it waits. Absent: a hook's systemMessage, shown as an error toast.
    */
   severity: z.literal("info").optional(),
 });
