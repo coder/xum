@@ -253,7 +253,7 @@ function isPeleCss(value: string, idPrefix: string | null): boolean {
   if (/[^\t\n\r\x20-\x7e]/.test(value)) return false;
   // CSS whitespace is space, tab, LF, CR and FF, not \s.
   const rest = value.replace(
-    /url\([ \t\n\r\f]*(["']?)#([\w-]+)\1[ \t\n\r\f]*\)/gi,
+    /(?<![\w-])url\([ \t\n\r\f]*(["']?)#([\w-]+)\1[ \t\n\r\f]*\)/gi,
     (url, _quote, id: string) => (idPrefix !== null && isDiagramId(id, idPrefix) ? "" : url)
   );
   return !/\\|\/\*|@|expression/i.test(rest) && usesOnlyPeleFunctions(rest);

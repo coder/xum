@@ -322,6 +322,16 @@ describe("sanitizeMermaidSvg", () => {
     expect(htmlParts(sanitized).filter((part) => part.includes("id="))).toEqual([]);
   });
 
+  it("reads url(#id) only as a whole function name", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(`<rect fill="xurl(#mermaid-r1-a)" stroke="-url(#mermaid-r1-a)"/>`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(htmlParts(sanitized).filter((part) => /fill|stroke/.test(part))).toEqual([]);
+  });
+
   it("keeps a url(#id) attribute but no url() declaration", () => {
     const sanitized = sanitizeMermaidSvg(
       svgWith(
