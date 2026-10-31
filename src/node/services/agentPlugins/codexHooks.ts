@@ -24,7 +24,6 @@
  * - `timeout: null` and an omitted `timeout` both mean the default, but they hash differently
  *   (the hash covers the raw definition), so changing one into the other needs a new review.
  */
-import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type {
   AgentPluginHook,
@@ -38,6 +37,12 @@ import {
   readPluginFileWithinRootCapped,
   type AgentPluginInfo,
 } from "./discovery";
+import {
+  HookWarnings,
+  MAX_HOOKS_FILE_BYTES,
+  MAX_PLUGIN_HOOKS,
+  hashHookDefinition,
+} from "./hookDefinition";
 import { isPlainObject } from "./manifest";
 import { MAX_HOOK_POINTER_ENTRIES, type OpenAIPluginHooksEntry } from "./openaiExtension";
 
@@ -113,42 +118,12 @@ const MATCHERLESS_CLAUDE_HOOK_EVENTS = new Set([
 ]);
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
-const MAX_HOOKS_FILE_BYTES = 256 * 1024;
 /**
  * Codex reads `timeout` as a u64 (whole seconds); the runner caps it at 30 s anyway. JSON.parse
  * rounds u64::MAX (18446744073709551615) up to 2^64, so the bound is inclusive: the one value it
  * also lets through, 2^64 itself, cannot be told apart after parsing (PRRT_kwDOPxxmWM6sSOZI).
  */
 const U64_MAX_AFTER_PARSE = 2 ** 64;
-/**
- * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
- * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
- * could reread the same file each time and exhaust the backend's memory. The pointer entry cap
- * (MAX_HOOK_POINTER_ENTRIES) is shared with discovery's readOpenAIExtension.
- */
-const MAX_PLUGIN_HOOKS = 256;
-/** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
-const MAX_HOOK_WARNINGS = 50;
-
-/**
- * Keeps the first MAX_HOOK_WARNINGS warnings and counts the rest, so a file with ~100k invalid
- * groups never holds ~100k strings (Codex PRRT_kwDOPxxmWM6rRIkV).
- */
-class HookWarnings {
-  private readonly kept: string[] = [];
-  private omitted = 0;
-
-  push(warning: string): void {
-    if (this.kept.length < MAX_HOOK_WARNINGS) this.kept.push(warning);
-    else this.omitted++;
-  }
-
-  list(): string[] {
-    const omitted = this.omitted > 0 ? [`${this.omitted} more hook warnings not shown`] : [];
-    return [...this.kept, ...omitted];
-  }
-}
-
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
 
@@ -171,11 +146,20 @@ export interface PluginHooksLoadResult {
 export async function loadPluginCodexHooks(
   plugin: Pick<
     AgentPluginInfo,
-    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude" | "skillsOnly"
+    | "rootPath"
+    | "openai"
+    | "openaiManifestPath"
+    | "claudeFallback"
+    | "claude"
+    | "skillsOnly"
+    | "cursorFallback"
   >
 ): Promise<PluginHooksLoadResult> {
-  // A skills-only package has no hooks, not even the default hooks/hooks.json.
-  if (plugin.skillsOnly === true) return { hooks: [], warnings: [] };
+  // A skills-only package has no hooks, not even the default hooks/hooks.json. A Cursor package's
+  // hooks.json is in the Cursor format, which this loader does not read (discovery lists it).
+  if (plugin.skillsOnly === true || plugin.cursorFallback === true) {
+    return { hooks: [], warnings: [] };
+  }
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
   const { entries, defaultFileListed } = listHookEntries(plugin, warnings);
@@ -207,15 +191,8 @@ export async function loadPluginCodexHooks(
     seenFiles.add(path.normalize(entry));
     // Only the default file is optional: a listed file that is missing is a plugin bug.
     const isDefault = defaultFileListed && index === 0;
-    const content = await readHooksFile(plugin.rootPath, entry, isDefault, warnings);
-    if (content === undefined) continue;
-    let document: unknown;
-    try {
-      document = JSON.parse(content);
-    } catch (error) {
-      warnings.push(`${entry} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
-      continue;
-    }
+    const document = await readHooksDocument(plugin.rootPath, entry, isDefault, warnings);
+    if (document === undefined) continue;
     parseHooksDocument(document, { source: path.normalize(entry), claude }, hooks, warnings);
   }
   const list = warnings.list();
@@ -224,6 +201,18 @@ export async function loadPluginCodexHooks(
     hooks.length = MAX_PLUGIN_HOOKS;
   }
   return { hooks, warnings: list };
+}
+
+/**
+ * A plugin's hooks in its own format: the Cursor hooks that discovery parsed for a Cursor package
+ * (the Codex loader reads none there), else the Codex loader's. Every hook reader uses this, the
+ * per-call trust gate included, so a Cursor hook is checked against the Cursor parse.
+ */
+export async function loadPluginHooks(
+  plugin: Parameters<typeof loadPluginCodexHooks>[0] & Pick<AgentPluginInfo, "cursorHooks">
+): Promise<PluginHooksLoadResult> {
+  if (plugin.cursorFallback === true) return plugin.cursorHooks ?? { hooks: [], warnings: [] };
+  return loadPluginCodexHooks(plugin);
 }
 
 /**
@@ -247,6 +236,22 @@ function listHookEntries(
     );
   }
   return { entries: pointer.slice(0, MAX_HOOK_POINTER_ENTRIES), defaultFileListed: false };
+}
+
+async function readHooksDocument(
+  rootPath: string,
+  relativePath: string,
+  isDefault: boolean,
+  warnings: HookWarnings
+): Promise<unknown> {
+  const content = await readHooksFile(rootPath, relativePath, isDefault, warnings);
+  if (content === undefined) return undefined;
+  try {
+    return JSON.parse(content) as unknown;
+  } catch (error) {
+    warnings.push(`${relativePath} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
 }
 
 async function readHooksFile(
@@ -680,42 +685,4 @@ function hookMatcherError(pattern: string): string | undefined {
   } catch (error) {
     return getErrorMessage(error);
   }
-}
-
-/**
- * Nesting limit for a hashed definition. canonicalJson recurses, and a 256 KiB file can nest
- * far deeper than the stack allows; real hook inputs nest a few levels.
- */
-const MAX_HOOK_DEFINITION_DEPTH = 64;
-
-/**
- * The trust key. Canonical JSON (sorted keys) of the event, the matcher and the handler exactly
- * as declared, so reformatting the file keeps trust and any change to what runs drops it.
- * Throws when the definition nests deeper than MAX_HOOK_DEFINITION_DEPTH.
- */
-export function hashHookDefinition(event: string, matcher: string | undefined, handler: unknown) {
-  const canonical = canonicalJson({ event, matcher: matcher ?? null, handler });
-  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
-}
-
-function canonicalJson(value: unknown, depth = 0): string {
-  if (depth > MAX_HOOK_DEFINITION_DEPTH) {
-    throw new Error(`the hook definition nests deeper than ${MAX_HOOK_DEFINITION_DEPTH} levels`);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
-  }
-  if (isPlainObject(value)) {
-    const keys = Object.keys(value).sort();
-    const fields = keys.map(
-      (key) => `${JSON.stringify(key)}:${canonicalJson(value[key], depth + 1)}`
-    );
-    return `{${fields.join(",")}}`;
-  }
-  // `1e400` parses to Infinity, which JSON.stringify writes as null, so two different inputs
-  // would share one trust hash. Refuse it; the caller drops only this handler.
-  if (typeof value === "number" && !Number.isFinite(value)) {
-    throw new Error("the hook definition contains a non-finite number");
-  }
-  return JSON.stringify(value) ?? "null";
 }

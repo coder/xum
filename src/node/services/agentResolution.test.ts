@@ -14,6 +14,7 @@ import {
   resolveAgentBody,
 } from "./agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "./agentDefinitions/resolveAgentInheritanceChain";
+import { resolveChainAgentCacheTtl } from "./agentDefinitions/resolveNodeAgentAiSettings";
 import * as agentDefinitionsService from "./agentDefinitions/agentDefinitionsService";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
@@ -1270,5 +1271,82 @@ describe("resolveAgentForStream caller tool policy keeps the advertised tool set
       success: false,
       error: "Tool 'bash' is disabled for this turn.",
     });
+  });
+});
+
+describe("resolveAgentForStream agentAiSettingsChain (Cursor model: fast)", () => {
+  async function resolveChild(agentFrontmatter: string) {
+    using tempDir = new DisposableTempDir("agent-resolution-settings-base");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsRoot = path.join(projectPath, ".xum", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "ci-watcher.md"),
+      `---\nname: ci-watcher\nbase: exec\nsubagent:\n  runnable: true\n${agentFrontmatter}---\nWatch CI.\n`
+    );
+    const metadata = createSubagentMetadata({ projectPath, agentId: "ci-watcher" });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "ci-watcher",
+                agentType: "ci-watcher",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = path.join(tempDir.path, "xum-home");
+    try {
+      const result = await resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
+        workspaceId: CHILD_WORKSPACE_ID,
+        metadata,
+        runtime: new LocalRuntime(projectPath),
+        workspacePath: projectPath,
+        requestedAgentId: "exec",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+      });
+      if (!result.success) throw new Error("Expected agent resolution to succeed");
+      return result.data;
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
+
+  test("equals the inheritance chain for an agent without settingsBase", async () => {
+    const agent = await resolveChild("");
+    expect(agent.agentAiSettingsChain).toEqual(agent.agentInheritanceChain);
+  });
+
+  test("runs a fast agent's AI settings through Explore and keeps its own tool policy", async () => {
+    const fast = await resolveChild("ai:\n  settingsBase: explore\n");
+    const plain = await resolveChild("");
+    expect(fast.agentAiSettingsChain.map((hop) => hop.id)).toEqual([
+      "ci-watcher",
+      "explore",
+      "exec",
+    ]);
+    expect(fast.agentInheritanceChain.map((hop) => hop.id)).toEqual(["ci-watcher", "exec"]);
+    // Explore's built-in prompt-cache TTL, with no Settings entry setting one.
+    expect(resolveChainAgentCacheTtl("ci-watcher", undefined, fast.agentAiSettingsChain)).toBe(
+      "5m"
+    );
+    expect(fast.effectiveToolPolicy).toEqual(plain.effectiveToolPolicy);
   });
 });

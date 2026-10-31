@@ -1,7 +1,12 @@
 import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { publishChatError } from "@/browser/utils/chatErrorToasts";
-import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
+import { publishChatError, publishChatInfo } from "@/browser/utils/chatErrorToasts";
+import type {
+  DeleteMessage,
+  PluginHookNoticeEvent,
+  StreamErrorMessage,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
 import {
   isBashOutputEvent,
   isCaughtUpMessage,
@@ -126,6 +131,11 @@ function boundPluginHookNotice(message: string): string {
   return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
 }
 
+function publishPluginHookNotice(event: PluginHookNoticeEvent): void {
+  const publish = event.severity === "info" ? publishChatInfo : publishChatError;
+  publish(event.workspaceId, `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`);
+}
+
 export function applyWorkspaceChatEventToAggregator(
   aggregator: WorkspaceChatEventAggregator,
   event: WorkspaceChatMessage,
@@ -215,11 +225,7 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isPluginHookNoticeEvent(event)) {
     // A plugin hook's systemMessage: a toast for the user, never a transcript row.
-    if (allowSideEffects)
-      publishChatError(
-        event.workspaceId,
-        `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`
-      );
+    if (allowSideEffects) publishPluginHookNotice(event);
     return "ignored";
   }
 

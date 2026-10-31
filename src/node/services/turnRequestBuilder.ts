@@ -2280,6 +2280,7 @@ export class TurnRequestBuilder {
       agentDiscoveryPath,
       isSubagentWorkspace,
       agentInheritanceChain,
+      agentAiSettingsChain,
       agentIsPlanLike,
       effectiveMode,
       taskSettings,
@@ -2291,7 +2292,7 @@ export class TurnRequestBuilder {
     agentCacheTtl.value = resolveChainAgentCacheTtl(
       effectiveAgentId,
       cfg.agentAiDefaults,
-      agentInheritanceChain
+      agentAiSettingsChain
     );
     // Side conversations must not inherit completion requirements for work in the main chat.
     // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.

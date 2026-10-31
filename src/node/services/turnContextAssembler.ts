@@ -67,6 +67,7 @@ import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeU
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
+  backgroundHintField,
   readAgentDefinition,
   type AgentDefinitionRequestCache,
   resolveAgentBody,
@@ -1695,6 +1696,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           // Important: descriptor.subagentRunnable comes from the agent's own frontmatter only.
           // Re-resolve with inheritance so derived agents inherit runnable: true from their base.
           subagentRunnable: resolvedFrontmatter.subagent?.runnable ?? false,
+          ...backgroundHintField(resolvedFrontmatter),
         };
       } catch (error) {
         // A failed read must not publish unverified sub-agent metadata (#4438, #4827).

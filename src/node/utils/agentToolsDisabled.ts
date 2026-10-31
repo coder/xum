@@ -15,3 +15,12 @@
 export function isAgentToolsDisabled(): boolean {
   return process.env.XUM_DISABLE_AGENT_TOOLS === "1";
 }
+
+/**
+ * XUM_DISABLE_TERMINALS=1: no terminal starts and no input reaches one (TerminalService), and no
+ * Cursor command hook starts a process (cursorHookRunner.ts). The bug-bash app's real-AI mode sets
+ * it, because an explorer model that follows injected text could otherwise reach a host shell.
+ */
+export function isTerminalsDisabled(): boolean {
+  return process.env.XUM_DISABLE_TERMINALS === "1";
+}

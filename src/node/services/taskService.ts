@@ -1293,6 +1293,40 @@ interface TaskLaunchState {
   sendAdmitted: boolean;
 }
 
+/** A direct launch's first send, started under create's locks (see dispatchTaskLaunchPrompt). */
+interface TaskLaunchDispatch {
+  /** Never rejects. */
+  readonly send: Promise<Result<void, string | SendMessageError>>;
+  /** Resolves once the session admits the send's turn; never for a send refused before that. */
+  readonly admitted: Promise<void>;
+}
+
+/** A direct launch whose first send's turn was admitted before create released its locks. */
+interface DispatchedTaskLaunch {
+  readonly plan: TaskCreatePlan;
+  readonly launch: TaskLaunchState;
+  readonly checkout: TaskLaunchCheckout;
+  /** Never rejects. */
+  readonly send: Promise<Result<void, string | SendMessageError>>;
+  readonly releaseWaiters: () => void;
+}
+
+/** create's result for a direct launch whose first send succeeded. */
+function launchedTaskCreateResult(plan: TaskCreatePlan): Result<TaskCreateResult, string> {
+  return Ok({
+    taskId: plan.taskId,
+    kind: "agent",
+    status: "running",
+    modelString: plan.taskModelString,
+    thinkingLevel: plan.effectiveThinkingLevel,
+    desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? plan.taskId,
+  });
+}
+
+type TaskCreateOutcome =
+  | Result<TaskCreateResult, string>
+  | { readonly dispatched: DispatchedTaskLaunch };
+
 /**
  * The plan fields that the launch blocks shared by a reserved launch (TaskLaunchPlan) and a
  * direct Task.create launch (TaskCreatePlan) read.
@@ -3577,6 +3611,11 @@ export class TaskService implements AgentTaskIntegration {
   // removal cannot cross and delete a child while its next execution starts.
   private readonly workspaceTreeLifecycleLocks = new MutexMap<string>();
   private readonly mutex = new AsyncMutex();
+  /**
+   * First sends of direct launches still in flight after create released its locks, by task id:
+   * an operation naming the task waits for the promise (see withTaskTreeLifecycleLocks).
+   */
+  private readonly inFlightFirstSends = new Map<string, Promise<void>>();
   private maybeStartQueuedTasksInFlight: Promise<void> | undefined;
   private maybeStartQueuedTasksRerunRequested = false;
   // A queue drain with no queued task skips the global workspace-turn count: it reads every turn
@@ -5335,19 +5374,39 @@ export class TaskService implements AgentTaskIntegration {
     workspaceIds: readonly string[],
     operation: () => Promise<T>
   ): Promise<T> {
-    const rootIds = [
-      ...new Set(workspaceIds.map((workspaceId) => this.taskTreeRootId(workspaceId))),
-    ]
-      .filter((workspaceId) => workspaceId.length > 0)
-      .sort();
-    const acquire = async (index: number): Promise<T> => {
-      const rootId = rootIds[index];
-      if (rootId == null) {
-        return await operation();
-      }
-      return await this.workspaceTreeLifecycleLocks.withLock(rootId, () => acquire(index + 1));
-    };
-    return await acquire(0);
+    // An operation naming a task whose first send is in flight waits for it, as it waited for
+    // create's tree lock before. It waits outside the lock (the send's failure path takes the
+    // mutex, which comes after the tree lock), and checks again under it: it may have queued on
+    // the lock before the send started. dispatchTrustedMessageUnderTaskLocks waits before it
+    // takes the task's event lock (see there).
+    for (;;) {
+      const inFlight = this.inFlightFirstSendFor(workspaceIds);
+      if (inFlight != null) await inFlight;
+      const rootIds = [
+        ...new Set(workspaceIds.map((workspaceId) => this.taskTreeRootId(workspaceId))),
+      ]
+        .filter((workspaceId) => workspaceId.length > 0)
+        .sort();
+      const acquire = async (index: number): Promise<{ value: T } | undefined> => {
+        const rootId = rootIds[index];
+        if (rootId == null) {
+          return this.inFlightFirstSendFor(workspaceIds) == null
+            ? { value: await operation() }
+            : undefined;
+        }
+        return await this.workspaceTreeLifecycleLocks.withLock(rootId, () => acquire(index + 1));
+      };
+      const ran = await acquire(0);
+      if (ran != null) return ran.value;
+    }
+  }
+
+  private inFlightFirstSendFor(workspaceIds: readonly string[]): Promise<void> | undefined {
+    for (const workspaceId of workspaceIds) {
+      const inFlight = this.inFlightFirstSends.get(workspaceId);
+      if (inFlight != null) return inFlight;
+    }
+    return undefined;
   }
 
   async editWorkspaceEntry(
@@ -8815,23 +8874,29 @@ export class TaskService implements AgentTaskIntegration {
     if (!parentWorkspaceId) {
       return Err("Task.create: parentWorkspaceId is required");
     }
-    return await this.withTaskTreeLifecycleLock(parentWorkspaceId, async () =>
+    const outcome = await this.withTaskTreeLifecycleLock(parentWorkspaceId, async () =>
       this.createUnderTaskTreeLifecycleLock(args, parentWorkspaceId)
     );
+    // A direct launch's first send started under both locks, which stayed held until the session
+    // admitted its turn. The rest of its pre-stream preparation (seconds) runs here, after both
+    // were released, so it holds up no other spawn, Stop or queue drain.
+    return "dispatched" in outcome
+      ? await this.awaitDispatchedTaskLaunch(outcome.dispatched)
+      : outcome;
   }
 
   private async createUnderTaskTreeLifecycleLock(
     args: TaskCreateArgs,
     parentWorkspaceId: string
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     const request = this.readTaskCreateRequest(args, parentWorkspaceId);
     if (!request.success) {
       return request;
     }
 
-    // Held until the create settles: every step below runs under it, and none takes it again (the
-    // mutex is not reentrant). The step call must be awaited here: a bare `return promise` would
-    // dispose the lock before the promise settles.
+    // Held until the steps below return (a direct launch's first send finishes after that, see
+    // create), and none takes it again (the mutex is not reentrant). The step call must be awaited
+    // here: a bare `return promise` would dispose the lock before the promise settles.
     await using _lock = await this.mutex.acquire();
 
     return await this.loadTaskCreateParent(request.data);
@@ -8891,9 +8956,7 @@ export class TaskService implements AgentTaskIntegration {
    * the later steps. Each step starts the next in the same tick as its own last await, so no call
    * runs later than it did inline.
    */
-  private async loadTaskCreateParent(
-    request: TaskCreateRequest
-  ): Promise<Result<TaskCreateResult, string>> {
+  private async loadTaskCreateParent(request: TaskCreateRequest): Promise<TaskCreateOutcome> {
     // Validate parent exists and fetch runtime context.
     const parentMetaResult = await this.aiService.getWorkspaceMetadata(request.parentWorkspaceId);
     if (!parentMetaResult.success) {
@@ -8954,9 +9017,7 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /** Refuses a stopped or too-deep parent, then counts the active tasks and names the new task. */
-  private async countAndPlaceTask(
-    parent: TaskCreateParent
-  ): Promise<Result<TaskCreateResult, string>> {
+  private async countAndPlaceTask(parent: TaskCreateParent): Promise<TaskCreateOutcome> {
     const { cfg, taskSettings, agentId } = parent;
     const refusal = this.refuseTaskCreateUnderParent(parent);
     if (refusal !== undefined) {
@@ -9083,7 +9144,7 @@ export class TaskService implements AgentTaskIntegration {
    */
   private async readTaskCreateParentBranch(
     placement: TaskCreatePlacement
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     const {
       args,
       parentEntry,
@@ -9173,7 +9234,7 @@ export class TaskService implements AgentTaskIntegration {
   private async checkTaskAgentRunnable(
     placement: TaskCreatePlacement,
     parentBranchName: string | undefined
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     const { args, cfg, agentId, runtime, parentWorkspacePath, projectPluginsTrusted } = placement;
     let skipInitHook = false;
     try {
@@ -9214,7 +9275,7 @@ export class TaskService implements AgentTaskIntegration {
     placement: TaskCreatePlacement,
     parentBranchName: string | undefined,
     skipInitHook: boolean
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     const {
       args,
       cfg,
@@ -9313,7 +9374,7 @@ export class TaskService implements AgentTaskIntegration {
    * desktop gate, then chains to sanitizeTaskLaunchCheckout. Runs under the global mutex that
    * createUnderTaskTreeLifecycleLock holds.
    */
-  private async launchTask(plan: TaskCreatePlan): Promise<Result<TaskCreateResult, string>> {
+  private async launchTask(plan: TaskCreatePlan): Promise<TaskCreateOutcome> {
     const launch: TaskLaunchState = {
       // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
       // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
@@ -9584,14 +9645,14 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * The direct launch after its entry is persisted. Sanitizes the materialized checkout, then
-   * chains to announceAndInitTask and sendTaskLaunchPrompt: each step starts the next in the same
-   * tick as its own last await, so no call runs later than it did inline.
+   * chains to announceAndInitTask and dispatchTaskLaunchPrompt: each step starts the next in the
+   * same tick as its own last await, so no call runs later than it did inline.
    */
   private async sanitizeTaskLaunchCheckout(
     plan: TaskCreatePlan,
     launch: TaskLaunchState,
     checkout: TaskLaunchCheckout
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     if (!plan.useSharedWorkspace) {
       // SECURITY: this checkout materialized outside the host's create/fork paths, so
       // registration-time plugin-override sanitization never saw it —
@@ -9623,12 +9684,12 @@ export class TaskService implements AgentTaskIntegration {
     return this.announceAndInitTask(plan, launch, checkout);
   }
 
-  /** Announces the launched task's workspace and kicks its init, then sends the prompt. */
+  /** Announces the launched task's workspace and kicks its init, then dispatches the first send. */
   private async announceAndInitTask(
     plan: TaskCreatePlan,
     launch: TaskLaunchState,
     checkout: TaskLaunchCheckout
-  ): Promise<Result<TaskCreateResult, string>> {
+  ): Promise<TaskCreateOutcome> {
     const { taskId } = plan;
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
@@ -9642,7 +9703,46 @@ export class TaskService implements AgentTaskIntegration {
       );
       this.registerTaskBackgroundInit(plan, checkout, secrets);
     }
-    return this.sendTaskLaunchPrompt(plan, launch, checkout);
+    return this.releaseOnTaskLaunchAdmission(
+      plan,
+      launch,
+      checkout,
+      this.dispatchTaskLaunchPrompt(plan, launch)
+    );
+  }
+
+  /**
+   * Holds create's locks until the session admits the brief's turn (its rows are durable in
+   * history by then) or the send settles. A Stop queued on the locks then finds the brief in
+   * history, as when create held them through the whole send: a direct row keeps no taskPrompt
+   * that a resume could replay.
+   */
+  private async releaseOnTaskLaunchAdmission(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout,
+    dispatch: TaskLaunchDispatch
+  ): Promise<TaskCreateOutcome> {
+    const settled = await Promise.race([dispatch.admitted.then(() => undefined), dispatch.send]);
+    if (settled === undefined) {
+      const waiters = Promise.withResolvers<void>();
+      this.inFlightFirstSends.set(plan.taskId, waiters.promise);
+      return {
+        dispatched: {
+          plan,
+          launch,
+          checkout,
+          send: dispatch.send,
+          releaseWaiters: waiters.resolve,
+        },
+      };
+    }
+    if (settled.success) return launchedTaskCreateResult(plan);
+    const message = launchSendErrorMessage(settled.error);
+    await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
+      preservePhysicalWorkspace: plan.useSharedWorkspace,
+    });
+    return Err(message);
   }
 
   /** Starts a launched task's init in its own checkout (callers skip a shared parent checkout). */
@@ -9680,64 +9780,98 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  /** Admits the launch's prompt under the attempt it persisted and sends it. */
-  private async sendTaskLaunchPrompt(
+  /**
+   * Admits the launch's prompt under the attempt it persisted and starts its send. Synchronous on
+   * purpose: the admission and the send's synchronous entry, which takes its place ahead of any
+   * later send into the task and captures the session's stop generation, must run before create
+   * releases its locks. So a user Stop of the task refuses the brief even after the Stop's latch
+   * dropped. A refused admission is a send that already failed.
+   */
+  private dispatchTaskLaunchPrompt(
     plan: TaskCreatePlan,
-    launch: TaskLaunchState,
-    checkout: TaskLaunchCheckout
-  ): Promise<Result<TaskCreateResult, string>> {
-    const { taskId, taskModelString, effectiveThinkingLevel } = plan;
+    launch: TaskLaunchState
+  ): TaskLaunchDispatch {
+    const { taskId } = plan;
+    assert(launch.launchAttempt != null, "the first send runs once the launch owns its attempt");
     // Start immediately (counts towards parallel limit). Launch fence, as in startReservedAgentTask:
     // the obligation is bound under the owned attempt before dispatch and the token doubles as the
     // send's staleness probe. A guarded send is never a user resume, so WorkspaceService skips
-    // markInterruptedTaskRunning for it — which matters here because this method holds the global
-    // mutex that method serializes on (a rescue reaching it from this send would self-deadlock).
+    // markInterruptedTaskRunning for it: a Stop that persists `interrupted` while this send
+    // prepares is not flipped back to running.
     // Bound to the attempt this launch persisted: the row was published above (metadata emitted,
     // sanitization awaited), so another writer may have re-admitted it under its own attempt
     // since — a launch decided for A never dispatches its prompt under B (refused, and the
-    // failure path below leaves B's row alone).
+    // failure path leaves B's row alone).
     const admission = this.admitTaskWorkspaceTurn(taskId, {
       acceptanceOrigin: "automatic",
       expectedAttemptId: launch.attemptId,
     });
     launch.sendAdmitted = admission.kind === "admitted";
-    const sendResult =
-      admission.kind !== "admitted"
-        ? Err(launchAdmissionRefusalMessage(admission))
-        : await this.workspaceService
-            .sendMessage(
-              taskId,
-              plan.prompt,
-              {
-                model: taskModelString,
-                agentId: plan.agentId,
-                thinkingLevel: effectiveThinkingLevel,
-                reasoningMode: plan.effectiveReasoningMode,
-              },
-              {
-                acceptanceOrigin: "automatic",
-                agentInitiated: true,
-                turnAdmission: admission.token,
-                admissionStale: () => admission.token.admissionStale(),
-              }
-            )
-            .catch((error: unknown) => Err(getErrorMessage(error)));
-    if (!sendResult.success) {
-      const message = launchSendErrorMessage(sendResult.error);
-      await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
-        preservePhysicalWorkspace: plan.useSharedWorkspace,
-      });
-      return Err(message);
+    const admitted = Promise.withResolvers<void>();
+    if (admission.kind !== "admitted") {
+      return {
+        send: Promise.resolve(Err(launchAdmissionRefusalMessage(admission))),
+        admitted: admitted.promise,
+      };
     }
+    const token: TurnAdmissionToken = {
+      ...admission.token,
+      onAdmitted: (turnId) => {
+        admission.token.onAdmitted(turnId);
+        admitted.resolve();
+      },
+    };
+    return {
+      send: this.workspaceService
+        .sendMessage(
+          taskId,
+          plan.prompt,
+          {
+            model: plan.taskModelString,
+            agentId: plan.agentId,
+            thinkingLevel: plan.effectiveThinkingLevel,
+            reasoningMode: plan.effectiveReasoningMode,
+          },
+          {
+            acceptanceOrigin: "automatic",
+            agentInitiated: true,
+            turnAdmission: token,
+            admissionStale: () => token.admissionStale(),
+          }
+        )
+        .catch((error: unknown) => Err(getErrorMessage(error))),
+      admitted: admitted.promise,
+    };
+  }
 
-    return Ok({
-      taskId,
-      kind: "agent",
-      status: "running",
-      modelString: taskModelString,
-      thinkingLevel: effectiveThinkingLevel,
-      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
-    });
+  /** Awaits a dispatched first send once create released its locks, and fails the launch on Err. */
+  private async awaitDispatchedTaskLaunch(
+    dispatched: DispatchedTaskLaunch
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { plan, launch, checkout } = dispatched;
+    const { taskId } = plan;
+    try {
+      const sendResult = await dispatched.send;
+      if (!sendResult.success) {
+        const message = launchSendErrorMessage(sendResult.error);
+        // Closed before the mutex wait below: no send binds to the failed attempt meanwhile.
+        this.closeAttemptAdmission(taskId, launch.attemptId, launch.launchAttempt, "launch-failed");
+        {
+          await using _lock = await this.mutex.acquire();
+          await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
+            preservePhysicalWorkspace: plan.useSharedWorkspace,
+          });
+        }
+        // A create that ran during this send counted the task as running and may have queued its
+        // own: the freed slot starts it, as after markTaskLaunchFailed.
+        this.scheduleMaybeStartQueuedTasks();
+        return Err(message);
+      }
+      return launchedTaskCreateResult(plan);
+    } finally {
+      this.inFlightFirstSends.delete(taskId);
+      dispatched.releaseWaiters();
+    }
   }
 
   /**
@@ -9756,8 +9890,8 @@ export class TaskService implements AgentTaskIntegration {
    *     re-admitted is that writer's to end (no marker, no stop, no metadata for it; only this
    *     attempt's own obligations are accounted for);
    *  3. when anything is live under the row this launch still owns, this task's own stop
-   *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (this
-   *     method holds the global mutex Phase A requires; the mutex is not reentrant, so it must
+   *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (its
+   *     caller holds the global mutex Phase A requires; the mutex is not reentrant, so it must
    *     not be re-acquired here), Phase B (clearQueue + stopStream, bounded), then a bounded
    *     wait for the captured owners to settle, which releases the record and settles the
    *     attempt (Phase C).
@@ -10803,6 +10937,11 @@ export class TaskService implements AgentTaskIntegration {
     labeledMessage: string
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { taskId, sender } = deferral;
+    // Wait for the child's first send here, not inside the event lock: the child's stream end
+    // takes that lock, and a message admitted while that stream end waits reads it as undecided
+    // (stale). The send registered under the mutex that updateQueuedTaskPrompt took, so a send
+    // still in flight is visible here.
+    await this.inFlightFirstSends.get(taskId);
     // Definition I/O never runs under the event or tree lifecycle lock: read the child's
     // definition layers first (inactive candidates only), then plan under the locks.
     let preparedReawakenAi: PreparedReawakenAi | undefined;
@@ -15265,10 +15404,13 @@ export class TaskService implements AgentTaskIntegration {
             executionId
           );
         } else {
+          // Only an active record changes the checks below, so the scan reads only those files.
           continuationRecord =
-            (await this.getWorkspaceTurnManager().listAllWorkspaceTurns()).find(
-              (record) => record.handleId === executionId
-            ) ?? null;
+            (
+              await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
+                statuses: ["queued", "starting", "running"],
+              })
+            ).find((record) => record.handleId === executionId) ?? null;
         }
       }
       const continuationActive = isActiveWorkspaceTurnTaskStatus(continuationRecord?.status);

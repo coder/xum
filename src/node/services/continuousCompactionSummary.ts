@@ -123,7 +123,7 @@ export async function summarizeContinuousCompaction(args: {
   const agentCacheTtl = resolveChainAgentCacheTtl(
     agent.data.effectiveAgentId,
     cfg.agentAiDefaults,
-    agent.data.agentInheritanceChain
+    agent.data.agentAiSettingsChain
   );
   const system = await resolveAgentBody(
     agent.data.agentDiscoveryRuntime,

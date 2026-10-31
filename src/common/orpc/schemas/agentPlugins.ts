@@ -14,6 +14,10 @@ import {
 
 export { AgentPluginGitSourceSchema, AgentPluginInstallEntrySchema };
 
+/** How a Cursor rule applies in Cursor (cursorRules.ts); the review labels the rule skill by it. */
+export const AgentPluginRuleTypeSchema = z.enum(["always-apply", "description", "glob", "manual"]);
+export type AgentPluginRuleType = z.infer<typeof AgentPluginRuleTypeSchema>;
+
 export const AgentPluginPreviewSkillSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
@@ -22,7 +26,17 @@ export const AgentPluginPreviewSkillSchema = z.object({
    * the user invokes the skill, so the review shows them. Absent when there are none.
    */
   directives: z.array(z.string()).optional(),
+  /** Set only for a skill that Xum made from a Cursor rule file. */
+  ruleType: AgentPluginRuleTypeSchema.optional(),
 });
+
+/** A part of a plugin that Xum lists but does not load or run (Cursor plugins, RFC Goal 7). */
+export const AgentPluginNotAppliedSchema = z.object({
+  part: z.enum(["field", "rule", "agent", "hook", "mcp", "command"]),
+  name: z.string(),
+  reason: z.string(),
+});
+export type AgentPluginNotApplied = z.infer<typeof AgentPluginNotAppliedSchema>;
 
 export const AgentPluginPreviewMcpServerSchema = z.object({
   serverName: z.string(),
@@ -54,8 +68,9 @@ export const AgentPluginPreviewHookSchema = z.object({
 });
 
 /**
- * One Codex-format plugin hook handler (hooks.json). Only `mcp_tool` can run; `command`,
- * `prompt` and `agent` are parsed and shown, never run.
+ * One plugin hook handler (hooks.json). Codex format: only `mcp_tool` can run; `command`, `prompt`
+ * and `agent` are parsed and shown, never run. Cursor format: `cursor-command` runs a command on
+ * the host (local and worktree workspaces only), `cursor-prompt` never runs.
  */
 export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
   z.object({
@@ -69,12 +84,28 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
     statusMessage: z.string().optional(),
   }),
   z.object({ type: z.enum(["command", "prompt", "agent"]), summary: z.string() }),
+  z.object({
+    type: z.literal("cursor-command"),
+    command: z.string(),
+    /** Declared positive `timeout` in seconds; absent means the runner default. */
+    timeoutSeconds: z.number().optional(),
+    /** The declared `loop_limit`, at most 50 (the per-user-turn ceiling); null: no own limit. */
+    loopLimit: z.number().int().nullable().optional(),
+    failClosed: z.boolean().optional(),
+    /**
+     * The entry as declared, as the canonical JSON that the hook hash covers (clamped values and
+     * unknown fields included), so the review shows every field the user trusts.
+     */
+    declared: z.string(),
+  }),
+  z.object({ type: z.literal("cursor-prompt"), declared: z.string() }),
 ]);
 
 /**
- * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
- * agent handler. `ignored-event`: a Codex event Xum does not map. `claude-plugin`: any hook of a
- * Claude Code plugin (Xum lists them and never runs them).
+ * `runnable`: an mcp_tool handler on a mapped Codex event, or a `cursor-command` handler on a mapped
+ * Cursor event without a matcher. `unsupported-handler`: a Codex command, prompt or agent handler,
+ * or a Cursor prompt hook. `ignored-event`: an event Xum does not map, or a Cursor hook with a
+ * matcher. `claude-plugin`: any hook of a Claude Code plugin (Xum lists them and never runs them).
  */
 export const PluginHookStatusSchema = z.enum([
   "runnable",
@@ -101,11 +132,6 @@ export const AgentPluginHookSchema = z.object({
   /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
   source: z.string(),
   review: PluginHookReviewStateSchema,
-});
-
-export const AgentPluginHooksSchema = z.object({
-  hooks: z.array(AgentPluginHookSchema),
-  warnings: z.array(z.string()),
 });
 
 /** Composer slash command declared by the manifest (data-driven expansion). */
@@ -170,6 +196,8 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("agent-plugin") }),
   /** .claude-plugin/plugin.json. */
   z.object({ kind: z.literal("claude-plugin") }),
+  /** .cursor-plugin/plugin.json. */
+  z.object({ kind: z.literal("cursor-plugin") }),
   /** SKILL.md folders only: Xum writes a plugin.json for them (installMethods.ts). */
   z.object({ kind: z.literal("skills") }),
   /**
@@ -178,8 +206,53 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
    * plugin.json of its own and Xum writes one from the entry (claudeMarketplace.ts).
    */
   z.object({ kind: z.literal("claude-marketplace"), entry: z.string().min(1) }),
+  /**
+   * One entry of a Cursor marketplace (`.cursor-plugin/marketplace.json`). A preview selector
+   * only: the entry installs through its folder's own manifest, so install never gets it back.
+   * No install record stores a method (agentPluginInstalls.ts).
+   */
+  z.object({ kind: z.literal("cursor-marketplace"), entry: z.string().min(1) }),
 ]);
 export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
+
+/**
+ * One consent-relevant difference between the installed tree and a staged
+ * update (see installService capabilitySurface). `before`/`after` carry the
+ * human-readable value on each side so the user can judge the change instead
+ * of only being told that something changed; additions have no `before`.
+ */
+/**
+ * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
+ * renderer sends the shown refs back on confirm, and the backend records only refs that still
+ * match, so a component that changed after the review never gets consent.
+ */
+export const AgentPluginComponentRefSchema = z.object({
+  kind: AgentPluginComponentKindSchema,
+  name: z.string(),
+  fingerprint: z.string(),
+});
+
+export const AgentPluginCapabilityChangeSchema = z.object({
+  summary: z.string(),
+  before: z.string().optional(),
+  after: z.string().optional(),
+  /** Set for a skill or MCP server change: what confirming the review approves. */
+  component: AgentPluginComponentRefSchema.optional(),
+});
+
+export const AgentPluginHooksSchema = z.object({
+  hooks: z.array(AgentPluginHookSchema),
+  warnings: z.array(z.string()),
+  /**
+   * D30 at the first trust: every file of the plugin, as the install preview lists them. Set
+   * while the plugin runs a Cursor command hook and none of its Cursor hooks is trusted: a plugin
+   * installed by a build without the file review never showed its files. Trusting a Cursor
+   * command hook then needs `digest`, so the trust covers exactly the files shown.
+   */
+  fileReview: z
+    .object({ changes: z.array(AgentPluginCapabilityChangeSchema), digest: z.string() })
+    .optional(),
+});
 
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
@@ -209,8 +282,19 @@ export const AgentPluginInstallPreviewSchema = z.object({
    * trusts it in Settings (Codex trust per hash).
    */
   codexHooks: z.array(AgentPluginHookSchema.omit({ review: true })),
+  /**
+   * The first file review (Cursor plugin RFC D30): one added row per file of a plugin with a
+   * runnable Cursor command hook, because such a hook can run any file of the plugin. Empty for
+   * every other plugin.
+   */
+  fileChanges: z.array(AgentPluginCapabilityChangeSchema),
   /** Agent definition files (agents/*.md) that become selectable agents. */
   agents: z.array(z.string()),
+  /**
+   * The files of `agents` with Cursor `readonly: true`: they run on Explore's tools, so the
+   * review says file edits are removed and the shell stays.
+   */
+  readonlyAgents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */
   workflows: z.array(z.string()),
   /** Composer slash commands the manifest contributes. */
@@ -229,6 +313,8 @@ export const AgentPluginInstallPreviewSchema = z.object({
   ),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
+  /** The parts of the staged plugin that Xum lists but does not apply. */
+  notApplied: z.array(AgentPluginNotAppliedSchema),
   /** Final install directory (~/.mux/plugins/<name>). */
   targetPath: z.string(),
   /**
@@ -238,10 +324,13 @@ export const AgentPluginInstallPreviewSchema = z.object({
   consentDigest: z.string(),
 });
 
-/** One plugin entry of a Claude Code marketplace listing. */
-export const AgentPluginMarketplaceEntrySchema = z.object({
-  name: z.string(),
-  description: z.string().optional(),
+/**
+ * One marketplace file's entry for a listing row. A row's builds keep their own status, so a
+ * broken entry in one file never disables or enables the other file's build.
+ */
+export const AgentPluginMarketplaceBuildSchema = z.object({
+  /** The marketplace file that lists the entry. */
+  file: z.enum(["cursor", "claude"]),
   /** The entry `source` kind; "relative" is a folder of the marketplace repository. */
   sourceKind: z.enum([
     "relative",
@@ -265,7 +354,18 @@ export const AgentPluginMarketplaceEntrySchema = z.object({
   reason: z.string().optional(),
 });
 
-/** A repository whose only package is a Claude Code marketplace: the user picks one entry. */
+/**
+ * One plugin name of a marketplace listing. A repository with both marketplace files lists a
+ * name once; a name in both files has two builds, Cursor first.
+ */
+export const AgentPluginMarketplaceEntrySchema = z.object({
+  name: z.string(),
+  /** The first build's description. */
+  description: z.string().optional(),
+  builds: z.array(AgentPluginMarketplaceBuildSchema).min(1),
+});
+
+/** A repository whose only package is a marketplace: the user picks one entry. */
 export const AgentPluginMarketplaceListingSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
@@ -314,6 +414,8 @@ export const AgentPluginListItemSchema = z.object({
   /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
   mcpServerCount: z.number().int().nonnegative(),
+  /** The installed plugin's not-applied parts; absent when there are none or the folder is gone. */
+  notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
 });
 
 /**
@@ -340,31 +442,6 @@ export const AgentPluginUpdateCheckSchema = z.object({
   remoteSha: z.string().optional(),
   /** Error detail when status is "error". */
   message: z.string().optional(),
-});
-
-/**
- * One consent-relevant difference between the installed tree and a staged
- * update (see installService capabilitySurface). `before`/`after` carry the
- * human-readable value on each side so the user can judge the change instead
- * of only being told that something changed; additions have no `before`.
- */
-/**
- * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
- * renderer sends the shown refs back on confirm, and the backend records only refs that still
- * match, so a component that changed after the review never gets consent.
- */
-export const AgentPluginComponentRefSchema = z.object({
-  kind: AgentPluginComponentKindSchema,
-  name: z.string(),
-  fingerprint: z.string(),
-});
-
-export const AgentPluginCapabilityChangeSchema = z.object({
-  summary: z.string(),
-  before: z.string().optional(),
-  after: z.string().optional(),
-  /** Set for a skill or MCP server change: what confirming the review approves. */
-  component: AgentPluginComponentRefSchema.optional(),
 });
 
 /** Ties an update confirmation to the exact trees the user reviewed. */
@@ -394,6 +471,11 @@ export const AgentPluginUpdateReviewSchema = z.object({
   changes: z.array(AgentPluginCapabilityChangeSchema),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
+  /**
+   * The staged plugin's not-applied parts; absent when there are none, or when the review stages
+   * no plugin (no new commit, or a component review).
+   */
+  notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
 });
 
 export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;
@@ -410,6 +492,7 @@ export type AgentPluginHook = z.infer<typeof AgentPluginHookSchema>;
 export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
+export type AgentPluginMarketplaceBuild = z.infer<typeof AgentPluginMarketplaceBuildSchema>;
 export type AgentPluginMarketplaceEntry = z.infer<typeof AgentPluginMarketplaceEntrySchema>;
 export type AgentPluginMarketplaceListing = z.infer<typeof AgentPluginMarketplaceListingSchema>;
 export type AgentPluginSourcePreview = z.infer<typeof AgentPluginSourcePreviewSchema>;
