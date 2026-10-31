@@ -167,18 +167,14 @@ real marketplace:
     not applied.
 8.  **Hooks in remote workspaces** (SSH, Docker, devcontainer). Tracking issue
     T6.
-9.  **`is_background`** as a background default. Listed as not applied.
-    Tracking issue T7.
+9.  **`is_background` as an enforced default.** Xum shows it as a hint in the
+    `task` tool's agent list (D12). Tracking issue T7.
 10. **The Cursor MCP `auth` block.** Listed as not applied. Tracking issue T8.
 11. **Cursor commands.** Listed as not applied. Tracking issue T9.
 
 ## Open Questions
 
-The owner (@ThomasK33) decided D1-D21. The Decisions table under Technical
-Plan lists each one. Open item:
-
-1.  The text of D6, and a confirmation of D3 (see the Decisions table). Owner:
-    @ThomasK33.
+None. The Decisions table under Technical Plan lists every decision.
 
 ## Critical User Journeys (CUJs)
 
@@ -200,8 +196,8 @@ Plan lists each one. Open item:
 *   **When**: The parent agent spawns `ci-watcher`, which declares
     `model: fast`.
 *   **Then**: `ci-watcher` runs on the Explore model. The sub-agent header shows
-    the model and where it came from. If the user clears the Explore model, the
-    next spawn uses the parent model.
+    that model. If the user clears the Explore model, the next spawn uses the
+    parent model.
 
 ### CUJ 3: Loop a turn with a stop hook
 
@@ -258,16 +254,16 @@ marked "(Dn)" at the step it changes.
 | --- | --- | --- |
 | D1 | Hook trust hashes the `hooks.json` entry. The update review lists every changed file of a plugin with a runnable Cursor command hook. A local edit on disk outside an update is an accepted risk. | 5.1 |
 | D2 | A ceiling of 50 continuations per user turn for all hooks. | 6 |
-| D3 | One shared default stop-loop limit of 3 for every hook source. (Inferred from Alternative Y and section 8. Owner to confirm.) | 6 |
+| D3 | One shared default stop-loop limit of 3 for every hook source. No second default or code path for Cursor hooks. | 6 |
 | D4 | Continuations count per user turn, for every hook source. | 6 |
 | D5 | After a user Stop or an error, Xum runs no stop hook. | 6 |
-| D6 | Not recorded in this RFC. Owner to supply. | - |
+| D6 | The runner refuses to start any hook process when `XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS` or `XUM_DISABLE_PROJECT_AUTOMATION` is set. | 5.1 |
 | D7 | Cursor command hooks run in local and worktree workspaces only. Remote workspaces list them as "does not run in remote workspaces" (T6). | 5.1, 5.6 |
-| D8 | Cursor hooks follow Cursor's documented failure rule. Codex hooks keep the shipped rule. | 5.5 |
+| D8 | Cursor hooks follow Cursor's documented failure rule. A Codex `PreToolUse` hook whose output is malformed or fails its schema check blocks the tool call. Every other Codex failure keeps failing open. | 5.5, PR 6 |
 | D9 | Only `afterFileEdit`, `afterAgentResponse` and `stop` run. Tool, message and compaction events and matchers are listed (T1). | 5.2, 5.3 |
 | D10 | `beforeReadFile` and `postToolUseFailure` are not applied (T1). | 5.2 |
 | D11 | `model: fast` agents use Explore as their AI settings base. | 7 |
-| D12 | `is_background` is listed as not applied (T7). | 7 |
+| D12 | `is_background: true` is a hint, not enforced: the `task` tool's agent list shows "meant to run in the background (run_in_background=true)". The `task` schema and its default are unchanged (T7). | 7 |
 | D13 | `readonly` agents get Explore's prompt before their own body. | 7 |
 | D14 | Rule skills use the shipped skill consent. | 2 |
 | D15 | Hooks run through `runtime.exec` on every platform (Git Bash on Windows). | 5.4 |
@@ -277,10 +273,20 @@ marked "(Dn)" at the step it changes.
 | D19 | The Cursor `auth` block is listed as not applied (T8). | 4 |
 | D20 | A repository with both marketplace files shows one merged list. | 3 |
 | D21 | A schema-less root `plugin.json` yields to a Cursor manifest, as it yields to Codex and Claude. | 1 |
+| D22 | The turn-stop text keeps its shipped rule (the reply's trailing text run, `null` after a tool part, #6067). Only the cut changes: it keeps the last 16 × 1024 characters. | 5.4, PR 5 |
+| D23 | `cursor-marketplace` is a preview selector only. A Cursor entry installs through its folder's own manifest, with no generated manifest or `generatedFrom` marker. An entry without a manifest is refused. | 3, PR 2 |
+| D24 | Cursor manifest component paths (`skills`, `rules`, `agents`) are folder paths. Globs and file paths are listed as not applied (T10). | 1, PR 1 |
+| D25 | `afterFileEdit` runs after `file_edit_replace_string` and `file_edit_insert` only. `edits` comes from the tool input. | 5.2, 5.4, PR 8 |
+| D26 | An `ai.settingsBase` that names a missing agent, the agent itself, or an agent whose chain contains the agent is ignored with a warning. | 7, PR 4 |
+| D27 | The sub-agent header shows the model only, not where it came from (T11). | 7, PR 4 |
+| D28 | A Cursor hook failure logs a warning and shows one chat notice per workspace and hook. The hooks panel shows no failure state. | 5.5, PR 8 |
+| D29 | The `cursor` MCP dialect has the Codex shape: `type: "http"` and a `url` without `type` both become `streamable-http`. Only the two plugin roots expand, so `${CURSOR_PLUGIN_DATA}` counts as a user value. | 4, PR 3 |
 
-After the Goldfish review, the owner changed D1, D5, D7, D8, D9, D12 and D19
-and added D21 (2026-10-31). Commands are not applied, and the Codex failure rule
-is unchanged.
+After the Goldfish review, the owner delegated the remaining trade-offs
+(2026-10-31). The final set is D1-D29: the owner decided D1-D21, and the Stage 9
+re-audit added D22-D29 under the same delegation. The rule for D22-D29: build
+what the 128 marketplace plugins use today, track the rest, and prefer the
+smaller and more secure option.
 
 ### Shape of the change
 
@@ -330,16 +336,17 @@ flowchart LR
 *   Cursor rule
     ([reference/plugins.md](https://cursor.com/docs/reference/plugins.md)): a
     manifest path replaces folder discovery for that component. Each path is
-    contained in the plugin folder, as for Claude. A path outside the folder, or
-    a glob that matches nothing, is listed as not applied.
+    contained in the plugin folder, as for Claude. Xum applies folder paths only
+    (D24): every marketplace manifest names folders. A glob, a file path or a
+    path outside the folder is listed as not applied (T10).
 
 | Cursor field | Xum field | Rule |
 | --- | --- | --- |
 | `name`, `displayName`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords`, `logo` | plugin metadata | Same handling as Claude. `logo` uses the existing logo path checks. |
-| `skills` (string or list of paths or globs) | `skillsDirs` | Replaces the default `skills/` scan, as Cursor does. Without the field, Xum scans `skills/`. |
+| `skills` (string or list of folder paths) | `skillsDirs` | Replaces the default `skills/` scan, as Cursor does. Without the field, Xum scans `skills/`. |
 | `commands` (string or list) | none | Listed as not applied (T9). No marketplace plugin names `commands` or ships a `commands/` folder. |
-| `rules` (string or list of paths or globs) | `skillsDirs` with `{rule: true}` | Replaces the default `rules/` scan. Files `.md`, `.mdc`, `.markdown`. See section 2. |
-| `agents` (string or list of paths or globs) | `agentsDir` and agent files | Replaces the default `agents/` scan. Files `.md`, `.mdc`, `.markdown`. Each path or glob resolves to files inside the plugin folder. |
+| `rules` (string or list of folder paths) | `skillsDirs`, one rule root per file | Replaces the default `rules/` scan. Files `.md`, `.mdc`, `.markdown`. See section 2. |
+| `agents` (string or list of folder paths) | `agentsDir` | Replaces the default `agents/` scan. The first folder path is used. Each later one is listed as not applied. |
 | `mcpServers` (string) | `mcpConfigPath`, dialect `cursor` | See section 4. An inline object or list is not applied and listed, as for Claude (`claudeManifest.ts:166-181`). No marketplace plugin uses that form. |
 | `hooks` (string or inline object) | `cursor.hooks` | See section 5. |
 | `variables`, `category`, `tags`, `publisher`, `clientVersionRequirement`, `minClientVersions` | none | Listed as not applied (Goal 7). |
@@ -350,8 +357,10 @@ flowchart LR
     into SKILL.md text when Xum
     reads it, the way `claudeCommands.ts` turns a command into a skill. Nothing
     new is written to disk.
-*   The skill name is the file name without `.mdc`. If a real skill in the same
-    plugin has that name, the skill wins and the rule is listed as not applied.
+*   The skill name is the file name without its extension. It must be a valid
+    skill name (kebab-case). If a real skill in the same plugin has that name,
+    the skill wins and the rule is listed as not applied. PR 1.1 gives the full
+    rules.
 *   Rule types map as follows:
 
 | Rule frontmatter | Skill | Install review label |
@@ -383,30 +392,30 @@ flowchart LR
     files when both exist, and shows one merged list (D20). `cursor/plugins` ships both: the Claude file lists 2 entries
     (`origin-apps`, and `pstack` at `./harness/pstack/claude-code`), the Cursor
     file lists 128 (`pstack` at `./pstack`).
-    *   A name in only one file shows once, with that file's install method.
-    *   A name in both files shows once, with two install methods: "Claude
-        build" and "Cursor build". The user picks one in the install review.
-        This reuses the multiple-methods-per-entry rule
-        (`entryInstallMethods`, `installMethods.ts:496-530`).
+    *   A name in only one file shows once, with that file's preview action.
+    *   A name in both files shows once, with two preview actions: "Preview
+        Cursor build" and "Preview Claude build". Each one previews that file's
+        entry.
     *   Same-name guard: install folders are named after the plugin
         (`targetPathFor(entry.name)`), so only one build of a name can be
         installed. A second install of the same name is refused until the user
         uninstalls the first. Xum reuses `collisionReason`
         (`installService.ts:3791-3800`): "A managed plugin named '<name>' is
         already installed. Uninstall it first."
-    *   Updates stay on the source file. The `generatedFrom` marker records
-        which file an install came from, and the update path reads the entry
-        again from that file (`installService.ts:6378-6383`). An install made
-        through the Claude file keeps updating from the Claude file after this
-        change.
+    *   Updates: an installed folder with its own manifest updates by tracking
+        that folder at the new commit (`installService.ts:6378-6384`). Every
+        Cursor entry is such a folder. An install made through a generated
+        Claude manifest keeps reading its entry from the Claude file.
     *   Merged-list caps: each file keeps its own 8 MiB and 500-entry cap. The
         merged list has at most 1000 entries.
-*   A new install-method kind (`cursor-marketplace`) joins
-    `detectInstallMethods` (`installMethods.ts:299-316`). The generated
-    manifest marker follows the `claude-marketplace` pattern
-    (`installMethods.ts:658-709`), including the downgrade-safe
-    `INERT_COMPONENT_PATH` (`manifest.ts:276`) for parts an older Xum build
-    must not load.
+*   A Cursor entry installs through its folder's own manifest (D23): all 128
+    Cursor entries point to a folder with `.cursor-plugin/plugin.json` (or a root
+    `plugin.json` with `$schema`, for `pstack`). `detectInstallMethods`
+    (`installMethods.ts:299-316`) gains the method `cursor-plugin`.
+    `cursor-marketplace` names a Cursor entry for a preview, as
+    `claude-marketplace` does for a Claude entry, and install never gets it
+    back. Xum writes no generated manifest and no `generatedFrom` marker for
+    Cursor entries. A Cursor entry whose folder has no manifest is refused.
 *   The install review shows every not-applied part, field and hook event. The
     preview schema gains one list for them (`common/orpc/schemas/agentPlugins.ts`).
 
@@ -416,14 +425,19 @@ flowchart LR
     `:1354`).
 *   The ternary in `pluginPlaceholderValues` (`mcpConfig.ts:366-375`) becomes a
     per-dialect table. The `cursor` dialect expands `CURSOR_PLUGIN_ROOT` and
-    `CLAUDE_PLUGIN_ROOT` to the install folder. The `${CLAUDE_PLUGIN_ROOT}/<path>`
-    rewrite to `./<path>` (`mcpConfig.ts:346-363`) applies to both names.
+    `CLAUDE_PLUGIN_ROOT` to the install folder, and no data folder names
+    (D29). The `${CLAUDE_PLUGIN_ROOT}/<path>` rewrite to `./<path>`
+    (`mcpConfig.ts:346-363`) applies to both names.
+*   Transport (D29): the `cursor` dialect has the Codex shape, so `type:
+    "http"` and a `url` without `type` (the `gong` server) both become
+    `streamable-http`. 101 of the 104 marketplace servers set `type: "http"`.
 *   Any other `${NAME}` placeholder (user values such as `${CLIENT_ID}`) in
     `command`, `args`, `env`, `cwd`, `url` or `headers`, including
     `${NAME:-default}`, gives that server the status "needs values not
-    supported in Xum". Xum lists the server, does not start it and does not read
-    the value from the environment. This status is new code. Cursor `variables` are a
-    non-goal.
+    supported in Xum". Xum skips the server with the existing per-server
+    diagnostic (`reportEntry`, `mcpConfig.ts:788`), and does not read the value
+    from the environment. The check is new and runs for the `cursor` dialect
+    only. Cursor `variables` are a non-goal.
 *   Remote HTTP servers go through the existing plugin MCP path, with its
     https rule for auth URLs.
 *   The Cursor `auth` block (D19) is not applied. Xum ignores it, lists "auth
@@ -480,12 +494,13 @@ flowchart LR
         folder walk on every hook run.
     *   Rejected: hashing the whole plugin folder before each run, and hashing
         each script a command names. See Alternatives Considered.
-*   Kill switches: the runner refuses to start any hook process when
-    `XUM_DISABLE_AGENT_TOOLS` (`utils/agentToolsDisabled.ts:16-18`),
-    `XUM_DISABLE_TERMINALS` (`terminalService.ts:75-76`) or
-    `XUM_DISABLE_PROJECT_AUTOMATION` (`utils/projectAutomation.ts:18-23`) is
-    set. AGENTS.md requires that model-driven bug-bash runs never reach a host
-    shell.
+*   Kill switches (D6): the runner refuses to start any hook process when
+    `XUM_DISABLE_AGENT_TOOLS` (read by `isAgentToolsDisabled`,
+    `src/node/utils/agentToolsDisabled.ts:15-17`), `XUM_DISABLE_TERMINALS`
+    (read inline in `src/node/services/terminalService.ts:75-76`) or
+    `XUM_DISABLE_PROJECT_AUTOMATION` (read by `projectAutomationDisabled`,
+    `src/node/utils/projectAutomation.ts:20-24`) is set. AGENTS.md requires
+    that model-driven bug-bash runs never reach a host shell.
 *   Remote workspaces (D7): Cursor command hooks do not run in SSH, Docker or
     devcontainer workspaces, as for all plugin hooks today
     (`remoteProjectPlugins.ts:1-16`, #7218: remote plugins load skills and
@@ -495,7 +510,7 @@ flowchart LR
 
 | Cursor event | Xum point | Phase | Can block or change |
 | --- | --- | --- | --- |
-| `afterFileEdit` | `tool.execute` (the file edit tools: `file_edit_replace_string`, `file_edit_replace_lines`, `file_edit_insert`) | after | none |
+| `afterFileEdit` | `tool.execute` (`file_edit_replace_string` and `file_edit_insert`, D25) | after | none |
 | `afterAgentResponse` | `turn.stop` | first | none |
 | `stop` | `turn.stop` | after `afterAgentResponse` | `followup_message` |
 | `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `postToolUse`, `afterShellExecution`, `afterMCPExecution`, `beforeSubmitPrompt`, `preCompact` | none in this version (D9) | | listed as not applied (T1) |
@@ -534,9 +549,9 @@ tool events in T1.
     environment with the same minimal-environment option.
 *   `CURSOR_PLUGIN_ROOT` is the install folder. Xum never sets
     `CURSOR_CODE_REMOTE`, because Cursor hooks do not run in remote workspaces.
-*   Exit code 127 (command not found) is logged and shown once per workspace
-    as "`<command>` not found in this workspace". A machine without `jq` or
-    `bun` gives this result.
+*   Exit code 127 (command not found) is a failure (5.5) with the reason
+    "`<command>` not found in this workspace". A machine without `jq` or `bun`
+    gives this result.
 *   Shell (D15): `runtime.exec` on every
     platform. On Windows, local `exec` runs through Git Bash (`getBashPath`,
     `LocalBaseRuntime.ts:250`, `:631`), so there is no Windows-only path. A
@@ -580,32 +595,42 @@ tool events in T1.
     ID, `generation_id` = turn ID, `model`, `hook_event_name`,
     `cursor_version`, `workspace_roots`) plus each event's own fields.
     `user_email` is `null`. `transcript_path` follows D18.
-    *   `afterAgentResponse`: `text` is the full text of the final reply, every
-        text part of the last assistant message, cut to its **last**
-        16 × 1024 characters (`TURN_STOP_TEXT_MAX_CHARS`). Text parts join with
-        `\n`, and the cut keeps whole UTF-16 surrogate pairs. Today
-        `lastAssistantText` keeps the trailing text run only, returns `null`
-        when the turn ends on a tool call, and keeps the **first** 16 × 1024
-        characters (`promptHooks.ts:128`, `:173-181`). A completion promise
-        sits at the end of a reply, so the first 16 × 1024 characters can miss
-        it.
+    *   `afterAgentResponse`: `text` is the reply's trailing text run, from
+        `lastAssistantText` (`promptHooks.ts:173-182`), cut to its **last**
+        16 × 1024 characters (D22). At `0f82063e7e` it keeps the **first**
+        16 × 1024 characters (`promptHooks.ts:128`). A completion promise sits
+        at the end of a reply, so the first 16 × 1024 characters can miss it.
+        A turn that ends on a tool part still gives `null` (#6067), and Xum
+        then passes `text: ""`.
     *   `stop`: `status` is `"completed"` (D5: no stop hook runs after a user
         Stop or an error) and `loop_count` follows section 6.
-    *   `afterFileEdit`: `file_path` (absolute) and `edits`, one
-        `{old_string, new_string}` entry per edit. `old_string` is the text the
-        edit replaced (empty for an insert) and `new_string` the text it wrote.
-        PR 7 reads both from the edit tool's input and result.
+    *   `afterFileEdit` (D25): `file_path` is the tool's resolved `path`
+        (absolute). For `file_edit_replace_string`, `edits` is
+        `[{old_string, new_string}]` from the tool input. For
+        `file_edit_insert`, it is `[{old_string: "", new_string: content}]`.
+        `file_edit_replace_lines` is disabled in Xum
+        (`toolDefinitions.ts:3502`), and `bash` edits fire no hook, as in
+        Cursor.
 *   Exit codes and bad output: see 5.5.
 
-#### 5.5 Failure rules for Cursor hooks (D8)
+#### 5.5 Failure rules for plugin hooks (D8)
 
 Cursor hooks follow Cursor's documented rule
 ([hooks.md](https://cursor.com/docs/hooks.md), "Exit code behavior"). Codex
-hooks keep the shipped rule: every failure lets the call through
-(`codexHookRunner.ts:10-15`). This RFC does not change Codex hooks.
+hooks change in one case only (PR 6): a Codex `PreToolUse` hook whose output is
+malformed or fails its schema check blocks the tool call. Today `applyOutput`
+(`codexHookRunner.ts:560-571`) warns and ignores such output, and a `parse`
+throw lands in `invoke`'s catch (`:552-554`) and fails open. Every other Codex
+failure keeps failing open: a timeout, an error from the MCP call, a missing or
+unavailable server, and malformed output from `PostToolUse`,
+`UserPromptSubmit` or `Stop`. An `updatedInput` that fails the tool's schema
+already blocks today (`blockRewrite`, `:387`, `:401`), so it does not change.
+The owner chose the more secure option for Codex hooks too.
 
-No event in this version is a Cursor permission hook (5.2), so no hook failure
-blocks anything.
+Cursor hooks:
+
+No Cursor event in this version is a permission hook (5.2), so no Cursor hook
+failure blocks anything.
 
 | Result | `afterFileEdit`, `afterAgentResponse`, `stop` |
 | --- | --- |
@@ -619,12 +644,17 @@ blocks anything.
 *   Output schemas: `stop` accepts `{followup_message?: string}`.
     `afterAgentResponse` and `afterFileEdit` have no output fields, so Xum
     ignores their stdout after the JSON check. Unknown fields are ignored.
-*   "Warn" means: Xum logs the failure and shows it on the hook's row in the
-    hooks panel. A 127 also shows the one-time chat notice (5.4).
+*   "Warn" means (D28): Xum logs the failure and, once per workspace and hook,
+    shows the chat notice "<plugin>: hook <event> failed (<reason>). Turn the
+    hook off in Settings > Plugins." The hooks panel shows no failure state.
 *   `failClosed` has no effect on these events, as in Cursor. It is parsed and
     hashed, so a change to it asks for trust again. When T1 adds permission
     hooks, they follow Cursor's rule: invalid JSON or schema-failing output
     blocks, and other failures block only with `failClosed: true`.
+*   A Codex `PreToolUse` block caused by malformed output shows one chat line:
+    "<plugin>: hook PreToolUse blocked this call (its output is malformed:
+    <detail>). Turn the hook off in Settings > Plugins." Without that line a
+    broken guard looks like a stalled agent.
 
 #### 5.6 Remote workspaces (not in this version)
 
@@ -703,13 +733,29 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         for consent once after the update that ships this field.
     *   Downgrade: an older Xum build ignores `ai.settingsBase` and resolves as
         today. A schema fixture covers this.
-    *   The sub-agent header names the source: "model from Explore settings".
+    *   An `ai.settingsBase` that names a missing agent, the agent itself, or an
+        agent whose chain contains the agent is ignored with a warning, and the
+        agent resolves as without it (D26).
+    *   The sub-agent header shows the resolved model, as for every sub-agent.
+        It does not name where the model came from (D27, T11).
     *   `model: inherit` and every other `model` value keep today's behavior.
-*   `is_background` (D12): not applied. The shipped mapping already ignores it
-    (`pluginAgentFormat.ts:366-367`): the parent chooses `run_in_background`
-    for each spawn. The install review lists "`is_background` not applied in
-    Xum" for each agent that sets it (4 marketplace agent files). A background
-    default is tracking issue T7.
+*   `is_background: true` (D12): a hint, not enforced. The `task` tool's schema
+    and its default (`run_in_background` defaults to `false`,
+    `toolDefinitions.ts:423`) do not change. The parent still chooses
+    `run_in_background` for each spawn.
+    *   The Cursor mapping writes a new optional Xum field,
+        `subagent.background_hint: true`. The agent descriptor carries it as
+        `backgroundHint`. The `task` tool's agent list
+        (`buildTaskDescription`, `src/node/services/tools/task.ts:102-124`)
+        shows it as "[meant to run in the background
+        (run_in_background=true)]" after the agent's description.
+    *   3 marketplace agents set it: `cursor-team-kit/ci-watcher`,
+        `dyl-stack/dyl-agent` and `pstack/poteto-agent`.
+    *   The field is part of the mapped frontmatter, so it is fingerprinted, and
+        each installed agent that sets it asks for consent once after this
+        update. An older Xum build strips it (`AgentDefinitionSubagentSchema`
+        is `.strip()`).
+    *   Enforcing it as a default is tracking issue T7.
 *   `readonly` agent prompt (D13): for
     `readonly: true` agents only, the mapping sets `prompt.append: true`
     instead of `false` (`pluginAgentFormat.ts:340-372`). The model sees the
@@ -732,9 +778,10 @@ Each one needs a line in the release notes.
 
 | Change | Who sees it | Decision |
 | --- | --- | --- |
+| A Codex `PreToolUse` hook whose output is malformed or fails its schema check now blocks the tool call instead of being ignored. A chat line names the plugin and the hook. | Users of Codex plugins with `PreToolUse` hooks | D8 |
 | Adding a repository with both marketplace files shows one merged list. `cursor/plugins` goes from 2 entries to 128. | Users of the Plugins tab | D20 |
 | A folder with a schema-less root `plugin.json` and a Cursor manifest loads the Cursor manifest. | Users with such a folder (none in the marketplace) | D21 |
-| The `afterAgentResponse` and turn-stop text passed to hooks is the last 16 × 1024 characters of the full final reply. Codex `Stop` hooks receive the same text. | Users of Codex `Stop` hooks | Mechanical (5.4) |
+| The turn-stop text passed to hooks keeps the last 16 × 1024 characters of the reply's trailing text run instead of the first. Codex `Stop` hooks receive the same text. | Users of Codex `Stop` hooks | D22 |
 | Stop-hook continuations are counted per hook with a ceiling of 50 per user turn. Hooks without `loop_limit`, all Codex hooks included, keep 3 per user turn. | No visible change for existing hooks | D2, D3, D4 |
 
 ## Risks & Mitigations
@@ -744,7 +791,8 @@ Each one needs a line in the release notes.
 | Hook scripts run on the host | A script changed by an upstream update, or by a local edit, runs on the host. | The update review lists every changed file (5.1). A local edit outside an update is an accepted risk. | D1 |
 | Cost of stop loops | A `loop_limit: null` hook continues up to 50 paid turns per user message. After a user Stop the loop stays active (CUJ 3), so each later message can spend up to 50 more until the plugin ends it. | The ceiling of 50, the chat notice on each continuation, and the user Stop. | D2, D4 |
 | Hook process load | One process per hook call. Matching hooks run in sequence (`codexHookRunner.ts:17-19`), and each call is capped at 30 s. | The shared timeout rule. The kill switches stop all hook processes. | D16 |
-| A broken hook fails quietly | A crashed or misconfigured hook does nothing. | The hooks panel shows the failure on the hook's row, and a 127 shows a one-time chat notice (5.5). | D8 |
+| A broken Codex guard blocks the agent | Malformed output from a Codex `PreToolUse` hook blocks every matching tool call. | One chat line names the plugin, the hook and how to turn it off (5.5). | D8 |
+| A broken hook fails quietly | A crashed or misconfigured hook does nothing. | One chat notice per workspace and hook names the failure (5.5). | D28 |
 | Sign-in fails for servers with an `auth` block | A provider without dynamic client registration rejects sign-in. | The server shows "auth not applied in Xum" (section 4). | D19 |
 | Transcript format | `chat.jsonl` is not Cursor's transcript format. | Known gap. No marketplace plugin parses the format. | D18 |
 | `readonly` conflict | A plugin body that asks a `readonly` agent to write gets two conflicting orders. | None of the 6 marketplace agents asks to write. | D13 |
@@ -876,13 +924,14 @@ and names the decision that rejected it.
     plugins read and write workspace state.
 *   **Reason for Rejection**: D7. The hooks would act on the wrong folder.
 
-#### Alternative O: One failure rule for Cursor and Codex hooks
+#### Alternative O: Codex hooks keep the shipped rule
 
-*   **Pros**: One rule instead of two.
-*   **Cons**: Reverses the shipped Codex rule (`codexHookRunner.ts:10-15`) for
-    every Codex user, against Codex's documentation.
-*   **Reason for Rejection**: D8. Each format follows its own documentation, and
-    no shipped behavior changes.
+*   **Pros**: No shipped behavior changes, and Codex hooks follow Codex's
+    documentation, which says failures do not block.
+*   **Cons**: A Codex `PreToolUse` guard with broken output lets every call
+    through.
+*   **Reason for Rejection**: D8. The owner asked for the more secure option for
+    Codex hooks too.
 
 #### Alternative P: Tool, message and compaction events and matchers now
 
@@ -1007,7 +1056,8 @@ and names the decision that rejected it.
 *   **Cons**: The `task` tool's parse-time default changes for every parent
     agent, and a new frontmatter field (`subagent.defaultBackground`) is needed.
     No success test needs it.
-*   **Reason for Rejection**: D12. Deferred to tracking issue T7.
+*   **Reason for Rejection**: D12. Xum shows `is_background` as a hint in the
+    `task` tool's agent list instead. Enforcing it is tracking issue T7.
 
 #### Alternative AF: `readonly` keeps the plugin body only, or gets a separate notice
 
@@ -1064,12 +1114,15 @@ and names the decision that rejected it.
         message, with no limit across messages (see Risks & Mitigations).
     *   Hooks keep the shared 10 s default and 30 s cap.
 *   **Rollout and rollback.**
-    *   Every new frontmatter field (`ai.settingsBase`), schema value (`cursor-marketplace`,
-        dialect `cursor`) and marker is optional. Older builds ignore it or read
-        it as opaque.
-    *   A downgrade fixture covers each one.
-    *   Generated manifests use `INERT_COMPONENT_PATH` (`manifest.ts:276`) for
-        parts an older build must not load.
+    *   Every new frontmatter field (`ai.settingsBase`,
+        `subagent.background_hint`) is optional, and an older build strips it.
+        PR 4's schema test covers both.
+    *   An older build skips a folder whose only manifest is a Cursor manifest,
+        as at `0f82063e7e`, so an installed Cursor plugin loads nothing there.
+        A registry entry with the new method `cursor-plugin` is one an older
+        build cannot parse, and it still owns its name
+        (`installService.ts:3791-3800`).
+    *   Xum writes no generated manifest or marker for Cursor plugins (D23).
     *   The changes to shipped behavior are listed in section 8.
 
 ### Additional Resources
@@ -1114,11 +1167,16 @@ and names the decision that rejected it.
     than 3 continuations.
 *   **T6, hooks in remote workspaces** through a plugin copy (Alternative M).
     Trigger: a user who runs a hook plugin in a remote workspace.
-*   **T7, `is_background` as a background default** (Alternative AE). Trigger:
+*   **T7, `is_background` as an enforced background default** (Alternative AE). Trigger:
     a parent agent that waits on a Cursor background agent.
 *   **T8, the Cursor MCP `auth` block** (Alternative AH). Trigger: a user of one
     of the 4 servers with a fixed client ID.
 *   **T9, Cursor commands.** Trigger: a marketplace plugin that ships one.
+*   **T10, globs and file paths in Cursor manifest component fields** (D24).
+    Trigger: a marketplace manifest that uses one.
+*   **T11, the model source in the sub-agent header** ("model from Explore
+    settings", D27). Trigger: users who cannot tell which settings a `fast`
+    agent used.
 *   **An `origin` discriminant for plugin formats** in `discovery.ts`, in place
     of the `codexFallback`, `claudeFallback` and `cursorFallback` booleans
     (Alternative G).
@@ -1131,531 +1189,982 @@ and names the decision that rejected it.
 
 Paths are repo-relative. "Create" means a new file. Each PR below is a
 reviewable unit. Its files are listed with it, and every PR ships its own tests.
+Line numbers are from `0f82063e7e`.
 
-Order: PR 1 first. PR 2, 3 and 4 need PR 1. PR 7 needs PRs 5 and 6. PR 8
-(docs) is last. PR 4 modifies `pluginAgentFormat.test.ts`, which PR 1 creates.
+Order: PR 1 first. PR 2, 3 and 4 need PR 1. PR 5 and PR 6 need no other PR. PR 7
+needs no other PR. PR 8 needs PRs 1, 5 and 7. PR 9 (docs) is last. PR 6 and PR 7
+both edit `codexHookRunner.ts`, in different functions (`invoke` and
+`runToolHooks` for PR 6, the `Stop` push at line 170 for PR 7). The one that lands
+second rebases. PR 4 modifies `pluginAgentFormat.test.ts`, which PR 1 creates.
+
+Each PR with a row in section 8 puts that row's text in its PR description under
+"Release note".
 
 ### PR 1: Cursor manifest reader, rules as skills, agent prompt
+
+Files: `src/node/services/agentPlugins/discovery.ts` (Modify),
+`src/node/services/agentPlugins/cursorManifest.ts` (Create),
+`src/node/services/agentPlugins/cursorRules.ts` (Create),
+`src/node/services/agentPlugins/claudeCommands.ts` (Modify),
+`src/node/services/agentPlugins/codexHooks.ts` (Modify),
+`src/node/services/agentSkills/agentSkillsService.ts` (Modify),
+`src/node/services/tools/agent_skill_list.ts` (Modify),
+`src/node/services/workflows/workflowScriptResolver.ts` (Modify),
+`src/node/services/agentPlugins/installService.ts` (Modify),
+`src/node/services/agentPlugins/testFixtures.ts` (Modify),
+`src/node/services/agentDefinitions/pluginAgentFormat.ts` (Modify), and the
+tests in 1.6.
 
 #### 1.1 `src/node/services/agentPlugins/discovery.ts` (Modify)
 
 *   **Type / Scope**: TypeScript module, plugin discovery.
 *   **Proposed Changes**:
-    *   Add `CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH` (`.cursor-plugin/plugin.json`)
+    *   Add `CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH = ".cursor-plugin/plugin.json"`
         beside the constants at lines 79-86.
-    *   Add it as the last candidate in `selectManifest` (lines 1178-1203).
-    *   Add `cursorFallback = manifestRelative ===
-        CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH` beside lines 1248-1249, and
-        normalize with `normalizeCursorManifest` in that branch.
-    *   Treat a Cursor package as `foreign` in `xumComponentGate` (lines
-        1118-1124).
-    *   Pass rule roots (`{rule: true}`) into `skillsDirs`. List a `commands`
-        field or a `commands/` folder as not applied (T9).
-    *   Until PR 3, list a Cursor plugin's `mcp.json` as not applied.
-    *   Make `loadPluginCodexHooks` (`codexHooks.ts:171`) return no hooks when
-        `cursorFallback` is set.
-    *   Record not-applied fields on `AgentPluginInfo` as `notApplied:
-        Array<{part: "field" | "rule" | "agent" | "hook" | "mcp" | "command",
-        name: string, reason: string}>`.
+    *   Add it as the last entry of the candidate list in `selectManifest`
+        (lines 1178-1203). The loop's schema-less root rule then yields to it,
+        as it yields to Codex and Claude (D21). No other change to the loop.
+    *   Add `const cursorFallback = manifestRelative ===
+        CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH;` beside lines 1248-1249. In that
+        branch, normalize with `normalizeCursorManifest` (1.2).
+    *   Pass `foreign: true` to `xumComponentGate` (lines 1118-1124) for a
+        Cursor package, so `hooks.js` and `workflows/` never load.
+    *   For a Cursor package, call `resolvePluginMcpConfig` (lines 984-1007)
+        with no root `mcp.json` until PR 3: set `mcp = {}` and add the
+        `notApplied` entry `{part: "mcp", name: "mcp.json", reason: "MCP
+        servers of Cursor plugins load in a later Xum build"}`. PR 3 removes
+        this step.
+    *   Add `resolveRuleRoots`, modeled on `resolveCommandRoots` (lines
+        907-929), and call it for a Cursor package after the skills roots,
+        where `resolveCommandRoots` runs for a Claude package (lines
+        1336-1340). It reads each rules folder that `normalizeCursorManifest`
+        returns (default `rules`). For each file ending in `.md`, `.mdc` or
+        `.markdown`, in byte order of the file name:
+        *   the name is the file name without its extension;
+        *   a name that fails `SkillNameSchema` (line 831) is dropped with the
+            warning "Rule '<file>' has no valid skill name (kebab-case);
+            ignoring it" and the `notApplied` entry `{part: "rule", name:
+            <file>, reason: "not a valid skill name"}`;
+        *   a name that a skill, a command or an earlier rule already has is
+            dropped with the warning "Rule '<file>' is ignored: a skill or rule
+            named '<name>' comes first" and a `notApplied` entry with reason
+            "a skill or rule of the same name comes first";
+        *   rules count toward `MAX_PLUGIN_COMMANDS` (line 785) together with
+            commands. Past the cap, the rest are dropped with the warning
+            "More than <n> rules; ignoring the rest";
+        *   each kept rule becomes the root `{dir, single: true, name, rule:
+            <file>}`.
+    *   Extend the single variant of `PluginSkillsRoot` (lines 445-455) with
+        `rule?: string` (the rule's file name, for example `prefer-const.mdc`).
+        `command` and `rule` are never both set.
+    *   Pass `rule` beside `command` at `discovery.ts:522`.
+    *   Add `notApplied: AgentPluginNotApplied[]` to `AgentPluginInfo` (line
+        362), with `type AgentPluginNotApplied = {part: "field" | "rule" |
+        "agent" | "hook" | "mcp" | "command", name: string, reason: string}`.
+        Every other package kind gets `[]`.
 
 #### 1.2 `src/node/services/agentPlugins/cursorManifest.ts` (Create)
 
 *   **Type / Scope**: TypeScript module.
-*   **Proposed Changes**: `normalizeCursorManifest(raw, root)`, modeled on
-    `normalizeClaudeManifest`. It returns metadata, skill and rule roots, the agents folder (the first one if a list), the `mcp.json` path,
-    the hooks source (path or inline object) and the list of not-applied
-    fields, following the table in Technical Plan section 1. It is fail-soft:
-    an invalid field warns and is dropped. Glob matching uses the matcher
-    already used for plugin paths. A path outside the plugin folder is dropped
-    and listed.
+*   **Proposed Changes**: `normalizeCursorManifest(raw: unknown):
+    CursorManifestResult`, modeled on `normalizeClaudeManifest`
+    (`claudeManifest.ts:298`):
 
-#### 1.3 `src/node/services/agentPlugins/cursorRules.ts` (Create)
+    ```ts
+    interface CursorManifestResult {
+      manifest: unknown; // the Agent Plugins manifest validatePluginManifest reads
+      warnings: string[];
+      skillsDirs: string[]; // folder paths; default ["skills"]
+      ruleDirs: string[]; // default ["rules"]
+      agentsDir?: string; // default "agents"
+      mcpConfigPath?: string; // the `mcpServers` string
+      hooks?: string | Record<string, unknown>; // path or inline object; default "hooks/hooks.json"
+      notApplied: AgentPluginNotApplied[];
+    }
+    ```
 
-*   **Type / Scope**: TypeScript module.
-*   **Proposed Changes**: `cursorRuleAsSkill(mdcText, fileName)` returns
-    SKILL.md text and a rule-type label, using the mapping table in section 2.
-    `PluginSkillsRoot` (`discovery.ts:445-453`) gains `rule?: true`. Each site
-    that converts Claude commands converts rules too: `agentSkillsService.ts:77`,
-    `src/node/services/tools/agent_skill_list.ts:31` (a separate folder
-    scanner, so a naming change must reach it, see PR #7399, skill scanner
-    naming), `installService.ts:115` and `:3254-3258` (install preview and
-    approved copy), and `testFixtures.ts:24`. A name clash with a real skill
-    keeps the skill and lists the rule as not applied.
-    *   Skill name: the file name without its extension, lowercased, with
-        characters outside `[a-z0-9-]` replaced by `-`. An empty name, or a name
-        that two rule files share, drops the later file and lists it. Bad
-        frontmatter drops the rule with a warning, as for skills.
+    *   Fields follow the table in Technical Plan section 1. An invalid field
+        is one whose JSON type is not the type in that table (for example
+        `skills: 3`). It adds a warning "'<field>' must be <type>; ignoring it"
+        and is dropped.
+    *   Component paths (D24): `skills`, `rules` and `agents` take a string or
+        a list of folder paths. A path is a folder path when it contains none
+        of `*`, `?`, `[` and does not end in `.md`, `.mdc` or `.markdown`. A
+        glob or file path gets the `notApplied` entry `{part: "field", name:
+        "<field>: <path>", reason: "only folder paths are applied in Xum"}`.
+        A path outside the plugin folder gets the reason "path is outside the
+        plugin folder". `agents` uses the first folder path. Each later one
+        gets the reason "only one agents folder is applied in Xum".
+    *   `commands`, a `commands/` folder (checked by discovery), `variables`,
+        `category`, `tags`, `publisher`, `clientVersionRequirement` and
+        `minClientVersions` get `{part: "field", name: <field>, reason: "not
+        applied in Xum"}`. `commands` uses `part: "command"`.
+    *   An inline `mcpServers` object or list gets `{part: "mcp", name:
+        "mcpServers", reason: "inline mcpServers is not applied in Xum; use a
+        ./mcp.json file"}`.
 
-#### 1.4 `src/node/services/agentPlugins/componentConsent.ts` (Modify)
+#### 1.3 `src/node/services/agentPlugins/cursorRules.ts` (Create) and the scan sites
 
-*   **Type / Scope**: Consent fingerprints.
-*   **Proposed Changes**: Rule skills fingerprint the converted frontmatter and
-    the rule-type label, plus directive lines, the same as skills (D14). Reuse
-    `SkillConsentInput` (`componentConsent.ts:207`), `skillConsentFingerprint`
-    (`:244`) and `skillConsentFields` (`installService.ts:520-525`). Rule skills
-    pass the converted frontmatter and the label as `SkillConsentInput` fields.
+*   **Type / Scope**: TypeScript module, plus the sites that read plugin skill
+    files.
+*   **Proposed Changes**:
+    *   `cursorRuleSkillMarkdown(name: string, content: string): string` returns
+        SKILL.md text. It parses the rule frontmatter with the helper that
+        `claudeCommands.ts` uses (`stripUtf8Bom`, `normalizeNewlines` and the
+        frontmatter split). Frontmatter that fails to parse, or is not an
+        object, makes the rule invalid: the scan site drops it with the warning
+        "Rule '<file>' has invalid frontmatter; ignoring it".
+    *   The SKILL.md frontmatter it writes:
+        *   `name`: the rule name;
+        *   `description`: the rule's `description`; else the first non-empty
+            body line (at most 1024 characters, as `claudeCommands.ts` cuts
+            it); else "Cursor rule <name>". When `globs` is set, append
+            "\n\nApplies to files matching: <glob>, <glob>";
+        *   `disable-model-invocation: true` for a manual rule only;
+        *   `metadata: {cursor-rule-type: <type>}`, where `<type>` is
+            `always-apply`, `description`, `glob` or `manual`, chosen by the
+            precedence in section 2.
+    *   The body is the rule body unchanged.
+    *   `pluginSkillFileName` and `pluginSkillMarkdown` (`claudeCommands.ts:27`,
+        `:32`) take `root: {command?: true; rule?: string}` instead of
+        `command`. A rule's file is `root.rule`, and its markdown is
+        `cursorRuleSkillMarkdown`.
+    *   Every scan site that carries `commandSkill?: true` carries `ruleFile?:
+        string` the same way and passes both to the two helpers:
+        `agentSkillsService.ts:350`, `:482`, `:806-813`, `:993`, `:1023`,
+        `:1265`, `:1380-1406`, `:1438-1457`, `:1563`;
+        `agent_skill_list.ts:79`, `:208-232`, `:414`, `:429`, `:468` (a
+        separate folder scanner, so a naming change must reach it, see PR
+        #7399, skill scanner naming); `installService.ts:3254` (approved
+        copy); `testFixtures.ts:85`. `workflowScriptResolver.ts:198` treats
+        `ruleFile !== undefined` like `commandSkill === true`.
+*   **Consent**: the converted frontmatter is the skill's frontmatter, and the
+    shipped skill consent fingerprints the whole frontmatter (#6498) plus
+    directive lines (#6617, D14). The rule type sits in
+    `metadata.cursor-rule-type`, so a change to `alwaysApply` or `globs` that
+    changes the type asks for review. `componentConsent.ts` does not change.
+*   **Install review label**: the review shows the label of section 2 for each
+    rule skill, read from `metadata.cursor-rule-type` (PR 2 renders it).
+
+#### 1.4 `src/node/services/agentPlugins/codexHooks.ts` (Modify)
+
+*   **Type / Scope**: Codex hook loader.
+*   **Proposed Changes**: Add `"cursorFallback"` to the `Pick` of
+    `loadPluginCodexHooks` (lines 171-176), and return `{hooks: [], warnings:
+    []}` when it is `true`, next to the `skillsOnly` check (line 178). Until
+    PR 8, discovery adds `{part: "hook", name: "hooks/hooks.json", reason:
+    "Cursor hooks run in a later Xum build"}` to `notApplied` when the file
+    exists.
 
 #### 1.5 `src/node/services/agentDefinitions/pluginAgentFormat.ts` (Modify)
 
 *   **Type / Scope**: Agent frontmatter mapping.
 *   **Proposed Changes**: For `readonly: true`, set `prompt.append: true`
-    (D13). Agents without `readonly` keep `false`. This reverses the
-    `prompt.append: false` comment at `:352-354` for `readonly` agents only.
+    (D13). Agents without `readonly` keep `false`. Replace the comment at
+    lines 352-354 with: "`readonly` agents get Explore's prompt before their own
+    body (Cursor plugin RFC, D13). Other agents keep append: false."
 
 #### 1.6 Tests for PR 1
 
 *   `src/node/services/agentPlugins/discovery.test.ts` (Modify):
-    *   a Cursor-only folder loads;
-    *   a folder with both a root `plugin.json` that declares `$schema` and a
-        Cursor manifest keeps the root manifest;
+    *   a folder with only `.cursor-plugin/plugin.json` and a `skills/` folder
+        loads, with its skills;
+    *   a folder with a root `plugin.json` that declares `$schema` and a Cursor
+        manifest loads the root manifest;
     *   a folder with a schema-less root `plugin.json` and a Cursor manifest
         loads the Cursor manifest (D21);
-    *   a Cursor `commands/` folder is listed as not applied;
     *   `hooks.js` and `workflows/` in a Cursor folder do not load;
-    *   a Cursor folder with `variables` and `category` lists both in
-        `notApplied`, with reason "not applied in Xum";
-    *   a Cursor folder's `hooks/hooks.json` is not read by the Codex loader,
-        and the install review lists "hooks: not applied" until PR 7;
-    *   a `rules` glob, a manifest path that replaces the default folder, and a
-        `.md` rule each load as described in section 1.
+    *   a Cursor folder with `variables`, `category` and a `commands/` folder
+        has three `notApplied` entries with the reasons from 1.2;
+    *   a Cursor folder's `hooks/hooks.json` produces no Codex hooks and one
+        `notApplied` entry with part `hook`;
+    *   a Cursor folder's `mcp.json` produces no MCP config and one
+        `notApplied` entry with part `mcp`;
+    *   a manifest `rules: "./my-rules/"` loads rules from `my-rules/` and not
+        from `rules/`;
+    *   `rules/a.mdc`, `rules/b.md` and `rules/c.markdown` load as rule skills
+        `a`, `b` and `c`;
+    *   `rules/Bad_Name.mdc` is dropped with the warning from 1.1;
+    *   `rules/x.md` and `rules/x.mdc` keep `x.md` and drop `x.mdc`;
+    *   a rule `review.mdc` beside a skill `review/` keeps the skill and drops
+        the rule.
 *   `src/node/services/agentPlugins/cursorManifest.test.ts` (Create): each row
-    of the section 1 table, including a string or a list for `skills`,
-    `agents` and `rules`, and an inline `mcpServers` that is not applied.
+    of the section 1 table; `skills` as a string and as a list of two folders;
+    `agents` as a list of two folders keeps the first and lists the second;
+    `rules: "./rules/*.mdc"` and `skills: "./skills/a/SKILL.md"` give the
+    "only folder paths" entry; `skills: "../x"` gives the "outside the plugin
+    folder" entry; `skills: 3` warns and is dropped; an inline `mcpServers`
+    object gives its `notApplied` entry.
 *   `src/node/services/agentPlugins/cursorRules.test.ts` (Create):
-    *   the four rule types and their labels;
-    *   a manual rule is user-invocable only;
-    *   a name clash with a skill.
-*   `src/node/services/agentPlugins/componentConsent.test.ts` (Modify): a
-    change to `alwaysApply` that changes the label asks for review, and a
-    prose-only change does not.
+    *   `alwaysApply: true` gives type `always-apply`, a model-invocable skill
+        and its `description`;
+    *   `description` only gives type `description`;
+    *   `globs: ["**/*.ts"]` gives type `glob` and the description suffix
+        "Applies to files matching: **/*.ts";
+    *   `alwaysApply: true` with `globs` gives `always-apply` (precedence);
+    *   no `alwaysApply`, `description` or `globs` gives `manual`,
+        `disable-model-invocation: true`, and the first body line as the
+        description;
+    *   frontmatter `: [` is invalid and the scan drops the rule.
+*   `src/node/services/agentPlugins/componentConsent.test.ts` (Modify): a rule
+    whose `alwaysApply` changes from `true` to absent changes the skill
+    fingerprint, and a prose-only body change does not.
 *   `src/node/services/agentDefinitions/pluginAgentFormat.test.ts` (Create):
-    *   `readonly` maps to base Explore with `append: true`;
-    *   other agents keep `append: false`;
-    *   the mapped fingerprint changes for `readonly` agents.
-*   `tests/bugbash/pluginInstallFixtures.ts` (Modify): add a fixture in the
-    `cursor-team-kit` format: `.cursor-plugin/plugin.json`, two skills,
-    `agents/ci-watcher.md` (`model: fast`) and `agents/reviewer.md`
-    (`readonly: true`), and `rules/a.mdc` (`alwaysApply`) and `rules/b.mdc`
-    (`globs`).
+    *   `readonly: true` maps to base Explore with `prompt.append: true`;
+    *   an agent without `readonly` keeps `prompt.append: false`;
+    *   the mapped fingerprint differs between the two.
+*   `tests/bugbash/pluginInstallFixtures.ts` (Modify): add the fixture
+    `cursor-team-kit-mini`: `.cursor-plugin/plugin.json` (`{"name":
+    "cursor-team-kit-mini"}`), `skills/alpha/SKILL.md`, `skills/beta/SKILL.md`,
+    `agents/ci-watcher.md` (`model: fast`, `is_background: true`),
+    `agents/reviewer.md` (`readonly: true`), `rules/a.mdc` (`alwaysApply:
+    true`, `description: Rule A`) and `rules/b.mdc` (`globs: "**/*.ts"`).
 
-### PR 2: Cursor marketplace, merged list, install method
+### PR 2: Cursor marketplace, merged list
+
+Files: `src/node/services/agentPlugins/claudeMarketplace.ts`,
+`src/node/services/agentPlugins/installService.ts`,
+`src/node/services/agentPlugins/installMethods.ts`,
+`src/common/orpc/schemas/agentPlugins.ts`,
+`src/common/constants/agentPluginInstallMethods.ts`,
+`src/browser/features/Settings/Sections/PluginInstallMethods.tsx`,
+`src/browser/features/Settings/Sections/PluginsSettingsSection.tsx`,
+`src/browser/features/Settings/Sections/PluginMarketplaceListing.tsx` (all
+Modify), and the tests in 2.7.
+
+The design (D23): `cursor-marketplace` is a preview selector only. It names an
+entry of the Cursor marketplace file, as `claude-marketplace` names an entry of
+the Claude file. All 128 Cursor entries point to a folder with its own
+manifest, so a Cursor entry always installs through that manifest's method
+(`cursor-plugin`, or `agent-plugin` for a root `plugin.json` with `$schema`).
+No `cursor-marketplace` install method, generated manifest or `generatedFrom`
+marker exists. An update tracks the entry's folder, as for every installed
+folder with its own manifest (`installService.ts:6378-6384`). A Cursor entry
+whose folder has no manifest is refused.
 
 #### 2.1 `src/node/services/agentPlugins/claudeMarketplace.ts` (Modify)
 
 *   **Type / Scope**: Marketplace parser.
 *   **Proposed Changes**:
-    *   Add `CURSOR_MARKETPLACE_RELATIVE_PATH` beside line 33.
-    *   Export a merge of two parsed lists by entry name. Each file keeps its
-        own caps (8 MiB, 500 entries). An entry in both files carries both
-        sources.
-    *   Merged order: the Cursor file's order, then the Claude-only names in
-        the Claude file's order. Entry shape: `{name, sources: Array<{file:
-        "cursor" | "claude", entry}>}`.
+    *   Add `CURSOR_MARKETPLACE_RELATIVE_PATH = ".cursor-plugin/marketplace.json"`
+        beside line 33. The Cursor file uses the Claude file's format, so
+        `parseClaudeMarketplace` (line 181) reads both, with the same caps
+        (lines 38-40), applied per file.
+    *   Export `mergeMarketplaces(cursor: ClaudeMarketplace | null, claude:
+        ClaudeMarketplace | null): MergedMarketplaceEntry[]`, with
+        `interface MergedMarketplaceEntry {name: string; builds:
+        Array<{file: "cursor" | "claude"; entry: ClaudeMarketplaceEntry}>}`.
+        Order: the Cursor file's entries in file order, then each Claude entry
+        whose name the Cursor file lacks, in file order. A name in both files
+        has two builds, Cursor first. The merged list has at most 1000
+        entries.
 
 #### 2.2 `src/node/services/agentPlugins/installService.ts` (Modify)
 
-*   **Type / Scope**: Preview, install and update.
+*   **Type / Scope**: Preview and install.
 *   **Proposed Changes**:
-    *   `marketplaceListingAt` (line 3542, called by `previewSource` at
-        `:3494`) reads both marketplace files and returns the merged list (D20).
-    *   The marketplace read at a sha (lines 2452-2476) takes the file path as
-        a parameter. So do `cloneExactSha` (`:2404-2437`), `cloneWithEntry`
-        (`:2486-2500`), `stageMarketplaceEntry` (`:3650-3654`) and the install
-        path (`:3835-3840`).
-    *   The update path (lines 6378-6383) passes the stored `entry` from a
-        `cursor-marketplace` marker to `stageMarketplaceEntry`, with the Cursor
-        marketplace path.
-    *   Reuse `collisionReason` (`:3791-3800`) for a second build of a name. No
-        new refusal path.
+    *   `marketplaceListingAt` (line 3542, called by `previewSource` at line
+        3522) reads both files when present, merges them with
+        `mergeMarketplaces`, and returns one listing row per merged entry
+        (D20).
+    *   Add the parameter `file: "cursor" | "claude"` to each function that
+        reads the marketplace file at a commit: the read at lines 2452-2478,
+        `cloneExactSha` (lines 2401-2440), `cloneWithEntry` (lines
+        2486-2502), `stageMarketplaceEntry` (lines 3650-3654) and the install
+        path (lines 3835-3840). `"claude"` reads
+        `CLAUDE_MARKETPLACE_RELATIVE_PATH`, and `"cursor"` reads
+        `CURSOR_MARKETPLACE_RELATIVE_PATH`. Every existing caller passes
+        `"claude"`.
+    *   A preview with `{kind: "cursor-marketplace", entry}` stages that entry
+        with `file: "cursor"`. When the staged folder has no own manifest
+        (`detectInstallMethods` returns neither `agent-plugin` nor
+        `cursor-plugin`), the preview fails with "The Cursor marketplace entry
+        '<name>' has no plugin manifest in its folder. Xum does not install
+        it."
+    *   `marketplaceEntryOf` (lines 1139-1143) maps a `cursor-marketplace`
+        selector to its entry name, as it does for `claude-marketplace`.
+    *   Installing a second build of an installed name is refused by
+        `collisionReason` (lines 3791-3800): "A managed plugin named '<name>'
+        is already installed. Uninstall it first." No new refusal path.
 
 #### 2.3 `src/node/services/agentPlugins/installMethods.ts` (Modify)
 
 *   **Type / Scope**: Install methods.
 *   **Proposed Changes**:
-    *   Add a `cursor-plugin` detection beside `claude-plugin` (line 311): the
-        staged folder has `.cursor-plugin/plugin.json` and no own manifest.
-    *   `ownManifest` (lines 302-308) yields a schema-less root `plugin.json` to
-        a Cursor manifest, as it does for a Claude manifest (D21), so the method
-        matches the manifest discovery loads.
-    *   Add a `cursor-marketplace` entry method. Marker fields:
-        `{kind: "cursor-marketplace", marketplace, entry}`, the same fields as
-        `claude-marketplace`.
-    *   `entryInstallMethods` (lines 496-530) offers both builds for a name
-        listed in both files.
-    *   `marketplaceManifest` (lines 658-709) writes the `cursor-marketplace`
-        marker, with `INERT_COMPONENT_PATH` for `hooks`, `workflows` and
-        `agents` (the parts an older build must not load).
+    *   In `detectInstallMethods` (lines 300-313), add `const cursorManifest =
+        await entryExists(stagedDir, CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH)`.
+        `ownManifest` becomes `codexManifest || (rootEntry &&
+        !((claudeManifest || cursorManifest) && (await
+        rootManifestIsSchemaLess(stagedDir))))` (D21). After the
+        `claude-plugin` push (line 311), push `{kind: "cursor-plugin"}` when
+        `cursorManifest && !claudeManifest`, because discovery loads a Claude
+        manifest before a Cursor one.
+    *   `entryInstallMethods` (lines 496-530) treats `cursor-plugin` as an own
+        method beside `agent-plugin` and `claude-plugin`.
+    *   `sameInstallMethod` (lines 337-347) adds `case "cursor-plugin"` to the
+        kinds compared by kind only, and `case "cursor-marketplace"` compared by
+        kind and entry.
+    *   The update method list (lines 378-391) needs no change: Cursor installs
+        never have a `generatedFrom` marker.
 
-#### 2.4 `src/node/services/agentPlugins/manifest.ts` (Modify)
+#### 2.4 `src/common/orpc/schemas/agentPlugins.ts` and `src/common/constants/agentPluginInstallMethods.ts` (Modify)
 
-*   **Type / Scope**: Generated manifest types.
-*   **Proposed Changes**: Add the `cursor-marketplace` variant to
-    `GeneratedFrom` (line 301).
-
-#### 2.5 `src/common/orpc/schemas/agentPlugins.ts` (Modify)
-
-*   **Type / Scope**: oRPC schemas.
+*   **Type / Scope**: oRPC schemas and labels.
 *   **Proposed Changes**:
-    *   Add `cursor-plugin` and `cursor-marketplace` (with `entry`) to
-        `AgentPluginInstallMethodSchema` (line 168).
-    *   Add a `notApplied` list (part, name, reason) to
-        `AgentPluginInstallPreviewSchema` (line 184).
+    *   Add `z.object({kind: z.literal("cursor-plugin")})` and
+        `z.object({kind: z.literal("cursor-marketplace"), entry:
+        z.string().min(1)})` to `AgentPluginInstallMethodSchema` (line 168). The
+        doc comment says `cursor-marketplace` is a preview selector that
+        install never gets back.
+    *   Add `builds: z.array(z.enum(["cursor", "claude"])).min(1)` to
+        `AgentPluginMarketplaceEntrySchema` (lines 242-266): the files that
+        list the name, Cursor first. `source`, `sourceKind`, `description` and
+        `skillCount` come from the first build.
+    *   Add `notApplied: z.array(z.object({part: z.enum(["field", "rule",
+        "agent", "hook", "mcp", "command"]), name: z.string(), reason:
+        z.string()}))` to `AgentPluginInstallPreviewSchema` (line 184), filled
+        from `AgentPluginInfo.notApplied`.
+    *   Add `"cursor-plugin": "Cursor plugin"` and `"cursor-marketplace":
+        "Cursor marketplace entry"` to `AGENT_PLUGIN_INSTALL_METHOD_LABELS`
+        (`agentPluginInstallMethods.ts:4-10`).
+
+#### 2.5 `src/browser/features/Settings/Sections/PluginMarketplaceListing.tsx` and `PluginsSettingsSection.tsx` (Modify)
+
+*   **Type / Scope**: Renderer.
+*   **Proposed Changes**:
+    *   The listing shows one row per merged entry. A row with one build keeps
+        its single preview action. A row with two builds shows two actions,
+        "Preview Cursor build" and "Preview Claude build". Each one calls
+        `onPreviewEntry` with `{kind: "cursor-marketplace", entry}` or
+        `{kind: "claude-marketplace", entry}`.
+    *   `onPreviewEntry` (`PluginsSettingsSection.tsx:740`) takes the selector
+        instead of building `{kind: "claude-marketplace", entry}`, and
+        `setPreviewedEntry` (line 674) records the entry for both selector
+        kinds.
+    *   `PreviewDisclosures` (line 1036) and `UpdateReviewPanel` (line 1335)
+        show the `notApplied` list as rows "<part> <name>: <reason>", and each
+        rule skill's label from section 2.
+    *   The same view shows the label "edit tools removed, shell still
+        available" for `readonly` agents.
 
 #### 2.6 `src/browser/features/Settings/Sections/PluginInstallMethods.tsx` (Modify)
 
 *   **Type / Scope**: Renderer.
-*   **Proposed Changes**: Label the new methods "Cursor build" and "Claude
-    build" in `installMethodLabel` (line 28) and `InstallMethodPicker`
-    (line 77).
+*   **Proposed Changes**: The row key (line 34) becomes `kind:entry` for both
+    `claude-marketplace` and `cursor-marketplace`. `installMethodLabel` (line
+    28) reads the new labels from `AGENT_PLUGIN_INSTALL_METHOD_LABELS`.
 
-#### 2.7 `src/browser/features/Settings/Sections/PluginsSettingsSection.tsx` (Modify)
+#### 2.7 Tests and stories for PR 2
 
-*   **Type / Scope**: Renderer.
-*   **Proposed Changes**:
-    *   `PreviewDisclosures` (line 1036) and `UpdateReviewPanel` (line 1335)
-        show the `notApplied` list and the rule-type labels.
-    *   The same view shows the read-only label "edit tools removed, shell
-        still available" for `readonly` agents.
-
-#### 2.8 `src/browser/features/Settings/Sections/PluginMarketplaceListing.tsx` (Modify)
-
-*   **Type / Scope**: Renderer.
-*   **Proposed Changes**: Show one row per name. A name with two builds shows
-    both methods.
-
-#### 2.9 Tests and stories for PR 2
-
-*   `claudeMarketplace.test.ts`, `installMethods.test.ts`,
-    `installService.marketplace.test.ts` and
-    `installService.installMethods.test.ts` (Modify):
-    *   the merge (a name in one file, a name in both);
-    *   per-file caps;
-    *   the `cursor-marketplace` marker round trip;
-    *   an update reads the source file;
-    *   the same-name refusal.
-*   `src/node/services/agentPlugins/manifest.test.ts` (Modify): downgrade
-    fixture. A manifest with the `cursor-marketplace` marker, read by the
-    existing parser, loads no part that must stay inert.
-*   `PluginsSettingsSection.stories.tsx` (Modify): a story with two builds and
-    a `notApplied` list, at desktop and phone widths (AGENTS.md mobile rule).
+*   `src/node/services/agentPlugins/claudeMarketplace.test.ts` (Modify):
+    *   `mergeMarketplaces` with Cursor `[a, b]` and Claude `[b, c]` returns
+        `a` (cursor), `b` (cursor, claude), `c` (claude), in that order;
+    *   a Cursor file over 500 entries fails its own parse, and the Claude
+        file still loads.
+*   `src/node/services/agentPlugins/installMethods.test.ts` (Modify):
+    *   a folder with only a Cursor manifest gets `[cursor-plugin]`;
+    *   a folder with a Claude and a Cursor manifest gets `[claude-plugin]`;
+    *   a folder with a schema-less root `plugin.json` and a Cursor manifest
+        gets `[cursor-plugin]`;
+    *   `sameInstallMethod` matches two `cursor-marketplace` selectors only
+        with the same entry.
+*   `src/node/services/agentPlugins/installService.marketplace.test.ts`
+    (Modify):
+    *   a repository with both files previews a listing with `pstack` once and
+        `builds: ["cursor", "claude"]`;
+    *   a `cursor-marketplace` preview of `pstack` stages `./pstack`, and a
+        `claude-marketplace` preview stages `./harness/pstack/claude-code`;
+    *   a Cursor entry whose folder has no manifest fails with the message from
+        2.2;
+    *   installing the Claude build after the Cursor build fails with the
+        `collisionReason` message;
+    *   an update of an installed Cursor entry stages the same folder at the
+        new commit.
+*   `src/browser/features/Settings/Sections/PluginsSettingsSection.stories.tsx`
+    (Modify): a story with a two-build row and a `notApplied` list, at desktop
+    and phone widths (AGENTS.md mobile rule).
 *   `tests/bugbash/repros/cursorMarketplaceMerge.e2e.ts` (Create, tags
-    `bugbash` and `cursor-marketplace-merge`): add a fixture repository with
-    both files. Expect the row `pstack` once, offering both builds, then install
-    the Cursor build.
+    `bugbash` and `cursor-marketplace-merge`): a fixture repository with
+    `.cursor-plugin/marketplace.json` listing `pstack` (`./pstack`, a folder
+    with a Cursor manifest and one skill) and `.claude-plugin/marketplace.json`
+    listing `pstack` (`./claude/pstack`, a folder with a Claude manifest). Expect
+    one `pstack` row with two preview actions. Preview the Cursor build and
+    install it. Expect the installed plugin to list its one skill.
 
 ### PR 3: MCP dialect `cursor`
 
-#### 3.1 `src/node/services/agentPlugins/mcpConfig.ts` (Modify)
+Files: `src/node/services/agentPlugins/mcpConfig.ts`,
+`src/node/services/agentPlugins/expansion.ts`,
+`src/node/services/agentPlugins/openaiMcpAuth.ts`,
+`src/node/services/agentPlugins/discovery.ts` (all Modify), and the tests in
+3.2.
+
+#### 3.1 Changes
 
 *   **Type / Scope**: Plugin MCP config.
 *   **Proposed Changes**:
-    *   Widen `mcpConfigDialect` (`discovery.ts:427`) to `"codex" | "claude" |
-        "cursor"` and set it for Cursor packages.
-    *   Replace the ternary in `pluginPlaceholderValues` (lines 366-375) with a
-        per-dialect table. `cursor` expands `CURSOR_PLUGIN_ROOT` and
-        `CLAUDE_PLUGIN_ROOT`.
-    *   Apply the `${...}/<path>` to `./<path>` rewrite (lines 346-363) to both
-        names.
-    *   `PluginPlaceholderValues` and `PLUGIN_PLACEHOLDER_PATTERN`
-        (`expansion.ts:13-22`) gain `CURSOR_PLUGIN_ROOT`.
-    *   Reserve `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` beside
-        `PLUGIN_ROOT` (`openaiMcpAuth.ts:285`).
-    *   Accept both names in `CWD_FORM_PATTERN` (`mcpConfig.ts:185`).
-    *   Route `cursor` through `claudeStdioEntry` (`:646`), the Claude-shape
-        branch (`:742`) and the transport inference (`:809`), because Cursor's
-        `mcp.json` uses the Claude shape.
-    *   Any other `${NAME}` (section 4 lists the fields) gives the server the
-        status "needs values not supported in Xum". Xum lists the server and
-        does not start it. This status is new code.
-    *   Ignore an `auth` block and add "auth not applied in Xum" to the
-        server's `notApplied` entry (D19).
+    *   `discovery.ts`: widen `mcpConfigDialect` (line 427) to `"codex" |
+        "claude" | "cursor"`. Remove PR 1's `mcp = {}` step, and pass
+        `manifestDialect: "cursor"` to `resolvePluginMcpConfig` for a Cursor
+        package.
+    *   `expansion.ts`: add `CURSOR_PLUGIN_ROOT?: string` to
+        `PluginPlaceholderValues` (lines 13-18), and change
+        `PLUGIN_PLACEHOLDER_PATTERN` (line 22) to
+        `/\$\{((?:CLAUDE_|CURSOR_)?PLUGIN_(?:ROOT|DATA))\}/g`.
+    *   `mcpConfig.ts`, `pluginPlaceholderValues` (lines 366-375): the
+        `cursor` dialect gets `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` set
+        to the install folder. It gets no `CURSOR_PLUGIN_DATA` or
+        `CLAUDE_PLUGIN_DATA`, because Cursor documents only the two roots.
+    *   `mcpConfig.ts`, `claudeStdioEntry` (lines 346-363): also rewrite a
+        command that starts with `${CURSOR_PLUGIN_ROOT}/` to `./<rest>`, and a
+        cwd anchored at `${CURSOR_PLUGIN_ROOT}` to `${PLUGIN_ROOT}`. Line 646
+        applies `claudeStdioEntry` when the dialect is `"claude"` or
+        `"cursor"`. `CWD_FORM_PATTERN` (line 185) does not change, because the
+        rewrite runs first.
+    *   Transport (D29): the `cursor` dialect has the Codex shape, so line 742
+        (`codexDialect = plugin.mcpConfigDialect !== undefined`) already applies
+        `translateCodexMcpEntry`: `type: "http"` becomes `streamable-http`, a
+        `url` without `type` becomes `streamable-http` (the `gong` server), and
+        a `command` becomes `stdio`. The Claude-only rule at lines 806-815 stays
+        Claude-only.
+    *   Needs values (new check, `cursor` dialect only): after placeholder
+        expansion, a server whose `command`, `args`, `env` values, `cwd`,
+        `url` or `headers` values still match
+        `/\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}/` is skipped through
+        `reportEntry("warning", "needs values not supported in Xum (${NAME})")`
+        (line 788), the existing per-server diagnostic. `${NAME:-default}`
+        counts too.
+    *   `auth` (D19, `cursor` dialect only): before `translateCodexMcpEntry`,
+        remove the `auth` key from the entry and add "auth not applied in Xum"
+        to the server's `ignored` list, which the consent preview shows as the
+        server's warning (line 616-629). The server still connects.
+    *   `openaiMcpAuth.ts`: add `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT`
+        to `RESERVED_ENV_NAMES` (line 285), so a plugin's `env_vars` cannot
+        forward them.
 
 #### 3.2 Tests for PR 3
 
-*   `mcpConfig.test.ts` (Modify):
-    *   both root names in `command`, `args`, `env` and `cwd`;
-    *   a user placeholder gives the server the status "needs values not
-        supported in Xum";
-    *   the `claude` dialect is unchanged.
-*   `mcpConfig.test.ts` (Modify): a server with an `auth` block is listed as
-    "auth not applied in Xum" and still connects through the plugin MCP path
-    (D19).
-*   `tests/bugbash/pluginInstallFixtures.ts` (Modify): a stdio fixture
-    launched through `${CURSOR_PLUGIN_ROOT}` (success test 6).
+*   `src/node/services/agentPlugins/mcpConfig.test.ts` (Modify):
+    *   `${CURSOR_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expand to the install
+        folder in `args`, `env` and `cwd`, and a command
+        `${CURSOR_PLUGIN_ROOT}/bin/server` becomes `./bin/server`;
+    *   a server with `"env": {"TOKEN": "${BREVO_MCP_TOKEN}"}` is skipped with
+        the diagnostic "needs values not supported in Xum (${BREVO_MCP_TOKEN})";
+    *   `${CLIENT_SECRET:-}` in a header skips the server the same way;
+    *   `{"url": "https://x.example/mcp"}` with no `type` loads as
+        `streamable-http`;
+    *   a server with an `auth` block loads, and its consent warning includes
+        "auth not applied in Xum";
+    *   the `claude` and `codex` dialects keep their results for the same
+        inputs (their existing tests pass unchanged).
+*   `src/node/services/agentPlugins/expansion.test.ts` (Modify):
+    `${CURSOR_PLUGIN_ROOT}` expands only when supplied.
+*   `tests/bugbash/pluginInstallFixtures.ts` (Modify): add the fixture
+    `cursor-stdio-mcp`: `.cursor-plugin/plugin.json` with `"mcpServers":
+    "./mcp.json"`, and `mcp.json` with one stdio server `echo` whose command is
+    `node` and whose `args` are `["${CURSOR_PLUGIN_ROOT}/server.mjs"]`.
+    `server.mjs` is a minimal MCP server with one tool `echo` that returns its
+    `text` argument (success test 6).
 
-### PR 4: `model: fast`
+### PR 4: `model: fast` and the `is_background` hint
+
+Files: `src/common/orpc/schemas/agentDefinition.ts`,
+`src/node/services/agentDefinitions/pluginAgentFormat.ts`,
+`src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts`,
+`src/node/services/agentDefinitions/agentDefinitionsService.ts`,
+`src/node/services/turnContextAssembler.ts`,
+`src/node/services/tools/task.ts` (all Modify), and the tests in 4.6.
 
 #### 4.1 `src/common/orpc/schemas/agentDefinition.ts` (Modify)
 
 *   **Type / Scope**: Agent frontmatter schema.
-*   **Proposed Changes**: Add optional `ai.settingsBase` (an agent ID) under
-    `ai` (line 84).
+*   **Proposed Changes**:
+    *   Add `settingsBase: AgentIdSchema.optional()` to
+        `AgentDefinitionAiDefaultsSchema` (lines 33-39).
+    *   Add `background_hint: z.boolean().optional()` to
+        `AgentDefinitionSubagentSchema` (lines 20-31).
+    *   Add `backgroundHint: z.boolean().optional()` to
+        `AgentDefinitionDescriptorSchema` (lines 92-109).
 
 #### 4.2 `src/node/services/agentDefinitions/pluginAgentFormat.ts` (Modify)
 
 *   **Type / Scope**: Agent frontmatter mapping.
-*   **Proposed Changes**: In `mapAiDefaults` (`pluginAgentFormat.ts:306-311`),
-    `model: fast` writes `settingsBase: "explore"` (D11). `is_background`
-    stays ignored, as the comment at lines 366-367 says (D12). The mapping
-    returns a not-applied note for an agent that sets `is_background` or
-    `background`, and discovery adds it to `notApplied` (part `agent`).
+*   **Proposed Changes**: `mapAiDefaults` (lines 306-312) returns
+    `{settingsBase: "explore"}` (plus `thinkingLevel` when set) for `model:
+    fast` (D11). In the `subagent` literal (line 351), `is_background: true`
+    adds `background_hint: true` (D12). Claude's `background` field stays
+    ignored. Replace the comment at lines 366-367 with: "`is_background: true`
+    becomes a hint in the task tool's agent list (Cursor plugin RFC, D12).
+    `background` stays ignored: the parent chooses `run_in_background` per
+    spawn."
 
 #### 4.3 `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.ts` (Modify)
 
 *   **Type / Scope**: AI settings resolution.
-*   **Proposed Changes**: `collectDefinitionLayers` (line 102) walks the chain
-    from `ai.settingsBase` when it is set, for AI settings only, by calling
-    `resolveAgentInheritanceChain` with that ID as the start of the chain.
-    `loadAgentDefinitionAiLayers` (`:145`) is unchanged. Tool policy keeps
-    following `base`.
+*   **Proposed Changes**: In `loadAgentDefinitionAiLayers` (lines 145-176),
+    after `readAgentDefinition`, when `agentDefinition.frontmatter.ai?.settingsBase`
+    is set:
+    1.  Read the settings-base agent with `readAgentDefinition` and resolve its
+        chain with `resolveAgentInheritanceChain` (same options as the existing
+        call).
+    2.  Pass `[ownChain[0], ...settingsBaseChain]` (the agent itself, then the
+        settings-base chain) to
+        `collectDefinitionLayers` (line 102), in place of the agent's own
+        chain. `collectDefinitionLayers` does not change.
+    3.  When the settings-base ID equals the agent's ID, when the read throws
+        a not-found error, or when the agent's ID appears in the settings-base
+        chain, log `log.warn("settingsBase ignored", {agentId, settingsBase,
+        reason})` and use the agent's own chain (D26). A transport
+        `RuntimeError` still rethrows, as the function documents.
+    *   Tool policy keeps following `base`: only this AI-settings loader reads
+        `settingsBase`.
 
-#### 4.4 `src/browser/features/Tools/TaskToolCall.tsx` (Modify)
+#### 4.4 Agent descriptor builders (Modify)
 
-*   **Type / Scope**: Renderer.
-*   **Proposed Changes**: Next to the model display (lines 536-561), show the
-    model source when it came from another agent's settings ("model from
-    Explore settings"). Add `aiSettingsSource?: {agentId: string}` to the task
-    metadata. The renderer shows "model from <agentId> settings" when it is
-    set.
+*   **Type / Scope**: `agentDefinitionsService.ts` and `turnContextAssembler.ts`.
+*   **Proposed Changes**: Each place that sets `subagentRunnable` on a
+    descriptor (`agentDefinitionsService.ts:621`, `:652`, `:1438` and
+    `turnContextAssembler.ts:1697`) also sets `backgroundHint: true` when the
+    frontmatter has `subagent.background_hint === true`, and omits the field
+    otherwise.
 
-#### 4.5 Tests for PR 4
+#### 4.5 `src/node/services/tools/task.ts` (Modify)
 
-*   `resolveNodeAgentAiSettings.test.ts` (Modify):
-    *   a `fast` agent takes Explore's Settings model and thinking level;
-    *   with no Explore model it takes the parent model;
-    *   the agent's own Settings entry still wins;
-    *   tool policy is unchanged.
-*   `pluginAgentFormat.test.ts` (Modify): `model: fast` writes
-    `ai.settingsBase: "explore"` and changes the mapped fingerprint, and
-    `is_background: true` writes nothing and returns a not-applied note.
-*   Schema downgrade fixture: an older frontmatter parse ignores
-    `ai.settingsBase`.
+*   **Type / Scope**: Task tool description.
+*   **Proposed Changes**: In `buildTaskDescription` (lines 102-124), an agent
+    with `backgroundHint: true` gets the line
+    `- <id>: <description> [meant to run in the background (run_in_background=true)]`.
+    Without a description the line is
+    `- <id> [meant to run in the background (run_in_background=true)]`. Other
+    lines do not change. The `task` schema (`toolDefinitions.ts:423`) does not
+    change.
 
-### PR 5: Turn-stop text (shipped change)
+#### 4.6 Tests for PR 4
+
+*   `src/node/services/agentDefinitions/resolveNodeAgentAiSettings.test.ts`
+    (Modify):
+    *   a `fast` agent with no Settings entry takes Explore's Settings model and
+        thinking level;
+    *   with no Explore model in Settings, it takes the parent model;
+    *   the `fast` agent's own Settings entry wins over Explore's;
+    *   `settingsBase: "missing-agent"` and `settingsBase` equal to the agent's
+        own ID each log the warning and resolve as without the field;
+    *   the agent's resolved tool policy is the same with and without
+        `settingsBase`.
+*   `src/node/services/agentDefinitions/pluginAgentFormat.test.ts` (Modify):
+    `model: fast` writes `ai.settingsBase: "explore"`; `is_background: true`
+    writes `subagent.background_hint: true`; `background: true` writes
+    nothing; each written field changes the mapped fingerprint.
+*   `src/node/services/tools/task.test.ts` (Modify): with `availableSubagents`
+    holding one runnable agent with `backgroundHint: true` and one without, the
+    `task` description has the hint line for the first and the plain line for
+    the second, and `run_in_background` still parses to `false` when omitted.
+*   `src/common/orpc/schemas/agentDefinition.test.ts` (Create): a frontmatter parse with the schema from before this PR strips
+    `ai.settingsBase` and `subagent.background_hint` (copy the two schemas
+    from `0f82063e7e` into the test).
+
+### PR 5: Turn-stop text (changes shipped behavior)
+
+Files: `src/node/services/agentPlugins/promptHooks.ts` (Modify) and its test.
 
 #### 5.1 `src/node/services/agentPlugins/promptHooks.ts` (Modify)
 
 *   **Type / Scope**: Turn-stop text.
-*   **Proposed Changes**: `lastAssistantText` (lines 173-181) returns all text
-    parts of the final assistant message joined with `\n`, cut to the last
-    16 × 1024 characters (`TURN_STOP_TEXT_MAX_CHARS`, line 128) without
-    splitting a UTF-16 surrogate pair, and returns text even when the turn
-    ended on a tool call.
+*   **Proposed Changes** (D22): `lastAssistantText` (lines 173-182) keeps its
+    rule: the trailing text run, and `null` when the turn ends on a tool part
+    (#6067). Only the cut changes: it keeps the last `TURN_STOP_TEXT_MAX_CHARS`
+    (16 × 1024, line 128) characters, with `text.slice(-TURN_STOP_TEXT_MAX_CHARS)`.
+    When the first character of the cut is a low surrogate (U+DC00-U+DFFF),
+    the cut drops it. Update the doc comment to say the end is kept, because a
+    completion promise sits at the end of a reply.
 
 #### 5.2 Tests for PR 5
 
-*   `promptHooks.test.ts` (Modify): a reply over 16 × 1024 characters keeps its
-    end, and a reply that ends on a tool call keeps its text.
+*   `src/node/services/agentPlugins/promptHooks.test.ts` (Modify):
+    *   a trailing run of 20,000 characters ending in `<promise>DONE</promise>`
+        returns its last 16,384 characters, which end with the tag;
+    *   a run whose cut starts inside a surrogate pair returns 16,383
+        characters and no lone low surrogate;
+    *   a turn that ends on a tool part still returns `null`.
 
-### PR 6: Per-hook stop limits
+### PR 6: Codex `PreToolUse` blocks on malformed output (changes shipped behavior)
 
-#### 6.1 `src/constants/pluginHooks.ts` (Modify)
+Files: `src/node/services/agentPlugins/codexHookRunner.ts` (Modify) and its
+test.
+
+#### 6.1 `src/node/services/agentPlugins/codexHookRunner.ts` (Modify)
+
+*   **Type / Scope**: Codex hook runner.
+*   **Proposed Changes** (D8):
+    *   In `invoke` (lines 486-558), add `malformed?: (detail: string) => T` to
+        the `call` options, beside `inputTooLarge`.
+    *   Call `parse(result)` in its own `try` block inside `invoke`. When
+        `parse` throws, or `applyOutput` (lines 560-571) sees `output.invalid`,
+        return `call.malformed(detail)` when it is set. `detail` is the thrown
+        message or `output.invalid`. When `call.malformed` is not set, warn and
+        return `null`, as at `0f82063e7e`.
+    *   Errors from the trust check, the MCP call and the timeout stay in the
+        outer `catch` (lines 552-554) and keep failing open.
+    *   In `runToolHooks` (line 180), `preCall` sets `malformed` to a function
+        that returns the `PreToolUseOutput`
+        `{denyReason: "its output is malformed: " + detail}`. `PostToolUse`,
+        `UserPromptSubmit` and `Stop` calls do not set it.
+    *   On that deny, emit one `plugin.hook.notice` through
+        `registration.deps.notifyUser` (line 69): "<plugin>: hook PreToolUse
+        blocked this call (its output is malformed: <detail>). Turn the hook
+        off in Settings > Plugins."
+    *   Replace the "Failure rule" paragraph of the header comment (lines
+        10-15) with: "Failure rule: every event fails OPEN, with one exception:
+        a PreToolUse output that is malformed or fails its schema check blocks
+        the call (Cursor plugin RFC, D8). An updatedInput that fails the tool's
+        schema also blocks (blockRewrite)."
+
+#### 6.2 Tests for PR 6
+
+*   `src/node/services/agentPlugins/codexHookRunner.test.ts` (Modify):
+    *   a `PreToolUse` output that `parse` rejects blocks the call, with the
+        deny reason and one notice;
+    *   a `PreToolUse` output with an unsupported `permissionDecision` (an
+        `invalid` output) blocks the call;
+    *   malformed `PostToolUse`, `UserPromptSubmit` and `Stop` output is
+        ignored with a warning;
+    *   a `PreToolUse` timeout, an MCP call error and a missing server let the
+        call through;
+    *   an `updatedInput` that fails the tool's schema blocks the call (it
+        blocks at `0f82063e7e` too).
+
+### PR 7: Per-hook stop limits
+
+Files: `src/constants/pluginHooks.ts`, `src/node/services/events/eventSpine.ts`,
+`src/node/services/agentPlugins/promptHooks.ts`,
+`src/node/services/agentPlugins/codexHookRunner.ts`,
+`src/node/services/agentSession.ts` (all Modify), and the tests in 7.4.
+
+#### 7.1 `src/constants/pluginHooks.ts` (Modify)
 
 *   **Type / Scope**: Shared constants.
 *   **Proposed Changes**: Move `MAX_STOP_HOOK_CONTINUATIONS` (3) here from
-    `agentSession.ts:706` as the shared default. Add
-    `MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN` (50).
+    `agentSession.ts:706` as the shared per-hook default (D3). Add
+    `MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN = 50` (D2).
 
-#### 6.2 `src/node/services/events/eventSpine.ts` (Modify)
+#### 7.2 `eventSpine.ts`, `promptHooks.ts` and `codexHookRunner.ts` (Modify)
 
-*   **Type / Scope**: Spine types.
-*   **Proposed Changes**: `continueReasons` in `TurnStopContext` (line 200)
-    becomes `Array<{text: string, hookKey: string, loopLimit?: number |
-    null}>`. Update its readers: `eventSpine.ts:247-250`,
-    `promptHooks.ts:159-163` and `codexHookRunner.ts:170` (add both files to
-    this PR).
+*   **Type / Scope**: Continuation reasons.
+*   **Proposed Changes**:
+    *   `continueReasons` in `TurnStopContext` (`eventSpine.ts:200`) becomes
+        `Array<{text: string; hookKey: string; loopLimit?: number | null}>`.
+        `hookKey` is the hook's `AgentPluginHookSchema.key` (its stable
+        location, the trust record's key). `loopLimit` absent means the shared
+        default. The snapshot and restore at `eventSpine.ts:247-250` copy the
+        objects.
+    *   `codexHookRunner.ts:170` pushes `{text: output.continueWith, hookKey:
+        hook.key}`.
+    *   `runTurnStopHooks` (`promptHooks.ts:138-165`) takes a new argument
+        `counts: ReadonlyMap<string, number>` (continuations per hook key in
+        this user turn). It drops a reason whose hook has reached its limit:
+        `counts.get(hookKey) ?? 0` is at least `loopLimit ??
+        MAX_STOP_HOOK_CONTINUATIONS`, and `loopLimit === null` never reaches a
+        limit. It returns `{kind: "continue", prompt, hookKeys}` with the keys
+        of the kept reasons, each key once.
 
-#### 6.3 `src/node/services/agentSession.ts` (Modify)
+#### 7.3 `src/node/services/agentSession.ts` (Modify)
 
 *   **Type / Scope**: Turn lifecycle.
 *   **Proposed Changes**:
-    *   Replace the one counter (line 1646) with a per-hook count map that
-        resets when a user turn starts (D4). The reset happens where
-        `stopHookContinuations` resets today (`:5193`, `:10757`, `:10769`,
-        `:10778`, `:10793`, `:10802`, `:10807`), and the reads at `:10857` and
-        `:10876` read the map.
-    *   `loop_limit` values: a whole number from 1 to 50 is the limit. 0 means
-        the hook never continues. A negative number, a fraction or a non-number
-        drops the hook with a warning at parse time. A value above 50 acts as
-        50.
-    *   `runTurnStopHooks` (line 10742) keeps a reason only while its hook is
-        under its limit (default 3, `null` = none) and the turn is under 50
-        (D2).
-    *   Each continuation emits a `plugin.hook.notice` "plugin continued turn n
-        of 50".
-    *   Xum's own nudges still run only when no hook continued this user turn
-        (lines 10874-10881): they check that every count in the new map is 0.
+    *   Keep `stopHookContinuations` (line 1646) as the count of
+        continuations in this user turn, and add `stopHookCountsByKey = new
+        Map<string, number>()`. Every place that resets
+        `stopHookContinuations` (lines 5193, 10757, 10769, 10778, 10793, 10802,
+        10807, 10814) also clears the map (D4).
+    *   The cap check at line 10810 compares with
+        `MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN` instead of
+        `MAX_STOP_HOOK_CONTINUATIONS`. At the increment (line 10817), add 1 to
+        `stopHookCountsByKey` for each key in `hookKeys`.
+    *   Pass `stopHookCountsByKey` to `runTurnStopHooks` (the call in the
+        method at line 10742).
+    *   After the increment, emit `plugin.hook.notice` "plugin continued turn
+        <n> of 50", where `<n>` is `stopHookContinuations`.
+    *   The reads at lines 10857 and 10876 keep reading
+        `stopHookContinuations > 0`. A continuation refused at admission
+        (`admissionStale`, line 10827) keeps the counts, as the single counter
+        does at `0f82063e7e`.
 
-#### 6.4 Tests for PR 6
+#### 7.4 Tests for PR 7
 
-*   `src/node/services/agentSession.turnStopHooks.test.ts` (Modify):
-    *   a hook without `loop_limit` stops after 3;
-    *   `loop_limit: 2` stops after 2 continuations;
-    *   `null` stops at 50;
-    *   two hooks count separately;
-    *   counts reset on a user message;
-    *   a Stop adds no continuation;
-    *   a Codex `Stop` hook without `loop_limit` still stops after 3;
-    *   `loop_limit: 0` never continues, and `loop_limit: 80` stops at 50.
+*   `src/node/services/agentSession.turnStopHooks.test.ts` (Modify). Each test
+    registers a `turn.stop` middleware on the spine that pushes reasons with a
+    chosen `hookKey` and `loopLimit`:
+    *   a hook without `loopLimit` continues 3 times, then the turn ends;
+    *   `loopLimit: 2` continues 2 times;
+    *   `loopLimit: null` continues 50 times, then the turn ends;
+    *   two hook keys each continue 3 times in the same user turn;
+    *   a new user message resets both counts;
+    *   a user Stop adds no continuation;
+    *   a Codex `Stop` hook (pushed by `codexHookRunner.ts`) without
+        `loop_limit` continues 3 times;
+    *   each continuation emits "plugin continued turn <n> of 50" with
+        `<n>` = 1, 2, 3.
 
-### PR 7: Cursor hooks: parse, trust, update review and runner (security review)
+### PR 8: Cursor hooks: parse, trust, update review and runner (security review)
 
-#### 7.0 `src/common/orpc/schemas/agentPlugins.ts` (Modify)
+Files: `src/common/orpc/schemas/agentPlugins.ts`,
+`src/node/services/agentPlugins/cursorHooks.ts` (Create),
+`src/node/services/agentPlugins/cursorHookRunner.ts` (Create),
+`src/node/services/agentPlugins/codexHookService.ts`,
+`src/node/services/agentPlugins/discovery.ts`,
+`src/node/services/agentPlugins/treeHash.ts`,
+`src/node/services/agentPlugins/installService.ts`,
+`src/node/utils/agentToolsDisabled.ts`, `src/node/services/terminalService.ts`,
+`src/browser/features/Settings/Sections/PluginHooksPanel.tsx`,
+`src/node/runtime/fakeRuntime.testHarness.ts` (all Modify unless marked), and
+the tests in 8.7.
+
+#### 8.0 `src/common/orpc/schemas/agentPlugins.ts` (Modify)
 
 *   **Type / Scope**: oRPC schemas.
-*   **Proposed Changes**: Add the `cursor-command` variant to
-    `PluginHookHandlerSchema` (lines 57-72), as section 5.1 defines it. Update
-    the `PluginHookStatusSchema` doc comment: `runnable` also covers a
-    `cursor-command` handler on a mapped event.
+*   **Proposed Changes**: Add the variant `z.object({type:
+    z.literal("cursor-command"), command: z.string(), timeoutSeconds:
+    z.number().optional(), loopLimit: z.number().int().nullable().optional(),
+    failClosed: z.boolean().optional()})` to `PluginHookHandlerSchema` (lines
+    57-72). `"cursor-command"` is a new discriminator value. The existing
+    `"command"` value stays for Codex command handlers, which never run. Update
+    the `PluginHookStatusSchema` doc comment (lines 74-78): `runnable` also
+    covers a `cursor-command` handler on a mapped event.
 
-#### 7.1 `src/node/services/agentPlugins/cursorHooks.ts` (Create)
+#### 8.1 `src/node/services/agentPlugins/cursorHooks.ts` (Create)
 
 *   **Type / Scope**: TypeScript module.
 *   **Proposed Changes**:
-    *   Parse Cursor `hooks.json` (file or inline) into
-        `AgentPluginHookSchema` entries.
-    *   Set the status per section 5.1 and the hash with `hashHookDefinition`
-        (D1). A hook with a `matcher` gets `ignored-event` (D9).
-    *   List unmapped events, hooks with a matcher and `prompt` hooks as not
-        applied.
+    *   `loadPluginCursorHooks(plugin)` reads the hooks source from
+        `normalizeCursorManifest` (a path, default `hooks/hooks.json`, or an
+        inline object) and parses `{version: 1, hooks: {<event>: [{command,
+        type?, matcher?, timeout?, loop_limit?, failClosed?}]}}` into
+        `AgentPluginHookSchema` entries. Discovery calls it for Cursor
+        packages, in place of the PR 1 `notApplied` entry.
+    *   `type` defaults to `"command"`. A `command` entry becomes a
+        `cursor-command` handler. `type: "prompt"` gets the status
+        `unsupported-handler`.
+    *   `key`: `cursor:<source>#<event>[<index>]`, where `<source>` is the
+        hooks file path or `plugin.json#hooks`. `source`: the same path.
+        `hash`: `hashHookDefinition(event, matcher, raw)` (`codexHooks.ts:696`),
+        with `raw` the entry as declared (D1).
+    *   Status: `runnable` for `afterFileEdit`, `afterAgentResponse` and `stop`
+        with no `matcher`; `ignored-event` for any other event or any hook
+        with a `matcher` (D9); `unsupported-handler` for `type: "prompt"`.
+        Each non-runnable hook gets a `notApplied` entry with part `hook` and
+        one reason, checked in this order: "prompt hooks are not applied in
+        Xum", "event not applied in Xum", "matcher not applied in Xum".
+    *   `loop_limit` rules: a whole number from 0 to 50 is the limit, and 0
+        means the hook never continues. A value above 50 is stored as 50.
+        `null` is stored as `null`. A negative number, a fraction or a
+        non-number drops the hook with the warning "hook <event>[<index>]:
+        loop_limit must be a whole number or null; ignoring this hook".
+    *   `timeout`: a positive number of seconds, else the warning "timeout must
+        be a positive number" and the shared default. An entry without a string
+        `command` is dropped with a warning.
 
-#### 7.2 `src/node/services/agentPlugins/cursorHookRunner.ts` (Create)
+#### 8.2 `src/node/services/agentPlugins/cursorHookRunner.ts` (Create)
 
 *   **Type / Scope**: TypeScript module.
 *   **Proposed Changes**:
     *   Register on `turn.stop`: `afterAgentResponse` first, then `stop`.
-    *   Register on `tool.execute`, after phase, for the file edit tools
-        (`file_edit_replace_string`, `file_edit_replace_lines`,
-        `file_edit_insert`): `afterFileEdit`, with the input from section 5.4.
-    *   For each call:
-        1.  Recheck trust and the three kill switches
-            (`XUM_DISABLE_AGENT_TOOLS`, `XUM_DISABLE_TERMINALS`,
-            `XUM_DISABLE_PROJECT_AUTOMATION`). `XUM_DISABLE_TERMINALS` has no
-            exported check today (`terminalService.ts:75-76` is an inline
-            assert): add `isTerminalsDisabled()` to
-            `src/node/utils/agentToolsDisabled.ts` and use it in both places. A
-            refused hook does not run, and Xum logs one `log.debug` line. No
-            chat notice is shown, because bug-bash runs set the switches.
-        2.  Skip the call in a remote workspace (SSH, Docker, devcontainer)
-            (D7).
-        3.  Get the runtime with `createRuntimeForWorkspace`
+    *   Register on `tool.execute`, after the tool runs (the `next()` call of
+        the middleware), for `file_edit_replace_string` and `file_edit_insert`
+        only: `afterFileEdit` (D25). Input: for `file_edit_replace_string`,
+        `file_path` is the tool's resolved `path` and `edits` is
+        `[{old_string: input.old_string, new_string: input.new_string}]`. For
+        `file_edit_insert`, `edits` is `[{old_string: "", new_string:
+        input.content}]`. A tool call that failed runs no hook.
+    *   For each call, in order:
+        1.  Skip unless `canRunCodexHooks` (`codexHookService.ts:68-70`) is
+            true: no `/side` chat, plugin MCP allowed, and
+            `XUM_DISABLE_AGENT_TOOLS` unset. Also skip when
+            `isTerminalsDisabled()` or `projectAutomationDisabled()`
+            (`src/node/utils/projectAutomation.ts:20-24`) is true (D6). Add
+            `isTerminalsDisabled()` to `src/node/utils/agentToolsDisabled.ts`
+            (`process.env.XUM_DISABLE_TERMINALS === "1"`), and use it at
+            `terminalService.ts:75`. A skipped hook logs one `log.debug` line
+            and shows no notice, because bug-bash runs set the switches.
+        2.  Skip unless `runtime.location === "local"` (`Runtime.ts:466`):
+            devcontainer and remote runtimes run no Cursor hooks (D7).
+        3.  Recheck trust with `deps.isHookAllowed(hook)`, as the Codex runner
+            does (`codexHookRunner.ts:521`). An untrusted hook never starts.
+        4.  Get the runtime with `createRuntimeForWorkspace`
             (`src/node/runtime/runtimeHelpers.ts:157`).
-        4.  Run the command as written (D17) through `Runtime.exec`
+        5.  Run the command as written (D17) through `Runtime.exec`
             (`src/node/runtime/Runtime.ts:506`), with `cwd` per section 5.4,
-            `hostEnv: "minimal"`, the environment from section 5.4 and D18 in
-            `env`, and the timeout from `effectiveHookTimeoutSeconds` (D16).
-        5.  Write the JSON input to `ExecStream.stdin`, and read JSON from
-            stdout.
-        6.  Apply the failure table (5.5). For `stop`, map `followup_message`
-            to a continuation reason with the hook's `loop_limit`.
-        7.  Exit 127 emits a one-time "not found in this workspace" notice. The
-            one-time state is kept in memory per workspace and plugin.
-    *   The hooks panel and the install review show "does not run in remote
-        workspaces" on each Cursor hook (D7).
+            `hostEnv: "minimal"`, the environment of section 5.4 and D18 in
+            `env`, and `timeout: effectiveHookTimeoutSeconds(timeoutSeconds)`
+            (D16).
+        6.  Write the JSON input to `ExecStream.stdin` and close it. Read
+            stdout to the end, at most 64 × 1024 characters. More output counts
+            as invalid output.
+        7.  Apply the failure table (5.5). For `stop`, a non-empty
+            `followup_message` string becomes `{text, hookKey: hook.key,
+            loopLimit: handler.loopLimit}` on `continueReasons`.
+        8.  A failure logs `log.warn` and, once per workspace and hook key,
+            emits `plugin.hook.notice` (D28): "<plugin>: hook <event> failed
+            (<reason>). Turn the hook off in Settings > Plugins." Exit 127 uses
+            the reason "`<command>` not found in this workspace". The
+            once-per-key set lives in the runner registration's memory.
+    *   `HOOK_INPUT_MAX_CHARS` (`codexHookRunner.ts:47`) moves to
+        `src/constants/pluginHooks.ts` and is exported, so both runners use it.
 
-#### 7.3 `src/node/services/agentPlugins/codexHookService.ts` (Modify)
+#### 8.3 `src/node/services/agentPlugins/codexHookService.ts` and `discovery.ts` (Modify)
 
 *   **Type / Scope**: Hook registration.
 *   **Proposed Changes**: Register the Cursor runner beside the Codex runner in
-    the per-workspace step (lines 94-125). The trust gate is shared.
+    the per-workspace step (lines 94-125), with the same `isHookAllowed` gate
+    (lines 215-218). Discovery calls `loadPluginCursorHooks` for Cursor
+    packages and stores the hooks where it stores Codex hooks, so the hooks
+    panel lists them.
 
-#### 7.4 `src/node/services/agentPlugins/treeHash.ts` (Modify)
+#### 8.4 `src/node/services/agentPlugins/treeHash.ts` (Modify)
 
 *   **Type / Scope**: Plugin tree hash.
-*   **Proposed Changes**: Export the per-file records that `hashPluginTree`
-    (lines 12-97) builds (path, mode, content hash or link text), through a new
-    `listPluginTreeRecords(root, quota)`. `hashPluginTree` hashes the same
-    records, so its result does not change.
+*   **Proposed Changes**: Move the walk of `hashPluginTree` (lines 13-97) into
+    `listPluginTreeRecords(root, quota): Promise<Array<[string, number,
+    string]>>` (path, mode, content hash or link text). `hashPluginTree` hashes
+    those records as before, so its result does not change.
 
-#### 7.5 `src/node/services/agentPlugins/installService.ts` (Modify)
+#### 8.5 `src/node/services/agentPlugins/installService.ts` (Modify)
 
-*   **Type / Scope**: Update review.
+*   **Type / Scope**: Update review (D1).
 *   **Proposed Changes**: In the update-review change list (lines 3090-3111),
-    when the staged plugin has a runnable Cursor command hook, compare
-    `listPluginTreeRecords` of the installed tree and the staged tree. Add one
-    change per added, removed or changed file outside `skills/`, the rule
-    roots, the agent roots and `workflows/` (D1). A UTF-8 text file shows its
-    before and after text (`reviewText`). Any other file shows "changed". The
-    list still goes through `assertReviewFits` (lines 586-597).
+    when the staged plugin has at least one `runnable` `cursor-command` hook:
+    *   compare `listPluginTreeRecords` of the installed tree and the staged
+        tree, with the quota of `STAGED_TREE_MAX_BYTES` and
+        `STAGED_TREE_MAX_FILES` (lines 1192-1193);
+    *   skip paths under the skills roots, rule roots, agent folder and
+        `workflows/`, which the review already covers;
+    *   for each added, removed or changed path, add a change with component
+        `"hooks"` and summary "file <path> added", "removed" or "changed". For
+        a file of at most 64 × 1024 bytes that decodes as UTF-8 without
+        replacement characters (`new TextDecoder("utf-8", {fatal: true})`),
+        `before` and `after` are its text through `reviewText` (lines
+        540-542), read from each tree. Any other file has no `before` or
+        `after`;
+    *   the list still goes through `assertReviewFits` (lines 586-597), so an
+        update too large to review fails with its existing message.
 
-#### 7.6 `src/browser/features/Settings/Sections/PluginHooksPanel.tsx` (Modify)
+#### 8.6 `src/browser/features/Settings/Sections/PluginHooksPanel.tsx` (Modify)
 
 *   **Type / Scope**: Renderer.
 *   **Proposed Changes**: Show Cursor hooks with their status notes
-    (`PLUGIN_HOOK_STATUS_NOTE`, line 87), the last failure on the hook's row
-    (5.5), and "does not run in remote workspaces". Add "runs a command in your
-    workspace" to the trust prompt.
+    (`PLUGIN_HOOK_STATUS_NOTE`, line 87). Add the note "does not run in remote
+    workspaces" (SSH, Docker and devcontainer) to each Cursor hook. Add "runs a command in
+    your workspace" to the trust prompt of a `cursor-command` hook.
 
-#### 7.7 Tests for PR 7
+#### 8.7 Tests for PR 8
 
-*   `cursorHooks.test.ts` (Create): parsing, status values, the hash stays
-    stable when the file is reformatted, a changed `loop_limit` changes the
-    hash, a hook with a `matcher` gets `ignored-event`, and unmapped events are
-    listed.
+*   `src/node/services/agentPlugins/cursorHooks.test.ts` (Create):
+    *   ralph-loop's `hooks.json` gives two `runnable` hooks, and `stop` has
+        `loopLimit: null`;
+    *   advisor's `hooks.json` gives three `runnable` hooks and one
+        `ignored-event` (`subagentStop`) with the reason "event not applied in
+        Xum";
+    *   reformatting the file keeps every hash, and changing `loop_limit` from
+        3 to 4 changes that hook's hash;
+    *   `loop_limit: 80` is stored as 50, `-1` and `1.5` drop the hook with the
+        warning;
+    *   a `preToolUse` hook gets `ignored-event` and the reason "event not
+        applied in Xum".
 *   `src/node/runtime/fakeRuntime.testHarness.ts` (Modify): accept `hostEnv`
-    (refused today, lines 86-116) and record stdin (a no-op today, line 129).
-*   `cursorHookRunner.test.ts` (Create), with that fake runtime:
-    *   the hook receives `conversation_id`, `generation_id`,
-        `hook_event_name`, `cursor_version`, `workspace_roots` and
-        `transcript_path` on stdin;
+    (refused at lines 86-116) and record what is written to stdin (a no-op at
+    line 129).
+*   `src/node/services/agentPlugins/cursorHookRunner.test.ts` (Create), with
+    that fake runtime:
+    *   stdin has `conversation_id`, `generation_id`, `hook_event_name`,
+        `cursor_version`, `workspace_roots` and `transcript_path`;
+    *   the environment has `CURSOR_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`,
+        `CURSOR_PLUGIN_ROOT`, `CURSOR_TRANSCRIPT_PATH`, `CURSOR_VERSION`,
+        `PATH` and `HOME`, and no `CURSOR_USER_EMAIL` or `CURSOR_CODE_REMOTE`;
     *   `stop` runs in the workspace root, and `afterAgentResponse` and
         `afterFileEdit` in the plugin folder;
-    *   `afterFileEdit` runs after each file edit tool with `file_path` and
-        `edits`, and not after `bash`;
-    *   exit 2 from `stop` is ignored with a warning, exit 127 shows the notice
-        once, and exit 1 is ignored with a warning;
+    *   `afterFileEdit` runs after `file_edit_replace_string` with its
+        `old_string` and `new_string`, after `file_edit_insert` with
+        `old_string: ""`, and not after `bash` or a failed edit;
+    *   `stop` output `{"followup_message": "again"}` adds one reason with the
+        hook's key and `loopLimit`, and empty stdout adds none;
+    *   exit 2, `{"permission": "deny"}`, invalid JSON, `{"followup_message":
+        3}` and exit 1 from `stop` each add no reason and one notice;
+    *   exit 127 shows the "not found in this workspace" notice once for two
+        calls;
     *   a hook that sleeps past its timeout is killed, and the turn proceeds;
-    *   with `XUM_DISABLE_AGENT_TOOLS=1`, no process starts;
-    *   in a remote workspace, no process starts;
-    *   a revoke between two calls stops the second call;
-    *   `afterAgentResponse` runs before `stop`;
-    *   invalid JSON from `afterAgentResponse` is ignored with a warning;
-    *   with `failClosed: true`, a crash in `stop` is still ignored with a
-        warning;
-    *   an input over `HOOK_INPUT_MAX_CHARS` skips the call with a warning;
-    *   an unreadable trust store skips the call with a warning;
+    *   each of `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and
+        `XUM_DISABLE_PROJECT_AUTOMATION=1` starts no process;
+    *   a devcontainer or remote runtime starts no process;
+    *   an untrusted hook starts no process, and revoking trust between two
+        calls stops the second call;
+    *   with `failClosed: true`, a crash in `stop` adds no reason and one
+        notice;
+    *   an input over `HOOK_INPUT_MAX_CHARS` and an unreadable trust store each
+        skip the call with one notice;
     *   after a user Stop, no Cursor hook runs (D5).
-*   `src/node/services/agentPlugins/installService.test.ts` (Modify): an update that changes `hooks/lib.sh` of a plugin with a runnable
-    Cursor command hook lists `hooks/lib.sh` with its before and after text,
-    and the same change in a plugin without command hooks lists nothing new.
-*   `src/node/services/agentPlugins/treeHash.test.ts` (Create): `hashPluginTree`
-    returns the same hash as before for a fixed tree, and
-    `listPluginTreeRecords` lists each file once.
-*   `tests/bugbash/pluginHookFixtures.ts` (Modify): add a new fixture
+*   `src/node/services/agentPlugins/treeHash.test.ts` (Create): for a fixed
+    fixture tree, `hashPluginTree` returns the hash that the code at
+    `0f82063e7e` returns (compute it once with that code and write it into the
+    test), and `listPluginTreeRecords` lists each path once.
+*   `src/node/services/agentPlugins/installService.test.ts` (Modify), for a
+    plugin with a runnable `cursor-command` hook:
+    *   an update that changes `hooks/lib.sh` lists "file hooks/lib.sh changed"
+        with its before and after text;
+    *   an added and a removed file under `hooks/` are listed as "added" and
+        "removed";
+    *   a changed binary file is listed with no text;
+    *   a changed `skills/a/SKILL.md` is not listed twice;
+    *   a plugin without a runnable Cursor hook lists no file changes;
+    *   an update with more text than `assertReviewFits` allows fails with its
+        message.
+*   `tests/bugbash/pluginHookFixtures.ts` (Modify): add the fixture
     `ralph-loop-cursor`, copied from cursor/plugins `ralph-loop` at `4dd1d05`
-    (`hooks/hooks.json`, `hooks/stop-hook.sh`, `hooks/capture-response.sh`, the
-    `ralph-loop` and `cancel-ralph` skills). Change only the two commands to
+    (`.cursor-plugin/plugin.json`, `hooks/hooks.json`, `hooks/stop-hook.sh`,
+    `hooks/capture-response.sh`, and the `ralph-loop` and `cancel-ralph`
+    skills). Change only the two commands to
     `bash "${CURSOR_PLUGIN_ROOT}/hooks/<script>.sh"`.
 *   `tests/bugbash/repros/cursorStopHookLoop.e2e.ts` (Create, tags `bugbash`
-    and `cursor-stop-loop`): the mock AI with a `[mock:...]` prompt that ends
-    with `<promise>DONE</promise>` on its third turn. It is not a `tools-on`
-    repro. Expect the loop to continue until the promise, no continuation after
-    Stop, and no continuation after `cancel-ralph`.
+    and `cursor-stop-loop`): mock AI mode, with a `[mock:...]` prompt whose
+    reply has `<promise>DONE</promise>` on its third turn. It is not a
+    `tools-on` repro. Expect two "plugin continued turn n of 50" notices, then
+    no continuation. In a second run, press the user Stop after the first
+    continuation and expect no continuation. Then run `cancel-ralph` and send a
+    message, and expect no continuation.
 
-### PR 8: Docs
+### PR 9: Docs
 
-#### 8.1 `docs/hooks/plugins.mdx` (Modify)
+Files: `docs/hooks/plugins.mdx`, `docs/config/mcp-servers.mdx`,
+`docs/agents/agent-skills.mdx` (all Modify).
 
-*   **Type / Scope**: User docs.
-*   **Proposed Changes**: A "Cursor plugins" section:
-    *   what loads, and the "not applied" list;
-    *   rules as skills;
-    *   the three hook events that run, and the failure rules;
-    *   stop-loop limits and the ceiling of 50;
-    *   the update review lists changed files of a plugin with command hooks;
-    *   Cursor hooks do not run in remote workspaces.
-
-#### 8.2 `docs/config/mcp-servers.mdx` (Modify)
+#### 9.1 `docs/hooks/plugins.mdx` (Modify)
 
 *   **Type / Scope**: User docs.
-*   **Proposed Changes**: The `cursor` MCP dialect, the plugin-root variables,
-    "needs values", and that the `auth` block is not applied.
+*   **Proposed Changes**: A section "Cursor plugins" with these headings and
+    facts:
+    *   "What loads": skills, rules as skills (section 2 labels), agents, MCP
+        servers and three hook events; the "not applied" list in the install
+        review;
+    *   "Hooks": `afterFileEdit`, `afterAgentResponse` and `stop` run in local
+        and worktree workspaces after the user trusts them; the failure table of
+        5.5; the update review lists changed files of a plugin with command
+        hooks;
+    *   "Stop-loop limits": the default of 3 per hook, `loop_limit`, and the
+        ceiling of 50 per user turn;
+    *   "Codex hooks": a `PreToolUse` hook with malformed output blocks the
+        call.
 
-#### 8.3 `docs/agents/agent-skills.mdx` (Modify)
+#### 9.2 `docs/config/mcp-servers.mdx` (Modify)
 
 *   **Type / Scope**: User docs.
-*   **Proposed Changes**: Cursor agents: `model: fast` uses Explore's settings,
-    `is_background` is not applied, and `readonly` gets Explore's tool policy
+*   **Proposed Changes**: A section "Cursor plugin servers": the `cursor`
+    dialect, `${CURSOR_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}`, the status
+    "needs values not supported in Xum", and "auth not applied in Xum".
+
+#### 9.3 `docs/agents/agent-skills.mdx` (Modify)
+
+*   **Type / Scope**: User docs.
+*   **Proposed Changes**: A section "Cursor agents": `model: fast` uses
+    Explore's model settings, `is_background: true` shows the background hint
+    in the `task` tool's agent list, and `readonly` gets Explore's tool policy
     and Explore's prompt.
 
 `docs/docs.json` needs no change: all three pages are already in the
@@ -1664,38 +2173,50 @@ navigation.
 ### Verification Plan
 
 *   **Build**: `make typecheck` and `make build` for every PR.
-*   **Unit tests**: `bun test` on each PR's test files listed above, then
-    `make test` before each push.
+*   **Unit tests**: `bun test <file>` on each PR's test files listed above,
+    then `make test` before each push.
 *   **Static analysis**: `make static-check` before each push, `make
     lint-eslint` for type-aware rules, and `make crap-check`, `make dry-check`
     and `make mutate-check` on the changed functions.
-*   **Repros**: `make test-bugbash-repros` with `BUGBASH_AI=mock`.
-*   **Docs (PR 8)**: `make static-check-full`, which includes
+*   **Repros**: `make test-bugbash-repros` with `BUGBASH_AI=mock` (PR 2 and
+    PR 8).
+*   **Docs (PR 9)**: `make static-check-full`, which includes
     `mintlify broken-links`.
-*   **Dogfood** (dev-server sandbox, `dev-server-sandbox` skill, API at
-    `/api/agentPlugins/preview` and `/install`):
-    1.  Add `https://github.com/cursor/plugins`. Expect 128 entries, `pstack`
-        with two builds, and `origin-apps` once (success test 1).
-    2.  Install `cursor-team-kit`. Expect 18 skills, 2 rule skills with labels,
-        and 2 agents. Spawn `thermo-nuclear-code-quality-review` (tests 1, 2).
-    3.  Set an Explore model, then spawn `ci-watcher`. Expect it on that model,
-        with the source label in the header, and `is_background` listed as not
-        applied (test 3, CUJ 2).
-    4.  Install the ralph-loop fixture, trust both hooks, and run a loop to its
-        promise. Press Stop mid-loop, then run `cancel-ralph`. Expect "plugin
-        continued turn n of 50" until the promise, no continuation after Stop,
-        and no continuation after `cancel-ralph` (test 4, CUJ 3).
-    5.  Install `attio` and sign in. Install the stdio fixture. Call a tool
-        on each. Expect a tool result from both (tests 5, 6, CUJ 4, 4b).
-    6.  Change `hooks/stop-hook.sh` in the fixture's source and update the
-        plugin. Expect the update review to list `hooks/stop-hook.sh` with its
-        before and after text (D1).
-    7.  Preview `advisor`. Expect `subagentStop` as not applied (test 7,
+*   **Dogfood** (dev-server sandbox from the `dev-server-sandbox` skill; oRPC at
+    `/orpc/agentPlugins/preview` and `/orpc/agentPlugins/install`). Each step
+    names the PR that makes it pass:
+    1.  PR 2: add `https://github.com/cursor/plugins`. Expect 128 rows, one
+        `pstack` row with "Preview Cursor build" and "Preview Claude build", and
+        one `origin-apps` row (success test 1).
+    2.  PR 1 and PR 2: install `cursor-team-kit`. Expect 18 skills, 2 rule
+        skills labeled "always-apply rule, loaded on request in Xum", and 2
+        agents. Spawn `thermo-nuclear-code-quality-review` and expect a report
+        from it (success tests 1, 2).
+    3.  PR 4: set an Explore model in Settings, then spawn `ci-watcher`. Expect
+        the sub-agent header to show that model, and the `task` tool's agent
+        list to show `ci-watcher` with "[meant to run in the background
+        (run_in_background=true)]" (success test 3, CUJ 2).
+    4.  PR 7 and PR 8: install the `ralph-loop-cursor` fixture, trust both
+        hooks, and run a loop to its promise. Expect "plugin continued turn n of
+        50" until the promise, then no continuation. Press the user Stop
+        mid-loop and expect no continuation. Run `cancel-ralph`, send a
+        message, and expect no continuation (success test 4, CUJ 3).
+    5.  PR 3: install `attio` and sign in, and install the `cursor-stdio-mcp`
+        fixture. Call an `attio` tool and expect a result without an error.
+        Call `echo` with `text: "hi"` and expect `hi` (success tests 5, 6, CUJ 4,
+        4b).
+    6.  PR 8: change `hooks/stop-hook.sh` in the fixture's source and update
+        the plugin. Expect the update review to list "file hooks/stop-hook.sh
+        changed" with its before and after text (D1).
+    7.  PR 1 and PR 2: preview `advisor`. Expect `subagentStop` in the
+        `notApplied` list with "event not applied in Xum" (success test 7,
         CUJ 5).
-    8.  Check the Plugins tab at 390 px. Expect the plugin list and the install
-        review with no horizontal scroll, and the `notApplied` list readable.
-*   **Evidence**: screenshots of steps 1, 2, 4, 6 and 7 and a short recording of
-    step 4, attached to each PR with `gh pr ... --attach`.
+    8.  PR 2: check the Plugins tab and the install review at 390 px wide.
+        Expect no horizontal scroll, and each `notApplied` row on its own line
+        with its part, name and reason.
+*   **Evidence**: screenshots of steps 1, 2, 4, 6, 7 and 8, and a recording of
+    step 4. Attach each to the PR named in its step, with
+    `gh pr comment <pr> --body-file <file> --attach <file>`.
 
 --------------------------------------------------------------------------------
 
