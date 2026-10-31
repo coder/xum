@@ -10,6 +10,7 @@ import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
 import { REDACTED_BACKUP_VALUE } from "./payload";
+import { pinToShelf } from "@/node/services/artifactShelf";
 import { ProjectService } from "@/node/services/projectService";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { runGit, writeFixtureFile } from "./testHelpers";
@@ -39,6 +40,21 @@ describe("BackupService against a real repository", () => {
     return new BackupService(config, {
       gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
       payload: createBackupPayloadStore({ config }),
+    });
+  }
+
+  /** A service whose safety snapshot runs `afterSnapshot` once it is written. */
+  function createServiceRacingSnapshot(afterSnapshot: () => Promise<void>): BackupService {
+    const payload = createBackupPayloadStore({ config });
+    return new BackupService(config, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
+      payload: {
+        ...payload,
+        async writeSafetySnapshot(snapshotRoot, contents) {
+          await payload.writeSafetySnapshot(snapshotRoot, contents);
+          await afterSnapshot();
+        },
+      },
     });
   }
 
@@ -461,17 +477,9 @@ describe("BackupService against a real repository", () => {
     await fs.rm(linkPath, { recursive: true });
     await fs.symlink(sharedSkill, linkPath);
 
-    const payload = createBackupPayloadStore({ config });
-    const racing = new BackupService(config, {
-      gitRepo: createBackupGitRepo({ cacheRoot: path.join(muxRoot, "backup-cache") }),
-      payload: {
-        ...payload,
-        async writeSafetySnapshot(snapshotRoot, contents) {
-          await payload.writeSafetySnapshot(snapshotRoot, contents);
-          await fs.rm(linkPath);
-          await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
-        },
-      },
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, "skills/gh-stack/SKILL.md", "written after snapshot\n");
     });
 
     const restored = await racing.restore(settings);
@@ -480,6 +488,211 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(linkPath, "SKILL.md"), "utf-8")).toBe(
       "written after snapshot\n"
     );
+  });
+
+  /** A registered project whose memory folder was pushed as a real folder and is now a link. */
+  async function linkMatchedProjectMemory(): Promise<{ memoryDir: string; sharedMemory: string }> {
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const created = await new ProjectService(config).create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const memoryDir = `memory/project/${projectMemoryDirName(created.data.normalizedPath)}`;
+    await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "backed-up memory\n");
+    settings = { ...settings, includeProjects: true };
+    await pushOrThrow();
+    const sharedMemory = path.join(tempDir, "shared-memory");
+    await writeFixtureFile(sharedMemory, "notes.md", "shared memory\n");
+    await fs.rm(path.join(muxRoot, memoryDir), { recursive: true });
+    await fs.symlink(sharedMemory, path.join(muxRoot, memoryDir));
+    return { memoryDir, sharedMemory };
+  }
+
+  it("previews and restores around a matched project whose local memory folder is now a symlink", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      `${memoryDir}/notes.md`
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(path.join(muxRoot, memoryDir))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe("shared memory\n");
+  });
+
+  it("leaves a memory folder alone when it becomes a symlink while the core settings restore", async () => {
+    const { memoryDir, sharedMemory } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    await fs.rm(linkPath);
+    await fs.cp(sharedMemory, linkPath, { recursive: true });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const editConfig = config.editConfig.bind(config);
+    let swapped = false;
+    const spy = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fs.rm(linkPath, { recursive: true });
+        await fs.symlink(sharedMemory, linkPath);
+      }
+      return await editConfig(...args);
+    });
+    try {
+      const restored = await service.restore(settings);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(swapped).toBe(true);
+      expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+      expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+        "global instructions\n"
+      );
+      expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe(
+        "shared memory\n"
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("leaves a skipped symlinked memory folder alone when it becomes a folder after the snapshot", async () => {
+    const { memoryDir } = await linkMatchedProjectMemory();
+    const linkPath = path.join(muxRoot, memoryDir);
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(linkPath);
+      await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(linkPath, "notes.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
+  /** A global pin pushed as a real shelf entry whose local entry folder is now a link. */
+  async function linkPinnedShelfEntry(): Promise<{ entryPath: string; sharedEntry: string }> {
+    const shelfRoot = path.join(muxRoot, "artifacts");
+    const pinned = await pinToShelf({
+      shelfRoot,
+      scopeDir: path.join(shelfRoot, "global"),
+      relPath: "report.md",
+      bytes: Buffer.from("backed-up report\n"),
+      meta: {
+        sourceWorkspaceId: "ws-1",
+        version: 1,
+        title: "report.md",
+        kind: "markdown",
+        pinnedAtMs: 1,
+        pinnedBy: "user",
+      },
+    });
+    if (!pinned.success) throw new Error(pinned.error);
+    settings = { ...settings, includeGlobalArtifacts: true };
+    await pushOrThrow();
+    const entryPath = path.join(shelfRoot, "global", pinned.name);
+    const sharedEntry = path.join(tempDir, "shared-artifacts", pinned.name);
+    await fs.mkdir(path.dirname(sharedEntry), { recursive: true });
+    await fs.rename(entryPath, sharedEntry);
+    await writeFixtureFile(sharedEntry, "report.md", "shared report\n");
+    await fs.symlink(sharedEntry, entryPath);
+    return { entryPath, sharedEntry };
+  }
+
+  const PINNED_ENTRY_FILES = [
+    "artifacts/global/report.md/meta.json",
+    "artifacts/global/report.md/report.md",
+  ];
+
+  it("previews and restores around a pinned artifact whose local shelf entry is now a symlink", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      PINNED_ENTRY_FILES[1]
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
+  it("leaves a skipped symlinked shelf entry alone when it becomes a folder after the snapshot", async () => {
+    const { entryPath } = await linkPinnedShelfEntry();
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath);
+      await writeFixtureFile(entryPath, "report.md", "written after snapshot\n");
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect(await fs.readFile(path.join(entryPath, "report.md"), "utf-8")).toBe(
+      "written after snapshot\n"
+    );
+  });
+
+  it("leaves a shelf entry alone when it becomes a symlink after the snapshot", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await fs.rm(entryPath);
+    await fs.cp(sharedEntry, entryPath, { recursive: true });
+    const racing = createServiceRacingSnapshot(async () => {
+      await fs.rm(entryPath, { recursive: true });
+      await fs.symlink(sharedEntry, entryPath);
+    });
+
+    const restored = await racing.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
+  });
+
+  it("leaves a shelf entry alone when it becomes a symlink while the core settings restore", async () => {
+    const { entryPath, sharedEntry } = await linkPinnedShelfEntry();
+    await fs.rm(entryPath);
+    await fs.cp(sharedEntry, entryPath, { recursive: true });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const editConfig = config.editConfig.bind(config);
+    let swapped = false;
+    const spy = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+      if (!swapped) {
+        swapped = true;
+        await fs.rm(entryPath, { recursive: true });
+        await fs.symlink(sharedEntry, entryPath);
+      }
+      return await editConfig(...args);
+    });
+    try {
+      const restored = await service.restore(settings);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(swapped).toBe(true);
+      expect(restored.data.symlinkSkipped).toEqual(PINNED_ENTRY_FILES);
+      expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+        "global instructions\n"
+      );
+      expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe(
+        "shared report\n"
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
