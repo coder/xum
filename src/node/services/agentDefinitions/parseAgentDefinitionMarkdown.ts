@@ -16,6 +16,11 @@ export class AgentDefinitionParseError extends Error {
 export interface ParsedAgentDefinitionMarkdown {
   frontmatter: AgentDefinitionFrontmatter;
   body: string;
+  /**
+   * The raw frontmatter has Cursor `readonly: true`. The schema strips the key, so the install
+   * review reads it here (agentFiles.ts).
+   */
+  rawReadonly: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -104,5 +109,9 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
-  return { frontmatter: parsed.data, body };
+  return {
+    frontmatter: parsed.data,
+    body,
+    rawReadonly: raw.readonly === true,
+  };
 }

@@ -5,10 +5,12 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { parseClaudeMarketplace } from "./claudeMarketplace";
 import { discoverAgentPluginAt } from "./discovery";
 import {
   chooseInstallMethod,
   detectInstallMethods,
+  entryInstallMethods,
   findSkillsPackageRoots,
   generatedPluginName,
   toPluginName,
@@ -239,6 +241,58 @@ describe("detectInstallMethods", () => {
     });
     expect((await detectInstallMethods(invalid)).methods).toEqual([{ kind: "agent-plugin" }]);
   });
+
+  test("a Cursor manifest is cursor-plugin, after a Claude one, as discovery loads them", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    const cursorManifest = JSON.stringify({ name: "pstack" });
+
+    const cursor = path.join(tmp.path, "cursor");
+    await writeTree(cursor, [], { ".cursor-plugin/plugin.json": cursorManifest });
+    expect((await detectInstallMethods(cursor)).methods).toEqual([{ kind: "cursor-plugin" }]);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: cursor, scope: "global" });
+    expect(plugin?.cursorFallback).toBe(true);
+
+    const both = path.join(tmp.path, "both");
+    await writeTree(both, [], {
+      ".claude-plugin/plugin.json": cursorManifest,
+      ".cursor-plugin/plugin.json": cursorManifest,
+    });
+    expect((await detectInstallMethods(both)).methods).toEqual([{ kind: "claude-plugin" }]);
+
+    // A schema-less root plugin.json yields to the Cursor manifest, as it does to a Claude one.
+    const schemaLess = path.join(tmp.path, "schema-less");
+    await writeTree(schemaLess, [], {
+      "plugin.json": JSON.stringify({ name: "pstack" }),
+      ".cursor-plugin/plugin.json": cursorManifest,
+    });
+    expect((await detectInstallMethods(schemaLess)).methods).toEqual([{ kind: "cursor-plugin" }]);
+    const loaded = await discoverAgentPluginAt({ pluginDir: schemaLess, scope: "global" });
+    expect(loaded.plugin?.cursorFallback).toBe(true);
+  });
+});
+
+describe("entryInstallMethods", () => {
+  const cursorEntry = parseClaudeMarketplace(
+    JSON.stringify({ name: "cursor-plugins", plugins: [{ name: "kit", source: "kit" }] }),
+    ".cursor-plugin/marketplace.json"
+  ).entries[0];
+
+  test("a Cursor entry installs only through its folder's own manifest", () => {
+    const ctx = { file: "cursor" as const, entry: cursorEntry, rootSource: false };
+    expect(entryInstallMethods([{ kind: "cursor-plugin" }], { ...ctx, relative: true })).toEqual({
+      methods: [{ kind: "cursor-plugin" }],
+      warnings: [],
+    });
+    const refusal =
+      "The Cursor marketplace entry 'kit' has no plugin manifest in its folder. Xum does not install it.";
+    // No generated manifest for a folder of the repository, no Skills for another repository.
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: true })).toThrow(
+      refusal
+    );
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: false })).toThrow(
+      refusal
+    );
+  });
 });
 
 describe("chooseInstallMethod", () => {
@@ -257,6 +311,24 @@ describe("chooseInstallMethod", () => {
     ).toThrow("cannot be installed as Agent Plugin; it fits: Claude Code plugin, Skills");
   });
 
+  test("a Cursor marketplace entry matches only the same entry", () => {
+    const pstack = { kind: "cursor-marketplace" as const, entry: "pstack" };
+    expect(chooseInstallMethod([pstack], { mode: "exact", method: { ...pstack } })).toEqual(pstack);
+    expect(() =>
+      chooseInstallMethod([pstack], {
+        mode: "exact",
+        method: { kind: "cursor-marketplace", entry: "origin-apps" },
+      })
+    ).toThrow("cannot be installed as Cursor marketplace entry");
+    // The Claude entry of the same name is another method.
+    expect(() =>
+      chooseInstallMethod([pstack], {
+        mode: "exact",
+        method: { kind: "claude-marketplace", entry: "pstack" },
+      })
+    ).toThrow("cannot be installed as Claude Code marketplace entry");
+  });
+
   test("update keeps a generated install on skills unless the repository has its own manifest", () => {
     const generatedFrom = { kind: "skills" as const };
     expect(chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom })).toEqual({
@@ -272,6 +344,24 @@ describe("chooseInstallMethod", () => {
     expect(
       chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom: undefined })
     ).toEqual({ kind: "claude-plugin" });
+  });
+
+  test("update reads a Cursor manifest, also for an entry Xum generated from the Claude file", () => {
+    const cursorAndSkills = [{ kind: "cursor-plugin" as const }, { kind: "skills" as const }];
+    expect(
+      chooseInstallMethod([{ kind: "cursor-plugin" }], { mode: "update", generatedFrom: undefined })
+    ).toEqual({ kind: "cursor-plugin" });
+    // A Claude marketplace entry whose folder gained a Cursor manifest switches to it.
+    expect(
+      chooseInstallMethod(cursorAndSkills, {
+        mode: "update",
+        generatedFrom: { kind: "claude-marketplace", entry: "kit" },
+      })
+    ).toEqual({ kind: "cursor-plugin" });
+    // A generated skills install keeps its generator.
+    expect(
+      chooseInstallMethod(cursorAndSkills, { mode: "update", generatedFrom: { kind: "skills" } })
+    ).toEqual({ kind: "skills" });
   });
 });
 

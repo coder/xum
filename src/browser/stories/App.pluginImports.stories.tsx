@@ -38,6 +38,7 @@ const preview: AgentPluginInstallPreview = {
     },
   ],
   agents: ["reviewer.md"],
+  readonlyAgents: [],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
   consentDigest: "c".repeat(64),
@@ -46,6 +47,7 @@ const preview: AgentPluginInstallPreview = {
   fileChanges: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
+  notApplied: [],
 };
 
 function setupPluginSettings(installed = false, conflict = false) {

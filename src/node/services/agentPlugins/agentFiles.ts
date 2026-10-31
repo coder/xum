@@ -12,6 +12,8 @@ export interface PluginAgentFile {
   id: string;
   /** The parsed frontmatter (plugin format mapping applied), as the runtime parses it. */
   frontmatter: unknown;
+  /** Cursor `readonly: true`: the agent runs on Explore's tools (no file edits, shell stays). */
+  readonly: boolean;
 }
 
 /**
@@ -41,11 +43,11 @@ export async function listPluginAgentFiles(
     if (agentId === null || ambiguous.has(agentId)) {
       continue;
     }
-    const frontmatter = await readAgentFrontmatter(path.join(dir, name), agentId);
-    if (frontmatter === undefined) {
+    const parsed = await readAgentDefinition(path.join(dir, name), agentId);
+    if (parsed === undefined) {
       continue;
     }
-    agents.push({ file: name, id: agentId, frontmatter });
+    agents.push({ file: name, id: agentId, ...parsed });
   }
   return agents.sort((a, b) => a.file.localeCompare(b.file));
 }
@@ -93,8 +95,11 @@ export function ambiguousPluginAgentIds(
   return ambiguous;
 }
 
-/** The parsed frontmatter of one agent file, or undefined when the runtime would skip it. */
-async function readAgentFrontmatter(filePath: string, agentId: string): Promise<unknown> {
+/** The parsed definition of one agent file, or undefined when the runtime would skip it. */
+async function readAgentDefinition(
+  filePath: string,
+  agentId: string
+): Promise<Pick<PluginAgentFile, "frontmatter" | "readonly"> | undefined> {
   try {
     const stat = await fsPromises.stat(filePath);
     // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -107,11 +112,17 @@ async function readAgentFrontmatter(filePath: string, agentId: string): Promise<
     const content = await fsPromises.readFile(filePath, "utf8");
     // Throws on malformed frontmatter or oversized content — exactly the
     // definitions runtime discovery would skip.
-    return parseAgentDefinitionMarkdown({
+    const parsed = parseAgentDefinitionMarkdown({
       content,
       byteSize: stat.size,
       plugin: { agentId },
-    }).frontmatter;
+    });
+    // A Xum-format file keeps its own base: only the foreign-format mapping turns `readonly`
+    // into Explore (pluginAgentFormat.ts).
+    return {
+      frontmatter: parsed.frontmatter,
+      readonly: parsed.rawReadonly && parsed.frontmatter.base === "explore",
+    };
   } catch {
     return undefined;
   }
