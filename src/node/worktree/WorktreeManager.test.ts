@@ -2153,6 +2153,42 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("fetches again for a linked worktree whose relative origin URL names another remote", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
+      const uploadPackRuns = await countOriginUploadPacks(fixture);
+      const git = (cwd: string, ...args: string[]) =>
+        execFileSync("git", args, { cwd, stdio: "ignore" });
+      git(fixture.projectPath, "remote", "set-url", "origin", "../remote");
+      const nested = path.join(fixture.rootDir, "nested");
+      const nestedRemote = path.join(nested, "remote");
+      git(fixture.rootDir, "clone", "--quiet", path.join(fixture.rootDir, "remote"), nestedRemote);
+      git(
+        nestedRemote,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "--quiet",
+        "-m",
+        "only on the nested remote"
+      );
+      const linkedTree = path.join(nested, "linked-tree");
+      git(fixture.projectPath, "worktree", "add", "--quiet", "-b", "linked", linkedTree);
+
+      expect(await createBranchHead(fixture, "via-project")).toBe(remoteHead);
+      expect(await createBranchHead(fixture, "via-nested-worktree", linkedTree)).toBe(
+        gitRevParseHead(nestedRemote)
+      );
+      expect(await uploadPackRuns()).toBe(2);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("keeps a shared origin fetch running until every creation waiting on it is cancelled", async () => {
     const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 30_000 });
     try {

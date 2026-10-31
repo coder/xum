@@ -100,9 +100,9 @@ async function originFetchKey(
   signal: AbortSignal | undefined
 ): Promise<string> {
   const options = signal ? { signal } : undefined;
-  using commonDirProc = execFileAsync(
+  using repoProc = execFileAsync(
     "git",
-    ["-C", projectPath, "rev-parse", "--git-common-dir"],
+    ["-C", projectPath, "rev-parse", "--show-toplevel", "--git-common-dir"],
     options
   );
   using urlProc = execFileAsync(
@@ -110,18 +110,33 @@ async function originFetchKey(
     ["-C", projectPath, "config", "--get", "remote.origin.url"],
     options
   );
-  const [repository, originUrl] = await Promise.all([
-    commonDirProc.result
-      .then(({ stdout }) => fsPromises.realpath(path.resolve(projectPath, stdout.trim())))
+  const [[worktree, repository], originUrl] = await Promise.all([
+    repoProc.result
+      .then(async ({ stdout }) => {
+        const [toplevel = "", commonDir = ""] = stdout.trim().split("\n");
+        return [toplevel, await fsPromises.realpath(path.resolve(projectPath, commonDir))];
+      })
       // An unreadable repository fails the fetch itself, which falls back to local refs.
-      .catch(() => path.resolve(projectPath)),
+      .catch(() => [path.resolve(projectPath), path.resolve(projectPath)]),
     // `config --get` exits 1 when origin has no URL.
     urlProc.result.then(
       ({ stdout }) => stdout.trim(),
       () => ""
     ),
   ]);
-  return JSON.stringify([repository, originUrl, trunkBranch]);
+  return JSON.stringify([repository, originRemoteIdentity(originUrl, worktree), trunkBranch]);
+}
+
+/**
+ * Git resolves a relative local remote path against each worktree's top level, so one raw URL
+ * can name a different remote per worktree. Local means what git's url_is_local_not_ssh means:
+ * no scheme, and no colon before the first slash.
+ */
+function originRemoteIdentity(url: string, worktree: string): string {
+  const colon = url.indexOf(":");
+  const slash = url.indexOf("/");
+  const local = !url.includes("://") && (colon === -1 || (slash !== -1 && slash < colon));
+  return local && !path.isAbsolute(url) ? path.resolve(worktree, url) : url;
 }
 
 function leaveOriginFetchAndStopIfAbandoned(key: string, entry: SharedOriginFetch): void {
