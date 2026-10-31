@@ -150,6 +150,26 @@ export function writeScreenState(
   }
 }
 
+/**
+ * The screen writer of one router subscription of a view.
+ *
+ * A hidden tab stays mounted but leaves the router. Shown again, it subscribes again and gets the
+ * server's full screen (with its scrollback) without `replace`. clear() keeps the scrollback, so
+ * the first screen of a view that already shows one must replace it, or each show repeats every
+ * line (#6330). The first screen of a new terminal is written plainly, as before.
+ */
+function createScreenWriter(
+  term: Pick<Terminal, "write">,
+  shownScreen: { current: boolean }
+): (state: string, replace: boolean) => void {
+  let replaceNext = shownScreen.current;
+  return (state, replace) => {
+    writeScreenState(term, state, replace || replaceNext);
+    replaceNext = false;
+    shownScreen.current = true;
+  };
+}
+
 interface TerminalViewProps {
   workspaceId: string;
   /** Session ID to connect to (required - must be created before mounting) */
@@ -212,6 +232,8 @@ export function TerminalView({
   const autoFocusRef = useRef(autoFocus);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const exitHandledRef = useRef(false);
+  // Whether the current terminal already shows a screen from the server (see createScreenWriter).
+  const shownScreenRef = useRef(false);
   const onExitRef = useRef(onExit);
   // The right sidebar can recreate onExit while chat streams. Sync the latest committed
   // callback through a ref so subscriptions stay stable without exposing render-time props.
@@ -406,6 +428,7 @@ export function TerminalView({
       console.warn("[TerminalView] Error clearing terminal:", err);
     }
 
+    const writeScreen = createScreenWriter(term, shownScreenRef);
     const unsubscribe = router.subscribe(sessionId, {
       onOutput: (data) => {
         try {
@@ -416,7 +439,7 @@ export function TerminalView({
         }
       },
       onScreenState: (state, options) => {
-        writeScreenState(term, state, options?.replace === true);
+        writeScreen(state, options?.replace === true);
         // Mark loading complete - we now have valid content to show
         setIsLoading(false);
       },
@@ -456,6 +479,7 @@ export function TerminalView({
       containerEl?.replaceChildren();
 
       termRef.current = null;
+      shownScreenRef.current = false;
       fitAddonRef.current = null;
       initInProgressRef.current = false;
       setTerminalReady(false);
