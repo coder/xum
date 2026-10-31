@@ -1051,10 +1051,6 @@ const PreviewConsent: React.FC<{
   </>
 );
 
-/**
- * Parts of a plugin that Xum lists but does not load or run, such as a Cursor field or hook.
- * Absent `items`: the payload had no plugin to read them from.
- */
 const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; className?: string }> = (
   props
 ) => {

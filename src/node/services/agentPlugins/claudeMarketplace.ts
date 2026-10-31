@@ -454,7 +454,6 @@ function sourceLabel(
   return entry.sourceKind;
 }
 
-/** One file's build of a listing row, with the reason when it cannot install. */
 function describeMarketplaceBuild(
   marketplace: ClaudeMarketplace,
   marketplaceUrl: string,
@@ -517,7 +516,6 @@ export function mergeMarketplaces(
   return rows;
 }
 
-/** The marketplace files of a repository root, as parsed for its listing. */
 export interface ParsedMarketplaces {
   /** Null when the file is missing, or failed to parse beside a file that parsed. */
   files: Record<MarketplaceFile, ClaudeMarketplace | null>;

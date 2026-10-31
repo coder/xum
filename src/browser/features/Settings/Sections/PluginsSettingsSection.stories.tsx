@@ -1492,7 +1492,6 @@ const MARKETPLACE_SOURCE = {
   refType: "branch" as const,
 };
 
-/** A marketplace build Xum refuses: its source is an npm package. */
 const NPM_BUILD = {
   sourceKind: "npm",
   source: "npm",
@@ -1672,10 +1671,6 @@ const CURSOR_PLUGINS_SOURCE = {
   refType: "branch" as const,
 };
 
-/**
- * cursor/plugins ships both marketplace files: a name in both is one row with a Cursor build and
- * a Claude build, a name in one file has one build.
- */
 const CURSOR_MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
   name: "cursor-plugins",
   description: "Plugins for Cursor",
@@ -1729,7 +1724,6 @@ const CURSOR_MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
   warnings: [],
 };
 
-/** The pstack entry previewed from one marketplace file: the badge names its install method. */
 const pstackBuildPreview = (
   method: AgentPluginInstallPreview["method"],
   description: string
@@ -1842,10 +1836,6 @@ export const AddPluginCursorMarketplacePhoneViewport: Story = {
 
 const LONG_FIELD_NAME = "skills: ./averylongskillfolderpathwithoutanybreakpointsthatmustwrap/*";
 
-/**
- * A Cursor plugin like cursor-team-kit: its rules become skills labeled by how each rule loads in
- * Xum, its readonly agent keeps the shell, and the parts Xum does not apply are listed.
- */
 const CURSOR_KIT_PREVIEW: AgentPluginInstallPreview = {
   ...SKILLS_PREVIEW,
   source: { ...CURSOR_PLUGINS_SOURCE, subpath: "cursor-team-kit" },

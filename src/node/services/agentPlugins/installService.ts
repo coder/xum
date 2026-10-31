@@ -603,7 +603,6 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
   }
 }
 
-/** The not-applied parts of a plugin as an optional field: absent when there are none. */
 function notAppliedField(plugin: Pick<AgentPluginInfo, "notApplied">): {
   notApplied?: AgentPluginNotApplied[];
 } {
@@ -1150,7 +1149,6 @@ function resolvePreviewRef(
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
 }
 
-/** The marketplace entry that a `claude-marketplace` or `cursor-marketplace` method names. */
 function marketplaceEntryOf(
   method: AgentPluginInstallMethod | null | undefined
 ): MarketplaceEntryRef | undefined {

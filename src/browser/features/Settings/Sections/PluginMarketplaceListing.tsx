@@ -12,7 +12,6 @@ import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { installMethodLabel } from "./PluginInstallMethods";
 
 type MarketplaceFile = AgentPluginMarketplaceBuild["file"];
-/** The preview selector of one marketplace entry: names the file and the entry. */
 export type MarketplaceEntrySelector = Extract<AgentPluginInstallMethod, { entry: string }>;
 
 const MARKETPLACE_FILE: Record<
@@ -31,7 +30,6 @@ const MARKETPLACE_FILE: Record<
   },
 };
 
-/** A row can be picked when any of its builds installs. */
 function pickable(entry: AgentPluginMarketplaceEntry): boolean {
   return entry.builds.some((build) => build.installable);
 }
@@ -159,10 +157,6 @@ const MarketplaceHeader: React.FC<{ listing: AgentPluginMarketplaceListing }> = 
   );
 };
 
-/**
- * One entry: a radio with its name and description, and for each build its skill count, source
- * and refusal reason. A one-build row keeps the build's details on the name line.
- */
 const EntryRow: React.FC<{
   entry: AgentPluginMarketplaceEntry;
   checked: boolean;
@@ -233,16 +227,11 @@ const BuildReason: React.FC<{ build: AgentPluginMarketplaceBuild }> = (props) =>
     <span className="text-warning block text-xs break-words">{props.build.reason}</span>
   ) : null;
 
-/**
- * The preview action of the picked row: "Preview <name>" for one build, else one action per
- * build, each enabled only when its own build installs.
- */
 const PreviewEntryButtons: React.FC<{
   picked: AgentPluginMarketplaceEntry | null;
   busy: boolean;
   onPreview: (selector: MarketplaceEntrySelector) => void;
 }> = (props) => {
-  // Only the clicked action of a two-build row says it is fetching.
   const [clicked, setClicked] = useState<MarketplaceFile | null>(null);
   const picked = props.picked;
   if (picked === null) return <PreviewButton label="Preview" fetching={props.busy} disabled />;

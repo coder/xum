@@ -36,7 +36,6 @@ function listing(files: {
   });
 }
 
-/** Each row of a one-file listing as its name and its only build. */
 function claudeRows(parsed: ClaudeMarketplace) {
   return listing({ claude: parsed }).entries.map((row) => {
     expect(row.builds.length).toBe(1);
@@ -164,7 +163,6 @@ describe("mergeMarketplaces", () => {
       ["b", ["cursor", "claude"]],
       ["c", ["claude"]],
     ]);
-    // Each build is its own file's entry.
     expect(merged[1].builds.map((build) => build.entry.raw.source)).toEqual(["b", "./claude/b"]);
   });
 
@@ -202,7 +200,6 @@ describe("marketplaceListing", () => {
       { name: "pstack", description: "Claude build", source: "./harness/pstack" },
     ]);
     const result = listing({ cursor, claude });
-    // The header is the Cursor file's when it parsed.
     expect([result.name, result.owner]).toEqual(["cursor-plugins", "Cursor"]);
     expect(result.entries).toEqual([
       {

@@ -49,7 +49,6 @@ async function commit(dir: string, message: string): Promise<void> {
   await git(dir, "commit", "-q", "-m", message);
 }
 
-/** The rows of a listing whose names each file lists once, as the name and its only build. */
 function singleBuildRows(listing: AgentPluginMarketplaceListing) {
   return listing.entries.map((entry) => {
     expect(entry.builds.length).toBe(1);
@@ -586,7 +585,6 @@ describe("AgentPluginInstallService marketplaces", () => {
   test("both files list one row per name; a shared name has the Cursor build, then the Claude one", async () => {
     await writeCursorMarketplace();
     const listing = await listMarketplace();
-    // The header is the Cursor file's.
     expect([listing.name, listing.owner]).toEqual(["cursor-market", "Cursor"]);
     expect(listing.warnings).toEqual([]);
     expect(
