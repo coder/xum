@@ -124,8 +124,9 @@ function capContextEntries(
   return kept;
 }
 
-/** turn.stop reply text keeps at most this many trailing UTF-16 units. */
+/** turn.stop reply text is cut to this length. */
 const TURN_STOP_TEXT_MAX_CHARS = 16 * 1024;
+const LEADING_LONE_LOW_SURROGATE = /^[\uDC00-\uDFFF]/;
 /** A continuation prompt is a new user row; longer prompts are cut. */
 export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 
@@ -180,6 +181,5 @@ export function lastAssistantText(parts: readonly CompletedMessagePart[]): strin
     text = part.text + text;
   }
   if (text.trim().length === 0) return null;
-  // Drop a low surrogate whose high half fell outside the cut.
-  return text.slice(-TURN_STOP_TEXT_MAX_CHARS).replace(/^[\uDC00-\uDFFF]/, "");
+  return text.slice(-TURN_STOP_TEXT_MAX_CHARS).replace(LEADING_LONE_LOW_SURROGATE, "");
 }

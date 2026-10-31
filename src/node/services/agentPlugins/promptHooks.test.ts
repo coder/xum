@@ -201,7 +201,8 @@ describe("runTurnStopHooks", () => {
 
 describe("lastAssistantText", () => {
   test("a long run keeps its end, cut across the joined text parts", () => {
-    const tail = "y".repeat(10_000 - "<promise>DONE</promise>".length) + "<promise>DONE</promise>";
+    const promise = "<promise>DONE</promise>";
+    const tail = "y".repeat(10_000 - promise.length) + promise;
     const parts: CompletedMessagePart[] = [
       { type: "text", text: "x".repeat(10_000) },
       { type: "text", text: tail },
@@ -217,7 +218,7 @@ describe("lastAssistantText", () => {
   });
 
   test("a cut on a high surrogate keeps the whole pair", () => {
-    const parts: CompletedMessagePart[] = [{ type: "text", text: "😀".repeat(10_000) }];
+    const parts: CompletedMessagePart[] = [{ type: "text", text: "!" + "😀".repeat(10_000) }];
 
     expect(lastAssistantText(parts)).toBe("😀".repeat(8_192));
   });
