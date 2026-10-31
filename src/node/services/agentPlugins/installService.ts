@@ -179,6 +179,7 @@ import {
 import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   readPluginHookTrust,
+  rebindPluginHookTrust,
   removePluginHookTrust,
   reviewStateOf,
   setPluginHookTrust,
@@ -598,21 +599,41 @@ function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
 }
 
 /**
- * Whether the user trusted a current Cursor hook of the plugin, at any hash. Trusting the first
- * one took the full file review (firstTrustFileReview), and every update since reviewed its
- * changed files. Trust of a hook the plugin no longer has does not count.
+ * Whether the user trusted a current Cursor hook of the plugin, at any hash, for the installed
+ * commit. Trusting the first one took the full file review (firstTrustFileReview), and every
+ * update this build applied since reviewed its changed files and moved the binding along
+ * (rebindPluginHookTrust). Trust of a hook the plugin no longer has does not count, and neither
+ * does trust bound to another commit (the read drops that binding).
  */
 function trustsCursorHook(
   hooks: readonly PluginHookDefinition[],
   trust: PluginHookTrustRecord
 ): boolean {
-  return hooks.some(
-    (hook) => hook.handler.type === "cursor-command" && getOwn(trust, hook.key)?.state === "trusted"
-  );
+  return hooks.some((hook) => {
+    const entry = getOwn(trust, hook.key);
+    return (
+      hook.handler.type === "cursor-command" &&
+      entry?.state === "trusted" &&
+      entry.reviewedSha !== undefined
+    );
+  });
 }
 
-function fileReviewDigest(changes: readonly AgentPluginCapabilityChange[]): string {
-  return createHash("sha256").update(JSON.stringify(changes)).digest("hex");
+/**
+ * The rows as shown, plus each entry's kind, mode and content hash (Codex review): a binary or
+ * large file's row shows no bytes, so the rows alone would not change when such a file does.
+ */
+function fileReviewDigest(
+  changes: readonly AgentPluginCapabilityChange[],
+  records: readonly PluginTreeRecord[]
+): string {
+  // The rows leave directories out, so a directory's mode change must not void the review either.
+  const entries = records
+    .filter((record) => record.kind !== "directory")
+    .map((record) => [record.path, record.kind, record.mode, pluginTreeRecordContent(record)]);
+  return createHash("sha256")
+    .update(JSON.stringify([changes, entries]))
+    .digest("hex");
 }
 
 function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
@@ -646,13 +667,33 @@ function fileReviewRow(
   // A row without the text of a side must say so: an empty row reads as a harmless change.
   const hidden = textHidden(was, before) || textHidden(now, after);
   return {
-    summary: `file ${showOneLineControls(filePath)} ${verb}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
+    summary: `${treeEntryNoun(was, now)} ${showOneLineControls(filePath)} ${verb}${modeNote(was, now)}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
     ...(before !== undefined ? { before } : {}),
     ...(after !== undefined ? { after } : {}),
   };
 }
 
 const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+/**
+ * "file" or "symlink" (Codex review): a symlink's text is its target, so an added symlink must not
+ * read as a file holding that text. A row whose entry changes kind names both.
+ */
+function treeEntryNoun(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined) {
+  const noun = (record: PluginTreeRecord) => (record.kind === "symlink" ? "symlink" : "file");
+  const newest = now ?? was;
+  assert(newest !== undefined, "a review row has a side");
+  if (was === undefined || now === undefined) return noun(newest);
+  return noun(was) === noun(now) ? noun(now) : `${noun(was)} → ${noun(now)}`;
+}
+
+/** A permission change is consent-relevant (sameTreeEntry), and a chmod alone shows no text change. */
+function modeNote(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined): string {
+  const bits = (record: PluginTreeRecord) => (record.mode & 0o7777).toString(8);
+  // A symlink's own mode means nothing on most systems: only a file's bits are shown.
+  if (was?.kind !== "file" || now?.kind !== "file" || bits(was) === bits(now)) return "";
+  return ` (mode ${bits(was)} → ${bits(now)})`;
+}
 
 function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
   return record?.kind === "file" && text === undefined;
@@ -4906,9 +4947,10 @@ export class AgentPluginInstallService {
     trust: PluginHookTrustRecord
   ): Promise<AgentPluginHooks["fileReview"]> {
     if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
-    const changes = fileReviewRows(null, await this.fileReviewRecords(plugin.rootPath));
+    const records = await this.fileReviewRecords(plugin.rootPath);
+    const changes = fileReviewRows(null, records);
     assertReviewFits(changes);
-    return { changes, digest: fileReviewDigest(changes) };
+    return { changes, digest: fileReviewDigest(changes, records) };
   }
 
   /**
@@ -4927,7 +4969,7 @@ export class AgentPluginInstallService {
     // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
     // the trust file between this check and the write, which would recreate it.
     return this.runExclusive(async () => {
-      const { plugin, hooks } = await this.loadManagedPluginHooks(args.name);
+      const { entry, plugin, hooks } = await this.loadManagedPluginHooks(args.name);
       const hook = hooks.find((candidate) => candidate.key === args.key);
       if (hook?.hash !== args.hash) {
         throw new Error("This hook changed since you reviewed it. Review it again.");
@@ -4936,24 +4978,42 @@ export class AgentPluginInstallService {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
       const instanceId = this.instanceIdFor(args.name);
-      if (args.state === "trusted" && hook.handler.type === "cursor-command") {
-        const trust = await readPluginHookTrust(this.config.rootDir, instanceId);
-        // Read again here, not taken from the caller: the trust covers the files as they are now.
-        const review = await this.firstTrustFileReview(plugin, hooks, trust);
-        if (review !== undefined && review.digest !== args.fileReviewDigest) {
-          throw new Error(
-            args.fileReviewDigest === undefined
-              ? "Review this plugin's files before you trust its first hook."
-              : "This plugin's files changed since you reviewed them. Review them again."
-          );
-        }
+      if (args.state === "trusted") {
+        await this.assertFilesReviewed({ plugin, hooks, hook, instanceId }, args.fileReviewDigest);
       }
       await setPluginHookTrust(this.config.rootDir, instanceId, {
         key: args.key,
         hash: args.hash,
         state: args.state,
+        // The files of this commit are the ones reviewed: at install, an update, or just above.
+        ...(hook.handler.type === "cursor-command" ? { reviewedSha: entry.lockedSha } : {}),
       });
     });
+  }
+
+  /**
+   * Before a Cursor command hook's trust: while getHooks shows the first-trust file review, the
+   * trust needs the digest of that review, read again here, not taken from the caller: the trust
+   * covers the files as they are now.
+   */
+  private async assertFilesReviewed(
+    target: {
+      plugin: AgentPluginInfo;
+      hooks: readonly PluginHookDefinition[];
+      hook: PluginHookDefinition;
+      instanceId: string;
+    },
+    fileReviewDigest: string | undefined
+  ): Promise<void> {
+    if (target.hook.handler.type !== "cursor-command") return;
+    const trust = await readPluginHookTrust(this.config.rootDir, target.instanceId);
+    const review = await this.firstTrustFileReview(target.plugin, target.hooks, trust);
+    if (review === undefined || review.digest === fileReviewDigest) return;
+    throw new Error(
+      fileReviewDigest === undefined
+        ? "Review this plugin's files before you trust its first hook."
+        : "This plugin's files changed since you reviewed them. Review them again."
+    );
   }
 
   /**
@@ -4989,13 +5049,13 @@ export class AgentPluginInstallService {
   }
 
   private async loadManagedPluginHooks(name: string) {
-    await this.findOwnRegistryEntry(name);
+    const entry = await this.findOwnRegistryEntry(name);
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
-    return { plugin, ...(await loadPluginHooks(plugin)) };
+    return { entry, plugin, ...(await loadPluginHooks(plugin)) };
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
@@ -7149,6 +7209,18 @@ export class AgentPluginInstallService {
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
+        // This update reviewed every changed file a Cursor hook can run: trust bound to the old
+        // commit moves to the new one. A failure only asks the user to review again.
+        await rebindPluginHookTrust(
+          this.config.rootDir,
+          this.instanceIdFor(entry.name),
+          entry.lockedSha
+        ).catch((error: unknown) => {
+          log.warn("Failed to move hook trust to the updated plugin commit", {
+            name: entry.name,
+            error: getErrorMessage(error),
+          });
+        });
         await this.sweepApprovedCopies(updated);
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`

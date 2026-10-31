@@ -55,6 +55,11 @@ export interface CursorHookRunnerDeps {
   runtime: Runtime;
   /** A chat notice for the user; it never reaches the model. */
   notifyUser(message: string): void;
+  /**
+   * `workspace_roots` for a call that runs in `cwd`: each project's folder in a multi-project
+   * workspace. Absent: `[cwd]`.
+   */
+  workspaceRoots?(cwd: string): string[];
 }
 
 export interface CursorHookRegistration {
@@ -188,7 +193,8 @@ function continueReasonOf(
 
 function fileEditOf(ctx: ToolExecuteContext): { filePath: string; edits: unknown[] } | null {
   if (!FILE_EDIT_TOOLS.has(ctx.toolName) || !ctx.executed) return null;
-  if (!isPlainObject(ctx.result) || ctx.result.success !== true) return null;
+  // The tool's own result: a post hook that blocked the edit replaced `result`, not the file.
+  if (!isPlainObject(ctx.terminalResult) || ctx.terminalResult.success !== true) return null;
   const args = ctx.args;
   if (!isPlainObject(args) || typeof args.path !== "string") return null;
   const edit =
@@ -292,7 +298,7 @@ async function startAndRead(
     model: call.model,
     hook_event_name: hook.event,
     cursor_version: registration.cursorVersion,
-    workspace_roots: [call.workspaceRoot],
+    workspace_roots: workspaceRootsOf(registration, call.workspaceRoot),
     user_email: null,
     transcript_path: registration.transcriptPath,
     ...eventFields,
@@ -376,16 +382,27 @@ async function execHook(
     if (options.abortSignal?.aborted === true) return { kind: "aborted" };
     return { kind: "failed", reason: `it could not start: ${getErrorMessage(error)}` };
   }
+  // Aborting `release` cancels the three pipes, which frees their readers, writer and handles.
+  const release = new AbortController();
+  const read = (pipe: ReadableStream<Uint8Array>, maxBytes: number) =>
+    streamToStringCapped(
+      pipe.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal: release.signal }),
+      maxBytes
+    );
   const settled = Promise.all([
     stream.exitCode,
-    streamToStringCapped(stream.stdout, HOOK_OUTPUT_READ_BYTES),
-    streamToStringCapped(stream.stderr, 0),
-    writeInput(stream.stdin, input),
+    read(stream.stdout, HOOK_OUTPUT_READ_BYTES),
+    read(stream.stderr, 0),
+    writeInput(stream.stdin, input, release.signal),
   ]);
   // The runtime kills the process group at the timeout, but a process that left the group (job
   // control, setsid) can hold the pipes open after it: the call must still end.
   const ended = await settledBy(settled, (options.seconds + OUTPUT_CLOSE_GRACE_SECONDS) * 1000);
   if (ended === undefined) {
+    // Xum cannot kill a process outside the group, but the call stops holding its pipes, so
+    // repeated calls do not pile up readers and handles (Codex review).
+    settled.catch(() => undefined);
+    release.abort();
     return {
       kind: "failed",
       reason: `its output stayed open past its ${options.seconds}s timeout`,
@@ -409,13 +426,30 @@ async function settledBy<T>(promise: Promise<T>, ms: number): Promise<T | undefi
   }
 }
 
-async function writeInput(stdin: WritableStream<Uint8Array>, input: string): Promise<void> {
+/** Each project's folder in a multi-project workspace (the deps know them), else the call's. */
+function workspaceRootsOf(registration: CursorHookRegistration, cwd: string): string[] {
+  return registration.deps.workspaceRoots?.(cwd) ?? [cwd];
+}
+
+async function writeInput(
+  stdin: WritableStream<Uint8Array>,
+  input: string,
+  release: AbortSignal
+): Promise<void> {
   const writer = stdin.getWriter();
+  // A process that never reads a full pipe would hold the write (and the pipe) forever.
+  const abort = () => {
+    // Nothing waits on this: the call already failed, and the write below settles with it.
+    void writer.abort().catch(() => undefined);
+  };
+  release.addEventListener("abort", abort, { once: true });
   try {
     await writer.write(new TextEncoder().encode(input));
     await writer.close();
   } catch {
-    // EPIPE: the process ended or closed stdin first.
+    // EPIPE: the process ended or closed stdin first, or the call let go of the pipe.
+  } finally {
+    release.removeEventListener("abort", abort);
   }
 }
 

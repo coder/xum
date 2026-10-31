@@ -3,7 +3,7 @@
  * store. The MCP manager is a fake that records the server key of each call. Covers the per-call
  * gate (#6042's P1-a and P1-b) and the same-plugin server rule.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
@@ -11,6 +11,7 @@ import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
+import * as discovery from "./discovery";
 import { discoverAgentPluginAt } from "./discovery";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -611,6 +612,25 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     );
   const followup = `echo '{"followup_message":"again"}'`;
 
+  const writeRegistry = (lockedSha: string) =>
+    fs.writeFile(
+      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
+      JSON.stringify({ plugins: [{ ...createTestPluginInstallEntry("ralph"), lockedSha }] })
+    );
+
+  /** Trust as the hooks panel records it: bound to the commit whose files the user reviewed. */
+  async function trustRalph(reviewedSha: string | undefined) {
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+    for (const hook of plugin?.cursorHooks?.hooks ?? []) {
+      await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
+        key: hook.key,
+        hash: hook.hash,
+        state: "trusted",
+        ...(reviewedSha !== undefined ? { reviewedSha } : {}),
+      });
+    }
+  }
+
   async function installRalph() {
     await fs.mkdir(path.join(root(), ".cursor-plugin"), { recursive: true });
     await fs.mkdir(path.join(root(), "hooks"), { recursive: true });
@@ -619,18 +639,8 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
       JSON.stringify({ name: "ralph" })
     );
     await writeHooks(followup);
-    await fs.writeFile(
-      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
-      JSON.stringify({ plugins: [createTestPluginInstallEntry("ralph")] })
-    );
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
-    for (const hook of plugin?.cursorHooks?.hooks ?? []) {
-      await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
-        key: hook.key,
-        hash: hook.hash,
-        state: "trusted",
-      });
-    }
+    await writeRegistry("a".repeat(40));
+    await trustRalph("a".repeat(40));
   }
 
   const args = (overrides: Partial<EnsureCodexHooksArgs> = {}): EnsureCodexHooksArgs => ({
@@ -674,6 +684,66 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     await writeHooks(`${followup} # changed`);
     expect(await stop()).toEqual({ kind: "none" });
   });
+
+  test("trust bound to another commit, or to none, does not run the hook", async () => {
+    // An older build updated the plugin: the registry moved on, the binding did not (Codex P1).
+    await writeRegistry("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect(await stop()).toEqual({ kind: "none" });
+    // Trust recorded without a binding covers files nobody reviewed either.
+    await trustRalph(undefined);
+    await service.ensureWorkspaceHooks(args());
+    expect(await stop()).toEqual({ kind: "none" });
+    await trustRalph("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect((await stop()).kind).toBe("continue");
+    // The per-call gate reads the registry again: a move after registration stops the next call.
+    await writeRegistry("c".repeat(40));
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
+  test("a hook in a multi-project workspace gets each project's root as workspace_roots", async () => {
+    const input = path.join(xumHome, "hook-input.json");
+    await writeHooks(`cat > '${input}'`);
+    await trustRalph("a".repeat(40));
+    await service.ensureWorkspaceHooks(
+      args({ cursorWorkspaceRoots: (cwd) => [path.join(cwd, "api"), path.join(cwd, "web")] })
+    );
+    await stop();
+    const sent = JSON.parse(await fs.readFile(input, "utf8")) as { workspace_roots: string[] };
+    expect(sent.workspace_roots).toEqual([path.join(xumHome, "api"), path.join(xumHome, "web")]);
+  });
+
+  test.each([
+    ["the project loses its trust", "project"],
+    ["the user turns the hook off", "hook"],
+  ] as const)(
+    "a hook starts no process when %s while the gate reads the plugin",
+    async (_name, revoke) => {
+      let projectTrusted = true;
+      await service.ensureWorkspaceHooks(args({ isProjectTrusted: () => projectTrusted }));
+      const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+      const hooks = plugin?.cursorHooks?.hooks ?? [];
+      const read = discovery.discoverAgentPluginAt;
+      // The gate's rediscovery is its first await: the revoke lands while it runs.
+      const spy = spyOn(discovery, "discoverAgentPluginAt").mockImplementation(async (options) => {
+        if (revoke === "project") projectTrusted = false;
+        for (const hook of revoke === "hook" ? hooks : []) {
+          await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
+            key: hook.key,
+            hash: hook.hash,
+            state: "disabled",
+          });
+        }
+        return read(options);
+      });
+      try {
+        expect(await stop()).toEqual({ kind: "none" });
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  );
 
   test("no Cursor hook registers in a /side chat or without a host runtime", async () => {
     await service.ensureWorkspaceHooks(args({ sideChat: true }));

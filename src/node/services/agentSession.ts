@@ -10889,7 +10889,8 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
         turnContinuations: this.stopHookContinuations,
         hookContinuations: this.stopHookCountsByKey,
-        abortSignal: hooksAbort.signal,
+        // A shutdown or dispose ends the hooks too: their processes must not delay teardown.
+        abortSignal: AbortSignal.any([hooksAbort.signal, this.closingSignal]),
       })) ?? { kind: "none" };
     } finally {
       if (this.turnStopHooksAbort === hooksAbort) this.turnStopHooksAbort = undefined;

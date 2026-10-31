@@ -114,6 +114,12 @@ export interface ToolExecuteContext {
   /** Set by the terminal; mutable after next() returns (middleware may augment). */
   result?: unknown;
   /**
+   * Set by the terminal with `result`, and never rewritten: what the tool itself returned, after
+   * a post hook replaced `result` (a Codex PostToolUse block) too. Cursor `afterFileEdit` reads it,
+   * so whether an edit happened does not depend on which hook wraps which (Codex review).
+   */
+  terminalResult?: unknown;
+  /**
    * Set by middleware to block tool execution; the pipeline skips the terminal
    * and `blocked.result` is returned to the model. Middleware that sets this
    * must not call next().

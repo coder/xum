@@ -11,6 +11,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import type { PluginHookDefinition } from "./codexHooks";
 import { loadPluginCursorHooks } from "./cursorHooks";
 import { registerCursorPluginHooks, type CursorHookGate } from "./cursorHookRunner";
+import { PLUGIN_HOOK_ORDER_BASE } from "@/constants/pluginHooks";
 import { nodePluginFs } from "./discovery";
 import { runTurnStopHooks, type TurnStopHookOutcome } from "./promptHooks";
 
@@ -109,6 +110,7 @@ function harness(args: {
       };
       await spine.run("tool.execute", ctx, (c) => {
         c.result = result;
+        c.terminalResult = result;
         c.executed = true;
       });
     },
@@ -206,6 +208,26 @@ describe("Cursor hook input, environment and working folder", () => {
       file_path: "/abs/b.ts",
       edits: [{ old_string: "", new_string: "new" }],
     });
+  });
+
+  test("afterFileEdit runs after an edit whose result an inner post hook replaced", async () => {
+    // A Codex PostToolUse block replaces the result the model sees; the file changed anyway.
+    const runtime = fakeRuntime({ "./e.sh": {} });
+    const h = harness({
+      hooks: await hooksOf({ afterFileEdit: [{ command: "./e.sh" }] }),
+      runtime,
+    });
+    h.spine.use(
+      "tool.execute",
+      async (ctx, next) => {
+        await next();
+        ctx.result = { error: "blocked by a PostToolUse hook" };
+        ctx.postBlocked = true;
+      },
+      { workspaceId, order: PLUGIN_HOOK_ORDER_BASE + 1 }
+    );
+    await h.edit("file_edit_insert", { path: "/abs/b.ts", content: "new" }, { success: true });
+    expect(runtime.execCalls).toHaveLength(1);
   });
 });
 
@@ -526,9 +548,30 @@ describe("with the local runtime", () => {
 
   test("a process that leaves the group and holds stdout open cannot hold the turn", async () => {
     // `set -m` gives the background job its own process group, which the kill at exit misses.
+    let stdoutCancelled = false;
+    const runtime = await local();
+    const tracked = Object.assign(Object.create(runtime) as Runtime, {
+      exec: async (command: string, options: ExecOptions): Promise<ExecStream> => {
+        const stream = await runtime.exec(command, options);
+        const reader = stream.stdout.getReader();
+        // The pipe as the runner sees it, with a note when the runner lets go of it.
+        const stdout = new ReadableStream<Uint8Array>({
+          pull: async (controller) => {
+            const chunk = await reader.read();
+            if (chunk.done) controller.close();
+            else controller.enqueue(chunk.value);
+          },
+          cancel: (reason) => {
+            stdoutCancelled = true;
+            return reader.cancel(reason);
+          },
+        });
+        return { ...stream, stdout };
+      },
+    });
     const h = await localHarness(
       { command: `set -m; sleep 30 & echo '{"followup_message":"again"}'`, timeout: 1 },
-      await local()
+      tracked
     );
     const started = Date.now();
     expect(await h.stop()).toEqual({ kind: "none" });
@@ -536,6 +579,8 @@ describe("with the local runtime", () => {
     expect(h.notices).toEqual([
       "hook stop failed (its output stayed open past its 1s timeout). Turn the hook off in Settings > Plugins.",
     ]);
+    // The call let go of the pipe the escaped process still holds.
+    expect(stdoutCancelled).toBe(true);
   }, 10_000);
 
   test("1 MiB on stderr does not stall the hook: its reason arrives before the timeout", async () => {

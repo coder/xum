@@ -67,6 +67,8 @@ export interface EnsureCodexHooksArgs {
    * (D7), also a multi-project one: SSH, Docker and devcontainer workspaces start no hook process.
    */
   cursorHookRuntime?: Runtime;
+  /** Cursor `workspace_roots` for a hook call in `cwd`; read on each call (a project can be added). */
+  cursorWorkspaceRoots?: (cwd: string) => string[];
   transcriptPath: string;
 }
 
@@ -262,6 +264,9 @@ export class CodexPluginHookService {
         checkHook: (hook) => checkHook(plugin, hook, args),
         runtime: args.cursorHookRuntime,
         notifyUser: (message) => args.notifyUser(plugin.name, message),
+        ...(args.cursorWorkspaceRoots !== undefined
+          ? { workspaceRoots: args.cursorWorkspaceRoots }
+          : {}),
       },
     });
   }
@@ -329,19 +334,24 @@ async function checkHook(
   hook: PluginHookDefinition,
   args: EnsureCodexHooksArgs
 ): Promise<CursorHookGate> {
-  if (!args.isProjectTrusted()) return "refused";
-  const trust = await readPluginHookTrustChecked(args.xumHome, instanceIdOf(plugin));
-  if (trust === "unreadable") return "trust-store-unreadable";
-  if (!isPluginHookTrusted(trust, hook)) return "refused";
   const now = await rediscover(plugin);
   if (now === undefined) return "refused";
   const current = await loadPluginHooks(now);
   const stillDeclared = current.hooks.some(
     (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
   );
-  if (!stillDeclared)
+  if (!stillDeclared) {
     log.debug("Plugin hooks: a hook changed on disk; skipping it", { key: hook.key });
-  return stillDeclared ? "allowed" : "refused";
+    return "refused";
+  }
+  // The trust decisions come last, after the plugin reads: a hook turned off, or a project
+  // untrusted, while those reads ran stops this call (Codex review). The trust read is the last
+  // await. The exec that follows still awaits its folder check before the spawn: a revoke in
+  // that window is a known gap (PR follow-up).
+  const trust = await readPluginHookTrustChecked(args.xumHome, instanceIdOf(plugin));
+  if (!args.isProjectTrusted()) return "refused";
+  if (trust === "unreadable") return "trust-store-unreadable";
+  return isPluginHookTrusted(trust, hook) ? "allowed" : "refused";
 }
 
 /** Same identity as the install service and the plugin's MCP server keys. */
