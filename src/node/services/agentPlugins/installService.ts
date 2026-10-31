@@ -655,10 +655,19 @@ function fileReviewRows(
   });
 }
 
+/** Display form: names come from the plugin's files, so they get the agent names' marks (#6629). */
+function shownNotApplied(plugin: Pick<AgentPluginInfo, "notApplied">): AgentPluginNotApplied[] {
+  return plugin.notApplied.map((item) => ({
+    ...item,
+    name: showInvisibleControls(item.name),
+    reason: showInvisibleControls(item.reason),
+  }));
+}
+
 function notAppliedField(plugin: Pick<AgentPluginInfo, "notApplied">): {
   notApplied?: AgentPluginNotApplied[];
 } {
-  return plugin.notApplied.length > 0 ? { notApplied: plugin.notApplied } : {};
+  return plugin.notApplied.length > 0 ? { notApplied: shownNotApplied(plugin) } : {};
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -3801,7 +3810,7 @@ export class AgentPluginInstallService {
     if (content === undefined) {
       throw new Error(`This repository has no ${relativePath}.`);
     }
-    const parsed = parseClaudeMarketplace(content, relativePath);
+    const parsed = parseClaudeMarketplace(content, ref.file);
     const entry = findMarketplaceEntry(parsed, ref.entry);
     const target = resolveEntrySource(parsed, marketplaceSource.url, entry);
     const marketplaceResolved: ResolvedRemoteRef = {
@@ -3934,7 +3943,7 @@ export class AgentPluginInstallService {
       slashCommands,
       reviewedComponents,
       warnings,
-      notApplied: plugin.notApplied,
+      notApplied: shownNotApplied(plugin),
       targetPath: shortenHome(targetPath),
       consentDigest,
     };

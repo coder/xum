@@ -27,7 +27,8 @@ test(
     await settings.getByRole("textbox", "Git URL or owner/repo").fill(source);
     await settings.getByRole("button", "Preview").tap();
     await expect(settings.getByRole("radio", /pstack/)).toBeChecked({ timeout: 30_000 });
-    await expect(settings.getByRole("radio")).toHaveCount(1);
+    await expect(settings.getByRole("radio")).toHaveCount(2);
+    await expect(settings.getByRole("radio", /notes/)).toBeEnabled();
     await expect(settings.getByRole("button", "Preview Claude build")).toBeEnabled();
     await settings.getByRole("button", "Preview Cursor build").tap();
 

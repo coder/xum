@@ -4,7 +4,10 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
-import { mapForeignPluginAgentFrontmatter } from "./pluginAgentFormat";
+import {
+  isReadonlyForeignPluginAgent,
+  mapForeignPluginAgentFrontmatter,
+} from "./pluginAgentFormat";
 
 export class AgentDefinitionParseError extends Error {
   constructor(message: string) {
@@ -17,10 +20,10 @@ export interface ParsedAgentDefinitionMarkdown {
   frontmatter: AgentDefinitionFrontmatter;
   body: string;
   /**
-   * The raw frontmatter has Cursor `readonly: true`. The schema strips the key, so the install
-   * review reads it here (agentFiles.ts).
+   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true`.
+   * The schema strips the key, so the install review reads it here (agentFiles.ts).
    */
-  rawReadonly: boolean;
+  mappedReadonly: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -112,6 +115,6 @@ export function parseAgentDefinitionMarkdown(input: {
   return {
     frontmatter: parsed.data,
     body,
-    rawReadonly: raw.readonly === true,
+    mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
   };
 }

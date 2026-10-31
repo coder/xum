@@ -577,7 +577,7 @@ export function relativeEntryContext(
       `The repository has no ${relativePath} at this commit, so Xum cannot read the entry '${entryName}'.`
     );
   }
-  const marketplace = parseClaudeMarketplace(marketplaceJson, relativePath);
+  const marketplace = parseClaudeMarketplace(marketplaceJson, file);
   const entry = findMarketplaceEntry(marketplace, entryName);
   const resolved = resolveEntrySource(marketplace, source.url, entry);
   if (resolved.kind !== "relative" || resolved.subpath !== source.subpath) {

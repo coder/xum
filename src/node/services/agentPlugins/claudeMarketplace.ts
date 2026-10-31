@@ -89,6 +89,8 @@ export interface ClaudeMarketplaceEntry {
 }
 
 export interface ClaudeMarketplace {
+  /** The file it was parsed from: a path source resolves by that file's rule. */
+  file: MarketplaceFile;
   name: string;
   description?: string;
   owner?: string;
@@ -203,13 +205,14 @@ function readPluginRoot(
 }
 
 /**
- * Parse a marketplace file; `relativePath` names it in the diagnostics. Throws only when the file
- * is not JSON or has no `plugins` list.
+ * Parse a marketplace file; the diagnostics name its path. Throws only when the file is not JSON
+ * or has no `plugins` list.
  */
 export function parseClaudeMarketplace(
   content: string,
-  relativePath = CLAUDE_MARKETPLACE_RELATIVE_PATH
+  file: MarketplaceFile = "claude"
 ): ClaudeMarketplace {
+  const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
   let raw: unknown;
   try {
     raw = JSON.parse(content);
@@ -230,6 +233,7 @@ export function parseClaudeMarketplace(
     .slice(0, MAX_CLAUDE_MARKETPLACE_ENTRIES)
     .map((value, index) => readEntry(value, index, seen));
   return {
+    file,
     ...readMarketplaceHeader(raw, warnings, relativePath),
     ...readPluginRoot(raw.metadata),
     entries,
@@ -365,9 +369,16 @@ function entryGitUrl(raw: unknown, marketplaceUrl: string): string {
 }
 
 function relativeEntrySource(
-  marketplace: Pick<ClaudeMarketplace, "pluginRoot" | "pluginRootProblem">,
+  marketplace: Pick<ClaudeMarketplace, "file" | "pluginRoot" | "pluginRootProblem">,
   source: string
 ): ResolvedEntrySource {
+  // The Cursor rule: a path starts at the marketplace root, with or without "./", and Cursor has
+  // no metadata.pluginRoot (cursor/plugins lists `third_party/attio`). The containment checks of
+  // marketplaceRelativePath still apply.
+  if (marketplace.file === "cursor") {
+    const folder = marketplaceRelativePath(source);
+    return { kind: "relative", subpath: folder === "" ? undefined : folder };
+  }
   if (marketplace.pluginRootProblem !== undefined) throw new Error(marketplace.pluginRootProblem);
   // Each part is checked on its own before the join, so `..` cannot cancel a pluginRoot folder.
   const folder = marketplaceRelativePath(source);
@@ -387,11 +398,12 @@ function relativeEntrySource(
 }
 
 /**
- * Where an entry's plugin lives. A relative source joins `metadata.pluginRoot`; the others name a
- * git repository. Throws a user-facing reason when the entry cannot install.
+ * Where an entry's plugin lives. A relative source is a folder of the marketplace repository
+ * (relativeEntrySource); the others name a git repository. Throws a user-facing reason when the
+ * entry cannot install.
  */
 export function resolveEntrySource(
-  marketplace: Pick<ClaudeMarketplace, "pluginRoot" | "pluginRootProblem">,
+  marketplace: Pick<ClaudeMarketplace, "file" | "pluginRoot" | "pluginRootProblem">,
   marketplaceUrl: string,
   entry: ClaudeMarketplaceEntry
 ): ResolvedEntrySource {
@@ -541,7 +553,7 @@ export function parseMarketplaces(
     present++;
     try {
       if (content instanceof Error) throw content;
-      files[file] = parseClaudeMarketplace(content, MARKETPLACE_RELATIVE_PATHS[file]);
+      files[file] = parseClaudeMarketplace(content, file);
     } catch (error) {
       errors.push(getErrorMessage(error));
     }

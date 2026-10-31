@@ -74,7 +74,7 @@ test("claude-market lists five entries, one of them not installable", async () =
   expect(result.marketplace.methods.map((method) => method.kind)).toEqual(["skills"]);
 });
 
-test("cursor-market lists pstack once, with an installable Cursor build and Claude build", async () => {
+test("cursor-market lists pstack once with both builds, and a nested Cursor folder", async () => {
   const result = await preview("cursor-market");
   if (result.kind !== "marketplace") throw new Error(`previewed as a ${result.kind}`);
   expect(
@@ -90,6 +90,7 @@ test("cursor-market lists pstack once, with an installable Cursor build and Clau
         ["claude", true],
       ],
     ],
+    ["notes", [["cursor", true]]],
   ]);
 });
 

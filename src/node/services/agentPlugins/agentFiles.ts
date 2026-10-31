@@ -117,12 +117,7 @@ async function readAgentDefinition(
       byteSize: stat.size,
       plugin: { agentId },
     });
-    // A Xum-format file keeps its own base: only the foreign-format mapping turns `readonly`
-    // into Explore (pluginAgentFormat.ts).
-    return {
-      frontmatter: parsed.frontmatter,
-      readonly: parsed.rawReadonly && parsed.frontmatter.base === "explore",
-    };
+    return { frontmatter: parsed.frontmatter, readonly: parsed.mappedReadonly };
   } catch {
     return undefined;
   }

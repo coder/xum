@@ -289,18 +289,27 @@ function cursorTeamKitMini(): Files {
 /**
  * The shape of cursor/plugins: a Cursor and a Claude Code marketplace file that both list
  * `pstack`, each at its own folder. The two builds have different skills, so a repro can tell
- * which one was installed.
+ * which one was installed. The Cursor file also lists a nested folder without "./", as
+ * cursor/plugins lists `third_party/attio`.
  */
 function cursorMarket(): Files {
-  const marketplace = (source: string) =>
-    JSON.stringify(
-      { name: "cursor-market", owner: { name: "Bug Bash" }, plugins: [{ name: "pstack", source }] },
+  const marketplace = (plugins: { name: string; source: string }[]) =>
+    JSON.stringify({ name: "cursor-market", owner: { name: "Bug Bash" }, plugins }, null, 2);
+  return {
+    ".cursor-plugin/marketplace.json": marketplace([
+      { name: "pstack", source: "./pstack" },
+      { name: "notes", source: "third_party/notes" },
+    ]),
+    ".claude-plugin/marketplace.json": marketplace([{ name: "pstack", source: "./claude/pstack" }]),
+    "third_party/notes/.cursor-plugin/plugin.json": JSON.stringify(
+      { name: "notes", version: "1.0.0", description: "A nested Cursor plugin" },
       null,
       2
-    );
-  return {
-    ".cursor-plugin/marketplace.json": marketplace("./pstack"),
-    ".claude-plugin/marketplace.json": marketplace("./claude/pstack"),
+    ),
+    "third_party/notes/skills/take-notes/SKILL.md": skillMd(
+      "take-notes",
+      "Keeps short notes of a session"
+    ),
     "pstack/.cursor-plugin/plugin.json": JSON.stringify(
       { name: "pstack", version: "1.0.0", description: "The Cursor build of pstack" },
       null,
