@@ -759,10 +759,13 @@ describe("AgentPluginInstallService marketplaces", () => {
       "kit/agents/writer.md": "---\nname: writer\ndescription: W\n---\nWrite\n",
       // Xum format: `readonly` is no Xum field, so the agent keeps its tools.
       "kit/agents/xum.md": "---\nname: xum\nbase: exec\nreadonly: true\n---\nXum\n",
+      // Xum format on Explore that adds the edit tools back: no readonly label.
+      "kit/agents/editor.md":
+        "---\nname: editor\nbase: explore\nreadonly: true\ntools:\n  add: [\"file_edit_.*\"]\n---\nEdit\n",
     });
     await commit(marketDir, "kit agents");
     const preview = await previewCursorEntry("kit");
-    expect(preview.agents).toEqual(["reviewer.md", "writer.md", "xum.md"]);
+    expect(preview.agents).toEqual(["editor.md", "reviewer.md", "writer.md", "xum.md"]);
     expect(preview.readonlyAgents).toEqual(["reviewer.md"]);
   });
 
