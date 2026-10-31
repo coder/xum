@@ -1,4 +1,6 @@
 import { describe, it, expect } from "bun:test";
+import { ORPCError, call, os } from "@orpc/server";
+import { z } from "zod";
 import { clampErrorMessage, getErrorMessage } from "./errors";
 
 describe("getErrorMessage", () => {
@@ -118,6 +120,32 @@ describe("getErrorMessage", () => {
     const err = new Error("self");
     err.cause = err;
     expect(getErrorMessage(err)).toBe("self");
+  });
+});
+
+describe("getErrorMessage for oRPC input validation", () => {
+  it("names each rejected field with its schema rule", async () => {
+    const procedure = os
+      .input(
+        z.object({
+          name: z.string().min(1, { message: "Enter a name" }),
+          tags: z.array(z.string({ message: "Enter tag text" })),
+        })
+      )
+      .handler(() => "unreachable");
+    const error = await call(procedure, { name: "", tags: [7] }).catch((e: unknown) => e);
+
+    expect(getErrorMessage(error)).toBe(
+      "Input validation failed: name: Enter a name; tags[0]: Enter tag text"
+    );
+  });
+
+  it("keeps the message of an oRPC error whose data has no issues", () => {
+    const error = new ORPCError("BAD_REQUEST", {
+      message: "Bad project",
+      data: { issues: "none" },
+    });
+    expect(getErrorMessage(error)).toBe("Bad project");
   });
 });
 
