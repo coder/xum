@@ -15,7 +15,11 @@
 import assert from "node:assert";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { getErrorMessage } from "@/common/utils/errors";
-import { HOOK_INPUT_MAX_CHARS, effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
+import {
+  HOOK_INPUT_MAX_CHARS,
+  PLUGIN_HOOK_ORDER_BASE,
+  effectiveHookTimeoutSeconds,
+} from "@/constants/pluginHooks";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { streamToStringCapped } from "@/node/runtime/streamUtils";
 import type {
@@ -31,7 +35,6 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import type { PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 
-const CURSOR_HOOK_ORDER_BASE = -1_000_000;
 const HOOK_OUTPUT_MAX_BYTES = 64 * 1024;
 /**
  * The read cap: four bytes over the limit, because the capped reader drops a code point that the
@@ -95,7 +98,7 @@ export function registerCursorPluginHooks(
   const forEvent = (event: string) => runnable.filter((hook) => hook.event === event);
   const scope = {
     workspaceId: registration.workspaceId,
-    order: CURSOR_HOOK_ORDER_BASE + registration.order,
+    order: PLUGIN_HOOK_ORDER_BASE + registration.order,
   };
   const notified = new Set<string>();
   const runner = { registration, notified };

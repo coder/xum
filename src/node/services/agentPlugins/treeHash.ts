@@ -135,13 +135,13 @@ class PluginTreeWalk {
     this.bytes += stat.size;
     if (this.bytes > this.quota.maxBytes)
       throw new Error("Installed plugin exceeds the component review size limit.");
-    const kept = this.keeps(stat.size) ? ([] as Buffer[]) : undefined;
+    const kept = this.claimKeptBytes(stat.size) ? ([] as Buffer[]) : undefined;
     const hash = await hashWalkedFile(this.rootReal, current, stat, kept && ((c) => kept.push(c)));
     const file = { kind: "file", path: relative, mode: stat.mode, hash } as const;
     this.records.push(kept !== undefined ? { ...file, bytes: Buffer.concat(kept) } : file);
   }
 
-  private keeps(size: number): boolean {
+  private claimKeptBytes(size: number): boolean {
     if (this.options.keepBytesUpTo === undefined || size > this.options.keepBytesUpTo) return false;
     this.keptBytes += size;
     if (this.keptBytes > (this.options.maxKeptBytes ?? Infinity)) throw new KeptBytesLimitError();
