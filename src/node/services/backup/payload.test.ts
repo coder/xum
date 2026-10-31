@@ -877,6 +877,16 @@ describe("backup payload", () => {
       expect(await collectedPaths()).toEqual([]);
     });
 
+    it("does not follow a link to the Xum root or a folder above it", async () => {
+      await writeFixtureFile(tempDir, "SKILL.md", "stray marker\n");
+      await writeFixtureFile(muxRoot, "SKILL.md", "stray marker\n");
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(tempDir, path.join(muxRoot, "skills/above"));
+      await fs.symlink(muxRoot, path.join(muxRoot, "skills/self"));
+
+      expect(await collectedPaths()).toEqual([]);
+    });
+
     it("does not follow a link to a folder whose SKILL.md is itself a symlink", async () => {
       const elsewhere = await skillFolder("elsewhere");
       const folder = path.join(tempDir, "marker-linked");

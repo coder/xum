@@ -939,14 +939,14 @@ async function linkedSkillSources(root: BackupRoot): Promise<CollectionSource[]>
   const sources: CollectionSource[] = [];
   for (const entry of await fs.readdir(skillsDir, { withFileTypes: true })) {
     if (!entry.isSymbolicLink() || isHiddenName(entry.name)) continue;
-    const target = await resolveSkillFolder(path.join(skillsDir, entry.name));
+    const target = await resolveSkillFolder(root, path.join(skillsDir, entry.name));
     if (target !== null) sources.push({ root: target, prefix: toPosixPath("skills", entry.name) });
   }
   if (sources.length > 0) await assertOpenedFileContained(root, "skills", skillsStat);
   return sources;
 }
 
-async function resolveSkillFolder(linkPath: string): Promise<BackupRoot | null> {
+async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<BackupRoot | null> {
   let target: BackupRoot;
   try {
     target = await resolveRoot(linkPath);
@@ -954,6 +954,10 @@ async function resolveSkillFolder(linkPath: string): Promise<BackupRoot | null> 
     // Dangling, looping, or not a directory: not a skill folder, so skipped like any link.
     return null;
   }
+  // A link to the Xum root or a folder above it (`skills/all -> ~`) would export sessions and
+  // everything else beside the settings, so no stray SKILL.md there makes it a skill folder.
+  const relative = path.relative(target.path, root.path);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) return null;
   return (await isRegularFile(absolutePathOf(target.path, "SKILL.md"))) ? target : null;
 }
 
