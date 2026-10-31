@@ -151,12 +151,16 @@ export interface CreateBackupPayloadOptions {
   reportSecrets?: boolean;
   /** Keep the local MCP file verbatim for the safety snapshot used to undo a restore. */
   keepLocalSecrets?: boolean;
+  /** Push only: see `collectAllowlistedFiles`. */
+  followSkillLinks?: boolean;
 }
 
 export interface RestoreBackupPayloadOptions {
   muxRoot: string;
   contents: BackupContents;
   payload: BackupPayload;
+  /** What `omitSymlinkedDestinations` removed from `payload`, so it is not called local-only. */
+  symlinkSkipped?: readonly string[];
   approvedCommandTokens?: readonly string[];
 }
 
@@ -349,11 +353,16 @@ async function fileIdentity(
 /**
  * A hard-linked alias is local-only unless restored directly because writes sever the
  * restored name.
+ *
+ * `symlinkSkipped` are backed-up paths restore leaves alone because their local destination
+ * is a link (`omitSymlinkedDestinations`). They are in the backup, so they are not local-only,
+ * but they are not written either, so they take no part in the overwrite analysis.
  */
 export async function localOnlyPayloadFiles(
   muxRoot: string,
   localPaths: Iterable<string>,
-  restoredPaths: ReadonlySet<string>
+  restoredPaths: ReadonlySet<string>,
+  symlinkSkipped: ReadonlySet<string>
 ): Promise<{ localOnly: string[]; overwritten: Map<string, string[]> }> {
   const locals = [...localPaths];
   const { overwritten, multiLinkLocals } = await localFilesOverwrittenByPayload(
@@ -366,7 +375,9 @@ export async function localOnlyPayloadFiles(
     localOnly: locals
       .filter(
         (file) =>
-          !restoredPaths.has(file) && (!overwrittenLocals.has(file) || multiLinkLocals.has(file))
+          !restoredPaths.has(file) &&
+          !symlinkSkipped.has(file) &&
+          (!overwrittenLocals.has(file) || multiLinkLocals.has(file))
       )
       .sort(),
     overwritten,
@@ -603,29 +614,37 @@ interface FileIdentityStat {
  * feature already refuses would, so the unprovable case is refused too. Aliases inside the
  * set stay allowed: they are how a case-folding volume's one-file-many-spellings behaves,
  * and every one of them is content the backup already carries.
+ *
+ * Names are counted where they are on disk, not under the path the backup records: two
+ * `skills/<name>` links to one shared folder record every file in it twice, and counting
+ * those as two names would hide the outside name a hard link really has.
  */
 function fileIdentityKey(identity: FileIdentityStat): string {
   return `${identity.dev}:${identity.ino}`;
 }
 
 function createHardLinkTracker() {
-  const identities = new Map<string, { nlink: number; names: string[] }>();
+  const identities = new Map<string, { nlink: number; recorded: string; sources: Set<string> }>();
   return {
-    record(relativePath: string, identity: FileIdentityStat): void {
+    record(relativePath: string, identity: FileIdentityStat, sourcePath: string): void {
       if (identity.nlink <= 1) return;
       const key = fileIdentityKey(identity);
       const entry = identities.get(key);
       if (entry === undefined) {
-        identities.set(key, { nlink: identity.nlink, names: [relativePath] });
+        identities.set(key, {
+          nlink: identity.nlink,
+          recorded: relativePath,
+          sources: new Set([sourcePath]),
+        });
       } else {
-        entry.names.push(relativePath);
+        entry.sources.add(sourcePath);
       }
     },
     assertContained(): void {
-      for (const { nlink, names } of identities.values()) {
-        if (nlink > names.length) {
+      for (const { nlink, recorded, sources } of identities.values()) {
+        if (nlink > sources.size) {
           throw new Error(
-            `Refusing to use '${names[0] ?? ""}': it is hard-linked to a file outside the backed-up files`
+            `Refusing to use '${recorded}': it is hard-linked to a file outside the backed-up files`
           );
         }
       }
@@ -752,17 +771,34 @@ async function openSeveredWriteHandle(
   }
 }
 
+/**
+ * Where a collection walk reads and the backup path that place is recorded under. The mux
+ * root records every file at its own relative path. A followed `skills/<name>` link reads from
+ * its canonical target and records under `skills/<name>`, so each open and containment check
+ * stays rooted at the target while the backup still names the skill folder.
+ */
+interface CollectionSource {
+  root: BackupRoot;
+  prefix: string;
+}
+
+function joinRelative(parent: string, name: string): string {
+  if (name === "") return parent;
+  return parent === "" ? name : toPosixPath(parent, name);
+}
+
 async function readBackupFile(
-  root: BackupRoot,
+  source: CollectionSource,
   relativePath: string,
   budget: ByteBudget,
   links: HardLinkTracker
 ): Promise<BackupFile> {
-  const { content, mode, identity } = await readCheckedFile(root, relativePath, (size) =>
-    budget(relativePath, size)
+  const recordedPath = joinRelative(source.prefix, relativePath);
+  const { content, mode, identity } = await readCheckedFile(source.root, relativePath, (size) =>
+    budget(recordedPath, size)
   );
-  links.record(relativePath, identity);
-  return { path: relativePath, content, executable: (mode & 0o111) !== 0 };
+  links.record(recordedPath, identity, absolutePathOf(source.root.path, relativePath));
+  return { path: recordedPath, content, executable: (mode & 0o111) !== 0 };
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -775,7 +811,8 @@ async function fileExists(filePath: string): Promise<boolean> {
 
 /**
  * lstat, not stat: a symlinked entry would let the closed allowlist export whatever it
- * points at (`AGENTS.md -> ~/company-secrets.txt`). Symlinks are not backed up.
+ * points at (`AGENTS.md -> ~/company-secrets.txt`). The only symlinks collection follows are
+ * the skill folders `linkedSkillSources` admits.
  */
 async function isRegularFile(filePath: string): Promise<boolean> {
   return (await lstatOrNull(filePath))?.isFile() === true;
@@ -791,6 +828,7 @@ function createBackupFileCollector(root: BackupRoot) {
   const budget = createByteBudget();
   const links = createHardLinkTracker();
   const pathComplexity = createBackupPathComplexityTracker();
+  const muxSource: CollectionSource = { root, prefix: "" };
 
   /**
    * `maxFileBytes` and `maxFiles` skip what the caller would drop anyway, before the file
@@ -803,21 +841,35 @@ function createBackupFileCollector(root: BackupRoot) {
     collectOptions: { maxFileBytes?: number; maxFiles?: number } = {}
   ): Promise<void> {
     const progress = { collected: 0 };
-    await walkDirectory(relativeRoot, filter, collectOptions, progress);
+    await walkDirectory(muxSource, relativeRoot, filter, collectOptions, progress);
   }
 
+  /**
+   * A skill folder `linkedSkillSources` admitted. It goes through the same walk, budget, file
+   * count, and hard-link proof as the real skill folders, so every rule inside it is the rule
+   * that already applies there.
+   */
+  async function collectLinkedSkill(source: CollectionSource): Promise<void> {
+    await walkDirectory(source, "", () => true, {}, { collected: 0 });
+  }
+
+  /** `relativeRoot` and the paths below it are relative to `source.root`. */
   async function walkDirectory(
+    source: CollectionSource,
     relativeRoot: string,
     filter: (relativePath: string, entry: Dirent) => boolean,
     collectOptions: { maxFileBytes?: number; maxFiles?: number },
     progress: { collected: number }
   ): Promise<void> {
-    const absoluteRoot = path.join(root.path, ...relativeRoot.split("/"));
+    const absoluteRoot = absolutePathOf(source.root.path, relativeRoot);
     // A symlinked collection root would let readdir walk outside MUX_ROOT, and restore
-    // refuses to write through symlinks anyway, so they are simply not backed up.
+    // refuses to write through symlinks anyway, so a walk never follows one. A linked skill
+    // folder is walked from its resolved target instead (`collectLinkedSkill`).
     const rootStat = await lstatOrNull(absoluteRoot);
     if (rootStat?.isSymbolicLink() === true) return;
-    if (rootStat?.isDirectory() === true) pathComplexity.recordDirectory(relativeRoot);
+    if (rootStat?.isDirectory() === true) {
+      pathComplexity.recordDirectory(joinRelative(source.prefix, relativeRoot));
+    }
 
     let entries: Dirent[];
     try {
@@ -829,10 +881,11 @@ function createBackupFileCollector(root: BackupRoot) {
 
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (isHiddenName(entry.name)) continue;
-      const relativePath = toPosixPath(relativeRoot, entry.name);
-      if (!filter(relativePath, entry)) continue;
+      const relativePath = joinRelative(relativeRoot, entry.name);
+      const recordedPath = joinRelative(source.prefix, relativePath);
+      if (!filter(recordedPath, entry)) continue;
       if (entry.isDirectory()) {
-        await walkDirectory(relativePath, filter, collectOptions, progress);
+        await walkDirectory(source, relativePath, filter, collectOptions, progress);
       } else if (entry.isFile() && !isForbiddenBasename(entry.name)) {
         if (
           collectOptions.maxFiles !== undefined &&
@@ -841,12 +894,12 @@ function createBackupFileCollector(root: BackupRoot) {
           continue;
         }
         if (collectOptions.maxFileBytes !== undefined) {
-          const stat = await lstatOrNull(path.join(root.path, ...relativePath.split("/")));
+          const stat = await lstatOrNull(absolutePathOf(source.root.path, relativePath));
           if (stat !== null && stat.size > collectOptions.maxFileBytes) continue;
         }
         assertBackupFileCount(files.length + 1);
-        pathComplexity.recordFile(relativePath);
-        files.push(await readBackupFile(root, relativePath, budget, links));
+        pathComplexity.recordFile(recordedPath);
+        files.push(await readBackupFile(source, relativePath, budget, links));
         progress.collected += 1;
       }
     }
@@ -856,22 +909,97 @@ function createBackupFileCollector(root: BackupRoot) {
     if (await isRegularFile(path.join(root.path, ...relativePath.split("/")))) {
       assertBackupFileCount(files.length + 1);
       pathComplexity.recordFile(relativePath);
-      files.push(await readBackupFile(root, relativePath, budget, links));
+      files.push(await readBackupFile(muxSource, relativePath, budget, links));
     }
   }
 
   return {
     files,
     collectDirectory,
+    collectLinkedSkill,
     collectNamedFile,
     assertHardLinksContained: () => links.assertContained(),
   };
 }
 
-/** The local files in the selected categories, for export and for the restore's local view. */
+/**
+ * The skill folders linked into `skills/` that collection follows (#7775): a user can keep a
+ * skill in a shared store (`skills/gh-stack -> ~/.agents/skills/gh-stack`), and skipping the
+ * link left that skill out of every backup. Only a direct child of a real `skills/` directory
+ * qualifies, and only when it resolves to a real directory with a regular `SKILL.md` at its
+ * top: a careless link to `~/.ssh` or a home directory is not a skill folder and stays out.
+ * Anyone who can plant a qualifying link can already copy the same files into `skills/`, so
+ * following it exports nothing they could not export without it.
+ *
+ * Each target is resolved once and walked from its canonical path, so retargeting the link
+ * later cannot move the walk. `skills/` itself is checked again afterwards, because the reads
+ * below a target no longer pass through it and so no longer catch it being swapped.
+ */
+async function linkedSkillSources(root: BackupRoot): Promise<CollectionSource[]> {
+  const skillsDir = absolutePathOf(root.path, "skills");
+  const skillsStat = await lstatIfExists(skillsDir);
+  if (skillsStat?.isDirectory() !== true) return [];
+  const sources: CollectionSource[] = [];
+  for (const entry of await fs.readdir(skillsDir, { withFileTypes: true })) {
+    if (!entry.isSymbolicLink() || isHiddenName(entry.name)) continue;
+    const target = await resolveSkillFolder(root, path.join(skillsDir, entry.name));
+    if (target !== null) sources.push({ root: target, prefix: toPosixPath("skills", entry.name) });
+  }
+  if (sources.length > 0) await assertOpenedFileContained(root, "skills", skillsStat);
+  return sources;
+}
+
+const SKIPPED_SKILL_LINK_ERRORS = ["ENOENT", "ENOTDIR", "ELOOP"] as const;
+
+/**
+ * Null for a dangling or looping link, which is not a skill folder. Anything else (EACCES, EIO,
+ * EMFILE) aborts the push: skipping it would publish a backup without the skill and delete the
+ * last good remote copy.
+ */
+async function realpathOfSkillLink(linkPath: string): Promise<string | null> {
+  try {
+    return await fs.realpath(linkPath);
+  } catch (error) {
+    if (SKIPPED_SKILL_LINK_ERRORS.some((code) => isErrnoWithCode(error, code))) return null;
+    throw error;
+  }
+}
+
+/**
+ * A link to the Xum root or a folder above it (`skills/all -> ~`) would export sessions and
+ * everything else beside the settings, so no stray SKILL.md there makes it a skill folder.
+ */
+function containsOrIs(folder: string, target: string): boolean {
+  const relative = path.relative(folder, target);
+  if (relative === "") return true;
+  const outside = relative === ".." || relative.startsWith(`..${path.sep}`);
+  return !outside && !path.isAbsolute(relative);
+}
+
+async function resolveSkillFolder(root: BackupRoot, linkPath: string): Promise<BackupRoot | null> {
+  const canonical = await realpathOfSkillLink(linkPath);
+  if (canonical === null) return null;
+  const stat = await fs.lstat(canonical);
+  if (!stat.isDirectory()) return null;
+  const target: BackupRoot = { path: canonical, dev: stat.dev, ino: stat.ino };
+  if (containsOrIs(target.path, root.path)) return null;
+  // Not `isRegularFile`, which reads every failure as "missing": an unreadable SKILL.md must
+  // abort the push, not publish a backup without the skill.
+  const marker = await lstatIfExists(absolutePathOf(target.path, "SKILL.md"));
+  return marker?.isFile() === true ? target : null;
+}
+
+/**
+ * The local files in the selected categories, for export and for the restore's local view.
+ *
+ * `followSkillLinks` is for a push only. Restore never writes under a skill link, so its
+ * snapshot and local view leave linked skills out: a shared skill over the backup limits
+ * must not fail a restore that cannot touch it.
+ */
 export async function collectAllowlistedFiles(
   muxRoot: string,
-  contents: BackupContents
+  contents: BackupContents,
+  options: { followSkillLinks?: boolean } = {}
 ): Promise<BackupFile[]> {
   const root = await resolveRoot(muxRoot);
   const collector = createBackupFileCollector(root);
@@ -884,7 +1012,13 @@ export async function collectAllowlistedFiles(
       (relativePath, entry) => entry.isDirectory() || /^agents\/[^/]+\.md$/.test(relativePath)
     );
   }
-  if (contents.includeSkills) await collector.collectDirectory("skills", () => true);
+  if (contents.includeSkills) {
+    await collector.collectDirectory("skills", () => true);
+    const sources = options.followSkillLinks === true ? await linkedSkillSources(root) : [];
+    for (const source of sources) {
+      await collector.collectLinkedSkill(source);
+    }
+  }
   if (contents.includeGlobalMemory) await collector.collectDirectory("memory/global", () => true);
   collector.assertHardLinksContained();
   return collector.files.sort((a, b) => a.path.localeCompare(b.path));
@@ -1635,7 +1769,9 @@ export function backupSecretApprovalDigest(
 export async function createBackupPayload(
   options: CreateBackupPayloadOptions
 ): Promise<BackupPayload> {
-  const files = await collectAllowlistedFiles(options.muxRoot, options.contents);
+  const files = await collectAllowlistedFiles(options.muxRoot, options.contents, {
+    followSkillLinks: options.followSkillLinks,
+  });
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
@@ -2795,32 +2931,48 @@ async function passesThroughSymlink(rootPath: string, relativePath: string): Pro
 }
 
 /**
- * Drops the backed-up files whose local destination passes through a symlink, leaf included.
- * A user who links `skills/<name>` into a shared skills store chose that link, and a backup
- * pushed before it still holds the real folder: refusing the whole payload failed every preview
- * and restore. Push skips symlinks too, so neither direction touches these files. A symlink that
- * appears after this check is still refused when the restore writes.
+ * The destinations, relative to the Xum root, that a restore leaves alone because they pass
+ * through a symlink, leaf included. A user who links `skills/<name>` (or a project's memory
+ * folder) into a shared store chose that link, and a backup pushed before it still holds the
+ * real folder: refusing the whole restore failed every preview and restore. Push backs up the
+ * folder a skill link points at, but restore never writes through the link into that shared
+ * store.
  *
  * `checked` is the skip set a restore's preflight found before the safety snapshot. A restore
- * applies that set instead of looking again: a symlink replaced by a regular file in between
- * would otherwise be overwritten, and the snapshot, taken while it was a link, holds no copy.
+ * keeps every path in it and also skips any path that is a link now. Dropping a checked path
+ * would overwrite a link replaced by a regular file in between, which the snapshot, taken
+ * while it was a link, holds no copy of. Not looking again would let a link created after
+ * the preflight be replaced by a real folder (a shelf entry is renamed aside, not written
+ * through).
  */
+export async function findSymlinkedDestinations(
+  muxRoot: string,
+  relativePaths: readonly string[],
+  checked?: readonly string[]
+): Promise<Set<string>> {
+  const root = await resolveRoot(muxRoot);
+  const skipped = new Set<string>();
+  for (const relativePath of relativePaths) {
+    const linked =
+      checked?.includes(relativePath) === true ||
+      (await passesThroughSymlink(root.path, relativePath));
+    if (linked) skipped.add(relativePath);
+  }
+  return skipped;
+}
+
+/** Drops the backed-up core files `findSymlinkedDestinations` skips. */
 export async function omitSymlinkedDestinations(
   muxRoot: string,
   payload: BackupPayload,
   checked?: readonly string[]
 ): Promise<{ payload: BackupPayload; skipped: string[] }> {
-  const root = await resolveRoot(muxRoot);
-  const skipped = new Set<string>();
-  for (const file of payload.files) {
+  const skipped = await findSymlinkedDestinations(
+    muxRoot,
     // Merged into config.json, never written at its own path.
-    if (file.path === "preferences.json") continue;
-    const linked =
-      checked === undefined
-        ? await passesThroughSymlink(root.path, file.path)
-        : checked.includes(file.path);
-    if (linked) skipped.add(file.path);
-  }
+    payload.files.map((file) => file.path).filter((file) => file !== "preferences.json"),
+    checked
+  );
   if (skipped.size === 0) return { payload, skipped: [] };
   return {
     payload: {
@@ -2940,7 +3092,12 @@ export async function restoreBackupPayload(
 
   const plan = await planRestoreWrites(options.muxRoot, options.payload);
   // Classify against the pre-restore filesystem state before writes change file identities.
-  const { localOnly } = await localOnlyPayloadFiles(options.muxRoot, localPaths, restoredPaths);
+  const { localOnly } = await localOnlyPayloadFiles(
+    options.muxRoot,
+    localPaths,
+    restoredPaths,
+    new Set(options.symlinkSkipped)
+  );
 
   for (const write of plan.writes) {
     await writeCheckedFile(plan.root, write.path, write.content, write.executable, {
@@ -3425,6 +3582,28 @@ export function matchedProjectWrites(
     path: rekeyProjectMemoryPath(file.path, match.localMemoryDir),
     content: file.content,
   }));
+}
+
+/** Drops each matched file whose local destination `findSymlinkedDestinations` skips. */
+export async function omitSymlinkedProjectMemory(
+  muxRoot: string,
+  matched: readonly MatchedProjectEntry[],
+  checked?: readonly string[]
+): Promise<{ matched: MatchedProjectEntry[]; skipped: string[] }> {
+  const skipped = await findSymlinkedDestinations(
+    muxRoot,
+    matched.flatMap((match) => matchedProjectWrites(match).map((write) => write.path)),
+    checked
+  );
+  return {
+    matched: matched.map((match) => ({
+      ...match,
+      files: match.files.filter(
+        (file) => !skipped.has(rekeyProjectMemoryPath(file.path, match.localMemoryDir))
+      ),
+    })),
+    skipped: [...skipped].sort(),
+  };
 }
 
 /**

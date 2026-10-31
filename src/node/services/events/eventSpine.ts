@@ -44,8 +44,16 @@ export interface ObserverEventMap {
    * lifecycle is observer-only for now; a waterfall variant can be added when a
    * mutating consumer lands. */
   "session.start": { workspaceId: string };
-  /** A plugin hook's systemMessage for the user (AgentSession shows it; never the model). */
-  "plugin.hook.notice": { workspaceId: string; pluginName: string; message: string };
+  /**
+   * A plugin hook's systemMessage for the user (AgentSession shows it; never the model). `info`
+   * marks a routine notice (a Stop continuation), not a warning.
+   */
+  "plugin.hook.notice": {
+    workspaceId: string;
+    pluginName: string;
+    message: string;
+    severity?: "info";
+  };
   "session.end": { workspaceId: string };
   "stream.start": { workspaceId: string; messageId: string };
   "stream.end": { workspaceId: string; messageId: string };
@@ -180,6 +188,23 @@ export interface MessageSendContext {
   blocked?: { pluginName: string; reason: string };
 }
 
+/** One hook's continuation prompt, with the hook it counts against (runTurnStopHooks). */
+export interface TurnStopContinueReason {
+  text: string;
+  /** Names the plugin in the user's continuation notice. */
+  pluginName: string;
+  /**
+   * The hook's identity across plugins: `<plugin instance id>:<AgentPluginHookSchema.key>`. A
+   * hook key names a location inside one plugin, so two plugins can share it.
+   */
+  hookKey: string;
+  /**
+   * The hook's continuations per user turn. Absent: the shared default. null: no per-hook limit
+   * (the per-user-turn ceiling still applies).
+   */
+  loopLimit?: number | null;
+}
+
 /**
  * `turn.stop` (the Codex Stop event): middleware sees each turn that finished normally, before
  * Xum picks the next turn. Every consumer runs (none can skip the rest). Interrupted, failed and
@@ -196,8 +221,15 @@ export interface TurnStopContext {
   readonly lastAssistantMessage: string | null;
   /** True when Stop already continued this turn (Codex stop_hook_active). */
   readonly stopHookActive: boolean;
+  /** Continuations of this user turn so far, all hooks together (the ceiling counts these). */
+  readonly turnContinuations: number;
+  /**
+   * Each hook's continuations in this user turn so far, by hookKey (no entry: 0). Set before the
+   * chain runs, so a consumer can pass its own count to its hook (Cursor `loop_count`).
+   */
+  readonly hookContinuations: ReadonlyMap<string, number>;
   /** Continuation prompts (Codex `decision: "block"` reasons), in chain order. */
-  readonly continueReasons: string[];
+  readonly continueReasons: TurnStopContinueReason[];
   /** Set by a consumer whose output said `continue: false`: it overrides every continuation. */
   halted?: { pluginName: string };
 }
@@ -244,7 +276,7 @@ const ISOLATED_CONSUMERS = {
   },
   "turn.stop": (ctx: TurnStopContext) => {
     const { halted } = ctx;
-    const reasons = [...ctx.continueReasons];
+    const reasons = ctx.continueReasons.map((reason) => ({ ...reason }));
     return () => {
       ctx.halted = halted;
       restoreArray(ctx.continueReasons, reasons);

@@ -1,9 +1,5 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import {
-  eventSpine,
-  type RequestAssemblySnapshot,
-  type TurnStopContext,
-} from "./events/eventSpine";
+import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
 import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import {
@@ -11,6 +7,7 @@ import {
   runTurnStopHooks,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  type TurnStopHookInput,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import * as path from "path";
@@ -607,7 +604,7 @@ export class AIService extends EventEmitter {
   /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
   async runTurnStopHooks(
     workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
+    input: TurnStopHookInput
   ): Promise<TurnStopHookOutcome> {
     const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
       ? await this.resolvePromptHookCwd(workspaceId)
