@@ -171,11 +171,20 @@ export interface PluginHooksLoadResult {
 export async function loadPluginCodexHooks(
   plugin: Pick<
     AgentPluginInfo,
-    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude" | "skillsOnly"
+    | "rootPath"
+    | "openai"
+    | "openaiManifestPath"
+    | "claudeFallback"
+    | "claude"
+    | "skillsOnly"
+    | "cursorFallback"
   >
 ): Promise<PluginHooksLoadResult> {
-  // A skills-only package has no hooks, not even the default hooks/hooks.json.
-  if (plugin.skillsOnly === true) return { hooks: [], warnings: [] };
+  // A skills-only package has no hooks, not even the default hooks/hooks.json. A Cursor package's
+  // hooks.json is in the Cursor format, which this loader does not read (discovery lists it).
+  if (plugin.skillsOnly === true || plugin.cursorFallback === true) {
+    return { hooks: [], warnings: [] };
+  }
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
   const { entries, defaultFileListed } = listHookEntries(plugin, warnings);
@@ -207,15 +216,8 @@ export async function loadPluginCodexHooks(
     seenFiles.add(path.normalize(entry));
     // Only the default file is optional: a listed file that is missing is a plugin bug.
     const isDefault = defaultFileListed && index === 0;
-    const content = await readHooksFile(plugin.rootPath, entry, isDefault, warnings);
-    if (content === undefined) continue;
-    let document: unknown;
-    try {
-      document = JSON.parse(content);
-    } catch (error) {
-      warnings.push(`${entry} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
-      continue;
-    }
+    const document = await readHooksDocument(plugin.rootPath, entry, isDefault, warnings);
+    if (document === undefined) continue;
     parseHooksDocument(document, { source: path.normalize(entry), claude }, hooks, warnings);
   }
   const list = warnings.list();
@@ -247,6 +249,22 @@ function listHookEntries(
     );
   }
   return { entries: pointer.slice(0, MAX_HOOK_POINTER_ENTRIES), defaultFileListed: false };
+}
+
+async function readHooksDocument(
+  rootPath: string,
+  relativePath: string,
+  isDefault: boolean,
+  warnings: HookWarnings
+): Promise<unknown> {
+  const content = await readHooksFile(rootPath, relativePath, isDefault, warnings);
+  if (content === undefined) return undefined;
+  try {
+    return JSON.parse(content) as unknown;
+  } catch (error) {
+    warnings.push(`${relativePath} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
 }
 
 async function readHooksFile(

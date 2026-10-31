@@ -1285,9 +1285,10 @@ function declaredSkills(manifest: Record<string, unknown>): string | string[] | 
 
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
-  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // A command or a rule is its file; a single skill folder is the skill itself, and at the plugin root it
   // has no relative path.
   if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
+  if (skillsRoot.rule !== undefined) return path.join(relativeRoot, skillsRoot.rule);
   if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
   return `${relativeRoot}/${name}`;
 }
@@ -3249,12 +3250,12 @@ export class AgentPluginInstallService {
         continue;
       }
       try {
-        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // A Claude command or a Cursor rule becomes SKILL.md text first, so its review, fingerprint and approved
         // copy are a skill's (the copy is that text, which the runtime check parses as is).
         const content = pluginSkillMarkdown(
           skillName,
           await fsPromises.readFile(containedSkillPath, "utf8"),
-          skillsRoot.command
+          skillsRoot
         );
         const parsed = parseSkillMarkdown({
           content,
