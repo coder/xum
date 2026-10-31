@@ -254,7 +254,11 @@ describe("a sub-agent launch after create() returned", () => {
     );
     expect(result).toMatchObject({
       results: [
-        { status: "error", taskId: created.data.taskId, error: expect.stringContaining(failure) },
+        {
+          status: "error",
+          taskId: created.data.taskId,
+          error: expect.stringContaining(failure) as string,
+        },
       ],
     });
   });
@@ -373,7 +377,10 @@ describe("a Coder parent's task whose fork does not finish", () => {
   /** The Coder workspaces a forced removal of the task's row deletes (as task_remove does). */
   async function coderWorkspacesDeletedByRemoving(taskId: string): Promise<unknown[]> {
     const row = findWorkspaceInConfig(config, taskId);
-    assert(row?.runtimeConfig != null, "the task's row must have a runtime config");
+    assert(
+      row?.runtimeConfig != null && row.name != null,
+      "the task's row must have a runtime config and a name"
+    );
     const deleteWorkspaceEventually = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
