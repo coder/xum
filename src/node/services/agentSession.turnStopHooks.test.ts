@@ -621,6 +621,32 @@ describe("turn.stop", () => {
     expect(streams()).toBe(1);
   });
 
+  test("a session shutdown while the turn.stop chain runs aborts the chain's abortSignal", async () => {
+    const chainRunning = Promise.withResolvers<void>();
+    const chainEnded = Promise.withResolvers<boolean>();
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          const signal = ctx.abortSignal;
+          assert(signal !== undefined);
+          chainRunning.resolve();
+          await new Promise((resolve) => {
+            signal.addEventListener("abort", resolve, { once: true });
+            setTimeout(resolve, 2_000);
+          });
+          chainEnded.resolve(signal.aborted);
+        },
+        { workspaceId }
+      )
+    );
+    const { h } = await setup();
+    await h.session.sendMessage("fix the tests", options);
+    await chainRunning.promise;
+    h.session.beginShutdown();
+    expect(await chainEnded.promise).toBe(true);
+  });
+
   test("a Stop after the stream ends and before the chain starts gives the chain an aborted signal", async () => {
     let stopEpoch = 0;
     let abortedAtStart: boolean | undefined;
