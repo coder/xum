@@ -5,7 +5,7 @@ import type { Config } from "@/node/config";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { codexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
-import { prepareWorkspaceRequestHooks } from "./requestHooks";
+import { cursorWorkspaceRoots, prepareWorkspaceRequestHooks } from "./requestHooks";
 
 const spies: Array<{ mockRestore: () => void }> = [];
 afterEach(() => spies.splice(0).forEach((spy) => spy.mockRestore()));
@@ -155,11 +155,49 @@ test("a side chat registers its hooks as a side chat, so no Cursor command hook 
     });
   }
 
+  // The Cursor roots come from the workspace's projects (one here, so the call's folder).
+  expect(calls[0].cursorWorkspaceRoots?.("/src/ws-main")).toEqual(["/src/ws-main"]);
   // Both get a host runtime (local), so only the flag keeps the side chat's hooks off.
   expect(
     calls.map((args) => [args.workspaceId, args.sideChat, args.cursorHookRuntime !== undefined])
   ).toEqual([
     ["ws-main", false, true],
     ["ws-side", true, true],
+  ]);
+});
+
+test("Cursor workspace_roots name each project's folder in a multi-project workspace", () => {
+  // A multi-project workspace runs in its container, which links each project under its name.
+  const single: WorkspaceMetadata = {
+    id: "ws-one",
+    name: "ws-one",
+    projectName: "primary",
+    projectPath: "/repo/primary",
+    runtimeConfig: { type: "local" },
+  };
+  const multi: WorkspaceMetadata = {
+    ...single,
+    id: "ws-two",
+    projects: [
+      { projectPath: "/repo/primary", projectName: "primary" },
+      { projectPath: "/repo/secondary", projectName: "secondary" },
+    ],
+  };
+  let current: { projects?: WorkspaceMetadata["projects"] } | null = {};
+  const config = { findWorkspace: () => current } as unknown as Config;
+
+  expect(cursorWorkspaceRoots(config, single, "/src/ws-one")).toEqual(["/src/ws-one"]);
+  expect(cursorWorkspaceRoots(config, multi, "/c/ws-two")).toEqual([
+    "/c/ws-two/primary",
+    "/c/ws-two/secondary",
+  ]);
+  // Read again on each call: a project added mid-session counts.
+  current = {
+    projects: [...(multi.projects ?? []), { projectPath: "/repo/third", projectName: "third" }],
+  };
+  expect(cursorWorkspaceRoots(config, multi, "/c/ws-two")).toEqual([
+    "/c/ws-two/primary",
+    "/c/ws-two/secondary",
+    "/c/ws-two/third",
   ]);
 });

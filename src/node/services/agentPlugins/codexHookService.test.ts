@@ -701,6 +701,18 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     expect(await stop()).toEqual({ kind: "none" });
   });
 
+  test("a hook in a multi-project workspace gets each project's root as workspace_roots", async () => {
+    const input = path.join(xumHome, "hook-input.json");
+    await writeHooks(`cat > '${input}'`);
+    await trustRalph("a".repeat(40));
+    await service.ensureWorkspaceHooks(
+      args({ cursorWorkspaceRoots: (cwd) => [path.join(cwd, "api"), path.join(cwd, "web")] })
+    );
+    await stop();
+    const sent = JSON.parse(await fs.readFile(input, "utf8")) as { workspace_roots: string[] };
+    expect(sent.workspace_roots).toEqual([path.join(xumHome, "api"), path.join(xumHome, "web")]);
+  });
+
   test("no Cursor hook registers in a /side chat or without a host runtime", async () => {
     await service.ensureWorkspaceHooks(args({ sideChat: true }));
     expect(spine.hasMiddlewareFor("turn.stop", workspaceId)).toBe(false);

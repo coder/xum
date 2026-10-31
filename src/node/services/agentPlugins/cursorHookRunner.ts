@@ -55,6 +55,11 @@ export interface CursorHookRunnerDeps {
   runtime: Runtime;
   /** A chat notice for the user; it never reaches the model. */
   notifyUser(message: string): void;
+  /**
+   * `workspace_roots` for a call that runs in `cwd`: each project's folder in a multi-project
+   * workspace. Absent: `[cwd]`.
+   */
+  workspaceRoots?(cwd: string): string[];
 }
 
 export interface CursorHookRegistration {
@@ -293,7 +298,7 @@ async function startAndRead(
     model: call.model,
     hook_event_name: hook.event,
     cursor_version: registration.cursorVersion,
-    workspace_roots: [call.workspaceRoot],
+    workspace_roots: registration.deps.workspaceRoots?.(call.workspaceRoot) ?? [call.workspaceRoot],
     user_email: null,
     transcript_path: registration.transcriptPath,
     ...eventFields,

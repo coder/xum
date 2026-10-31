@@ -5,6 +5,7 @@ import type { DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -63,11 +64,34 @@ export async function prepareWorkspaceRequestHooks(args: {
     // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
     isProjectTrusted: () => isWorkspaceTrustedNow(config, metadata),
     ...(args.mcpServerManager !== undefined ? { mcp: args.mcpServerManager } : {}),
-    ...(runsOnHost(metadata) ? { cursorHookRuntime: createRuntimeForWorkspace(metadata) } : {}),
+    ...(runsOnHost(metadata)
+      ? {
+          cursorHookRuntime: createRuntimeForWorkspace(metadata),
+          cursorWorkspaceRoots: (cwd: string) => cursorWorkspaceRoots(config, metadata, cwd),
+        }
+      : {}),
     transcriptPath: path.join(config.sessionsDir, metadata.id, "chat.jsonl"),
     notifyUser: (pluginName, message) =>
       eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
   });
+}
+
+/**
+ * Cursor `workspace_roots`: the root folder of each project. A multi-project workspace runs in
+ * its container, which holds one folder per project under its name (ContainerManager), so the
+ * call's `cwd` alone would hand a hook the container instead (Codex review). Like the trust gate,
+ * it reads the workspace's projects again: a project added mid-session counts on the next call.
+ */
+export function cursorWorkspaceRoots(
+  config: Pick<Config, "findWorkspace">,
+  metadata: WorkspaceMetadata,
+  cwd: string
+): string[] {
+  const current = config.findWorkspace(metadata.id);
+  const live =
+    current?.projects !== undefined ? { ...metadata, projects: current.projects } : metadata;
+  if (!isMultiProject(live)) return [cwd];
+  return getProjects(live).map((project) => path.join(cwd, project.projectName));
 }
 
 function runsOnHost(metadata: WorkspaceMetadata): boolean {

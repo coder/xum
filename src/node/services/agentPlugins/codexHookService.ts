@@ -67,6 +67,8 @@ export interface EnsureCodexHooksArgs {
    * (D7), also a multi-project one: SSH, Docker and devcontainer workspaces start no hook process.
    */
   cursorHookRuntime?: Runtime;
+  /** Cursor `workspace_roots` for a hook call in `cwd`; read on each call (a project can be added). */
+  cursorWorkspaceRoots?: (cwd: string) => string[];
   transcriptPath: string;
 }
 
@@ -262,6 +264,9 @@ export class CodexPluginHookService {
         checkHook: (hook) => checkHook(plugin, hook, args),
         runtime: args.cursorHookRuntime,
         notifyUser: (message) => args.notifyUser(plugin.name, message),
+        ...(args.cursorWorkspaceRoots !== undefined
+          ? { workspaceRoots: args.cursorWorkspaceRoots }
+          : {}),
       },
     });
   }
