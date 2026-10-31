@@ -6,13 +6,8 @@
  * workflows paths) and `extensions` (hook tool grants, com.openai) are dropped with a warning.
  * Discovery also skips the implicit hooks.js and workflows/ for these packages (cursorFallback).
  */
-import {
-  INERT_COMPONENT_PATH,
-  MAX_SKILLS_ROOTS,
-  AGENT_PLUGIN_SCHEMA_ID_1_0_0,
-  isPlainObject,
-} from "./manifest";
-import { claudeComponentPath, claudePluginName, readAuthor } from "./claudeManifest";
+import { INERT_COMPONENT_PATH, MAX_SKILLS_ROOTS, isPlainObject } from "./manifest";
+import { CLAUDE_METADATA_KEYS, claudeComponentPath, readForeignMetadata } from "./claudeManifest";
 import { CURSOR_RULE_EXTENSIONS } from "./cursorRules";
 import type { AgentPluginNotApplied } from "./discovery";
 
@@ -34,16 +29,6 @@ export interface CursorManifestResult {
   notApplied: AgentPluginNotApplied[];
 }
 
-const CURSOR_METADATA_KEYS = [
-  "name",
-  "version",
-  "description",
-  "homepage",
-  "repository",
-  "license",
-  "keywords",
-] as const;
-
 const SILENT_CURSOR_KEYS = new Set(["displayName", "logo"]);
 
 const NOT_APPLIED_CURSOR_KEYS = [
@@ -56,7 +41,7 @@ const NOT_APPLIED_CURSOR_KEYS = [
 ] as const;
 
 const HANDLED_CURSOR_KEYS = new Set<string>([
-  ...CURSOR_METADATA_KEYS,
+  ...CLAUDE_METADATA_KEYS,
   ...SILENT_CURSOR_KEYS,
   ...NOT_APPLIED_CURSOR_KEYS,
   "author",
@@ -210,20 +195,6 @@ function readHooks(
   return { hooks: "hooks/hooks.json" };
 }
 
-function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<string, unknown> {
-  const manifest: Record<string, unknown> = { $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0 };
-  for (const key of CURSOR_METADATA_KEYS) {
-    if (raw[key] !== undefined) manifest[key] = raw[key];
-  }
-  if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
-  if (typeof raw.name === "string") manifest.name = claudePluginName(raw.name, warnings);
-  for (const key of Object.keys(raw)) {
-    if (HANDLED_CURSOR_KEYS.has(key)) continue;
-    warnings.push(`'${key}' is not supported in ${CURSOR_MANIFEST_LABEL}; ignoring`);
-  }
-  return manifest;
-}
-
 function notAppliedFields(raw: Record<string, unknown>): AgentPluginNotApplied[] {
   const entries: AgentPluginNotApplied[] = [];
   if (raw.commands !== undefined) {
@@ -245,7 +216,10 @@ export function normalizeCursorManifest(raw: unknown): CursorManifestResult {
   const warnings: string[] = [];
   if (!isPlainObject(raw)) return { manifest: raw, warnings, ruleDirs: [], notApplied: [] };
   const notApplied = notAppliedFields(raw);
-  const manifest = readMetadata(raw, warnings);
+  const manifest = readForeignMetadata(raw, warnings, {
+    label: CURSOR_MANIFEST_LABEL,
+    isKnown: (key) => HANDLED_CURSOR_KEYS.has(key),
+  });
   const read = (field: string) => readFolderPaths(field, raw[field], warnings, notApplied);
   const skills = read("skills");
   const rules = read("rules");
