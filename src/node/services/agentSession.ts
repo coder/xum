@@ -2113,6 +2113,7 @@ export class AgentSession {
         workspaceId: notice.workspaceId,
         plugin: notice.pluginName,
         message: notice.message,
+        severity: notice.severity,
       });
     });
     // A subscription is lazy: protect an existing engine before any caller can
@@ -10847,6 +10848,7 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       pluginName: continuation.pluginNames.join(", "),
       message: `plugin continued turn ${this.stopHookContinuations} of ${MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN}`,
+      severity: "info",
     });
   }
 

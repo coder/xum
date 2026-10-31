@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
+import { isPluginHookNoticeEvent } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
@@ -217,7 +218,7 @@ const keepGoing = (ctx: TurnStopContext) => {
 };
 
 function pluginNotices(h: AgentSessionHarness) {
-  return h.events.filter((event) => event.type === "plugin-hook-notice");
+  return h.events.filter(isPluginHookNoticeEvent);
 }
 
 /**
@@ -411,8 +412,33 @@ describe("turn.stop", () => {
         workspaceId,
         plugin: "guard",
         message: `plugin continued turn ${n} of 50`,
+        // A routine notice, not a warning: the chat shows it as a non-error toast.
+        severity: "info",
       }))
     );
+  });
+
+  test("the notice names only the plugins whose reasons the continuation kept", async () => {
+    addConsumer((ctx) => {
+      ctx.continueReasons.push(
+        stopReason("Guard."),
+        stopReason("Tidy.", {
+          pluginName: "tidy",
+          hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+          loopLimit: 1,
+        })
+      );
+    });
+    const { h } = await setup({ session: { captureEvents: true } });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual([
+      "guard, tidy",
+      "guard",
+      "guard",
+    ]);
   });
 
   test("the Stop hooks see the model that answered after a refusal fallback", async () => {

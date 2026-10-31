@@ -44,8 +44,16 @@ export interface ObserverEventMap {
    * lifecycle is observer-only for now; a waterfall variant can be added when a
    * mutating consumer lands. */
   "session.start": { workspaceId: string };
-  /** A plugin hook's systemMessage for the user (AgentSession shows it; never the model). */
-  "plugin.hook.notice": { workspaceId: string; pluginName: string; message: string };
+  /**
+   * A plugin hook's systemMessage for the user (AgentSession shows it; never the model). `info`
+   * marks a routine notice (a Stop continuation), not a warning.
+   */
+  "plugin.hook.notice": {
+    workspaceId: string;
+    pluginName: string;
+    message: string;
+    severity?: "info";
+  };
   "session.end": { workspaceId: string };
   "stream.start": { workspaceId: string; messageId: string };
   "stream.end": { workspaceId: string; messageId: string };

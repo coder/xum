@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
-import { runMessageSendHooks } from "./promptHooks";
+import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
@@ -196,6 +196,39 @@ describe("CodexPluginHookService", () => {
       expect(calledKeys).toEqual([buildPluginServerKey(instanceId("guard"), fixture.server)]);
     }
   );
+
+  test("a Stop hook counts under its plugin folder's instance id, not the plugin's name", async () => {
+    // Two installs can share a name: only the folder-based instance id keeps their counts apart.
+    const stop = {
+      hooks: { Stop: [{ hooks: [{ type: "mcp_tool", server: "loop", tool: "check" }] }] },
+    };
+    await writePlugin("ralph", "loop", true, stop);
+    const [hook] = await trustAll("ralph");
+    const block = {
+      content: [{ type: "text", text: JSON.stringify({ decision: "block", reason: "Again." }) }],
+    };
+    await service.ensureWorkspaceHooks({
+      ...args(),
+      mcp: {
+        canCallToolForPluginHook: () => true,
+        callToolForPluginHook: () => Promise.resolve(block),
+      },
+    });
+
+    expect(
+      await runTurnStopHooks(spine, workspaceId, {
+        messageId: "a1",
+        lastAssistantMessage: "done",
+        turnContinuations: 0,
+        hookContinuations: new Map(),
+      })
+    ).toEqual({
+      kind: "continue",
+      prompt: "Again.",
+      hookKeys: [`${instanceId("ralph")}:${hook.key}`],
+      pluginNames: ["ralph"],
+    });
+  });
 
   test("a hook turned off mid-turn does not run on the next call", async () => {
     await writePlugin("guard", "scanner");
