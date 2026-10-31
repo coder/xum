@@ -653,7 +653,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const { localOnly, overwritten } = await localOnlyPayloadFiles(
         muxRoot,
         local.keys(),
-        restoredPaths
+        restoredPaths,
+        new Set(symlinkSkipped)
       );
       const changes: BackupFileChange[] = [];
       for (const file of payload.files) {
@@ -833,6 +834,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           muxRoot,
           contents,
           payload,
+          symlinkSkipped,
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         if (result.backupPreferences !== undefined) {

@@ -457,10 +457,13 @@ describe("BackupService against a real repository", () => {
     expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
       "skills/gh-stack/SKILL.md"
     );
+    // The linked folder is collected now, and the backup holds the same path.
+    expect(preview.data.localOnlyFiles).not.toContain("skills/gh-stack/SKILL.md");
 
     const restored = await service.restore(settings);
     if (!restored.success) throw new Error(restored.error.message);
     expect(restored.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(restored.data.localOnlyFiles).not.toContain("skills/gh-stack/SKILL.md");
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
       "global instructions\n"
     );
@@ -485,6 +488,44 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(clone, "mux/skills/gh-stack/SKILL.md"), "utf-8")).toBe(
       "shared skill\n"
     );
+  });
+
+  it("previews and restores a linked skill as unchanged on the machine that pushed it", async () => {
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.symlink(sharedSkill, linkPath);
+    await pushOrThrow();
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(["skills/gh-stack/SKILL.md"]);
+    expect(preview.data.pushChanges).toEqual([]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      "skills/gh-stack/SKILL.md"
+    );
+    expect(preview.data.localOnlyFiles).toEqual([]);
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.localOnlyFiles).toEqual([]);
+    expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedSkill, "SKILL.md"), "utf-8")).toBe("shared skill\n");
+  });
+
+  it("restores a linked skill as a real folder where the link is absent", async () => {
+    const sharedSkill = path.join(tempDir, "shared-skills", "gh-stack");
+    await writeFixtureFile(sharedSkill, "SKILL.md", "shared skill\n");
+    const linkPath = path.join(muxRoot, "skills/gh-stack");
+    await fs.symlink(sharedSkill, linkPath);
+    await pushOrThrow();
+    await fs.rm(linkPath);
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped ?? []).toEqual([]);
+    expect((await fs.lstat(linkPath)).isDirectory()).toBe(true);
+    expect(await fs.readFile(path.join(linkPath, "SKILL.md"), "utf-8")).toBe("shared skill\n");
   });
 
   it("leaves a skipped symlink destination alone when it becomes a file after the snapshot", async () => {

@@ -831,6 +831,167 @@ describe("backup payload", () => {
     expect(everything).toContain("use1MContext");
   });
 
+  describe("skill folders linked into skills/ (#7775)", () => {
+    async function skillFolder(name: string): Promise<string> {
+      const folder = path.join(tempDir, "shared-skills", name);
+      await writeFixtureFile(folder, "SKILL.md", `${name} skill\n`);
+      return folder;
+    }
+
+    async function collectedPaths(): Promise<string[]> {
+      return (await collectAllowlistedFiles(muxRoot, CONTENTS)).map((file) => file.path);
+    }
+
+    it("collects a linked skill folder under the link's name, with the in-folder rules", async () => {
+      const shared = await skillFolder("gh-stack");
+      await writeFixtureFile(shared, "references/usage.md", "usage\n");
+      await writeFixtureFile(shared, "scripts/run.sh", "#!/bin/sh\n");
+      await fs.chmod(path.join(shared, "scripts/run.sh"), 0o755);
+      await writeFixtureFile(shared, ".env", "PASSWORD=hunter2\n");
+      await writeFixtureFile(shared, ".git/config", "url = https://token@host/repo\n");
+      await writeFixtureFile(shared, "providers.jsonc", "{}\n");
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "skills/gh-stack"));
+
+      const files = new Map(
+        (await collectAllowlistedFiles(muxRoot, CONTENTS)).map((file) => [file.path, file])
+      );
+
+      expect([...files.keys()].sort()).toEqual([
+        "skills/gh-stack/SKILL.md",
+        "skills/gh-stack/references/usage.md",
+        "skills/gh-stack/scripts/run.sh",
+      ]);
+      expect(files.get("skills/gh-stack/SKILL.md")?.content.toString("utf-8")).toBe(
+        "gh-stack skill\n"
+      );
+      expect(files.get("skills/gh-stack/scripts/run.sh")?.executable).toBe(true);
+    });
+
+    it("does not follow a link to a folder without SKILL.md", async () => {
+      const notSkill = path.join(tempDir, "dotfiles");
+      await writeFixtureFile(notSkill, "notes.md", "not a skill\n");
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(notSkill, path.join(muxRoot, "skills/dotfiles"));
+
+      expect(await collectedPaths()).toEqual([]);
+    });
+
+    it("does not follow a link to a folder whose SKILL.md is itself a symlink", async () => {
+      const elsewhere = await skillFolder("elsewhere");
+      const folder = path.join(tempDir, "marker-linked");
+      await writeFixtureFile(folder, "notes.md", "not a skill\n");
+      await fs.symlink(path.join(elsewhere, "SKILL.md"), path.join(folder, "SKILL.md"));
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(folder, path.join(muxRoot, "skills/marker-linked"));
+
+      expect(await collectedPaths()).toEqual([]);
+    });
+
+    it("skips a dangling skill link and one that points at a file", async () => {
+      const marker = path.join(await skillFolder("file-target"), "SKILL.md");
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(path.join(tempDir, "missing"), path.join(muxRoot, "skills/dangling"));
+      await fs.symlink(marker, path.join(muxRoot, "skills/file-target"));
+
+      expect(await collectedPaths()).toEqual([]);
+    });
+
+    it("does not follow a symlink nested inside a linked skill folder", async () => {
+      const shared = await skillFolder("gh-stack");
+      // Both targets would qualify on their own: the nested links are refused by position.
+      const nestedSkill = await skillFolder("nested");
+      await fs.symlink(nestedSkill, path.join(shared, "vendored"));
+      await fs.symlink(path.join(nestedSkill, "SKILL.md"), path.join(shared, "linked.md"));
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "skills/gh-stack"));
+
+      expect(await collectedPaths()).toEqual(["skills/gh-stack/SKILL.md"]);
+    });
+
+    it("follows only links directly under skills/", async () => {
+      const shared = await skillFolder("gh-stack");
+      await writeFixtureFile(muxRoot, "skills/real/SKILL.md", "real skill\n");
+      await fs.symlink(shared, path.join(muxRoot, "skills/real/nested"));
+      await fs.mkdir(path.join(muxRoot, "agents"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "agents/linked"));
+      await fs.mkdir(path.join(muxRoot, "memory/global"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "memory/global/linked"));
+      await fs.symlink(path.join(shared, "SKILL.md"), path.join(muxRoot, "AGENTS.md"));
+
+      expect(await collectedPaths()).toEqual(["skills/real/SKILL.md"]);
+    });
+
+    it("does not follow skill links behind a symlinked skills/ root", async () => {
+      const shared = await skillFolder("gh-stack");
+      const linkedRoot = path.join(tempDir, "linked-skills-root");
+      await fs.mkdir(linkedRoot);
+      await fs.symlink(shared, path.join(linkedRoot, "gh-stack"));
+      await fs.symlink(linkedRoot, path.join(muxRoot, "skills"));
+
+      expect(await collectedPaths()).toEqual([]);
+    });
+
+    it("refuses a hard link out of a skill folder that two links share", async () => {
+      // Each link records the folder's files again. Counted by recorded path, the two names
+      // would match the file's two links and hide the one outside the backup.
+      const shared = await skillFolder("gh-stack");
+      await writeFixtureFile(tempDir, "outside-secret.md", "outside\n");
+      await fs.link(path.join(tempDir, "outside-secret.md"), path.join(shared, "notes.md"));
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "skills/a"));
+      await fs.symlink(shared, path.join(muxRoot, "skills/b"));
+
+      const rejected = await captureRejection(collectAllowlistedFiles(muxRoot, CONTENTS));
+
+      expect((rejected as Error).message).toContain("hard-linked to a file outside");
+    });
+
+    it("refuses when skills/ is swapped for a link while its skill links resolve", async () => {
+      const shared = await skillFolder("gh-stack");
+      const skillsDir = path.join(muxRoot, "skills");
+      await fs.mkdir(skillsDir);
+      await fs.symlink(shared, path.join(skillsDir, "gh-stack"));
+      const moved = path.join(tempDir, "moved-skills");
+      const realpath = fs.realpath;
+      let swapped = false;
+      // The walk below a resolved target no longer passes through `skills/`, so only the
+      // re-check after resolving can see the swap.
+      const spy = spyOn(fs, "realpath").mockImplementation((async (target: string) => {
+        if (!swapped && target === path.join(skillsDir, "gh-stack")) {
+          swapped = true;
+          await fs.rename(skillsDir, moved);
+          await fs.symlink(moved, skillsDir);
+        }
+        return await realpath(target);
+      }) as typeof fs.realpath);
+      try {
+        const rejected = await captureRejection(collectAllowlistedFiles(muxRoot, CONTENTS));
+        expect(swapped).toBe(true);
+        expect((rejected as Error).message).toContain("Refusing to follow symlink 'skills'");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("does not call a backed-up file local-only when restore skips it for its link", async () => {
+      const shared = await skillFolder("gh-stack");
+      await writeFixtureFile(shared, "local-extra.md", "not in the backup\n");
+      await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+      await fs.symlink(shared, path.join(muxRoot, "skills/gh-stack"));
+      const local = ["skills/gh-stack/SKILL.md", "skills/gh-stack/local-extra.md"];
+
+      const { localOnly } = await localOnlyPayloadFiles(
+        muxRoot,
+        local,
+        new Set(),
+        new Set(["skills/gh-stack/SKILL.md"])
+      );
+
+      expect(localOnly).toEqual(["skills/gh-stack/local-extra.md"]);
+    });
+  });
+
   it("keeps no undeclared provider option out of the payload", () => {
     for (const provider of Object.keys(MuxProviderOptionsSchema.shape)) {
       const serialized = serializeBackupPreferences({
@@ -3695,7 +3856,8 @@ describe("backup payload", () => {
     const preview = await localOnlyPayloadFiles(
       muxRoot,
       [restoredPath, aliasPath],
-      new Set([restoredPath])
+      new Set([restoredPath]),
+      new Set()
     );
     const result = await restoreBackupPayload({
       muxRoot,
