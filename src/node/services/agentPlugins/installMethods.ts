@@ -3,14 +3,18 @@
  *
  * - `agent-plugin`: the repository's plugin.json (or .codex-plugin/plugin.json).
  * - `claude-plugin`: its .claude-plugin/plugin.json.
+ * - `cursor-plugin`: its .cursor-plugin/plugin.json.
  * - `skills`: SKILL.md folders only. Xum writes a plugin.json into the staged tree before the
  *   review, so the consent preview, receipts and updates treat it like any plugin.
  * - `claude-marketplace`: one entry of a Claude Code marketplace whose folder has no manifest.
  *   Xum writes a plugin.json from the entry (the Claude rule: the entry is the manifest).
+ * - `cursor-marketplace`: one entry of a Cursor marketplace, for a preview only. The entry
+ *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
+ *   whose folder has none.
  *
  * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
- * Claude manifest does not block `skills`: the generated root plugin.json wins by discovery order,
- * which is the user's explicit choice.
+ * Claude or Cursor manifest does not block `skills`: the generated root plugin.json wins by
+ * discovery order, which is the user's explicit choice.
  */
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -32,6 +36,7 @@ import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import {
   CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
   MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_MANIFEST_RELATIVE_PATH,
   ensurePluginPathContained,
@@ -40,13 +45,14 @@ import {
 } from "./discovery";
 import { normalizeClaudeManifest } from "./claudeManifest";
 import {
-  CLAUDE_MARKETPLACE_RELATIVE_PATH,
+  MARKETPLACE_RELATIVE_PATHS,
   entryAsManifest,
   entryDeclaresComponents,
   findMarketplaceEntry,
   parseClaudeMarketplace,
   resolveEntrySource,
   type ClaudeMarketplaceEntry,
+  type MarketplaceFile,
 } from "./claudeMarketplace";
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
@@ -279,15 +285,15 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 }
 
 export interface DetectedInstallMethods {
-  /** Every method that fits, in order: agent-plugin, claude-plugin, skills. */
+  /** Every method that fits, in order: agent-plugin, claude-plugin or cursor-plugin, skills. */
   methods: AgentPluginInstallMethod[];
   /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
   skillsRoots: SkillsPackageRoot[];
 }
 
 /**
- * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude
- * manifest. It uses discovery's own reader, which follows a symlink inside the tree and refuses
+ * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude or a
+ * Cursor manifest. It uses discovery's own reader, which follows a symlink inside the tree and refuses
  * one that leaves it, so the method always names the manifest discovery loads. A refused or
  * unreadable file stays the own manifest: discovery then reports its error.
  */
@@ -300,16 +306,20 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
   const rootEntry = await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH);
   const claudeManifest = await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH);
-  // Discovery loads a Claude manifest over a schema-less root plugin.json (selectManifest), so
-  // the method must be claude-plugin there, not agent-plugin.
+  const cursorManifest = await entryExists(stagedDir, CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH);
+  // Discovery loads a Claude or Cursor manifest over a schema-less root plugin.json
+  // (selectManifest), so the method must be claude-plugin or cursor-plugin there, not agent-plugin.
   const ownManifest =
     (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)) ||
-    (rootEntry && !(claudeManifest && (await rootManifestIsSchemaLess(stagedDir))));
+    (rootEntry &&
+      !((claudeManifest || cursorManifest) && (await rootManifestIsSchemaLess(stagedDir))));
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
   if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
   const methods: AgentPluginInstallMethod[] = [];
   if (claudeManifest) methods.push({ kind: "claude-plugin" });
-  // A root entry that yields to the Claude manifest still blocks the generated plugin.json.
+  // Discovery loads a Claude manifest before a Cursor one.
+  else if (cursorManifest) methods.push({ kind: "cursor-plugin" });
+  // A root entry that yields to the Claude or Cursor manifest still blocks the generated plugin.json.
   if (!rootEntry && skillsRoots.length > 0) methods.push({ kind: "skills" });
   return { methods, skillsRoots };
 }
@@ -339,9 +349,11 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
   switch (a.kind) {
     case "agent-plugin":
     case "claude-plugin":
+    case "cursor-plugin":
     case "skills":
       return b.kind === a.kind;
     case "claude-marketplace":
+    case "cursor-marketplace":
       return b.kind === a.kind && b.entry === a.entry;
   }
 }
@@ -379,13 +391,13 @@ function chooseUpdateMethod(
 ): AgentPluginInstallMethod | undefined {
   const own = methods.find((method) => method.kind === "agent-plugin");
   if (own !== undefined) return own;
-  // A marketplace entry that now ships a Claude manifest switches to it (the update review
-  // covers every component); a generated skills install keeps its generator.
+  // A marketplace entry that now ships a Claude or Cursor manifest switches to it (the update
+  // review covers every component); a generated skills install keeps its generator.
   const kinds: Array<AgentPluginInstallMethod["kind"]> =
     generated === undefined
-      ? ["claude-plugin"]
+      ? ["claude-plugin", "cursor-plugin"]
       : generated.kind === "claude-marketplace"
-        ? ["claude-plugin", generated.kind]
+        ? ["claude-plugin", "cursor-plugin", generated.kind]
         : [generated.kind];
   return methods.find((method) => kinds.includes(method.kind));
 }
@@ -393,7 +405,7 @@ function chooseUpdateMethod(
 /** The error when no method fits: it names every format Xum looked for. */
 export function noInstallMethodMessage(subpath: string | undefined): string {
   const formats =
-    "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) and no SKILL.md files";
+    "No plugin.json (or .codex-plugin/plugin.json, .claude-plugin/plugin.json or .cursor-plugin/plugin.json) and no SKILL.md files";
   return subpath === undefined
     ? `${formats} found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin.`
     : `${formats} found in '${subpath}'. The folder is not a plugin.`;
@@ -477,8 +489,10 @@ export async function skillsCliSkillNames(
   };
 }
 
-/** A Claude marketplace entry being previewed, installed or updated (claudeMarketplace.ts). */
+/** A marketplace entry being previewed, installed or updated (claudeMarketplace.ts). */
 export interface MarketplaceEntryContext {
+  /** The marketplace file that lists the entry. */
+  file: MarketplaceFile;
   entry: ClaudeMarketplaceEntry;
   /** The entry is a folder of the marketplace repository, so Xum can write its plugin.json. */
   relative: boolean;
@@ -486,21 +500,36 @@ export interface MarketplaceEntryContext {
   rootSource: boolean;
 }
 
+/** The methods that read a folder's own manifest, so Xum writes no plugin.json for them. */
+const OWN_MANIFEST_METHOD_KINDS: ReadonlyArray<AgentPluginInstallMethod["kind"]> = [
+  "agent-plugin",
+  "claude-plugin",
+  "cursor-plugin",
+];
+
+export function isOwnManifestMethod(method: AgentPluginInstallMethod): boolean {
+  return OWN_MANIFEST_METHOD_KINDS.includes(method.kind);
+}
+
 /**
  * The methods of a marketplace entry's folder: its own manifest when it has one; else the entry
  * as the manifest, for a relative source only (an update must find the entry again in the same
  * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
  * components is the Claude conflict for `strict: false`; with `strict` Xum uses only the
- * manifest and warns (Claude would merge them).
+ * manifest and warns (Claude would merge them). A Cursor entry installs only through its own
+ * manifest (Cursor plugin RFC, D23).
  */
 export function entryInstallMethods(
   detected: AgentPluginInstallMethod[],
   ctx: MarketplaceEntryContext
 ): { methods: AgentPluginInstallMethod[]; warnings: string[] } {
   const name = ctx.entry.name;
-  const own = detected.find(
-    (method) => method.kind === "agent-plugin" || method.kind === "claude-plugin"
-  );
+  const own = detected.find(isOwnManifestMethod);
+  if (own === undefined && ctx.file === "cursor") {
+    throw new Error(
+      `The Cursor marketplace entry '${name}' has no plugin manifest in its folder. Xum does not install it.`
+    );
+  }
   if (own !== undefined) {
     if (!entryDeclaresComponents(ctx.entry)) return { methods: [own], warnings: [] };
     if (!ctx.entry.strict) {
@@ -532,21 +561,23 @@ export function entryInstallMethods(
 
 /**
  * The context of a relative entry at an install or update commit: the entry named `entryName` in
- * the marketplace.json of that commit. Its source must still resolve to the folder of `source`
- * (a direct API install cannot pair one entry with another folder, and an update does not follow
- * an entry that moved).
+ * the marketplace file `file` of that commit. Its source must still resolve to the folder of
+ * `source` (a direct API install cannot pair one entry with another folder, and an update does
+ * not follow an entry that moved).
  */
 export function relativeEntryContext(
   marketplaceJson: string | undefined,
   entryName: string,
-  source: Pick<AgentPluginGitSource, "url" | "subpath">
+  source: Pick<AgentPluginGitSource, "url" | "subpath">,
+  file: MarketplaceFile
 ): MarketplaceEntryContext {
+  const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
   if (marketplaceJson === undefined) {
     throw new Error(
-      `The repository has no ${CLAUDE_MARKETPLACE_RELATIVE_PATH} at this commit, so Xum cannot read the entry '${entryName}'.`
+      `The repository has no ${relativePath} at this commit, so Xum cannot read the entry '${entryName}'.`
     );
   }
-  const marketplace = parseClaudeMarketplace(marketplaceJson);
+  const marketplace = parseClaudeMarketplace(marketplaceJson, relativePath);
   const entry = findMarketplaceEntry(marketplace, entryName);
   const resolved = resolveEntrySource(marketplace, source.url, entry);
   if (resolved.kind !== "relative" || resolved.subpath !== source.subpath) {
@@ -554,7 +585,7 @@ export function relativeEntryContext(
       `The marketplace entry '${entryName}' now points to another location. Uninstall it and install it again.`
     );
   }
-  return { entry, relative: true, rootSource: resolved.subpath === undefined };
+  return { file, entry, relative: true, rootSource: resolved.subpath === undefined };
 }
 
 /** The error when a marketplace entry's folder fits no method. */
@@ -563,7 +594,7 @@ export function noEntryMethodMessage(
   source: Pick<AgentPluginGitSource, "url" | "subpath">
 ): string {
   const where = `${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`;
-  return `The marketplace entry '${entry}' points to ${where}, which has no plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) and no SKILL.md files.`;
+  return `The marketplace entry '${entry}' points to ${where}, which has no plugin.json (or .codex-plugin/plugin.json, .claude-plugin/plugin.json or .cursor-plugin/plugin.json) and no SKILL.md files.`;
 }
 
 /** The methods that fit a staged tree, the one to use, and what the preview shows about them. */
@@ -703,8 +734,8 @@ export function marketplaceManifest(ctx: MarketplaceEntryContext): {
  * Write the plugin.json of a `skills` or `claude-marketplace` install into the staged tree and
  * return preview warnings. The file is part of the tree that the receipts hash and that install
  * promotes, and preview and install generate it from the same commit, so their consent digests
- * match. Callers run it only when the method fits (no root, Codex or Claude manifest for a
- * marketplace entry; no root or Codex manifest for skills).
+ * match. Callers run it only when the method fits (no root, Codex, Claude or Cursor manifest
+ * for a marketplace entry; no root or Codex manifest for skills).
  */
 export async function writeGeneratedManifest(
   stagedDir: string,
