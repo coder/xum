@@ -1783,8 +1783,17 @@ export const AddPluginCursorMarketplace: Story = {
     const canvas = await openCursorMarketplace(canvasElement);
     await canvas.findByText(/Cursor and Claude Code marketplaces · 3 plugins/);
     await expect(canvas.getByRole("radio", { name: /pstack/ })).toBeChecked();
-    await expect(canvas.queryByRole("button", { name: "Preview pstack" })).toBeNull();
 
+    await userEvent.click(canvas.getByRole("radio", { name: /origin-apps/ }));
+    await expect(canvas.getByRole("button", { name: "Preview Cursor build" })).toBeDisabled();
+    await expect(canvas.getByRole("button", { name: "Preview Claude build" })).toBeEnabled();
+    await canvas.findByText(/does not install npm packages/);
+
+    await userEvent.click(canvas.getByRole("radio", { name: /cursor-team-kit/ }));
+    await expect(canvas.getByRole("button", { name: "Preview cursor-team-kit" })).toBeEnabled();
+
+    await userEvent.click(canvas.getByRole("radio", { name: /pstack/ }));
+    await expect(canvas.queryByRole("button", { name: "Preview pstack" })).toBeNull();
     await userEvent.click(canvas.getByRole("button", { name: "Preview Cursor build" }));
     await canvas.findByText("pstack, Cursor build");
     await expect(canvas.getByText("Cursor plugin", { selector: "span" })).toBeVisible();
@@ -1794,15 +1803,9 @@ export const AddPluginCursorMarketplace: Story = {
     await userEvent.click(canvas.getByRole("button", { name: "Preview Claude build" }));
     await canvas.findByText("pstack, Claude build");
     await expect(canvas.getByText("Claude Code plugin", { selector: "span" })).toBeVisible();
+    // The snapshot shows the list again, with pstack's two actions.
     await userEvent.click(canvas.getByRole("button", { name: /Back/ }));
-
-    await userEvent.click(await canvas.findByRole("radio", { name: /origin-apps/ }));
-    await expect(canvas.getByRole("button", { name: "Preview Cursor build" })).toBeDisabled();
-    await expect(canvas.getByRole("button", { name: "Preview Claude build" })).toBeEnabled();
-    await canvas.findByText(/does not install npm packages/);
-
-    await userEvent.click(canvas.getByRole("radio", { name: /cursor-team-kit/ }));
-    await expect(canvas.getByRole("button", { name: "Preview cursor-team-kit" })).toBeEnabled();
+    await canvas.findByRole("button", { name: "Preview Claude build" });
   },
 };
 
