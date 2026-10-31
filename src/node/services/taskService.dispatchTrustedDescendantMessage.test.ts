@@ -602,8 +602,14 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
       unknown,
       Record<string, unknown>,
     ];
-    // Unlabeled, the sent message carries the default label (prose): only the labeled case reads it.
-    expect([workspaceId, c.label != null ? message : LABELED]).toEqual([CHILD, LABELED]);
+    // The sent message is "<label>:\n\n<message>". Unlabeled, the label is the default (prose), so
+    // the test checks that it is one non-blank line, not its words.
+    const body = `:\n\n${MESSAGE}`;
+    const label = message.endsWith(body) ? message.slice(0, -body.length) : null;
+    expect({ workspaceId, label }).toEqual({
+      workspaceId: CHILD,
+      label: c.label ?? (expect.stringMatching(/^\S[^\n]*$/) as string),
+    });
     expect(options).toStrictEqual({
       reasoningMode: undefined,
       serviceTier: undefined,
