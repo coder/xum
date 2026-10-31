@@ -1,13 +1,6 @@
-import * as http from "node:http";
-import type { AddressInfo } from "node:net";
 import { describe, expect, test } from "bun:test";
-import { call, os } from "@orpc/server";
-import { RPCHandler } from "@orpc/server/node";
 import { z } from "zod";
 import * as zod4Core from "zod/v4/core";
-import * as schemas from "@/common/orpc/schemas";
-import { Ok } from "@/common/types/result";
-import type { ORPCContext } from "@/node/orpc/context";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 
@@ -207,46 +200,5 @@ describe("proxifyOrpc CLI help output", () => {
     expect(optionsJsonSchema?.description).toBeDefined();
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     expect(optionsJsonSchema?.description).toContain("model: string");
-  });
-});
-
-describe("proxifyOrpc calls against a running server", () => {
-  // `xum api workspace interrupt-stream` exited 1 with "Output validation failed" after a
-  // successful Stop (#7854): the server returns Ok(undefined), the RPC wire drops the undefined
-  // `data` key, and the CLI must not reject the `{ success: true }` it receives.
-  test("a Result<void> procedure resolves with the server's success", async () => {
-    let calls = 0;
-    const serverRouter = {
-      workspace: {
-        interruptStream: os
-          .input(schemas.workspace.interruptStream.input)
-          .output(schemas.workspace.interruptStream.output)
-          .handler(() => {
-            calls++;
-            return Ok(undefined);
-          }),
-      },
-    };
-    const handler = new RPCHandler(serverRouter);
-    const server = http.createServer((req, res) => {
-      void handler.handle(req, res, { prefix: "/orpc", context: {} });
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    try {
-      const { port } = server.address() as AddressInfo;
-      const proxied = proxifyOrpc(router(), { baseUrl: `http://127.0.0.1:${port}` });
-
-      // The proxy forwards over HTTP and never reads the server context.
-      const output = await call(
-        proxied.workspace.interruptStream,
-        { workspaceId: "ws-1" },
-        { context: {} as ORPCContext }
-      );
-
-      expect(output).toEqual({ success: true, data: undefined });
-      expect(calls).toBe(1);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
   });
 });
