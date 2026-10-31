@@ -428,7 +428,10 @@ async function writeInput(
 ): Promise<void> {
   const writer = stdin.getWriter();
   // A process that never reads a full pipe would hold the write (and the pipe) forever.
-  const abort = () => writer.abort().catch(() => undefined);
+  const abort = () => {
+    // Nothing waits on this: the call already failed, and the write below settles with it.
+    void writer.abort().catch(() => undefined);
+  };
   release.addEventListener("abort", abort, { once: true });
   try {
     await writer.write(new TextEncoder().encode(input));
