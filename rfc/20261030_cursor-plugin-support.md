@@ -428,7 +428,9 @@ flowchart LR
     per-dialect table. The `cursor` dialect expands `CURSOR_PLUGIN_ROOT` and
     `CLAUDE_PLUGIN_ROOT` to the install folder, and no data folder names
     (D29). The `${CLAUDE_PLUGIN_ROOT}/<path>` rewrite to `./<path>`
-    (`mcpConfig.ts:346-363`) applies to both names.
+    (`mcpConfig.ts:346-363`) applies to both names. Its cwd rewrite maps only
+    these two root names for `cursor`, so a cwd anchored at a data folder name
+    stays as written, and Xum skips the server.
 *   Transport (D29): the `cursor` dialect has the Codex shape, so `type:
     "http"` and a `url` without `type` (the `gong` server) both become
     `streamable-http`. 101 of the 104 marketplace servers set `type: "http"`.
@@ -486,8 +488,10 @@ flowchart LR
     body or a helper such as `skills/foo/lib.sh`. The review compares the
     per-file records that `hashPluginTree` (`treeHash.ts:12-97`) already
     builds for the installed tree and the staged tree: path, mode and content
-    hash. A text file shows
-    its before and after text. Any other file shows "changed". The review keeps
+    hash. A small text file shows its before and after text, taken from the
+    same `O_NOFOLLOW`, identity-checked read that hashes it, so Xum reads no
+    file a second time. A symlink shows its link text, never its target. Any
+    other file shows "changed". The review keeps
     its size cap (`assertReviewFits`, `installService.ts:586-597`). This runs
     once per update, not on each hook run.
     *   Accepted risk: a script edited on disk after install, outside an update
@@ -572,7 +576,9 @@ tool events in T1.
     the local runtime then kills the process group
     (`LocalBaseRuntime.ts:376-381`). An aborted call applies nothing and shows
     no notice. `tool.execute` has the signal today (`eventSpine.ts:94`).
-    `turn.stop` gets one in PR 8.
+    `turn.stop` gets one in PR 8. A Stop that lands after the stream ends and
+    before the hooks start gives them an already aborted signal (PR 8.2), so
+    no hook process starts.
 *   Working folder: the plugin folder, except `stop` (and, later,
     `subagentStop`), which run from the workspace root, as Cursor documents.
 *   `command` runs as written (D17). Xum does not
@@ -705,8 +711,10 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
         turn only when `loop_count === 0` (`continual-learning-stop.ts:137-139`),
         and advisor expects to nudge again after the user answers
         (`stop-hook.sh:32-37`). Both break if the count never resets.
-    *   Codex hooks keep their shipped behavior: 3 continuations per user
-        turn.
+    *   A Codex hook continues a user turn at most 3 times, as today, but the
+        count is that hook's own. A nudge or another hook does not count
+        against it, so one user turn can have more than 3 continuations
+        (section 8).
     *   Xum's own nudges keep their check: they run only when no hook
         continued the current user turn.
 *   A user Stop or abort already skips `turn.stop` (`handleTurnAbort`, called
@@ -763,9 +771,11 @@ of the plugin inside the workspace (Alternative M) and is tracked in T6.
             (`TasksSection.tsx:460-476`) and ACP
             (`src/node/acp/resolveAgentAiSettings.ts:68`). The descriptor gets
             a new field, `aiSettingsBase`, and each of these uses
-            `aiSettingsBase ?? base` when it builds its map. A child workspace
-            of a `fast` agent then shows the same configured model as a run
-            uses.
+            `aiSettingsBase ?? base` when it builds its map. `agents.list`
+            sets the field only when the settings base applies. An ignored
+            settings base (D26) is left out, so these walks follow `base`, as
+            a run does. A child workspace of a `fast` agent then shows the
+            same configured model as a run uses.
     *   New lookup order for a `fast` agent: its own saved choice, its own
         Settings entry, its own frontmatter defaults, then Explore's Settings
         (Delegated override, then base entry) and Explore's definition, then
@@ -842,7 +852,7 @@ Each one needs a line in the release notes.
 | Adding a repository with both marketplace files shows one merged list. `cursor/plugins` goes from 2 entries to 128. | Users of the Plugins tab | D20 |
 | A folder with a schema-less root `plugin.json` and a Cursor manifest loads the Cursor manifest. | Users with such a folder (none in the marketplace) | D21 |
 | The turn-stop text passed to hooks keeps the last 16 × 1024 characters of the reply's trailing text run instead of the first. Codex `Stop` hooks receive the same text. | Users of Codex `Stop` hooks | D22 |
-| Stop-hook continuations are counted per hook with a ceiling of 50 per user turn. Hooks without `loop_limit`, all Codex hooks included, keep 3 per user turn. | No visible change for existing hooks | D2, D3, D4 |
+| Stop-hook continuations are counted per hook, with a ceiling of 50 per user turn. A hook without `loop_limit`, every Codex hook included, continues a user turn at most 3 times. Each continuation that a plugin hook asks for shows the chat notice "plugin continued turn n of 50", for Codex `Stop` hooks too. A Xum TODO or status nudge does not count against a hook's 3. After a nudge continues a turn, a Codex `Stop` hook can still continue it 3 times, so one user turn can reach 4 continuations. Today it stops at 3. | Users of Codex `Stop` hooks | D2, D3, D4 |
 
 ## Risks & Mitigations
 
@@ -1346,8 +1356,10 @@ tests in 1.6.
 
     *   Fields follow the table in Technical Plan section 1. An invalid field
         is one whose JSON type is not the type in that table (for example
-        `skills: 3`). It adds a warning "'<field>' must be <type>; ignoring it"
-        and is dropped.
+        `skills: 3`). It is dropped with the warning "'<field>' must be
+        <type>; ignoring it" and the `notApplied` entry `{part: "field", name:
+        <field>, reason: "must be <type>"}`, so the install review and the
+        plugin card still list it (Goal 7).
     *   Component paths (D24): `skills`, `rules` and `agents` take a string or
         a list of folder paths. A path is a folder path when it contains none
         of `*`, `?`, `[` and does not end in `.md`, `.mdc` or `.markdown`. A
@@ -1464,8 +1476,9 @@ tests in 1.6.
     `agents` as a list of two folders keeps the first and lists the second;
     `rules: "./rules/*.mdc"` and `skills: "./skills/a/SKILL.md"` give the
     "only folder paths" entry; `skills: "../x"` gives the "outside the plugin
-    folder" entry; `skills: 3` warns and is dropped; an inline `mcpServers`
-    object gives its `notApplied` entry.
+    folder" entry; `skills: 3` warns, is dropped and gives one `notApplied`
+    entry with part `field` and name `skills`; an inline `mcpServers` object
+    gives its `notApplied` entry.
 *   `src/node/services/agentPlugins/cursorRules.test.ts` (Create):
     *   `alwaysApply: true` gives type `always-apply`, a model-invocable skill
         and its `description`;
@@ -1550,6 +1563,10 @@ whose folder has no manifest is refused.
         (D20). When both files exist and one of them fails
         `parseClaudeMarketplace`, the listing shows the other file's entries
         and adds the error as a warning.
+    *   The manifest guard in `marketplaceListingAt` (lines 3551-3555) also
+        returns no listing when `detectInstallMethods` returns `cursor-plugin`
+        (2.3). A root with `.cursor-plugin/plugin.json` and a marketplace file
+        then previews the root plugin, as a root with a Claude manifest does.
     *   Each build of a row gets its status from its own file entry: the
         per-entry code of today (`describeMarketplaceEntries`,
         `claudeMarketplace.ts:428`, and `withAcceptedSkillCount`,
@@ -1690,6 +1707,9 @@ whose folder has no manifest is refused.
     (Modify):
     *   a repository with both files previews a listing with `pstack` once and
         two builds, `cursor` then `claude`;
+    *   a root with `.cursor-plugin/plugin.json` and
+        `.cursor-plugin/marketplace.json` previews the root plugin, not a
+        listing;
     *   a Cursor `pstack` entry with an `npm` source and a valid Claude
         `pstack` entry give one row: the Cursor build is not installable and
         has the `npm` reason, and the Claude build is installable;
@@ -1743,12 +1763,16 @@ Files: `src/node/services/agentPlugins/mcpConfig.ts`,
         `cursor` dialect gets `CURSOR_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` set
         to the install folder. It gets no `CURSOR_PLUGIN_DATA` or
         `CLAUDE_PLUGIN_DATA`, because Cursor documents only the two roots.
-    *   `mcpConfig.ts`, `claudeStdioEntry` (lines 346-363): also rewrite a
-        command that starts with `${CURSOR_PLUGIN_ROOT}/` to `./<rest>`, and a
-        cwd anchored at `${CURSOR_PLUGIN_ROOT}` to `${PLUGIN_ROOT}`. Line 646
-        applies `claudeStdioEntry` when the dialect is `"claude"` or
-        `"cursor"`. `CWD_FORM_PATTERN` (line 185) does not change, because the
-        rewrite runs first.
+    *   `mcpConfig.ts`, `claudeStdioEntry` (lines 346-363) takes the dialect.
+        Line 646 applies it when the dialect is `"claude"` or `"cursor"`. The
+        `"claude"` rewrite does not change. For `"cursor"`, it rewrites a
+        command that starts with `${CURSOR_PLUGIN_ROOT}/` or
+        `${CLAUDE_PLUGIN_ROOT}/` to `./<rest>`, and a cwd anchored at either
+        root name to `${PLUGIN_ROOT}`. It rewrites no data name. A Cursor cwd
+        anchored at `${CLAUDE_PLUGIN_DATA}` or `${CURSOR_PLUGIN_DATA}` stays as
+        written and fails the cwd form check (line 421), and Xum skips the
+        server with that error (line 828). `CWD_FORM_PATTERN` (line 185) does
+        not change, because the rewrite runs first.
     *   Transport (D29): the `cursor` dialect has the Codex shape, so line 742
         (`codexDialect = plugin.mcpConfigDialect !== undefined`) already applies
         `translateCodexMcpEntry`: `type: "http"` becomes `streamable-http`, a
@@ -1776,6 +1800,9 @@ Files: `src/node/services/agentPlugins/mcpConfig.ts`,
     *   `${CURSOR_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expand to the install
         folder in `args`, `env` and `cwd`, and a command
         `${CURSOR_PLUGIN_ROOT}/bin/server` becomes `./bin/server`;
+    *   a `cursor` server with `cwd: "${CLAUDE_PLUGIN_DATA}/state"` is skipped
+        with the cwd form error, and the same server in the `claude` dialect
+        loads with its cwd in the plugin data folder;
     *   a server with `"env": {"TOKEN": "${BREVO_MCP_TOKEN}"}` is skipped with
         the diagnostic "needs values not supported in Xum (${BREVO_MCP_TOKEN})";
     *   `${CLIENT_SECRET:-}` in a header skips the server the same way;
@@ -1912,23 +1939,30 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
         `resolvedFrontmatter.ai?.settingsBase` is set, build `aiLayers` from
         `applySettingsBaseChain(id, entry.aiChain, settingsBaseEntry?.aiChain
         ?? null)`, where `settingsBaseEntry` is the resolved entry with that ID
-        in the same list. Log the same warning when `ignored` is set. Other
-        entries keep `collectDefinitionLayers(id, aiChain)`. This adds no file
-        reads: the list resolves every descriptor already.
-    *   `backgroundHint` and `aiSettingsBase`: each place that sets
-        `subagentRunnable` on a descriptor (lines 622, 653, 1450) also sets
-        `backgroundHint: true` when the frontmatter has
-        `subagent.background_hint === true`, and `aiSettingsBase` to
-        `frontmatter.ai.settingsBase` when it is set. Both fields are omitted
-        otherwise.
+        in the same list. The lookup includes agents that the list hides as
+        disabled (lines 1424-1428), because `readAgentDefinition` reads a
+        disabled agent too (4.4). Log the same warning when `ignored` is set.
+        Other entries keep `collectDefinitionLayers(id, aiChain)`. This adds
+        no file reads: the list resolves every descriptor already.
+    *   `aiSettingsBase`: the list (line 1450) sets it to
+        `frontmatter.ai.settingsBase` only when `applySettingsBaseChain`
+        returned no `ignored`. An ignored settings base is left out, so the
+        walks in 4.9 follow `base`, as a run does (D26). The descriptors built
+        at lines 622 and 653, and a list entry whose definition did not
+        resolve (line 1435), never carry it.
+    *   `backgroundHint`: each place that sets `subagentRunnable` on a
+        descriptor (lines 622, 653, 1450) also sets `backgroundHint: true`
+        when the frontmatter has `subagent.background_hint === true`. It is
+        omitted otherwise.
 
 #### 4.7 `src/node/services/turnContextAssembler.ts` (Modify)
 
 *   **Type / Scope**: Turn context descriptors.
 *   **Proposed Changes**: Where the descriptor sets `subagentRunnable`
     (line 1697), also set `backgroundHint: true` when the resolved frontmatter
-    has `subagent.background_hint === true`, and `aiSettingsBase` when
-    `ai.settingsBase` is set, as in 4.6.
+    has `subagent.background_hint === true`. These descriptors reach only the
+    tool configuration (`availableSubagents`), and `buildTaskDescription`
+    reads no AI settings from them, so they carry no `aiSettingsBase`.
 
 #### 4.8 `src/node/services/tools/task.ts` (Modify)
 
@@ -1987,10 +2021,15 @@ Files: `src/common/orpc/schemas/agentDefinition.ts`,
     `resolveChainAgentCacheTtl` over that chain returns `5m` (Explore's
     built-in value) when no Settings entry sets a TTL.
 *   `src/node/services/agentDefinitions/agentDefinitionsService.test.ts`
-    (Modify): the descriptor list for a plugin agent with
-    `settingsBase: "explore"` has `aiLayers.ancestors` starting with
-    `explore`, `aiSettingsBase: "explore"`, and `backgroundHint: true` when
-    `background_hint` is set.
+    (Modify):
+    *   the descriptor list for a plugin agent with `settingsBase: "explore"`
+        has `aiLayers.ancestors` starting with `explore`,
+        `aiSettingsBase: "explore"`, and `backgroundHint: true` when
+        `background_hint` is set;
+    *   with Explore disabled, that agent still has
+        `aiSettingsBase: "explore"`;
+    *   an agent with `base: exec` and `settingsBase: "missing-agent"` has no
+        `aiSettingsBase`, and its `aiLayers.ancestors` start with `exec`.
 *   `src/browser/utils/workspaceModeAi.test.ts` (Modify): after
     `setAgentBases` with a descriptor `{id: "ci-watcher", base: "exec",
     aiSettingsBase: "explore"}`, `resolveConfiguredAiDefaults("ci-watcher",
@@ -2264,9 +2303,13 @@ the tests in 8.7.
             `env`, `timeout: effectiveHookTimeoutSeconds(timeoutSeconds)`
             (D16), and `abortSignal: ctx.abortSignal`, the signal of the
             `turn.stop` or `tool.execute` context.
-        6.  Write the JSON input to `ExecStream.stdin` and close it. Read
-            stdout to the end, at most 64 × 1024 characters. More output counts
-            as invalid output.
+        6.  Start reading stdout and stderr, then write the JSON input to
+            `ExecStream.stdin` and close it. Wait for the write, both reads and
+            `exitCode` together. Both reads use `streamToStringCapped`
+            (`src/node/runtime/streamUtils.ts:107`), which drains and discards
+            the bytes past its cap, so a hook never blocks on a full pipe.
+            Stdout keeps at most 64 × 1024 + 1 bytes, and more than 64 × 1024
+            bytes counts as invalid output. Stderr keeps nothing (cap 0).
         7.  Apply the failure table (5.5). For `stop`, a non-empty
             `followup_message` string becomes `{text, hookKey, loopLimit:
             handler.loopLimit}` on `continueReasons`, where `hookKey` joins the
@@ -2283,8 +2326,14 @@ the tests in 8.7.
         (`agentSession.ts:10847`) creates an `AbortController`, keeps it in a
         field while the chain runs, and passes its signal in the input. A hard
         `interruptStream` (`agentSession.ts:8518`, `soft` unset), which is the
-        path of a user Stop from `WorkspaceService`, aborts it. The runner
-        starts no further hook once the signal is aborted.
+        path of a user Stop from `WorkspaceService`, aborts it. A Stop can
+        also land after the stream ends and before the controller exists,
+        when there is nothing to abort. For that case,
+        `readTurnStopContinuation` checks
+        `stoppedSince(provenance.admissionStopEpoch)` (line 10835) right after
+        it stores the controller, with no `await` between, and before it calls
+        `runTurnStopHooks`. When the check is true, it aborts the controller.
+        The runner starts no further hook once the signal is aborted.
     *   `HOOK_INPUT_MAX_CHARS` (`codexHookRunner.ts:47`) moves to
         `src/constants/pluginHooks.ts` and is exported, so both runners use it.
 
@@ -2310,9 +2359,14 @@ the tests in 8.7.
 
 *   **Type / Scope**: Plugin tree hash.
 *   **Proposed Changes**: Move the walk of `hashPluginTree` (lines 13-97) into
-    `listPluginTreeRecords(root, quota): Promise<Array<[string, number,
-    string]>>` (path, mode, content hash or link text). `hashPluginTree` hashes
-    those records as before, so its result does not change.
+    `listPluginTreeRecords(root, quota, keepBytesUpTo?: number):
+    Promise<Array<[string, number, string, Buffer?]>>` (path, mode, content
+    hash or link text, file bytes). With `keepBytesUpTo`, the record of a
+    regular file of at most that many bytes also carries its bytes, from the
+    walk's own read (lines 50-83: the `O_NOFOLLOW` open and the identity
+    checks before and after the read). A symlink record never carries bytes.
+    `hashPluginTree` passes no `keepBytesUpTo` and hashes the first three
+    fields as before, so its result does not change.
 
 #### 8.5 `src/node/services/agentPlugins/installService.ts` (Modify)
 
@@ -2326,12 +2380,13 @@ the tests in 8.7.
         and `workflows/` are listed too: the skill and agent rows do not show
         bodies or helper files, and a component root can be the plugin root;
     *   for each added, removed or changed path, add a change with component
-        `"hooks"` and summary "file <path> added", "removed" or "changed". For
-        a file of at most 64 × 1024 bytes that decodes as UTF-8 without
-        replacement characters (`new TextDecoder("utf-8", {fatal: true})`),
-        `before` and `after` are its text through `reviewText` (lines
-        540-542), read from each tree. Any other file has no `before` or
-        `after`;
+        `"hooks"` and summary "file <path> added", "removed" or "changed".
+        Both walks set `keepBytesUpTo` to 64 × 1024 (8.4). For a record whose
+        bytes decode as UTF-8 without replacement characters (`new
+        TextDecoder("utf-8", {fatal: true})`), `before` and `after` are that
+        text through `reviewText` (lines 540-542). Xum opens no file a second
+        time. For a symlink, `before` and `after` are its link text. Any other
+        file has no `before` or `after`;
     *   the list still goes through `assertReviewFits` (lines 586-597), so an
         update too large to review fails with its existing message.
 
@@ -2384,6 +2439,10 @@ the tests in 8.7.
     *   exit 127 shows the "not found in this workspace" notice once for two
         calls;
     *   a hook that sleeps past its timeout is killed, and the turn proceeds;
+    *   `stop` stdout of 64 × 1024 + 1 bytes adds no reason and one notice;
+    *   with the local runtime instead of the fake, a `stop` hook that writes
+        1 MiB to stderr and then prints `{"followup_message": "again"}` adds
+        its reason before its timeout;
     *   each of `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and
         `XUM_DISABLE_PROJECT_AUTOMATION=1` starts no process;
     *   a devcontainer or remote runtime starts no process;
@@ -2398,9 +2457,11 @@ the tests in 8.7.
     Cursor package, `isHookAllowed` allows a trusted hook that
     `hooks/hooks.json` still declares, and refuses it after the entry's
     `command` changes on disk.
-*   `src/node/services/agentSession.turnStopHooks.test.ts` (Modify): a hard
-    `interruptStream` while the `turn.stop` chain runs aborts the context's
-    `abortSignal`.
+*   `src/node/services/agentSession.turnStopHooks.test.ts` (Modify):
+    *   a hard `interruptStream` while the `turn.stop` chain runs aborts the
+        context's `abortSignal`;
+    *   a Stop that changes the stop epoch after the stream ends and before
+        the chain starts gives the chain an already aborted `abortSignal`.
 *   `src/node/services/agentPlugins/treeHash.test.ts` (Create): for a fixed
     fixture tree, `hashPluginTree` returns the hash that the code at
     `0f82063e7e` returns (compute it once with that code and write it into the
@@ -2412,6 +2473,9 @@ the tests in 8.7.
     *   an added and a removed file under `hooks/` are listed as "added" and
         "removed";
     *   a changed binary file is listed with no text;
+    *   a staged `hooks/lib.sh` that is a symlink to a file outside the plugin
+        is listed with its link text as `after`, and the target's content
+        appears nowhere in the review;
     *   a prose-only change to `skills/a/SKILL.md` and a changed
         `skills/a/lib.sh` each get a file row, beside any skill row;
     *   a plugin without a runnable Cursor hook lists no file changes;
