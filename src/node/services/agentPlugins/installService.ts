@@ -41,7 +41,7 @@ import type {
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { showInvisibleControls } from "@/common/utils/agentPluginReviewText";
+import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
 import {
@@ -155,7 +155,7 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
-import { hashPluginTree } from "./treeHash";
+import { hashPluginTree, listPluginTreeRecords, type PluginTreeRecord } from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -163,7 +163,7 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
-import { loadPluginHooks } from "./codexHooks";
+import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   readPluginHookTrust,
   removePluginHookTrust,
@@ -571,6 +571,74 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
     );
   }
+}
+
+/** A file larger than this shows only its row in the file review, like a binary file. */
+const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
+
+/**
+ * A Cursor command hook can run or source any file of its plugin, so a plugin with one gets a
+ * review of its files (Cursor plugin RFC D1).
+ */
+function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
+  return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
+}
+
+/** The text of one side of a file review row: absent for a binary or large file. */
+function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
+  if (record?.kind === "symlink") return showOneLineControls(record.target);
+  if (record?.kind !== "file" || record.bytes === undefined) return undefined;
+  try {
+    // ignoreBOM keeps a leading BOM in the text, so the review marks it instead of dropping it.
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(record.bytes);
+    return showInvisibleControls(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function treeEntryContent(record: PluginTreeRecord): string {
+  return record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "";
+}
+
+/**
+ * The file review (D1, D30): one row per file or symlink that differs between two plugin trees.
+ * `before: null` is the empty tree, so every file is an added row. A directory gets no row; the
+ * files under it do.
+ */
+function fileReviewRows(
+  before: readonly PluginTreeRecord[] | null,
+  after: readonly PluginTreeRecord[]
+): AgentPluginCapabilityChange[] {
+  const entries = (records: readonly PluginTreeRecord[]) =>
+    new Map(
+      records.filter((record) => record.kind !== "directory").map((record) => [record.path, record])
+    );
+  const old = entries(before ?? []);
+  const next = entries(after);
+  return [...new Set([...old.keys(), ...next.keys()])].sort().flatMap((filePath) => {
+    const was = old.get(filePath);
+    const now = next.get(filePath);
+    if (
+      was !== undefined &&
+      now !== undefined &&
+      was.kind === now.kind &&
+      was.mode === now.mode &&
+      treeEntryContent(was) === treeEntryContent(now)
+    ) {
+      return [];
+    }
+    const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
+    const beforeText = fileReviewText(was);
+    const afterText = fileReviewText(now);
+    return [
+      {
+        summary: `file ${showOneLineControls(filePath)} ${verb}`,
+        ...(beforeText !== undefined ? { before: beforeText } : {}),
+        ...(afterText !== undefined ? { after: afterText } : {}),
+      },
+    ];
+  });
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -2233,6 +2301,14 @@ export class AgentPluginInstallService {
     );
   }
 
+  /** The records a file review compares, with the bytes that their hash read. */
+  private fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
+    return listPluginTreeRecords(dir, this.stagingQuota(), {
+      keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
+      skipRootGit: true,
+    });
+  }
+
   /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
    * allow twice the checkout quota (bytes AND file count — loose objects can
@@ -3086,6 +3162,18 @@ export class AgentPluginInstallService {
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
     );
+    if (runsCursorCommands((await loadPluginHooks(stagedPlugin)).hooks)) {
+      // D30: an installed tree without a runnable Cursor command hook never had a file review, so
+      // the staged tree is compared with the empty tree and every file is listed.
+      const reviewed =
+        currentPlugin !== null && runsCursorCommands((await loadPluginHooks(currentPlugin)).hooks);
+      changes.push(
+        ...fileReviewRows(
+          reviewed ? await this.fileReviewRecords(installedPath) : null,
+          await this.fileReviewRecords(stagedPlugin.rootPath)
+        )
+      );
+    }
     assertReviewFits(changes);
     return changes;
   }
@@ -3698,6 +3786,10 @@ export class AgentPluginInstallService {
     const hook = this.collectHook(plugin);
     const codexHooks = await loadPluginHooks(plugin);
     warnings.push(...codexHooks.warnings);
+    const fileChanges = runsCursorCommands(codexHooks.hooks)
+      ? fileReviewRows(null, await this.fileReviewRecords(stagedDir))
+      : [];
+    assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
     // Display only: the names a user reads before Install show invisible controls (#6629).
@@ -3750,7 +3842,7 @@ export class AgentPluginInstallService {
       mcpServers,
       ...(hook !== undefined ? { hook } : {}),
       codexHooks: codexHooks.hooks,
-      fileChanges: [],
+      fileChanges,
       agents,
       workflows,
       slashCommands,
