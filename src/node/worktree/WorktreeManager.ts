@@ -95,7 +95,7 @@ function sweepOriginFetches(now: number): void {
 /**
  * Keys a fetch by the ref it writes, refs/remotes/origin/<branch> in the repository's common git
  * dir, so symlinked paths and linked worktrees of one repository share a fetch. `remote` is the
- * origin it reads, so a changed origin fetches again.
+ * origin URL git contacts, so a changed origin fetches again.
  */
 async function originFetchTarget(
   projectPath: string,
@@ -110,7 +110,8 @@ async function originFetchTarget(
   );
   using urlProc = execFileAsync(
     "git",
-    ["-C", projectPath, "config", "--get", "remote.origin.url"],
+    // get-url applies url.<base>.insteadOf, so the key names the repository git contacts.
+    ["-C", projectPath, "remote", "get-url", "origin"],
     options
   );
   const [[worktree, repository], originUrl] = await Promise.all([
@@ -121,7 +122,7 @@ async function originFetchTarget(
       })
       // An unreadable repository fails the fetch itself, which falls back to local refs.
       .catch(() => [path.resolve(projectPath), path.resolve(projectPath)]),
-    // `config --get` exits 1 when origin has no URL.
+    // get-url exits 2 when the repository has no origin.
     urlProc.result.then(
       ({ stdout }) => stdout.trim(),
       () => ""

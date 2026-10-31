@@ -2118,7 +2118,7 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
-  it("fetches again after origin moves to another remote and back", async () => {
+  it("fetches again whenever the remote that origin resolves to changes", async () => {
     const fixture = await createWorktreeManagerFixture();
     try {
       const { remoteHead } = addOriginAheadOfLocalRef(fixture, { fetchOnce: false });
@@ -2144,8 +2144,17 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(await createBranchHead(fixture, "from-second-remote")).toBe(
         gitRevParseHead(secondRemote)
       );
-      git(fixture.projectPath, "remote", "set-url", "origin", path.join(fixture.rootDir, "remote"));
+      const firstRemote = path.join(fixture.rootDir, "remote");
+      git(fixture.projectPath, "remote", "set-url", "origin", firstRemote);
       expect(await createBranchHead(fixture, "from-first-remote-again")).toBe(remoteHead);
+      git(fixture.projectPath, "config", `url.${firstRemote}.insteadOf`, "rewritten:");
+      git(fixture.projectPath, "remote", "set-url", "origin", "rewritten:");
+      expect(await createBranchHead(fixture, "from-rewrite-to-first")).toBe(remoteHead);
+      git(fixture.projectPath, "config", "--remove-section", `url.${firstRemote}`);
+      git(fixture.projectPath, "config", `url.${secondRemote}.insteadOf`, "rewritten:");
+      expect(await createBranchHead(fixture, "from-rewrite-to-second")).toBe(
+        gitRevParseHead(secondRemote)
+      );
     } finally {
       await fixture.cleanup();
     }
