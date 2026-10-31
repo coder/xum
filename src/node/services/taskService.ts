@@ -7153,79 +7153,46 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
 
+    return await this.holdReservationLaunchLeases(run, { plans, results });
+  }
+
+  /**
+   * The launch leases of the batch's `starting` plans, held for the rest of the batch: a launch
+   * takes its own, and the scope releases the rest when it exits, before the mutex.
+   */
+  private async holdReservationLaunchLeases(
+    run: ReservationRun,
+    batch: ReservationBatch
+  ): Promise<Result<TaskCreateResult[], string>> {
     // Before the commit publishes any `starting` row: its launch lease (see startReservedAgentTask).
-    let heldLaunchLeases: Awaited<ReturnType<typeof holdLaunchLeases>>;
+    let heldLaunchLeases: HeldLaunchLeases;
     try {
       heldLaunchLeases = await holdLaunchLeases(
         workspaceUseLeasesFor(this.config),
-        plans.filter((plan) => plan.status === "starting").map((plan) => plan.taskId)
+        batch.plans.filter((plan) => plan.status === "starting").map((plan) => plan.taskId)
       );
     } catch (error) {
       return Err(`Task.createMany: ${getErrorMessage(error)}`);
     }
     await using launchLeases = heldLaunchLeases;
+    return await this.commitUnderDesktopGate(run, batch, launchLeases);
+  }
 
+  /** The owned checkpoint and commit inside the desktop gate, then the rest of the batch. */
+  private async commitUnderDesktopGate(
+    run: ReservationRun,
+    batch: ReservationBatch,
+    launchLeases: HeldLaunchLeases
+  ): Promise<Result<TaskCreateResult[], string>> {
     // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
-    progress.enter("desktop-gate");
+    run.progress.enter("desktop-gate");
     const commitState: ReservationCommitState = { canceledInsideCommit: false };
-    const commit = async (): Promise<Result<TaskCreateResult[], string> | null> => {
-      // Checkpoint entry is the LAST cancellation point: an abort observed here leaves nothing
-      // durable. Once a callback is entered it is owned to completion (the runner checks the
-      // signal itself before its store write).
-      progress.enter("checkpoint");
-      if (signal?.aborted) return interrupted();
-      // Ownership BEFORE exposure: every id a checkpoint callback may durably record is owned by
-      // this process from here, whatever happens to the callbacks or the commit. The identity is
-      // kept through a successful commit (the launch reuses it) and, when the pre-launch path
-      // fails, settled once nothing can launch — a checkpointed id must never read back to the
-      // runner as "no attempt owned by this process".
-      // The reservation is the FIRST admission of a brand-new task by construction, so its
-      // lineage is proven: the attempt id minted here is persisted by the commit below in the same
-      // write that creates the entry, and the launch reuses it.
-      const ownedAttempts = new Map(
-        plans.map((plan) => {
-          plan.attemptId = newTaskAttemptId();
-          return [
-            plan.taskId,
-            this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
-              attemptId: plan.attemptId,
-              receiptEligible: true,
-              ...(signal != null ? { abortSignal: signal } : {}),
-            }),
-          ];
-        })
-      );
-      try {
-        for (const [index, result] of results.entries()) {
-          // Workflow callers durably checkpoint returned task IDs before task records are
-          // persisted. If this backend dies before the commit, the checkpoint names a task that
-          // never existed: a resuming runner tombstones the ID (tombstoneUnpublishedReservation)
-          // and only then replaces it, and the commit below refuses a tombstoned ID, so a stalled
-          // (not dead) backend's late commit can never publish a second child for the step.
-          await options.onTaskReserved?.(index, result);
-        }
-        progress.enter("config-commit");
-        await this.commitReservations(
-          plans,
-          signal,
-          () => {
-            commitState.canceledInsideCommit = true;
-          },
-          options.retires
-        );
-      } catch (error: unknown) {
-        await this.settleFailedReservations(plans, ownedAttempts, signal, error);
-        throw error;
-      }
-      return null;
-    };
-
     let commitOutcome: Result<TaskCreateResult[], string> | null;
     try {
       commitOutcome = await this.runCancellableAcquisition(
         (callback) =>
           this.desktopInputCoordinator.withReservations(
-            plans.flatMap((plan) =>
+            batch.plans.flatMap((plan) =>
               plan.taskDesktopOwnerWorkspaceId == null
                 ? []
                 : [
@@ -7237,15 +7204,75 @@ export class TaskService implements AgentTaskIntegration {
             ),
             callback
           ),
-        signal,
-        commit,
-        interrupted
+        run.signal,
+        () => this.runReservationCommit(run, batch, commitState),
+        run.interrupted
       );
     } catch (error) {
       return Err(getErrorMessage(error));
     }
     if (commitOutcome != null) return commitOutcome;
-    return await this.finishReservations(run, { plans, results }, launchLeases, commitState);
+    return await this.finishReservations(run, batch, launchLeases, commitState);
+  }
+
+  /**
+   * The owned checkpoint and commit, run inside the desktop gate. Returns the cancellation result
+   * when the abort is seen at checkpoint entry, else null once the commit wrote the batch.
+   */
+  private async runReservationCommit(
+    run: ReservationRun,
+    batch: ReservationBatch,
+    commitState: ReservationCommitState
+  ): Promise<Result<TaskCreateResult[], string> | null> {
+    // Checkpoint entry is the LAST cancellation point: an abort observed here leaves nothing
+    // durable. Once a callback is entered it is owned to completion (the runner checks the
+    // signal itself before its store write).
+    run.progress.enter("checkpoint");
+    if (run.signal?.aborted) return run.interrupted();
+    // Ownership BEFORE exposure: every id a checkpoint callback may durably record is owned by
+    // this process from here, whatever happens to the callbacks or the commit. The identity is
+    // kept through a successful commit (the launch reuses it) and, when the pre-launch path
+    // fails, settled once nothing can launch — a checkpointed id must never read back to the
+    // runner as "no attempt owned by this process".
+    // The reservation is the FIRST admission of a brand-new task by construction, so its
+    // lineage is proven: the attempt id minted here is persisted by the commit below in the same
+    // write that creates the entry, and the launch reuses it.
+    const ownedAttempts = new Map(
+      batch.plans.map((plan) => {
+        plan.attemptId = newTaskAttemptId();
+        return [
+          plan.taskId,
+          this.beginOwnedTaskAttempt(plan.taskId, "reservation", {
+            attemptId: plan.attemptId,
+            receiptEligible: true,
+            ...(run.signal != null ? { abortSignal: run.signal } : {}),
+          }),
+        ];
+      })
+    );
+    try {
+      for (const [index, result] of batch.results.entries()) {
+        // Workflow callers durably checkpoint returned task IDs before task records are
+        // persisted. If this backend dies before the commit, the checkpoint names a task that
+        // never existed: a resuming runner tombstones the ID (tombstoneUnpublishedReservation)
+        // and only then replaces it, and the commit below refuses a tombstoned ID, so a stalled
+        // (not dead) backend's late commit can never publish a second child for the step.
+        await run.options.onTaskReserved?.(index, result);
+      }
+      run.progress.enter("config-commit");
+      await this.commitReservations(
+        batch.plans,
+        run.signal,
+        () => {
+          commitState.canceledInsideCommit = true;
+        },
+        run.options.retires
+      );
+    } catch (error: unknown) {
+      await this.settleFailedReservations(batch.plans, ownedAttempts, run.signal, error);
+      throw error;
+    }
+    return null;
   }
 
   /**
