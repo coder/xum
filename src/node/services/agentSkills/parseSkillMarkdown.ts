@@ -115,6 +115,29 @@ export function quoteBracketedArgumentHint(yaml: string): string {
   });
 }
 
+/** The skill schema's description cap: the longest description Xum derives from a body line. */
+export const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
+
+/**
+ * SKILL.md text written from a frontmatter object and a body, for plugin files that Xum reads as
+ * skills (Claude commands, Cursor rules). YAML aliases can repeat one large value many times, so
+ * the text can be far bigger than the file, and every caller parses it with the file's byteSize:
+ * over the SKILL.md cap it throws AgentSkillParseError, naming the file as `label`.
+ */
+export function rewrittenSkillMarkdown(
+  frontmatter: Record<string, unknown>,
+  body: string,
+  label: string
+): string {
+  const rewritten = `---\n${YAML.stringify(frontmatter)}---\n${body}`;
+  if (Buffer.byteLength(rewritten, "utf8") > MAX_FILE_SIZE) {
+    throw new AgentSkillParseError(
+      `${label} is larger than ${MAX_FILE_SIZE} bytes once its frontmatter is rewritten as a skill; it does not load.`
+    );
+  }
+  return rewritten;
+}
+
 export function parseSkillMarkdown(input: {
   content: string;
   byteSize: number;

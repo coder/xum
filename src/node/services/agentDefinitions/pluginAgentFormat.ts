@@ -349,9 +349,9 @@ export function mapForeignPluginAgentFrontmatter(
     // their bodies are written for delegates, so keep them out of the picker.
     ui: { hidden: true },
     subagent: { runnable: true },
-    // The body is the whole system prompt in both ecosystems, so it replaces
-    // the base body instead of Xum's default append.
-    prompt: { append: false },
+    // `readonly` agents get Explore's prompt before their own body (Cursor plugin RFC, D13).
+    // Other agents keep append: false.
+    prompt: { append: raw.readonly === true },
     ...(Object.keys(ai).length > 0 ? { ai } : {}),
     // Replaces the Claude list. Kept in the mapped frontmatter, so the install
     // consent fingerprint changes when the effective tool list changes.

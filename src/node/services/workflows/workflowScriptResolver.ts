@@ -194,9 +194,13 @@ async function resolveSkillWorkflowScript(
   const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
 
   // A Claude command's skill directory is its plugin's commands folder: a script there is not
-  // part of the command, and a Claude package runs no Xum workflow code.
+  // part of the command, and a Claude package runs no Xum workflow code. A Cursor rule's skill
+  // directory is its rules folder, the same case.
   if (resolvedSkill.commandSkill === true) {
     throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
+  }
+  if (resolvedSkill.ruleFile !== undefined) {
+    throw new Error(`Skill '${parsed.skillName}' is a Cursor rule and has no workflow scripts`);
   }
   // A Skills install loads skills only (installMethods.ts): its skills run no workflow scripts.
   if (resolvedSkill.skillsOnlyPlugin === true) {
@@ -208,6 +212,12 @@ async function resolveSkillWorkflowScript(
   if (resolvedSkill.claudePackagePlugin === true) {
     throw new Error(
       `Skill '${parsed.skillName}' comes from a Claude Code plugin and has no workflow scripts`
+    );
+  }
+  // A Cursor package was not written for Xum either: it runs no Xum code.
+  if (resolvedSkill.cursorPackagePlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a Cursor plugin and has no workflow scripts`
     );
   }
 

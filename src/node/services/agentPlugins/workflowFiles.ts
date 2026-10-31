@@ -59,12 +59,15 @@ export async function listPluginSkillScripts(plugin: {
   skillsDirs?: PluginSkillsRoot[];
   skillsOnly?: true;
   claudeFallback?: true;
+  cursorFallback?: true;
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
   // A skills-only package runs no scripts, so none is offered for review either.
   if (plugin.skillsOnly === true) return scripts;
   // A Claude Code package runs no Xum code, so none of its skill scripts is offered for review.
   if (plugin.claudeFallback === true) return scripts;
+  // Nor does a Cursor package.
+  if (plugin.cursorFallback === true) return scripts;
   for (const skillsRoot of plugin.skillsDirs ?? []) {
     // A Claude command's folder is the commands folder, not a skill folder: no script of its own.
     if (skillsRoot.command) continue;

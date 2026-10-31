@@ -182,7 +182,7 @@ function mcpFile(value: unknown, warnings: string[]): { mcp?: string } {
 }
 
 /** `author` keeps its name, email and url. Other keys warn instead of failing validation. */
-function readAuthor(value: unknown, warnings: string[]): unknown {
+export function readAuthor(value: unknown, warnings: string[]): unknown {
   if (!isPlainObject(value)) return value;
   const author: Record<string, unknown> = {};
   for (const [key, member] of Object.entries(value)) {
