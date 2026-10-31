@@ -23,7 +23,7 @@ import assert from "@/common/utils/assert";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
-import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { parseCreationDraftScopeId } from "@/common/constants/storage";
 import { CreationDraftSchema } from "@/common/orpc/schemas/drafts";
 

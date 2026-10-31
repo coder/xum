@@ -12,6 +12,7 @@ import type {
   ResolvedAgentAiSettings,
 } from "@/common/types/agentAiSettings";
 import {
+  aiSettingsBaseOf,
   collectDeclaredAncestorLayers,
   type AgentAncestorDescriptor,
 } from "@/common/utils/ai/agentAncestorLayers";
@@ -67,7 +68,7 @@ export async function resolveAcpAgentAiSettings(
   const agentDefsById = new Map<string, AgentAncestorDescriptor>(
     agents.map((agent) => [
       agent.id,
-      { base: agent.aiSettingsBase ?? agent.base, definitionAiDefaults: agent.aiDefaults },
+      { base: aiSettingsBaseOf(agent), definitionAiDefaults: agent.aiDefaults },
     ])
   );
 

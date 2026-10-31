@@ -104,6 +104,25 @@ export function collectDefinitionLayers(
   return { targetDefinitionAiDefaults, ancestors };
 }
 
+/** An agent's AI-settings base: its applied `aiSettingsBase`, else `base` (Cursor plugin RFC, D11). */
+export function aiSettingsBaseOf(agent: { base?: string; aiSettingsBase?: string }) {
+  return agent.aiSettingsBase ?? agent.base;
+}
+
+/** Agent ID -> AI-settings base, for the declared-base walks (collectDeclaredAncestorLayers). */
+export function getAgentAiSettingsBases(
+  agents: ReadonlyArray<{ id: string; base?: string; aiSettingsBase?: string }>
+): Map<string, string | undefined> {
+  return new Map(agents.map((agent) => [agent.id, aiSettingsBaseOf(agent)]));
+}
+
+/** The settings base a read chain declares: its closest hop's, as in the base-merged frontmatter. */
+export function chainSettingsBase(
+  chain: ReadonlyArray<{ ai?: { settingsBase?: string } }>
+): string | undefined {
+  return chain.find((entry) => entry.ai?.settingsBase != null)?.ai?.settingsBase;
+}
+
 export type SettingsBaseIgnoredReason = "missing" | "self" | "cycle" | "nested";
 
 /**
@@ -125,7 +144,7 @@ export function applySettingsBaseChain<T extends { id: string; ai?: { settingsBa
   if (settingsBaseChain.some((entry) => entry.id === agentId)) {
     return { chain: [...ownChain], ignored: "cycle" };
   }
-  if (settingsBaseChain.some((entry) => entry.ai?.settingsBase != null)) {
+  if (chainSettingsBase(settingsBaseChain) != null) {
     return { chain: [...ownChain], ignored: "nested" };
   }
   const firstBase = ownChain.findIndex((entry) => entry.id !== agentId);

@@ -23,7 +23,7 @@ import { useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { KEYBINDS, matchesKeybind, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
-import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 

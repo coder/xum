@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useAgent } from "@/browser/contexts/AgentContext";
-import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { recordWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { normalizeAgentId } from "@/common/utils/agentIds";

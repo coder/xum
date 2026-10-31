@@ -45,10 +45,8 @@ import {
 } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import {
-  getAgentAiSettingsBases,
-  resolveWorkspaceAiSettingsForAgent,
-} from "@/browser/utils/workspaceModeAi";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getCreationDraftScopeId,

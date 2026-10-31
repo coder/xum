@@ -22,6 +22,7 @@ import type {
 } from "@/common/types/thinking";
 import {
   applySettingsBaseChain,
+  chainSettingsBase,
   collectDefinitionLayers,
 } from "@/common/utils/ai/agentAncestorLayers";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -97,32 +98,25 @@ export function resolveChainAgentCacheTtl(
   })?.value;
 }
 
-/**
- * The chain an agent's AI settings resolve over (Cursor plugin RFC, D11): its inheritance chain
- * with `ai.settingsBase` applied by applySettingsBaseChain. Tool policy keeps the inheritance
- * chain. The settings base is the closest hop's, the value of the base-merged frontmatter that
- * agents.list reads, so a run and the listed agent agree. Reads the settings-base agent the way
- * the inheritance walk reads a base: an unreadable or aborted read throws, a missing one is
- * ignored with a warning (D26).
- */
-export async function resolveAgentAiSettingsChain(
-  agentId: string,
-  chain: AgentForInheritance[],
-  context: NodeAgentDefinitionContext & {
-    cache?: AgentDefinitionRequestCache;
-    abortSignal?: AbortSignal;
-  }
-): Promise<AgentForInheritance[]> {
-  const settingsBase = chain.find((entry) => entry.ai?.settingsBase != null)?.ai?.settingsBase;
-  if (settingsBase == null) return chain;
+type SettingsBaseReadContext = NodeAgentDefinitionContext & {
+  cache?: AgentDefinitionRequestCache;
+  abortSignal?: AbortSignal;
+};
 
+/**
+ * The settings-base agent's chain, read as the inheritance walk reads a base: null when the agent
+ * is absent, and a throw when the read was aborted or failed (unreachable host, permission).
+ */
+async function readSettingsBaseChain(
+  settingsBase: string,
+  context: SettingsBaseReadContext
+): Promise<AgentForInheritance[] | null> {
   const readOptions = {
     cache: context.cache,
     projectPluginsTrusted: context.projectPluginsTrusted,
     runtimeFactory: context.runtimeFactory,
-    ...(context.abortSignal != null ? { abortSignal: context.abortSignal } : {}),
+    abortSignal: context.abortSignal,
   };
-  let settingsBaseChain: AgentForInheritance[] | null = null;
   try {
     const agentDefinition = await readAgentDefinition(
       context.runtime,
@@ -130,7 +124,7 @@ export async function resolveAgentAiSettingsChain(
       settingsBase,
       readOptions
     );
-    settingsBaseChain = await resolveAgentInheritanceChain({
+    return await resolveAgentInheritanceChain({
       runtime: context.runtime,
       workspacePath: context.workspacePath,
       agentId: agentDefinition.id,
@@ -140,9 +134,27 @@ export async function resolveAgentAiSettingsChain(
     });
   } catch (error) {
     if (context.abortSignal?.aborted === true || isRuntimeReadFailure(error)) throw error;
+    return null;
   }
+}
 
-  const result = applySettingsBaseChain(agentId, chain, settingsBaseChain);
+/**
+ * The chain an agent's AI settings resolve over (Cursor plugin RFC, D11): its inheritance chain
+ * with `ai.settingsBase` applied. Tool policy keeps the inheritance chain. An ignored settings
+ * base logs a warning and leaves the chain as it is (D26).
+ */
+export async function resolveAgentAiSettingsChain(
+  agentId: string,
+  chain: AgentForInheritance[],
+  context: SettingsBaseReadContext
+): Promise<AgentForInheritance[]> {
+  const settingsBase = chainSettingsBase(chain);
+  if (settingsBase == null) return chain;
+  const result = applySettingsBaseChain(
+    agentId,
+    chain,
+    await readSettingsBaseChain(settingsBase, context)
+  );
   if (result.ignored != null) {
     log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
   }

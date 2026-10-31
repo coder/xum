@@ -17,6 +17,7 @@ import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   applySettingsBaseChain,
+  chainSettingsBase,
   collectDefinitionLayers,
 } from "@/common/utils/ai/agentAncestorLayers";
 import {
@@ -1219,7 +1220,12 @@ interface ResolvedAgentDefinitionWithAiChain {
    * resolveAgentInheritanceChain skips, so collectDefinitionLayers over it gives the layers a
    * run of the agent resolves.
    */
-  aiChain: Array<{ id: AgentId; ai?: AgentDefinitionPackage["frontmatter"]["ai"] }>;
+  aiChain: AiChainHop[];
+}
+
+interface AiChainHop {
+  id: AgentId;
+  ai?: AgentDefinitionPackage["frontmatter"]["ai"];
 }
 
 /**
@@ -1399,6 +1405,24 @@ export async function resolveAgentDiscoveryContext(
   };
 }
 
+/**
+ * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26), from the read
+ * chains of every listed agent: the same chains a run reads, so a run and the list agree.
+ */
+function listedAgentAiSettings(
+  agentId: AgentId,
+  aiChain: AiChainHop[],
+  aiChainsById: ReadonlyMap<string, AiChainHop[]>
+): Pick<AgentDefinitionDescriptor, "aiLayers" | "aiSettingsBase"> {
+  const settingsBase = chainSettingsBase(aiChain);
+  if (settingsBase == null) return { aiLayers: collectDefinitionLayers(agentId, aiChain) };
+  const result = applySettingsBaseChain(agentId, aiChain, aiChainsById.get(settingsBase) ?? null);
+  const aiLayers = collectDefinitionLayers(agentId, result.chain);
+  if (result.ignored == null) return { aiLayers, aiSettingsBase: settingsBase };
+  log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
+  return { aiLayers };
+}
+
 export async function listAgentDefinitions(
   context: AgentDefinitionsContext,
   input: {
@@ -1437,9 +1461,9 @@ export async function listAgentDefinitions(
           descriptor,
           resolvedFrontmatter,
           aiChain: resolvedDefinition.aiChain,
-          hidden:
-            isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
-            input.includeDisabled !== true,
+          listed:
+            input.includeDisabled === true ||
+            !isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }),
         };
       } catch {
         return { descriptor };
@@ -1455,21 +1479,8 @@ export async function listAgentDefinitions(
   );
   return resolved.flatMap((entry) => {
     if (entry.resolvedFrontmatter == null) return [entry.descriptor];
-    if (entry.hidden) return [];
+    if (!entry.listed) return [];
     const frontmatter = entry.resolvedFrontmatter;
-    const id = entry.descriptor.id;
-    const settingsBase = frontmatter.ai?.settingsBase;
-    const settingsBaseResult =
-      settingsBase != null
-        ? applySettingsBaseChain(id, entry.aiChain, aiChainsById.get(settingsBase) ?? null)
-        : undefined;
-    if (settingsBaseResult?.ignored != null) {
-      log.warn("settingsBase ignored", {
-        agentId: id,
-        settingsBase,
-        reason: settingsBaseResult.ignored,
-      });
-    }
     return [
       {
         ...entry.descriptor,
@@ -1480,11 +1491,8 @@ export async function listAgentDefinitions(
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
         ...backgroundHintField(frontmatter),
         base: frontmatter.base,
-        ...(settingsBaseResult != null && settingsBaseResult.ignored == null
-          ? { aiSettingsBase: settingsBase }
-          : {}),
         aiDefaults: frontmatter.ai,
-        aiLayers: collectDefinitionLayers(id, settingsBaseResult?.chain ?? entry.aiChain),
+        ...listedAgentAiSettings(entry.descriptor.id, entry.aiChain, aiChainsById),
         tools: frontmatter.tools,
       },
     ];

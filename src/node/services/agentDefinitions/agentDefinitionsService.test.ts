@@ -6,10 +6,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import {
-  getAgentAiSettingsBases,
-  resolveConfiguredAiDefaults,
-} from "@/browser/utils/workspaceModeAi";
+import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";

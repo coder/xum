@@ -9,7 +9,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useAutoRouting, useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
-import { getAgentAiSettingsBases } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
