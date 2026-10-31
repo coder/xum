@@ -21,6 +21,7 @@ import type { PluginHookDefinition, PluginHooksLoadResult } from "./codexHooks";
 import type { AgentPluginNotApplied, PluginFs } from "./discovery";
 import {
   HookWarnings,
+  MAX_HOOK_WARNINGS,
   MAX_HOOKS_FILE_BYTES,
   MAX_PLUGIN_HOOKS,
   canonicalJson,
@@ -52,8 +53,9 @@ export async function loadPluginCursorHooks(args: {
       ? await readHooksDocument(args.rootPath, args.source, args.fs, warnings)
       : args.source;
   const label = typeof args.source === "string" ? path.normalize(args.source) : INLINE_HOOKS_SOURCE;
+  const dropped: AgentPluginNotApplied[] = [];
   const hooks: PluginHookDefinition[] =
-    document === undefined ? [] : parseCursorHooksDocument(document, label, warnings);
+    document === undefined ? [] : parseCursorHooksDocument(document, label, { warnings, dropped });
   const list = warnings.list();
   if (hooks.length > MAX_PLUGIN_HOOKS) {
     list.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
@@ -63,7 +65,7 @@ export async function loadPluginCursorHooks(args: {
     const reason = cursorHookNotAppliedReason(hook);
     return reason === undefined ? [] : [{ part: "hook", name: hookName(hook), reason }];
   });
-  return { hooks, warnings: list, notApplied };
+  return { hooks, warnings: list, notApplied: [...notApplied, ...dropped] };
 }
 
 function hookName(hook: Pick<PluginHookDefinition, "key" | "source">): string {
@@ -130,21 +132,38 @@ function hooksMapOf(
   return document.hooks;
 }
 
+/**
+ * What a parse reports besides its hooks. A dropped hook gets a warning and a `notApplied` row, so
+ * the plugin's "not applied" list names it too (CUJ 5). The rows are bounded like the warnings: a
+ * 256 KiB file can hold thousands of bad entries.
+ */
+interface ParseReport {
+  warnings: HookWarnings;
+  dropped: AgentPluginNotApplied[];
+}
+
+function reportDropped(report: ParseReport, name: string, reason: string): void {
+  if (report.dropped.length < MAX_HOOK_WARNINGS)
+    report.dropped.push({ part: "hook", name, reason });
+}
+
 /** Up to MAX_PLUGIN_HOOKS + 1 hooks, so the caller can tell that the file holds more. */
 function parseCursorHooksDocument(
   document: unknown,
   source: string,
-  warnings: HookWarnings
+  report: ParseReport
 ): PluginHookDefinition[] {
+  const { warnings } = report;
   const hooks: PluginHookDefinition[] = [];
   for (const [event, entries] of Object.entries(hooksMapOf(document, source, warnings) ?? {})) {
     if (!Array.isArray(entries)) {
       warnings.push(`${source}: '${event}' must be an array of hooks; ignoring it`);
+      reportDropped(report, event, "must be an array of hooks");
       continue;
     }
     for (const [index, raw] of (entries as unknown[]).entries()) {
       if (hooks.length > MAX_PLUGIN_HOOKS) return hooks;
-      const hook = parseEntry(raw, { source, event, index }, warnings);
+      const hook = parseEntry(raw, { source, event, index }, report);
       if (hook !== undefined) hooks.push(hook);
     }
   }
@@ -160,12 +179,14 @@ interface EntryPlace {
 function parseEntry(
   raw: unknown,
   where: EntryPlace,
-  warnings: HookWarnings
+  report: ParseReport
 ): PluginHookDefinition | undefined {
   const label = `${where.source}: hook ${where.event}[${where.index}]`;
-  const parsed = readEntry(raw, where, label, warnings);
+  const parsed = readEntry(raw, where, label, report.warnings);
   if (typeof parsed === "string") {
-    warnings.push(`${label}: ${parsed}; ignoring this hook`);
+    report.warnings.push(`${label}: ${parsed}; ignoring this hook`);
+    // The name of a kept hook (hookName); the display marks its controls (shownNotApplied).
+    reportDropped(report, `${where.event}[${where.index}]`, parsed);
     return undefined;
   }
   return withStatus(parsed);
