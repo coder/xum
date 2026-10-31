@@ -2526,6 +2526,16 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
+  test("a dotted plugin name gives its root skill a skill name", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "prompts.chat" }),
+      "SKILL.md": skill("prompts-chat"),
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: "prompts-chat" },
+    ]);
+  });
+
   test("agents in .mdc and .markdown files are listed; .md agents load", async () => {
     const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nBody\n`;
     using kit = await discoverKit({

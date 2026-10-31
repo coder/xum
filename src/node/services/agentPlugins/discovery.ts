@@ -1256,6 +1256,14 @@ async function cursorAgentFilesNotApplied(
     .map((name) => ({ part: "agent", name, reason: "only .md agent files are applied in Xum" }));
 }
 
+/**
+ * Cursor plugin names may contain periods (`prompts.chat`), and skill names may not, so a Cursor
+ * root skill loads under the name with `-` for `.`. Its SKILL.md `name` becomes the display name.
+ */
+function cursorRootSkillName(pluginName: string): string {
+  return pluginName.replaceAll(".", "-");
+}
+
 /** The MCP servers of a Cursor package load in a later Xum build (Cursor plugin RFC PR 3). */
 async function resolvePackageMcpConfig(args: {
   packageKind: {
@@ -1622,7 +1630,7 @@ async function discoverPluginAt(args: {
         ? ["."]
         : undefined),
     rootReal,
-    pluginName: manifest.name,
+    pluginName: cursorFallback ? cursorRootSkillName(manifest.name) : manifest.name,
     resolveComponent,
   });
   // Claude commands load as user-only skills, after every skills root (a skill wins).

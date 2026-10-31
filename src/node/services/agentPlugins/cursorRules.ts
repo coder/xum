@@ -17,6 +17,8 @@ import {
   splitFrontmatter,
   stripUtf8Bom,
 } from "@/node/utils/markdownFrontmatter";
+import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
+import assert from "@/common/utils/assert";
 import { isPlainObject } from "./manifest";
 
 export const CURSOR_RULE_EXTENSIONS = [".md", ".mdc", ".markdown"] as const;
@@ -76,6 +78,23 @@ function ruleSkillDescription(args: {
   return `${base.slice(0, room)}${suffix}`.slice(0, MAX_SKILL_DESCRIPTION_LENGTH);
 }
 
+/**
+ * A Cursor rule is guidance, and Cursor runs nothing in it. A line that skill dynamic context would
+ * run as a shell command when the user invokes the skill (`!`cmd``, skillDynamicContext.ts) gets a
+ * backslash in front, so it stays text: an unmanaged Cursor package has no review that shows it.
+ */
+function inertDirectiveLines(body: string): string {
+  return body
+    .split("\n")
+    .map((line) => {
+      if (skillDynamicDirectiveCommands(line).length === 0) return line;
+      const escaped = `\\${line}`;
+      assert(skillDynamicDirectiveCommands(escaped).length === 0, "escaped rule line still runs");
+      return escaped;
+    })
+    .join("\n");
+}
+
 export interface CursorRuleRefusal {
   reason: string;
   warning: string;
@@ -112,7 +131,13 @@ export function convertCursorRule(
     metadata: { "cursor-rule-type": type },
   };
   try {
-    return { markdown: rewrittenSkillMarkdown(frontmatter, parts.body, `Rule '${rule.file}'`) };
+    return {
+      markdown: rewrittenSkillMarkdown(
+        frontmatter,
+        inertDirectiveLines(parts.body),
+        `Rule '${rule.file}'`
+      ),
+    };
   } catch (error) {
     if (!(error instanceof AgentSkillParseError)) throw error;
     return { reason: "too large once rewritten as a skill", warning: error.message };
