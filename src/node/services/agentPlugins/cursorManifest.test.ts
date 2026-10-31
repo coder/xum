@@ -160,9 +160,8 @@ describe("normalizeCursorManifest fields of the wrong type", () => {
     ["hooks", ["hooks.json"]],
   ])("a wrong-typed %s is listed as a not-applied field", (field, value) => {
     const { notApplied } = load({ [field]: value });
-    expect(notApplied).toEqual([
-      { part: "field", name: field, reason: expect.stringMatching(/^must be /) },
-    ]);
+    expect(notApplied.map((entry) => [entry.part, entry.name])).toEqual([["field", field]]);
+    expect(notApplied[0]?.reason).toMatch(/^must be /);
   });
 });
 
