@@ -15,7 +15,11 @@ import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
-import { collectDefinitionLayers } from "@/common/utils/ai/agentAncestorLayers";
+import {
+  applySettingsBaseChain,
+  chainSettingsBase,
+  collectDefinitionLayers,
+} from "@/common/utils/ai/agentAncestorLayers";
 import {
   execBuffered,
   readFileString,
@@ -620,6 +624,7 @@ async function readAgentDescriptorFromFile(
       uiSelectable: selectable,
       uiColor: parsed.frontmatter.ui?.color,
       subagentRunnable: parsed.frontmatter.subagent?.runnable ?? false,
+      ...backgroundHintField(parsed.frontmatter),
       base: parsed.frontmatter.base,
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
@@ -640,6 +645,12 @@ async function readAgentDescriptorFromFile(
   }
 }
 
+export function backgroundHintField(
+  frontmatter: Pick<AgentDefinitionPackage["frontmatter"], "subagent">
+): { backgroundHint?: true } {
+  return frontmatter.subagent?.background_hint === true ? { backgroundHint: true } : {};
+}
+
 function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
   const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
 
@@ -651,6 +662,7 @@ function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescr
     uiSelectable: selectable,
     uiColor: pkg.frontmatter.ui?.color,
     subagentRunnable: pkg.frontmatter.subagent?.runnable ?? false,
+    ...backgroundHintField(pkg.frontmatter),
     base: pkg.frontmatter.base,
     aiDefaults: pkg.frontmatter.ai,
     tools: pkg.frontmatter.tools,
@@ -1207,7 +1219,12 @@ interface ResolvedAgentDefinitionWithAiChain {
    * resolveAgentInheritanceChain skips, so collectDefinitionLayers over it gives the layers a
    * run of the agent resolves.
    */
-  aiChain: Array<{ id: AgentId; ai?: AgentDefinitionPackage["frontmatter"]["ai"] }>;
+  aiChain: AiChainHop[];
+}
+
+interface AiChainHop {
+  id: AgentId;
+  ai?: AgentDefinitionPackage["frontmatter"]["ai"];
 }
 
 /**
@@ -1387,6 +1404,24 @@ export async function resolveAgentDiscoveryContext(
   };
 }
 
+/**
+ * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26), from the read
+ * chains of every discovered agent: the same chains a run reads, so a run and the list agree.
+ */
+function listedAgentAiSettings(
+  agentId: AgentId,
+  aiChain: AiChainHop[],
+  aiChainsById: ReadonlyMap<string, AiChainHop[]>
+): Pick<AgentDefinitionDescriptor, "aiLayers" | "aiSettingsBase"> {
+  const settingsBase = chainSettingsBase(aiChain);
+  if (settingsBase == null) return { aiLayers: collectDefinitionLayers(agentId, aiChain) };
+  const result = applySettingsBaseChain(agentId, aiChain, aiChainsById.get(settingsBase) ?? null);
+  const aiLayers = collectDefinitionLayers(agentId, result.chain);
+  if (result.ignored == null) return { aiLayers, aiSettingsBase: settingsBase };
+  log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
+  return { aiLayers };
+}
+
 export async function listAgentDefinitions(
   context: AgentDefinitionsContext,
   input: {
@@ -1421,24 +1456,29 @@ export async function listAgentDefinitions(
           }
         );
         const resolvedFrontmatter = resolvedDefinition.definition.frontmatter;
-        if (
-          isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
-          input.includeDisabled !== true
-        )
-          return null;
         return {
           descriptor,
           resolvedFrontmatter,
-          aiLayers: collectDefinitionLayers(descriptor.id, resolvedDefinition.aiChain),
+          aiChain: resolvedDefinition.aiChain,
+          listed:
+            input.includeDisabled === true ||
+            !isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }),
         };
       } catch {
         return { descriptor };
       }
     })
   );
+  // A settings base resolves from every discovered agent, disabled ones included: a run reads a
+  // disabled agent's definition too (resolveAgentAiSettingsChain).
+  const aiChainsById = new Map(
+    resolved.flatMap((entry) =>
+      entry.aiChain != null ? [[entry.descriptor.id, entry.aiChain] as const] : []
+    )
+  );
   return resolved.flatMap((entry) => {
-    if (entry == null) return [];
     if (entry.resolvedFrontmatter == null) return [entry.descriptor];
+    if (!entry.listed) return [];
     const frontmatter = entry.resolvedFrontmatter;
     return [
       {
@@ -1448,9 +1488,10 @@ export async function listAgentDefinitions(
         uiSelectable: resolveAgentVisibility(frontmatter.ui).selectable,
         uiColor: frontmatter.ui?.color,
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
+        ...backgroundHintField(frontmatter),
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
-        aiLayers: entry.aiLayers,
+        ...listedAgentAiSettings(entry.descriptor.id, entry.aiChain, aiChainsById),
         tools: frontmatter.tools,
       },
     ];

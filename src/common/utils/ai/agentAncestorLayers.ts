@@ -10,6 +10,7 @@ import type {
   AgentAiAncestorLayer,
   AgentAiDefinitionDefaults,
 } from "@/common/types/agentAiSettings";
+import assert from "@/common/utils/assert";
 
 export interface AgentAncestorDescriptor {
   base?: string;
@@ -101,4 +102,84 @@ export function collectDefinitionLayers(
     }
   }
   return { targetDefinitionAiDefaults, ancestors };
+}
+
+/** AI-settings walks follow this in place of `base` (Cursor plugin RFC, D11). */
+export function aiSettingsBaseOf(agent: { base?: string; aiSettingsBase?: string }) {
+  return agent.aiSettingsBase ?? agent.base;
+}
+
+export interface ListedAgentAiAncestry {
+  id: string;
+  base?: string;
+  aiSettingsBase?: string;
+  aiLayers?: { ancestors: readonly AgentAiAncestorLayer[] };
+}
+
+/**
+ * The hops of the listed agents' resolved ancestry through agents the list leaves out, such as a
+ * disabled Explore that a `fast` agent's settings base names: without them a declared-base walk
+ * stops at the unlisted agent, while a run goes on to its bases.
+ */
+export function collectUnlistedAncestorHops(
+  agents: readonly ListedAgentAiAncestry[]
+): Map<string, AgentAncestorDescriptor> {
+  const listed = new Set(agents.map((agent) => agent.id));
+  const hops = new Map<string, AgentAncestorDescriptor>();
+  for (const agent of agents) {
+    const ancestors = agent.aiLayers?.ancestors ?? [];
+    ancestors.forEach((layer, index) => {
+      if (listed.has(layer.agentId) || hops.has(layer.agentId)) return;
+      hops.set(layer.agentId, {
+        base: ancestors[index + 1]?.agentId,
+        definitionAiDefaults: layer.definitionAiDefaults,
+      });
+    });
+  }
+  return hops;
+}
+
+export function getAgentAiSettingsBases(
+  agents: readonly ListedAgentAiAncestry[]
+): Map<string, string | undefined> {
+  return new Map([
+    ...[...collectUnlistedAncestorHops(agents)].map(([id, hop]) => [id, hop.base] as const),
+    ...agents.map((agent) => [agent.id, aiSettingsBaseOf(agent)] as const),
+  ]);
+}
+
+/** The closest hop wins, as in the base-merged frontmatter. */
+export function chainSettingsBase(
+  chain: ReadonlyArray<{ ai?: { settingsBase?: string } }>
+): string | undefined {
+  return chain.find((entry) => entry.ai?.settingsBase != null)?.ai?.settingsBase;
+}
+
+export type SettingsBaseIgnoredReason = "missing" | "self" | "cycle" | "nested";
+
+/**
+ * The AI-settings chain of an agent with `ai.settingsBase` (Cursor plugin RFC, D11, D26): the
+ * agent's own entries (its same-ID scope refinements), then the settings-base agent's chain in
+ * place of the agent's own bases. Both chains are target first. `settingsBaseChain` is null
+ * when the settings-base agent could not be read. A missing, self, cyclic or nested settings
+ * base (one whose chain sets `ai.settingsBase` again) is ignored: the own chain comes back with
+ * the reason, so every consumer falls back to `base` instead of following settings bases further.
+ */
+export function applySettingsBaseChain<T extends { id: string; ai?: { settingsBase?: string } }>(
+  agentId: string,
+  ownChain: readonly T[],
+  settingsBaseChain: readonly T[] | null
+): { chain: T[]; ignored?: SettingsBaseIgnoredReason } {
+  if (settingsBaseChain === null) return { chain: [...ownChain], ignored: "missing" };
+  assert(settingsBaseChain.length > 0, "applySettingsBaseChain: a read chain starts at its agent");
+  if (settingsBaseChain[0].id === agentId) return { chain: [...ownChain], ignored: "self" };
+  if (settingsBaseChain.some((entry) => entry.id === agentId)) {
+    return { chain: [...ownChain], ignored: "cycle" };
+  }
+  if (chainSettingsBase(settingsBaseChain) != null) {
+    return { chain: [...ownChain], ignored: "nested" };
+  }
+  const firstBase = ownChain.findIndex((entry) => entry.id !== agentId);
+  const ownEntries = firstBase === -1 ? ownChain : ownChain.slice(0, firstBase);
+  return { chain: [...ownEntries, ...settingsBaseChain] };
 }

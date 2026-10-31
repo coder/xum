@@ -12,7 +12,9 @@ import type {
   ResolvedAgentAiSettings,
 } from "@/common/types/agentAiSettings";
 import {
+  aiSettingsBaseOf,
   collectDeclaredAncestorLayers,
+  collectUnlistedAncestorHops,
   type AgentAncestorDescriptor,
 } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings as resolveAgentAiSettingsShared } from "@/common/utils/ai/resolveAgentAiSettings";
@@ -64,9 +66,16 @@ export async function resolveAcpAgentAiSettings(
   ]);
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
-  const agentDefsById = new Map<string, AgentAncestorDescriptor>(
-    agents.map((agent) => [agent.id, { base: agent.base, definitionAiDefaults: agent.aiDefaults }])
-  );
+  const agentDefsById = new Map<string, AgentAncestorDescriptor>([
+    ...collectUnlistedAncestorHops(agents),
+    ...agents.map(
+      (agent) =>
+        [
+          agent.id,
+          { base: aiSettingsBaseOf(agent), definitionAiDefaults: agent.aiDefaults },
+        ] as const
+    ),
+  ]);
 
   return resolveAgentAiSettingsShared({
     targetAgentId: trimmedAgentId,

@@ -110,6 +110,33 @@ describe("task tool", () => {
     expect(paragraphCount([agent("explore"), agent("desktop", "project")])).toBe(base);
   });
 
+  it("marks agents meant to run in the background without changing the run_in_background default", () => {
+    using tempDir = new TestTempDir("test-task-tool-background-hint");
+    const agent = (id: string, backgroundHint?: true): AgentDefinitionDescriptor => ({
+      id,
+      scope: "global",
+      name: id,
+      description: `${id} agent`,
+      uiSelectable: false,
+      subagentRunnable: true,
+      ...(backgroundHint ? { backgroundHint } : {}),
+    });
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      availableSubagents: [agent("ci-watcher", true), agent("reviewer")],
+    });
+    const lines = String(tool.description).split("\n");
+
+    expect(lines).toContain(
+      "- ci-watcher: ci-watcher agent [meant to run in the background (run_in_background=true)]"
+    );
+    expect(lines).toContain("- reviewer: reviewer agent");
+    const parsed = (
+      tool.inputSchema as { parse: (v: unknown) => { run_in_background?: boolean | null } }
+    ).parse({ agentId: "ci-watcher", prompt: "watch", title: "CI watcher" });
+    expect(parsed.run_in_background).toBe(false);
+  });
+
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits
   // `isolation` rejects the field outright, proving it never enters LLM context for that runtime.
   const parseWithIsolation = (tool: ReturnType<typeof createTaskTool>) =>

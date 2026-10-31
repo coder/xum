@@ -48,7 +48,11 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
-import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
+import {
+  aiSettingsBaseOf,
+  collectDeclaredAncestorLayers,
+  getAgentAiSettingsBases,
+} from "@/common/utils/ai/agentAncestorLayers";
 import { CacheTtlSchema } from "@/common/config/schemas/providersConfig";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
@@ -465,7 +469,7 @@ function buildPromptCacheTtlProps(input: {
         input.listedAgents.map((agent) => [
           agent.id,
           {
-            base: agent.base,
+            base: aiSettingsBaseOf(agent),
             // A resolved agent's aiDefaults merge its bases' frontmatter, which the backend
             // ranks below those bases' Settings, so the walk takes only its own layer.
             definitionAiDefaults: agent.aiLayers
@@ -926,13 +930,13 @@ export function TasksSection() {
   const resolveBaseChainDefaults = (
     agentId: string
   ): { modelString?: string; reasoningMode?: OpenAIReasoningMode } => {
-    const agentsById = new Map(listedAgents.map((agent) => [agent.id, agent]));
+    const aiSettingsBases = getAgentAiSettingsBases(listedAgents);
     const visited = new Set<string>([agentId]);
     let cursor = agentId;
     let modelString: string | undefined;
     let reasoningMode: OpenAIReasoningMode | undefined;
     while (modelString === undefined || reasoningMode === undefined) {
-      const base = agentsById.get(cursor)?.base ?? (cursor === "plan" ? "plan" : "exec");
+      const base = aiSettingsBases.get(cursor) ?? (cursor === "plan" ? "plan" : "exec");
       if (base === cursor || visited.has(base)) {
         break;
       }
