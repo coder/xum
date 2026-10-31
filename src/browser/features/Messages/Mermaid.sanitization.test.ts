@@ -275,6 +275,35 @@ describe("sanitizeMermaidSvg", () => {
     ]);
   });
 
+  // CSS reads \" in a string as an escaped quote and skips comments, so the text between the
+  // quotes or inside the comment is inert. A sanitizer that reads it as declarations makes it live.
+  const hidden = "position:fixed;inset:0;width:100vw;height:100vh;background:red";
+  const withDivStyle = (style: string) =>
+    svgWith(peleMathLabel().replace('style="display:flex"', `style="${style}"`));
+  it.each([
+    [
+      "Q1",
+      svgWith(`<rect style="font-family:&quot;a\\&quot;;fill:red&quot;;stroke:blue"/>`),
+      "fill:red",
+    ],
+    ["Q2", svgWith(`<rect style="font-family:&quot;\\&quot;;${hidden};x:&quot;"/>`), hidden],
+    ["Q3", svgWith(`<rect style="font-family:'a\\';fill:red';stroke:blue"/>`), "fill:red"],
+    ["Q13", svgRoot(`style="font-family:&quot;\\&quot;;${hidden};x:&quot;"`), hidden],
+    ["Q14", withDivStyle(`font-family:&quot;\\&quot;;${hidden};x:&quot;`), hidden],
+    ["a comment", svgWith(`<rect style="font-family:a/*;${hidden};*/"/>`), hidden],
+  ])("keeps no declaration that CSS reads as text in %s", (_case, svg, text) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+    const pieces = text.split(";");
+
+    expect(sanitized).toContain("<rect");
+    expect(pieces.filter((piece) => sanitized.includes(piece))).toEqual([]);
+    expect(
+      htmlParts(sanitized).filter(
+        (part) => part.includes("position") || pieces.some((piece) => part.includes(piece))
+      )
+    ).toEqual([]);
+  });
+
   it("keeps an id list with whitespace around its ids", () => {
     const sanitized =
       sanitizeMermaidSvg(
