@@ -1,15 +1,20 @@
 // Characterization tests for TaskService.dispatchTrustedDescendantMessage, written before the method
-// is split into steps. They drive it through sendMessageToDescendantAgentTask and pin: the result and
-// the row of each path, the lock scopes (a trace of the mutex, the event lock, the task-tree lock,
-// the desktop gate and every config edit), and that an inactive target goes to
-// reactivateInactiveAgentTask in the tick of the inactive decision. The reactivation itself is a
-// stub here: the reawakening suites cover it.
+// is split into steps. They drive it through sendMessageToDescendantAgentTask (and the sibling route)
+// and pin: the result and the row of each path, which refusal wins when several apply, the lock
+// scopes (a trace of the mutex, the event lock, the task-tree lock, the desktop gate and every config
+// edit), that an inactive target goes to reactivateInactiveAgentTask in the tick of the inactive
+// decision, and the exact send options and hooks of the live path. The reactivation itself is a stub
+// here: the reawakening suites cover it.
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { createMuxMessage } from "@/common/types/message";
+import type { SendMessageError } from "@/common/types/errors";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { defaultModel } from "@/common/utils/ai/models";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import type { PreparedReawakenAi } from "@/node/services/agentTaskReawakenAi";
 import type {
   SendAgentTaskMessageError,
@@ -24,6 +29,7 @@ import {
   projectWorkspace,
   saveWorkspacesWithCheckouts,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -40,6 +46,8 @@ const PARENT = "parent";
 const CHILD = "child";
 /** A second tree root: an out-of-scope sender, or the child's new parent. */
 const OTHER = "other-root";
+/** CHILD's running sibling, the sender of family messages. */
+const SIB = "sib";
 const ATTEMPT = "att_00000000000000a1";
 const MESSAGE = "Fix the parser.";
 const LABEL = "Label";
@@ -117,6 +125,16 @@ async function editRow(config: Config, id: string, edit: (row: WorkspaceConfigEn
   });
 }
 
+/** Removes one config row, as a removal does. */
+async function removeRow(config: Config, id: string) {
+  await config.editConfig((cfg) => {
+    for (const project of cfg.projects.values()) {
+      project.workspaces = project.workspaces.filter((workspace) => workspace.id !== id);
+    }
+    return cfg;
+  });
+}
+
 describe("TaskService.dispatchTrustedDescendantMessage", () => {
   let rootDir: string;
   // Each test awaits every send it starts. The background work left: terminal-attention drains of
@@ -151,6 +169,10 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
       [
         projectWorkspace(projectPath, "parent", PARENT),
         projectWorkspace(projectPath, "other", OTHER),
+        projectWorkspace(projectPath, "sib", SIB, {
+          parentWorkspaceId: PARENT,
+          taskStatus: "running",
+        }),
         projectWorkspace(projectPath, "child", CHILD, {
           parentWorkspaceId: PARENT,
           agentId: "exec",
@@ -186,7 +208,7 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
         _message: string,
         _options: unknown,
         internal?: { onAccepted?: () => Promise<void> }
-      ): Promise<Result<void>> => {
+      ): Promise<Result<void, SendMessageError>> => {
         trace.push("send+");
         if (flags.accept) await internal?.onAccepted?.();
         trace.push("send-");
@@ -194,7 +216,11 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
       }
     );
     const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const waitForIdle = mock(() => Promise.resolve());
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage,
+      waitForIdleAndNoQueuedMessages: waitForIdle,
+    });
     const { taskService, historyService } = createTaskServiceHarness(config, {
       aiService,
       workspaceService,
@@ -252,7 +278,7 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
       taskService.sendMessageToDescendantAgentTask(PARENT, CHILD, MESSAGE, mode, sendOptions);
     return {
       ...{ config, taskService, historyService, trace, lockKeys, flags, isStreaming, sendMessage },
-      ...{ appendToHistory, prepare, reactivations, passedAtReactivation, send },
+      ...{ appendToHistory, prepare, reactivations, passedAtReactivation, send, waitForIdle },
       row: () => findWorkspaceInConfig(config, CHILD),
       history: async () => (await collectFullHistory(historyService, CHILD)).map((m) => m.id),
     };
@@ -373,6 +399,85 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
     });
   });
 
+  // When several refusals apply, the first one in the method wins.
+  test.each([
+    {
+      name: "a missing target is not found before the scope check",
+      child: {},
+      target: "ghost",
+      sender: PARENT,
+      expected: Err({ code: "not_found" }),
+    },
+    {
+      name: "an out-of-scope sender is refused before the queued splice",
+      child: { taskStatus: "queued", taskPrompt: "Brief" },
+      sender: OTHER,
+      expected: Err({ code: "invalid_scope" }),
+      after: { taskPrompt: "Brief" },
+    },
+    {
+      name: "an archived queued target without a prompt is reawakened before the prompt check",
+      child: { taskStatus: "queued", archivedAt: ARCHIVED_AT },
+      expected: REACTIVATED,
+    },
+    {
+      name: "a status that takes no guidance is refused before the checkout probe",
+      child: { taskStatus: "starting" },
+      checkout: false,
+      expected: Err({ code: "not_active", taskStatus: "starting" }),
+      after: { taskStatus: "starting" },
+    },
+    {
+      name: "a missing checkout is refused before the guidance is reserved",
+      child: { taskStatus: undefined },
+      checkout: false,
+      expected: Err({ code: "send_failed", message: PROSE }),
+      after: { taskStatus: undefined },
+    },
+    {
+      name: "an awaiting_report target takes guidance and runs again",
+      child: { taskStatus: "awaiting_report" },
+      expected: Ok({ delivery: "accepted" }),
+      sends: 1,
+      after: { taskStatus: "running" },
+    },
+    {
+      name: "a streaming target takes guidance whatever its status",
+      child: { taskStatus: "starting" },
+      streaming: true,
+      expected: Ok({ delivery: "accepted" }),
+      sends: 1,
+      after: { taskStatus: "starting" },
+    },
+  ] satisfies Array<{
+    name: string;
+    child: Partial<WorkspaceConfigEntry>;
+    target?: string;
+    sender?: string;
+    checkout?: boolean;
+    streaming?: boolean;
+    expected: DispatchResult;
+    sends?: number;
+    after?: Partial<WorkspaceConfigEntry>;
+  }>)("$name", async (c) => {
+    const s = await setup(c.child, { checkout: c.checkout ?? true });
+    s.flags.streaming = c.streaming ?? false;
+    const result = await s.taskService.sendMessageToDescendantAgentTask(
+      c.sender ?? PARENT,
+      c.target ?? CHILD,
+      MESSAGE,
+      "tool-end"
+    );
+    expect(result).toStrictEqual(c.expected);
+    expect(s.sendMessage).toHaveBeenCalledTimes(c.sends ?? 0);
+    expect(s.reactivations).toHaveLength(c.expected === REACTIVATED ? 1 : 0);
+    const row = s.row();
+    expect(row?.taskPendingGuidance).toBe(undefined);
+    for (const [key, value] of Object.entries(c.after ?? {})) {
+      expect([key, row?.[key as keyof WorkspaceConfigEntry]]).toEqual([key, value]);
+    }
+  });
+
   test("live guidance is reserved under the desktop gate and sent under both task locks", async () => {
     // Missing status is a legacy running task: the reservation persists `running`.
     const s = await setup({ taskStatus: undefined });
@@ -433,5 +538,295 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
     expect(s.isStreaming.mock.calls).toEqual([[CHILD], [CHILD]]);
     // The locks stay held until the reactivation settled.
     expect(s.trace).toEqual([...LOCKED, ...c.reads, ...REAWAKEN_TAIL]);
+  });
+
+  // The five model fields that the shared-helper PR moves (buildActiveTaskAiSendOptions), and the
+  // hooks object of the send. Without a label the durable guidance keeps the bare message.
+  test.each([
+    {
+      name: "the agent's settings win over the legacy settings and the task fields",
+      label: LABEL,
+      mode: "turn-end" as const,
+      child: {
+        agentId: "explore",
+        agentType: "explore",
+        aiSettingsByAgent: {
+          explore: {
+            model: "openai:gpt-5.2",
+            thinkingLevel: "low",
+            reasoningMode: "pro",
+            serviceTier: "priority",
+          },
+        },
+        aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+        taskModelString: "anthropic:claude-sonnet-4-5",
+        taskThinkingLevel: "medium",
+      },
+      fields: {
+        model: "openai:gpt-5.2",
+        agentId: "explore",
+        thinkingLevel: "low",
+        reasoningMode: "pro",
+        serviceTier: "priority",
+      },
+    },
+    {
+      name: "a blank model and unset fields fall back to the task fields; unknown modes drop",
+      child: {
+        aiSettings: { model: " ", reasoningMode: "bogus", serviceTier: "bogus" },
+        taskModelString: "openai:gpt-5.2",
+        taskThinkingLevel: "medium",
+      },
+      fields: { model: "openai:gpt-5.2", agentId: "exec", thinkingLevel: "medium" },
+    },
+    {
+      name: "without any settings or task model the default model is used",
+      child: {},
+      fields: { model: defaultModel, agentId: "exec", thinkingLevel: undefined },
+    },
+  ])("send options: $name", async (c) => {
+    const s = await setup({ taskStatus: "running", ...(c.child as Partial<WorkspaceConfigEntry>) });
+    s.flags.accept = false;
+    const mode = c.mode ?? "tool-end";
+    const sent = await s.send(mode, c.label != null ? { messageLabel: c.label } : {});
+    expect(sent).toStrictEqual(Ok({ delivery: "queued", queueDispatchMode: mode }));
+    expect(s.sendMessage).toHaveBeenCalledTimes(1);
+    const [workspaceId, message, options, internal] = s.sendMessage.mock.calls[0] as unknown as [
+      string,
+      string,
+      unknown,
+      Record<string, unknown>,
+    ];
+    // Unlabeled, the sent message carries the default label (prose): only the labeled case reads it.
+    expect([workspaceId, c.label != null ? message : LABELED]).toEqual([CHILD, LABELED]);
+    expect(options).toStrictEqual({
+      reasoningMode: undefined,
+      serviceTier: undefined,
+      ...c.fields,
+      queueDispatchMode: mode,
+    });
+    const guidance = s.row()?.taskPendingGuidance;
+    expect(guidance).toEqual([
+      { id: PROSE, message: c.label != null ? LABELED : MESSAGE, queueDispatchMode: mode },
+    ]);
+    const isHook = ([, value]: [string, unknown]) => typeof value === "function";
+    const entries = Object.entries(internal);
+    expect(
+      entries
+        .filter(isHook)
+        .map(([key]) => key)
+        .sort()
+    ).toEqual(["onAccepted", "onAcceptedPreStreamFailure", "onCanceled"]);
+    expect(Object.fromEntries(entries.filter((entry) => !isHook(entry)))).toStrictEqual({
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+      agentInitiated: true,
+      startStreamInBackground: true,
+      queueDedupeKey: guidance?.[0]?.id,
+      workspaceTurnContinuation: false,
+      preTurnMessages: undefined,
+    });
+  });
+
+  test("an empty pre-turn list appends nothing to a queued target", async () => {
+    const s = await setup({ taskStatus: "queued", taskPrompt: "Brief" });
+    expect(await s.send("tool-end", { preTurnMessages: [] })).toStrictEqual(
+      Ok({ delivery: "queued" })
+    );
+    expect(s.trace).toEqual(["mutex+", "edit", "mutex-"]);
+  });
+
+  test("a child removed during the definition read is not found", async () => {
+    const s = await setup({ taskStatus: "running" });
+    s.prepare.mockImplementation(async () => {
+      await removeRow(s.config, CHILD);
+      return undefined;
+    });
+    expect(await s.send()).toStrictEqual(Err({ code: "not_found" }));
+    expect(s.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("a child removed during the checkout probe still gets its guidance sent", async () => {
+    const s = await setup({ taskStatus: "running" });
+    const create = runtimeHelpers.createRuntimeForWorkspace;
+    spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockImplementation((...args) => {
+      const runtime = create(...args);
+      const ensureReady = runtime.ensureReady.bind(runtime);
+      runtime.ensureReady = async (...readyArgs) => {
+        await removeRow(s.config, CHILD);
+        return ensureReady(...readyArgs);
+      };
+      return runtime;
+    });
+    expect(await s.send()).toStrictEqual(Ok({ delivery: "accepted" }));
+    expect(s.row()).toBe(undefined);
+  });
+
+  // An unreachable host refuses the send; any other definition-read failure propagates. Both
+  // before the task locks.
+  test.each([
+    {
+      name: "an unreachable host",
+      error: new RuntimeError("ssh: reset", "network"),
+      refused: true,
+    },
+    { name: "another failure", error: new Error("read failed"), refused: false },
+  ])("a definition read that fails with $name", async (c) => {
+    const s = await setup({ taskStatus: "reported" });
+    s.prepare.mockImplementation(() => {
+      s.trace.push("prepare");
+      return Promise.reject(c.error);
+    });
+    const outcome = await s.send().then(
+      (result) => ({ result }),
+      (thrown: unknown) => ({ thrown })
+    );
+    expect(outcome).toStrictEqual(
+      c.refused ? { result: Err({ code: "send_failed", message: PROSE }) } : { thrown: c.error }
+    );
+    expect(s.trace).toEqual(["mutex+", "mutex-", "prepare"]);
+    expect(s.reactivations).toEqual([]);
+  });
+
+  // F54: a message to an inactive target that still streams waits for it to go idle. A redelivery
+  // that finds it streaming again waits again, and keeps the Stop fence of the original send.
+  test("a deferred message waits again while the target still streams", async () => {
+    const s = await setup({ taskStatus: "reported" });
+    s.flags.streaming = true;
+    let epoch = 1;
+    spyOn(s.taskService, "getWorkspaceStopEpoch").mockImplementation(() => epoch);
+    let waits = 0;
+    s.waitForIdle.mockImplementation(() => {
+      // A Stop lands during the first wait; the stream ends during the second.
+      epoch = 2;
+      waits += 1;
+      s.flags.streaming = waits < 2;
+      return Promise.resolve();
+    });
+    expect(await s.send("turn-end")).toStrictEqual(
+      Ok({ delivery: "queued", queueDispatchMode: "turn-end" })
+    );
+    await flushTerminalAttentionDrains(s.taskService);
+    expect(waits).toBe(2);
+    expect(s.reactivations.map((params) => params.stopFence)).toEqual([
+      new Map([
+        [CHILD, 1],
+        [PARENT, 1],
+      ]),
+    ]);
+  });
+
+  describe("sibling sender", () => {
+    test("reawakens an inactive target without a definition read or an AI refresh", async () => {
+      const s = await setup({ taskStatus: "reported" });
+      const result = await s.taskService.sendMessageToSiblingAgentTask(
+        SIB,
+        CHILD,
+        MESSAGE,
+        "turn-end"
+      );
+      expect(result).toBe(REACTIVATED);
+      expect(s.prepare).not.toHaveBeenCalled();
+      const [params] = s.reactivations;
+      expect(Object.keys(params ?? {}).sort()).toEqual([
+        ...["ancestorWorkspaceId", "message", "preTurnMessages", "prependKeptBrief"],
+        ...["queueDispatchMode", "stopFence", "taskId"],
+      ]);
+      expect([params?.ancestorWorkspaceId, params?.queueDispatchMode]).toEqual([
+        PARENT,
+        "turn-end",
+      ]);
+      expect((params?.preTurnMessages as MuxMessage[]).map((row) => row.role)).toEqual([
+        "assistant",
+      ]);
+    });
+
+    test("a live target gets the payload row with the trigger and the recipient's hold", async () => {
+      const s = await setup({ taskStatus: "running" });
+      s.flags.accept = false;
+      const result = await s.taskService.sendMessageToSiblingAgentTask(
+        SIB,
+        CHILD,
+        MESSAGE,
+        "tool-end"
+      );
+      expect(result).toStrictEqual(Ok({ delivery: "queued", queueDispatchMode: "tool-end" }));
+      const [, message, , internal] = s.sendMessage.mock.calls[0] as unknown as [
+        string,
+        string,
+        unknown,
+        { honorRecipientHold?: boolean; preTurnMessages?: MuxMessage[] },
+      ];
+      expect(internal.honorRecipientHold).toBe(true);
+      expect(internal.preTurnMessages?.map((row) => row.role)).toEqual(["assistant"]);
+      // A labeled message keeps its label in the durable guidance.
+      expect(s.row()?.taskPendingGuidance?.map((guidance) => guidance.message)).toEqual([message]);
+      expect(s.prepare).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("send failures", () => {
+    interface Hooks {
+      onCanceled(reason: string): Promise<void>;
+      onAcceptedPreStreamFailure(error: SendMessageError): Promise<void>;
+    }
+    const hooksOf = (s: Awaited<ReturnType<typeof setup>>) =>
+      s.sendMessage.mock.calls.at(-1)?.[3] as unknown as Hooks;
+    const BOOM: SendMessageError = { type: "unknown", raw: "boom" };
+
+    // An idle child goes to completion recovery; a streaming one gets back its previous status.
+    test.each([
+      { name: "an idle", child: { taskStatus: "running" as const }, streaming: false },
+      { name: "a streaming", child: { taskStatus: "awaiting_report" as const }, streaming: true },
+    ])("a refused send to $name child drops the guidance", async (c) => {
+      const s = await setup(c.child);
+      s.flags.streaming = c.streaming;
+      s.sendMessage.mockImplementationOnce(() => Promise.resolve(Err(BOOM)));
+      expect(await s.send()).toStrictEqual(Err({ code: "send_failed", message: "boom" }));
+      const row = s.row();
+      expect([row?.taskStatus, row?.taskPendingGuidance]).toEqual(["awaiting_report", undefined]);
+    });
+
+    test("a canceled send without a continuation drops the guidance only", async () => {
+      const s = await setup({ taskStatus: "running" });
+      const manager = workspaceTurnManagerFor(s.taskService);
+      const settle = spyOn(manager, "settleWorkspaceTurnContinuationFailure").mockResolvedValue();
+      s.flags.accept = false;
+      await s.send();
+      await hooksOf(s).onCanceled("stopped");
+      expect([s.row()?.taskStatus, s.row()?.taskPendingGuidance]).toEqual([
+        "awaiting_report",
+        undefined,
+      ]);
+      expect(settle).not.toHaveBeenCalled();
+    });
+
+    test("a canceled or failed continuation send settles that continuation", async () => {
+      const s = await setup({ taskStatus: "reported" });
+      await startLiveWorkspaceTurn(s.taskService, s.config, {
+        ownerWorkspaceId: PARENT,
+        workspaceId: CHILD,
+        handleId: "wst_live",
+      });
+      const manager = workspaceTurnManagerFor(s.taskService);
+      const settle = spyOn(manager, "settleWorkspaceTurnContinuationFailure").mockResolvedValue();
+      s.flags.accept = false;
+      await s.send();
+      await hooksOf(s).onCanceled("stopped");
+      expect(s.row()?.taskPendingGuidance).toBe(undefined);
+      await s.send();
+      await hooksOf(s).onAcceptedPreStreamFailure(BOOM);
+      expect(s.row()?.taskPendingGuidance).toBe(undefined);
+      const meta = {
+        type: "workspace-turn-task" as const,
+        taskHandleId: "wst_live",
+        ownerWorkspaceId: PARENT,
+        turnId: "wst_live-turn",
+      };
+      expect(settle.mock.calls).toEqual([
+        [CHILD, meta, "interrupted", "stopped"],
+        [CHILD, meta, "error", "boom"],
+      ]);
+    });
   });
 });
