@@ -17,8 +17,8 @@ import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   applySettingsBaseChain,
-  chainSettingsBase,
   collectDefinitionLayers,
+  settingsBaseHop,
 } from "@/common/utils/ai/agentAncestorLayers";
 import {
   execBuffered,
@@ -1225,6 +1225,7 @@ interface ResolvedAgentDefinitionWithAiChain {
 interface AiChainHop {
   id: AgentId;
   ai?: AgentDefinitionPackage["frontmatter"]["ai"];
+  scope: AgentDefinitionScope;
 }
 
 /**
@@ -1277,7 +1278,7 @@ async function resolveAgentDefinitionWithAiChain(
     }
     visited.add(visitKey);
 
-    const hop = { id: pkg.id, ai: pkg.frontmatter.ai };
+    const hop = { id: pkg.id, ai: pkg.frontmatter.ai, scope: pkg.scope };
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
       return { definition: pkg, aiChain: [hop] };
@@ -1405,17 +1406,26 @@ export async function resolveAgentDiscoveryContext(
 }
 
 /**
- * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26), from the read
- * chains of every discovered agent: the same chains a run reads, so a run and the list agree.
+ * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26). The settings
+ * base is read as a run reads it (resolveAgentAiSettingsChain): anchored to the declaring hop's
+ * scope, and whether or not it is disabled.
  */
-function listedAgentAiSettings(
+async function listedAgentAiSettings(
   agentId: AgentId,
   aiChain: AiChainHop[],
-  aiChainsById: ReadonlyMap<string, AiChainHop[]>
-): Pick<AgentDefinitionDescriptor, "aiLayers" | "aiSettingsBase"> {
-  const settingsBase = chainSettingsBase(aiChain);
-  if (settingsBase == null) return { aiLayers: collectDefinitionLayers(agentId, aiChain) };
-  const result = applySettingsBaseChain(agentId, aiChain, aiChainsById.get(settingsBase) ?? null);
+  readAiChain: (id: AgentId, skipScopesAbove?: AgentDefinitionScope) => Promise<AiChainHop[] | null>
+): Promise<Pick<AgentDefinitionDescriptor, "aiLayers" | "aiSettingsBase">> {
+  const hop = settingsBaseHop(aiChain);
+  const settingsBase = hop?.ai?.settingsBase;
+  if (hop == null || settingsBase == null) {
+    return { aiLayers: collectDefinitionLayers(agentId, aiChain) };
+  }
+  const skipScopesAbove = computeBaseSkipScope(settingsBase, hop.id, hop.scope);
+  const result = applySettingsBaseChain(
+    agentId,
+    aiChain,
+    await readAiChain(settingsBase, skipScopesAbove)
+  );
   const aiLayers = collectDefinitionLayers(agentId, result.chain);
   if (result.ignored == null) return { aiLayers, aiSettingsBase: settingsBase };
   log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
@@ -1442,6 +1452,15 @@ export async function listAgentDefinitions(
     runtimeFactory,
   });
   const cfg = context.config.loadConfigOrDefault();
+  const readAiChain = (agentId: AgentId, skipScopesAbove?: AgentDefinitionScope) =>
+    resolveAgentDefinitionWithAiChain(runtime, discoveryPath, agentId, {
+      skipScopesAbove,
+      projectPluginsTrusted,
+      runtimeFactory,
+    }).then(
+      (resolvedDefinition) => resolvedDefinition.aiChain,
+      () => null
+    );
   const resolved = await Promise.all(
     descriptors.map(async (descriptor) => {
       try {
@@ -1456,29 +1475,28 @@ export async function listAgentDefinitions(
           }
         );
         const resolvedFrontmatter = resolvedDefinition.definition.frontmatter;
+        if (
+          isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
+          input.includeDisabled !== true
+        )
+          return null;
         return {
           descriptor,
           resolvedFrontmatter,
-          aiChain: resolvedDefinition.aiChain,
-          listed:
-            input.includeDisabled === true ||
-            !isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }),
+          aiSettings: await listedAgentAiSettings(
+            descriptor.id,
+            resolvedDefinition.aiChain,
+            readAiChain
+          ),
         };
       } catch {
         return { descriptor };
       }
     })
   );
-  // A settings base resolves from every discovered agent, disabled ones included: a run reads a
-  // disabled agent's definition too (resolveAgentAiSettingsChain).
-  const aiChainsById = new Map(
-    resolved.flatMap((entry) =>
-      entry.aiChain != null ? [[entry.descriptor.id, entry.aiChain] as const] : []
-    )
-  );
   return resolved.flatMap((entry) => {
+    if (entry == null) return [];
     if (entry.resolvedFrontmatter == null) return [entry.descriptor];
-    if (!entry.listed) return [];
     const frontmatter = entry.resolvedFrontmatter;
     return [
       {
@@ -1491,7 +1509,7 @@ export async function listAgentDefinitions(
         ...backgroundHintField(frontmatter),
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
-        ...listedAgentAiSettings(entry.descriptor.id, entry.aiChain, aiChainsById),
+        ...entry.aiSettings,
         tools: frontmatter.tools,
       },
     ];

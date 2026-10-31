@@ -418,7 +418,7 @@ describe("resolveNodeAgentAiSettings with ai.settingsBase (Cursor model: fast)",
     ["ci-watcher", "self", {}],
     ["helper", "nested", HELPER],
     // agents.list cannot resolve an agent whose base is missing, so a run ignores it as well.
-    ["broken", "missing", { broken: "base: missing-base\n" }],
+    ["broken", "incomplete", { broken: "base: missing-base\n" }],
   ])("ignores settingsBase %s with a warning", async (settingsBase, reason, otherAgents) => {
     const warn = spyOn(log, "warn");
     try {
@@ -444,6 +444,63 @@ describe("resolveNodeAgentAiSettings with ai.settingsBase (Cursor model: fast)",
       });
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  it("ignores the settings base of an agent whose own base is missing", async () => {
+    const warn = spyOn(log, "warn");
+    try {
+      const cfg = { agentAiDefaults: { explore: { modelString: MODEL_A } } };
+      const params = { cfg, parentRuntime: { model: MODEL_C } };
+      const ignored = await resolveWatcher(
+        "base: missing-base\nai:\n  settingsBase: explore\n",
+        params
+      );
+      expect(ignored).toEqual(await resolveWatcher("base: missing-base\n", params));
+      expect(ignored.selected.model).toBe(MODEL_C);
+      expect(warn).toHaveBeenCalledWith("settingsBase ignored", {
+        agentId: "ci-watcher",
+        settingsBase: "explore",
+        reason: "incomplete",
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads a global agent's settings base past a project agent of that ID", async () => {
+    using project = new DisposableTempDir("settings-base-scope-project");
+    using home = new DisposableTempDir("settings-base-scope-home");
+    await fs.mkdir(path.join(project.path, ".xum", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(project.path, ".xum", "agents", "explore.md"),
+      `---\nname: Explore\nbase: exec\nai:\n  model: ${MODEL_A}\n---\nExplore.\n`
+    );
+    await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(home.path, "agents", "ci-watcher.md"),
+      "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: explore\n---\nWatch CI.\n"
+    );
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const resolved = await resolveNodeAgentAiSettings({
+        agentId: "ci-watcher",
+        profile: "subagent",
+        cfg: {},
+        parentRuntime: { model: MODEL_C },
+        definitionContext: {
+          runtime: new LocalRuntime(project.path),
+          workspacePath: project.path,
+          workspaceId: "ws",
+          runtimeFactory,
+        },
+      });
+      // The built-in Explore sets no model: the project explore.md's model must not reach it.
+      expect(resolved.selected.model).toBe(MODEL_C);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
     }
   });
 

@@ -8,6 +8,7 @@
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import type {
   AgentAiAncestorLayer,
   AgentAiDefinitionDefaults,
@@ -22,8 +23,8 @@ import type {
 } from "@/common/types/thinking";
 import {
   applySettingsBaseChain,
-  chainSettingsBase,
   collectDefinitionLayers,
+  settingsBaseHop,
 } from "@/common/utils/ai/agentAncestorLayers";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import {
@@ -39,7 +40,11 @@ import {
 } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 
-import { readAgentDefinition, type AgentDefinitionRequestCache } from "./agentDefinitionsService";
+import {
+  computeBaseSkipScope,
+  readAgentDefinition,
+  type AgentDefinitionRequestCache,
+} from "./agentDefinitionsService";
 import {
   resolveAgentInheritanceChain,
   type AgentForInheritance,
@@ -109,6 +114,7 @@ type SettingsBaseReadContext = NodeAgentDefinitionContext & {
  */
 async function readSettingsBaseChain(
   settingsBase: string,
+  skipScopesAbove: AgentDefinitionScope | undefined,
   context: SettingsBaseReadContext
 ): Promise<AgentForInheritance[] | null> {
   const readOptions = {
@@ -122,9 +128,9 @@ async function readSettingsBaseChain(
       context.runtime,
       context.workspacePath,
       settingsBase,
-      readOptions
+      { ...readOptions, skipScopesAbove }
     );
-    const chain = await resolveAgentInheritanceChain({
+    return await resolveAgentInheritanceChain({
       runtime: context.runtime,
       workspacePath: context.workspacePath,
       agentId: agentDefinition.id,
@@ -132,9 +138,6 @@ async function readSettingsBaseChain(
       workspaceId: context.workspaceId,
       ...readOptions,
     });
-    // A chain that stops at a missing or cyclic base does not resolve in agents.list either, so
-    // the run ignores it too instead of resolving over part of it.
-    return chain.at(-1)?.base == null ? chain : null;
   } catch (error) {
     if (context.abortSignal?.aborted === true || isRuntimeReadFailure(error)) throw error;
     return null;
@@ -151,12 +154,16 @@ export async function resolveAgentAiSettingsChain(
   chain: AgentForInheritance[],
   context: SettingsBaseReadContext
 ): Promise<AgentForInheritance[]> {
-  const settingsBase = chainSettingsBase(chain);
-  if (settingsBase == null) return chain;
+  const hop = settingsBaseHop(chain);
+  const settingsBase = hop?.ai?.settingsBase;
+  if (hop == null || settingsBase == null) return chain;
+  // Read as the declaring hop's `base` would be, so a global agent's settings base skips project
+  // agents (computeBaseSkipScope).
+  const skipScopesAbove = computeBaseSkipScope(settingsBase, hop.id, hop.scope);
   const result = applySettingsBaseChain(
     agentId,
     chain,
-    await readSettingsBaseChain(settingsBase, context)
+    await readSettingsBaseChain(settingsBase, skipScopesAbove, context)
   );
   if (result.ignored != null) {
     log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });

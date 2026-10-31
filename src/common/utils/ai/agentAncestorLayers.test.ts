@@ -6,6 +6,7 @@ import { applySettingsBaseChain, getAgentAiSettingsBases } from "./agentAncestor
 
 interface Hop {
   id: string;
+  base?: string;
   ai?: AgentDefinitionPackage["frontmatter"]["ai"];
 }
 
@@ -20,10 +21,14 @@ describe("applySettingsBaseChain", () => {
   });
 
   test("keeps the own chain when the settings base is the agent itself", () => {
-    expect(applySettingsBaseChain("fast", ownChain, [{ id: "fast" }, { id: "exec" }])).toEqual({
-      chain: ownChain,
-      ignored: "self",
-    });
+    // Its same-ID read skips the agent's own scope, so it finds no agent or a lower-scope one.
+    const selfChain: Hop[] = [{ id: "fast", ai: { settingsBase: "fast" } }, { id: "exec" }];
+    for (const settingsBaseChain of [null, [{ id: "fast" }, { id: "exec" }]]) {
+      expect(applySettingsBaseChain("fast", selfChain, settingsBaseChain)).toEqual({
+        chain: selfChain,
+        ignored: "self",
+      });
+    }
   });
 
   test("keeps the own chain when the settings base inherits from the agent", () => {
@@ -43,6 +48,17 @@ describe("applySettingsBaseChain", () => {
     expect(applySettingsBaseChain("fast", ownChain, settingsBaseChain)).toEqual({
       chain: ownChain,
       ignored: "nested",
+    });
+  });
+
+  // agents.list cannot resolve a chain that stops at a missing or cyclic base.
+  test.each([
+    ["the agent's own chain", [{ id: "fast", base: "missing-base" }], [{ id: "explore" }]],
+    ["the settings base's chain", ownChain, [{ id: "explore", base: "missing-base" }]],
+  ])("keeps the own chain when %s stops before its root", (_label, own, settingsBaseChain) => {
+    expect(applySettingsBaseChain("fast", own, settingsBaseChain)).toEqual({
+      chain: own,
+      ignored: "incomplete",
     });
   });
 
