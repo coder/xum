@@ -482,6 +482,38 @@ describe("BackupService against a real repository", () => {
     );
   });
 
+  it("previews and restores around a matched project whose local memory folder is now a symlink", async () => {
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const created = await new ProjectService(config).create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const memoryDir = `memory/project/${projectMemoryDirName(created.data.normalizedPath)}`;
+    await writeFixtureFile(muxRoot, `${memoryDir}/notes.md`, "backed-up memory\n");
+    settings = { ...settings, includeProjects: true };
+    await pushOrThrow();
+    const sharedMemory = path.join(tempDir, "shared-memory");
+    await writeFixtureFile(sharedMemory, "notes.md", "shared memory\n");
+    await fs.rm(path.join(muxRoot, memoryDir), { recursive: true });
+    await fs.symlink(sharedMemory, path.join(muxRoot, memoryDir));
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(
+      `${memoryDir}/notes.md`
+    );
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual([`${memoryDir}/notes.md`]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(path.join(muxRoot, memoryDir))).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedMemory, "notes.md"), "utf-8")).toBe("shared memory\n");
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();
