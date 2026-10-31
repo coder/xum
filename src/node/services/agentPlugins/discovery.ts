@@ -1140,10 +1140,11 @@ async function resolveCursorParts(args: {
 }): Promise<{
   ruleRoots: PluginSkillsRoot[];
   notApplied: AgentPluginNotApplied[];
-  hooks?: PluginHooksLoadResult;
+  /** Spread into the plugin: `cursorHooks` for a Cursor package, nothing for any other. */
+  hooksField: Pick<AgentPluginInfo, "cursorHooks">;
 }> {
   const { cursor } = args;
-  if (cursor === undefined) return { ruleRoots: [], notApplied: [] };
+  if (cursor === undefined) return { ruleRoots: [], notApplied: [], hooksField: {} };
   const rules = await resolveRuleRoots({
     ruleDirs: cursor.ruleDirs,
     skillsDirs: args.skillsDirs,
@@ -1163,7 +1164,7 @@ async function resolveCursorParts(args: {
   return {
     ruleRoots: rules.roots,
     notApplied: [...cursor.notApplied, ...rules.notApplied, ...onDisk, ...hooksNotApplied],
-    hooks,
+    hooksField: { cursorHooks: hooks },
   };
 }
 
@@ -1731,7 +1732,7 @@ async function discoverPluginAt(args: {
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(cursorFallback ? { cursorFallback: true } : {}),
-    ...(cursorParts.hooks !== undefined ? { cursorHooks: cursorParts.hooks } : {}),
+    ...cursorParts.hooksField,
     notApplied: [
       ...cursorParts.notApplied,
       ...(await cursorAgentFilesNotApplied(cursor, agentsDir)),
