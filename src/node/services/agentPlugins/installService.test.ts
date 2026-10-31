@@ -9264,6 +9264,22 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     });
   });
 
+  test("a directory's mode change does not void the first-trust review", async () => {
+    // The review lists no directories, so the user could not see this change anyway.
+    await install();
+    const shown = await service.getHooks({ name: "looper" });
+    await fsPromises.chmod(path.join(muxRoot, "plugins", "looper", "skills"), 0o700);
+    const [stop] = shown.hooks;
+    await service.setHookTrust({
+      name: "looper",
+      key: stop.key,
+      hash: stop.hash,
+      state: "trusted",
+      fileReviewDigest: shown.fileReview?.digest,
+    });
+    expect((await service.getHooks({ name: "looper" })).hooks[0].review).toBe("trusted");
+  });
+
   test("an update with no trusted hook writes no trust file", async () => {
     await install();
     await writeFiles({ "hooks/lib.sh": "echo v2\n" });

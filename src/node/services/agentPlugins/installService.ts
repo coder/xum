@@ -627,12 +627,10 @@ function fileReviewDigest(
   changes: readonly AgentPluginCapabilityChange[],
   records: readonly PluginTreeRecord[]
 ): string {
-  const entries = records.map((record) => [
-    record.path,
-    record.kind,
-    record.mode,
-    pluginTreeRecordContent(record),
-  ]);
+  // The rows leave directories out, so a directory's mode change must not void the review either.
+  const entries = records
+    .filter((record) => record.kind !== "directory")
+    .map((record) => [record.path, record.kind, record.mode, pluginTreeRecordContent(record)]);
   return createHash("sha256")
     .update(JSON.stringify([changes, entries]))
     .digest("hex");

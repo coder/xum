@@ -377,7 +377,7 @@ async function execHook(
     if (options.abortSignal?.aborted === true) return { kind: "aborted" };
     return { kind: "failed", reason: `it could not start: ${getErrorMessage(error)}` };
   }
-  // Aborting `release` cancels both pipes, which frees their readers and handles.
+  // Aborting `release` cancels the three pipes, which frees their readers, writer and handles.
   const release = new AbortController();
   const read = (pipe: ReadableStream<Uint8Array>, maxBytes: number) =>
     streamToStringCapped(
@@ -388,7 +388,7 @@ async function execHook(
     stream.exitCode,
     read(stream.stdout, HOOK_OUTPUT_READ_BYTES),
     read(stream.stderr, 0),
-    writeInput(stream.stdin, input),
+    writeInput(stream.stdin, input, release.signal),
   ]);
   // The runtime kills the process group at the timeout, but a process that left the group (job
   // control, setsid) can hold the pipes open after it: the call must still end.
@@ -421,13 +421,22 @@ async function settledBy<T>(promise: Promise<T>, ms: number): Promise<T | undefi
   }
 }
 
-async function writeInput(stdin: WritableStream<Uint8Array>, input: string): Promise<void> {
+async function writeInput(
+  stdin: WritableStream<Uint8Array>,
+  input: string,
+  release: AbortSignal
+): Promise<void> {
   const writer = stdin.getWriter();
+  // A process that never reads a full pipe would hold the write (and the pipe) forever.
+  const abort = () => writer.abort().catch(() => undefined);
+  release.addEventListener("abort", abort, { once: true });
   try {
     await writer.write(new TextEncoder().encode(input));
     await writer.close();
   } catch {
-    // EPIPE: the process ended or closed stdin first.
+    // EPIPE: the process ended or closed stdin first, or the call let go of the pipe.
+  } finally {
+    release.removeEventListener("abort", abort);
   }
 }
 
