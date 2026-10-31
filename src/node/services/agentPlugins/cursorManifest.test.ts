@@ -293,13 +293,11 @@ describe("normalizeCursorManifest hooks", () => {
     expect(load({ hooks: "./config/hooks.json" }).hooks).toBe("config/hooks.json");
   });
 
-  test("an inline object is kept and listed as a hook Xum does not run yet", () => {
+  test("an inline object is kept as the hooks source", () => {
     const inline = { version: 1, hooks: { stop: [{ command: "./stop.sh" }] } };
     const { hooks, notApplied } = load({ hooks: inline });
     expect(hooks).toEqual(inline);
-    expect(notApplied).toEqual([
-      { part: "hook", name: "hooks", reason: "Cursor hooks run in a later Xum build" },
-    ]);
+    expect(notApplied).toEqual([]);
   });
 
   test("Cursor hooks never become Xum hooks.js", () => {

@@ -16,11 +16,13 @@
  * - Runners read this file at each hook call (not at turn start), so a revoke stops the next call.
  * - Fail closed: a missing, unreadable or malformed file trusts nothing.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import { AgentPluginInstallEntrySchema } from "@/common/config/schemas/agentPluginInstalls";
 import type { PluginHookReviewState } from "@/common/orpc/schemas/agentPlugins";
 import { log } from "@/node/services/log";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { PluginHookDefinition } from "./codexHooks";
 import { computePluginInstanceId } from "./mcpConfig";
@@ -77,6 +79,19 @@ export async function readPluginHookTrust(
   xumHome: string,
   instanceId: string
 ): Promise<PluginHookTrustRecord> {
+  const trust = await readPluginHookTrustChecked(xumHome, instanceId);
+  return trust === "unreadable" ? {} : trust;
+}
+
+/**
+ * readPluginHookTrust, but "unreadable" when the trust file exists and Xum cannot read or parse
+ * it: the Cursor runner then skips the call with a notice (Xum's failure, not the hook's). It
+ * still trusts nothing.
+ */
+export async function readPluginHookTrustChecked(
+  xumHome: string,
+  instanceId: string
+): Promise<PluginHookTrustRecord | "unreadable"> {
   const installedAt = await readInstalledAt(xumHome, instanceId);
   if (installedAt === undefined) return {};
   const trust = await readTrustFile(getPluginHookTrustPath(xumHome, instanceId), installedAt);
@@ -87,15 +102,16 @@ export async function readPluginHookTrust(
 const MAX_TRUST_FILE_BYTES = 1024 * 1024;
 
 /**
- * The record for this install, `{}` when missing, malformed or for another install, and
- * "newer-version" for a file a newer Xum wrote: reads trust none of it, writes must keep it.
+ * The record for this install, `{}` when missing or for another install, "unreadable" when it
+ * exists but cannot be read or parsed, and "newer-version" for a file a newer Xum wrote: reads
+ * trust none of it, writes must keep it.
  */
 async function readTrustFile(
   file: string,
   installedAt: string
-): Promise<PluginHookTrustRecord | "newer-version"> {
+): Promise<PluginHookTrustRecord | "newer-version" | "unreadable"> {
   const raw = await readBoundedStateFile(file, MAX_TRUST_FILE_BYTES, TRUST_FILE_LABEL);
-  if (raw === undefined) return {};
+  if (raw === undefined) return (await stateFileExists(file)) ? "unreadable" : {};
   const json = parseStateJson(raw);
   const parsed = TrustRecordSchema.safeParse(json);
   // Trust recorded for an earlier install under this name never carries over.
@@ -104,7 +120,17 @@ async function readTrustFile(
   }
   if (isNewerVersionFor(json, installedAt)) return "newer-version";
   log.warn("Plugin hook trust file is malformed; trusting no hooks", { file });
-  return {};
+  return "unreadable";
+}
+
+/** Whether anything sits at the path; an lstat error other than ENOENT counts as present. */
+async function stateFileExists(file: string): Promise<boolean> {
+  try {
+    await fs.lstat(file);
+    return true;
+  } catch (error) {
+    return !hasErrorCode(error, "ENOENT");
+  }
 }
 
 /**
@@ -163,7 +189,8 @@ export async function setPluginHookTrust(
   if (trust === "newer-version") {
     throw new Error("A newer Xum version saved this plugin's hook trust. Update Xum to change it.");
   }
-  const hooks = { ...trust };
+  // An unreadable file holds no decision Xum can keep: the write replaces it (self-healing).
+  const hooks = trust === "unreadable" ? {} : { ...trust };
   if (decision.state === null) delete hooks[decision.key];
   else hooks[decision.key] = { hash: decision.hash, state: decision.state };
   await writeStateFile(

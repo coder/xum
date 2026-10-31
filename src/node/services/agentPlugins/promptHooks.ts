@@ -144,7 +144,12 @@ export type TurnStopHookOutcome =
 
 export type TurnStopHookInput = Pick<
   TurnStopContext,
-  "messageId" | "lastAssistantMessage" | "model" | "turnContinuations" | "hookContinuations"
+  | "messageId"
+  | "lastAssistantMessage"
+  | "model"
+  | "turnContinuations"
+  | "hookContinuations"
+  | "abortSignal"
 >;
 
 /**

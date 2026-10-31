@@ -14,6 +14,10 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 /** One-line handler summary, shared by the consent preview and the review panel. */
 export function describePluginHookHandler(handler: PluginHookHandler): string {
+  if (handler.type === "cursor-command") {
+    return `command ${handler.command}, ${describeHookTimeout(handler.timeoutSeconds)}`;
+  }
+  if (handler.type === "cursor-prompt") return "prompt hook";
   if (handler.type !== "mcp_tool") return `${handler.type}: ${handler.summary}`;
   const summary = `MCP tool ${handler.server} / ${handler.tool}, ${describeHookTimeout(handler.timeoutSeconds)}`;
   return summary + describeStatusMessage(handler.statusMessage);

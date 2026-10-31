@@ -2332,7 +2332,7 @@ describe("Cursor plugin discovery", () => {
     expect(plugin.skillsDirs).toBeUndefined();
   });
 
-  test("hooks/hooks.json produces no Codex hooks and one not-applied hook entry", async () => {
+  test("hooks/hooks.json produces no Codex hooks; discovery parses it as Cursor hooks", async () => {
     using kit = await discoverKit({
       ...cursorManifest({ name: "kit" }),
       // Cursor's `stop` and a Codex-shaped `Stop`: the Codex loader must read neither.
@@ -2346,13 +2346,10 @@ describe("Cursor plugin discovery", () => {
     });
     const { plugin } = kit;
     expect(await loadPluginCodexHooks(plugin)).toEqual({ hooks: [], warnings: [] });
-    expect(plugin.notApplied).toEqual([
-      {
-        part: "hook",
-        name: "hooks/hooks.json",
-        reason: "Cursor hooks run in a later Xum build",
-      },
+    expect(plugin.cursorHooks?.hooks.map((hook) => [hook.key, hook.status])).toEqual([
+      ["cursor:hooks/hooks.json#stop[0]", "runnable"],
     ]);
+    expect(plugin.notApplied).toEqual([]);
   });
 
   test("mcp.json produces no MCP config and one not-applied MCP entry", async () => {

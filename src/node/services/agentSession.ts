@@ -1639,6 +1639,8 @@ export class AgentSession {
   private stopHookContinuations = 0;
   /** The same continuations per hook (runTurnStopHooks' hookKeys), for each hook's own limit. */
   private readonly stopHookCountsByKey = new Map<string, number>();
+  /** The running turn.stop chain's abort: a hard interruptStream (a user Stop) kills its hooks. */
+  private turnStopHooksAbort?: AbortController;
   private pendingResumeIntent?: AbortController;
 
   private readonly retryManager: RetryManager;
@@ -8522,6 +8524,8 @@ export class AgentSession {
     ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
+    // A user Stop ends the turn.stop hooks too: their host processes must not outlive it.
+    if (options?.soft !== true) this.turnStopHooksAbort?.abort();
     const settled = Promise.withResolvers<boolean>();
     const initiallySettled = Promise.withResolvers<Result<void>>();
     let physicallyStopped = false;
@@ -10867,16 +10871,24 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
   ): Promise<TurnStopContinuation | null> {
-    const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
-      this.workspaceId,
-      {
+    const hooksAbort = new AbortController();
+    this.turnStopHooksAbort = hooksAbort;
+    // A Stop that landed after the stream ended and before this point had nothing to abort. No
+    // await sits between storing the controller and this check, so no Stop falls between them.
+    if (this.stoppedSince(provenance.admissionStopEpoch)) hooksAbort.abort();
+    let hookOutcome: TurnStopHookOutcome;
+    try {
+      hookOutcome = (await this.aiService.runTurnStopHooks?.(this.workspaceId, {
         messageId: payload.messageId,
         lastAssistantMessage: lastAssistantText(payload.parts),
         model: stopHookModel(payload, provenance),
         turnContinuations: this.stopHookContinuations,
         hookContinuations: this.stopHookCountsByKey,
-      }
-    )) ?? { kind: "none" };
+        abortSignal: hooksAbort.signal,
+      })) ?? { kind: "none" };
+    } finally {
+      if (this.turnStopHooksAbort === hooksAbort) this.turnStopHooksAbort = undefined;
+    }
     return mergeTurnStopContinuation({
       hookReasons: hookOutcome.kind === "continue" ? hookOutcome.reasons : [],
       nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),

@@ -246,6 +246,11 @@ export abstract class LocalBaseRuntime implements Runtime {
     } catch (err) {
       throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
+    // An abort during the check above fires no listener (none is added until after the spawn), so
+    // without this second check the process would start and run to its end after the abort.
+    if (options.abortSignal?.aborted) {
+      throw new RuntimeErrorClass("Operation aborted before execution", "exec");
+    }
 
     const bashPath = getBashPath();
     const spawnCommand = bashPath;

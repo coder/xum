@@ -58,6 +58,7 @@ const pluginPreview: AgentPluginInstallPreview = {
   slashCommands: [],
   reviewedComponents: [],
   codexHooks: [],
+  fileChanges: [],
   warnings: [],
   targetPath: "~/.mux/plugins/tools-next",
   consentDigest: "c".repeat(64),

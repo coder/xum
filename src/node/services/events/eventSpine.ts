@@ -228,6 +228,12 @@ export interface TurnStopContext {
    * chain runs, so a consumer can pass its own count to its hook (Cursor `loop_count`).
    */
   readonly hookContinuations: ReadonlyMap<string, number>;
+  /**
+   * Aborted by a user Stop (a hard interruptStream), also one that landed after the stream ended
+   * and before the chain started. A consumer starts no hook process once it is aborted and kills
+   * the one it runs.
+   */
+  readonly abortSignal?: AbortSignal;
   /** Continuation prompts (Codex `decision: "block"` reasons), in chain order. */
   readonly continueReasons: TurnStopContinueReason[];
   /** Set by a consumer whose output said `continue: false`: it overrides every continuation. */

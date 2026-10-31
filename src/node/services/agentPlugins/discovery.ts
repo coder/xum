@@ -36,11 +36,12 @@ import {
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
 import {
-  CURSOR_HOOKS_REASON,
   normalizeCursorManifest,
   type CursorManifestResult,
 } from "./cursorManifest";
 import { convertCursorRule, cursorRuleName, type CursorRuleRefusal } from "./cursorRules";
+import { loadPluginCursorHooks } from "./cursorHooks";
+import type { PluginHooksLoadResult } from "./codexHooks";
 import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
@@ -413,11 +414,17 @@ export interface AgentPluginInfo {
    * package carries its commands paths in the marker). */
   claude?: ClaudePluginComponents;
   /**
-   * Found through `.cursor-plugin/plugin.json`: skills, rules (as skills) and agents/ load. Like a
-   * Claude package it gets no hooks.js, workflows/, skill workflow scripts, slash commands or
-   * `extensions`. Its hooks and MCP servers do not run yet; they are listed in `notApplied`.
+   * Found through `.cursor-plugin/plugin.json`: skills, rules (as skills), agents/ and its Cursor
+   * hooks (`cursorHooks`) load. Like a Claude package it gets no hooks.js, workflows/, skill
+   * workflow scripts, slash commands or `extensions`. Its MCP servers do not run yet; they are
+   * listed in `notApplied`.
    */
   cursorFallback?: true;
+  /**
+   * A Cursor package's hooks, parsed when discovery read the package (cursorHooks.ts), so every
+   * reader (the per-call trust gate included) sees the hooks of that one read.
+   */
+  cursorHooks?: PluginHooksLoadResult;
   notApplied: AgentPluginNotApplied[];
   /**
    * The plugin.json carries an `extensions.mux.generatedFrom` marker other than a well-formed
@@ -1061,12 +1068,11 @@ async function firstExisting(rootReal: string, candidates: string[]): Promise<st
 }
 
 /**
- * A declared `commands` field lists itself, and the normalizer lists inline hooks and inline MCP
- * servers.
+ * A declared `commands` field lists itself, the normalizer lists inline MCP servers, and the
+ * hooks loader lists each hook that does not run.
  */
 async function cursorPackageNotApplied(args: {
   rootReal: string;
-  hooks: CursorManifestResult["hooks"];
   declaredMcp: string | undefined;
   declaresCommands: boolean;
 }): Promise<AgentPluginNotApplied[]> {
@@ -1079,11 +1085,6 @@ async function cursorPackageNotApplied(args: {
       part: "mcp",
       candidates: args.declaredMcp !== undefined ? [args.declaredMcp] : ["mcp.json", ".mcp.json"],
       reason: "MCP servers of Cursor plugins load in a later Xum build",
-    },
-    {
-      part: "hook",
-      candidates: typeof args.hooks === "string" ? [args.hooks] : [],
-      reason: CURSOR_HOOKS_REASON,
     },
     {
       part: "command",
@@ -1107,7 +1108,11 @@ async function resolveCursorParts(args: {
   resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
   rootReal: string;
   warn: (message: string) => void;
-}): Promise<{ ruleRoots: PluginSkillsRoot[]; notApplied: AgentPluginNotApplied[] }> {
+}): Promise<{
+  ruleRoots: PluginSkillsRoot[];
+  notApplied: AgentPluginNotApplied[];
+  hooks?: PluginHooksLoadResult;
+}> {
   const { cursor } = args;
   if (cursor === undefined) return { ruleRoots: [], notApplied: [] };
   const rules = await resolveRuleRoots({
@@ -1119,13 +1124,18 @@ async function resolveCursorParts(args: {
   });
   const onDisk = await cursorPackageNotApplied({
     rootReal: args.rootReal,
-    hooks: cursor.hooks,
     declaredMcp: cursor.mcpConfigPath,
     declaresCommands: isPlainObject(args.rawManifest) && args.rawManifest.commands !== undefined,
   });
+  const { notApplied: hooksNotApplied, ...hooks } = await loadPluginCursorHooks({
+    rootPath: args.rootReal,
+    source: cursor.hooks,
+    fs: pluginFs(),
+  });
   return {
     ruleRoots: rules.roots,
-    notApplied: [...cursor.notApplied, ...rules.notApplied, ...onDisk],
+    notApplied: [...cursor.notApplied, ...rules.notApplied, ...onDisk, ...hooksNotApplied],
+    hooks,
   };
 }
 
@@ -1623,6 +1633,7 @@ async function discoverPluginAt(args: {
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(cursorFallback ? { cursorFallback: true } : {}),
+    ...(cursorParts.hooks !== undefined ? { cursorHooks: cursorParts.hooks } : {}),
     notApplied: cursorParts.notApplied,
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),

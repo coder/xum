@@ -118,6 +118,7 @@ describe("CodexPluginHookService", () => {
   const args = (): EnsureCodexHooksArgs => ({
     workspaceId,
     xumHome,
+    transcriptPath: path.join(xumHome, "sessions", workspaceId, "chat.jsonl"),
     isProjectTrusted: () => projectTrusted,
     mcp: {
       canCallToolForPluginHook: () => toolAvailable,

@@ -1,8 +1,9 @@
 /**
  * A Runtime on a memfs volume, for tests that must not touch the host (phase 5, claim 4.4).
  *
- * - `location` is absent, so tools take their host branch. That branch reads HostFiles, so a
- *   test builds this runtime and the memory HostFiles on one volume (createMemoryHost).
+ * - `location` is absent unless the options set it, so tools take their host branch. That branch
+ *   reads HostFiles, so a test builds this runtime and the memory HostFiles on one volume
+ *   (createMemoryHost). A test of code that branches on the runtime family sets it.
  * - readFile and stat of a missing path fail with a RuntimeError "file_io" whose cause has the
  *   fs code (isRuntimePathAbsentError), as LocalRuntime does.
  * - exec answers from a script table (scriptedCommands.testHarness.ts), with the command string
@@ -12,8 +13,9 @@
  *   `<userHome>/.xum-tmp` deletes that entry and exits 0 (not for the names . and ..). Any other command without an entry
  *   rejects with a RuntimeError "exec" that names it. An exec whose signal is already aborted
  *   rejects before it runs anything, as LocalRuntime does.
- *   An option that the entry cannot honor is refused by name (refuseSetOptions): pathEnv,
- *   hostEnv and forcePTY always, and timeout, env and abortSignal for a function entry.
+ *   An option that the entry cannot honor is refused by name (refuseSetOptions): pathEnv and
+ *   forcePTY always, and timeout, env, hostEnv and abortSignal for a function entry.
+ * - `execCalls` records each exec's options and the text written to its stdin.
  * - readFile and ensureDir honor an aborted signal as LocalBaseRuntime does.
  * - idle() resolves when every exec has settled, so a test can drain fire-and-forget execs.
  * - The workspace lifecycle methods reject: loop tests do not create workspaces.
@@ -33,6 +35,7 @@ import {
   type ExecStream,
   type FileStat,
   type Runtime,
+  type RuntimeLocation,
   type WorkspaceCreationResult,
   type WorkspaceForkResult,
   type WorkspaceInitResult,
@@ -46,6 +49,8 @@ export interface FakeRuntimeOptions {
   /** What tempDir() returns. It must exist in the volume. */
   tempDir: string;
   commands?: ScriptTable;
+  /** Runtime.location; absent by default. */
+  location?: RuntimeLocation;
 }
 
 const encoder = new TextEncoder();
@@ -73,9 +78,18 @@ const RM_RF_ONE_NAME = /^rm -rf '([^'/]+)'$/;
 /** The folder under the home that createTempDirForStream (streamManager.ts) uses. */
 const STREAM_TEMP_ROOT = ".xum-tmp";
 
+/** One exec as the caller made it: its options and everything it wrote to stdin so far. */
+export interface FakeExecCall {
+  command: string;
+  options: ExecOptions;
+  stdin: string;
+}
+
 export class FakeRuntime implements Runtime {
   /** Every exec command line, in order, answered or not. */
   readonly execs: string[] = [];
+  /** Every exec, in order, with its options and stdin. */
+  readonly execCalls: FakeExecCall[] = [];
   private readonly pending = new Set<Promise<unknown>>();
 
   constructor(
@@ -83,16 +97,20 @@ export class FakeRuntime implements Runtime {
     private readonly options: FakeRuntimeOptions
   ) {}
 
+  get location(): RuntimeLocation | undefined {
+    return this.options.location;
+  }
+
   private expand(target: string): string {
     return target.replace(/^~(?=\/|$)/, this.options.userHome);
   }
 
   // The option rules of refuseSetOptions: the built-in rule and a fixed outcome settle at once
-  // and read no environment, so timeout and env hold for them. A function entry refuses both,
-  // and abortSignal too.
+  // and read no environment, so timeout, env and hostEnv hold for them. A function entry refuses
+  // them, and abortSignal too.
   private async outcomeOf(command: string, options: ExecOptions): Promise<ScriptedOutcome> {
     const { cwd } = options;
-    refuseSetOptions(command, options, ["pathEnv", "hostEnv", "forcePTY"]);
+    refuseSetOptions(command, options, ["pathEnv", "forcePTY"]);
     const removal = RM_RF_ONE_NAME.exec(command);
     // "." and ".." name the folder itself and its parent, never one stream folder.
     if (
@@ -110,7 +128,7 @@ export class FakeRuntime implements Runtime {
       { file: command, args: [], cwd },
       options,
       // The fake checks abortSignal only before the start, which a slow entry outlives.
-      ["timeout", "env", "abortSignal"]
+      ["timeout", "env", "hostEnv", "abortSignal"]
     );
     if (outcome === undefined) {
       throw new RuntimeError(`FakeRuntime has no scripted command: ${command}`, "exec");
@@ -120,13 +138,20 @@ export class FakeRuntime implements Runtime {
 
   exec(command: string, options: ExecOptions): Promise<ExecStream> {
     this.execs.push(command);
+    const call: FakeExecCall = { command, options, stdin: "" };
+    this.execCalls.push(call);
     if (options.abortSignal?.aborted) {
       return Promise.reject(new RuntimeError("Operation aborted before execution", "exec"));
     }
+    const decoder = new TextDecoder();
     const started = this.outcomeOf(command, options).then((outcome) => ({
       stdout: streamOf(outcome.stdout ?? ""),
       stderr: streamOf(outcome.stderr ?? ""),
-      stdin: new WritableStream<Uint8Array>(),
+      stdin: new WritableStream<Uint8Array>({
+        write(chunk) {
+          call.stdin += decoder.decode(chunk, { stream: true });
+        },
+      }),
       exitCode: Promise.resolve(outcome.exitCode ?? 0),
       duration: Promise.resolve(0),
     }));
