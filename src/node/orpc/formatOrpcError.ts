@@ -2,6 +2,8 @@ import { ORPCError, ValidationError } from "@orpc/server";
 import { COMMON_ERROR_STATUS_MAP } from "@orpc/client";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { inspect } from "node:util";
+import { formatIssuePath, isValidationIssue } from "@/common/utils/errors/formatValidationIssues";
+import { MAX_SHOWN_VALIDATION_ISSUES } from "@/constants/errors";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { WorkflowDeclaredPhasesValidationError } from "@/node/services/workflows/workflowMetadata";
 
@@ -229,45 +231,6 @@ function summarizeForLogs(value: unknown, depth = 1): string {
   return inspect(value, { depth: 3, maxArrayLength: 50, breakLength: 120 });
 }
 
-function isIssue(value: unknown): value is StandardSchemaV1.Issue {
-  return isRecord(value) && typeof value.message === "string";
-}
-
-function formatIssuePath(path: StandardSchemaV1.Issue["path"]): string {
-  if (!path || path.length === 0) {
-    return "<root>";
-  }
-
-  const parts: string[] = [];
-
-  for (const segment of path) {
-    const key =
-      typeof segment === "object" && segment !== null && "key" in segment
-        ? (segment as { key: PropertyKey }).key
-        : segment;
-
-    if (typeof key === "number") {
-      parts.push(`[${key}]`);
-      continue;
-    }
-
-    if (typeof key === "string") {
-      const isIdentifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key);
-      if (parts.length === 0) {
-        parts.push(isIdentifier ? key : `[${JSON.stringify(key)}]`);
-      } else {
-        parts.push(isIdentifier ? `.${key}` : `[${JSON.stringify(key)}]`);
-      }
-      continue;
-    }
-
-    const rendered = typeof key === "symbol" ? key.toString() : String(key);
-    parts.push(parts.length === 0 ? `[${rendered}]` : `[${rendered}]`);
-  }
-
-  return parts.join("");
-}
-
 function getValidationErrorInfo(
   cause: unknown
 ): { message?: string; issues: readonly StandardSchemaV1.Issue[]; data: unknown } | null {
@@ -284,7 +247,7 @@ function getValidationErrorInfo(
     return null;
   }
 
-  const issues = cause.issues.filter(isIssue);
+  const issues = cause.issues.filter(isValidationIssue);
 
   return {
     message: typeof cause.message === "string" ? cause.message : undefined,
@@ -348,7 +311,7 @@ export function formatOrpcError(error: unknown, interceptorOptions?: unknown): F
         );
 
         if (validation.issues.length > 0) {
-          const maxIssues = 5;
+          const maxIssues = MAX_SHOWN_VALIDATION_ISSUES;
           lines.push(`Validation issues (${validation.issues.length}):`);
 
           for (const issue of validation.issues.slice(0, maxIssues)) {
