@@ -70,6 +70,15 @@
     --color-content-secondary: hsla(240, 5%, 65%);
     --color-content-tertiary: hsla(240, 5%, 34%);
     --color-content-disabled: hsl(240, 5%, 26%);
+    /* Coder product link and highlight colors, from coder/coder site/src/index.css via Coder Kit.
+       Light values live in globals.css. */
+    --color-content-link: hsl(213 94% 68%);
+    --color-highlight-purple: hsl(269 100% 74%);
+    --color-highlight-sky: hsl(188 75% 80%);
+    --color-highlight-orange: hsl(31 100% 70%);
+    --color-highlight-magenta: hsl(292 100% 78%);
+    --color-highlight-green: hsl(141 79% 85%);
+    --color-highlight-red: hsl(0 91% 71%);
     --color-muted-foreground: hsl(0 0% 60%);
     /* Lightened to reach WCAG AA (4.5:1) on the dark surfaces, down to the slash command rows
        (#262626, 5.05:1) (#6021). It is about the same gray as --color-muted (#999999, #6544): the

@@ -72,6 +72,8 @@ export interface CodexHookRunnerDeps {
 export interface CodexHookRegistration {
   workspaceId: string;
   pluginName: string;
+  /** computePluginInstanceId of the plugin folder: its Stop hooks' counts are its own. */
+  pluginInstanceId: string;
   /** Discovery index (spine order). */
   order: number;
   hooks: PluginHookDefinition[];
@@ -167,7 +169,11 @@ export function registerCodexPluginHooks(
             if (output === null) continue;
             if (output.halt !== undefined) haltTurn(ctx, output.halt, registration);
             else if (output.continueWith !== undefined)
-              ctx.continueReasons.push(output.continueWith);
+              ctx.continueReasons.push({
+                text: output.continueWith,
+                pluginName: registration.pluginName,
+                hookKey: `${registration.pluginInstanceId}:${hook.key}`,
+              });
           }
         },
         scope
