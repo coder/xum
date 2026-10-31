@@ -116,3 +116,50 @@ test("the per-call gate reads the workspace's projects again, so a project added
   current = null;
   expect(codexArgs?.isProjectTrusted()).toBe(false);
 });
+
+test("a side chat registers its hooks as a side chat, so no Cursor command hook runs in it", async () => {
+  // The service refuses every hook for `sideChat: true` (codexHookService.test.ts); this is the
+  // link that sets it. A side chat shares the main chat's checkout, and a hook there would run
+  // commands beside the main chat's work.
+  const config = {
+    rootDir: "/xum",
+    sessionsDir: "/xum/sessions",
+    loadConfigOrDefault: () => ({ projects: new Map() }),
+    findWorkspace: () => ({}),
+  } as unknown as Config;
+  const workspace: WorkspaceMetadata = {
+    id: "ws-main",
+    name: "ws-main",
+    projectName: "primary",
+    projectPath: "/repo/primary",
+    runtimeConfig: { type: "local" },
+  };
+  const calls: EnsureCodexHooksArgs[] = [];
+  spies.push(
+    spyOn(agentPluginHookService, "ensureWorkspaceHooksForRequest").mockResolvedValue(undefined),
+    spyOn(codexPluginHookService, "ensureWorkspaceHooks").mockImplementation((args) => {
+      calls.push(args);
+      return Promise.resolve();
+    })
+  );
+
+  for (const metadata of [
+    workspace,
+    { ...workspace, id: "ws-side", sideChatParentWorkspaceId: "ws-main" },
+  ]) {
+    await prepareWorkspaceRequestHooks({
+      config,
+      metadata,
+      hostCheckoutRoot: null,
+      journal: sharedDurableEventJournal(`/xum/sessions/${metadata.id}`),
+    });
+  }
+
+  // Both get a host runtime (local), so only the flag keeps the side chat's hooks off.
+  expect(
+    calls.map((args) => [args.workspaceId, args.sideChat, args.cursorHookRuntime !== undefined])
+  ).toEqual([
+    ["ws-main", false, true],
+    ["ws-side", true, true],
+  ]);
+});

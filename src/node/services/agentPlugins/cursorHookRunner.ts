@@ -14,6 +14,7 @@
  */
 import assert from "node:assert";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
+import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   HOOK_INPUT_MAX_CHARS,
@@ -426,8 +427,10 @@ function exitFailure(exitCode: number, command: string, seconds: number): string
       return `timed out after ${seconds}s`;
     case EXIT_CODE_NOT_FOUND:
       // The shell gives 127 for a missing command and for a missing command inside it (jq, bun),
-      // and Xum keeps no stderr to tell them apart, so the reason names both.
-      return `\`${command}\`: a command or one of its dependencies was not found (exit 127)`;
+      // and Xum keeps no stderr to tell them apart, so the reason names both. The command is
+      // plugin text: its control characters are marked, so a bidi character cannot reorder the
+      // notice.
+      return `\`${showOneLineControls(command)}\`: a command or one of its dependencies was not found (exit 127)`;
     case 2:
       return "exit code 2; this event cannot block";
     default:
