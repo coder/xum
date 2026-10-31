@@ -167,7 +167,6 @@ function mcpFile(
   return {};
 }
 
-/** The hooks source; discovery parses it (cursorHooks.ts), which lists each hook that does not run. */
 function readHooks(
   value: unknown,
   warnings: string[],

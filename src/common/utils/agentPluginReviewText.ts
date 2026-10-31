@@ -30,7 +30,6 @@ export function showInvisibleControls(text: string): string {
   return text.replace(REVIEW_TEXT_CONTROLS, markControl);
 }
 
-/** A one-line value (a path, a link target) as the review shows it: every control is marked. */
 export function showOneLineControls(text: string): string {
   return text.replace(ONE_LINE_CONTROLS, markControl);
 }

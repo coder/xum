@@ -1,16 +1,12 @@
 /**
  * Cursor-format plugin hooks (`hooks/hooks.json`, or the `.cursor-plugin/plugin.json` `hooks`
- * value): parsing and a trust hash per hook. Nothing here runs a hook (cursorHookRunner.ts does).
+ * value).
  *
  * Source: https://cursor.com/docs/hooks.md. Shape:
  * `{ version: 1, hooks: { <event>: [{ command, type?, matcher?, timeout?, loop_limit?, failClosed? }] } }`.
  *
- * - Only a `command` entry on afterFileEdit, afterAgentResponse or stop without a matcher runs
- *   (Cursor plugin RFC D9). Every other entry is listed with its reason (cursorHookNotAppliedReason).
  * - Trust (D1): the hash covers the event, the matcher and the entry exactly as declared, unknown
  *   fields included, and `declared` carries that canonical entry so the review shows all of it.
- * - Fail-soft, as codexHooks.ts: an invalid file or entry is dropped with a warning. The Codex
- *   loader's bounds apply (file size, hooks per plugin, kept warnings).
  *
  * Discovery calls the loader with its own PluginFs, so this module imports discovery for types only.
  */
@@ -32,15 +28,12 @@ import {
 } from "./hookDefinition";
 import { isPlainObject } from "./manifest";
 
-/** The source label of hooks declared inline in the manifest. */
 const INLINE_HOOKS_SOURCE = "plugin.json#hooks";
 
 export interface CursorHooksLoadResult extends PluginHooksLoadResult {
-  /** One entry per listed hook that does not run, with its reason. */
   notApplied: AgentPluginNotApplied[];
 }
 
-/** The normalized manifest `hooks` value (normalizeCursorManifest): a plugin-relative path or an inline document. */
 export type CursorHooksSource = string | Record<string, unknown> | undefined;
 
 /**
@@ -73,7 +66,6 @@ export async function loadPluginCursorHooks(args: {
   return { hooks, warnings: list, notApplied };
 }
 
-/** `<event>[<index>]`, the name a warning and a not-applied row use for one entry. */
 function hookName(hook: Pick<PluginHookDefinition, "key" | "source">): string {
   return hook.key.slice(`cursor:${hook.source}#`.length);
 }
@@ -122,7 +114,6 @@ function errorCode(error: unknown): unknown {
   return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 }
 
-/** The `hooks` map of a version 1 document, or undefined (with a warning). */
 function hooksMapOf(
   document: unknown,
   source: string,
@@ -166,7 +157,6 @@ interface EntryPlace {
   index: number;
 }
 
-/** One entry as a hook, or undefined with a warning that names it. */
 function parseEntry(
   raw: unknown,
   where: EntryPlace,
@@ -181,7 +171,6 @@ function parseEntry(
   return withStatus(parsed);
 }
 
-/** The hook of one entry, or why Xum drops it. */
 function readEntry(
   raw: unknown,
   where: EntryPlace,
@@ -214,7 +203,6 @@ function readEntry(
   };
 }
 
-/** The fields that decide what an entry is, or why Xum drops it. */
 function readEntryShape(
   raw: unknown
 ): { raw: Record<string, unknown>; type: "command" | "prompt"; matcher?: string } | string {
@@ -226,7 +214,6 @@ function readEntryShape(
   return { raw, type, matcher: raw.matcher };
 }
 
-/** A `command` entry's handler, or why Xum drops it. */
 function commandHandler(
   raw: Record<string, unknown>,
   declared: string,

@@ -1286,7 +1286,6 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
-/** The keys of the review texts that a row list shows cut (`<row>:before|after`). */
 function cutReviewTextKeys(changes: readonly AgentPluginCapabilityChange[]): string[] {
   return changes.flatMap((change, index) =>
     (["before", "after"] as const).flatMap((field) => {

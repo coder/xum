@@ -33,7 +33,6 @@ interface PluginTreeWalkOptions {
   skipRootGit?: boolean;
 }
 
-/** The kept bytes of a walk passed `maxKeptBytes`. */
 export class KeptBytesLimitError extends Error {}
 
 const treeChanged = () =>
@@ -49,10 +48,6 @@ function sameStat(
   return fields.every((field) => a[field] === b[field]);
 }
 
-/**
- * Hashes one regular file of the walk through an O_NOFOLLOW handle whose identity matches the
- * walk's lstat, and fails when the file changes while it is read. `keep` receives every chunk.
- */
 async function hashWalkedFile(
   rootReal: string,
   file: string,
@@ -84,10 +79,6 @@ async function hashWalkedFile(
   }
 }
 
-/**
- * One walk of a plugin tree, without following any symlink: a link contributes its link text.
- * The records include the root folder itself (path "").
- */
 class PluginTreeWalk {
   readonly records: PluginTreeRecord[] = [];
   private entries = 0;
@@ -109,7 +100,6 @@ class PluginTreeWalk {
     }
   }
 
-  /** Records one entry and returns the children still to visit. */
   private async visit(current: string, skipped: string | undefined): Promise<string[]> {
     const stat = await fs.lstat(current);
     const relative = path.relative(this.rootReal, current).split(path.sep).join("/");
@@ -151,7 +141,6 @@ class PluginTreeWalk {
     this.records.push(kept !== undefined ? { ...file, bytes: Buffer.concat(kept) } : file);
   }
 
-  /** Whether the walk keeps a file of this size, counting it against `maxKeptBytes`. */
   private keeps(size: number): boolean {
     if (this.options.keepBytesUpTo === undefined || size > this.options.keepBytesUpTo) return false;
     this.keptBytes += size;
@@ -173,7 +162,6 @@ async function walkPluginTree(
   return { rootReal, records: walk.records };
 }
 
-/** What a record compares besides its kind and mode: the content hash, the link text, or "". */
 export function pluginTreeRecordContent(record: PluginTreeRecord): string {
   return record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "";
 }
@@ -182,7 +170,6 @@ function byPath(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Every entry of the plugin tree except the folder itself, sorted by path. */
 export async function listPluginTreeRecords(
   root: string,
   quota: PluginTreeQuota,

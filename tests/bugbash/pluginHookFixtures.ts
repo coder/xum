@@ -123,7 +123,6 @@ export function pluginFixtures(): PluginFixture[] {
   ];
 }
 
-/** relative path -> content, written as is. */
 type Files = Record<string, string>;
 
 /**
@@ -450,7 +449,6 @@ function ralphLoopCursor(): Files {
   return files;
 }
 
-/** Fixtures in another tool's format, written file by file. */
 function fileFixtures(): Record<string, Files> {
   return { "ralph-loop-cursor": ralphLoopCursor() };
 }

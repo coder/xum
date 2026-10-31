@@ -1,8 +1,3 @@
-// Cursor plugin RFC PR 8, CUJ 3 (Verification Plan step 4): a copy of Cursor's ralph-loop
-// (ralph-loop-cursor, tests/bugbash/pluginHookFixtures.ts) continues a turn with its stop hook
-// until the reply holds its <promise> tag, then stops. A user Stop ends the current turn with no
-// continuation, the loop stays active in `.cursor/ralph/`, and cancel-ralph ends it.
-//
 // The mock model runs no tool, so the test does the ralph-loop and cancel-ralph skills' file steps
 // itself (their SKILL.md): it writes `.cursor/ralph/scratchpad.md` and later deletes the folder.
 // The hooks need jq and perl on the app's PATH, as in Cursor.
@@ -45,7 +40,6 @@ async function playground(app: App): Promise<{ id: string; root: string }> {
   return { id: found[0].id, root: found[0].namedWorkspacePath };
 }
 
-/** The continuation rows the stop hook added to the chat, from the server's history. */
 async function continuations(app: App): Promise<number> {
   const { id } = await playground(app);
   const replay = await client(app).workspace.getFullReplay({ workspaceId: id });
@@ -69,7 +63,6 @@ function startLoop(root: string, prompt: string): void {
   );
 }
 
-/** The loop's iteration from the state file; null when no loop is active. */
 function iteration(root: string): number | null {
   if (!fs.existsSync(scratchpad(root))) return null;
   const match = /^iteration: (\d+)$/m.exec(fs.readFileSync(scratchpad(root), "utf8"));

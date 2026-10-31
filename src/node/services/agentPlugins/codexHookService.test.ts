@@ -597,10 +597,6 @@ describe("CodexPluginHookService", () => {
   });
 });
 
-/**
- * Cursor command hooks in a workspace, with a real Cursor plugin, registry and trust store, and
- * the local runtime. The per-call gate rereads the hooks in the Cursor format.
- */
 describe("CodexPluginHookService with a Cursor plugin", () => {
   let tmp: DisposableTempDir;
   let xumHome: string;

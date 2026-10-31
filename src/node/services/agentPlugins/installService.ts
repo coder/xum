@@ -592,7 +592,6 @@ function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
   return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
 }
 
-/** The text of one side of a file review row: absent for a binary or large file. */
 function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
   if (record?.kind === "symlink") return showOneLineControls(record.target);
   if (record?.kind !== "file" || record.bytes === undefined) return undefined;
@@ -613,7 +612,6 @@ function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
   );
 }
 
-/** One file review row: an added row has only `after`, a removed row only `before`. */
 function fileReviewRow(
   filePath: string,
   was: PluginTreeRecord | undefined,
@@ -2313,7 +2311,6 @@ export class AgentPluginInstallService {
     );
   }
 
-  /** The records a file review compares, with the bytes that their hash read. */
   private async fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
     try {
       return await listPluginTreeRecords(dir, this.stagingQuota(), {

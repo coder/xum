@@ -39,7 +39,6 @@ describe("plugin tree records", () => {
     await fs.rm(second, { recursive: true, force: true });
   });
 
-  /** The paths whose record differs between the two folders. */
   async function differingPaths(): Promise<string[]> {
     const byPath = (records: PluginTreeRecord[]) =>
       new Map(records.map((record) => [record.path, record]));

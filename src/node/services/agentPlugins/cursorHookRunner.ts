@@ -1,6 +1,5 @@
 /**
- * Runs trusted Cursor command hooks (cursorHooks.ts) on Xum's hook points: afterAgentResponse and
- * then stop on `turn.stop`, and afterFileEdit on `tool.execute` after a file edit tool ran.
+ * Runs trusted Cursor command hooks (cursorHooks.ts).
  * Source: https://cursor.com/docs/hooks.md. Contract: Cursor plugin RFC section 5.
  *
  * SECURITY AUDIT: this is the first plugin code that starts a host process on a hook event. The
@@ -32,22 +31,17 @@ import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import type { PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 
-/** The same spine band as Codex hooks (codexHookRunner.ts), in discovery order. */
 const CURSOR_HOOK_ORDER_BASE = -1_000_000;
-/** Kept stdout; more counts as invalid output. */
 const HOOK_OUTPUT_MAX_BYTES = 64 * 1024;
 /**
  * The read cap: four bytes over the limit, because the capped reader drops a code point that the
  * cap splits (at most three bytes), and an output over the limit must still read as over it.
  */
 const HOOK_OUTPUT_READ_BYTES = HOOK_OUTPUT_MAX_BYTES + 4;
-/** How long past its timeout a call waits for the hook's pipes to close. */
 const OUTPUT_CLOSE_GRACE_SECONDS = 2;
-/** Cursor's exit code for a command (or a command it runs) that the shell cannot find. */
 const EXIT_CODE_NOT_FOUND = 127;
 const FILE_EDIT_TOOLS = new Set(["file_edit_replace_string", "file_edit_insert"]);
 
-/** What the per-call trust gate decided (codexHookService.ts). */
 export type CursorHookGate = "allowed" | "refused" | "trust-store-unreadable";
 
 export interface CursorHookRunnerDeps {
@@ -64,19 +58,15 @@ export interface CursorHookRegistration {
   pluginName: string;
   /** computePluginInstanceId of the plugin folder: its stop hooks' counts are its own. */
   pluginInstanceId: string;
-  /** CURSOR_PLUGIN_ROOT and the working folder of every hook except stop. */
   pluginRoot: string;
-  /** The workspace's chat.jsonl (D18). */
   transcriptPath: string;
   /** CURSOR_VERSION and `cursor_version`: `xum-<version>` (D18). */
   cursorVersion: string;
-  /** Discovery index (spine order). */
   order: number;
   hooks: PluginHookDefinition[];
   deps: CursorHookRunnerDeps;
 }
 
-/** How one call ended. Only `output` applies anything. */
 type CallResult =
   | { kind: "output"; output: Record<string, unknown> }
   | { kind: "skipped" }
@@ -84,7 +74,6 @@ type CallResult =
   | { kind: "failed"; reason: string };
 
 interface CallContext {
-  /** The workspace root: CURSOR_PROJECT_DIR, `workspace_roots`, and the working folder of stop. */
   workspaceRoot: string;
   /** Absent outside a model turn; JSON.stringify then leaves the field out of the input. */
   generationId: string | undefined;
@@ -92,7 +81,6 @@ interface CallContext {
   abortSignal: AbortSignal | undefined;
 }
 
-/** Register one plugin's runnable Cursor hooks on the spine. Returns the unregister function. */
 export function registerCursorPluginHooks(
   spine: EventSpine,
   registration: CursorHookRegistration
@@ -109,7 +97,6 @@ export function registerCursorPluginHooks(
     workspaceId: registration.workspaceId,
     order: CURSOR_HOOK_ORDER_BASE + registration.order,
   };
-  // Once per hook key for this registration's life (D28).
   const notified = new Set<string>();
   const runner = { registration, notified };
   const unregisters: Array<() => void> = [];
@@ -175,7 +162,6 @@ async function runTurnStopHooks(
   }
 }
 
-/** A stop hook's continuation: a non-empty `followup_message` string, under the hook's limit. */
 function continueReasonOf(
   hook: PluginHookDefinition,
   result: CallResult,
@@ -196,10 +182,8 @@ function continueReasonOf(
   };
 }
 
-/** Cursor's `edits` for the two edit tools Xum maps (D25); null for any other call. */
 function fileEditOf(ctx: ToolExecuteContext): { filePath: string; edits: unknown[] } | null {
   if (!FILE_EDIT_TOOLS.has(ctx.toolName) || !ctx.executed) return null;
-  // A failed edit (the tool's `success: false`) changed no file.
   if (!isPlainObject(ctx.result) || ctx.result.success !== true) return null;
   const args = ctx.args;
   if (!isPlainObject(args) || typeof args.path !== "string") return null;
@@ -229,10 +213,6 @@ async function runAfterFileEditHooks(
   }
 }
 
-/**
- * One hook call under the failure table of RFC 5.5. Returns the parsed output only for exit 0
- * with valid output that does not ask to deny (these events cannot block).
- */
 async function runHook(
   hook: PluginHookDefinition,
   eventFields: Record<string, unknown>,
@@ -268,7 +248,6 @@ function commandOf(hook: PluginHookDefinition) {
   return handler;
 }
 
-/** The start conditions of RFC 5.4 before any input is built: undefined when the call may start. */
 async function refusedStart(
   hook: PluginHookDefinition,
   call: CallContext,
@@ -319,7 +298,7 @@ async function startAndRead(
   }
   const seconds = effectiveHookTimeoutSeconds(handler.timeoutSeconds);
   const exit = await execHook(handler.command, input, {
-    // Cursor runs stop (and, later, subagentStop) from the workspace root, the rest from the
+    // Cursor runs stop from the workspace root, the rest from the
     // plugin folder. The command is not rewritten (D17): `./x.sh` in stop looks in the workspace.
     cwd: hook.event === "stop" ? call.workspaceRoot : registration.pluginRoot,
     env: hookEnvironment(registration, call.workspaceRoot),
@@ -334,7 +313,6 @@ async function startAndRead(
   return failure !== undefined ? { kind: "failed", reason: failure } : parseOutput(exit.stdout);
 }
 
-/** Why no hook process may start in this process at all, or undefined (D6, D7). */
 function startBlocker(registration: CursorHookRegistration): string | undefined {
   if (isAgentToolsDisabled()) return "XUM_DISABLE_AGENT_TOOLS";
   if (isTerminalsDisabled()) return "XUM_DISABLE_TERMINALS";
@@ -343,7 +321,6 @@ function startBlocker(registration: CursorHookRegistration): string | undefined 
   return undefined;
 }
 
-/** The documented Cursor variables over the minimal host environment (hostEnv: "minimal"). */
 function hookEnvironment(
   registration: CursorHookRegistration,
   workspaceRoot: string
@@ -428,7 +405,6 @@ async function settledBy<T>(promise: Promise<T>, ms: number): Promise<T | undefi
   }
 }
 
-/** A hook that exits without reading its input closes the pipe: that is not a failure. */
 async function writeInput(stdin: WritableStream<Uint8Array>, input: string): Promise<void> {
   const writer = stdin.getWriter();
   try {
@@ -439,7 +415,6 @@ async function writeInput(stdin: WritableStream<Uint8Array>, input: string): Pro
   }
 }
 
-/** Why an exit code is a failure (RFC 5.5), or undefined for exit 0. */
 function exitFailure(exitCode: number, command: string, seconds: number): string | undefined {
   switch (exitCode) {
     case 0:
@@ -457,7 +432,6 @@ function exitFailure(exitCode: number, command: string, seconds: number): string
   }
 }
 
-/** The output of a hook that exited 0: empty, or one JSON object that does not ask to deny. */
 function parseOutput(stdout: string): CallResult {
   if (Buffer.byteLength(stdout, "utf8") > HOOK_OUTPUT_MAX_BYTES) {
     return { kind: "failed", reason: `invalid output: over ${HOOK_OUTPUT_MAX_BYTES} bytes` };

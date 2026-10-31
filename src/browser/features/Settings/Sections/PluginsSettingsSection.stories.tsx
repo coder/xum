@@ -561,9 +561,6 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             slashCommands: [],
             reviewedComponents: [],
             codexHooks: [],
-            // The first file review of a plugin with a runnable Cursor command hook (D30): a text
-            // file, a symlink (its link text), a binary file (no text), a marked bidi control and
-            // a separator-free path that must wrap.
             fileChanges: [
               {
                 summary: "file hooks/hooks.json added",
@@ -859,7 +856,6 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
   },
 };
 
-/** Cursor hooks in the ralph-loop shape: two runnable command hooks and one Xum never runs. */
 const cursorHooksOptions = (): MockORPCClientOptions => {
   const hook = (
     event: string,

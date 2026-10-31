@@ -49,7 +49,6 @@ export interface FakeRuntimeOptions {
   /** What tempDir() returns. It must exist in the volume. */
   tempDir: string;
   commands?: ScriptTable;
-  /** Runtime.location; absent by default. */
   location?: RuntimeLocation;
 }
 
@@ -88,7 +87,6 @@ export interface FakeExecCall {
 export class FakeRuntime implements Runtime {
   /** Every exec command line, in order, answered or not. */
   readonly execs: string[] = [];
-  /** Every exec, in order, with its options and stdin. */
   readonly execCalls: FakeExecCall[] = [];
   private readonly pending = new Set<Promise<unknown>>();
 

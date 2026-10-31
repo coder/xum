@@ -6,7 +6,6 @@
 import * as crypto from "node:crypto";
 import { isPlainObject } from "./manifest";
 
-/** Largest hooks file Xum reads. */
 export const MAX_HOOKS_FILE_BYTES = 256 * 1024;
 /**
  * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a

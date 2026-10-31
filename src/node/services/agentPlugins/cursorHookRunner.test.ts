@@ -1,9 +1,3 @@
-/**
- * The Cursor command hook runner on a real EventSpine, driven through runTurnStopHooks and a
- * tool.execute run. The fake runtime answers from a script table and records each exec's options
- * and stdin. The cases that depend on process behavior (abort, timeout, full pipes) use the local
- * runtime with real bash commands.
- */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -46,7 +40,6 @@ function fakeRuntime(commands: ScriptTable, location: RuntimeLocation | null = "
   });
 }
 
-/** A runtime that calls `onExec` right after it hands the exec to `inner` (for abort timing). */
 function withExecHook(inner: Runtime, onExec: (command: string) => void): Runtime {
   return Object.assign(Object.create(inner) as Runtime, {
     exec: (command: string, options: ExecOptions): Promise<ExecStream> => {

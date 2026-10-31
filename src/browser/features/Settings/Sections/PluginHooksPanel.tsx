@@ -88,7 +88,6 @@ export function kilobytes(text: string): number {
   return Math.ceil(text.length / 1024);
 }
 
-/** Why a Codex or Claude Code hook can never run; null for a runnable hook. */
 const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = {
   runnable: null,
   "unsupported-handler": "Never runs: Xum runs only mcp_tool hooks.",
@@ -102,15 +101,9 @@ export function isCursorHookHandler(handler: PluginHookHandler): handler is Curs
   return handler.type === "cursor-command" || handler.type === "cursor-prompt";
 }
 
-/** Cursor plugin RFC 5.6: Cursor hooks run only in local and worktree workspaces. */
 export const CURSOR_HOOK_REMOTE_NOTE =
   "Does not run in remote workspaces (SSH, Docker and devcontainer).";
 
-/**
- * Why a hook can never run; null for a runnable hook. A Cursor hook names its own reason: the
- * shared note describes Codex handlers and events ("Xum runs only mcp_tool hooks" is false for a
- * Cursor command hook). Both keep the "Never runs" lead that the install preview's note names.
- */
 export function hookStatusNote(
   hook: Pick<AgentPluginHook, "event" | "matcher" | "handler" | "status">
 ): string | null {
@@ -119,7 +112,6 @@ export function hookStatusNote(
   return reason === undefined ? null : `Never runs: ${reason}.`;
 }
 
-/** Hook text the review shows; `full` is set only when `shown` is cut and must be expanded before Trust. */
 interface PluginHookReviewDetail extends PluginHookInputView {
   noun: "input" | "entry";
 }
@@ -166,7 +158,6 @@ function hooksIntro(data: AgentPluginHooks | null): string {
     : "Hooks from hooks.json. A hook runs only after you trust it, and only while it stays unchanged.";
 }
 
-/** A hook's hashed text, with the "Show full" control while it is cut. */
 const HookReviewDetailText: React.FC<{
   detail: PluginHookReviewDetail;
   expanded: boolean;

@@ -1,9 +1,4 @@
 /**
- * Per-workspace lifecycle for plugin hooks.json hooks: discovers the managed global plugins,
- * registers each plugin's runnable hooks on the event spine (Codex `mcp_tool` hooks through
- * codexHookRunner.ts, Cursor command hooks through cursorHookRunner.ts), and supplies the runners'
- * dependencies.
- *
  * Scope: managed global plugins only (`~/.xum/plugins`, in the install registry). Project
  * plugins and unmanaged global plugins never run hooks.json hooks: their trust review is a
  * follow-up, and an unreviewed hook must not run.
@@ -67,7 +62,6 @@ export interface EnsureCodexHooksArgs {
    * (D7), also a multi-project one: SSH, Docker and devcontainer workspaces start no hook process.
    */
   cursorHookRuntime?: Runtime;
-  /** The workspace's chat.jsonl, the transcript Cursor hooks get (D18). */
   transcriptPath: string;
 }
 
@@ -226,7 +220,6 @@ export class CodexPluginHookService {
     return plugins.filter((plugin) => plugin.componentPolicy !== undefined);
   }
 
-  /** Each plugin's hooks go to the runner of its format. */
   private registerPluginHooks(
     plugin: AgentPluginInfo,
     hooks: PluginHookDefinition[],
@@ -297,10 +290,9 @@ export class CodexPluginHookService {
 
 /**
  * Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
- * catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
- * per-call gate still refuses a revoked hook, and the refresh runs on every send and turn, so a
- * newly trusted hook registers on the next one (the fingerprint changes). Plugins left with no
- * hook are dropped.
+ * catastrophic) never runs. Trust can change afterwards: the per-call gate still refuses a
+ * revoked hook, and the refresh runs on every send and turn, so a newly trusted hook registers on
+ * the next one (the fingerprint changes).
  */
 async function trustedRunnableHooks(
   loaded: Array<{ plugin: AgentPluginInfo; hooks: PluginHookDefinition[] }>,
@@ -323,8 +315,7 @@ async function trustedRunnableHooks(
 
 /**
  * The gate before each hook call (see the module doc). The CURRENT manifest decides which hooks
- * file is declared (Codex PRRT_kwDOPxxmWM6rN77w): the discovery snapshot would keep a hook that
- * the manifest no longer points at. The reread uses the plugin's own format (loadPluginHooks).
+ * file is declared: the discovery snapshot would keep a hook that the manifest no longer points at.
  */
 async function checkHook(
   plugin: AgentPluginInfo,

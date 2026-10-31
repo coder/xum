@@ -70,10 +70,6 @@ export async function prepareWorkspaceRequestHooks(args: {
   });
 }
 
-/**
- * A local or worktree workspace, also with several projects: its commands run on the host. Cursor
- * command hooks run only there (D7); SSH, Docker and devcontainer workspaces run none.
- */
 function runsOnHost(metadata: WorkspaceMetadata): boolean {
   const type = metadata.runtimeConfig.type;
   return type === "local" || type === "worktree";
