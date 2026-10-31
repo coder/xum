@@ -355,6 +355,7 @@ describe("Mermaid layout stability", () => {
       "flowchart LR\nA[Request]-->B[Parse]-->C[Plan]-->D[Build]-->E[Test]-->F[Ship]";
     let observers: Array<{ callback: ResizeObserverCallback; element: Element | null }>;
     let measuredWidth: number;
+    let dialogWidth: number;
     let originalResizeObserver: typeof globalThis.ResizeObserver;
     let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
     let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
@@ -363,6 +364,7 @@ describe("Mermaid layout stability", () => {
     beforeEach(() => {
       observers = [];
       measuredWidth = 0;
+      dialogWidth = 0;
       originalResizeObserver = globalThis.ResizeObserver;
       originalRequestAnimationFrame = globalThis.requestAnimationFrame;
       originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
@@ -389,7 +391,11 @@ describe("Mermaid layout stability", () => {
       // unless afterEach restores it.
       measure = spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
         function (this: HTMLElement) {
-          const width = this.classList.contains("mermaid-container") ? measuredWidth : 0;
+          const width = this.classList.contains("mermaid-modal")
+            ? dialogWidth
+            : this.classList.contains("mermaid-container")
+              ? measuredWidth
+              : 0;
           return new window.DOMRect(0, 0, width, 300);
         }
       );
@@ -445,6 +451,22 @@ describe("Mermaid layout stability", () => {
         expect(wide.width).toBeGreaterThan(wide.height);
       });
       expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+    });
+
+    test("the expand dialog lays the diagram out for its own width", async () => {
+      measuredWidth = 326;
+      dialogWidth = 1200;
+      const view = renderMermaid({ chart: WIDE_CHART });
+      const inline = view.container.querySelector<HTMLElement>(".mermaid-container");
+      await waitFor(() => expect(viewBoxOf(inline).width).toBeGreaterThan(0));
+
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      await waitFor(() => {
+        const dialog = viewBoxOf(view.container.querySelector(".mermaid-modal"));
+        expect(dialog.width).toBeGreaterThan(dialog.height);
+      });
+      const narrow = viewBoxOf(inline);
+      expect(narrow.height).toBeGreaterThan(narrow.width);
     });
   });
 

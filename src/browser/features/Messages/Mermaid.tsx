@@ -280,6 +280,45 @@ function diagramLayout(containerSize: { width: number } | null) {
   return { maxWidth: width > 0 ? width : undefined, style };
 }
 
+/**
+ * Renders chart at the width of the element that containerRef points to, so each frame
+ * (inline and the expand dialog) lays the diagram out for its own width. A chart that
+ * fails to render keeps the last valid diagram on screen.
+ */
+function useDiagramSvg(chart: string, idPrefix: string) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const layout = diagramLayout(useResizeObserver(containerRef));
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [rendered, setRendered] = useState<{ svg: string; chart: string } | null>(null);
+  const [error, setError] = useState<{ chart: string; message: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const renderDiagram = async () => {
+      try {
+        const svg = await renderMermaidSvg(chart, idPrefix, layout.maxWidth);
+        if (cancelled) return;
+
+        setRendered({ svg, chart });
+        setError(null);
+      } catch (err) {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : "Failed to render diagram";
+        setError({ chart, message });
+      }
+    };
+
+    void renderDiagram();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chart, idPrefix, layout.maxWidth]);
+
+  return { containerRef, layoutStyle: layout.style, rendered, error };
+}
+
 function normalizeDiagramZoom(value: number): number {
   if (!Number.isFinite(value)) {
     return DEFAULT_ZOOM;
@@ -368,26 +407,46 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
   );
 };
 
+/** The expand dialog renders its own copy of an already valid chart, at the dialog's width. */
+const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
+  const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
+  return (
+    <div
+      ref={containerRef}
+      className="mermaid-container mermaid-modal"
+      style={{
+        background: "var(--color-code-bg)",
+        padding: "24px",
+        borderRadius: "8px",
+        minWidth: "80vw",
+        minHeight: "60vh",
+      }}
+      // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
+      dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
+    />
+  );
+};
+
 // Mermaid diagram component
 export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const { isStreaming } = useContext(StreamingContext);
-  const modalContainerRef = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  // Keep the source and SVG together while a newer chart is pending or invalid.
-  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
-    null
-  );
-  const svg = renderedDiagram?.svg ?? "";
-  const stableId = useId();
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const layout = diagramLayout(useResizeObserver(containerRef));
+  // Each diagram needs its own prefix: inline SVG ids (markers, clip paths) share the document.
+  const idPrefix = `mermaid-${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
 
   // Debounce chart changes to avoid flickering during streaming
   const [debouncedChart, setDebouncedChart] = useState(chart);
+  const {
+    containerRef,
+    layoutStyle,
+    rendered: renderedDiagram,
+    error: renderError,
+  } = useDiagramSvg(debouncedChart, idPrefix);
+  const svg = renderedDiagram?.svg ?? "";
+  // An error belongs to the chart that failed, so a newer chart hides it at once instead of
+  // flashing it at the end of a stream.
+  const error = renderError?.chart === chart ? renderError.message : null;
   useEffect(() => {
-    // Clear stale errors when chart changes - avoids error flash at end of stream
-    setError(null);
     const timer = setTimeout(() => setDebouncedChart(chart), 350);
     return () => clearTimeout(timer);
   }, [chart]);
@@ -414,40 +473,6 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
       setStoredDiagramZoom((prev) => normalizeDiagramZoom(normalizeDiagramZoom(prev) - ZOOM_STEP));
     }
   };
-
-  useEffect(() => {
-    // Each diagram needs its own prefix: inline SVG ids (markers, clip paths) share the document.
-    const idPrefix = `mermaid-${stableId.replace(/[^A-Za-z0-9_-]/g, "")}`;
-    let cancelled = false;
-
-    const renderDiagram = async () => {
-      try {
-        const sanitizedSvg = await renderMermaidSvg(debouncedChart, idPrefix, layout.maxWidth);
-        if (cancelled) return;
-
-        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
-        setError(null);
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Failed to render diagram");
-        // Don't clear SVG - keep showing last valid render during errors
-      }
-    };
-
-    void renderDiagram();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedChart, layout.maxWidth, stableId]);
-
-  // Update modal container when opened
-  useEffect(() => {
-    if (isModalOpen && modalContainerRef.current && svg) {
-      // SECURITY AUDIT: svg state only stores sanitizeMermaidSvg() output.
-      modalContainerRef.current.innerHTML = svg;
-    }
-  }, [isModalOpen, svg]);
 
   if (error && !isStreaming) {
     return (
@@ -508,7 +533,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           style={{
             ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
-            ...layout.style,
+            ...layoutStyle,
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
@@ -519,19 +544,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           {showPendingPlaceholder ? MERMAID_PENDING_TEXT : null}
         </div>
       </div>
-      {isModalOpen && (
+      {isModalOpen && renderedDiagram && (
         <DiagramModal onClose={() => setIsModalOpen(false)}>
-          <div
-            ref={modalContainerRef}
-            className="mermaid-container mermaid-modal"
-            style={{
-              background: "var(--color-code-bg)",
-              padding: "24px",
-              borderRadius: "8px",
-              minWidth: "80vw",
-              minHeight: "60vh",
-            }}
-          />
+          <DialogDiagram chart={renderedDiagram.chart} idPrefix={`${idPrefix}-modal`} />
         </DiagramModal>
       )}
     </>
