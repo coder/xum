@@ -218,7 +218,7 @@ async function unlessMissing<T>(pending: Promise<T>): Promise<T | null> {
 
 export class TaskHandleStore {
   private readonly scanIndex = new Map<string, OwnerScanIndex>();
-  /** Bumped after each write by this store, so a scan that overlapped it publishes no proof. */
+  /** Bumped by each write during a scan, so a scan that overlapped the write publishes no proof. */
   private readonly writeGenerations = new Map<string, number>();
   private scansInFlight = 0;
   private readonly now: () => number;
@@ -566,10 +566,13 @@ export class TaskHandleStore {
 
   /** Rows need nothing here: the write gives the handle file a new inode. */
   private forgetScannedHandle(ownerWorkspaceId: string): void {
-    this.writeGenerations.set(
-      ownerWorkspaceId,
-      (this.writeGenerations.get(ownerWorkspaceId) ?? 0) + 1
-    );
+    // With no scan running, no scan holds a generation, and the delete below covers the next scan.
+    if (this.scansInFlight > 0) {
+      this.writeGenerations.set(
+        ownerWorkspaceId,
+        (this.writeGenerations.get(ownerWorkspaceId) ?? 0) + 1
+      );
+    }
     if (this.scanIndex.get(ownerWorkspaceId)?.provenBy === "session-dir") {
       this.scanIndex.delete(ownerWorkspaceId);
     }
