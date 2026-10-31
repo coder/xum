@@ -268,7 +268,7 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
             const expandKey = `${hook.key}\0${hook.hash}`;
             const expanded = expandedInputs.has(expandKey);
             // Trust covers the full definition: it waits until the user can have read all of it.
-            const mustExpand = detail !== null && detail.full !== null && !expanded;
+            const mustExpand = detail?.full != null && !expanded;
             return (
               <li
                 key={hook.key}

@@ -92,7 +92,7 @@ describe("loadPluginCursorHooks", () => {
     const [ninety] = (await stopEntry({ loop_limit: 90 })).hooks;
     expect(eighty.handler.type === "cursor-command" && eighty.handler.loopLimit).toBe(50);
     expect(ninety.handler.type === "cursor-command" && ninety.handler.loopLimit).toBe(50);
-    const declared = (hook: typeof eighty) =>
+    const declared = (hook: typeof eighty): unknown =>
       hook.handler.type === "cursor-command" ? JSON.parse(hook.handler.declared) : undefined;
     expect(declared(eighty)).toEqual({ command: "./x.sh", loop_limit: 80 });
     expect(declared(ninety)).toEqual({ command: "./x.sh", loop_limit: 90 });
@@ -110,9 +110,8 @@ describe("loadPluginCursorHooks", () => {
   test("an unknown field appears in declared, and changing it changes the hash", async () => {
     const [a] = (await stopEntry({ extra: { a: 1 } })).hooks;
     const [b] = (await stopEntry({ extra: { a: 2 } })).hooks;
-    expect(a.handler.type === "cursor-command" && JSON.parse(a.handler.declared).extra).toEqual({
-      a: 1,
-    });
+    const declared: unknown = a.handler.type === "cursor-command" && JSON.parse(a.handler.declared);
+    expect(declared).toMatchObject({ extra: { a: 1 } });
     expect(a.hash).not.toBe(b.hash);
   });
 
