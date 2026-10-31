@@ -188,7 +188,8 @@ function continueReasonOf(
 
 function fileEditOf(ctx: ToolExecuteContext): { filePath: string; edits: unknown[] } | null {
   if (!FILE_EDIT_TOOLS.has(ctx.toolName) || !ctx.executed) return null;
-  if (!isPlainObject(ctx.result) || ctx.result.success !== true) return null;
+  // The tool's own result: a post hook that blocked the edit replaced `result`, not the file.
+  if (!isPlainObject(ctx.terminalResult) || ctx.terminalResult.success !== true) return null;
   const args = ctx.args;
   if (!isPlainObject(args) || typeof args.path !== "string") return null;
   const edit =

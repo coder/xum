@@ -11,6 +11,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import type { PluginHookDefinition } from "./codexHooks";
 import { loadPluginCursorHooks } from "./cursorHooks";
 import { registerCursorPluginHooks, type CursorHookGate } from "./cursorHookRunner";
+import { PLUGIN_HOOK_ORDER_BASE } from "@/constants/pluginHooks";
 import { nodePluginFs } from "./discovery";
 import { runTurnStopHooks, type TurnStopHookOutcome } from "./promptHooks";
 
@@ -109,6 +110,7 @@ function harness(args: {
       };
       await spine.run("tool.execute", ctx, (c) => {
         c.result = result;
+        c.terminalResult = result;
         c.executed = true;
       });
     },
@@ -206,6 +208,26 @@ describe("Cursor hook input, environment and working folder", () => {
       file_path: "/abs/b.ts",
       edits: [{ old_string: "", new_string: "new" }],
     });
+  });
+
+  test("afterFileEdit runs after an edit whose result an inner post hook replaced", async () => {
+    // A Codex PostToolUse block replaces the result the model sees; the file changed anyway.
+    const runtime = fakeRuntime({ "./e.sh": {} });
+    const h = harness({
+      hooks: await hooksOf({ afterFileEdit: [{ command: "./e.sh" }] }),
+      runtime,
+    });
+    h.spine.use(
+      "tool.execute",
+      async (ctx, next) => {
+        await next();
+        ctx.result = { error: "blocked by a PostToolUse hook" };
+        ctx.postBlocked = true;
+      },
+      { workspaceId, order: PLUGIN_HOOK_ORDER_BASE + 1 }
+    );
+    await h.edit("file_edit_insert", { path: "/abs/b.ts", content: "new" }, { success: true });
+    expect(runtime.execCalls).toHaveLength(1);
   });
 });
 
