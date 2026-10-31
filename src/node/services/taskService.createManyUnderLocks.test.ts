@@ -26,8 +26,9 @@ import {
 const PARENT_ID = "1111111111";
 const TASK_ID = "aaaaaaaaaa";
 const SECOND_ID = "cccccccccc";
-// TASK_RESERVATION_CANCELED_MESSAGE: the fence persists it and rejects the waiters with it.
-const CANCELED = "Reservation canceled";
+// The cancel message is production copy: the tests check that the fence persists the same message
+// it rejects the waiters with, never its wording.
+const ANY_MESSAGE = expect.any(String) as unknown as string;
 const realResolveAgentDefinition = agentDefinitionsService.resolveAgentDefinition;
 
 type CreateManyArgs = Parameters<TaskService["createMany"]>[0][number];
@@ -244,7 +245,8 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
       event(`reserved ${index} ${result.taskId} @${stage()}`);
       hooks.duringCheckpoint?.();
     });
-    recordFence(taskService, hooks, event, owned);
+    const rejections: string[] = [];
+    recordFence(taskService, hooks, event, owned, rejections);
     const createMany = (
       count: number,
       options: { abortSignal?: AbortSignal; args?: Partial<CreateManyArgs> } = {}
@@ -265,7 +267,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
         }
       );
     };
-    return { taskService, hooks, events, onTaskReserved, stage, createMany, owned };
+    return { taskService, hooks, events, onTaskReserved, stage, createMany, owned, rejections };
   }
 
   /** Records the post-commit fence's collaborators (call-through, see setup). */
@@ -273,7 +275,8 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     taskService: TaskService,
     hooks: Hooks,
     event: (name: string) => void,
-    owned: ReadonlyMap<string, { attempt: unknown }>
+    owned: ReadonlyMap<string, { attempt: unknown }>,
+    rejections: string[]
   ) {
     const target = internals(taskService);
     const realClose = target.closeReservedAttempts.bind(taskService);
@@ -301,7 +304,8 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     });
     const realReject = target.rejectWaiters.bind(taskService);
     spyOn(target, "rejectWaiters").mockImplementation((id, error) => {
-      event(`reject ${id} ${error.message}`);
+      event(`reject ${id}`);
+      rejections.push(error.message);
       realReject(id, error);
     });
     const ledger = target.attemptLedger;
@@ -613,7 +617,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
       fence: { edit: true, transition: true, reject: true },
       row: {
         taskStatus: "interrupted",
-        taskLaunchError: CANCELED,
+        taskLaunchError: ANY_MESSAGE,
         taskAttemptId: "reserved",
         taskGoalPauseOwed: "reserved",
       },
@@ -653,11 +657,15 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
       label: "a row the commit already wrote interrupted is not edited again",
       canceledInsideCommit: true,
       fence: { edit: false, transition: true, reject: true },
-      row: { taskStatus: "interrupted", taskLaunchError: CANCELED, taskAttemptId: "reserved" },
+      row: {
+        taskStatus: "interrupted",
+        taskLaunchError: ANY_MESSAGE,
+        taskAttemptId: "reserved",
+      },
     },
   ];
   test.each(fenceCases)("$label", async ({ otherWriter, canceledInsideCommit, fence, row }) => {
-    const { hooks, events, stage, createMany, owned } = await setup();
+    const { hooks, events, stage, createMany, owned, rejections } = await setup();
     const controller = new AbortController();
     if (canceledInsideCommit === true) {
       hooks.duringCheckpoint = () => controller.abort();
@@ -685,7 +693,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
         ? [`interrupted ${TASK_ID} ${PARENT_ID} +mutex`, `goal-pause ${TASK_ID} +mutex`]
         : []),
       // Rejected before the receipt write's await.
-      ...(fence.reject ? [`reject ${TASK_ID} ${CANCELED} +mutex`] : []),
+      ...(fence.reject ? [`reject ${TASK_ID} +mutex`] : []),
       `receipt ${TASK_ID} owned reservation-canceled reservation-canceled +mutex`,
       `emit ${TASK_ID} +mutex`,
       // The untaken lease is released at scope exit, before the mutex.
@@ -693,6 +701,13 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
       "tree-exit",
     ]);
     expect(rowState(TASK_ID, owned)).toEqual(row);
+    // The waiters are rejected with the message the row persists (a row that moved on or was
+    // removed keeps none, so there any message is accepted).
+    const persistedError =
+      row?.taskLaunchError == null
+        ? ANY_MESSAGE
+        : (rowState(TASK_ID, owned)?.taskLaunchError ?? "(no persisted error)");
+    expect(rejections).toEqual(fence.reject ? [persistedError] : []);
     expect(stage()).toBe("launch");
     expect(launched).toEqual([]);
   });
@@ -703,7 +718,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     // The updater ran and saw the row moved on (another writer's): its waiters are not armed.
     ["the first plan's fence write rejects after its row moved on", [TASK_ID], true],
   ])("%s: every plan is still fenced, then the first failure is thrown", async (_l, ids, moved) => {
-    const { hooks, events, createMany, owned } = await setup();
+    const { hooks, events, createMany, owned, rejections } = await setup();
     const controller = new AbortController();
     const failures = new Map(ids.map((id) => [id, new Error(`fence write of ${id} failed`)]));
     hooks.failFenceEdit = (id) => {
@@ -735,7 +750,7 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
             `edit ${id} +mutex`,
             `interrupted ${id} ${PARENT_ID} +mutex`,
             `goal-pause ${id} +mutex`,
-            `reject ${id} ${CANCELED} +mutex`,
+            `reject ${id} +mutex`,
             `receipt ${id} owned reservation-canceled reservation-canceled +mutex`,
             `emit ${id} +mutex`,
           ];
@@ -753,6 +768,11 @@ describe("TaskService.createManyUnderTaskTreeLifecycleLocks before the split", (
     expect(rowState(SECOND_ID, owned)?.taskStatus).toBe(
       failures.has(SECOND_ID) ? "starting" : "interrupted"
     );
+    // Each fenced plan's waiters are rejected with the message its row persists.
+    const persisted = [TASK_ID, SECOND_ID]
+      .filter((id) => !failures.has(id))
+      .map((id) => rowState(id, owned)?.taskLaunchError ?? "(no persisted error)");
+    expect(rejections).toEqual(persisted);
   });
 
   test("the post-commit fence reads the abort after the last emit, in the tick that schedules", async () => {
