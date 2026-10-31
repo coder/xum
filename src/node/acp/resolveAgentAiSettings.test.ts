@@ -41,30 +41,46 @@ function clientFor(projectPath: string, config: Config): ORPCClient {
 }
 
 describe("ACP resolveAgentAiSettings with ai.settingsBase (Cursor model: fast)", () => {
-  test("an agent with settingsBase explore takes Explore's Settings model, not Exec's", async () => {
+  async function resolveWatcher(agents: Record<string, string>, agentAiDefaults: AgentAiDefaults) {
     using project = new DisposableTempDir("acp-settings-base");
     using home = new DisposableTempDir("acp-settings-base-home");
     const agentsRoot = path.join(project.path, ".xum", "agents");
     await fs.mkdir(agentsRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(agentsRoot, "ci-watcher.md"),
-      "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: explore\n---\nWatch CI.\n"
-    );
+    for (const [id, frontmatter] of Object.entries(agents)) {
+      await fs.writeFile(
+        path.join(agentsRoot, `${id}.md`),
+        `---\nname: ${id}\n${frontmatter}---\nBody.\n`
+      );
+    }
     const config = new Config(home.path);
-    const agentAiDefaults: AgentAiDefaults = {
-      explore: { modelString: "custom:m-explore" },
-      exec: { modelString: "custom:m-exec" },
-    };
     await config.editConfig((cfg) => ({ ...cfg, agentAiDefaults }));
 
     const previousRoot = process.env.XUM_ROOT;
     process.env.XUM_ROOT = home.path;
     try {
-      const resolved = await resolveAgentAiSettings(clientFor(project.path, config), "ci-watcher");
-      expect(resolved.model).toBe("custom:m-explore");
+      return await resolveAgentAiSettings(clientFor(project.path, config), "ci-watcher");
     } finally {
       if (previousRoot === undefined) delete process.env.XUM_ROOT;
       else process.env.XUM_ROOT = previousRoot;
     }
+  }
+
+  test("an agent with settingsBase explore takes Explore's Settings model, not Exec's", async () => {
+    const resolved = await resolveWatcher(
+      { "ci-watcher": "base: exec\nai:\n  settingsBase: explore\n" },
+      { explore: { modelString: "custom:m-explore" }, exec: { modelString: "custom:m-exec" } }
+    );
+    expect(resolved.model).toBe("custom:m-explore");
+  });
+
+  test("the model its ordinary base's frontmatter sets does not outrank the settings base", async () => {
+    const resolved = await resolveWatcher(
+      {
+        helper: "base: exec\nai:\n  model: custom:m-helper\n",
+        "ci-watcher": "base: helper\nai:\n  settingsBase: explore\n",
+      },
+      { explore: { modelString: "custom:m-explore" } }
+    );
+    expect(resolved.model).toBe("custom:m-explore");
   });
 });

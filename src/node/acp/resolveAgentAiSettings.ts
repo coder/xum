@@ -66,13 +66,17 @@ export async function resolveAcpAgentAiSettings(
   ]);
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
+  // A listed agent's aiDefaults merge its bases' frontmatter, which a run ranks below those bases'
+  // Settings and drops when a settings base replaces them, so each layer takes only its own.
+  const ownAiDefaults = (agent: (typeof agents)[number]) =>
+    agent.aiLayers ? agent.aiLayers.targetDefinitionAiDefaults : agent.aiDefaults;
   const agentDefsById = new Map<string, AgentAncestorDescriptor>([
     ...collectUnlistedAncestorHops(agents),
     ...agents.map(
       (agent) =>
         [
           agent.id,
-          { base: aiSettingsBaseOf(agent), definitionAiDefaults: agent.aiDefaults },
+          { base: aiSettingsBaseOf(agent), definitionAiDefaults: ownAiDefaults(agent) },
         ] as const
     ),
   ]);
@@ -83,7 +87,7 @@ export async function resolveAcpAgentAiSettings(
     explicit: extras?.explicit,
     targetWorkspaceSettings: extras?.targetWorkspaceSettings,
     agentAiDefaults: config.agentAiDefaults,
-    targetDefinitionAiDefaults: agentDef?.aiDefaults,
+    targetDefinitionAiDefaults: agentDef && ownAiDefaults(agentDef),
     ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
     parentRuntime: extras?.parentRuntime,
   });

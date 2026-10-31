@@ -417,6 +417,8 @@ describe("resolveNodeAgentAiSettings with ai.settingsBase (Cursor model: fast)",
     ["missing-agent", "missing", {}],
     ["ci-watcher", "self", {}],
     ["helper", "nested", HELPER],
+    // agents.list cannot resolve an agent whose base is missing, so a run ignores it as well.
+    ["broken", "missing", { broken: "base: missing-base\n" }],
   ])("ignores settingsBase %s with a warning", async (settingsBase, reason, otherAgents) => {
     const warn = spyOn(log, "warn");
     try {
