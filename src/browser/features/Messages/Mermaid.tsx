@@ -10,6 +10,7 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
   MERMAID_BUTTON_HEIGHT,
   MERMAID_BUTTON_INSET,
@@ -257,6 +258,47 @@ const PELE_CSS_FUNCTIONS = new Set([
   "var",
 ]);
 
+/**
+ * The custom properties Pele declares, all in the style of the root <svg>, each as one theme
+ * variable such as `--_bg:var(--pele-bg,#fff)`. Chromium nests each var() when it computes styles
+ * after insert, in time that doubles with each level, so a chain of custom properties freezes it
+ * while each declaration nests only 2 deep. Pele drops custom properties from chart styles.
+ */
+const PELE_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set([
+  "--_a",
+  "--_b",
+  "--_bg",
+  "--_c",
+  "--_fg",
+  "--_fm",
+  "--_hw",
+  "--_l",
+  "--_m",
+  "--_r",
+  "--_s",
+  "--_tw",
+  "--_w",
+]);
+const NO_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set();
+
+// One theme variable with a fallback of names, numbers, colors and closed strings: the value reads
+// no other custom property, and without a block or an open string it ends at the next ;.
+const PELE_CUSTOM_PROPERTY =
+  /^[ \t\n\r]*(--[\w-]*)[ \t\n\r]*:[ \t\n\r]*var\(--pele-[\w-]+,(?:[^;()[\]{}"']|"[^"\n\r]*")*\)[ \t\n\r]*$/;
+// Chromium starts a declaration at the start of a style and after a ;, { or }.
+const CUSTOM_PROPERTY_START = /(?:^|[;{}])(?=[ \t\n\r]*--)/g;
+
+/** Every custom property that style declares is one of customProperties, as Pele writes it. */
+function declaresOnly(style: string, customProperties: ReadonlySet<string>): boolean {
+  for (const { 0: delimiter, index } of style.matchAll(CUSTOM_PROPERTY_START)) {
+    const start = index + delimiter.length;
+    const end = style.indexOf(";", start);
+    const name = PELE_CUSTOM_PROPERTY.exec(style.slice(start, end === -1 ? undefined : end))?.[1];
+    if (name === undefined || !customProperties.has(name)) return false;
+  }
+  return true;
+}
+
 /** Pele derives every id from idPrefix, such as `${idPrefix}-title` for an accTitle. */
 function isDiagramId(id: string, idPrefix: string): boolean {
   return id.startsWith(`${idPrefix}-`);
@@ -303,12 +345,16 @@ function keptIdValue(name: string, value: string, idPrefix: string): string | nu
   return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
 }
 
-/** The value to keep for an attribute, or null to remove the attribute. */
+/**
+ * The value to keep for an attribute, or null to remove the attribute. A style may declare only
+ * customProperties.
+ */
 function keptAttributeValue(
   rules: PeleNamespace,
   name: string,
   value: string,
-  idPrefix: string
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
 ): string | null {
   if (rules.textAttributes.has(name)) return value;
   if (rules.idAttributes.has(name)) return keptIdValue(name, value, idPrefix);
@@ -316,16 +362,24 @@ function keptAttributeValue(
   // A style is kept or removed whole, never split into declarations: a splitter that tokenizes
   // quotes, escapes or comments unlike the browser turns an inert string into live declarations.
   // Pele writes no style that fails, so its diagrams lose nothing.
-  return isPeleCss(value, name === "style" ? null : idPrefix) ? value : null;
+  const isKept =
+    name === "style"
+      ? isPeleCss(value, null) && declaresOnly(value, customProperties)
+      : isPeleCss(value, idPrefix);
+  return isKept ? value : null;
 }
 
 /** Applies PELE_OUTPUT to the attributes of an element that removeUnknownElements kept. */
-function sanitizeAttributes(element: Element, idPrefix: string): void {
+function sanitizeAttributes(
+  element: Element,
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
+): void {
   const rules = peleNamespace(element.namespaceURI);
   for (const attribute of Array.from(element.attributes)) {
     // Lowercase like the HTML parser, which turns an XML FILL attribute into fill.
     const name = asciiLowerCase(attribute.name);
-    const value = keptAttributeValue(rules, name, attribute.value, idPrefix);
+    const value = keptAttributeValue(rules, name, attribute.value, idPrefix, customProperties);
     if (value === null) element.removeAttributeNode(attribute);
     else attribute.value = value;
   }
@@ -383,24 +437,109 @@ function removeUnknownElements(parent: Element): void {
   }
 }
 
+/** Names that the browser never parses as CSS, so their values may hold any label text. */
+const NON_CSS_ATTRIBUTES = new Set(
+  [...PELE_OUTPUT.values()].flatMap((rules) => [...rules.textAttributes, ...rules.idAttributes])
+);
+
+function isNonCssAttribute(name: string): boolean {
+  return NON_CSS_ATTRIBUTES.has(name) || /^(?:aria-|data-|xmlns:)/.test(name);
+}
+
+const XML_REFERENCE = /&(?:#x([\dA-Fa-f]+)|#(\d+)|(quot|apos|amp|lt|gt));/g;
+const XML_ENTITIES: Record<string, string> = { quot: '"', apos: "'", amp: "&", lt: "<", gt: ">" };
+
 /**
- * Keeps only element and text children. Pele emits no comments, processing instructions or
- * CDATA. The HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`,
- * so markup that the XML parser read as their data becomes live elements.
+ * An attribute value as the XML parser decodes it, with each non-ASCII character as U+0080. CSS
+ * reads every non-ASCII character alike: as part of a name.
  */
-function removeNonElementNodes(elements: Element[]): void {
-  for (const element of elements) {
-    for (const child of Array.from(element.childNodes)) {
-      if (child.nodeType !== child.ELEMENT_NODE && child.nodeType !== child.TEXT_NODE) {
-        child.remove();
-      }
+function decodeXmlAttribute(value: string): string {
+  // The XML parser turns a literal tab, LF or CR into a space, but not one written as a reference.
+  return value
+    .replace(/[\t\n\r]/g, " ")
+    .replace(XML_REFERENCE, (_reference, hex?: string, decimal?: string, name?: string) => {
+      if (name !== undefined) return XML_ENTITIES[name];
+      const code = hex === undefined ? Number(decimal) : parseInt(hex, 16);
+      // mutation-equivalent: String.fromCharCode(0x80) is U+0080 too
+      return code < 0x80 ? String.fromCharCode(code) : "\u0080";
+    });
+}
+
+// The CSS tokens that can open or close a block: a backslash, a block character, and the strings,
+// comments and unquoted url() whose (, ), [, ], { and } open and close nothing. A string ends at
+// its quote, a newline or a backslash. An unquoted url( ends at its ) or a backslash, and a name
+// character, # or @ before it makes it part of an earlier token, so the ( opens a block.
+const CSS_BLOCK_TOKEN =
+  /\\|"[^"\\\n\r\f]*"?|'[^'\\\n\r\f]*'?|\/\*[\s\S]*?(?:\*\/|$)|(?<![\w#@\u0080-\uffff-])url\((?![ \t\n\r\f]*["'])[^)\\]*\)?|[()[\]{}]/gi;
+const CSS_BLOCK_CLOSERS: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+
+/**
+ * How deep (, [ and { nest in css, never less than Chromium's CSS tokenizer reads it: a block
+ * closes only at its own closer. Past a backslash every opener counts and no closer does. Pele
+ * writes no escape in CSS, and isPeleCss removes one.
+ */
+function cssNestingDepth(css: string): number {
+  const closers: string[] = [];
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  for (const { 0: token, index } of css.matchAll(CSS_BLOCK_TOKEN)) {
+    if (token === "\\") {
+      // mutation-equivalent: || reads the same length, because match returns null for no match
+      const openers = css.slice(index).match(/[([{]/g)?.length ?? 0;
+      return Math.max(deepest, closers.length + openers);
     }
+    const closer = CSS_BLOCK_CLOSERS[token];
+    if (closer !== undefined) deepest = Math.max(deepest, closers.push(closer));
+    else if (token === closers.at(-1)) closers.pop();
   }
+  return deepest;
+}
+
+// XML whitespace is space, tab, LF and CR. A < cannot be in a name or value, so it starts the next
+// tag.
+const XML_TAG_NAME = /<[^ \t\n\r/<>]*/y;
+const XML_ATTRIBUTE = /[ \t\n\r]+([^ \t\n\r=/<>]+)[ \t\n\r]*=[ \t\n\r]*(?:"([^"<]*)"|'([^'<]*)')/y;
+
+/**
+ * The deepest nesting in an attribute value of svg that the browser may parse as CSS, read from
+ * the markup in one pass. svg has no comment, CDATA, processing instruction or DOCTYPE, so each <
+ * starts a tag. The XML parser stops at the first error, so the scan of a tag may stop there too.
+ */
+function attributeNestingDepth(svg: string): number {
+  // mutation-equivalent: the limit is above 1, so a floor of 0 or 1 decides nothing
+  let deepest = 0;
+  for (let tag = svg.indexOf("<"); tag !== -1; ) {
+    XML_TAG_NAME.lastIndex = tag;
+    XML_TAG_NAME.exec(svg);
+    XML_ATTRIBUTE.lastIndex = XML_TAG_NAME.lastIndex;
+    let end = XML_ATTRIBUTE.lastIndex;
+    for (let attribute = XML_ATTRIBUTE.exec(svg); attribute; attribute = XML_ATTRIBUTE.exec(svg)) {
+      end = XML_ATTRIBUTE.lastIndex;
+      if (isNonCssAttribute(attribute[1])) continue;
+      const value = decodeXmlAttribute(attribute[2] ?? attribute[3]);
+      deepest = Math.max(deepest, cssNestingDepth(value));
+    }
+    tag = svg.indexOf("<", end);
+  }
+  return deepest;
 }
 
 /** Sanitizes the SVG that Pele rendered with idPrefix. Null when it is not well-formed SVG. */
 export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null {
   assert(/^[\w-]+$/.test(idPrefix), "idPrefix is a plain id, as Mermaid builds it");
+  // Pele writes no comment, CDATA, processing instruction or DOCTYPE. A quote in one would hide
+  // the markup after it from attributeNestingDepth, and a DOCTYPE entity can expand to CSS. The
+  // HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`, so markup
+  // that the XML parser read as their data would become live elements.
+  if (/<[!?]/.test(svg)) return null;
+  // DOMParser parses the text of a <style> too, and the scan below reads only attributes. Pele
+  // writes no <style>, so this refuses one in any namespace or case. The name ends at XML
+  // whitespace, not \s: a prefix such as x\u1680 is one XML name.
+  if (/<(?:[^ \t\n\r/<>]*:)?style[ \t\n\r/>]/i.test(svg)) return null;
+  // Chromium parses each style while DOMParser builds the tree, in time that doubles with each
+  // color-mix() nested around an invalid value, so this check must run first. Pele passes such
+  // values from a chart unchanged.
+  if (attributeNestingDepth(svg) > MERMAID_MAX_ATTRIBUTE_NESTING) return null;
   // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
   // fail closed.
   const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
@@ -414,9 +553,10 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
 
   // Defense in depth: keep only the elements, text and attribute values Pele emits.
   removeUnknownElements(svgRoot);
-  const elements: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
-  removeNonElementNodes(elements);
-  for (const element of elements) sanitizeAttributes(element, idPrefix);
+  sanitizeAttributes(svgRoot, idPrefix, PELE_CUSTOM_PROPERTIES);
+  for (const element of Array.from(svgRoot.querySelectorAll("*"))) {
+    sanitizeAttributes(element, idPrefix, NO_CUSTOM_PROPERTIES);
+  }
 
   return svgRoot.outerHTML;
 }

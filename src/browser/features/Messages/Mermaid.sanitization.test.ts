@@ -1,5 +1,6 @@
 import { peleRenderOptions, sanitizeMermaidSvg } from "./Mermaid";
 import { PELE_SAMPLES } from "./Mermaid.sanitization.fixtures";
+import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSerializer";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 
@@ -66,9 +67,26 @@ function themeVariable(name: string): string {
   return value;
 }
 
+/**
+ * Chromium parses a style while DOMParser builds the tree, in time that doubles with each
+ * color-mix() nested around an invalid value: 1.27 s at depth 22.
+ */
+function nestedColorMix(depth: number, after = "", before = ""): string {
+  let value = "nope(1)";
+  for (let level = 0; level < depth; level++)
+    value = `color-mix(in srgb, ${before}${value}${after}, blue)`;
+  return value;
+}
+
 describe("sanitizeMermaidSvg", () => {
   it("returns null for malformed SVG", () => {
     expect(sanitizeMermaidSvg("<svg><g></svg", ID_PREFIX)).toBeNull();
+    expect(
+      sanitizeMermaidSvg(
+        '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="red/></svg>',
+        ID_PREFIX
+      )
+    ).toBeNull();
   });
 
   it("returns null for an svg root outside the SVG namespace", () => {
@@ -140,10 +158,10 @@ describe("sanitizeMermaidSvg", () => {
       ),
     ],
     ["an extra attribute on the wrapper", peleMathLabel(MATH, ' onclick="alert(1)"')],
-    // The HTML parser would read the math's text as CSS.
+    // Pele wraps the math only in a div. The sanitizer returns null for a <style> wrapper.
     [
-      "a style element as the wrapper",
-      `<foreignObject class="pele-math"><style xmlns="${XHTML}" style="">${MATH}</style></foreignObject>`,
+      "a span as the wrapper",
+      `<foreignObject class="pele-math"><span xmlns="${XHTML}" style="">${MATH}</span></foreignObject>`,
     ],
   ])("removes a foreignObject with %s", (_case, label) => {
     const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX);
@@ -153,18 +171,29 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("<img");
   });
 
-  // The HTML parser ends `<!-->` at its first `>`, so the <img> after it is a live element. happy-dom
-  // has no CDATA nodes and ends a processing instruction at its first `>`, so those cases cannot
-  // carry the same <img> here.
+  // The HTML parser ends `<!-->` at its first `>`, so the <img> after it is a live element. A quote
+  // in a comment, CDATA, processing instruction or DOCTYPE hides the style after it from a scan of
+  // attribute values, and a DOCTYPE entity expands to CSS.
   const BREAKOUT_COMMENT = '<!--><img src="x" onerror="alert(1)"/>-->';
+  const DEEP_RECT = `<rect style="fill:${nestedColorMix(22)}"/>`;
   it.each([
-    ["a comment in a text label", `<text>${BREAKOUT_COMMENT}label</text>`],
-    ["a comment in a math label", peleMathLabel(`${BREAKOUT_COMMENT}${MATH}`)],
-    ["a processing instruction in a text label", "<text><?xx data?>label</text>"],
-    ["a processing instruction in a math label", peleMathLabel(`<?xx data?>${MATH}`)],
-    ["a style element", '<style>@import url("https://example.com/x.css");</style>'],
-    // The HTML parser lowercases tag names, so this becomes a live <style>.
-    ["an uppercase style element", "<STYLE>text { fill: red }</STYLE>"],
+    ["a comment in a text label", svgWith(`<text>${BREAKOUT_COMMENT}label</text>`)],
+    ["a comment in a math label", svgWith(peleMathLabel(`${BREAKOUT_COMMENT}${MATH}`))],
+    ["a processing instruction in a text label", svgWith("<text><?xx data?>label</text>")],
+    ["a processing instruction in a math label", svgWith(peleMathLabel(`<?xx data?>${MATH}`))],
+    ["a quote in a comment", svgWith(`<!-- " -->${DEEP_RECT}`)],
+    ["a quote in CDATA", svgWith(`<text><![CDATA[ " ]]></text>${DEEP_RECT}`)],
+    ["a quote in a processing instruction", svgWith(`<?x " ?>${DEEP_RECT}`)],
+    ["a quote in a DOCTYPE comment", `<!DOCTYPE svg [<!-- " -->]>${svgWith(DEEP_RECT)}`],
+    [
+      "a DOCTYPE entity",
+      `<!DOCTYPE svg [<!ENTITY e 'fill:${nestedColorMix(22)}'>]>${svgWith('<rect style="&e;"/>')}`,
+    ],
+  ])("returns null for %s", (_case, svg) => {
+    expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toBeNull();
+  });
+
+  it.each([
     // A click on the link runs the script that <set> writes into its href.
     [
       "a set that writes a link's href",
@@ -384,7 +413,6 @@ describe("sanitizeMermaidSvg", () => {
   it.each([
     ["a long name", `font-family:${"a".repeat(49_000)}`],
     ["a long whitespace run", `fill:${" ".repeat(49_000)}`],
-    ["many parentheses", `fill:${"rgb(".repeat(12_250)}`],
   ])("checks a near-limit style with %s in linear time", (_case, style) => {
     const svg = svgWith(`<rect style="${style}"/>`);
 
@@ -394,6 +422,202 @@ describe("sanitizeMermaidSvg", () => {
 
     expect(sanitized).toContain("<rect");
     expect(elapsed).toBeLessThan(200);
+  });
+
+  it("returns null for a near-limit style of unclosed parentheses in linear time", () => {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg"><rect style="fill:${"rgb(".repeat(12_250)}"/></svg>`;
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toBeNull();
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it.each([
+    ["many strings", `font-family:${"'a'".repeat(16_000)}`],
+    ["many comments", `fill:${"/**/".repeat(12_000)}`],
+    ["many url()", `fill:${"url(x)".repeat(8_000)}`],
+  ])("checks a near-limit style with %s in linear time", (_case, style) => {
+    const svg = svgWith(`<rect style="${style}"/>`);
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toContain("<rect");
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  // Each value nests 22 deep as CSS reads it, behind characters that a count of ( and ) misreads.
+  // CSS reads a quoted, commented or escaped ) as no closer, and a ) closes only a (, not a [ or {.
+  // An unquoted url( starts a URL that ends at the first ), so a quote in it opens no string.
+  it.each([
+    ["a quoted ) at each level", `fill:${nestedColorMix(22, "", "')' ")}`],
+    ["a double-quoted ) at each level", `fill:${nestedColorMix(22, "", "&quot;)&quot; ")}`],
+    ["a commented ) at each level", `fill:${nestedColorMix(22, "", "/*)*/ ")}`],
+    ["an escaped ) at each level", `fill:${nestedColorMix(22, "", "\\) ")}`],
+    ["a [ and ) at each level", `fill:${nestedColorMix(22, "", "[) ")}`],
+    ["a { and ) at each level", `fill:${nestedColorMix(22, "", "{) ")}`],
+    // The XML parser turns a literal newline into a space, so the string goes on.
+    ["a string with a literal newline at each level", `fill:${nestedColorMix(22, "", "')\n)' ")}`],
+    ["a quoted ) in an earlier declaration", `font-family:')';fill:${nestedColorMix(22)}`],
+    ["a quote in an unquoted url()", `fill:url(x&quot;);color:${nestedColorMix(22)}`],
+    ["a quoted url() with a quoted )", `fill:url( &quot;)&quot; ${nestedColorMix(22)})`],
+    // Each of these ends a token that takes in the url, so url( is a plain function.
+    ...["#", "@", "-", "_", "5", "&#xE9;"].map(
+      (before) => [`${before}url(`, `fill:${before}url(${nestedColorMix(22)})`] as const
+    ),
+  ])("returns null for nesting deeper than the limit behind %s", (_case, style) => {
+    expect(sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX)).toBeNull();
+  });
+
+  // DOMParser parses these as CSS too, even where the sanitizer removes them afterwards.
+  it.each([
+    ["a single-quoted style", `<rect style='fill:${nestedColorMix(22)}'/>`],
+    ["an unknown presentation attribute", `<rect mask="${nestedColorMix(22)}"/>`],
+    ["an uppercase STYLE", `<rect STYLE="fill:${nestedColorMix(22)}"/>`],
+  ])("returns null for nesting deeper than the limit in %s", (_case, element) => {
+    expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
+  });
+
+  // DOMParser parses stylesheet text while it builds the tree, and the attribute scan never reads
+  // it. Pele writes no <style>.
+  const stylesheet = `rect{fill:${nestedColorMix(22)}}`;
+  it.each([
+    ["an SVG <style>", `<style>${stylesheet}</style>`],
+    ["a prefixed <style>", `<x:style xmlns:x="http://www.w3.org/2000/svg">${stylesheet}</x:style>`],
+    // JavaScript's \s matches U+1680, but XML reads it as part of the prefix.
+    [
+      "a <style> whose prefix holds U+1680",
+      `<x\u1680:style xmlns:x\u1680="http://www.w3.org/2000/svg">${stylesheet}</x\u1680:style>`,
+    ],
+    // The HTML parser that inserts the output lowercases tag names, so this becomes a live <style>.
+    ["an uppercase <STYLE>", `<STYLE>${stylesheet}</STYLE>`],
+    [
+      "an XHTML <style> in foreignObject",
+      `<foreignObject><style xmlns="${XHTML}">${stylesheet}</style></foreignObject>`,
+    ],
+    ["a <style> in <desc>", `<desc><style>${stylesheet}</style></desc>`],
+  ])("returns null for %s before DOMParser reads it", (_case, element) => {
+    const parse = spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  // Chromium nests each var() when it computes styles after insert, in time that doubles with each
+  // level, while each declaration nests only 2 deep.
+  const chainLink = (level: number) => `color-mix(in srgb, var(--d${level}), blue)`;
+  const varChain = (depth: number) =>
+    Array.from({ length: depth }, (_, level) => `--d${level + 1}:${chainLink(level)}`).join(";");
+  it("removes a style that chains custom properties on one element", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(`<rect style="--d0:#zzz;${varChain(22)};fill:var(--d22)"/>`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
+  });
+
+  it("removes styles that chain custom properties down nested elements", () => {
+    const groups = Array.from(
+      { length: 20 },
+      (_, level) => `<g style="--d${level + 1}:${chainLink(level)}">`
+    ).join("");
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(
+          `<g style="--d0:#zzz">${groups}<rect style="fill:var(--d20)"/>${"</g>".repeat(21)}`
+        ),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain("<g");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<g> style"))).toEqual([]);
+  });
+
+  // Pele declares its custom properties only on the root, and each one only reads a theme variable.
+  it.each([
+    ["a Pele property on a rect", svgWith(`<rect style="--_r:var(--pele-radius,4px)"/>`)],
+    ["an unknown property on the root", svgRoot(`style="--d0:var(--pele-bg,#fff)"`)],
+    ["a root property that reads another", svgRoot(`style="--_a:var(--_b)"`)],
+    [
+      "a root property that reads one in a fallback",
+      svgRoot(`style="--_a:var(--pele-a,var(--_b))"`),
+    ],
+    ["a root property that reads a non-theme one", svgRoot(`style="--_a:var(--color-a)"`)],
+    // A ; in a block does not end a custom property, a { block after it joins its value, and a
+    // declaration can start after a } block.
+    [
+      "a root property with a ; in a function",
+      svgRoot(`style="--_a:var(--pele-a,calc(1;var(--_b)))"`),
+    ],
+    ["a root property before a { block", svgRoot(`style="--_a:var(--pele-a,red){;var(--_b)}"`)],
+    ["a root property after a } block", svgRoot(`style="a{}--d0:var(--pele-a,red)"`)],
+  ])("removes a style that declares %s", (_case, svg) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.includes("> style"))).toEqual([]);
+  });
+
+  // CSS reads each of these as one level of nesting.
+  it.each([
+    ["a quoted value", "font-family:'X'"],
+    ["a double-quoted value", "font-family:&quot;X&quot;"],
+    ["a string that a newline ends", "font-family:'X&#10;"],
+    ["a string that a carriage return ends", "font-family:'X&#13;"],
+    ["a string that a form feed ends", "font-family:'X&#12;"],
+    ["a comment", "fill:/*X*/"],
+    ["a quote in an unquoted url()", "fill:url(x')"],
+    // A ) closes the ( above the [.
+    ["an open [", "fill:["],
+  ])("keeps a style of 9 functions in a row after %s", (_case, before) => {
+    const style = [before, ...Array<string>(9).fill("fill:rgb(1 2 3)")].join(";");
+
+    expect(sanitizeMermaidSvg(svgWith(`<rect style="${style}"/>`), ID_PREFIX)).toContain("<rect");
+  });
+
+  it.each(["data-x", "class"])(
+    "keeps an SVG with a deeply nested value in %s, which the browser never reads as CSS",
+    (name) => {
+      const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
+
+      expect(sanitizeMermaidSvg(svgWith(`<g ${name}="${label}"/>`), ID_PREFIX)).not.toBeNull();
+    }
+  );
+
+  // CSS reads an escape unlike the scan, so past one the scan counts every ( and no ).
+  it("counts every ( after an escape and no )", () => {
+    const svg = (opened: number, after: string) =>
+      svgWith(`<rect style="fill:${"f(".repeat(opened)}\\x${after}"/>`);
+
+    expect(sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING, ""), ID_PREFIX)).not.toBeNull();
+    expect(
+      sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING - 1, " g()"), ID_PREFIX)
+    ).not.toBeNull();
+    expect(
+      sanitizeMermaidSvg(svg(MERMAID_MAX_ATTRIBUTE_NESTING - 1, " g() g()"), ID_PREFIX)
+    ).toBeNull();
+  });
+
+  // Pele escapes &, so only a Pele bug writes these, but the XML parser turns them into ( before
+  // Chromium parses the style.
+  it("returns null for nesting written as character references", () => {
+    const svg = (references: string) =>
+      `<svg xmlns="http://www.w3.org/2000/svg" style="${references}"/>`;
+
+    expect(
+      sanitizeMermaidSvg(svg("&#40;".repeat(4) + "&#x28;".repeat(4)), ID_PREFIX)
+    ).not.toBeNull();
+    expect(sanitizeMermaidSvg(svg("&#40;".repeat(5) + "&#x28;".repeat(4)), ID_PREFIX)).toBeNull();
   });
 
   it("keeps only the text of title and desc", () => {
@@ -484,5 +708,70 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
       expect([...new Set(htmlParts(parsed))].filter((part) => !kept.has(part))).toEqual([]);
       expect(sanitized).toBe(parsed);
     }
+  });
+
+  // Pele passes nestedColorMix values unchanged, and its 50,000-character source limit allows
+  // far deeper nesting.
+  const sequenceRect = (color: string) =>
+    `sequenceDiagram\n  participant A\n  rect ${color}\n  A->>A: hi\n  end`;
+  it.each([
+    ["a sequence rect", sequenceRect(nestedColorMix(22))],
+    [
+      "a C4 $bgColor",
+      `C4Context\n  Person(a, "A")\n  UpdateElementStyle(a, $bgColor="${nestedColorMix(22)}")`,
+    ],
+    // CSS reads each ')' as a string, so it closes no function.
+    ["a rect with a quoted ) at each level", sequenceRect(nestedColorMix(22, " ')'"))],
+    ["a rect with a double-quoted ) at each level", sequenceRect(nestedColorMix(22, ' ")"'))],
+    ["a rect nested 200 deep", sequenceRect(nestedColorMix(200))],
+  ])("returns null for CSS functions nested deeply in %s", (_case, chart) => {
+    const { svg } = renderPele(chart, peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts }));
+    expect(svg).toContain("nope(1)");
+
+    const start = performance.now();
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+    const elapsed = performance.now() - start;
+
+    expect(sanitized).toBeNull();
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  // nope(1) adds a level, and Pele writes rx:var(--_r) before the fill of the rect.
+  it("keeps a rect nested MERMAID_MAX_ATTRIBUTE_NESTING deep and returns null one deeper", () => {
+    const sanitizeRect = (depth: number) =>
+      sanitizeMermaidSvg(
+        renderPele(
+          sequenceRect(nestedColorMix(depth)),
+          peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts })
+        ).svg,
+        ID_PREFIX
+      );
+
+    expect(sanitizeRect(MERMAID_MAX_ATTRIBUTE_NESTING - 1)).not.toBeNull();
+    expect(sanitizeRect(MERMAID_MAX_ATTRIBUTE_NESTING)).toBeNull();
+  });
+
+  // Pele copies these labels into data-id.
+  const LABEL = "f(f(f(f(f(f(f(f(f(x)))))))))";
+  it.each([
+    ["pie", `pie\n  "${LABEL}" : 3`],
+    ["gitGraph", `gitGraph\n  commit id: "${LABEL}"`],
+    ["sankey-beta", `sankey-beta\n"${LABEL}",B,5`],
+    ["journey", `journey\n  section S\n    ${LABEL}: 5: Me`],
+  ])("keeps a %s label with deeply nested parentheses", (_type, chart) => {
+    const { svg } = renderPele(chart, peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts }));
+    expect(svg).toContain(`data-id="${LABEL}`);
+
+    expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toContain(LABEL);
+  });
+
+  // Pele wraps the label into tspans where its font measure finds the label too wide, and that
+  // measure differs between machines, so at 94 it wraps everywhere.
+  // The scan reads attribute values only, so text content may nest any number of parentheses.
+  it("keeps a text label with deeply nested parentheses", () => {
+    const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg"><text>${label}</text></svg>`;
+
+    expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toBe(svg);
   });
 });
