@@ -1,7 +1,7 @@
 import type { CSSProperties, ReactNode } from "react";
 import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import katex from "katex";
-import { render as renderPele, type MathMarkup } from "pele";
+import { render as renderPele, type MathMarkup, type RenderOptions } from "pele";
 import assert from "@/common/utils/assert";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
@@ -278,6 +278,27 @@ function renderMathLabel(tex: string, size: number): MathMarkup | null {
   }
 }
 
+const DIAGRAM_FONT_SIZE = 14;
+
+/**
+ * Xum's Pele options. Mermaid.sanitization.test.ts renders with them, so every option that
+ * changes Pele's output belongs here.
+ */
+export function peleRenderOptions(
+  diagram: Pick<RenderOptions, "idPrefix" | "maxWidth" | "fontFamily" | "fontFamilyMono">
+): RenderOptions {
+  return {
+    ...diagram,
+    fontSize: DIAGRAM_FONT_SIZE,
+    directionBreakpoint: NARROW_DIAGRAM_WIDTH,
+    // Diagram text is untrusted model output: no clickable links, and no images,
+    // which would fetch from the network as soon as the SVG is inserted.
+    links: false,
+    images: false,
+    math: renderMathLabel,
+  };
+}
+
 /** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
 async function renderMermaidSvg(
   chart: string,
@@ -288,7 +309,6 @@ async function renderMermaidSvg(
   // Measure with the same fonts the .mermaid-container CSS draws with.
   const fontFamily = rootStyle.getPropertyValue("--font-primary").trim() || undefined;
   const fontFamilyMono = rootStyle.getPropertyValue("--font-monospace").trim() || undefined;
-  const fontSize = 14;
 
   // Pele measures labels with canvas when it renders, so the fonts must be loaded first
   // or boxes are sized for the fallback font. fonts.ready does not start loading a face
@@ -297,24 +317,15 @@ async function renderMermaidSvg(
   if ("fonts" in document) {
     const families = [fontFamily, fontFamilyMono].filter((family) => family !== undefined);
     await Promise.allSettled(
-      families.map((family) => document.fonts.load(`${fontSize}px ${family}`))
+      families.map((family) => document.fonts.load(`${DIAGRAM_FONT_SIZE}px ${family}`))
     );
     await document.fonts.ready;
   }
 
-  const { svg } = renderPele(chart, {
-    idPrefix,
-    fontFamily,
-    fontFamilyMono,
-    fontSize,
-    maxWidth,
-    directionBreakpoint: NARROW_DIAGRAM_WIDTH,
-    // Diagram text is untrusted model output: no clickable links, and no images,
-    // which would fetch from the network as soon as the SVG is inserted.
-    links: false,
-    images: false,
-    math: renderMathLabel,
-  });
+  const { svg } = renderPele(
+    chart,
+    peleRenderOptions({ idPrefix, maxWidth, fontFamily, fontFamilyMono })
+  );
 
   const sanitizedSvg = sanitizeMermaidSvg(svg);
   if (!sanitizedSvg) {
