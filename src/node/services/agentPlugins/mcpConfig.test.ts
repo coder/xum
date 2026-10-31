@@ -539,6 +539,10 @@ describe("loadPluginMcpServers", () => {
       rootCommand: { command: "${CURSOR_PLUGIN_ROOT}" },
       rootUrl: { type: "http", url: "https://h.example/${CURSOR_PLUGIN_ROOT}/mcp" },
       rootDefault: { command: "node", args: ["${CURSOR_PLUGIN_ROOT:-/opt/kit}/server.mjs"] },
+      // Cursor leaves the Agent Plugins names as written, so Xum must not fill them in.
+      xumRoot: { command: "node", args: ["${PLUGIN_ROOT}/server.mjs"] },
+      xumData: { command: "node", env: { DIR: "${PLUGIN_DATA}" } },
+      xumCwd: { command: "node", cwd: "${PLUGIN_ROOT}" },
     });
 
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
@@ -548,6 +552,9 @@ describe("loadPluginMcpServers", () => {
       ["warning", "rootCommand"],
       ["warning", "rootUrl"],
       ["warning", "rootDefault"],
+      ["warning", "xumRoot"],
+      ["warning", "xumData"],
+      ["warning", "xumCwd"],
     ]);
   });
 

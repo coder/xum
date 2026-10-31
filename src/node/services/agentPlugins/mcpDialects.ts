@@ -103,11 +103,10 @@ function unexpandedPlaceholder(
   return undefined;
 }
 
-const CURSOR_EXPANDED_NAMES: ReadonlySet<string> = new Set([
-  "PLUGIN_ROOT",
-  "PLUGIN_DATA",
-  ...Object.keys(DIALECT_FOLDER_ALIASES.cursor),
-]);
+// Cursor expands only its two root names, not the Agent Plugins `${PLUGIN_ROOT}`/`${PLUGIN_DATA}`.
+const CURSOR_EXPANDED_NAMES: ReadonlySet<string> = new Set(
+  Object.keys(DIALECT_FOLDER_ALIASES.cursor)
+);
 const NOTHING_EXPANDS: ReadonlySet<string> = new Set();
 
 const objectValues = (value: unknown): unknown[] =>
@@ -119,10 +118,10 @@ const arrayValues = (value: unknown): unknown[] => (Array.isArray(value) ? value
  * so the server cannot load. Command, url and headers never expand.
  */
 export function cursorValuePlaceholder(rawEntry: Record<string, unknown>): string | undefined {
-  const { command, args, env, cwd, url, headers } = xumStdioEntry(
-    rawEntry,
-    DIALECT_FOLDER_ALIASES.cursor
-  );
+  // Only the command is checked rewritten: `${CURSOR_PLUGIN_ROOT}/<path>` becomes `./<path>`. The
+  // cwd is checked as written, because its rewrite introduces `${PLUGIN_ROOT}`.
+  const { command } = xumStdioEntry(rawEntry, DIALECT_FOLDER_ALIASES.cursor);
+  const { args, env, cwd, url, headers } = rawEntry;
   return (
     unexpandedPlaceholder([command], NOTHING_EXPANDS) ??
     unexpandedPlaceholder(
