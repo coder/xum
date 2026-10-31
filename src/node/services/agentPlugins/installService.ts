@@ -572,14 +572,11 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
     0
   );
-  if (size > MAX_REVIEW_TEXT_CHARS) throw reviewTooLargeError();
+  if (size > MAX_REVIEW_TEXT_CHARS) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
 }
 
-function reviewTooLargeError(): Error {
-  return new Error(
-    "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
-  );
-}
+const REVIEW_TOO_LARGE_MESSAGE =
+  "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher.";
 
 /** A file larger than this shows only its row in the file review, like a binary file. */
 const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
@@ -2322,7 +2319,7 @@ export class AgentPluginInstallService {
         skipRootGit: true,
       });
     } catch (error) {
-      if (error instanceof KeptBytesLimitError) throw reviewTooLargeError();
+      if (error instanceof KeptBytesLimitError) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
       throw error;
     }
   }
