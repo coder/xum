@@ -330,19 +330,38 @@ describe("TaskHandleStore global scan", () => {
 
   it("re-reads a file rewritten in place after a scan that saw recent stamps", async () => {
     const { config } = await createTempConfig("task-handle-store-racy");
+    const file = sessionPaths(config).handleFile("owner", "inplace");
     let now = 0;
     const store = new TaskHandleStore(config, undefined, { now: () => now });
-    const completed = turnRecord("owner", "inplace", "completed");
+    const completed = { ...turnRecord("owner", "inplace", "completed"), title: "a" };
     await store.upsertWorkspaceTurn(completed);
     expect(await store.listAllWorkspaceTurns(ACTIVE)).toEqual([]);
 
-    // An in-place write (builds before #4413 wrote handles so) leaves the directory stamps alone.
-    const running = turnRecord("owner", "inplace", "running");
-    await fsPromises.writeFile(
-      sessionPaths(config).handleFile("owner", "inplace"),
-      JSON.stringify(running, null, 2)
-    );
+    // Same size, same inode, and likely the same timestamp tick: only the stamps' age tells the
+    // scan that its first look proves nothing.
+    const running = { ...turnRecord("owner", "inplace", "running"), title: "abc" };
+    const sizeBefore = (await fsPromises.stat(file)).size;
+    await fsPromises.writeFile(file, JSON.stringify(running, null, 2));
+    expect((await fsPromises.stat(file)).size).toBe(sizeBefore);
     now = TRUSTED_CLOCK();
+    expect(await store.listAllWorkspaceTurns(ACTIVE)).toEqual([running]);
+  });
+
+  it("shows an in-place rewrite after a trusted scan", async () => {
+    const { config } = await createTempConfig("task-handle-store-in-place");
+    const { handleDir, handleFile } = sessionPaths(config);
+    const store = new TaskHandleStore(config, undefined, { now: TRUSTED_CLOCK });
+    await store.upsertWorkspaceTurn(turnRecord("owner", "revived", "completed"));
+    await store.upsertWorkspaceTurn(turnRecord("owner", "other", "completed"));
+    expect(await store.listAllWorkspaceTurns(ACTIVE)).toEqual([]);
+
+    // Builds before #4413 rewrite a handle in place, which leaves the directory stamps unchanged.
+    const dirBefore = await fsPromises.stat(handleDir("owner"), { bigint: true });
+    const running = turnRecord("owner", "revived", "running");
+    await fsPromises.writeFile(handleFile("owner", "revived"), JSON.stringify(running, null, 2));
+    await createAger()(handleFile("owner", "revived"));
+    const dirAfter = await fsPromises.stat(handleDir("owner"), { bigint: true });
+    expect([dirAfter.mtimeNs, dirAfter.ctimeNs]).toEqual([dirBefore.mtimeNs, dirBefore.ctimeNs]);
     expect(await store.listAllWorkspaceTurns(ACTIVE)).toEqual([running]);
   });
 

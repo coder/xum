@@ -152,10 +152,10 @@ function assertValidWorkspaceTurnTaskId(handleId: string): void {
 }
 
 /**
- * dev, ino, size, mtime and ctime of a file or directory. Every handle write renames a temp file
- * over its target, which changes the target's inode and its directory's stamps, so an equal
- * fingerprint means nothing was written there in between. That holds only for stamps older than
- * the timestamp granularity at the first stat (git's racy-clean rule): `null` marks an
+ * dev, ino, size, mtime and ctime of a file or directory. Any write changes them: an atomic
+ * replace brings a new inode, and an in-place write (builds before #4413) moves the stamps. An
+ * equal fingerprint means nothing was written there in between. That holds only for stamps older
+ * than the timestamp granularity at the first stat (git's racy-clean rule): `null` marks an
  * observation too recent to vouch for anything, and never matches.
  */
 type Fingerprint = string;
@@ -168,11 +168,11 @@ interface HandleScanRow {
 }
 
 /**
- * What the last scan saw in one owner's session directory: its handle rows in readdir order (the
- * order of createdAt ties) and the fingerprint of the directory that proves them. An owner without
- * task-handles has no rows, proven by its session directory, which creating task-handles changes.
- * Only primitives: parsed records would pin every owner's history (F29), and callers mutate the
- * records a scan returns.
+ * What the last scan saw in one owner's session directory. An owner without task-handles has no
+ * rows, proven by its session directory, which creating task-handles changes. An owner with
+ * task-handles is re-listed on every scan and each row is proven by its own file's fingerprint:
+ * a directory's stamps miss in-place writes. Only primitives: parsed records would pin every
+ * owner's history (F29), and callers mutate the records a scan returns.
  */
 type OwnerScanIndex =
   | {
@@ -181,8 +181,7 @@ type OwnerScanIndex =
       readonly rows: readonly [];
     }
   | {
-      readonly provenBy: "handle-dir";
-      readonly proof: Fingerprint | null;
+      readonly provenBy: "handle-files";
       readonly rows: readonly HandleScanRow[];
     };
 
@@ -219,7 +218,7 @@ async function unlessMissing<T>(pending: Promise<T>): Promise<T | null> {
 
 export class TaskHandleStore {
   private readonly scanIndex = new Map<string, OwnerScanIndex>();
-  /** Bumped after each write by this store, so a scan that overlapped it does not publish. */
+  /** Bumped after each write by this store, so a scan that overlapped it publishes no proof. */
   private readonly writeGenerations = new Map<string, number>();
   private readonly now: () => number;
 
@@ -249,9 +248,10 @@ export class TaskHandleStore {
         JSON.stringify(record, null, 2)
       );
     } finally {
-      // Also on failure: the rename can land before a failing directory fsync. Stamps alone cannot
-      // prove this write visible, since it can share a timestamp tick with the last scan.
-      this.forgetScannedHandle(record.ownerWorkspaceId, record.handleId);
+      // Also on failure: the rename can land before a failing directory fsync. A first write
+      // creates task-handles, and the session directory's stamps alone cannot prove that visible:
+      // they can share a timestamp tick with the last scan.
+      this.forgetScannedHandle(record.ownerWorkspaceId);
     }
   }
 
@@ -444,14 +444,12 @@ export class TaskHandleStore {
   ): Promise<WorkspaceTurnTaskHandleRecord[]> {
     const generation = this.writeGenerations.get(ownerWorkspaceId);
     const previous = this.scanIndex.get(ownerWorkspaceId);
-    const reusable = await this.reusableRows(ownerWorkspaceId, previous, scan);
-    if (reusable != null) {
-      return await this.readSelectedHandles(ownerWorkspaceId, reusable, scan, new Map());
-    }
+    if (await this.stillHasNoHandles(ownerWorkspaceId, previous, scan)) return [];
 
     const parsed = new Map<string, WorkspaceTurnTaskHandleRecord>();
     const index = await this.refreshOwnerScanIndex(ownerWorkspaceId, previous, scan, parsed);
-    if (index == null || this.writeGenerations.get(ownerWorkspaceId) !== generation) {
+    const overlappedWrite = this.writeGenerations.get(ownerWorkspaceId) !== generation;
+    if (index == null || (index.provenBy === "session-dir" && overlappedWrite)) {
       this.scanIndex.delete(ownerWorkspaceId);
     } else {
       this.scanIndex.set(ownerWorkspaceId, index);
@@ -461,27 +459,23 @@ export class TaskHandleStore {
       : await this.readSelectedHandles(ownerWorkspaceId, index.rows, scan, parsed);
   }
 
-  private async reusableRows(
+  private async stillHasNoHandles(
     ownerWorkspaceId: string,
     entry: OwnerScanIndex | undefined,
     scan: ScanContext
-  ): Promise<readonly HandleScanRow[] | null> {
-    if (entry?.proof == null) return null;
-    const provenDir =
-      entry.provenBy === "handle-dir"
-        ? this.getOwnerHandleDir(ownerWorkspaceId)
-        : path.join(this.config.sessionsDir, ownerWorkspaceId);
-    const stats = await unlessMissing(fsPromises.stat(provenDir, { bigint: true }));
-    return stats != null && fingerprintIfSafe(stats, scan.startMs) === entry.proof
-      ? entry.rows
-      : null;
+  ): Promise<boolean> {
+    if (entry?.provenBy !== "session-dir" || entry.proof == null) return false;
+    const stats = await unlessMissing(
+      fsPromises.stat(path.join(this.config.sessionsDir, ownerWorkspaceId), { bigint: true })
+    );
+    return stats != null && fingerprintIfSafe(stats, scan.startMs) === entry.proof;
   }
 
   /**
    * Re-list one owner, re-reading only the handle files whose fingerprint changed, and add the
    * selected records it read to `parsed`. Each stamp is taken before the content it vouches for,
    * so a write that lands mid-scan leaves a stale fingerprint and the next scan re-reads. Returns
-   * null when the session directory or its task-handles directory disappears mid-scan.
+   * null when the session directory is gone.
    */
   private async refreshOwnerScanIndex(
     ownerWorkspaceId: string,
@@ -493,14 +487,11 @@ export class TaskHandleStore {
       fsPromises.stat(path.join(this.config.sessionsDir, ownerWorkspaceId), { bigint: true })
     );
     if (sessionStats == null) return null;
-    const handleDir = this.getOwnerHandleDir(ownerWorkspaceId);
-    const dirStats = await unlessMissing(fsPromises.stat(handleDir, { bigint: true }));
-    if (dirStats == null) {
+    const entries = await unlessMissing(fsPromises.readdir(this.getOwnerHandleDir(ownerWorkspaceId)));
+    if (entries == null) {
       const proof = fingerprintIfSafe(sessionStats, scan.startMs);
       return { provenBy: "session-dir", proof, rows: [] };
     }
-    const entries = await unlessMissing(fsPromises.readdir(handleDir));
-    if (entries == null) return null;
 
     const known = new Map(previous?.rows.map((row) => [row.handleId, row]));
     const rows = await Promise.all(
@@ -512,11 +503,10 @@ export class TaskHandleStore {
           this.scanHandleFile(ownerWorkspaceId, handleId, known.get(handleId), scan, parsed)
         )
     );
-    const present = rows.filter((row): row is HandleScanRow => row != null);
-    const proof = fingerprintIfSafe(dirStats, scan.startMs);
-    // A racy row needs a re-read next scan, which only a re-list reaches.
-    const proven = present.every((row) => row.file != null);
-    return { provenBy: "handle-dir", proof: proven ? proof : null, rows: present };
+    return {
+      provenBy: "handle-files",
+      rows: rows.filter((row): row is HandleScanRow => row != null),
+    };
   }
 
   private async scanHandleFile(
@@ -562,23 +552,15 @@ export class TaskHandleStore {
     );
   }
 
-  private forgetScannedHandle(ownerWorkspaceId: string, handleId: string): void {
+  /** Rows need nothing here: the write gives the handle file a new inode. */
+  private forgetScannedHandle(ownerWorkspaceId: string): void {
     this.writeGenerations.set(
       ownerWorkspaceId,
       (this.writeGenerations.get(ownerWorkspaceId) ?? 0) + 1
     );
-    const entry = this.scanIndex.get(ownerWorkspaceId);
-    if (entry?.provenBy !== "handle-dir") {
+    if (this.scanIndex.get(ownerWorkspaceId)?.provenBy === "session-dir") {
       this.scanIndex.delete(ownerWorkspaceId);
-      return;
     }
-    // Keep the other rows: their own fingerprints still prove them, so the next scan re-lists the
-    // owner but re-reads only this handle.
-    this.scanIndex.set(ownerWorkspaceId, {
-      provenBy: "handle-dir",
-      proof: null,
-      rows: entry.rows.filter((row) => row.handleId !== handleId),
-    });
   }
 
   async isWorkspaceOwnedBy(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {
