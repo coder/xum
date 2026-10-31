@@ -258,7 +258,9 @@ function isPeleCss(value: string, idPrefix: string | null): boolean {
 
 /** Removes the declarations that fail isPeleCss, and keeps Pele's exact text when none does. */
 function sanitizeStyle(style: string): string | null {
-  const declarations = style.split(";");
+  // A ; inside a quoted string does not end the declaration. isPeleCss rejects every backslash,
+  // so no quote is escaped, and an unclosed quote runs to the end of the style.
+  const declarations = style.match(/(?:[^;"']|"[^"]*(?:"|$)|'[^']*(?:'|$))+/g) ?? [];
   const kept = declarations.filter((declaration) => isPeleCss(declaration, null));
   if (kept.length === declarations.length) return style;
   return kept.some((declaration) => declaration.trim() !== "") ? kept.join(";") : null;
@@ -273,8 +275,10 @@ function keptAttributeValue(
 ): string | null {
   if (rules.textAttributes.has(name)) return value;
   if (rules.idAttributes.has(name)) {
-    // The browser splits an id list at any whitespace, including the tab that &#9; writes.
-    return value.split(/\s+/).every((id) => isDiagramId(id, idPrefix)) ? value : null;
+    // The browser splits an id list at ASCII whitespace, including the tab that &#9; writes, and
+    // skips empty ids. \S+ also splits at other whitespace, such as &#160;, so it is stricter.
+    const ids = value.match(/\S+/g);
+    return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
   }
   if (!rules.cssAttributes.has(name)) return null;
   if (name === "style") return sanitizeStyle(value);
@@ -300,7 +304,10 @@ function isKatexMathml(math: Element | null): boolean {
   const { elements } = peleNamespace(MATHML_NS);
   // Lowercase like the HTML parser does with MathML tag names.
   return [math, ...Array.from(math.querySelectorAll("*"))].every(
-    (element) => element.namespaceURI === MATHML_NS && elements.has(element.localName.toLowerCase())
+    (element) =>
+      element.namespaceURI === MATHML_NS &&
+      element.prefix === null &&
+      elements.has(element.localName.toLowerCase())
   );
 }
 
@@ -312,6 +319,7 @@ function isPeleMathLabel(foreignObject: Element): boolean {
     foreignObject.childElementCount === 1 &&
     // mutation-equivalent: the check above leaves foreignObject one child, so div is never null
     div?.namespaceURI === XHTML_NS &&
+    div.prefix === null &&
     peleNamespace(XHTML_NS).elements.has(div.localName) &&
     div.childElementCount === 1 &&
     Array.from(div.attributes, (attribute) => attribute.name).join() === "xmlns,style" &&
@@ -321,12 +329,15 @@ function isPeleMathLabel(foreignObject: Element): boolean {
 
 /**
  * Removes every SVG element that Pele does not emit and the element children of its text-only
- * elements, keeping only Pele's math labels as foreignObject.
+ * elements, keeping only Pele's math labels as foreignObject. Pele writes no namespace prefix,
+ * and the HTML parser knows no s:foreignobject, so a serializer that kept the prefix would let
+ * a label's div leave the <svg>.
  */
 function removeUnknownElements(parent: Element): void {
   const svg = peleNamespace(SVG_NS);
   for (const child of Array.from(parent.children)) {
-    const svgName = child.namespaceURI === SVG_NS ? child.localName.toLowerCase() : "";
+    const svgName =
+      child.namespaceURI === SVG_NS && child.prefix === null ? child.localName.toLowerCase() : "";
     if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
     if (!svg.elements.has(svgName)) {
       child.remove();
