@@ -106,6 +106,7 @@ describe("AgentPluginInstallService marketplaces", () => {
           { name: "pstack", source: "pstack", description: "Cursor pstack" },
           { name: "kit", source: "kit" },
           { name: "bare", source: "bare" },
+          { name: "attio", source: "third_party/attio" },
         ],
       }),
       ".claude-plugin/marketplace.json": marketplace([
@@ -118,6 +119,8 @@ describe("AgentPluginInstallService marketplaces", () => {
       "kit/.cursor-plugin/plugin.json": JSON.stringify({ name: "kit", variables: { TOKEN: "x" } }),
       "kit/skills/lint/SKILL.md": skillMd("lint"),
       "bare/skills/loose/SKILL.md": skillMd("loose"),
+      "third_party/attio/.cursor-plugin/plugin.json": JSON.stringify({ name: "attio" }),
+      "third_party/attio/skills/crm/SKILL.md": skillMd("crm"),
     });
     await commit(marketDir, "cursor marketplace");
   }
@@ -604,6 +607,39 @@ describe("AgentPluginInstallService marketplaces", () => {
       ],
       ["kit", undefined, [["cursor", "kit", true]]],
       ["bare", undefined, [["cursor", "bare", true]]],
+      ["attio", undefined, [["cursor", "third_party/attio", true]]],
+    ]);
+  });
+
+  test("each build counts the skills that its own file's entry lists", async () => {
+    await writeFiles(marketDir, {
+      ".cursor-plugin/marketplace.json": JSON.stringify({
+        name: "cursor-market",
+        plugins: [{ name: "kit", source: "kit", skills: ["./extra/a"] }],
+      }),
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "kit", source: "./claude/kit", skills: ["./skills/x", "./skills/y"] },
+      ]),
+      "kit/.cursor-plugin/plugin.json": JSON.stringify({ name: "kit" }),
+      "kit/extra/a/SKILL.md": skillMd("a"),
+      "claude/kit/skills/x/SKILL.md": skillMd("x"),
+      "claude/kit/skills/y/SKILL.md": skillMd("y"),
+    });
+    await commit(marketDir, "both files list kit with their own skills");
+    const listing = await listMarketplace();
+    expect(
+      listing.entries.map((entry) => [
+        entry.name,
+        entry.builds.map((build) => [build.file, build.skillCount]),
+      ])
+    ).toEqual([
+      [
+        "kit",
+        [
+          ["cursor", 1],
+          ["claude", 2],
+        ],
+      ],
     ]);
   });
 
@@ -620,6 +656,14 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(claude.source.subpath).toBe("harness/pstack/claude-code");
     expect(claude.method).toEqual({ kind: "claude-plugin" });
     expect(claude.skills.map((skill) => skill.name)).toEqual(["claude-only"]);
+
+    // cursor/plugins lists most entries as nested paths without "./".
+    const nested = await previewCursorEntry("attio");
+    expect([nested.source.subpath, nested.method]).toEqual([
+      "third_party/attio",
+      { kind: "cursor-plugin" },
+    ]);
+    expect(nested.skills.map((skill) => skill.name)).toEqual(["crm"]);
   });
 
   test("only one build of a name installs: the second is refused until the first is uninstalled", async () => {

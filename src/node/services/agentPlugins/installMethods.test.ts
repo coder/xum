@@ -274,7 +274,7 @@ describe("detectInstallMethods", () => {
 describe("entryInstallMethods", () => {
   const cursorEntry = parseClaudeMarketplace(
     JSON.stringify({ name: "cursor-plugins", plugins: [{ name: "kit", source: "kit" }] }),
-    ".cursor-plugin/marketplace.json"
+    "cursor"
   ).entries[0];
 
   test("a Cursor entry installs only through its folder's own manifest", () => {

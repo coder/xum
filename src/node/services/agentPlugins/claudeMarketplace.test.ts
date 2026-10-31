@@ -11,13 +11,19 @@ import {
   parseMarketplaces,
   resolveEntrySource,
   type ClaudeMarketplace,
+  type MarketplaceFile,
 } from "./claudeMarketplace";
 
 const REMOTE_MARKETPLACE = "https://github.com/acme/market.git";
 
-function marketplace(plugins: unknown[], metadata?: unknown): ClaudeMarketplace {
+function marketplace(
+  plugins: unknown[],
+  metadata?: unknown,
+  file: MarketplaceFile = "claude"
+): ClaudeMarketplace {
   return parseClaudeMarketplace(
-    JSON.stringify({ name: "acme", owner: { name: "Acme" }, metadata, plugins })
+    JSON.stringify({ name: "acme", owner: { name: "Acme" }, metadata, plugins }),
+    file
   );
 }
 
@@ -46,9 +52,9 @@ function claudeRows(parsed: ClaudeMarketplace) {
 /** The resolved source of the only entry, or the reason it cannot install. */
 function resolveOnly(
   source: unknown,
-  options?: { metadata?: unknown; marketplaceUrl?: string }
+  options?: { metadata?: unknown; marketplaceUrl?: string; file?: MarketplaceFile }
 ): ReturnType<typeof resolveEntrySource> | string {
-  const parsed = marketplace([{ name: "demo", source }], options?.metadata);
+  const parsed = marketplace([{ name: "demo", source }], options?.metadata, options?.file);
   try {
     return resolveEntrySource(
       parsed,
@@ -118,7 +124,7 @@ describe("parseClaudeMarketplace", () => {
     }));
     const parsed = parseClaudeMarketplace(
       JSON.stringify({ name: "cursor-plugins", plugins }),
-      CURSOR_MARKETPLACE_RELATIVE_PATH
+      "cursor"
     );
     expect(parsed.entries.length).toBe(500);
     expect(parsed.entries.at(-1)?.name).toBe("p499");
@@ -182,6 +188,20 @@ describe("mergeMarketplaces", () => {
       ["(entry 1)", ["claude:undefined"]],
     ]);
   });
+
+  test("a name the Claude file lists twice joins the Cursor row once; the repeat is its own row", () => {
+    const cursor = marketplace([entry("b", "b")], undefined, "cursor");
+    const claude = marketplace([entry("b", "./claude/b"), entry("b", "./claude/again")]);
+    expect(
+      mergeMarketplaces(cursor, claude).map((row) => [
+        row.name,
+        row.builds.map((build) => `${build.file}:${String(build.entry.raw.source)}`),
+      ])
+    ).toEqual([
+      ["b", ["cursor:b", "claude:./claude/b"]],
+      ["b", ["claude:./claude/again"]],
+    ]);
+  });
 });
 
 describe("marketplaceListing", () => {
@@ -194,7 +214,7 @@ describe("marketplaceListing", () => {
           { name: "pstack", description: "Cursor build", source: { source: "npm", package: "x" } },
         ],
       }),
-      CURSOR_MARKETPLACE_RELATIVE_PATH
+      "cursor"
     );
     const claude = marketplace([
       { name: "pstack", description: "Claude build", source: "./harness/pstack" },
@@ -241,6 +261,26 @@ describe("resolveEntrySource", () => {
     // A path with "/" is not a bare name and needs "./", with or without pluginRoot.
     expect(resolveOnly("team-a/demo", pluginRoot)).toContain("must start with './'");
     expect(resolveOnly("team-a/demo")).toContain("must start with './'");
+  });
+
+  test("a Cursor path starts at the marketplace root, with or without './', and cannot leave it", () => {
+    const cursor = { file: "cursor" as const };
+    const withRoot = { ...cursor, metadata: { pluginRoot: "./plugins" } };
+    expect(resolveOnly("third_party/attio", cursor)).toEqual({
+      kind: "relative",
+      subpath: "third_party/attio",
+    });
+    expect(resolveOnly("./third_party/attio", cursor)).toEqual({
+      kind: "relative",
+      subpath: "third_party/attio",
+    });
+    // Cursor has no metadata.pluginRoot: a bare name is a folder at the root.
+    expect(resolveOnly("pstack", withRoot)).toEqual({ kind: "relative", subpath: "pstack" });
+    expect(resolveOnly(".", cursor)).toEqual({ kind: "relative", subpath: undefined });
+    expect(resolveOnly("third_party/../../outside", cursor)).toContain("contains '..'");
+    expect(resolveOnly("/etc/plugins", cursor)).toContain("absolute path");
+    expect(resolveOnly("~/plugins", cursor)).toContain("absolute path");
+    expect(resolveOnly("third_party/.git/hooks", cursor)).toContain(".git");
   });
 
   test("entry names follow the marketplace grammar, and conflicts are Claude's six keys", () => {

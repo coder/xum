@@ -3714,7 +3714,7 @@ export class AgentPluginInstallService {
     if (content === undefined) {
       throw new Error(`This repository has no ${relativePath}.`);
     }
-    const parsed = parseClaudeMarketplace(content, relativePath);
+    const parsed = parseClaudeMarketplace(content, ref.file);
     const entry = findMarketplaceEntry(parsed, ref.entry);
     const target = resolveEntrySource(parsed, marketplaceSource.url, entry);
     const marketplaceResolved: ResolvedRemoteRef = {
