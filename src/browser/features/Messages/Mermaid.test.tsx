@@ -25,18 +25,21 @@ describe("Mermaid layout stability", () => {
   let originalDocument: typeof globalThis.document;
   let originalDOMParser: typeof globalThis.DOMParser;
   let originalHTMLElement: typeof globalThis.HTMLElement;
+  let originalXMLSerializer: typeof globalThis.XMLSerializer;
 
   beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalDOMParser = globalThis.DOMParser;
     originalHTMLElement = globalThis.HTMLElement;
+    originalXMLSerializer = globalThis.XMLSerializer;
 
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.DOMParser = domWindow.DOMParser;
     globalThis.HTMLElement = domWindow.HTMLElement;
+    globalThis.XMLSerializer = domWindow.XMLSerializer;
   });
 
   afterEach(() => {
@@ -45,6 +48,7 @@ describe("Mermaid layout stability", () => {
     globalThis.document = originalDocument;
     globalThis.DOMParser = originalDOMParser;
     globalThis.HTMLElement = originalHTMLElement;
+    globalThis.XMLSerializer = originalXMLSerializer;
   });
 
   test("markdown's diagram fallback keeps the loaded diagram's frame", async () => {
@@ -330,6 +334,7 @@ describe("Mermaid layout stability", () => {
     let originalResizeObserver: typeof globalThis.ResizeObserver;
     let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
     let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
+    let measure: { mockRestore(): void };
 
     beforeEach(() => {
       observers = [];
@@ -356,18 +361,21 @@ describe("Mermaid layout stability", () => {
           this.entry.element = null;
         }
       } as unknown as typeof ResizeObserver;
-      spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
-        this: HTMLElement
-      ) {
-        const width = this.classList.contains("mermaid-container") ? measuredWidth : 0;
-        return new window.DOMRect(0, 0, width, 300);
-      });
+      // happy-dom element classes are shared by every window, so this spy outlives the test
+      // unless afterEach restores it.
+      measure = spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+        function (this: HTMLElement) {
+          const width = this.classList.contains("mermaid-container") ? measuredWidth : 0;
+          return new window.DOMRect(0, 0, width, 300);
+        }
+      );
     });
 
     afterEach(() => {
       globalThis.ResizeObserver = originalResizeObserver;
       globalThis.requestAnimationFrame = originalRequestAnimationFrame;
       globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+      measure.mockRestore();
     });
 
     function resizeContainer(width: number) {
@@ -433,5 +441,36 @@ describe("Mermaid layout stability", () => {
     expect(container?.textContent).toContain("alert(1)");
     expect(view.container.querySelector("script")).toBeNull();
     expect(container?.querySelector("a, [href], image")).toBeNull();
+  });
+
+  test("typesets $$...$$ labels as MathML", async () => {
+    // happy-dom has no layout, and Pele shows the TeX source for a 0x0 expression. happy-dom
+    // parses <math> as an HTMLUnknownElement.
+    const measure = spyOn(window.HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new window.DOMRect(0, 0, 24, 18)
+    );
+    try {
+      const view = renderMermaid({ chart: 'flowchart TD\nA["$$x^2$$"]-->B' });
+
+      await waitFor(() =>
+        expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+      );
+      const label = view.container.querySelector(".mermaid-container foreignObject.pele-math");
+      expect(label?.querySelector("math msup")).not.toBeNull();
+      expect(view.container.querySelector(".mermaid-container")?.textContent).not.toContain("$$");
+    } finally {
+      measure.mockRestore();
+    }
+  });
+
+  test("shows invalid TeX as its source", async () => {
+    const view = renderMermaid({ chart: 'flowchart TD\nA["$$\\frac{$$"]-->B' });
+
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+    );
+    const container = view.container.querySelector(".mermaid-container");
+    expect(container?.querySelector("foreignObject")).toBeNull();
+    expect(container?.textContent).toContain("\\frac{");
   });
 });

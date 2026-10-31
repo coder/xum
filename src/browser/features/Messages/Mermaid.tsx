@@ -1,6 +1,8 @@
 import type { CSSProperties, ReactNode } from "react";
 import React, { useContext, useEffect, useId, useRef, useState } from "react";
-import { render as renderPele } from "pele";
+import katex from "katex";
+import { render as renderPele, type MathMarkup } from "pele";
+import assert from "@/common/utils/assert";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
@@ -90,9 +92,69 @@ function canonicalizeUrlForSchemeCheck(value: string): string {
   return canonical;
 }
 
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
+// The elements KaTeX's MathML output uses (MathNodeType in katex/src/mathMLTree.ts), minus
+// mglyph, which loads an image. The name matters, not only the namespace: inside <mtext> the
+// HTML parser that inserts the SVG builds HTML elements, so a MathML-namespace <img> there
+// becomes a real image.
+const MATHML_LABEL_ELEMENTS = new Set([
+  "math",
+  "semantics",
+  "annotation",
+  "mrow",
+  "mi",
+  "mn",
+  "mo",
+  "mtext",
+  "mspace",
+  "msup",
+  "msub",
+  "msubsup",
+  "mfrac",
+  "mroot",
+  "msqrt",
+  "mover",
+  "munder",
+  "munderover",
+  "mtable",
+  "mtr",
+  "mtd",
+  "mlabeledtr",
+  "menclose",
+  "mstyle",
+  "mpadded",
+  "mphantom",
+]);
+
+/** A <math> tree that holds only the elements KaTeX emits. */
+function isKatexMathml(math: Element | null): boolean {
+  if (math?.localName.toLowerCase() !== "math") return false;
+  // Lowercase like the HTML parser does with MathML tag names.
+  return [math, ...Array.from(math.querySelectorAll("*"))].every(
+    (element) =>
+      element.namespaceURI === MATHML_NS &&
+      MATHML_LABEL_ELEMENTS.has(element.localName.toLowerCase())
+  );
+}
+
+/** Pele wraps the MathML that renderMathLabel returns in exactly this shape. */
+function isPeleMathLabel(foreignObject: Element): boolean {
+  const div = foreignObject.firstElementChild;
+  return (
+    foreignObject.getAttribute("class") === "pele-math" &&
+    foreignObject.childElementCount === 1 &&
+    div?.namespaceURI === XHTML_NS &&
+    div.localName === "div" &&
+    div.childElementCount === 1 &&
+    Array.from(div.attributes, (attribute) => attribute.name).join() === "xmlns,style" &&
+    isKatexMathml(div.firstElementChild)
+  );
+}
+
 export function sanitizeMermaidSvg(svg: string): string | null {
-  // Pele emits well-formed SVG with no foreignObject, so anything that fails a strict
-  // parse is not its output: fail closed.
+  // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
+  // fail closed.
   const xmlDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
   if (xmlDoc.querySelector("parsererror") !== null) {
     return null;
@@ -102,8 +164,10 @@ export function sanitizeMermaidSvg(svg: string): string | null {
     return null;
   }
 
-  // Defense in depth: remove active content containers and sanitize remaining attributes.
+  // Defense in depth: remove active content containers (every foreignObject except Pele's
+  // math labels) and sanitize remaining attributes.
   svgRoot.querySelectorAll("script,iframe,object,embed,foreignObject").forEach((node) => {
+    if (node.localName === "foreignObject" && isPeleMathLabel(node)) return;
     node.remove();
   });
 
@@ -133,6 +197,36 @@ export function sanitizeMermaidSvg(svg: string): string | null {
   return svgRoot.outerHTML;
 }
 
+/** Typesets a `$$...$$` label as MathML. Null makes Pele show the TeX source. */
+function renderMathLabel(tex: string, size: number): MathMarkup | null {
+  let markup: string;
+  try {
+    markup = katex.renderToString(tex, { displayMode: true, output: "mathml", throwOnError: true });
+  } catch {
+    return null;
+  }
+
+  const probe = document.createElement("div");
+  probe.style.cssText =
+    "position:absolute;left:-9999px;visibility:hidden;display:inline-block;white-space:nowrap";
+  probe.style.fontSize = `${size}px`;
+  // SECURITY AUDIT: tex is untrusted chart text. KaTeX escapes it, and its default
+  // `trust: false` rejects \href, \url, \includegraphics and \html*. sanitizeMermaidSvg()
+  // still checks the markup Pele embeds.
+  probe.innerHTML = markup;
+  document.body.append(probe);
+  try {
+    const math = probe.querySelector("math");
+    assert(math, "KaTeX MathML output has a <math> element");
+    const { width, height } = math.getBoundingClientRect();
+    // Not outerHTML: sanitizeMermaidSvg() parses the SVG as strict XML, which has no HTML
+    // named entities.
+    return { html: new XMLSerializer().serializeToString(math), width, height };
+  } finally {
+    probe.remove();
+  }
+}
+
 /** Renders untrusted chart text to sanitized SVG markup. Throws Pele's parse errors. */
 async function renderMermaidSvg(
   chart: string,
@@ -156,6 +250,7 @@ async function renderMermaidSvg(
     // which would fetch from the network as soon as the SVG is inserted.
     links: false,
     images: false,
+    math: renderMathLabel,
   });
 
   const sanitizedSvg = sanitizeMermaidSvg(svg);
