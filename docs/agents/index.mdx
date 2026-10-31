@@ -126,7 +126,7 @@ A plugin agent with `model: fast` takes its model, thinking level, reasoning mod
 
 With no Explore model in Settings, a fast agent runs on Exec's model from Settings, else on the parent's model. The built-in Explore agent sets a 5-minute prompt cache, so a fast agent keeps 5 minutes unless its own card or Explore's card sets another value. `Fast` and other spellings are not `fast`: they use the inherited model.
 
-Any agent can set `ai.settingsBase`. Xum reads the named agent as it would read the agent's `base`, so a global agent's settings base never names a project agent. Xum ignores the settings base, and logs a warning, when it names a missing agent, the agent itself, an agent whose chain contains the agent, or an agent whose chain sets its own `ai.settingsBase`. It also ignores it when the agent's own chain or the settings-base chain stops at a missing or cyclic base.
+Any agent can set `ai.settingsBase`. Xum reads the named agent as it would read the agent's `base`, so a global agent's settings base never resolves to a project agent. Xum ignores the settings base, and logs a warning, when it names a missing agent, the agent itself, an agent whose chain contains the agent, or an agent whose chain sets its own `ai.settingsBase`. It also ignores it when the agent's own chain or the settings-base chain stops at a missing or cyclic base.
 
 #### `is_background: true`
 
