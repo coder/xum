@@ -1,8 +1,3 @@
-/**
- * A sub-agent whose launch fails tells its parent the way a terminal stream failure does: a failure
- * message in the parent's history and a terminal wake. Task creation returns before the launch,
- * so without this a background child's launch failure would reach no one.
- */
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -26,7 +21,6 @@ import {
 
 const SEND_FAILURE = "provider unavailable";
 
-/** The parent's history messages that report a sub-agent failure. */
 async function failureMessages(historyService: HistoryService, parentId: string) {
   const history = await historyService.getHistoryFromLatestBoundary(parentId);
   assert(history.success, "the parent's history must be readable");
@@ -48,7 +42,6 @@ describe("a sub-agent whose launch fails", () => {
     config = await createTestConfig(rootDir);
     ({ parentId } = await saveLocalParentWorkspace(config, rootDir));
     services = [];
-    // The init hook is not under test.
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
   });
   afterEach(async () => {
@@ -60,7 +53,6 @@ describe("a sub-agent whose launch fails", () => {
     await removeTaskServiceTestRoot(rootDir);
   });
 
-  /** A TaskService whose host refuses the child's first send, after `beforeFailing` settles. */
   function serviceFailingChildSends(beforeFailing: Promise<void> = Promise.resolve()) {
     const { workspaceService } = createWorkspaceServiceMocks({
       sendMessage: mock(async (workspaceId: string): Promise<Result<void, SendMessageError>> => {

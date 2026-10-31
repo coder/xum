@@ -1278,7 +1278,6 @@ describe("TaskService settlement receipt producers (G2)", () => {
       title: "D",
     } as const;
 
-    /** create returns at the reservation; its launch, and the failure it records, land after. */
     async function createAndSettleLaunch(taskService: TaskService): Promise<void> {
       expect(await taskService.create(direct)).toMatchObject({
         success: true,
@@ -1287,7 +1286,6 @@ describe("TaskService settlement receipt producers (G2)", () => {
       await taskService.reservedLaunchesSettled();
     }
 
-    /** A harness whose launches fail at the fork, before their send is admitted. */
     function failingForkHarness(config: Config, projectPath: string) {
       const harness = createHarness(config);
       stubMaterialize(harness.svc, projectPath).mockImplementation(() =>

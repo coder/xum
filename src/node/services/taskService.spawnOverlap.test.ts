@@ -1,11 +1,3 @@
-/**
- * Concurrent sub-agent spawns overlap. create() returns once the child's row is reserved, and
- * the child's fork and first send run outside every TaskService lock, so one spawn never waits
- * for another spawn's git or provider round trips. Forks of one project still run one at a time
- * (runProjectForkExclusive guards per-repository git state); forks of different projects overlap.
- *
- * Each test counts the work in flight at once. Serialized spawns never get past one.
- */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Ok, type Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
@@ -29,11 +21,9 @@ import {
   waitForWorkspaceTaskStatus,
 } from "@/node/services/taskService.shared.testHarness";
 
-/** Long enough that only a serialized spawn misses it. */
 const OVERLAP_WAIT_MS = 3_000;
 const TEST_TIMEOUT_MS = 30_000;
 
-/** Resolves with the promise's value, or "timed out" once `ms` passed first. */
 async function within<T>(promise: Promise<T>, ms: number): Promise<T | "timed out"> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<"timed out">((resolve) => {
@@ -65,8 +55,6 @@ async function createdTaskIds(creates: ReadonlyArray<ReturnType<typeof spawn>>) 
 
 describe("concurrent sub-agent spawns", () => {
   let rootDir: string;
-  // Every gate a test closes, opened at teardown: a failing test must not leave a send or a
-  // fork parked past its root's removal.
   let gates: Array<() => void>;
   function gate() {
     let open!: () => void;
@@ -78,7 +66,6 @@ describe("concurrent sub-agent spawns", () => {
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
     gates = [];
-    // The init hook is not under test.
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
   });
   afterEach(async () => {
@@ -190,10 +177,6 @@ describe("concurrent sub-agent spawns", () => {
   );
 });
 
-/**
- * One worktree parent per project, each the checkout of its own git repository, so a task forks
- * a real worktree under the test root.
- */
 async function saveWorktreeParents(config: Config, rootDir: string, names: readonly string[]) {
   const parents = await Promise.all(
     names.map(async (name, index) => ({

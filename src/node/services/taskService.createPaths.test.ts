@@ -1,8 +1,4 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
-// Tests for paths of TaskService.create that the other suites do not reach: what it refuses
-// before anything is written, and how the launch it schedules ends. create() returns once the
-// task's row is reserved, so each launch outcome is read after the launch settles (the
-// createAgentTask helper waits for it).
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert";
 import { existsSync } from "node:fs";
@@ -296,8 +292,6 @@ describe("TaskService.create paths", () => {
   });
 
   test("a task whose parent names no workspace is refused before anything is written", async () => {
-    // A parent whose metadata names no workspace: on a local runtime its branch is unknown, so
-    // the row would have no trunk branch.
     const { parentId, taskService } = await setupRowlessParent({ queue: true, parentName: "" });
     const created = await createAgentTask(taskService, parentId, "go");
     expect(created).toEqual(Err("Task.create: parent workspace name missing"));
@@ -354,8 +348,6 @@ describe("TaskService.create paths", () => {
     );
     const created = await createAgentTask(taskService, "1111111111", "go");
     expect(created.success).toBe(true);
-    // Fail closed: no durable marker and no settlement against a row of unknown state. The row
-    // keeps its reservation until startup recovery requeues it.
     expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({ taskStatus: "starting" });
     expect(findWorkspaceInConfig(config, TASK_ID)?.taskLaunchError).toBeUndefined();
     expect(

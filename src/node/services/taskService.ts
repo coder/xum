@@ -1156,7 +1156,6 @@ interface ReservationRowFence {
   rowMoved: boolean;
 }
 
-/** A launch's materialized checkout, as its init reads it. */
 interface TaskLaunchCheckout {
   readonly initLogger: InitLogger;
   readonly workspacePath: string;
@@ -1632,7 +1631,6 @@ type ReservationLaunchPlan = TaskLaunchPlan & {
   sharedWorkspacePath?: string;
 };
 
-/** What the parent's failure delivery reads of a child that ended without a report. */
 type TerminalFailureChild = Pick<
   WorkspaceConfigEntry,
   "parentWorkspaceId" | "agentType" | "workflowTask"
@@ -3120,7 +3118,7 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
 
 /**
  * A launched task's base commits in its materialized checkout: each project's HEAD, keyed by
- * project path, and the parent project's. The launch persists them on the task's row.
+ * project path, and the parent project's.
  */
 async function readTaskBaseCommits(
   plan: TaskLaunchPlan,
@@ -3460,7 +3458,6 @@ export class TaskService implements AgentTaskIntegration {
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
-  // createMany's launches, each until it settles (see reservedLaunchesSettled).
   private readonly reservedLaunches = new Set<Promise<void>>();
   // Terminal attention scheduling and bookkeeping: notify_on_terminal persists, drain chains, idle
   // waits, fresh sub-agent edges and wake-group send backoff. The drain itself stays here.
@@ -6633,10 +6630,6 @@ export class TaskService implements AgentTaskIntegration {
     string
   > {
     const { taskRuntimeMode, parentIsMultiProject, parentWorkspacePath } = parentRuntime;
-    // isolation: "none" runs the sub-agent directly in the parent's checkout instead of forking
-    // one. Only worktree/SSH single-project parents share it, since there the fork creates a
-    // separate checkout that can be bypassed safely; multi-project parents on those runtimes are
-    // refused (see MULTI_PROJECT_SHARED_ISOLATION_ERROR); everything else falls back to forking.
     if (
       args.isolation === "none" &&
       runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
@@ -7968,7 +7961,7 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Settles (never rejects) once every launch createMany scheduled so far has settled, its
-   * failure recorded. Shutdown joins it next to the queue drain's launches (queueDrainSettled).
+   * failure recorded.
    */
   reservedLaunchesSettled(): Promise<void> {
     return Promise.all(this.reservedLaunches).then(() => undefined);
@@ -8759,7 +8752,6 @@ export class TaskService implements AgentTaskIntegration {
       created = await this.createMany([args]);
     }
     if (!created.success) {
-      // The caller asked for one task: its refusals name that call, as they always have.
       return Err(created.error.replace(/^Task\.createMany:/, "Task.create:"));
     }
     const [result] = created.data;
@@ -8770,7 +8762,6 @@ export class TaskService implements AgentTaskIntegration {
     return Ok(result);
   }
 
-  /** The orchestrateFork options for a task that forks its parent's checkout. */
   private taskForkOptions(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,

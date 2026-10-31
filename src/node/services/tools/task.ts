@@ -318,7 +318,6 @@ function toAggregatePendingStatus(
   statuses: ReadonlyArray<PendingTaskInfo["status"]>
 ): "queued" | "starting" | "running" {
   if (statuses.every((status) => status === "queued")) return "queued";
-  // No member runs yet: the reserved ones are still launching, the rest wait for a slot.
   if (statuses.every((status) => status === "starting" || status === "queued")) return "starting";
   return "running";
 }
@@ -337,7 +336,6 @@ function waitFailureToRethrow(
     : undefined;
 }
 
-/** A member whose wait ended without its report: interrupted, or its launch or its run failed. */
 function endedWithoutReport(outcome: ForegroundWaitOutcome): boolean {
   return outcome.kind === "task_interrupted" || outcome.kind === "error";
 }

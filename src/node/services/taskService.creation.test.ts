@@ -492,7 +492,6 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     sendMessage.mockResolvedValueOnce(Err("launch refused"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    // create() returns at the reservation: the refused send fails the launch after it.
     const failed = await createAgentTask(taskService, parentId, "First", { desktop: "shared" });
     assert(failed.success);
     const failedRow = findWorkspaceInConfig(config, failed.data.taskId);
@@ -2003,7 +2002,6 @@ describe("TaskService", () => {
 
       expect(result.success).toBe(true);
       assert(result.success, "Expected shared-workspace task to be created");
-      // create() reports the reservation's status; the settled launch then started the task.
       expect(result.data.status).toBe("starting");
       expect(result.data.taskId).toBe(childTaskId);
       expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("running");
@@ -3209,7 +3207,6 @@ describe("TaskService", () => {
     );
     const { taskService } = createTaskServiceHarness(config);
 
-    // create() reports the reservation's status: a slot reserves the task as `starting`.
     const first = await createAgentTask(taskService, parentId, "task 1");
     expect(first.success).toBe(true);
     if (!first.success) return;

@@ -246,7 +246,6 @@ describe("TaskToolCall", () => {
   });
 
   test("shows a background spawn that is still starting as backgrounded, not completed", () => {
-    // The spawn returned at its reservation; the child's row is still starting (fork, first send).
     const workspace = createWorkspaceMetadata({ id: "task-starting-1", taskStatus: "starting" });
     workspaceContextMock = { workspaceMetadata: new Map([[workspace.id, workspace]]) };
     const agentTaskArgs = {

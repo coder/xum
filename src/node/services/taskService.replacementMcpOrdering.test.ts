@@ -616,7 +616,6 @@ describe("direct create: MCP after sanitize", () => {
           return "fixture: sanitize failed";
         }
       );
-      // Recorded, not delivered: delivering the wake would resume the parent with a model turn.
       const wakes = spyOn(env.services.taskService, "enqueueTerminalAttention").mockResolvedValue(
         undefined
       );
@@ -643,7 +642,6 @@ describe("direct create: MCP after sanitize", () => {
       ).toBe(false);
       expect(await fs.stat(checkout).catch(() => null)).toBeNull();
       expect((await readRecord(recordFile)).filter((e) => e.cwd === checkout)).toEqual([]);
-      // The reclaim removed the row, so the launch's plan names the parent to tell.
       const parentHistory = await new HistoryService(env.config).getHistoryFromLatestBoundary(
         parentId
       );
@@ -705,7 +703,6 @@ describe("direct create: MCP after sanitize", () => {
           .loadConfigOrDefault()
           .projects.get(repoPath)
           ?.workspaces.find((w) => w.id === held.taskId);
-      // The window: the row is published as starting while its sanitize is held.
       expect(row()?.taskStatus).toBe("starting");
 
       // A renderer's prompt catalog request parks on the launch's init until sanitize is done;
@@ -730,7 +727,6 @@ describe("direct create: MCP after sanitize", () => {
           ],
         },
       });
-      // Refused before its prompt snapshot: nothing was expanded, and nothing started.
       expect(racing.success).toBe(false);
       expect(getPrompt.mock.calls.some((call) => call[0] === held.taskId)).toBe(false);
       expect((await readRecord(recordFile)).filter((e) => e.cwd === held.checkout)).toEqual([]);

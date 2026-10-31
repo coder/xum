@@ -106,7 +106,6 @@ const MUTED_BADGE_STYLE = "bg-muted/20 text-muted";
 const INTERRUPTED_BADGE_STYLE = "bg-interrupted/20 text-interrupted";
 const DANGER_BADGE_STYLE = "bg-danger/20 text-danger";
 
-/** Badge style per task status; any other status is muted. */
 const TASK_STATUS_BADGE_STYLES = new Map<string, string>([
   ["accepted", SUCCESS_BADGE_STYLE],
   ["retitled", SUCCESS_BADGE_STYLE],
@@ -119,14 +118,11 @@ const TASK_STATUS_BADGE_STYLES = new Map<string, string>([
   ["rate_limited", WARNING_BADGE_STYLE],
   ["queued", MUTED_BADGE_STYLE],
   ["terminated", INTERRUPTED_BADGE_STYLE],
-  // Workflow runs surface "interrupted" (resumable) through task_terminate results and
-  // task_list rows; style it like "terminated" rather than the muted default.
   ["interrupted", INTERRUPTED_BADGE_STYLE],
   ["not_found", DANGER_BADGE_STYLE],
   ["invalid_scope", DANGER_BADGE_STYLE],
   ["refused", DANGER_BADGE_STYLE],
   ["error", DANGER_BADGE_STYLE],
-  // Workflow-run terminal failure status (task_list rows).
   ["failed", DANGER_BADGE_STYLE],
 ]);
 
@@ -907,7 +903,6 @@ function getAggregateTaskStatus(
   if (displayEntries.every((entry) => entry.status === "completed")) {
     return "completed";
   }
-  // A starting task is launching (fork, first send): as live as a running one.
   if (
     displayEntries.some(
       (entry) =>

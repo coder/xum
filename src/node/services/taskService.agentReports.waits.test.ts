@@ -1152,7 +1152,6 @@ describe("TaskService", () => {
 
     const created = await createAgentTask(taskService, parentId, "do the thing");
 
-    // create() returned at the reservation; the send failed in the launch after it.
     expect(created.success).toBe(true);
 
     // The entry was persisted and announced before the send: the workspace is published, so a
@@ -1204,8 +1203,6 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    // The transform that registers the child entry throws: the reservation commit, which runs
-    // before any fork.
     const editConfig = config.editConfig.bind(config);
     const persistSpy = spyOn(config, "editConfig").mockImplementation((transform) =>
       editConfig((cfg) => {

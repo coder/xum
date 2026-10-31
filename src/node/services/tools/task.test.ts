@@ -1367,7 +1367,6 @@ describe("task tool", () => {
   describe("a foreground best-of group whose members' launches fail", () => {
     const LAUNCH_FAILURE = "Task fork failed: no space left";
 
-    /** n=3 children: `failing` reject their wait with the launch error, the others report. */
     async function runGroup(failing: ReadonlySet<string>, statusOf: (taskId: string) => unknown) {
       using tempDir = new TestTempDir("test-task-tool-best-of-launch-failure");
       const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
@@ -1404,7 +1403,6 @@ describe("task tool", () => {
     }
 
     it("keeps the other members' reports and shows the failed one as interrupted", async () => {
-      // The failed member's row is gone (a reclaimed unsanitized checkout): no live status.
       const result: unknown = await runGroup(new Set(["child-task-2"]), () => undefined);
 
       expect(result).toMatchObject({

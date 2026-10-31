@@ -822,7 +822,6 @@ describe("ServiceContainer", () => {
   it("dispose joins a launch that task creation scheduled", async () => {
     services = new ServiceContainer(stores);
     spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
-    // A spawn returned at its reservation; its launch is still forking or sending.
     const launch = Promise.withResolvers<void>();
     const launchesSettled = spyOn(services.taskService, "reservedLaunchesSettled").mockReturnValue(
       launch.promise

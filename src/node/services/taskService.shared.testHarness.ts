@@ -188,10 +188,6 @@ export async function startLiveWorkspaceTurn(
   };
 }
 
-/**
- * Creates an agent task and waits for its launch (fork, init, first send) to settle: create()
- * returns at the reservation, and most tests assert what the launch did.
- */
 export async function createAgentTask(
   taskService: TaskService,
   parentWorkspaceId: string,

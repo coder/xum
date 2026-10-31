@@ -2198,7 +2198,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         title: "Direct",
         isolation: "none",
       });
-      // create returns once the row is reserved; the launch runs after it, outside every lock.
       expect(created).toMatchObject({
         success: true,
         data: { taskId: spawnedId, status: "starting" },
@@ -2212,7 +2211,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: entry!.taskAttemptId,
         receiptEligible: true,
       });
-      // The launch keeps the reserved attempt: same id, same owner, now live.
       await taskService.reservedLaunchesSettled();
       expect(entryOf(config, spawnedId)).toMatchObject({
         taskStatus: "running",
@@ -2241,8 +2239,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     // ---------------------------------------------------------------------------------------------
     // Direct create vs. another writer (a second backend on the same root — its startup re-drive or
     // reawaken rotates the published row A → B while this launch is still in flight). The launch
-    // is decided for A: its failure never touches B's row, queue or stream. A launch that sees B
-    // before its send stops without touching it (taskService.reservedLaunch.test.ts).
+    // is decided for A: its failure never touches B's row, queue or stream.
     // ---------------------------------------------------------------------------------------------
     const FOREIGN_ATTEMPT_ID = "att_00000000000000b2";
     /** The other backend's re-admission of the row: fresh unproven id, running (a reawaken). */
@@ -2326,7 +2323,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(launchSendFailed).toBe(true);
         expect(rotated).toBe(true);
         expect(mintedAttemptId).toMatch(ATTEMPT_ID);
-        // B's row is its writer's: no marker of ours survives, nothing is stopped or latched.
         expect(host.clearQueue).not.toHaveBeenCalled();
         expect(stopStream).not.toHaveBeenCalled();
         expect(entryOf(config, spawnedId)).toMatchObject({
@@ -2336,11 +2332,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
         expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
         expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-        // This process still owns A, never B.
         expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(
           mintedAttemptId
         );
-        // B's row stays open to its own writer's sends (bound unowned here).
         const admission = admitted(
           taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" })
         );
