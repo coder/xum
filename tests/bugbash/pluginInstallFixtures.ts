@@ -4,12 +4,12 @@
  * Local git repositories that Settings > Plugins installs from their absolute path: a Claude Code
  * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills, a
  * repository with one manifest per agent tool (multi-harness), a Claude Code plugin next to
- * another tool's plugin.json (claude-foreign-root) and a small copy of Cursor's cursor-team-kit
- * (cursor-team-kit-mini).
- * Nothing here runs on install or review: the one MCP server stays disabled until the user turns
- * it on (and bin/server only exits 0), Claude hooks never run in Xum, and Xum never loads a Claude
- * plugin's hooks.js or workflows/ (both are inert anyway). Model-driven jobs also set
- * XUM_DISABLE_AGENT_TOOLS=1.
+ * another tool's plugin.json (claude-foreign-root), a small copy of Cursor's cursor-team-kit
+ * (cursor-team-kit-mini) and a Cursor plugin with one local MCP server (cursor-stdio-mcp).
+ * Nothing here runs on install or review: the MCP servers stay disabled until the user turns them
+ * on (bin/server only exits 0, and server.mjs only echoes its text argument), Claude hooks never
+ * run in Xum, and Xum never loads a Claude plugin's hooks.js or workflows/ (both are inert
+ * anyway). Model-driven jobs also set XUM_DISABLE_AGENT_TOOLS=1.
  *
  * Only local paths install here (the sandbox has no network), so Settings never offers the Skills
  * CLI choice, which takes only remote sources (skillsCliSource.ts). The marketplace's github entry
@@ -286,6 +286,58 @@ function cursorTeamKitMini(): Files {
   };
 }
 
+/**
+ * A minimal MCP server over stdio (newline-delimited JSON-RPC, no dependencies): one tool `echo`
+ * that returns its `text` argument.
+ */
+const ECHO_SERVER = `import { createInterface } from "node:readline";
+
+const tools = [
+  {
+    name: "echo",
+    description: "Returns its text argument",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+  },
+];
+const results = {
+  initialize: (params) => ({
+    protocolVersion: params.protocolVersion,
+    capabilities: { tools: {} },
+    serverInfo: { name: "echo", version: "1.0.0" },
+  }),
+  ping: () => ({}),
+  "tools/list": () => ({ tools }),
+  "tools/call": (params) => ({ content: [{ type: "text", text: String(params.arguments?.text) }] }),
+};
+createInterface({ input: process.stdin }).on("line", (line) => {
+  if (line.trim() === "") return;
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  const result = results[request.method];
+  const reply = result
+    ? { result: result(request.params ?? {}) }
+    : { error: { code: -32601, message: "Method not found: " + request.method } };
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...reply }) + "\\n");
+});
+`;
+
+/** A Cursor plugin whose one MCP server launches through `${CURSOR_PLUGIN_ROOT}` (RFC CUJ 4b). */
+function cursorStdioMcp(): Files {
+  return {
+    ".cursor-plugin/plugin.json": JSON.stringify(
+      { name: "cursor-stdio-mcp", mcpServers: "./mcp.json" },
+      null,
+      2
+    ),
+    "mcp.json": JSON.stringify(
+      { mcpServers: { echo: { command: "node", args: ["${CURSOR_PLUGIN_ROOT}/server.mjs"] } } },
+      null,
+      2
+    ),
+    "server.mjs": ECHO_SERVER,
+  };
+}
+
 const EXECUTABLE = new Set(["claude-review-kit/bin/server"]);
 
 export function installFixtures(): Record<string, Files> {
@@ -298,6 +350,7 @@ export function installFixtures(): Record<string, Files> {
     "claude-foreign-root": claudeForeignRoot(),
     "snake-case-skills": snakeCaseSkills(),
     "cursor-team-kit-mini": cursorTeamKitMini(),
+    "cursor-stdio-mcp": cursorStdioMcp(),
   };
 }
 

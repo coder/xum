@@ -6,7 +6,8 @@
  * rescanned for further placeholders, unrecognized `${...}` text stays
  * literal, and no other placeholder or environment-variable expansion is
  * performed. A Claude Code `.mcp.json` also names the two values
- * `${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}`; they expand only when the
+ * `${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}`, and a Cursor `mcp.json`
+ * names the plugin folder `${CURSOR_PLUGIN_ROOT}`; they expand only when the
  * caller supplies them.
  */
 
@@ -15,11 +16,12 @@ export interface PluginPlaceholderValues {
   PLUGIN_DATA: string;
   CLAUDE_PLUGIN_ROOT?: string;
   CLAUDE_PLUGIN_DATA?: string;
+  CURSOR_PLUGIN_ROOT?: string;
 }
 
 // String.replace with a global regex visits each match of the ORIGINAL string
 // exactly once, so replacement output is never rescanned (single-pass §9.2).
-const PLUGIN_PLACEHOLDER_PATTERN = /\$\{((?:CLAUDE_)?PLUGIN_(?:ROOT|DATA))\}/g;
+const PLUGIN_PLACEHOLDER_PATTERN = /\$\{((?:CLAUDE_|CURSOR_)?PLUGIN_(?:ROOT|DATA))\}/g;
 
 /** Expand `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` (and supplied aliases) in a config string (single-pass). */
 export function expandPluginPlaceholders(value: string, vars: PluginPlaceholderValues): string {

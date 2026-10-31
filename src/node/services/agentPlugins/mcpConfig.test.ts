@@ -367,6 +367,195 @@ describe("loadPluginMcpServers", () => {
     ]);
   });
 
+  async function makeCursorPlugin(
+    baseDir: string,
+    name: string,
+    servers: Record<string, unknown>
+  ): Promise<AgentPluginInfo> {
+    return {
+      ...(await makePlugin(baseDir, name, { mcpServers: servers })),
+      mcpConfigDialect: "cursor",
+    };
+  }
+
+  const loadedNames = (servers: Record<string, { plugin?: { serverName: string } }>) =>
+    Object.values(servers).map((s) => s.plugin?.serverName);
+
+  test("the Cursor dialect expands both plugin roots and maps a root-anchored command", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makeCursorPlugin(tmp.path, "cursor", {
+      cursorRoot: {
+        command: "${CURSOR_PLUGIN_ROOT}/bin/server",
+        args: ["${CURSOR_PLUGIN_ROOT}/server.mjs", "${CLAUDE_PLUGIN_ROOT}/lib"],
+        env: { CONFIG: "${CURSOR_PLUGIN_ROOT}/config.json", LIB: "${CLAUDE_PLUGIN_ROOT}/lib" },
+        cwd: "${CURSOR_PLUGIN_ROOT}/work",
+      },
+      claudeRoot: { command: "${CLAUDE_PLUGIN_ROOT}/bin/server", cwd: "${CLAUDE_PLUGIN_ROOT}" },
+    });
+    await fs.mkdir(path.join(plugin.rootPath, "bin"));
+    await fs.mkdir(path.join(plugin.rootPath, "work"));
+    await fs.writeFile(path.join(plugin.rootPath, "bin", "server"), "#!/bin/sh\n", {
+      mode: 0o755,
+    });
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(diagnostics).toEqual([]);
+    const dataPath = getPluginDataPath(tmp.path, computePluginInstanceId(plugin.rootPath));
+    const [cursorRoot, claudeRoot] = Object.values(servers) as MCPStdioServerInfo[];
+    expect(cursorRoot.command).toBe(path.join(plugin.rootPath, "bin", "server"));
+    expect(cursorRoot.args).toEqual([`${plugin.rootPath}/server.mjs`, `${plugin.rootPath}/lib`]);
+    expect(cursorRoot.cwd).toBe(path.join(plugin.rootPath, "work"));
+    // Cursor documents only the two roots: no data folder alias is exported.
+    expect(cursorRoot.env).toEqual({
+      CONFIG: `${plugin.rootPath}/config.json`,
+      LIB: `${plugin.rootPath}/lib`,
+      PLUGIN_ROOT: plugin.rootPath,
+      PLUGIN_DATA: dataPath,
+      CURSOR_PLUGIN_ROOT: plugin.rootPath,
+      CLAUDE_PLUGIN_ROOT: plugin.rootPath,
+    });
+    expect(claudeRoot.command).toBe(path.join(plugin.rootPath, "bin", "server"));
+    expect(claudeRoot.cwd).toBe(plugin.rootPath);
+  });
+
+  test("a Cursor cwd at a data folder name fails the cwd form check; Claude maps it", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const servers = { stateful: { command: "node", cwd: "${CLAUDE_PLUGIN_DATA}/state" } };
+    const cursor = await makeCursorPlugin(tmp.path, "cursor", servers);
+    const claude: AgentPluginInfo = {
+      ...(await makePlugin(tmp.path, "claude", servers, { fileName: ".mcp.json" })),
+      mcpConfigDialect: "claude",
+    };
+
+    const cursorResult = await loadPluginMcpServers(cursor, { xumHome: tmp.path });
+    const claudeResult = await loadPluginMcpServers(claude, { xumHome: tmp.path });
+
+    expect(cursorResult.servers).toEqual({});
+    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "error",
+        "mcp.json server 'stateful': 'cwd' must be './…', '${PLUGIN_ROOT}[/…]', or '${PLUGIN_DATA}[/…]'; skipping this server",
+      ],
+    ]);
+    const claudeData = getPluginDataPath(tmp.path, computePluginInstanceId(claude.rootPath));
+    expect(claudeResult.diagnostics).toEqual([]);
+    expect((Object.values(claudeResult.servers)[0] as MCPStdioServerInfo).cwd).toBe(
+      path.join(claudeData, "state")
+    );
+  });
+
+  test("a Cursor server with a value Xum cannot fill is skipped as needing values", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makeCursorPlugin(tmp.path, "cursor", {
+      token: { command: "npx", env: { TOKEN: "${BREVO_MCP_TOKEN}" } },
+      // D29: only the two roots expand, so a Cursor data folder name is a user value.
+      data: { command: "npx", args: ["${CURSOR_PLUGIN_DATA}/cache"] },
+      header: {
+        type: "http",
+        url: "https://x.example/mcp",
+        headers: { Authorization: "Bearer ${CLIENT_SECRET:-}" },
+      },
+      // The url check would refuse it for its braces; the placeholder is the reason to report.
+      host: { type: "http", url: "https://${VANTA_MCP_HOST}/mcp" },
+      // A default can hold a secret: only the name is reported.
+      fallback: { type: "http", url: "https://x.example/${PATH_SEGMENT:-s3cret-default}" },
+      plain: { type: "http", url: "https://attio.example/mcp" },
+    });
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(loadedNames(servers)).toEqual(["plain"]);
+    expect(diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "warning",
+        "mcp.json server 'token': needs values not supported in Xum (${BREVO_MCP_TOKEN}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'data': needs values not supported in Xum (${CURSOR_PLUGIN_DATA}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'header': needs values not supported in Xum (${CLIENT_SECRET}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'host': needs values not supported in Xum (${VANTA_MCP_HOST}); skipping this server",
+      ],
+      [
+        "warning",
+        "mcp.json server 'fallback': needs values not supported in Xum (${PATH_SEGMENT}); skipping this server",
+      ],
+    ]);
+  });
+
+  test("the Cursor dialect infers streamable HTTP from a url and ignores an auth block", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makeCursorPlugin(tmp.path, "cursor", {
+      gong: { url: "https://x.example/mcp" },
+      x: {
+        type: "http",
+        url: "https://api.x.example/mcp",
+        auth: { CLIENT_ID: "fixed-client", scopes: ["tweet.read"] },
+      },
+    });
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
+      ["gong", "http"],
+      ["x", "http"],
+    ]);
+    // Not translated: sign-in uses discovery and dynamic client registration.
+    expect(Object.values(servers).map((s) => s.transport !== "stdio" && s.oauth)).toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      ["warning", "mcp.json server 'x': auth not applied in Xum"],
+    ]);
+  });
+
+  test("only the Cursor dialect reserves the Cursor plugin root names", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const cursor = await makeCursorPlugin(tmp.path, "cursor", {
+      forwardCursorRoot: { command: "node", env_vars: ["CURSOR_PLUGIN_ROOT"] },
+      forwardClaudeRoot: { command: "node", env_vars: ["CLAUDE_PLUGIN_ROOT"] },
+      setClaudeRoot: { command: "node", env: { CLAUDE_PLUGIN_ROOT: "/elsewhere" } },
+    });
+    const codex = await makePlugin(
+      tmp.path,
+      "codex",
+      {
+        forwardCursorRoot: { command: "node", env_vars: ["CURSOR_PLUGIN_ROOT"] },
+        setClaudeRoot: { command: "node", env: { CLAUDE_PLUGIN_ROOT: "/elsewhere" } },
+      },
+      { fileName: ".mcp.json" }
+    );
+
+    const cursorResult = await loadPluginMcpServers(cursor, { xumHome: tmp.path });
+    const codexResult = await loadPluginMcpServers(codex, { xumHome: tmp.path });
+
+    expect(cursorResult.servers).toEqual({});
+    expect(cursorResult.diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "error",
+        "mcp.json server 'forwardCursorRoot': 'env_vars[0]' must not name reserved variable 'CURSOR_PLUGIN_ROOT'; skipping this server",
+      ],
+      [
+        "error",
+        "mcp.json server 'forwardClaudeRoot': 'env_vars[0]' must not name reserved variable 'CLAUDE_PLUGIN_ROOT'; skipping this server",
+      ],
+      [
+        "error",
+        "mcp.json server 'setClaudeRoot': 'env' must not contain reserved variable 'CLAUDE_PLUGIN_ROOT'; skipping this server",
+      ],
+    ]);
+    expect(codexResult.diagnostics).toEqual([]);
+    expect(loadedNames(codexResult.servers)).toEqual(["forwardCursorRoot", "setClaudeRoot"]);
+  });
+
   test("the Codex dialect forwards only the host variables that env_vars names", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(

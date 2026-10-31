@@ -2337,20 +2337,16 @@ describe("Cursor plugin discovery", () => {
     ]);
   });
 
-  test("mcp.json produces no MCP config and one not-applied MCP entry", async () => {
-    const { plugin } = await discoverKit({
-      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
-      "mcp.json": JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } }),
+  test("the file that mcpServers names loads in the cursor MCP dialect", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    const { plugin, relative } = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./servers.json" }),
+      "servers.json": servers,
+      "mcp.json": servers,
     });
-    expect(plugin.mcpConfigPath).toBeUndefined();
-    expect(plugin.mcpConfigDialect).toBeUndefined();
-    expect(plugin.notApplied).toEqual([
-      {
-        part: "mcp",
-        name: "mcp.json",
-        reason: "MCP servers of Cursor plugins load in a later Xum build",
-      },
-    ]);
+    expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
+    expect(plugin.mcpConfigDialect).toBe("cursor");
+    expect(plugin.notApplied).toEqual([]);
   });
 
   test("a manifest rules folder replaces the default rules/", async () => {

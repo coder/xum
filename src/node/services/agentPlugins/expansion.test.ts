@@ -26,6 +26,18 @@ describe("expandPluginPlaceholders", () => {
     ).toBe("${HOME}/x ${PLUGIN_ROOTS} $PLUGIN_ROOT ${plugin_root}");
   });
 
+  test("expands ${CURSOR_PLUGIN_ROOT} only when the caller supplies it", () => {
+    expect(expandPluginPlaceholders("${CURSOR_PLUGIN_ROOT}/server.mjs", VARS)).toBe(
+      "${CURSOR_PLUGIN_ROOT}/server.mjs"
+    );
+    expect(
+      expandPluginPlaceholders("${CURSOR_PLUGIN_ROOT}/server.mjs ${CURSOR_PLUGIN_DATA}", {
+        ...VARS,
+        CURSOR_PLUGIN_ROOT: "/plugins/demo",
+      })
+    ).toBe("/plugins/demo/server.mjs ${CURSOR_PLUGIN_DATA}");
+  });
+
   test("returns strings without placeholders unchanged", () => {
     expect(expandPluginPlaceholders("plain text", VARS)).toBe("plain text");
     expect(expandPluginPlaceholders("", VARS)).toBe("");
