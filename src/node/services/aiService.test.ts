@@ -364,6 +364,7 @@ function resolvedAgentResultFor(
       agentDiscoveryPath: metadata.projectPath,
       isSubagentWorkspace: false,
       agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
+      agentAiSettingsChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
       effectiveMode: "exec",
       taskSettings: DEFAULT_TASK_SETTINGS,
@@ -6815,6 +6816,40 @@ describe("discoverAvailableSubagentsForToolContext", () => {
     }
   });
 
+  it("lists a background hint that a derived agent inherits from its base", async () => {
+    using project = new DisposableTempDir("available-subagents-background-hint");
+    using xumHome = new DisposableTempDir("available-subagents-background-hint-home");
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "watcher.md"),
+      "---\nname: Watcher\nbase: exec\nsubagent:\n  background_hint: true\n---\nBody\n"
+    );
+    await fs.writeFile(
+      path.join(agentsRoot, "ci-watcher.md"),
+      "---\nname: CI Watcher\ndescription: Watches CI\nbase: watcher\n---\nBody\n"
+    );
+
+    const availableSubagents = await discoverAvailableSubagentsForToolContext({
+      runtime: new LocalRuntime(project.path),
+      workspacePath: project.path,
+      cfg: new Config(xumHome.path).loadConfigOrDefault(),
+      roots: {
+        projectRoots: [agentsRoot],
+        globalRoot: path.join(project.path, "empty-global-agents"),
+      },
+      runtimeFactory: nodeRuntimeFactory,
+    });
+    const taskTool = createTaskTool({
+      ...createTestToolConfig(project.path, { workspaceId: "test-workspace" }),
+      availableSubagents,
+    });
+
+    expect(String(taskTool.description).split("\n")).toContain(
+      "- ci-watcher: Watches CI [meant to run in the background (run_in_background=true)]"
+    );
+  });
+
   it("filters the desktop agent when capability is unavailable", async () => {
     using project = new DisposableTempDir("available-subagents-desktop");
     using xumHome = new DisposableTempDir("available-subagents-desktop-home");
@@ -7163,6 +7198,18 @@ describe("per-agent prompt cache TTL", () => {
       name: "Exec without a Settings value follows the global TTL",
       input: { agentId: "exec", globalCacheTtl: "1h" },
       expected: "1h",
+    },
+    {
+      name: "an agent with settingsBase explore takes Explore's built-in 5m under a global 1h",
+      input: {
+        agentId: "ci-watcher",
+        globalCacheTtl: "1h",
+        projectAgents: {
+          "ci-watcher":
+            "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: explore\n---\nWatch CI.\n",
+        },
+      },
+      expected: "5m",
     },
   ];
 

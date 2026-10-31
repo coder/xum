@@ -28,6 +28,8 @@ const AgentDefinitionSubagentSchema = z
     // When true, do not run the project's .xum/init hook for this sub-agent.
     // NOTE: This skips only the hook execution, not runtime provisioning (e.g. SSH sync, Docker setup).
     skip_init_hook: z.boolean().optional(),
+    // A hint in the task tool's agent list, not enforced: the parent still picks run_in_background.
+    background_hint: z.boolean().optional(),
   })
   .strip();
 
@@ -38,6 +40,8 @@ const AgentDefinitionAiDefaultsSchema = z
     thinkingLevel: ThinkingLevelSchema.optional(),
     // Anthropic prompt-cache TTL; Settings > Agents overrides it, and it overrides the global TTL.
     cacheTtl: CacheTtlSchema.optional(),
+    // Resolve these AI settings through this agent's chain instead of `base`'s (tools keep `base`).
+    settingsBase: AgentIdSchema.optional(),
   })
   .strip();
 
@@ -101,8 +105,11 @@ export const AgentDefinitionDescriptorSchema = z
     uiSelectable: z.boolean(),
     uiColor: z.string().min(1).optional(),
     subagentRunnable: z.boolean(),
+    backgroundHint: z.boolean().optional(),
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
+    // The applied ai.settingsBase; absent when unset or ignored, so AI-settings walks follow `base`.
+    aiSettingsBase: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
     // The `ai` layers a run of this agent resolves (collectDefinitionLayers): its own, with
     // same-ID hops merged, which the per-agent AI resolvers rank above base agents' Settings,

@@ -95,6 +95,8 @@ function supportsSharedIsolation(config: ToolConfiguration): boolean {
 const DESKTOP_DELEGATION_HINT =
   "Delegate repeated screenshot, act and verify loops on a desktop GUI (clicking through application UIs, filling desktop app forms, visually verifying GUI state) to `desktop` instead of automating them inline. This does not apply to the `computer` tool: it controls the user's real computer, which sub-agents cannot use, so use it directly.";
 
+const BACKGROUND_HINT = "[meant to run in the background (run_in_background=true)]";
+
 /**
  * Build dynamic task tool description with runtime-specific workspace visibility
  * guidance and the currently available sub-agents.
@@ -112,7 +114,9 @@ function buildTaskDescription(config: ToolConfiguration): string {
 
   const subagentLines = subagents.map((agent) => {
     const desc = agent.description ? `: ${agent.description}` : "";
-    return `- ${agent.id}${desc}`;
+    // A hint only (Cursor plugin RFC, D12): run_in_background keeps its default.
+    const hint = agent.backgroundHint === true ? ` ${BACKGROUND_HINT}` : "";
+    return `- ${agent.id}${desc}${hint}`;
   });
 
   const desktopHint = subagents.some(
