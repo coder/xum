@@ -224,6 +224,8 @@ describe("joinTurnStopReasons", () => {
     { maxChars: 6, prompt: "aaaa\n\n", hooks: ["a"] },
     { maxChars: 4, prompt: "aaaa", hooks: ["a"] },
     { maxChars: 0, prompt: "", hooks: [] },
+    // Nudges longer than the cap leave negative room: still no reason text.
+    { maxChars: -1, prompt: "", hooks: [] },
   ]) {
     test(`cut to ${row.maxChars} characters, it continues ${row.hooks.length} hook(s)`, () => {
       expect(joinTurnStopReasons(reasons, row.maxChars)).toEqual({
