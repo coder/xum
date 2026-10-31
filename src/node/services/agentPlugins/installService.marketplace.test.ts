@@ -719,6 +719,21 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect([updated?.lockedSha, updated?.source?.subpath]).toEqual([head, "kit"]);
   });
 
+  test("not-applied names show invisible characters as marks", async () => {
+    await writeCursorMarketplace();
+    await writeFiles(marketDir, {
+      "kit/rules/Bad\u202eName.mdc": "---\nalwaysApply: true\n---\nX\n",
+    });
+    await commit(marketDir, "a rule file name with a bidi control");
+    const names = (items: AgentPluginNotApplied[] | undefined) =>
+      (items ?? []).filter((item) => item.part === "rule").map((item) => item.name);
+    const preview = await previewCursorEntry("kit");
+    expect(names(preview.notApplied)).toEqual(["Bad<U+202E>Name.mdc"]);
+    await install(preview);
+    const listed = (await service.list()).find((item) => item.name === "kit");
+    expect(names(listed?.notApplied)).toEqual(["Bad<U+202E>Name.mdc"]);
+  });
+
   test("a plugin without not-applied parts carries no list", async () => {
     await writeCursorMarketplace();
     const preview = await previewCursorEntry("pstack");
@@ -761,7 +776,7 @@ describe("AgentPluginInstallService marketplaces", () => {
       "kit/agents/xum.md": "---\nname: xum\nbase: exec\nreadonly: true\n---\nXum\n",
       // Xum format on Explore that adds the edit tools back: no readonly label.
       "kit/agents/editor.md":
-        "---\nname: editor\nbase: explore\nreadonly: true\ntools:\n  add: [\"file_edit_.*\"]\n---\nEdit\n",
+        '---\nname: editor\nbase: explore\nreadonly: true\ntools:\n  add: ["file_edit_.*"]\n---\nEdit\n',
     });
     await commit(marketDir, "kit agents");
     const preview = await previewCursorEntry("kit");
