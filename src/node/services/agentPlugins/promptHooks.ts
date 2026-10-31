@@ -13,7 +13,9 @@ import type {
   MessageSendContext,
   MessageSendOrigin,
   TurnStopContext,
+  TurnStopContinueReason,
 } from "@/node/services/events/eventSpine";
+import { MAX_STOP_HOOK_CONTINUATIONS } from "@/constants/pluginHooks";
 import type { PluginHookContextEntry } from "@/common/types/message";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -133,18 +135,36 @@ export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 export type TurnStopHookOutcome =
   | { kind: "none" }
   | { kind: "halted" }
-  | { kind: "continue"; prompt: string };
+  | {
+      kind: "continue";
+      prompt: string;
+      /** The hookKey of each hook whose reason the prompt carries, each once. */
+      hookKeys: string[];
+      /** Those hooks' plugins, each once, in chain order. */
+      pluginNames: string[];
+    };
 
+export type TurnStopHookInput = Pick<
+  TurnStopContext,
+  "messageId" | "lastAssistantMessage" | "model" | "turnContinuations" | "hookContinuations"
+>;
+
+/**
+ * Runs the chain, then drops each reason whose hook reached its limit (its `loopLimit`, or the
+ * shared default). The per-user-turn ceiling is the caller's.
+ */
 export async function runTurnStopHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: Pick<
-    TurnStopContext,
-    "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd" | "model"
-  >
+  input: TurnStopHookInput & Pick<TurnStopContext, "cwd">
 ): Promise<TurnStopHookOutcome> {
   if (!spine.hasMiddlewareFor("turn.stop", workspaceId)) return { kind: "none" };
-  const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };
+  const ctx: TurnStopContext = {
+    workspaceId,
+    ...input,
+    stopHookActive: input.turnContinuations > 0,
+    continueReasons: [],
+  };
   try {
     await spine.run("turn.stop", ctx);
   } catch (error) {
@@ -156,12 +176,30 @@ export async function runTurnStopHooks(
   }
   // Codex: a `continue: false` from any Stop hook wins over every continuation.
   if (ctx.halted != null) return { kind: "halted" };
-  const prompt = ctx.continueReasons
-    .map((reason) => reason.trim())
-    .filter((reason) => reason.length > 0)
-    .join("\n\n")
-    .slice(0, TURN_STOP_PROMPT_MAX_CHARS);
-  return prompt.length > 0 ? { kind: "continue", prompt } : { kind: "none" };
+  const kept = ctx.continueReasons
+    .map((reason) => ({ ...reason, text: reason.text.trim() }))
+    .filter(
+      (reason) => reason.text.length > 0 && hasContinuationsLeft(reason, input.hookContinuations)
+    );
+  if (kept.length === 0) return { kind: "none" };
+  return {
+    kind: "continue",
+    prompt: kept
+      .map((reason) => reason.text)
+      .join("\n\n")
+      .slice(0, TURN_STOP_PROMPT_MAX_CHARS),
+    hookKeys: [...new Set(kept.map((reason) => reason.hookKey))],
+    pluginNames: [...new Set(kept.map((reason) => reason.pluginName))],
+  };
+}
+
+function hasContinuationsLeft(
+  reason: TurnStopContinueReason,
+  counts: ReadonlyMap<string, number>
+): boolean {
+  if (reason.loopLimit === null) return true;
+  const limit = reason.loopLimit ?? MAX_STOP_HOOK_CONTINUATIONS;
+  return (counts.get(reason.hookKey) ?? 0) < limit;
 }
 
 /**

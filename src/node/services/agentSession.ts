@@ -23,15 +23,12 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type {
-  MessageSendOrigin,
-  RequestAssemblySnapshot,
-  TurnStopContext,
-} from "./events/eventSpine";
+import type { MessageSendOrigin, RequestAssemblySnapshot } from "./events/eventSpine";
 import {
   lastAssistantText,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  type TurnStopHookInput,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -132,6 +129,7 @@ import {
 import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
+import { MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN } from "@/constants/pluginHooks";
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
@@ -702,9 +700,11 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
-/** Codex Stop: a turn.stop hook continues one user turn at most this many times. */
-const MAX_STOP_HOOK_CONTINUATIONS = 3;
 const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
+
+/** A turn.stop continuation and the plugin hooks it counts against (none for nudges alone). */
+type StopHookContinuation = TurnStopContinuation &
+  Pick<Extract<TurnStopHookOutcome, { kind: "continue" }>, "hookKeys" | "pluginNames">;
 
 /** The ended stream's provenance that its turn.stop continuation keeps. */
 interface StopContinuationProvenance {
@@ -1072,10 +1072,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     hooksLoaded?: boolean
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
-  runTurnStopHooks?(
-    workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
-  ): Promise<TurnStopHookOutcome>;
+  runTurnStopHooks?(workspaceId: string, input: TurnStopHookInput): Promise<TurnStopHookOutcome>;
   /** The Agent interface view's status page nudge the turn earns, or null. Absent: never. */
   statusPageTurnEndNudge?(
     workspaceId: string,
@@ -1641,9 +1638,11 @@ export class AgentSession {
   private compactionStopGeneration = 0;
   /**
    * turn.stop continuations queued since the last manual send or the last turn Stop did not
-   * continue: the hooks see `stopHookActive`, and the cap ends the loop.
+   * continue: the hooks see `stopHookActive`, and the ceiling ends the loop.
    */
   private stopHookContinuations = 0;
+  /** The same continuations per hook (runTurnStopHooks' hookKeys), for each hook's own limit. */
+  private readonly stopHookCountsByKey = new Map<string, number>();
   private pendingResumeIntent?: AbortController;
 
   private readonly retryManager: RetryManager;
@@ -5190,7 +5189,7 @@ export class AgentSession {
         internal?.pluginSendHooksApplied == null &&
         !isCompactionRequestMetadata(options?.muxMetadata))
     )
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
 
     // A client retry of an accepted send (same send ids after a lost response) adds nothing:
     // the accepted row wins over anything the hooks decide.
@@ -10730,8 +10729,9 @@ export class AgentSession {
 
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
-   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own nudges (needsTodoTurnEndNudge,
+   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row. Each hook continues
+   * a user turn up to its own limit (runTurnStopHooks), and all of them together at most
+   * MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN times. Xum's own nudges (needsTodoTurnEndNudge,
    * statusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
    * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
    * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
@@ -10754,7 +10754,7 @@ export class AgentSession {
     // Stop notices would then be lost (Codex PRRT_kwDOPxxmWM6sT80F). Those still cancel the
     // continuation below.
     if (!provenance.externallyOwnedTurn && this.messageQueue.hasDispatchableEntries()) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
@@ -10766,7 +10766,7 @@ export class AgentSession {
     const stopEpochAtTurn = provenance.admissionStopEpoch;
     const continuation = await this.readTurnStopContinuation(payload, options, provenance);
     if (continuation == null || options == null) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // The hook ran (its notices are shown), but it cannot continue a turn whose end an outside
@@ -10775,7 +10775,7 @@ export class AgentSession {
       log.info("Prompt hooks: an ACP or xum run turn cannot be continued by turn.stop", {
         workspaceId: this.workspaceId,
       });
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A goal turn's continuation stays a goal turn: the goal counts its turns and cost against
@@ -10790,7 +10790,7 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: provenance.goalKind,
         });
-        this.stopHookContinuations = 0;
+        this.resetStopHookCounts();
         return;
       }
       goalAdmissionStale = admission.admissionStale;
@@ -10799,22 +10799,22 @@ export class AgentSession {
     // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
     // it wins too: the continuation must not run another model turn ahead of newer input.
     if (this.hasDispatchableFollowUp()) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
     // A Stop since the turn started ends it: no continuation runs after it.
     if (this.stoppedSince(stopEpochAtTurn)) {
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
-    if (this.stopHookContinuations >= MAX_STOP_HOOK_CONTINUATIONS) {
-      log.warn("Prompt hooks: turn.stop continuation cap reached; ending the turn", {
+    if (this.stopHookContinuations >= MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN) {
+      log.warn("Prompt hooks: turn.stop continuation ceiling reached; ending the turn", {
         workspaceId: this.workspaceId,
       });
-      this.stopHookContinuations = 0;
+      this.resetStopHookCounts();
       return;
     }
-    this.stopHookContinuations++;
+    this.recordStopHookContinuation(continuation);
     this.queueMessage(continuation.prompt, this.stopContinuationOptions(options, provenance), {
       acceptanceOrigin: "automatic",
       synthetic: true,
@@ -10828,6 +10828,28 @@ export class AgentSession {
       dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
+    });
+  }
+
+  /** A new user turn for Stop: every hook's count and the ceiling start again. */
+  // dry-duplicate-ok: field resets of unrelated state (stream, file tracking) only share a shape
+  private resetStopHookCounts(): void {
+    this.stopHookContinuations = 0;
+    this.stopHookCountsByKey.clear();
+  }
+
+  /** Counts a continuation against the ceiling and its hooks' limits, and tells the user. */
+  private recordStopHookContinuation(continuation: StopHookContinuation): void {
+    this.stopHookContinuations++;
+    for (const key of continuation.hookKeys) {
+      this.stopHookCountsByKey.set(key, (this.stopHookCountsByKey.get(key) ?? 0) + 1);
+    }
+    // A continuation of Xum's nudges alone names no plugin, so it shows no notice.
+    if (continuation.pluginNames.length === 0) return;
+    eventSpine.emit("plugin.hook.notice", {
+      workspaceId: this.workspaceId,
+      pluginName: continuation.pluginNames.join(", "),
+      message: `plugin continued turn ${this.stopHookContinuations} of ${MAX_PLUGIN_CONTINUATIONS_PER_USER_TURN}`,
     });
   }
 
@@ -10848,20 +10870,25 @@ export class AgentSession {
     payload: StreamEndEvent,
     options: SendMessageOptions | undefined,
     provenance: StopContinuationProvenance
-  ): Promise<TurnStopContinuation | null> {
+  ): Promise<StopHookContinuation | null> {
     const hookOutcome: TurnStopHookOutcome = (await this.aiService.runTurnStopHooks?.(
       this.workspaceId,
       {
         messageId: payload.messageId,
         lastAssistantMessage: lastAssistantText(payload.parts),
-        stopHookActive: this.stopHookContinuations > 0,
         model: stopHookModel(payload, provenance),
+        turnContinuations: this.stopHookContinuations,
+        hookContinuations: this.stopHookCountsByKey,
       }
     )) ?? { kind: "none" };
-    return mergeTurnStopContinuation({
+    const continuation = mergeTurnStopContinuation({
       hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
       nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
     });
+    if (continuation == null) return null;
+    return hookOutcome.kind === "continue"
+      ? { ...continuation, hookKeys: hookOutcome.hookKeys, pluginNames: hookOutcome.pluginNames }
+      : { ...continuation, hookKeys: [], pluginNames: [] };
   }
 
   /** Xum's turn-end nudges for the continuation, TODO first (see readTurnStopContinuation). */

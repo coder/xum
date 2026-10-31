@@ -176,24 +176,39 @@ describe("runMessageSendHooks", () => {
 });
 
 describe("runTurnStopHooks", () => {
+  const stopInput = {
+    messageId: "a1",
+    lastAssistantMessage: "done",
+    turnContinuations: 0,
+    hookContinuations: new Map<string, number>(),
+  };
+  const reason = (pluginName: string, text: string) => ({
+    text,
+    pluginName,
+    hookKey: `${pluginName}:hooks/hooks.json#Stop[0][0]`,
+  });
+
   test("a consumer that throws is isolated: its partial decision is dropped, the rest still run", async () => {
     // Codex PRRT_kwDOPxxmWM6rQfGc.
     const spine = new EventSpine();
     spine.useBefore("turn.stop", (ctx) => {
-      ctx.continueReasons.push("half done");
+      ctx.continueReasons.push(reason("broken", "half done"));
       ctx.halted = { pluginName: "broken" };
       throw new Error("broken plugin");
     });
     spine.useBefore("turn.stop", (ctx) => {
-      ctx.continueReasons.push("Run the tests again.");
+      ctx.continueReasons.push(reason("tests", "Run the tests again."));
+    });
+    spine.useBefore("turn.stop", (ctx) => {
+      ctx.continueReasons[0].text = "changed in place";
+      throw new Error("broken plugin");
     });
 
-    expect(
-      await runTurnStopHooks(spine, "ws", {
-        messageId: "a1",
-        lastAssistantMessage: "done",
-        stopHookActive: false,
-      })
-    ).toEqual({ kind: "continue", prompt: "Run the tests again." });
+    expect(await runTurnStopHooks(spine, "ws", stopInput)).toEqual({
+      kind: "continue",
+      prompt: "Run the tests again.",
+      hookKeys: ["tests:hooks/hooks.json#Stop[0][0]"],
+      pluginNames: ["tests"],
+    });
   });
 });

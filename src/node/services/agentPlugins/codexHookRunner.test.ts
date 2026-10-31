@@ -55,7 +55,14 @@ function setup(hooks: PluginHookDefinition[], answer: (input: Record<string, unk
     },
     notifyUser: (message) => notices.push(message),
   };
-  registerCodexPluginHooks(spine, { workspaceId, pluginName: "guard", order: 0, hooks, deps });
+  registerCodexPluginHooks(spine, {
+    workspaceId,
+    pluginName: "guard",
+    pluginInstanceId: "guard",
+    order: 0,
+    hooks,
+    deps,
+  });
   return { spine, calls, notices, state, deps };
 }
 
@@ -383,6 +390,7 @@ describe("PreToolUse", () => {
       registerCodexPluginHooks(spine, {
         workspaceId,
         pluginName: `p${order}`,
+        pluginInstanceId: `p${order}`,
         order,
         hooks: [hook("PreToolUse")],
         deps,
@@ -763,6 +771,7 @@ describe("PostToolUse", () => {
       registerCodexPluginHooks(spine, {
         workspaceId,
         pluginName,
+        pluginInstanceId: pluginName,
         order,
         hooks: [hook("PostToolUse", { input: { out: "${tool_response}" } })],
         deps: {
@@ -872,7 +881,8 @@ describe("UserPromptSubmit and Stop", () => {
     await runTurnStopHooks(spine, workspaceId, {
       messageId: "assistant-1",
       lastAssistantMessage: "done",
-      stopHookActive: false,
+      turnContinuations: 0,
+      hookContinuations: new Map(),
       model: "openai:gpt-4o",
     });
 
@@ -894,7 +904,8 @@ describe("UserPromptSubmit and Stop", () => {
       await runTurnStopHooks(spine, workspaceId, {
         messageId: "a1",
         lastAssistantMessage: "done",
-        stopHookActive: false,
+        turnContinuations: 0,
+        hookContinuations: new Map(),
       })
     ).toEqual({ kind: "halted" });
     expect(notices).toEqual(["Tests are red; stopping."]);
@@ -982,20 +993,28 @@ describe("UserPromptSubmit and Stop", () => {
     await runTurnStopHooks(stop.spine, workspaceId, {
       messageId: "a1",
       lastAssistantMessage: null,
-      stopHookActive: false,
+      turnContinuations: 0,
+      hookContinuations: new Map(),
       cwd: "/w",
     });
     expect([...prompt.calls, ...stop.calls]).toEqual([{ dir: "/w" }, { dir: "/w" }]);
   });
 
   test("Stop: decision block continues with the reason; continue false halts", async () => {
-    const input = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
+    const input = {
+      messageId: "a1",
+      lastAssistantMessage: "done",
+      turnContinuations: 0,
+      hookContinuations: new Map(),
+    };
     const more = setup([hook("Stop", { input: { last: "${last_assistant_message}" } })], () =>
       json({ decision: "block", reason: "Run the tests again." })
     );
     expect(await runTurnStopHooks(more.spine, workspaceId, input)).toEqual({
       kind: "continue",
       prompt: "Run the tests again.",
+      hookKeys: ["guard:hooks/hooks.json#Stop[0][0]"],
+      pluginNames: ["guard"],
     });
     expect(more.calls).toEqual([{ last: "done" }]);
 
@@ -1050,7 +1069,8 @@ describe("UserPromptSubmit and Stop", () => {
       await runTurnStopHooks(stop.spine, workspaceId, {
         messageId: "a1",
         lastAssistantMessage: "done",
-        stopHookActive: false,
+        turnContinuations: 0,
+        hookContinuations: new Map(),
       })
     ).toEqual({ kind: "halted" });
   });
@@ -1075,7 +1095,12 @@ describe("Codex output rules (output_parser.rs)", () => {
       origin: "user",
       canBlock: true,
     });
-  const stopInput = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
+  const stopInput = {
+    messageId: "a1",
+    lastAssistantMessage: "done",
+    turnContinuations: 0,
+    hookContinuations: new Map(),
+  };
 
   test("a voided output without a rewrite or a deny runs the original call", async () => {
     // The unchanged case next to #6608's deny of a voided rewrite: nothing to bypass here.
