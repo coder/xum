@@ -1777,6 +1777,8 @@ interface ReservationAgentDefinition
 /** A plan createMany reserved, with the status it was reserved in. */
 type ReservationLaunchPlan = TaskLaunchPlan & {
   status: "queued" | "starting";
+  // sharedWorkspacePath is set for honored isolation: "none" plans; the entry is persisted
+  // pointing at the parent's checkout and startReservedAgentTask reuses it without fork/init.
   sharedWorkspacePath?: string;
 };
 
@@ -1801,6 +1803,17 @@ interface ReservationBatch {
 /** What the commit's mutator saw: set by its callback inside the config edit, read after it. */
 interface ReservationCommitState {
   canceledInsideCommit: boolean;
+}
+
+/**
+ * The config read once under the mutex, which every plan is revalidated against, and the
+ * parallel slots the batch spends as it reserves each plan.
+ */
+interface ReservationRevalidation {
+  readonly cfg: ProjectsConfig;
+  readonly taskSettings: TaskSettings;
+  /** The active tasks and turns, plus the plans reserved `starting` so far. */
+  reservedActiveCount: number;
 }
 
 interface MaterializedTaskLaunch {
@@ -7005,155 +7018,236 @@ export class TaskService implements AgentTaskIntegration {
       prepared.push(preparation.data);
     }
 
+    return await this.reserveUnderMutex(run, prepared);
+  }
+
+  /**
+   * The global mutex, held for the rest of the batch: the lock releases when this scope exits,
+   * after the launch leases.
+   */
+  private async reserveUnderMutex(
+    run: ReservationRun,
+    prepared: readonly PreparedTaskReservation[]
+  ): Promise<Result<TaskCreateResult[], string>> {
     // Stage: global mutex (cancellable acquisition; a late lock is released untouched).
-    progress.enter("mutex");
+    run.progress.enter("mutex");
     const acquisition = this.mutex.acquire();
-    const lockRace = await raceWithAbortAndTimeout(acquisition, { signal });
+    const lockRace = await raceWithAbortAndTimeout(acquisition, { signal: run.signal });
     if (lockRace.kind !== "ok") {
       void acquisition.then((lock) => lock[Symbol.asyncDispose]());
-      return interrupted();
+      return run.interrupted();
     }
     await using _lock = lockRace.value;
-    if (signal?.aborted) return interrupted();
+    if (run.signal?.aborted) return run.interrupted();
+    return await this.revalidateReservations(run, prepared);
+  }
 
+  /**
+   * Under the mutex: revalidates and reserves each prepared plan in order, then holds the launch
+   * leases. A refusal or an abort ends the batch before any id is owned.
+   */
+  private async revalidateReservations(
+    run: ReservationRun,
+    prepared: readonly PreparedTaskReservation[]
+  ): Promise<Result<TaskCreateResult[], string>> {
     // Stage: revalidate every prepared input against a fresh config, then decide capacity.
-    progress.enter("revalidate");
+    run.progress.enter("revalidate");
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
-    let reservedActiveCount =
+    const reservedActiveCount =
       this.countActiveAgentTasks(cfg) +
       (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
-    if (signal?.aborted) return interrupted();
+    if (run.signal?.aborted) return run.interrupted();
 
-    // sharedWorkspacePath is set for honored isolation: "none" plans; the entry is persisted
-    // pointing at the parent's checkout and startReservedAgentTask reuses it without fork/init.
-    const plans: Array<
-      TaskLaunchPlan & { status: "queued" | "starting"; sharedWorkspacePath?: string }
-    > = [];
-    const results: TaskCreateResult[] = [];
-
+    const revalidation: ReservationRevalidation = { cfg, taskSettings, reservedActiveCount };
+    const batch: ReservationBatch = { plans: [], results: [] };
     for (const plan of prepared) {
-      const inputsNow = this.snapshotReservationInputs(
-        cfg,
-        plan.args,
-        plan.parentWorkspaceId,
-        plan.configProjectPath,
-        plan.agentId
+      const reserved = await this.revalidateReservationParent(run, revalidation, batch, plan);
+      if (!reserved.success) return reserved;
+    }
+    return await this.holdReservationLaunchLeases(run, batch);
+  }
+
+  /**
+   * One plan's inputs and parent against the config read under the mutex, then its definition
+   * (revalidateReservationDefinition). A changed input refuses the batch; an abort interrupts it.
+   */
+  private async revalidateReservationParent(
+    run: ReservationRun,
+    revalidation: ReservationRevalidation,
+    batch: ReservationBatch,
+    plan: PreparedTaskReservation
+  ): Promise<Result<void, string>> {
+    const inputsNow = this.snapshotReservationInputs(
+      revalidation.cfg,
+      plan.args,
+      plan.parentWorkspaceId,
+      plan.configProjectPath,
+      plan.agentId
+    );
+    if (inputsNow !== plan.inputs) {
+      return Err(
+        "Task.createMany: reservation inputs changed during preparation (parent, trust or AI defaults); retry"
       );
-      if (inputsNow !== plan.inputs) {
-        return Err(
-          "Task.createMany: reservation inputs changed during preparation (parent, trust or AI defaults); retry"
-        );
-      }
-      // Parent identity as the metadata service resolves it (runtime config, name, projects).
-      // Read-only and cancellable under the mutex: no config-queue wait, and a held read releases
-      // the mutex on abort instead of stalling every other reservation.
-      const parentMetaNowRead = await this.readCancellable(
-        this.aiService.getWorkspaceMetadata(plan.parentWorkspaceId, { persistMigrations: false }),
-        signal
+    }
+    // Parent identity as the metadata service resolves it (runtime config, name, projects).
+    // Read-only and cancellable under the mutex: no config-queue wait, and a held read releases
+    // the mutex on abort instead of stalling every other reservation.
+    const parentMetaNowRead = await this.readCancellable(
+      this.aiService.getWorkspaceMetadata(plan.parentWorkspaceId, { persistMigrations: false }),
+      run.signal
+    );
+    if (parentMetaNowRead.kind !== "ok") return run.interrupted();
+    const parentMetaNow = parentMetaNowRead.value;
+    if (
+      !parentMetaNow.success ||
+      this.pinParentMetaForReservation(parentMetaNow.data) !== plan.parentMetaJson
+    ) {
+      return Err(
+        "Task.createMany: parent workspace changed during preparation (runtime, name or projects); retry"
       );
-      if (parentMetaNowRead.kind !== "ok") return interrupted();
-      const parentMetaNow = parentMetaNowRead.value;
-      if (
-        !parentMetaNow.success ||
-        this.pinParentMetaForReservation(parentMetaNow.data) !== plan.parentMetaJson
-      ) {
-        return Err(
-          "Task.createMany: parent workspace changed during preparation (runtime, name or projects); retry"
-        );
-      }
-      // The definition resolved before the mutex must still be the one that would run.
-      let definitionNow: { source?: string; frontmatter: unknown };
-      try {
-        const definitionNowRead = await this.readCancellable(
-          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
-            projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, parentMetaNow.data),
-            runtimeFactory: nodeRuntimeFactory,
-          }),
-          signal
-        );
-        if (definitionNowRead.kind !== "ok") return interrupted();
-        definitionNow = definitionNowRead.value;
-      } catch (error) {
-        return Err(
-          `Task.createMany: agent definition changed during preparation (${plan.agentId}): ${getErrorMessage(error)}; retry`
-        );
-      }
-      if (
-        definitionNow.source !== plan.definitionSource ||
-        JSON.stringify(definitionNow.frontmatter) !== plan.frontmatter
-      ) {
-        return Err(
-          `Task.createMany: agent definition changed during preparation (${plan.agentId}); retry`
-        );
-      }
-      if (signal?.aborted) return interrupted();
+    }
+    return await this.revalidateReservationDefinition(
+      run,
+      revalidation,
+      batch,
+      plan,
+      parentMetaNow.data
+    );
+  }
 
-      const taskId = this.config.generateStableId();
-      const workspaceName = buildAgentWorkspaceName(plan.agentId, taskId);
-      const nameValidation = validateWorkspaceName(workspaceName);
-      if (!nameValidation.valid) {
-        return Err(
-          `Task.createMany: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
-        );
-      }
+  /** One plan's agent definition, re-read under the mutex; then the plan is reserved. */
+  private async revalidateReservationDefinition(
+    run: ReservationRun,
+    revalidation: ReservationRevalidation,
+    batch: ReservationBatch,
+    plan: PreparedTaskReservation,
+    parentMetaNow: WorkspaceMetadata
+  ): Promise<Result<void, string>> {
+    // The definition resolved before the mutex must still be the one that would run.
+    let definitionNow: { source?: string; frontmatter: unknown };
+    try {
+      const definitionNowRead = await this.readCancellable(
+        resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
+          projectPluginsTrusted: isWorkspaceProjectTrustedIn(
+            revalidation.cfg.projects,
+            parentMetaNow
+          ),
+          runtimeFactory: nodeRuntimeFactory,
+        }),
+        run.signal
+      );
+      if (definitionNowRead.kind !== "ok") return run.interrupted();
+      definitionNow = definitionNowRead.value;
+    } catch (error) {
+      return Err(
+        `Task.createMany: agent definition changed during preparation (${plan.agentId}): ${getErrorMessage(error)}; retry`
+      );
+    }
+    if (
+      definitionNow.source !== plan.definitionSource ||
+      JSON.stringify(definitionNow.frontmatter) !== plan.frontmatter
+    ) {
+      return Err(
+        `Task.createMany: agent definition changed during preparation (${plan.agentId}); retry`
+      );
+    }
+    if (run.signal?.aborted) return run.interrupted();
+    return this.appendReservationPlan(run, revalidation, batch, plan);
+  }
 
-      const status: "queued" | "starting" =
-        reservedActiveCount >= taskSettings.maxParallelAgentTasks ? "queued" : "starting";
-      if (status === "starting") reservedActiveCount += 1;
-
-      const createdAt = getIsoNow();
-      plans.push({
-        taskId,
-        parentWorkspaceId: plan.parentWorkspaceId,
-        requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
-        legacyParentRow: this.legacyParentRowOf(cfg, plan.parentWorkspaceId),
-        parentMeta: plan.parentMeta,
-        agentId: plan.agentId,
-        agentType: plan.agentId,
-        start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
-        title: plan.args.title,
-        workspaceName,
-        createdAt,
-        taskRuntimeConfig: plan.taskRuntimeConfig,
-        parentRuntimeConfig: plan.parentRuntimeConfig,
-        configProjectPath: plan.configProjectPath,
-        workspaceKind: plan.parentIsScratch ? "scratch" : undefined,
-        taskModelString: plan.taskModelString,
-        canonicalModel: plan.canonicalModel,
-        effectiveThinkingLevel: plan.effectiveThinkingLevel,
-        effectiveReasoningMode: plan.effectiveReasoningMode,
-        taskAiPins: plan.taskAiPins,
-        skipInitHook: plan.skipInitHook,
-        workflowTask: plan.args.workflowTask,
-        bestOf: plan.normalizedBestOf,
-        onRefusal: plan.args.onRefusal,
-        attentionPolicy: plan.args.attentionPolicy,
-        taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
-        status,
-        ...(signal != null ? { abortSignal: signal } : {}),
-        ...(plan.sharedWorkspacePath != null
-          ? { sharedWorkspacePath: plan.sharedWorkspacePath }
-          : {}),
-        // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
-        // by orchestrateFork's create-fallback when the fork cannot detect a source branch
-        // (a shared parent's synthetic name, or an auto-named worktree parent's, names no
-        // branch). Only then: other parents keep the existing branch-discovery fallback.
-        ...(plan.parentBranchName != null && plan.parentBranchName !== plan.parentMeta.name
-          ? { preferredTrunkBranch: plan.parentBranchName }
-          : {}),
-      });
-      results.push({
-        taskId,
-        kind: "agent",
-        status,
-        modelString: plan.taskModelString,
-        thinkingLevel: plan.effectiveThinkingLevel,
-        desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
-      });
+  /**
+   * Mints the plan's task id and reserves it, `starting` while a parallel slot is free and
+   * `queued` otherwise, then appends its launch plan and the caller's result to the batch.
+   */
+  private appendReservationPlan(
+    run: ReservationRun,
+    revalidation: ReservationRevalidation,
+    batch: ReservationBatch,
+    plan: PreparedTaskReservation
+  ): Result<void, string> {
+    const taskId = this.config.generateStableId();
+    const workspaceName = buildAgentWorkspaceName(plan.agentId, taskId);
+    const nameValidation = validateWorkspaceName(workspaceName);
+    if (!nameValidation.valid) {
+      return Err(
+        `Task.createMany: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
+      );
     }
 
-    return await this.holdReservationLaunchLeases(run, { plans, results });
+    const status: "queued" | "starting" =
+      revalidation.reservedActiveCount >= revalidation.taskSettings.maxParallelAgentTasks
+        ? "queued"
+        : "starting";
+    if (status === "starting") revalidation.reservedActiveCount += 1;
+
+    batch.plans.push(
+      this.buildReservationLaunchPlan(
+        revalidation.cfg,
+        plan,
+        { taskId, workspaceName, status },
+        run.signal
+      )
+    );
+    batch.results.push({
+      taskId,
+      kind: "agent",
+      status,
+      modelString: plan.taskModelString,
+      thinkingLevel: plan.effectiveThinkingLevel,
+      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
+    });
+    return Ok(undefined);
+  }
+
+  /** A reserved plan's launch plan: its preparation, the config read under the mutex, its id. */
+  private buildReservationLaunchPlan(
+    cfg: ProjectsConfig,
+    plan: PreparedTaskReservation,
+    reserved: Pick<ReservationLaunchPlan, "taskId" | "workspaceName" | "status">,
+    signal: AbortSignal | undefined
+  ): ReservationLaunchPlan {
+    const createdAt = getIsoNow();
+    return {
+      taskId: reserved.taskId,
+      parentWorkspaceId: plan.parentWorkspaceId,
+      requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
+      legacyParentRow: this.legacyParentRowOf(cfg, plan.parentWorkspaceId),
+      parentMeta: plan.parentMeta,
+      agentId: plan.agentId,
+      agentType: plan.agentId,
+      start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
+      title: plan.args.title,
+      workspaceName: reserved.workspaceName,
+      createdAt,
+      taskRuntimeConfig: plan.taskRuntimeConfig,
+      parentRuntimeConfig: plan.parentRuntimeConfig,
+      configProjectPath: plan.configProjectPath,
+      workspaceKind: plan.parentIsScratch ? "scratch" : undefined,
+      taskModelString: plan.taskModelString,
+      canonicalModel: plan.canonicalModel,
+      effectiveThinkingLevel: plan.effectiveThinkingLevel,
+      effectiveReasoningMode: plan.effectiveReasoningMode,
+      taskAiPins: plan.taskAiPins,
+      skipInitHook: plan.skipInitHook,
+      workflowTask: plan.args.workflowTask,
+      bestOf: plan.normalizedBestOf,
+      onRefusal: plan.args.onRefusal,
+      attentionPolicy: plan.args.attentionPolicy,
+      taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+      status: reserved.status,
+      ...(signal != null ? { abortSignal: signal } : {}),
+      ...(plan.sharedWorkspacePath != null
+        ? { sharedWorkspacePath: plan.sharedWorkspacePath }
+        : {}),
+      // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
+      // by orchestrateFork's create-fallback when the fork cannot detect a source branch
+      // (a shared parent's synthetic name, or an auto-named worktree parent's, names no
+      // branch). Only then: other parents keep the existing branch-discovery fallback.
+      ...(plan.parentBranchName != null && plan.parentBranchName !== plan.parentMeta.name
+        ? { preferredTrunkBranch: plan.parentBranchName }
+        : {}),
+    };
   }
 
   /**
