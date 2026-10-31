@@ -1664,3 +1664,278 @@ export const AddPluginMarketplacePhoneViewport: Story = {
     }
   },
 };
+
+const CURSOR_PLUGINS_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/cursor/plugins.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+/**
+ * cursor/plugins ships both marketplace files: a name in both is one row with a Cursor build and
+ * a Claude build, a name in one file has one build.
+ */
+const CURSOR_MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
+  name: "cursor-plugins",
+  description: "Plugins for Cursor",
+  owner: "Cursor",
+  source: CURSOR_PLUGINS_SOURCE,
+  lockedSha: "5e1f0c2d3b4a59687766554433221100ffeeddcc",
+  entries: [
+    {
+      name: "pstack",
+      description: "Poteto's agent style: plan, build, verify",
+      builds: [
+        {
+          file: "cursor",
+          sourceKind: "relative",
+          source: "pstack",
+          skillCount: 31,
+          installable: true,
+        },
+        {
+          file: "claude",
+          sourceKind: "relative",
+          source: "./harness/pstack/claude-code",
+          skillCount: 30,
+          installable: true,
+        },
+      ],
+    },
+    {
+      name: "cursor-team-kit",
+      description: "Skills and rules the Cursor team uses",
+      builds: [
+        {
+          file: "cursor",
+          sourceKind: "relative",
+          source: "cursor-team-kit",
+          skillCount: 12,
+          installable: true,
+        },
+      ],
+    },
+    {
+      name: "origin-apps",
+      description: "Apps for Origin",
+      builds: [
+        { file: "cursor", ...NPM_BUILD },
+        { file: "claude", sourceKind: "relative", source: "./origin-apps", installable: true },
+      ],
+    },
+  ],
+  methods: [],
+  warnings: [],
+};
+
+/** The pstack entry previewed from one marketplace file: the badge names its install method. */
+const pstackBuildPreview = (
+  method: AgentPluginInstallPreview["method"],
+  description: string
+): AgentPluginInstallPreview => ({
+  ...SKILLS_PREVIEW,
+  source: { ...CURSOR_PLUGINS_SOURCE, subpath: "pstack" },
+  method,
+  methods: [method],
+  skillsCliSkills: [],
+  manifest: { name: "pstack", description },
+  targetPath: "~/.mux/plugins/pstack",
+});
+
+function cursorMarketplaceOptions(): MockORPCClientOptions {
+  return {
+    agentPlugins: {
+      items: [],
+      marketplace: CURSOR_MARKETPLACE_LISTING,
+      // The mock answers a cursor-marketplace selector by its kind, a Claude entry by its name.
+      previewsByMethod: {
+        "cursor-marketplace": pstackBuildPreview({ kind: "cursor-plugin" }, "pstack, Cursor build"),
+      },
+      previewsByEntry: {
+        pstack: pstackBuildPreview({ kind: "claude-plugin" }, "pstack, Claude build"),
+      },
+    },
+  };
+}
+
+async function openCursorMarketplace(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "cursor/plugins");
+  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+  await canvas.findByRole("group", { name: "Pick one plugin to install" });
+  return canvas;
+}
+
+/**
+ * A repository with both marketplace files (cursor/plugins). pstack is in both: its row has a
+ * Preview action per build, and each previews its own build. origin-apps' Cursor build is an npm
+ * package, so only its Claude build previews.
+ */
+export const AddPluginCursorMarketplace: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={cursorMarketplaceOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openCursorMarketplace(canvasElement);
+    await canvas.findByText(/Cursor and Claude Code marketplaces · 3 plugins/);
+    await expect(canvas.getByRole("radio", { name: /pstack/ })).toBeChecked();
+    await expect(canvas.queryByRole("button", { name: "Preview pstack" })).toBeNull();
+
+    await userEvent.click(canvas.getByRole("button", { name: "Preview Cursor build" }));
+    await canvas.findByText("pstack, Cursor build");
+    await expect(canvas.getByText("Cursor plugin", { selector: "span" })).toBeVisible();
+    await userEvent.click(canvas.getByRole("button", { name: /Back/ }));
+    await expect(await canvas.findByRole("radio", { name: /pstack/ })).toBeChecked();
+
+    await userEvent.click(canvas.getByRole("button", { name: "Preview Claude build" }));
+    await canvas.findByText("pstack, Claude build");
+    await expect(canvas.getByText("Claude Code plugin", { selector: "span" })).toBeVisible();
+    await userEvent.click(canvas.getByRole("button", { name: /Back/ }));
+
+    await userEvent.click(await canvas.findByRole("radio", { name: /origin-apps/ }));
+    await expect(canvas.getByRole("button", { name: "Preview Cursor build" })).toBeDisabled();
+    await expect(canvas.getByRole("button", { name: "Preview Claude build" })).toBeEnabled();
+    await canvas.findByText(/does not install npm packages/);
+
+    await userEvent.click(canvas.getByRole("radio", { name: /cursor-team-kit/ }));
+    await expect(canvas.getByRole("button", { name: "Preview cursor-team-kit" })).toBeEnabled();
+  },
+};
+
+/** The merged list at phone width: each build's line wraps and nothing overflows the card. */
+export const AddPluginCursorMarketplacePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={cursorMarketplaceOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openCursorMarketplace(canvasElement);
+    await canvas.findByRole("button", { name: "Preview Claude build" });
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The merged marketplace list overflows the card at phone width");
+    }
+  },
+};
+
+const LONG_FIELD_NAME = "skills: ./averylongskillfolderpathwithoutanybreakpointsthatmustwrap/*";
+
+/**
+ * A Cursor plugin like cursor-team-kit: its rules become skills labeled by how each rule loads in
+ * Xum, its readonly agent keeps the shell, and the parts Xum does not apply are listed.
+ */
+const CURSOR_KIT_PREVIEW: AgentPluginInstallPreview = {
+  ...SKILLS_PREVIEW,
+  source: { ...CURSOR_PLUGINS_SOURCE, subpath: "cursor-team-kit" },
+  method: { kind: "cursor-plugin" },
+  methods: [{ kind: "cursor-plugin" }],
+  skillsCliSkills: [],
+  manifest: { name: "cursor-team-kit", description: "Skills and rules the Cursor team uses" },
+  skills: [
+    { name: "alpha", description: "Plans a change before it is written" },
+    { name: "imports", description: "Keep imports at the top.", ruleType: "always-apply" },
+    { name: "exhaustive", description: "Use exhaustive switches.", ruleType: "glob" },
+    { name: "naming", description: "How to name things.", ruleType: "description" },
+    { name: "release", description: "Release steps.", ruleType: "manual" },
+  ],
+  agents: ["ci-watcher.md", "reviewer.md"],
+  readonlyAgents: ["reviewer.md"],
+  notApplied: [
+    { part: "field", name: "variables", reason: "not applied in Xum" },
+    { part: "hook", name: "hooks", reason: "Cursor hooks run in a later Xum build" },
+    { part: "field", name: LONG_FIELD_NAME, reason: "only folder paths are applied in Xum" },
+  ],
+  targetPath: "~/.mux/plugins/cursor-team-kit",
+};
+
+const CURSOR_KIT_OPTIONS: MockORPCClientOptions = {
+  agentPlugins: { items: [], preview: CURSOR_KIT_PREVIEW },
+};
+
+async function openCursorKitReview(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+  await userEvent.type(
+    await canvas.findByLabelText(/Git URL or owner\/repo/),
+    "cursor/plugins/cursor-team-kit"
+  );
+  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+  await canvas.findByText("Not applied in Xum (3)");
+  return canvas;
+}
+
+/** The install review of a Cursor plugin: rule labels, the readonly agent and the not-applied list. */
+export const AddPluginCursorReview: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={CURSOR_KIT_OPTIONS}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openCursorKitReview(canvasElement);
+    await canvas.findByText(/always-apply rule, loaded on request in Xum/);
+    await canvas.findByText(/glob rule, not attached by file in Xum/);
+    await canvas.findByText("— rule");
+    await canvas.findByText(/manual rule/);
+    // The plain skill gets no rule label.
+    const alpha = canvas.getByText("alpha");
+    await expect(alpha.parentElement?.textContent).toBe("alphaPlans a change before it is written");
+
+    const readonly = canvas.getAllByText(/edit tools removed, shell still available/);
+    await expect(readonly).toHaveLength(1);
+    await expect(readonly[0].previousElementSibling?.textContent).toBe("reviewer.md");
+
+    await expect(canvas.getByText(/later Xum build/).closest("li")?.textContent).toBe(
+      "hook hooks: Cursor hooks run in a later Xum build"
+    );
+  },
+};
+
+/** The Cursor plugin review at phone width: a long not-applied name wraps inside the card. */
+export const AddPluginCursorReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={CURSOR_KIT_OPTIONS}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openCursorKitReview(canvasElement);
+    const row = canvas.getByText(LONG_FIELD_NAME).closest("li");
+    const card = row?.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Consent preview card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The not-applied list overflows the card at phone width");
+    }
+  },
+};
