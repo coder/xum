@@ -509,6 +509,41 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     expect(h.turns).toEqual([]);
   });
 
+  test("an empty pre-turn list appends no rows and reactivates", async () => {
+    const h = await setup();
+    expect(await h.send({ preTurnMessages: [] })).toMatchObject(Ok({ delivery: "reactivated" }));
+    expect(h.trace).toEqual([...OPEN, "unarchive", ...COMMIT, ...OWN_AND_TURN, ...CLOSE]);
+    expect(await collectFullHistory(h.historyService, CHILD)).toEqual([]);
+  });
+
+  test("nothing after the goal pause runs until the pause settles", async () => {
+    const h = await setup();
+    // Holds the goal pause open; the harness's own tap (the "goal-pause" label) runs after it.
+    const svc = h.taskService as unknown as {
+      settleChildGoalPause: (...args: unknown[]) => unknown;
+    };
+    const pause = svc.settleChildGoalPause.bind(h.taskService);
+    const reached = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    svc.settleChildGoalPause = async (...args) => {
+      reached.resolve();
+      await release.promise;
+      return pause(...args);
+    };
+    const sending = h.send();
+    let whilePaused: string[] = [];
+    try {
+      await reached.promise;
+      whilePaused = [...h.trace];
+    } finally {
+      release.resolve();
+    }
+    expect(await sending).toMatchObject(Ok({ delivery: "reactivated" }));
+    // No lineage, mutex or CAS while the pause was pending.
+    expect(whilePaused).toEqual([...OPEN, "unarchive"]);
+    expect(h.trace).toEqual([...OPEN, "unarchive", ...COMMIT, ...OWN_AND_TURN, ...CLOSE]);
+  });
+
   test("a row rotated by another backend after the CAS is neither published nor owned", async () => {
     const h = await setup();
     let committed: string | undefined;
@@ -522,6 +557,18 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     expect([PRIOR, OTHER]).not.toContain(committed);
     expect(h.trace).toEqual(REFUSED_AT_CAS);
     expect(h.row()?.taskAttemptId).toBe(OTHER);
+    expect(h.ledger.ownedAttempt(CHILD)).toBe(undefined);
+    expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(undefined);
+    expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
+    expect(h.turns).toEqual([]);
+  });
+
+  test("a row removed by another backend after the CAS is neither published nor owned", async () => {
+    const h = await setup();
+    h.hooks.afterCas = () => dropRow(h.config);
+    expect(await h.send()).toStrictEqual(Err({ code: "send_failed", message: PROSE }));
+    expect(h.trace).toEqual(REFUSED_AT_CAS);
+    expect(h.row()).toBe(undefined);
     expect(h.ledger.ownedAttempt(CHILD)).toBe(undefined);
     expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(undefined);
     expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
