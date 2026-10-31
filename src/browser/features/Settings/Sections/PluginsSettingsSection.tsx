@@ -35,6 +35,7 @@ import type {
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
   consumePendingPluginsSectionIntent,
@@ -42,8 +43,10 @@ import {
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
 import {
+  CURSOR_HOOK_REMOTE_NOTE,
   describePluginHookHandler,
-  PLUGIN_HOOK_STATUS_NOTE,
+  hookStatusNote,
+  isCursorHookHandler,
   PluginHooksPanel,
   cutReviewText,
   kilobytes,
@@ -922,20 +925,26 @@ const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHo
         </h4>
         <p className="text-muted mb-1 text-xs">{hooksRunNote(props.hooks)}</p>
         <ul className="space-y-1">
-          {props.hooks.map((hook) => (
-            <li key={hook.key} className="text-xs break-all">
-              <span className="text-foreground font-mono">{hook.event}</span>
-              {hook.matcher !== undefined && (
-                <span className="text-muted font-mono"> ({hook.matcher})</span>
-              )}
-              <span className="text-muted">
-                {" "}
-                — {describePluginHookHandler(hook.handler)}
-                {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
-                  `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
-              </span>
-            </li>
-          ))}
+          {props.hooks.map((hook) => {
+            const note = hookStatusNote(hook);
+            return (
+              <li key={hook.key} className="text-xs break-all">
+                <span className="text-foreground font-mono">{showOneLineControls(hook.event)}</span>
+                {hook.matcher !== undefined && (
+                  <span className="text-muted font-mono">
+                    {" "}
+                    ({showOneLineControls(hook.matcher)})
+                  </span>
+                )}
+                <span className="text-muted">
+                  {" "}
+                  — {describePluginHookHandler(hook.handler)}
+                  {note !== null && `. ${note}`}
+                  {isCursorHookHandler(hook.handler) && ` ${CURSOR_HOOK_REMOTE_NOTE}`}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     )}

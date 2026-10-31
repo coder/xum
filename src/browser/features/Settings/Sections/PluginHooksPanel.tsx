@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
-import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
+import { cursorHookNotAppliedReason, effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import type {
   AgentPluginHook,
   AgentPluginHooks,
@@ -10,12 +10,13 @@ import type {
   PluginHookReviewState,
   PluginHookStatus,
 } from "@/common/orpc/schemas/agentPlugins";
+import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /** One-line handler summary, shared by the consent preview and the review panel. */
 export function describePluginHookHandler(handler: PluginHookHandler): string {
   if (handler.type === "cursor-command") {
-    return `command ${handler.command}, ${describeHookTimeout(handler.timeoutSeconds)}`;
+    return `command ${showOneLineControls(handler.command)}, ${describeHookTimeout(handler.timeoutSeconds)}`;
   }
   if (handler.type === "cursor-prompt") return "prompt hook";
   if (handler.type !== "mcp_tool") return `${handler.type}: ${handler.summary}`;
@@ -87,13 +88,58 @@ export function kilobytes(text: string): number {
   return Math.ceil(text.length / 1024);
 }
 
-/** Why a hook can never run; null for a runnable hook. */
-export const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = {
+/** Why a Codex or Claude Code hook can never run; null for a runnable hook. */
+const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = {
   runnable: null,
   "unsupported-handler": "Never runs: Xum runs only mcp_tool hooks.",
   "ignored-event": "Never runs: Xum does not use this event.",
   "claude-plugin": "Never runs: Xum does not run Claude Code plugin hooks.",
 };
+
+type CursorHookHandler = Extract<PluginHookHandler, { type: "cursor-command" | "cursor-prompt" }>;
+
+export function isCursorHookHandler(handler: PluginHookHandler): handler is CursorHookHandler {
+  return handler.type === "cursor-command" || handler.type === "cursor-prompt";
+}
+
+/** Cursor plugin RFC 5.6: Cursor hooks run only in local and worktree workspaces. */
+export const CURSOR_HOOK_REMOTE_NOTE =
+  "Does not run in remote workspaces (SSH, Docker and devcontainer).";
+
+/**
+ * Why a hook can never run; null for a runnable hook. A Cursor hook names its own reason: the
+ * shared note describes Codex handlers and events ("Xum runs only mcp_tool hooks" is false for a
+ * Cursor command hook). Both keep the "Never runs" lead that the install preview's note names.
+ */
+export function hookStatusNote(
+  hook: Pick<AgentPluginHook, "event" | "matcher" | "handler" | "status">
+): string | null {
+  if (!isCursorHookHandler(hook.handler)) return PLUGIN_HOOK_STATUS_NOTE[hook.status];
+  const reason = cursorHookNotAppliedReason(hook);
+  return reason === undefined ? null : `Never runs: ${reason}.`;
+}
+
+/** Hook text the review shows; `full` is set only when `shown` is cut and must be expanded before Trust. */
+interface PluginHookReviewDetail extends PluginHookInputView {
+  noun: "input" | "entry";
+}
+
+/**
+ * The hashed part of a hook that its one-line summary leaves out: an mcp_tool input, or a Cursor
+ * entry exactly as declared (unknown fields and clamped values included, RFC 5.1), so two entries
+ * with different hashes never look the same. Controls are marked before the cut, so the shown
+ * text stays bounded.
+ */
+export function hookReviewDetail(handler: PluginHookHandler): PluginHookReviewDetail | null {
+  if (handler.type === "mcp_tool") {
+    if (Object.keys(handler.input).length === 0) return null;
+    return { noun: "input", ...formatPluginHookInput(handler.input) };
+  }
+  if (!isCursorHookHandler(handler)) return null;
+  const declared = showInvisibleControls(handler.declared);
+  const view = cutReviewText(declared);
+  return { noun: "entry", shown: view.shown, full: view.cut ? declared : null };
+}
 
 const REVIEW_LABEL: Record<PluginHookReviewState, { text: string; className: string }> = {
   trusted: { text: "trusted", className: "text-accent-text" },
@@ -198,30 +244,33 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
         <ul className="space-y-2">
           {data.hooks.map((hook) => {
             const label = REVIEW_LABEL[hook.review];
-            const note = PLUGIN_HOOK_STATUS_NOTE[hook.status];
+            const note = hookStatusNote(hook);
             const summary = describePluginHookHandler(hook.handler);
-            const input = hook.handler.type === "mcp_tool" ? hook.handler.input : {};
-            const inputView = formatPluginHookInput(input);
+            const detail = hookReviewDetail(hook.handler);
             const expandKey = `${hook.key}\0${hook.hash}`;
             const expanded = expandedInputs.has(expandKey);
             // Trust covers the full definition: it waits until the user can have read all of it.
-            const mustExpand = inputView.full !== null && !expanded;
+            const mustExpand = detail !== null && detail.full !== null && !expanded;
             return (
               <li
                 key={hook.key}
                 className="border-border-light space-y-1 rounded border p-2 text-xs"
               >
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="text-foreground font-mono">{hook.event}</span>
+                  <span className="text-foreground font-mono break-all">
+                    {showOneLineControls(hook.event)}
+                  </span>
                   {hook.matcher !== undefined && (
-                    <span className="text-muted font-mono break-all">matcher {hook.matcher}</span>
+                    <span className="text-muted font-mono break-all">
+                      matcher {showOneLineControls(hook.matcher)}
+                    </span>
                   )}
                   {note === null && <span className={label.className}>{label.text}</span>}
                 </div>
                 <p className="text-foreground font-mono break-all">{summary}</p>
-                {Object.keys(input).length > 0 && (
+                {detail !== null && (
                   <pre className="text-muted bg-background rounded p-1 font-mono break-all whitespace-pre-wrap">
-                    {expanded && inputView.full !== null ? inputView.full : inputView.shown}
+                    {expanded && detail.full !== null ? detail.full : detail.shown}
                   </pre>
                 )}
                 {mustExpand && (
@@ -233,10 +282,13 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                       setExpandedInputs((previous) => new Set(previous).add(expandKey))
                     }
                   >
-                    Show full input ({kilobytes(inputView.full ?? "")} KB)
+                    Show full {detail.noun} ({kilobytes(detail.full ?? "")} KB)
                   </Button>
                 )}
                 <p className="text-muted break-all">{hook.source}</p>
+                {isCursorHookHandler(hook.handler) && (
+                  <p className="text-muted">{CURSOR_HOOK_REMOTE_NOTE}</p>
+                )}
                 {note !== null ? (
                   <p className="text-muted">{note}</p>
                 ) : (
@@ -249,7 +301,12 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                     )}
                     {mustExpand && hook.review !== "trusted" && (
                       <p className="text-muted">
-                        Show the full input to review it before trusting.
+                        Show the full {detail.noun} to review it before trusting.
+                      </p>
+                    )}
+                    {hook.handler.type === "cursor-command" && hook.review !== "trusted" && (
+                      <p className="text-muted">
+                        Once trusted, this hook runs a command in your workspace.
                       </p>
                     )}
                     <div className="flex flex-wrap gap-2">

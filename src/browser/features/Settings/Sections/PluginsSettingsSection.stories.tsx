@@ -840,6 +840,102 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
   },
 };
 
+/** Cursor hooks in the ralph-loop shape: two runnable command hooks and one Xum never runs. */
+const cursorHooksOptions = (): MockORPCClientOptions => {
+  const hook = (
+    event: string,
+    entry: Record<string, unknown>,
+    status: AgentPluginHooks["hooks"][number]["status"]
+  ): AgentPluginHooks["hooks"][number] => ({
+    key: `cursor:hooks/hooks.json#${event}[0]`,
+    hash: event.padEnd(64, "0"),
+    event,
+    ...(typeof entry.matcher === "string" ? { matcher: entry.matcher } : {}),
+    handler: {
+      type: "cursor-command",
+      command: String(entry.command),
+      ...(typeof entry.loop_limit === "number"
+        ? { loopLimit: Math.min(entry.loop_limit, 50) }
+        : {}),
+      declared: JSON.stringify(entry),
+    },
+    status,
+    source: "hooks/hooks.json",
+    review: "new",
+  });
+  return {
+    agentPlugins: {
+      items: [MANAGED_ITEM],
+      hooks: {
+        grill: {
+          hooks: [
+            hook("stop", { command: "./hooks/stop-hook.sh", loop_limit: 80 }, "runnable"),
+            hook("afterAgentResponse", { command: "./hooks/capture-response.sh" }, "runnable"),
+            hook(
+              "subagentStop",
+              { command: "./hooks/subagent-stop.sh", matcher: "^ralph-.*$" },
+              "ignored-event"
+            ),
+          ],
+          warnings: [],
+        },
+      },
+    },
+  };
+};
+
+/** Cursor hooks review: each entry as declared, its Cursor reason, and the remote-workspace note. */
+export const CursorHooksReview: Story = {
+  // Out of Pixel snapshots, like HooksReview (snapshot budget).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={cursorHooksOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openHooksReview(canvasElement);
+    // The declared loop_limit shows as declared, though the runner clamps it to 50.
+    await canvas.findByText('{"command":"./hooks/stop-hook.sh","loop_limit":80}');
+    await canvas.findByText(/Never runs: event not applied in Xum/);
+    if (canvas.queryByText(/Xum runs only mcp_tool hooks/) !== null) {
+      throw new Error("A Cursor hook shows the Codex status note");
+    }
+    const trust = await canvas.findAllByRole("button", { name: /^Trust / });
+    if (trust.length !== 2) throw new Error(`Expected two Trust buttons, got ${trust.length}`);
+    const remote = await canvas.findAllByText(/does not run in remote workspaces/i);
+    if (remote.length !== 3) throw new Error(`Expected three remote notes, got ${remote.length}`);
+  },
+};
+
+/** Phone width (390 px): declared entries and the trust notes must wrap inside the card. */
+export const CursorHooksReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    // Out of Pixel snapshots, like HooksReview (snapshot budget).
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={cursorHooksOptions()}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openHooksReview(canvasElement);
+    const panel = (await canvas.findByText(/A hook runs only after you trust it/)).parentElement;
+    if (panel instanceof HTMLElement && panel.scrollWidth > panel.clientWidth + 1) {
+      throw new Error("Hook review panel overflows at phone width");
+    }
+  },
+};
+
 /** 48x48 dark disc: the light-theme logo, unreadable on a dark background. */
 const DARK_DISC_LOGO =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAh0lEQVR42u3ZwQ3AIAwEQcpASv91XkqIFLA5m31sAfNC+Macz6jcAADAD6CP7ABa7BhAm0sFKKhwgJIKASi5rQAdagtAh7sbIJN+AWTWXQCZBgBABkDmAQAAAACAWAAvMQAA/Mg8AOU/9dyFXADlT4stjrstzustBo42E1OLka/NzMpSD6ByL24kjnoh5of0AAAAAElFTkSuQmCC";
