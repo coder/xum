@@ -20,6 +20,7 @@ import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 async function writePlugin(
   containerPath: string,
@@ -2451,6 +2452,25 @@ describe("Cursor plugin discovery", () => {
     expect(messages).toContain("Rule 'x.md' has invalid frontmatter; ignoring it");
     expect(plugin.notApplied).toEqual([
       { part: "rule", name: "x.md", reason: "invalid frontmatter" },
+    ]);
+  });
+
+  test("rules refused at conversion are listed with their own reasons", async () => {
+    // Forty aliases of one anchor in `globs` grow the rewritten frontmatter past the file's own
+    // size, so a file just under the SKILL.md cap is over it once rewritten.
+    const frontmatter = `---\nx: &x "${"a".repeat(200)}"\nglobs: [${Array(40).fill("*x").join(", ")}]\n---\n`;
+    const overCap = `${frontmatter}${"p".repeat(MAX_FILE_SIZE - 100 - frontmatter.length)}`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/broken.mdc": "---\n: [\n---\nBroken\n",
+      "rules/huge.mdc": overCap,
+      "rules/ok.mdc": rule("Valid"),
+    });
+    const { plugin } = kit;
+    expect(ruleSkills(plugin)).toEqual([["ok", "ok.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "broken.mdc", reason: "invalid frontmatter" },
+      { part: "rule", name: "huge.mdc", reason: "too large once rewritten as a skill" },
     ]);
   });
 
