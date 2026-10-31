@@ -1889,6 +1889,15 @@ interface DeferredDescendantMessage {
 /** A trusted descendant message as dispatched: the deferred record before its archive snapshot. */
 type DescendantMessageDeferral = Omit<DeferredDescendantMessage, "archivedAtSend">;
 
+/** The target of a trusted descendant message as classified under the task locks. */
+interface TrustedMessageTarget {
+  readonly entry: { projectPath: string; workspace: WorkspaceConfigEntry };
+  /** The row's task execution is an active workspace turn: its live stream takes guidance. */
+  readonly continuationActive: boolean;
+  /** No active continuation, and the row is reported, interrupted or archived. */
+  readonly inactive: boolean;
+}
+
 function resolveDescendantMessageStopFence(
   options: TrustedDescendantMessageOptions | undefined,
   captured: ReadonlyMap<string, number>
@@ -10485,68 +10494,120 @@ export class TaskService implements AgentTaskIntegration {
     // with the original brief, whoever the sender is.
     const labeledMessage = renderLabeledTaskMessage(messageLabel, trimmedMessage);
 
-    const queuedUpdateResult = await (async (): Promise<
-      Result<SendAgentTaskMessageResult | null, SendAgentTaskMessageError>
-    > => {
-      // The scheduler snapshots taskPrompt and flips queued -> starting under this mutex. Use the
-      // same lock so a correction is either included in that snapshot or observes starting and is
-      // rejected; it can never be persisted after the scheduler already captured a stale prompt.
-      await using _lock = await this.mutex.acquire();
-      const cfg = this.config.loadConfigOrDefault();
-      const entry = findWorkspaceEntry(cfg, taskId);
-      if (!entry) {
-        return Err({ code: "not_found" as const });
-      }
-      const taskIndex = this.buildAgentTaskIndex(cfg);
-      if (
-        !this.isDescendantAgentTaskUsingParentById(
-          taskIndex.parentById,
-          ancestorWorkspaceId,
-          taskId
-        )
-      ) {
-        return Err({ code: "invalid_scope" as const });
-      }
-      if (entry.workspace.taskStatus !== "queued") {
-        return Ok(null);
-      }
-      if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
-        return Ok(null);
-      }
-
-      const initialPrompt = coerceNonEmptyString(entry.workspace.taskPrompt);
-      if (!initialPrompt) {
-        return Err({
-          code: "send_failed" as const,
-          message: "Queued task has no durable prompt to update.",
-        });
-      }
-      // While the entry is still queued under the scheduler mutex, no prompt
-      // send can be mid-admission (the scheduler flips queued -> starting
-      // under this same mutex before sending), so a direct durable append
-      // cannot land inside a PREPARING window; the rows precede the future
-      // prompt row. Persisted before the splice: a splice failure leaves an
-      // untriggered untrusted-labeled row behind.
-      if (options?.preTurnMessages != null && options.preTurnMessages.length > 0) {
-        const appendOutcome = await this.appendFamilyPayloadRows(taskId, options.preTurnMessages);
-        if (!appendOutcome.success) {
-          return appendOutcome;
-        }
-      }
-      await this.editWorkspaceEntry(taskId, (workspace) => {
-        workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
-        // No send carried this prompt; its launch mints its own id.
-        workspace.taskPromptSendId = undefined;
-      });
-      return Ok({ delivery: "queued" as const });
-    })();
+    const queuedUpdateResult = await this.updateQueuedTaskPrompt(deferral, labeledMessage);
     if (!queuedUpdateResult.success) {
       return queuedUpdateResult;
     }
     if (queuedUpdateResult.data != null) {
       return Ok(queuedUpdateResult.data);
     }
+    return await this.dispatchTrustedMessageUnderTaskLocks(deferral, labeledMessage);
+  }
 
+  /**
+   * A queued target: append the pre-turn rows, then splice the message into its durable prompt.
+   * Ok(null) when the target is not queued or is archived: the caller takes the locked path.
+   */
+  private async updateQueuedTaskPrompt(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string
+  ): Promise<Result<SendAgentTaskMessageResult | null, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId, options } = deferral;
+    // The scheduler snapshots taskPrompt and flips queued -> starting under this mutex. Use the
+    // same lock so a correction is either included in that snapshot or observes starting and is
+    // rejected; it can never be persisted after the scheduler already captured a stale prompt.
+    await using _lock = await this.mutex.acquire();
+    const target = this.readQueuedPromptTarget(ancestorWorkspaceId, taskId);
+    if (target.kind === "done") {
+      return target.result;
+    }
+    const { initialPrompt } = target;
+    // While the entry is still queued under the scheduler mutex, no prompt
+    // send can be mid-admission (the scheduler flips queued -> starting
+    // under this same mutex before sending), so a direct durable append
+    // cannot land inside a PREPARING window; the rows precede the future
+    // prompt row. Persisted before the splice: a splice failure leaves an
+    // untriggered untrusted-labeled row behind.
+    if (options?.preTurnMessages != null && options.preTurnMessages.length > 0) {
+      const appendOutcome = await this.appendFamilyPayloadRows(taskId, options.preTurnMessages);
+      if (!appendOutcome.success) {
+        return appendOutcome;
+      }
+    }
+    await this.editWorkspaceEntry(taskId, (workspace) => {
+      workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
+      // No send carried this prompt; its launch mints its own id.
+      workspace.taskPromptSendId = undefined;
+    });
+    return Ok({ delivery: "queued" as const });
+  }
+
+  /**
+   * The queued path's checks under the scheduler mutex: done (a refusal, or Ok(null) for a target
+   * that is not queued or is archived), or the durable prompt to update.
+   */
+  private readQueuedPromptTarget(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ):
+    | { kind: "done"; result: Result<null, SendAgentTaskMessageError> }
+    | { kind: "queued"; initialPrompt: string } {
+    const read = this.readDescendantTaskEntry(ancestorWorkspaceId, taskId);
+    if (!read.success) {
+      return { kind: "done", result: read };
+    }
+    const entry = read.data;
+    if (entry.workspace.taskStatus !== "queued") {
+      return { kind: "done", result: Ok(null) };
+    }
+    if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+      return { kind: "done", result: Ok(null) };
+    }
+
+    const initialPrompt = coerceNonEmptyString(entry.workspace.taskPrompt);
+    if (!initialPrompt) {
+      return {
+        kind: "done",
+        result: Err({
+          code: "send_failed" as const,
+          message: "Queued task has no durable prompt to update.",
+        }),
+      };
+    }
+    return { kind: "queued", initialPrompt };
+  }
+
+  /** The target's row, or the refusal when it is gone or outside the sender's subtree. */
+  private readDescendantTaskEntry(
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): Result<
+    { projectPath: string; workspace: WorkspaceConfigEntry },
+    { code: "not_found" } | { code: "invalid_scope" }
+  > {
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, taskId);
+    if (!entry) {
+      return Err({ code: "not_found" as const });
+    }
+    const taskIndex = this.buildAgentTaskIndex(cfg);
+    if (
+      !this.isDescendantAgentTaskUsingParentById(taskIndex.parentById, ancestorWorkspaceId, taskId)
+    ) {
+      return Err({ code: "invalid_scope" as const });
+    }
+    return Ok(entry);
+  }
+
+  /**
+   * Read the child's definition layers (ancestor sends only), then dispatch under the target's
+   * event lock and its task-tree lock.
+   */
+  private async dispatchTrustedMessageUnderTaskLocks(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { taskId, sender } = deferral;
     // Definition I/O never runs under the event or tree lifecycle lock: read the child's
     // definition layers first (inactive candidates only), then plan under the locks.
     let preparedReawakenAi: PreparedReawakenAi | undefined;
@@ -10564,68 +10625,105 @@ export class TaskService implements AgentTaskIntegration {
 
     // Event lock first, then the task-tree lock: the order every path holding both follows (see
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
-    return this.workspaceEventLocks.withLock(taskId, async () =>
-      this.withTaskTreeLifecycleLock(taskId, async () => {
-        // A brief history already holds is not prepended again on reawakening; the
-        // reactivation reads the kept brief from the row after this. Awaited before the row read
-        // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
-        await this.dropKeptTaskPromptAlreadyInHistory(taskId);
-        const cfg = this.config.loadConfigOrDefault();
-        const entry = findWorkspaceEntry(cfg, taskId);
-        if (!entry) {
-          return Err({ code: "not_found" as const });
-        }
-        const taskIndex = this.buildAgentTaskIndex(cfg);
-        if (
-          !this.isDescendantAgentTaskUsingParentById(
-            taskIndex.parentById,
-            ancestorWorkspaceId,
-            taskId
-          )
-        ) {
-          return Err({ code: "invalid_scope" as const });
-        }
+    return await this.workspaceEventLocks.withLock(taskId, async () =>
+      this.withTaskTreeLifecycleLock(taskId, () =>
+        this.readTrustedMessageTarget(deferral, labeledMessage, preparedReawakenAi)
+      )
+    );
+  }
 
-        const currentExecution =
-          entry.workspace.taskExecutionId != null
-            ? ((await this.getDescendantAgentTaskExecutionSnapshot(ancestorWorkspaceId, taskId))
-                ?.record ?? null)
-            : null;
-        const continuationActive = isActiveWorkspaceTurnTaskStatus(currentExecution?.status);
-        const legacyArchived = isWorkspaceArchived(
-          entry.workspace.archivedAt,
-          entry.workspace.unarchivedAt
-        );
-        const inactive =
-          !continuationActive &&
-          isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
-        const deferred = this.deferDescendantMessage(deferral, {
-          inactive,
-          archived: legacyArchived,
-          archivedAt: entry.workspace.archivedAt,
-          taskStatus: entry.workspace.taskStatus,
-        });
-        if (deferred != null) return deferred;
-        if (inactive && !this.aiService.isStreaming(taskId)) {
-          return this.reactivateInactiveAgentTask({
-            ancestorWorkspaceId,
-            taskId,
-            message: labeledMessage,
-            prependKeptBrief: true,
-            queueDispatchMode,
-            preTurnMessages: options?.preTurnMessages,
-            ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
-            stopFence,
-          });
-        }
+  /**
+   * Under both task locks: drop a kept brief that history already holds, then re-read the row and
+   * the sender's scope.
+   */
+  private async readTrustedMessageTarget(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    preparedReawakenAi: PreparedReawakenAi | undefined
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId } = deferral;
+    // A brief history already holds is not prepended again on reawakening; the
+    // reactivation reads the kept brief from the row after this. Awaited before the row read
+    // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
+    await this.dropKeptTaskPromptAlreadyInHistory(taskId);
+    const read = this.readDescendantTaskEntry(ancestorWorkspaceId, taskId);
+    if (!read.success) {
+      return read;
+    }
+    return await this.classifyTrustedMessageTarget(
+      deferral,
+      labeledMessage,
+      preparedReawakenAi,
+      read.data
+    );
+  }
 
-        return await this.deliverTrustedGuidance(
-          deferral,
-          labeledMessage,
-          entry,
-          continuationActive
-        );
-      })
+  /**
+   * Decide whether the target is inactive (no active continuation, and reported, interrupted or
+   * archived), hand a message that waits for an idle target to the F54 deferral, then route it.
+   */
+  private async classifyTrustedMessageTarget(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    preparedReawakenAi: PreparedReawakenAi | undefined,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry }
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId } = deferral;
+    const currentExecution =
+      entry.workspace.taskExecutionId != null
+        ? ((await this.getDescendantAgentTaskExecutionSnapshot(ancestorWorkspaceId, taskId))
+            ?.record ?? null)
+        : null;
+    const continuationActive = isActiveWorkspaceTurnTaskStatus(currentExecution?.status);
+    const legacyArchived = isWorkspaceArchived(
+      entry.workspace.archivedAt,
+      entry.workspace.unarchivedAt
+    );
+    const inactive =
+      !continuationActive && isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
+    const deferred = this.deferDescendantMessage(deferral, {
+      inactive,
+      archived: legacyArchived,
+      archivedAt: entry.workspace.archivedAt,
+      taskStatus: entry.workspace.taskStatus,
+    });
+    if (deferred != null) return deferred;
+    return await this.routeTrustedMessage(deferral, labeledMessage, preparedReawakenAi, {
+      entry,
+      continuationActive,
+      inactive,
+    });
+  }
+
+  /**
+   * An inactive target that is not streaming is reawakened in the inactive decision's tick, so
+   * reactivateInactiveAgentTask reads the row the decision read. Any other target takes live
+   * guidance.
+   */
+  private routeTrustedMessage(
+    deferral: DescendantMessageDeferral,
+    labeledMessage: string,
+    preparedReawakenAi: PreparedReawakenAi | undefined,
+    target: TrustedMessageTarget
+  ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    const { ancestorWorkspaceId, taskId, queueDispatchMode, sender, options, stopFence } = deferral;
+    if (target.inactive && !this.aiService.isStreaming(taskId)) {
+      return this.reactivateInactiveAgentTask({
+        ancestorWorkspaceId,
+        taskId,
+        message: labeledMessage,
+        prependKeptBrief: true,
+        queueDispatchMode,
+        preTurnMessages: options?.preTurnMessages,
+        ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
+        stopFence,
+      });
+    }
+    return this.deliverTrustedGuidance(
+      deferral,
+      labeledMessage,
+      target.entry,
+      target.continuationActive
     );
   }
 
