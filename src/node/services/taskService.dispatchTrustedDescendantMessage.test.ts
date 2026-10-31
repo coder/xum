@@ -121,7 +121,8 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
   let rootDir: string;
   // Each test awaits every send it starts. The background work left: terminal-attention drains of
   // the services, and the persist of the config migrations a load can start (one more edit on the
-  // same serialized queue settles it). allSettled: a test that failed early still settles both.
+  // same serialized queue settles it). allSettled: a test that failed early still settles both,
+  // and a drain that failed in the background still fails the test once cleanup is done.
   let configs: Config[];
   let services: TaskService[];
   beforeEach(async () => {
@@ -130,10 +131,14 @@ describe("TaskService.dispatchTrustedDescendantMessage", () => {
     services = [];
   });
   afterEach(async () => {
-    await Promise.allSettled(services.splice(0).map((s) => flushTerminalAttentionDrains(s)));
+    const drains = await Promise.allSettled(
+      services.splice(0).map((s) => flushTerminalAttentionDrains(s))
+    );
     mock.restore();
     await Promise.allSettled(configs.splice(0).map((config) => config.editConfig((cfg) => cfg)));
     await removeTaskServiceTestRoot(rootDir);
+    const failed = drains.find((drain) => drain.status === "rejected");
+    if (failed != null) throw failed.reason;
   });
 
   /**
