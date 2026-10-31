@@ -258,6 +258,47 @@ const PELE_CSS_FUNCTIONS = new Set([
   "var",
 ]);
 
+/**
+ * The custom properties Pele declares, all in the style of the root <svg>, each as one theme
+ * variable such as `--_bg:var(--pele-bg,#fff)`. Chromium nests each var() when it computes styles
+ * after insert, in time that doubles with each level, so a chain of custom properties freezes it
+ * while each declaration nests only 2 deep. Pele drops custom properties from chart styles.
+ */
+const PELE_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set([
+  "--_a",
+  "--_b",
+  "--_bg",
+  "--_c",
+  "--_fg",
+  "--_fm",
+  "--_hw",
+  "--_l",
+  "--_m",
+  "--_r",
+  "--_s",
+  "--_tw",
+  "--_w",
+]);
+const NO_CUSTOM_PROPERTIES: ReadonlySet<string> = new Set();
+
+// One theme variable with a fallback of names, numbers, colors and closed strings: the value reads
+// no other custom property, and without a block or an open string it ends at the next ;.
+const PELE_CUSTOM_PROPERTY =
+  /^[ \t\n\r]*(--[\w-]*)[ \t\n\r]*:[ \t\n\r]*var\(--pele-[\w-]+,(?:[^;()[\]{}"']|"[^"\n\r]*")*\)[ \t\n\r]*$/;
+// Chromium starts a declaration at the start of a style and after a ;, { or }.
+const CUSTOM_PROPERTY_START = /(?:^|[;{}])(?=[ \t\n\r]*--)/g;
+
+/** Every custom property that style declares is one of customProperties, as Pele writes it. */
+function declaresOnly(style: string, customProperties: ReadonlySet<string>): boolean {
+  for (const { 0: delimiter, index } of style.matchAll(CUSTOM_PROPERTY_START)) {
+    const start = index + delimiter.length;
+    const end = style.indexOf(";", start);
+    const name = PELE_CUSTOM_PROPERTY.exec(style.slice(start, end === -1 ? undefined : end))?.[1];
+    if (name === undefined || !customProperties.has(name)) return false;
+  }
+  return true;
+}
+
 /** Pele derives every id from idPrefix, such as `${idPrefix}-title` for an accTitle. */
 function isDiagramId(id: string, idPrefix: string): boolean {
   return id.startsWith(`${idPrefix}-`);
@@ -304,12 +345,16 @@ function keptIdValue(name: string, value: string, idPrefix: string): string | nu
   return ids?.every((id) => isDiagramId(id, idPrefix)) ? value : null;
 }
 
-/** The value to keep for an attribute, or null to remove the attribute. */
+/**
+ * The value to keep for an attribute, or null to remove the attribute. A style may declare only
+ * customProperties.
+ */
 function keptAttributeValue(
   rules: PeleNamespace,
   name: string,
   value: string,
-  idPrefix: string
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
 ): string | null {
   if (rules.textAttributes.has(name)) return value;
   if (rules.idAttributes.has(name)) return keptIdValue(name, value, idPrefix);
@@ -317,16 +362,24 @@ function keptAttributeValue(
   // A style is kept or removed whole, never split into declarations: a splitter that tokenizes
   // quotes, escapes or comments unlike the browser turns an inert string into live declarations.
   // Pele writes no style that fails, so its diagrams lose nothing.
-  return isPeleCss(value, name === "style" ? null : idPrefix) ? value : null;
+  const isKept =
+    name === "style"
+      ? isPeleCss(value, null) && declaresOnly(value, customProperties)
+      : isPeleCss(value, idPrefix);
+  return isKept ? value : null;
 }
 
 /** Applies PELE_OUTPUT to the attributes of an element that removeUnknownElements kept. */
-function sanitizeAttributes(element: Element, idPrefix: string): void {
+function sanitizeAttributes(
+  element: Element,
+  idPrefix: string,
+  customProperties: ReadonlySet<string>
+): void {
   const rules = peleNamespace(element.namespaceURI);
   for (const attribute of Array.from(element.attributes)) {
     // Lowercase like the HTML parser, which turns an XML FILL attribute into fill.
     const name = asciiLowerCase(attribute.name);
-    const value = keptAttributeValue(rules, name, attribute.value, idPrefix);
+    const value = keptAttributeValue(rules, name, attribute.value, idPrefix, customProperties);
     if (value === null) element.removeAttributeNode(attribute);
     else attribute.value = value;
   }
@@ -479,6 +532,9 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
   // HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`, so markup
   // that the XML parser read as their data would become live elements.
   if (/<[!?]/.test(svg)) return null;
+  // DOMParser parses the text of a <style> too, and the scan below reads only attributes. Pele
+  // writes no <style>, so this refuses one in any namespace or case.
+  if (/<(?:[^\s/<>]*:)?style[\s/>]/i.test(svg)) return null;
   // Chromium parses each style while DOMParser builds the tree, in time that doubles with each
   // color-mix() nested around an invalid value, so this check must run first. Pele passes such
   // values from a chart unchanged.
@@ -496,8 +552,9 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
 
   // Defense in depth: keep only the elements, text and attribute values Pele emits.
   removeUnknownElements(svgRoot);
-  for (const element of [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))]) {
-    sanitizeAttributes(element, idPrefix);
+  sanitizeAttributes(svgRoot, idPrefix, PELE_CUSTOM_PROPERTIES);
+  for (const element of Array.from(svgRoot.querySelectorAll("*"))) {
+    sanitizeAttributes(element, idPrefix, NO_CUSTOM_PROPERTIES);
   }
 
   return svgRoot.outerHTML;

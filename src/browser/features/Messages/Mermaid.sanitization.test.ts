@@ -158,10 +158,10 @@ describe("sanitizeMermaidSvg", () => {
       ),
     ],
     ["an extra attribute on the wrapper", peleMathLabel(MATH, ' onclick="alert(1)"')],
-    // The HTML parser would read the math's text as CSS.
+    // Pele wraps the math only in a div. The sanitizer returns null for a <style> wrapper.
     [
-      "a style element as the wrapper",
-      `<foreignObject class="pele-math"><style xmlns="${XHTML}" style="">${MATH}</style></foreignObject>`,
+      "a span as the wrapper",
+      `<foreignObject class="pele-math"><span xmlns="${XHTML}" style="">${MATH}</span></foreignObject>`,
     ],
   ])("removes a foreignObject with %s", (_case, label) => {
     const sanitized = sanitizeMermaidSvg(svgWith(label), ID_PREFIX);
@@ -194,9 +194,6 @@ describe("sanitizeMermaidSvg", () => {
   });
 
   it.each([
-    ["a style element", '<style>@import url("https://example.com/x.css");</style>'],
-    // The HTML parser lowercases tag names, so this becomes a live <style>.
-    ["an uppercase style element", "<STYLE>text { fill: red }</STYLE>"],
     // A click on the link runs the script that <set> writes into its href.
     [
       "a set that writes a link's href",
@@ -491,6 +488,7 @@ describe("sanitizeMermaidSvg", () => {
   it.each([
     ["an SVG <style>", `<style>${stylesheet}</style>`],
     ["a prefixed <style>", `<x:style xmlns:x="http://www.w3.org/2000/svg">${stylesheet}</x:style>`],
+    // The HTML parser that inserts the output lowercases tag names, so this becomes a live <style>.
     ["an uppercase <STYLE>", `<STYLE>${stylesheet}</STYLE>`],
     [
       "an XHTML <style> in foreignObject",
