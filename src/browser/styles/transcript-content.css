@@ -235,9 +235,6 @@
   --pele-font: var(--font-primary);
   --pele-font-mono: var(--font-monospace);
   --pele-radius: 6px;
-}
-
-.markdown-content .mermaid-container {
   display: flex;
   /* safe: Pele SVGs keep their measured width, so a wide diagram overflows. Plain center
      would push its left edge out of the scrollable area. */
