@@ -487,7 +487,9 @@ export class TaskHandleStore {
       fsPromises.stat(path.join(this.config.sessionsDir, ownerWorkspaceId), { bigint: true })
     );
     if (sessionStats == null) return null;
-    const entries = await unlessMissing(fsPromises.readdir(this.getOwnerHandleDir(ownerWorkspaceId)));
+    const entries = await unlessMissing(
+      fsPromises.readdir(this.getOwnerHandleDir(ownerWorkspaceId))
+    );
     if (entries == null) {
       const proof = fingerprintIfSafe(sessionStats, scan.startMs);
       return { provenBy: "session-dir", proof, rows: [] };
