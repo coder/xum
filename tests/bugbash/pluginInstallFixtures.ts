@@ -5,7 +5,8 @@
  * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills, a
  * repository with one manifest per agent tool (multi-harness), a Claude Code plugin next to
  * another tool's plugin.json (claude-foreign-root), a small copy of Cursor's cursor-team-kit
- * (cursor-team-kit-mini) and a Cursor plugin with one local MCP server (cursor-stdio-mcp).
+ * (cursor-team-kit-mini), a repository with both marketplace files (cursor-market) and a Cursor
+ * plugin with one local MCP server (cursor-stdio-mcp).
  * Nothing here runs on install or review: the MCP servers stay disabled until the user turns them
  * on (bin/server only exits 0, and server.mjs only echoes its text argument), Claude hooks never
  * run in Xum, and Xum never loads a Claude plugin's hooks.js or workflows/ (both are inert
@@ -286,6 +287,51 @@ function cursorTeamKitMini(): Files {
   };
 }
 
+/**
+ * The shape of cursor/plugins: a Cursor and a Claude Code marketplace file that both list
+ * `pstack`, each at its own folder. The two builds have different skills, so a repro can tell
+ * which one was installed. The Cursor file also lists a nested folder without "./", as
+ * cursor/plugins lists `third_party/attio`.
+ */
+function cursorMarket(): Files {
+  const marketplace = (plugins: { name: string; source: string }[]) =>
+    JSON.stringify({ name: "cursor-market", owner: { name: "Bug Bash" }, plugins }, null, 2);
+  return {
+    ".cursor-plugin/marketplace.json": marketplace([
+      { name: "pstack", source: "./pstack" },
+      { name: "notes", source: "third_party/notes" },
+    ]),
+    ".claude-plugin/marketplace.json": marketplace([{ name: "pstack", source: "./claude/pstack" }]),
+    "third_party/notes/.cursor-plugin/plugin.json": JSON.stringify(
+      { name: "notes", version: "1.0.0", description: "A nested Cursor plugin" },
+      null,
+      2
+    ),
+    "third_party/notes/skills/take-notes/SKILL.md": skillMd(
+      "take-notes",
+      "Keeps short notes of a session"
+    ),
+    "pstack/.cursor-plugin/plugin.json": JSON.stringify(
+      { name: "pstack", version: "1.0.0", description: "The Cursor build of pstack" },
+      null,
+      2
+    ),
+    "pstack/skills/plan-first/SKILL.md": skillMd(
+      "plan-first",
+      "Writes a short plan before any code changes"
+    ),
+    "claude/pstack/.claude-plugin/plugin.json": JSON.stringify(
+      { name: "pstack", version: "1.0.0", description: "The Claude Code build of pstack" },
+      null,
+      2
+    ),
+    "claude/pstack/skills/claude-notes/SKILL.md": skillMd(
+      "claude-notes",
+      "Keeps notes the way Claude Code reads them"
+    ),
+  };
+}
+
 const ECHO_SERVER = `import { createInterface } from "node:readline";
 
 const tools = [
@@ -346,6 +392,7 @@ export function installFixtures(): Record<string, Files> {
     "claude-foreign-root": claudeForeignRoot(),
     "snake-case-skills": snakeCaseSkills(),
     "cursor-team-kit-mini": cursorTeamKitMini(),
+    "cursor-market": cursorMarket(),
     "cursor-stdio-mcp": cursorStdioMcp(),
   };
 }

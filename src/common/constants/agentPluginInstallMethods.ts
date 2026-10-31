@@ -5,6 +5,8 @@ export const AGENT_PLUGIN_INSTALL_METHOD_LABELS: Record<AgentPluginInstallMethod
   {
     "agent-plugin": "Agent Plugin",
     "claude-plugin": "Claude Code plugin",
+    "cursor-plugin": "Cursor plugin",
     skills: "Skills",
     "claude-marketplace": "Claude Code marketplace entry",
+    "cursor-marketplace": "Cursor marketplace entry",
   };

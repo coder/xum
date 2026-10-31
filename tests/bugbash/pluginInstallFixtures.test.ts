@@ -61,7 +61,10 @@ test("claude-review-kit is a Claude Code plugin that also fits Skills", async ()
 test("claude-market lists five entries, one of them not installable", async () => {
   const result = await preview("claude-market");
   if (result.kind !== "marketplace") throw new Error(`previewed as a ${result.kind}`);
-  const entries = result.marketplace.entries.map((entry) => [entry.name, entry.installable]);
+  const entries = result.marketplace.entries.map((entry) => [
+    entry.name,
+    entry.builds.some((build) => build.installable),
+  ]);
   // The github entry is listed as installable; it fails only when Xum fetches it.
   expect(entries).toEqual([
     ["document-skills", true],
@@ -72,6 +75,26 @@ test("claude-market lists five entries, one of them not installable", async () =
   ]);
   // "Install the repository as Skills".
   expect(result.marketplace.methods.map((method) => method.kind)).toEqual(["skills"]);
+});
+
+test("cursor-market lists pstack once with both builds, and a nested Cursor folder", async () => {
+  const result = await preview("cursor-market");
+  if (result.kind !== "marketplace") throw new Error(`previewed as a ${result.kind}`);
+  expect(
+    result.marketplace.entries.map((entry) => [
+      entry.name,
+      entry.builds.map((build) => [build.file, build.installable]),
+    ])
+  ).toEqual([
+    [
+      "pstack",
+      [
+        ["cursor", true],
+        ["claude", true],
+      ],
+    ],
+    ["notes", [["cursor", true]]],
+  ]);
 });
 
 test("plain-skills installs as Skills only, without the skill whose description is too long", async () => {
