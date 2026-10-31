@@ -2795,32 +2795,46 @@ async function passesThroughSymlink(rootPath: string, relativePath: string): Pro
 }
 
 /**
- * Drops the backed-up files whose local destination passes through a symlink, leaf included.
- * A user who links `skills/<name>` into a shared skills store chose that link, and a backup
- * pushed before it still holds the real folder: refusing the whole payload failed every preview
- * and restore. Push skips symlinks too, so neither direction touches these files. A symlink that
- * appears after this check is still refused when the restore writes.
+ * The destinations, relative to the Xum root, that a restore leaves alone because they pass
+ * through a symlink, leaf included. A user who links `skills/<name>` (or a project's memory
+ * folder) into a shared store chose that link, and a backup pushed before it still holds the
+ * real folder: refusing the whole restore failed every preview and restore. Push skips
+ * symlinks too, so neither direction touches these files. A symlink that appears after this
+ * check is still refused when the restore writes.
  *
  * `checked` is the skip set a restore's preflight found before the safety snapshot. A restore
  * applies that set instead of looking again: a symlink replaced by a regular file in between
  * would otherwise be overwritten, and the snapshot, taken while it was a link, holds no copy.
  */
+export async function findSymlinkedDestinations(
+  muxRoot: string,
+  relativePaths: readonly string[],
+  checked?: readonly string[]
+): Promise<Set<string>> {
+  const root = await resolveRoot(muxRoot);
+  const skipped = new Set<string>();
+  for (const relativePath of relativePaths) {
+    const linked =
+      checked === undefined
+        ? await passesThroughSymlink(root.path, relativePath)
+        : checked.includes(relativePath);
+    if (linked) skipped.add(relativePath);
+  }
+  return skipped;
+}
+
+/** Drops the backed-up core files `findSymlinkedDestinations` skips. */
 export async function omitSymlinkedDestinations(
   muxRoot: string,
   payload: BackupPayload,
   checked?: readonly string[]
 ): Promise<{ payload: BackupPayload; skipped: string[] }> {
-  const root = await resolveRoot(muxRoot);
-  const skipped = new Set<string>();
-  for (const file of payload.files) {
+  const skipped = await findSymlinkedDestinations(
+    muxRoot,
     // Merged into config.json, never written at its own path.
-    if (file.path === "preferences.json") continue;
-    const linked =
-      checked === undefined
-        ? await passesThroughSymlink(root.path, file.path)
-        : checked.includes(file.path);
-    if (linked) skipped.add(file.path);
-  }
+    payload.files.map((file) => file.path).filter((file) => file !== "preferences.json"),
+    checked
+  );
   if (skipped.size === 0) return { payload, skipped: [] };
   return {
     payload: {
@@ -3425,6 +3439,31 @@ export function matchedProjectWrites(
     path: rekeyProjectMemoryPath(file.path, match.localMemoryDir),
     content: file.content,
   }));
+}
+
+/**
+ * Drops each matched file whose local destination `findSymlinkedDestinations` skips. The
+ * entries themselves stay: a restore checks them against the validated match keys.
+ */
+export async function omitSymlinkedProjectMemory(
+  muxRoot: string,
+  matched: readonly MatchedProjectEntry[],
+  checked?: readonly string[]
+): Promise<{ matched: MatchedProjectEntry[]; skipped: string[] }> {
+  const skipped = await findSymlinkedDestinations(
+    muxRoot,
+    matched.flatMap((match) => matchedProjectWrites(match).map((write) => write.path)),
+    checked
+  );
+  return {
+    matched: matched.map((match) => ({
+      ...match,
+      files: match.files.filter(
+        (file) => !skipped.has(rekeyProjectMemoryPath(file.path, match.localMemoryDir))
+      ),
+    })),
+    skipped: [...skipped].sort(),
+  };
 }
 
 /**
