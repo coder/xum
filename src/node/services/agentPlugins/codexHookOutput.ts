@@ -5,7 +5,8 @@
  * Two failure kinds:
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
- *   `additionalProperties: false`), a wrong type or a value outside an enum. Nothing of it applies.
+ *   `additionalProperties: false`), a wrong type, a value outside an enum, or JSON text that is
+ *   not an object. Nothing of it applies.
  * - A result with `invalid` set parsed but breaks a semantic rule (a reason without a decision, a
  *   field the event does not support). Codex still shows its `systemMessage` and ignores the rest.
  *
@@ -337,8 +338,8 @@ interface Wire {
 
 /**
  * The output object, checked against Codex's schema for `event`. Returns null for an empty
- * result (no text, no structuredContent) and for a result that is not an object (Codex ignores
- * both); throws for a malformed one.
+ * result (no text, no object structuredContent) and for plain text (Codex ignores both); throws
+ * for a malformed one.
  */
 function readWire(
   result: unknown,
@@ -380,14 +381,21 @@ function checkFieldTypes(
   }
 }
 
-/** JSON text; text that looks like JSON but does not parse is a malformed output. */
-function parseText(text: string, event: HookEventName): unknown {
+/**
+ * The output object in JSON text, or undefined for plain text. Text that looks like JSON but does
+ * not parse, and JSON that is not an object (`[]`, `42`, `"note"`, `null`), is a malformed output:
+ * a PreToolUse guard that answers with a list of findings must not let the call through (D8).
+ */
+function parseText(text: string, event: HookEventName): Record<string, unknown> | undefined {
+  let value: unknown;
   try {
-    return JSON.parse(text);
+    value = JSON.parse(text);
   } catch {
     if (looksLikeJson(text)) throw new Error(`returned invalid ${event} JSON output`);
     return undefined;
   }
+  if (!isPlainObject(value)) throw new Error(`returned ${event} JSON output that is not an object`);
+  return value;
 }
 
 /** Codex requires hookSpecificOutput.hookEventName to name this event. */

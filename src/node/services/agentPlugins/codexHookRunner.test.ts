@@ -220,6 +220,51 @@ describe("PreToolUse", () => {
     expect(notices[0]).toContain(detail);
   });
 
+  test("JSON that is not an object blocks the call with one notice; plain text does not", async () => {
+    const text = (value: string) => ({ content: [{ type: "text", text: value }] });
+    for (const output of ["[]", '[{"rule":"no-rm"}]', "42", '"note"', "true", "null"]) {
+      const { spine, notices } = setup([hook("PreToolUse")], () => text(output));
+      const ctx = await runTool(spine, "bash", { script: "rm -rf build" });
+
+      expect(ctx.executed).toBe(false);
+      expect(blockedError(ctx)).toContain("JSON output that is not an object");
+      expect(notices).toHaveLength(1);
+    }
+    // Codex ignores plain text on PreToolUse.
+    const plain = setup([hook("PreToolUse")], () => text("Checked 3 files."));
+    expect((await runTool(plain.spine, "bash", {})).executed).toBe(true);
+    expect(plain.notices).toEqual([]);
+  });
+
+  test("JSON that is not an object on PostToolUse or Stop is ignored with a warning", async () => {
+    const warn = spyOn(log, "warn");
+    try {
+      for (const output of ["[]", '[{"rule":"no-rm"}]']) {
+        const answer = () => ({ content: [{ type: "text", text: output }] });
+        const post = setup([hook("PostToolUse")], answer);
+        expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
+        const stop = setup([hook("Stop")], answer);
+        expect(
+          await runTurnStopHooks(stop.spine, workspaceId, {
+            messageId: "a1",
+            lastAssistantMessage: "done",
+            stopHookActive: false,
+          })
+        ).toEqual({ kind: "none" });
+        expect([post, stop].flatMap((h) => h.notices)).toEqual([]);
+      }
+      const warned = warn.mock.calls.map((call) => String(call[0]));
+      for (const event of ["PostToolUse", "Stop"]) {
+        const notObject = warned.filter(
+          (message) => message.includes(`${event} hook`) && message.includes("not an object")
+        );
+        expect(notObject).toHaveLength(2);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test("an unsupported permissionDecision (an invalid output) blocks the call (D8)", async () => {
     const { spine, notices } = setup([hook("PreToolUse")], () =>
       json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" } })

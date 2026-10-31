@@ -172,19 +172,31 @@ A rewrite in `updatedInput` must match the tool's input schema and pass the tool
 
 The transcript keeps the model's original tool call. Xum adds a note to the tool result that names the fields the hook changed, for example `[plugin:guard] Rewrote this tool call's input (fields: script).` The note never contains the values, because a hook can put a secret into the input, and the model provider and the chat log see the note.
 
-Xum honors an explicit deny or block when the rest of the output breaks a Codex rule, for example with an unknown field. It does not honor one when the output is malformed (a wrong type or a value outside an enum). See the list below. Xum does not support `permissionDecision: "ask"`, `updatedMCPToolOutput`, or `suppressOutput`.
+Xum honors an explicit deny or block when the rest of the output breaks a Codex rule, for example with an unknown field. It does not honor one when the output is malformed (a wrong type or a value outside an enum). Xum does not support `permissionDecision: "ask"`, `updatedMCPToolOutput`, or `suppressOutput`. The two lists below say what each case does.
+
+### What blocks a `PreToolUse` call
+
+A broken guard must not let a call through. Xum blocks a `PreToolUse` call when the hook's output:
+
+- Is malformed: invalid JSON, a wrong type, or a value outside an enum. A deny in the same output does not apply.
+- Fails Codex's schema: an unknown field, or `hookSpecificOutput` tagged for another event. An explicit deny next to an unknown field still applies, with its own reason.
+- Is JSON that is not an object, such as `[]`, a list of findings, `42`, or `"ok"`. Plain text that is not JSON is ignored.
+- Uses a decision or field that Xum does not support: `permissionDecision: "allow"` without `updatedInput`, `permissionDecision: "ask"`, the legacy `decision: "approve"`, `continue: false`, `stopReason`, `suppressOutput`, `updatedInput` without `allow`, or a reason without a decision. Codex runs the call in these cases. Xum blocks it.
+- Has a result text over 1 MiB (1,048,576 characters).
+
+The model sees `Tool call blocked by plugin '<plugin>' hook: its output is malformed: <reason>` as the tool error. You see a notice that names the plugin and says to turn the hook off in Settings > Plugins.
+
+A rewrite (`updatedInput`) next to an unknown or unsupported field makes Xum deny the call too, because the hook allowed only its rewrite. If the filled `input` of a `PreToolUse` hook is over 64 KiB (65,536 characters) as JSON, and the hook can run, Xum also denies the call. A model can pad a command to get past a guard, so Xum does not let it through.
 
 ### What fails open
 
 In these cases, Xum logs a warning and continues without the hook's output:
 
-- The hook times out, errors, or returns an MCP error.
-- The server or tool is missing, disabled, or not running.
-- The output is malformed: invalid JSON, a wrong type, or a value outside an enum. A deny or block in the same output is ignored too.
-- The output has an unknown field. Xum then ignores the hook's other output, with two exceptions: on `PreToolUse`, `PostToolUse`, and `UserPromptSubmit` an explicit deny or block still applies, and a `PreToolUse` rewrite (`updatedInput`) makes Xum deny the call, because the hook allowed only its rewrite. On `Stop`, an unknown field voids the whole output, a block included. On every event, Xum still shows a `systemMessage` to you.
-- The result text is over 1 MiB (1,048,576 characters).
+- On every event: the hook times out, errors, or returns an MCP error result (`isError`).
+- On every event: the server or tool is missing, disabled, or not running.
+- On `PostToolUse`, `UserPromptSubmit`, and `Stop`: the output is malformed, fails Codex's schema, is JSON that is not an object, or is over 1 MiB. A deny or block in a malformed output is ignored too. With an unknown field, an explicit block on `PostToolUse` and `UserPromptSubmit` still applies. On `Stop`, an unknown field voids the whole output, a block included. On `UserPromptSubmit`, text that does not start with `{` or `[` is context, as the table above says.
 
-One case fails closed. If the filled `input` of a `PreToolUse` hook is over 64 KiB (65,536 characters) as JSON, and the hook can run, Xum denies the call. A model can pad a command to get past a guard, so Xum does not let it through.
+When an output parses but breaks a Codex rule (an unknown field, an unsupported decision), Xum still shows its `systemMessage` to you.
 
 ### Size limits
 
