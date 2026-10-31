@@ -154,6 +154,57 @@ function isPeleMathLabel(foreignObject: Element): boolean {
   );
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+// Every SVG element Pele 1.9 emitted for the pele.run examples of all 33 diagram types. It also
+// emits <a> and <image>, but only with the links and images that renderMermaidSvg turns off.
+// Diagrams lose any element missing here, so re-check the list when Pele is upgraded.
+// Lowercase, because the HTML parser that inserts the output lowercases tag names.
+const PELE_SVG_ELEMENTS = new Set([
+  "circle",
+  "defs",
+  "desc",
+  "ellipse",
+  "g",
+  "lineargradient",
+  "path",
+  "polygon",
+  "rect",
+  "stop",
+  "svg",
+  "text",
+  "title",
+  "tspan",
+]);
+
+/**
+ * Removes every element that Pele does not emit, keeping only Pele's math labels as
+ * foreignObject. A blocklist leaks: <set> can write a javascript: href, and the HTML parser
+ * ends the <svg> at an SVG-namespace <p>, so the elements after it become HTML.
+ */
+function removeUnknownElements(parent: Element): void {
+  for (const child of Array.from(parent.children)) {
+    const svgName = child.namespaceURI === SVG_NS ? child.localName.toLowerCase() : "";
+    if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
+    if (PELE_SVG_ELEMENTS.has(svgName)) removeUnknownElements(child);
+    else child.remove();
+  }
+}
+
+/**
+ * Keeps only element and text children. Pele emits no comments, processing instructions or
+ * CDATA. The HTML parser that inserts the output ends `<!-->` and `<?x >` at their first `>`,
+ * so markup that the XML parser read as their data becomes live elements.
+ */
+function removeNonElementNodes(elements: Element[]): void {
+  for (const element of elements) {
+    for (const child of Array.from(element.childNodes)) {
+      if (child.nodeType !== child.ELEMENT_NODE && child.nodeType !== child.TEXT_NODE) {
+        child.remove();
+      }
+    }
+  }
+}
+
 export function sanitizeMermaidSvg(svg: string): string | null {
   // Pele emits well-formed SVG, so anything that fails a strict parse is not its output:
   // fail closed.
@@ -166,17 +217,15 @@ export function sanitizeMermaidSvg(svg: string): string | null {
     return null;
   }
 
-  // Defense in depth: remove active content containers (every foreignObject except Pele's
-  // math labels) and sanitize remaining attributes.
-  svgRoot.querySelectorAll("script,iframe,object,embed,foreignObject").forEach((node) => {
-    if (node.localName === "foreignObject" && isPeleMathLabel(node)) return;
-    node.remove();
-  });
+  // Defense in depth: keep only the elements and text Pele emits, and sanitize the remaining
+  // attributes.
+  removeUnknownElements(svgRoot);
 
   const urlAttributes = new Set(["href", "xlink:href", "src", "action", "formaction"]);
   const blockedSchemes = ["javascript:", "vbscript:", "data:text/html"];
 
   const elementsToScan: Element[] = [svgRoot, ...Array.from(svgRoot.querySelectorAll("*"))];
+  removeNonElementNodes(elementsToScan);
   elementsToScan.forEach((element) => {
     for (const attribute of Array.from(element.attributes)) {
       const attributeName = attribute.name.toLowerCase();

@@ -1,9 +1,27 @@
 import { sanitizeMermaidSvg } from "./Mermaid";
 
 import { Window } from "happy-dom";
+import { parseFragment, type DefaultTreeAdapterMap } from "parse5";
 
 const testWindow = new Window();
 globalThis.DOMParser = testWindow.DOMParser as unknown as typeof DOMParser;
+
+/**
+ * Node names after the HTML parse that inserts the sanitizer output. parse5 follows the
+ * browser's HTML parser. happy-dom's reads `<!-->` as an open comment, so it hides the live
+ * <img> these tests look for.
+ */
+function htmlNodeNames(markup: string): string[] {
+  const names: string[] = [];
+  const visit = (nodes: Array<DefaultTreeAdapterMap["childNode"]>) => {
+    for (const node of nodes) {
+      names.push(node.nodeName);
+      if ("childNodes" in node) visit(node.childNodes);
+    }
+  };
+  visit(parseFragment(markup).childNodes);
+  return names;
+}
 
 describe("sanitizeMermaidSvg", () => {
   it("returns null for malformed SVG", () => {
@@ -88,5 +106,38 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).toContain("<rect");
     expect(sanitized).not.toContain("foreignObject");
     expect(sanitized).not.toContain("<img");
+  });
+
+  // The HTML parser ends `<!-->` at its first `>`, so the <img> after it is a live element. happy-dom
+  // has no CDATA nodes and ends a processing instruction at its first `>`, so those cases cannot
+  // carry the same <img> here.
+  const BREAKOUT_COMMENT = '<!--><img src="x" onerror="alert(1)"/>-->';
+  it.each([
+    ["a comment in a text label", `<text>${BREAKOUT_COMMENT}label</text>`],
+    ["a comment in a math label", peleMathLabel(`${BREAKOUT_COMMENT}${MATH}`)],
+    ["a processing instruction in a text label", "<text><?xx data?>label</text>"],
+    ["a processing instruction in a math label", peleMathLabel(`<?xx data?>${MATH}`)],
+    ["a style element", '<style>@import url("https://example.com/x.css");</style>'],
+    // The HTML parser lowercases tag names, so this becomes a live <style>.
+    ["an uppercase style element", "<STYLE>text { fill: red }</STYLE>"],
+    // A click on the link runs the script that <set> writes into its href.
+    [
+      "a set that writes a link's href",
+      '<a><set attributeName="href" to="javascript:alert(1)"/><text>link</text></a>',
+    ],
+    [
+      "an animate element",
+      '<text><animate attributeName="href" values="javascript:alert(1)"/>label</text>',
+    ],
+    // The HTML parser ends the <svg> at an SVG-namespace <p>, so the <link> after it loads.
+    ["an SVG p before a link", '<p/><link rel="stylesheet" href="https://example.com/x.css"/>'],
+    ["an unknown element", "<unknown><text>label</text></unknown>"],
+  ])("removes %s", (_case, label) => {
+    const sanitized = sanitizeMermaidSvg(svgWith(label)) ?? "";
+    const injected = ["#comment", "img", "style", "a", "set", "animate", "p", "link", "unknown"];
+
+    expect(sanitized).toContain("<rect");
+    expect(sanitized).not.toMatch(/<!--|<\?|<!\[CDATA\[|javascript:/);
+    expect(htmlNodeNames(sanitized).filter((name) => injected.includes(name))).toEqual([]);
   });
 });
