@@ -16,6 +16,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   ARTIFACT_SHELF_BACKUP_DIR,
   BACKUP_MANIFEST_FILE,
+  findSymlinkedDestinations,
   hasDisallowedPathShape,
   MAX_BACKUP_FILE_BYTES,
   MAX_BACKUP_FILE_COUNT,
@@ -419,6 +420,34 @@ export function planShelfRestore(params: {
     else skipped.add(`${key} (not a complete shelf entry)`);
   }
   return { entries: complete, skipped: [...skipped].sort() };
+}
+
+function shelfEntryFilePaths(entry: ShelfRestoreEntry): string[] {
+  return entry.files.map((file) => `${entry.scopePath}/${entry.name}/${file.name}`);
+}
+
+/**
+ * Drops each planned entry with a file `findSymlinkedDestinations` skips, and reports all of
+ * its files: an entry is restored whole or not at all.
+ */
+export async function omitSymlinkedShelfEntries(
+  xumRoot: string,
+  entries: readonly ShelfRestoreEntry[],
+  checked?: readonly string[]
+): Promise<{ entries: ShelfRestoreEntry[]; skipped: string[] }> {
+  const linked = await findSymlinkedDestinations(
+    xumRoot,
+    entries.flatMap(shelfEntryFilePaths),
+    checked
+  );
+  const kept: ShelfRestoreEntry[] = [];
+  const skipped: string[] = [];
+  for (const entry of entries) {
+    const files = shelfEntryFilePaths(entry);
+    if (files.some((file) => linked.has(file))) skipped.push(...files);
+    else kept.push(entry);
+  }
+  return { entries: kept, skipped: skipped.sort() };
 }
 
 /** Current files of a local shelf entry (regular files only), or null when it is absent. */
