@@ -6,14 +6,23 @@
 // apply, the lock nesting (event lock, tree lock, mutex, the CAS edit, the turn) or a value that
 // the CAS callback sets. taskService.lifecycleRepro.test.ts covers the races with a Stop and a
 // manual resume.
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { pendingRemovalAdmissionMessage, retiredAttemptMessage } from "@/constants/agentMessaging";
+import {
+  pendingRemovalAdmissionMessage,
+  retiredAttemptMessage,
+  SEND_ADMISSION_STALE_MESSAGE,
+  TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+  WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+} from "@/constants/agentMessaging";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { AttemptLedger } from "@/node/services/attemptLedger";
+import { computeSendDigest } from "@/node/services/sendIds";
 import type { TaskService } from "@/node/services/taskService";
 import {
   collectFullHistory,
@@ -43,6 +52,7 @@ const CHILD = "reactivate-child";
 const PRIOR = "att_00000000000000a1";
 const OTHER = "att_00000000000000b2";
 const MESSAGE = "Keep going";
+const BRIEF = "Original brief";
 const AT = "2026-10-01T00:00:00.000Z";
 /** A live removal by another backend (a live pid, so no load takes the marker over). */
 const MARKER = {
@@ -77,6 +87,7 @@ interface Lineage {
 }
 type Row = Omit<Partial<WorkspaceConfigEntry>, "id" | "path">;
 type TurnArgs = Parameters<WorkspaceTurnManager["createWorkspaceTurn"]>[0];
+type TurnResult = Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
 
 /** Private members the harness wraps by name. The split keeps each one as an instance call. */
 interface Internals {
@@ -94,8 +105,16 @@ interface Hooks {
   afterUnarchive?: () => Promise<void>;
   /** Runs inside the lineage await, before the evaluation: a writer during the commit's awaits. */
   duringLineage?: () => Promise<void>;
+  /** Replaces the lineage evaluation's result. */
+  lineage?: Lineage;
   /** Runs after the identity CAS edit landed: another backend's write before the row check. */
   afterCas?: () => Promise<void>;
+  /** Replaces createWorkspaceTurn. */
+  turn?: () => Promise<TurnResult>;
+  /** The refusals under the mutex: the task's stop latch, a completed Stop, a live reawakening. */
+  latched?: boolean;
+  overtaken?: boolean;
+  live?: boolean;
 }
 
 async function editRow(config: Config, edit: (row: WorkspaceConfigEntry) => void) {
@@ -130,6 +149,8 @@ const COMMIT = [
   "edit",
   "edited",
 ];
+/** Ownership under the mutex, then the turn after the mutex is released. */
+const OWN_AND_TURN = ["publish", "own", "reawakening+", "mutex-", "turn+", "turn-", "reawakening-"];
 /** A refusal at or after the CAS returns from inside the mutex block. */
 const REFUSED_AT_CAS = [...OPEN, "unarchive", ...COMMIT, "mutex-", ...CLOSE];
 
@@ -217,7 +238,8 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     const manager = workspaceTurnManagerFor(taskService);
     const hooks: Hooks = {};
     const trace: string[] = [];
-    const turns: TurnArgs[] = [];
+    const params: Array<{ message: string }> = [];
+    const turns: Array<{ args: TurnArgs; liveAtStart: boolean; result?: TurnResult }> = [];
     let span = false;
     let inTurn = false;
     const note = (label: string) => {
@@ -244,11 +266,23 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     const withTreeLock = taskService.withTaskTreeLifecycleLock.bind(taskService);
     taskService.withTaskTreeLifecycleLock = (id, operation) =>
       withTreeLock(id, id === CHILD ? bracket("tree", operation) : operation);
+    // The entry reads the row in its caller's decision tick: no await runs before that read.
+    let callerTick = false;
+    let firstRead: "caller tick" | "later" | undefined;
+    const load = config.loadConfigOrDefault.bind(config);
+    config.loadConfigOrDefault = (options) => {
+      if (span) firstRead ??= callerTick ? "caller tick" : "later";
+      return load(options);
+    };
     const reactivate = svc.reactivateInactiveAgentTask.bind(taskService);
     svc.reactivateInactiveAgentTask = (p) => {
+      params.push(p);
       note("enter");
       span = true;
-      return reactivate(p).finally(() => {
+      callerTick = true;
+      const running = reactivate(p);
+      callerTick = false;
+      return running.finally(() => {
         span = false;
         note("exit");
       });
@@ -264,7 +298,7 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     svc.evaluateAttemptLineage = async (taskId, entry) => {
       step("lineage");
       await hooks.duringLineage?.();
-      return await lineage(taskId, entry);
+      return hooks.lineage ?? (await lineage(taskId, entry));
     };
     const acquire = svc.mutex.acquire.bind(svc.mutex);
     svc.mutex.acquire = async () => {
@@ -278,6 +312,9 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       };
       return lock;
     };
+    const latched = taskService.isWorkspaceStopInProgress.bind(taskService);
+    taskService.isWorkspaceStopInProgress = (id) =>
+      (hooks.latched === true && id === CHILD) || latched(id);
     const edit = taskService.editWorkspaceEntry.bind(taskService);
     taskService.editWorkspaceEntry = async (id, updater, options) => {
       const cas = span && !inTurn && id === CHILD;
@@ -287,19 +324,19 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       if (cas) await hooks.afterCas?.();
       return found;
     };
-    /** A call-through that records `label` first. */
-    const tap = (target: object, key: string, label: string) => {
+    /** A call-through that records `label` first; a true `override()` replaces the result. */
+    const tap = (target: object, key: string, label: string, override?: () => boolean) => {
       const methods = target as Record<string, (...args: unknown[]) => unknown>;
       const original = methods[key].bind(target);
       methods[key] = (...args) => {
         step(label === "goal-pause" ? `${label} ${JSON.stringify(args[1])}` : label);
-        return original(...args);
+        return override?.() === true || original(...args);
       };
     };
     tap(svc, "appendFamilyPayloadRows", "append");
     tap(svc, "settleChildGoalPause", "goal-pause");
-    tap(svc, "reawakeningOvertakenByStop", "overtaken");
-    tap(ledger, "hasLiveReawakening", "live?");
+    tap(svc, "reawakeningOvertakenByStop", "overtaken", () => hooks.overtaken === true);
+    tap(ledger, "hasLiveReawakening", "live?", () => hooks.live === true);
     tap(svc, "editActiveWorkspaceEntry", "active-edit");
     tap(ledger, "publishAttemptRotation", "publish");
     tap(svc, "beginOwnedTaskAttempt", "own");
@@ -309,12 +346,20 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     manager.createWorkspaceTurn = (args) => {
       step("turn+");
       inTurn = true;
-      turns.push(args);
-      return createTurn(args).finally(() => {
-        inTurn = false;
-        step("turn-");
-      });
+      const turn: (typeof turns)[number] = { args, liveAtStart: ledger.hasLiveReawakening(CHILD) };
+      turns.push(turn);
+      return (hooks.turn?.() ?? createTurn(args))
+        .then((result) => (turn.result = result))
+        .finally(() => {
+          inTurn = false;
+          step("turn-");
+        });
     };
+
+    // A bash-monitor wake sends through the wake's own send.
+    const wakeSend: Parameters<TaskService["reactivateInactiveAgentTaskFromBashMonitorWake"]>[2] = (
+      ...args
+    ) => host.workspaceService.sendMessage(...args);
 
     return {
       config,
@@ -324,11 +369,16 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
       ledger,
       hooks,
       trace,
+      params,
       turns,
       unarchive,
       row: () => findWorkspaceInConfig(config, CHILD),
+      firstRead: () => firstRead,
       send: (options?: Parameters<TaskService["sendMessageToDescendantAgentTask"]>[4]) =>
         taskService.sendMessageToDescendantAgentTask(PARENT, CHILD, MESSAGE, "turn-end", options),
+      wakeSend,
+      wake: () =>
+        taskService.reactivateInactiveAgentTaskFromBashMonitorWake(CHILD, MESSAGE, wakeSend),
     };
   }
 
@@ -476,5 +526,186 @@ describe("TaskService.reactivateInactiveAgentTask", () => {
     expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(undefined);
     expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
     expect(h.turns).toEqual([]);
+  });
+  test("a task_send_message reactivation runs its steps in order inside the caller's locks", async () => {
+    const h = await setup({ taskPrompt: BRIEF });
+    const result = await h.send({ preTurnMessages: [preTurnRow()] });
+    const [turn] = h.turns;
+    const executionTaskId = turn.result?.success === true ? turn.result.data.taskId : undefined;
+    expect(typeof executionTaskId).toBe("string");
+    expect(result).toStrictEqual(Ok({ delivery: "reactivated", executionTaskId }));
+    // The CAS, the ownership and the live marker run under the mutex; the turn starts after it.
+    expect(h.trace).toEqual([...OPEN, "unarchive", "append", ...COMMIT, ...OWN_AND_TURN, ...CLOSE]);
+    expect(h.firstRead()).toBe("caller tick");
+    const attemptId = h.row()?.taskAttemptId;
+    expect(isTaskAttemptId(attemptId) && attemptId !== PRIOR).toBe(true);
+    // The kept brief's fresh send id goes to the row with the CAS and to the turn's send.
+    const sendId = h.row()?.taskPromptSendId;
+    expect(sendId?.startsWith(MINTED_SEND_ID_PREFIX)).toBe(true);
+    expect(turn.args).toStrictEqual({
+      ownerWorkspaceId: PARENT,
+      prompt: `${BRIEF}\n\n${h.params[0].message}`,
+      title: "Child",
+      workspace: { mode: "existing", workspaceId: CHILD, queueDispatchMode: "turn-end" },
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      sendIdentities: [
+        { id: sendId ?? "none", digest: computeSendDigest({ message: BRIEF }), unpublished: true },
+      ],
+    });
+    // A reported child's lineage is unproven: the attempt is owned but not receipt-eligible.
+    expect(h.ledger.ownedAttempt(CHILD)).toStrictEqual({
+      generation: 1,
+      source: "reactivation",
+      attemptId,
+      receiptEligible: false,
+    });
+    expect(h.row()?.taskAttemptUnproven).toBe(true);
+    expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(attemptId);
+    expect(turn.liveAtStart).toBe(true);
+    expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
+  });
+
+  // A bash-monitor wake holds only the event lock, has no Stop fence and no kept-brief prepend
+  // (the row's brief send id stays), and sends through the wake's own send. The title falls back
+  // to the name, then a default.
+  test.each([
+    { row: { title: "Child" }, title: "Child" },
+    { row: { title: "" }, title: "child" },
+    { row: { title: "", name: "" }, title: "Sub-agent" },
+  ])("a bash-monitor wake reactivates with title $title", async (c) => {
+    const h = await setup({ taskPrompt: BRIEF, taskPromptSendId: "srv-kept", ...c.row });
+    expect(await h.wake()).toStrictEqual(Ok(undefined));
+    const commit = COMMIT.filter((label) => label !== "overtaken");
+    expect(h.trace).toEqual([
+      "event+",
+      "enter",
+      "unarchive",
+      ...commit,
+      ...OWN_AND_TURN,
+      "exit",
+      "event-",
+    ]);
+    expect(h.turns[0].args).toStrictEqual({
+      ownerWorkspaceId: PARENT,
+      prompt: MESSAGE,
+      title: c.title,
+      workspace: { mode: "existing", workspaceId: CHILD, queueDispatchMode: "tool-end" },
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      sendMessage: h.wakeSend,
+    });
+    expect(h.row()?.taskPromptSendId).toBe("srv-kept");
+  });
+
+  // Under the mutex the refusals run in this order: the stop latch, a completed Stop (the fence's
+  // epochs), a live reawakening. Each one that fires stops the later checks.
+  test.each([
+    {
+      name: "a held stop latch wins over a completed Stop and a live reawakening",
+      flags: { latched: true, overtaken: true, live: true },
+      message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+      checks: [],
+    },
+    {
+      name: "a completed Stop wins over a live reawakening",
+      flags: { overtaken: true, live: true },
+      message: SEND_ADMISSION_STALE_MESSAGE,
+      checks: ["overtaken"],
+    },
+    {
+      name: "a live reawakening refuses last",
+      flags: { live: true },
+      message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+      checks: ["overtaken", "live?"],
+    },
+  ])("under the mutex, $name", async (c) => {
+    const h = await setup();
+    h.hooks.duringLineage = () => Promise.resolve(void Object.assign(h.hooks, c.flags));
+    expect(await h.send()).toStrictEqual(Err({ code: "send_failed", message: c.message }));
+    const head = COMMIT.slice(0, COMMIT.indexOf("mutex+") + 1);
+    expect(h.trace).toEqual([...OPEN, "unarchive", ...head, ...c.checks, "mutex-", ...CLOSE]);
+    expect(h.row()?.taskAttemptId).toBe(PRIOR);
+    expect(h.turns).toEqual([]);
+  });
+
+  test("a bash-monitor wake has no Stop fence, so a completed Stop does not refuse it", async () => {
+    const h = await setup();
+    h.hooks.duringLineage = () =>
+      Promise.resolve(void Object.assign(h.hooks, { overtaken: true, live: true }));
+    expect(await h.wake()).toStrictEqual(Err(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE));
+    const head = ['goal-pause {"force":true}', "lineage", "mutex+", "live?", "mutex-"];
+    expect(h.trace).toEqual(["event+", "enter", "unarchive", ...head, "exit", "event-"]);
+  });
+
+  // committedProven is set inside the CAS callback and read after it, for the ownership.
+  test.each([
+    { name: "a proven lineage gives a receipt-eligible attempt", proven: true, eligible: true },
+    { name: "an unproven lineage marks the attempt unproven", proven: false, eligible: false },
+    {
+      name: "an unproven marker that lands before the CAS wins over a proven lineage",
+      proven: true,
+      marker: true,
+      eligible: false,
+    },
+  ])("$name", async (c) => {
+    const h = await setup();
+    h.hooks.lineage = { proven: c.proven, reason: "test" };
+    if (c.marker === true) {
+      h.hooks.duringLineage = () =>
+        editRow(h.config, (row) => void (row.taskAttemptUnproven = true));
+    }
+    expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
+    expect(h.ledger.ownedAttempt(CHILD)).toStrictEqual({
+      generation: 1,
+      source: "reactivation",
+      attemptId: h.row()?.taskAttemptId,
+      receiptEligible: c.eligible,
+    });
+    expect(h.row()?.taskAttemptUnproven).toBe(c.eligible ? undefined : true);
+  });
+
+  test("a brief rewritten during the commit's awaits keeps no send id, and the turn sends the brief read before", async () => {
+    const h = await setup({ taskPrompt: BRIEF });
+    h.hooks.duringLineage = () => editRow(h.config, (row) => void (row.taskPrompt = "Rewritten"));
+    expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
+    expect(h.row()?.taskPrompt).toBe("Rewritten");
+    expect(h.row()?.taskPromptSendId).toBe(undefined);
+    expect(h.turns[0].args.prompt).toBe(`${BRIEF}\n\n${h.params[0].message}`);
+    expect(h.turns[0].args.sendIdentities).toStrictEqual([
+      {
+        id: expect.stringMatching(new RegExp(`^${MINTED_SEND_ID_PREFIX}`)) as string,
+        digest: computeSendDigest({ message: BRIEF }),
+        unpublished: true,
+      },
+    ]);
+  });
+
+  // The attempt is published before the turn and stays whatever the turn does; the live marker
+  // ends in the finally around the turn.
+  test.each([
+    { name: "a refused turn", turn: () => Promise.resolve(Err("no turn")), throws: false },
+    { name: "a throwing turn", turn: () => Promise.reject(new Error("turn threw")), throws: true },
+  ])("$name keeps the published attempt and ends the live reawakening", async (c) => {
+    const h = await setup();
+    h.hooks.turn = c.turn;
+    if (c.throws) await expect(h.send()).rejects.toThrow("turn threw");
+    else expect(await h.send()).toStrictEqual(Err({ code: "send_failed", message: "no turn" }));
+    expect(h.trace).toEqual([...OPEN, "unarchive", ...COMMIT, ...OWN_AND_TURN, ...CLOSE]);
+    const attemptId = h.row()?.taskAttemptId;
+    expect(isTaskAttemptId(attemptId) && attemptId !== PRIOR).toBe(true);
+    expect(h.ledger.ownedAttempt(CHILD)?.attemptId).toBe(attemptId);
+    expect(h.ledger.currentAttemptIdByTaskId.get(CHILD)).toBe(attemptId);
+    expect(h.turns[0].liveAtStart).toBe(true);
+    expect(h.ledger.hasLiveReawakening(CHILD)).toBe(false);
+  });
+
+  test("a legacy archived child that was running at the decision is reactivated", async () => {
+    // Only a flip to running since the decision refuses; this status was running all along.
+    const h = await setup({ archivedAt: AT, taskStatus: "running" });
+    expect(await h.send()).toMatchObject(Ok({ delivery: "reactivated" }));
+    expect(h.row()?.taskStatus).toBe("running");
+    expect(h.ledger.ownedAttempt(CHILD)?.attemptId).toBe(h.row()?.taskAttemptId);
+    expect(h.turns.length).toBe(1);
   });
 });
