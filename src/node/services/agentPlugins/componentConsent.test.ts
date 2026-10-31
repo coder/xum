@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
+import { SkillNameSchema } from "@/common/orpc/schemas";
+
 import type { MCPHttpServerInfo, MCPStdioServerInfo } from "@/common/types/mcp";
 import {
   consentForSelection,
@@ -11,6 +13,11 @@ import {
   visibleReviewText,
 } from "./componentConsent";
 import { skillDynamicDirectiveCommands } from "@/node/services/agentSkills/skillDynamicContext";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
+import { cursorRuleSkillMarkdown } from "./cursorRules";
 
 const root = "/home/u/.xum/plugins/demo";
 const data = "/home/u/.xum/plugin-data/abc";
@@ -195,6 +202,36 @@ describe("skillConsentFingerprint", () => {
     expect(visibleReviewText("rm -rf a\u00a0b\u202fc\u200bd")).toBe(
       "rm -rf a\\u{A0}b\\u{202F}c\\u{200B}d"
     );
+  });
+});
+
+describe("Cursor rule skill consent (D14)", () => {
+  /** The skill fingerprint of a rule file, through the conversion the scan sites run. */
+  function ruleFingerprint(text: string): string {
+    const content = cursorRuleSkillMarkdown(
+      { name: "prefer-const", file: "prefer-const.mdc" },
+      text
+    );
+    const parsed = parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(text),
+      directoryName: SkillNameSchema.parse("prefer-const"),
+    });
+    return skillConsentFingerprint({
+      relativeDir: "rules",
+      frontmatter: skillConsentFrontmatter(parsed),
+      body: parsed.body,
+    });
+  }
+
+  test("a change of the rule type needs a review; a prose edit does not", () => {
+    const always = ruleFingerprint(
+      "---\ndescription: Prefer const\nalwaysApply: true\n---\nUse const.\n"
+    );
+    expect(ruleFingerprint("---\ndescription: Prefer const\n---\nUse const.\n")).not.toBe(always);
+    expect(
+      ruleFingerprint("---\ndescription: Prefer const\nalwaysApply: true\n---\nAlways use const.\n")
+    ).toBe(always);
   });
 });
 
