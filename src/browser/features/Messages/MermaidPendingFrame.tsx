@@ -1,7 +1,7 @@
 import type { CSSProperties } from "react";
 
 // Shared by Mermaid's own pending state and the lazy-load fallback, so both reserve the
-// same box and nothing shifts when the Mermaid chunk arrives. Keep `mermaid` out of this
+// same box and nothing shifts when the Mermaid chunk arrives. Keep `pele` out of this
 // module: it is on the first load (T3, #5971).
 export const MERMAID_FRAME_STYLE: CSSProperties = {
   position: "relative",
@@ -12,8 +12,6 @@ export const MERMAID_FRAME_STYLE: CSSProperties = {
 };
 
 export const MERMAID_CONTAINER_STYLE: CSSProperties = {
-  maxWidth: "70%",
-  margin: "0 auto",
   minHeight: "300px",
 };
 

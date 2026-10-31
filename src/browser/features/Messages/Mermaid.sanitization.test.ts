@@ -10,7 +10,7 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitizeMermaidSvg("<svg><g></svg")).toBeNull();
   });
 
-  it("removes active content/unsafe attributes while preserving foreignObject labels", () => {
+  it("removes active content, foreignObject and unsafe attributes", () => {
     const input =
       '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">' +
       "<script>alert(1)</script>" +
@@ -35,7 +35,58 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitized).not.toContain("href=");
     expect(sanitized).toContain("<svg");
     expect(sanitized).toContain("<rect");
-    expect(sanitized).toContain("<foreignObject");
-    expect(sanitized).toContain("label");
+    expect(sanitized).not.toContain("foreignObject");
+    expect(sanitized).not.toContain("label");
+  });
+
+  const XHTML = "http://www.w3.org/1999/xhtml";
+  const MATHML = "http://www.w3.org/1998/Math/MathML";
+  const MATH = `<math xmlns="${MATHML}" display="block"><semantics><msup><mi>x</mi><mn>2</mn></msup><annotation encoding="application/x-tex">x^2</annotation></semantics></math>`;
+  // The shape Pele wraps around a resolver's `html` result.
+  const peleMathLabel = (divContent = MATH, divAttributes = "") =>
+    '<foreignObject class="pele-math" x="0" y="0" width="20" height="10" overflow="visible">' +
+    `<div xmlns="${XHTML}" style="display:flex"${divAttributes}>${divContent}</div>` +
+    "</foreignObject>";
+  const svgWith = (label: string) =>
+    `<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/>${label}</svg>`;
+
+  it("keeps Pele's MathML labels", () => {
+    const sanitized = sanitizeMermaidSvg(svgWith(peleMathLabel()));
+
+    expect(sanitized).toContain('<foreignObject class="pele-math"');
+    expect(sanitized).toContain("<msup><mi>x</mi><mn>2</mn></msup>");
+  });
+
+  it.each([
+    [
+      "an HTML label",
+      `<foreignObject><div xmlns="${XHTML}"><img src="x" onerror="alert(1)"/></div></foreignObject>`,
+    ],
+    ["an XHTML img instead of math", peleMathLabel('<img src="x" onerror="alert(1)"/>')],
+    ["MathML without a math root", peleMathLabel(`<mrow xmlns="${MATHML}"><mi>x</mi></mrow>`)],
+    ["a script beside the math", peleMathLabel(`${MATH}<script>alert(1)</script>`)],
+    [
+      "an XHTML element inside the math",
+      peleMathLabel(`<math xmlns="${MATHML}"><mi xmlns="${XHTML}">x</mi></math>`),
+    ],
+    // Inherits the MathML namespace, but the HTML parser builds an HTML <img> inside <mtext>.
+    [
+      "an HTML-named element inside the math",
+      peleMathLabel(
+        `<math xmlns="${MATHML}"><mtext><img src="https://example.com/beacon.png"/></mtext></math>`
+      ),
+    ],
+    ["an extra attribute on the wrapper", peleMathLabel(MATH, ' onclick="alert(1)"')],
+    // The HTML parser would read the math's text as CSS.
+    [
+      "a style element as the wrapper",
+      `<foreignObject class="pele-math"><style xmlns="${XHTML}" style="">${MATH}</style></foreignObject>`,
+    ],
+  ])("removes a foreignObject with %s", (_case, label) => {
+    const sanitized = sanitizeMermaidSvg(svgWith(label));
+
+    expect(sanitized).toContain("<rect");
+    expect(sanitized).not.toContain("foreignObject");
+    expect(sanitized).not.toContain("<img");
   });
 });
