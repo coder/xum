@@ -16,6 +16,7 @@ import {
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
 import type { ProjectConfig } from "@/node/config";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 
 type ApiClient = ReturnType<typeof useAPI>["api"];
 
@@ -868,6 +869,9 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
     const [isLoadingDefaultCloneDir, setIsLoadingDefaultCloneDir] = useState(false);
     const [hasLoadedDefaultCloneDir, setHasLoadedDefaultCloneDir] = useState(false);
     const cloneDirLoadNonceRef = useRef(0);
+    // The client whose load lost the connection (#6383). Its calls keep failing at once while
+    // offline, so it is not retried: the next client (reconnect) loads the directory.
+    const cloneDirLostClientRef = useRef<typeof api>(null);
     const projectCreateFormRef = useRef<ProjectCreateFormHandle | null>(null);
     const projectCloneFormRef = useRef<ProjectCloneFormHandle | null>(null);
 
@@ -880,12 +884,18 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
     );
 
     const ensureDefaultCloneDir = useCallback(async () => {
-      if (!api || isLoadingDefaultCloneDir || hasLoadedDefaultCloneDir) {
+      if (
+        !api ||
+        api === cloneDirLostClientRef.current ||
+        isLoadingDefaultCloneDir ||
+        hasLoadedDefaultCloneDir
+      ) {
         return;
       }
 
       setIsLoadingDefaultCloneDir(true);
       const nonce = cloneDirLoadNonceRef.current;
+      let loaded = true;
 
       try {
         const projectDir = await api.projects.getDefaultProjectDir();
@@ -894,12 +904,17 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
         }
         setDefaultProjectDir(projectDir);
       } catch (err) {
+        // A lost connection is not a load: leave it to the next client.
+        if (isConnectionLostError(err)) {
+          cloneDirLostClientRef.current = api;
+          loaded = false;
+        }
         console.error("Failed to fetch default project directory:", err);
       } finally {
         if (nonce === cloneDirLoadNonceRef.current) {
           // Mark as loaded even on failure to prevent infinite retry loops
           // when the backend is unavailable.
-          setHasLoadedDefaultCloneDir(true);
+          setHasLoadedDefaultCloneDir(loaded);
           setIsLoadingDefaultCloneDir(false);
         }
       }
