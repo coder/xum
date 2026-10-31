@@ -1278,20 +1278,30 @@ describe("TaskService settlement receipt producers (G2)", () => {
       title: "D",
     } as const;
 
-    function failingSanitizeHarness(config: Config) {
-      const { workspaceService } = createWorkspaceServiceMocks();
-      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
-        Promise.resolve("sanitize failed")
+    /** create returns at the reservation; its launch, and the failure it records, land after. */
+    async function createAndSettleLaunch(taskService: TaskService): Promise<void> {
+      expect(await taskService.create(direct)).toMatchObject({
+        success: true,
+        data: { status: "starting" },
+      });
+      await taskService.reservedLaunchesSettled();
+    }
+
+    /** A harness whose launches fail at the fork, before their send is admitted. */
+    function failingForkHarness(config: Config, projectPath: string) {
+      const harness = createHarness(config);
+      stubMaterialize(harness.svc, projectPath).mockImplementation(() =>
+        Promise.reject(new Error("fork failed"))
       );
-      return createHarness(config, { workspaceService });
+      return harness;
     }
 
     test("a failure before the send is admitted writes the receipt, and a restart proves the successor", async () => {
       const spawnedId = "directnosend";
-      const { config } = await setupTree([]);
+      const { config, projectPath } = await setupTree([]);
       stubStableIds(config, [spawnedId]);
-      const { taskService, svc } = failingSanitizeHarness(config);
-      expect((await taskService.create(direct)).success).toBe(false);
+      const { taskService, svc } = failingForkHarness(config, projectPath);
+      await createAndSettleLaunch(taskService);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
       expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
@@ -1309,49 +1319,18 @@ describe("TaskService settlement receipt producers (G2)", () => {
       expect(entryOf(restartedConfig, spawnedId)?.taskAttemptUnproven).toBeUndefined();
     });
 
-    test("a failure after the send was admitted settles in memory only", async () => {
-      const spawnedId = "directsent";
-      const { config } = await setupTree([]);
-      stubStableIds(config, [spawnedId]);
-      const { workspaceService } = createWorkspaceServiceMocks({
-        // Admitted, then failed without leaving work behind (the idle failure branch).
-        sendMessage: mock(
-          (
-            _id: string,
-            _prompt: string,
-            _options: unknown,
-            internal?: { turnAdmission?: TurnAdmissionToken }
-          ): Promise<Result<void>> => {
-            internal?.turnAdmission?.onDisposed("no-work");
-            return Promise.resolve(Err("provider unavailable"));
-          }
-        ),
-      });
-      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
-        Promise.resolve(undefined)
-      );
-      const { taskService, svc } = createHarness(config, { workspaceService });
-      expect((await taskService.create(direct)).success).toBe(false);
-      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
-      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-        attemptId,
-        phase: "settled",
-        source: "launch-failed",
-      });
-      await expectNoReceipt(config, spawnedId, attemptId);
-    });
-
     test("crash cut: a blocked receipt write leaves the failed launch closing", async () => {
       const spawnedId = "directcut";
-      const { config } = await setupTree([]);
+      const { config, projectPath } = await setupTree([]);
       stubStableIds(config, [spawnedId]);
       // The outermost owner is written first: blocking it leaves no copy anywhere.
       const blocker = path.join(ownerDir(config, rootId), "subagent-attempt-settlements");
       await fsPromises.mkdir(path.dirname(blocker), { recursive: true });
       await fsPromises.writeFile(blocker, "not a directory", "utf-8");
-      const { taskService, svc } = failingSanitizeHarness(config);
-      expect((await taskService.create(direct)).success).toBe(false);
+      const { taskService, svc } = failingForkHarness(config, projectPath);
+      await createAndSettleLaunch(taskService);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
       expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "closing",

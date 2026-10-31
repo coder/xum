@@ -17,7 +17,6 @@ import type { Config } from "@/node/config";
 import { configFilePath, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
-  SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
@@ -138,9 +137,6 @@ interface Internals {
     failure: { errorType: string; errorMessage: string },
     options: { expectedAttemptId: string | null }
   ) => Promise<void>;
-  /** The direct create's rollback: the only deleter of a failed launch's row, checkout and session. */
-  rollbackFailedTaskCreate: (...args: unknown[]) => Promise<void>;
-  emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -2187,7 +2183,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       afterRotation.onDisposed("no-work");
     });
 
-    test("a direct (unqueued) create owns its attempt as the first admission by construction; a Stop settles it", async () => {
+    test("a direct (unqueued) create returns at its reservation and owns that attempt as the first admission; a Stop settles it", async () => {
       const spawnedId = "directchild01";
       const { config } = await setupTree([]);
       stubStableIds(config, [spawnedId]);
@@ -2202,18 +2198,27 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         title: "Direct",
         isolation: "none",
       });
+      // create returns once the row is reserved; the launch runs after it, outside every lock.
       expect(created).toMatchObject({
         success: true,
-        data: { taskId: spawnedId, status: "running" },
+        data: { taskId: spawnedId, status: "starting" },
       });
       const entry = entryOf(config, spawnedId);
       expect(entry?.taskAttemptId).toMatch(ATTEMPT_ID);
       expect(entry?.taskAttemptUnproven).toBeUndefined();
-      expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)).toMatchObject({
-        source: "launch",
+      const owned = svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId);
+      expect(owned).toMatchObject({
+        source: "reservation",
         attemptId: entry!.taskAttemptId,
         receiptEligible: true,
       });
+      // The launch keeps the reserved attempt: same id, same owner, now live.
+      await taskService.reservedLaunchesSettled();
+      expect(entryOf(config, spawnedId)).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: entry!.taskAttemptId,
+      });
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)).toBe(owned);
       expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
         kind: "live",
         executionId: spawnedId,
@@ -2233,160 +2238,11 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, spawnedId)?.taskAttemptUnproven).toBeUndefined();
     });
 
-    test.each(["pending", "admitted", "pending-outlives", "admitted-outlives"] as const)(
-      "a direct create whose launch fails closes and drains its attempt and keeps the published workspace as an interrupted one (%s racing send); an owner outliving the bound defers settlement to its own end",
-      async (racing) => {
-        const outlives = racing.endsWith("-outlives");
-        const spawnedId = {
-          pending: "directfail001",
-          admitted: "directfail002",
-          "pending-outlives": "directfail003",
-          "admitted-outlives": "directfail004",
-        }[racing];
-        const { config } = await setupTree([]);
-        stubStableIds(config, [spawnedId]);
-        shortenTerminationTimers();
-        const order: string[] = [];
-        const racingTurn = Symbol("racing-turn");
-        let racingToken: TurnAdmissionToken | undefined;
-        let liveTurn: symbol | undefined;
-        const host = hostWithTurnEvents({
-          sendMessage: mock((workspaceId: string) => {
-            // The entry is persisted and announced, so a concurrent (user/peer) send reaches the
-            // fence while the launch send is in flight and is admitted under the launch's attempt:
-            // still in its own preflight (pending) or already the live turn (admitted) when the
-            // launch fails.
-            racingToken = admitted(
-              taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
-            );
-            if (racing.startsWith("admitted")) {
-              racingToken.onAdmitted(racingTurn);
-              liveTurn = racingTurn;
-            }
-            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
-          }),
-          clearQueue: mock(() => {
-            order.push("clearQueue");
-            // The racing send's next gate refuses it once its attempt is closed (its host disposes
-            // the obligation); a pending debt settles only through that disposal. In the
-            // outliving variant that host is stuck in a long preflight and gets there late.
-            if (racing === "pending" && racingToken?.admissionStale() === true) {
-              racingToken.onDisposed("refused");
-            }
-            return Ok(undefined);
-          }),
-          getActiveTurnGeneration: mock(() => liveTurn),
-        });
-        const settleRacingTurn = (workspaceId: string) => {
-          const turn = liveTurn;
-          if (turn == null) return;
-          liveTurn = undefined;
-          host.settleTurn(workspaceId, turn);
-        };
-        const stopStream = mock((workspaceId: string) => {
-          order.push("stopStream");
-          // The stopped turn settles like a real coordinator's idle transition — unless the
-          // stream hangs (outliving variant), in which case only its later settlement counts.
-          if (racing === "admitted") settleRacingTurn(workspaceId);
-          return Promise.resolve(Ok(undefined));
-        });
-        const { aiService } = createAIServiceMocks(config, { stopStream });
-        const { taskService } = createHarness(config, {
-          aiService,
-          workspaceService: host.workspaceService,
-        });
-        const svc = internals(taskService);
-        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate").mockImplementation(() => {
-          order.push("rollback");
-          return Promise.resolve();
-        });
-        try {
-          const created = await taskService.create({
-            parentWorkspaceId: rootId,
-            kind: "agent",
-            agentId: "explore",
-            prompt: "go",
-            title: "Direct",
-            isolation: "none",
-          });
-          expect(created.success).toBe(false);
-          if (created.success) throw new Error("unreachable");
-          expect(created.error).toContain("provider unavailable");
-          expect(racingToken).toBeDefined();
-          // A pending obligation reads stale from the closure on (and a discharged one always
-          // does); an admitted one belongs to its turn — captured by the stop record — until that
-          // turn settles, so the still-live turn's token is the one exception.
-          expect(racingToken?.admissionStale()).toBe(racing !== "admitted-outlives");
-          // Whatever happens next, create released the capacity mutex: a hung owner never pins
-          // task creation.
-          const lock = await raceWithTimeout(taskService.acquireTaskCreationLock(), 1_000);
-          await lock[Symbol.asyncDispose]();
-          // The published workspace is never deleted underneath the racing send: closure and the
-          // attempt's stop cascade (queue cleared, stream stopped) run, and the row stays as the
-          // durable marker — interrupted with its launch error, removable like any other.
-          expect(order).toEqual(["clearQueue", "stopStream"]);
-          expect(rollbackSpy).not.toHaveBeenCalled();
-          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-          expect(entryOf(config, spawnedId)?.taskLaunchError).toContain("provider unavailable");
-          if (!outlives) {
-            // The captured owners settled within the bound: record released, attempt settled.
-            // The release follows the settlement receipt's real disk write, which this test's
-            // compressed settle bound can outrun; the record still releases on its own (nothing
-            // below disposes a token or settles a turn), so wait for it instead of racing it.
-            await waitForStopRelease(taskService, spawnedId);
-            expect(svc.attemptLedger.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-            expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-              phase: "settled",
-            });
-            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
-              kind: "terminal-no-report",
-            });
-            return;
-          }
-          // The captured owner outlived the bound: NO settlement proof — the latch holds and the
-          // attempt reads cleanup-pending until that owner's own settlement.
-          expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-            phase: "closing",
-            source: "launch-failed",
-          });
-          expect((await taskService.readAttemptOutcome(spawnedId, requesting)).kind).toBe(
-            "cleanup-pending"
-          );
-          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
-          expect(
-            taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" })
-          ).toEqual({
-            kind: "refused",
-            message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
-          });
-          // Only the owner's actual settlement releases the record and settles the attempt.
-          if (racing === "pending-outlives") racingToken?.onDisposed("refused");
-          else settleRacingTurn(spawnedId);
-          await waitForStopRelease(taskService, spawnedId);
-          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-          expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-            phase: "settled",
-            source: "stop-settled",
-          });
-          expect(svc.attemptLedger.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
-            kind: "terminal-no-report",
-          });
-          // Deferred means deferred: the interrupted workspace remains for the user or parent to
-          // remove; nothing deletes it behind their back.
-          expect(rollbackSpy).not.toHaveBeenCalled();
-          expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-        } finally {
-          rollbackSpy.mockRestore();
-        }
-      }
-    );
-
     // ---------------------------------------------------------------------------------------------
     // Direct create vs. another writer (a second backend on the same root — its startup re-drive or
     // reawaken rotates the published row A → B while this launch is still in flight). The launch
-    // is decided for A: it never dispatches under B, and its failure never touches B's row, queue
-    // or stream; only A's own obligations are accounted for.
+    // is decided for A: its failure never touches B's row, queue or stream. A launch that sees B
+    // before its send stops without touching it (taskService.reservedLaunch.test.ts).
     // ---------------------------------------------------------------------------------------------
     const FOREIGN_ATTEMPT_ID = "att_00000000000000b2";
     /** The other backend's re-admission of the row: fresh unproven id, running (a reawaken). */
@@ -2405,100 +2261,29 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       });
     }
 
-    test("a direct create whose row another writer re-admitted before the launch admission refuses to dispatch under the successor and leaves that row alone", async () => {
-      const spawnedId = "directforeign1";
-      const { config } = await setupTree([]);
-      stubStableIds(config, [spawnedId]);
-      const otherBackend = await createTestConfig(rootDir);
-      const host = createWorkspaceServiceMocks();
-      const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
-      const svc = internals(taskService);
-      let mintedAttemptId: string | undefined;
-      const emitOriginal = svc.emitWorkspaceMetadata.bind(taskService);
-      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
-        // The entry is persisted and about to be announced; the other writer's rotation lands
-        // in the announcement's own await, before this launch binds its send.
-        if (id === spawnedId && mintedAttemptId == null) {
-          mintedAttemptId = entryOf(config, spawnedId)?.taskAttemptId;
-          await rotateRowElsewhere(otherBackend, spawnedId);
-        }
-        return emitOriginal(id);
-      });
-      const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
-      try {
-        const created = await taskService.create({
-          parentWorkspaceId: rootId,
-          kind: "agent",
-          agentId: "explore",
-          prompt: "go",
-          title: "Foreign",
-          isolation: "none",
-        });
-        expect(created).toEqual(Err(SEND_ADMISSION_STALE_MESSAGE));
-        expect(mintedAttemptId).toMatch(ATTEMPT_ID);
-        // No prompt went out under B, and B's row is exactly as its writer left it.
-        expect(host.sendMessage).not.toHaveBeenCalled();
-        expect(rollbackSpy).not.toHaveBeenCalled();
-        expect(entryOf(config, spawnedId)).toMatchObject({
-          taskStatus: "running",
-          taskAttemptId: FOREIGN_ATTEMPT_ID,
-        });
-        expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
-        expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-        expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-        // This process still owns A; idle under it, the launch failure settles exactly A.
-        expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(
-          mintedAttemptId
-        );
-        expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-          attemptId: mintedAttemptId,
-          phase: "settled",
-          source: "launch-failed",
-        });
-        // B's row stays open to its own writer's sends (bound unowned here).
-        expect(
-          taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" }).kind
-        ).toBe("admitted");
-      } finally {
-        rollbackSpy.mockRestore();
-      }
-    });
-
-    test.each([
-      ["before the marker's CAS", "idle"],
-      ["before the marker's CAS", "pending"],
-      ["before the marker's CAS", "admitted"],
-      ["after the marker committed", "idle"],
-      ["after the marker committed", "pending"],
-      ["after the marker committed", "admitted"],
-    ] as const)(
-      "a direct launch failure whose row another writer re-admitted %s (A %s) writes no marker, stops nothing and settles A only when nothing runs under it",
-      async (rotateAt, liveness) => {
-        const spawnedId = `directforeign${rotateAt.startsWith("before") ? "b" : "a"}${liveness}`;
+    test.each(["before the marker's CAS", "after the marker committed"] as const)(
+      "a direct launch failure whose row another writer re-admitted %s leaves that writer's row and its sends alone",
+      async (rotateAt) => {
+        const spawnedId = `directforeign${rotateAt.startsWith("before") ? "b" : "a"}`;
         const { config } = await setupTree([]);
         stubStableIds(config, [spawnedId]);
         const otherBackend = await createTestConfig(rootDir);
-        const racingTurn = Symbol("racing-turn");
-        let racingToken: TurnAdmissionToken | undefined;
-        let liveTurn: symbol | undefined;
         let launchSendFailed = false;
-        const host = hostWithTurnEvents({
-          sendMessage: mock((workspaceId: string) => {
-            if (liveness !== "idle") {
-              // A user send admitted under A while the launch send is in flight: still in its
-              // own preflight (pending) or already the live turn (admitted) when the launch fails.
-              racingToken = admitted(
-                taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
-              );
-              if (liveness === "admitted") {
-                racingToken.onAdmitted(racingTurn);
-                liveTurn = racingTurn;
-              }
+        const host = createWorkspaceServiceMocks({
+          sendMessage: mock(
+            (
+              _id: string,
+              _prompt: string,
+              _options: unknown,
+              internal?: { turnAdmission?: TurnAdmissionToken }
+            ): Promise<Result<void>> => {
+              // The launch's own send is admitted and fails; the host disposes its token, as the
+              // real WorkspaceService does on every return that queued nothing.
+              internal?.turnAdmission?.onDisposed("refused");
+              launchSendFailed = true;
+              return Promise.resolve(Err("provider unavailable"));
             }
-            launchSendFailed = true;
-            return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
-          }),
-          getActiveTurnGeneration: mock(() => liveTurn),
+          ),
         });
         const stopStream = mock(() => Promise.resolve(Ok(undefined)));
         const { aiService } = createAIServiceMocks(config, { stopStream });
@@ -2525,126 +2310,6 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           await rotateRowElsewhere(otherBackend, spawnedId);
           return result;
         });
-        const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
-        try {
-          const created = await taskService.create({
-            parentWorkspaceId: rootId,
-            kind: "agent",
-            agentId: "explore",
-            prompt: "go",
-            title: "Foreign",
-            isolation: "none",
-          });
-          expect(created.success).toBe(false);
-          if (created.success) throw new Error("unreachable");
-          expect(created.error).toContain("provider unavailable");
-          expect(rotated).toBe(true);
-          expect(mintedAttemptId).toMatch(ATTEMPT_ID);
-          // B's row is its writer's: no marker of ours, no deletion, no latch, no stop record.
-          expect(rollbackSpy).not.toHaveBeenCalled();
-          expect(host.clearQueue).not.toHaveBeenCalled();
-          expect(stopStream).not.toHaveBeenCalled();
-          expect(entryOf(config, spawnedId)).toMatchObject({
-            taskStatus: "running",
-            taskAttemptId: FOREIGN_ATTEMPT_ID,
-          });
-          expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
-          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-          expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(
-            mintedAttemptId
-          );
-          if (liveness === "idle") {
-            expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-              attemptId: mintedAttemptId,
-              phase: "settled",
-              source: "launch-failed",
-            });
-            return;
-          }
-          // A's own obligation is still live — in its preflight (pending) or the live turn
-          // (admitted, not stopped: under B's row the session's turn is not ours to cut). No
-          // settlement proof is minted for it: A stays `closing` (a memory-only entry, dropped by
-          // the next rotation in this process). The obligation itself is released by the
-          // existing signals — a pending one reads stale (the row no longer names A) and is
-          // disposed by its host at its next gate; an admitted one is discharged when its turn
-          // settles — so no orphan obligation outlives the launch failure.
-          expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-            attemptId: mintedAttemptId,
-            phase: "closing",
-            source: "launch-failed",
-          });
-          const obligations = [...(svc.attemptLedger.admittedSendsByTaskId.get(spawnedId) ?? [])];
-          expect(obligations).toHaveLength(1);
-          expect(obligations[0]).toMatchObject({
-            attemptId: mintedAttemptId,
-            state: liveness,
-          });
-          if (liveness === "pending") {
-            expect(racingToken?.admissionStale()).toBe(true);
-            racingToken?.onDisposed("refused");
-          } else {
-            // The live turn belongs to its coordinator until it settles; then the ledger releases
-            // it exactly as for any settled turn (recordWorkspaceTurnSettled).
-            expect(racingToken?.admissionStale()).toBe(false);
-            liveTurn = undefined;
-            host.settleTurn(spawnedId, racingTurn);
-          }
-          expect(svc.attemptLedger.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-          expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-            attemptId: mintedAttemptId,
-            phase: "closing",
-          });
-          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-          expect(entryOf(config, spawnedId)).toMatchObject({
-            taskStatus: "running",
-            taskAttemptId: FOREIGN_ATTEMPT_ID,
-          });
-        } finally {
-          rollbackSpy.mockRestore();
-        }
-      }
-    );
-
-    test("a direct launch failure whose row another writer re-admits during its stop cascade finishes settling A and leaves B's row alone", async () => {
-      const spawnedId = "directforeign6";
-      const { config } = await setupTree([]);
-      stubStableIds(config, [spawnedId]);
-      shortenTerminationTimers();
-      const otherBackend = await createTestConfig(rootDir);
-      const racingTurn = Symbol("racing-turn");
-      let racingToken: TurnAdmissionToken | undefined;
-      let liveTurn: symbol | undefined;
-      const host = hostWithTurnEvents({
-        sendMessage: mock((workspaceId: string) => {
-          // A user send admitted under A is already the live turn when the launch fails.
-          racingToken = admitted(
-            taskService.admitTaskWorkspaceTurn(workspaceId, { acceptanceOrigin: "manual" })
-          );
-          racingToken.onAdmitted(racingTurn);
-          liveTurn = racingTurn;
-          return Promise.resolve(Err({ type: "unknown", raw: "provider unavailable" }));
-        }),
-        getActiveTurnGeneration: mock(() => liveTurn),
-      });
-      // Phase B targets A's captured turn; the other writer's rotation lands in this very await
-      // and the stopped turn hangs past the bound (the cleanup wait is abandoned at the shortened
-      // deadline, so the rotation is awaited explicitly below before the row is read).
-      const rotation = Promise.withResolvers<void>();
-      const stopStream = mock(async () => {
-        await rotateRowElsewhere(otherBackend, spawnedId);
-        rotation.resolve();
-        return Ok(undefined);
-      });
-      const { aiService } = createAIServiceMocks(config, { stopStream });
-      const { taskService } = createHarness(config, {
-        aiService,
-        workspaceService: host.workspaceService,
-      });
-      const svc = internals(taskService);
-      const rollbackSpy = spyOn(svc, "rollbackFailedTaskCreate");
-      try {
         const created = await taskService.create({
           parentWorkspaceId: rootId,
           kind: "agent",
@@ -2653,56 +2318,35 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           title: "Foreign",
           isolation: "none",
         });
-        expect(created.success).toBe(false);
-        expect(stopStream).toHaveBeenCalledTimes(1);
-        // Keep this bound outside shortenTerminationTimers' fast-forward window around
-        // ATTEMPT_CLOSURE_SETTLE_WAIT_MS: a 5 s bound fired at 0 ms and failed on slow runners
-        // before the other writer's config write landed.
-        assert(ATTEMPT_CLOSURE_SETTLE_WAIT_MS < 10_000, "the rotation bound must not be shortened");
-        await raceWithTimeout(rotation.promise, 10_000);
-        const mintedAttemptId = svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.attemptId;
-        expect(mintedAttemptId).toMatch(ATTEMPT_ID);
-        // The captured owner outlived the bound: the latch holds for A's turn, and B's row —
-        // written after our marker — is untouched (no deletion, no second marker).
-        expect(rollbackSpy).not.toHaveBeenCalled();
-        expect(svc.taskStopLatch.workspaceStopRecords.get(spawnedId)).toMatchObject({
-          attemptId: mintedAttemptId,
+        expect(created).toMatchObject({
+          success: true,
+          data: { taskId: spawnedId, status: "starting" },
         });
+        await taskService.reservedLaunchesSettled();
+        expect(launchSendFailed).toBe(true);
+        expect(rotated).toBe(true);
+        expect(mintedAttemptId).toMatch(ATTEMPT_ID);
+        // B's row is its writer's: no marker of ours survives, nothing is stopped or latched.
+        expect(host.clearQueue).not.toHaveBeenCalled();
+        expect(stopStream).not.toHaveBeenCalled();
         expect(entryOf(config, spawnedId)).toMatchObject({
           taskStatus: "running",
           taskAttemptId: FOREIGN_ATTEMPT_ID,
         });
-        expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-          attemptId: mintedAttemptId,
-          phase: "closing",
-          source: "launch-failed",
-        });
-        // `rotation` resolves inside stopStream, a few microtasks before the cascade's cleanup
-        // promise settles and hands its in-flight count back; the record cannot release while
-        // that cleanup is still counted, so wait for it before checking that only A's turn holds.
-        await waitForCondition(
-          () => svc.taskStopLatch.workspaceStopRecords.get(spawnedId)?.cleanupInFlight === 0
-        );
-        expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
-        // Only A's turn settling releases the record and settles A; B's row stays as it was.
-        liveTurn = undefined;
-        host.settleTurn(spawnedId, racingTurn);
+        expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
         expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
         expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
-        expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
-          attemptId: mintedAttemptId,
-          phase: "settled",
-          source: "stop-settled",
-        });
-        expect(rollbackSpy).not.toHaveBeenCalled();
-        expect(entryOf(config, spawnedId)).toMatchObject({
-          taskStatus: "running",
-          taskAttemptId: FOREIGN_ATTEMPT_ID,
-        });
-      } finally {
-        rollbackSpy.mockRestore();
+        // This process still owns A, never B.
+        expect(svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(
+          mintedAttemptId
+        );
+        // B's row stays open to its own writer's sends (bound unowned here).
+        const admission = admitted(
+          taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "manual" })
+        );
+        admission.onDisposed("no-work");
       }
-    });
+    );
 
     test.each(["id", "status"] as const)(
       "startup re-drive refuses to overwrite a row whose %s moved after the recovery snapshot",
