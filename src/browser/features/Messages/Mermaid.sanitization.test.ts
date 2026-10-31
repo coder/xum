@@ -485,6 +485,80 @@ describe("sanitizeMermaidSvg", () => {
     expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
   });
 
+  // DOMParser parses stylesheet text while it builds the tree, and the attribute scan never reads
+  // it. Pele writes no <style>.
+  const stylesheet = `rect{fill:${nestedColorMix(22)}}`;
+  it.each([
+    ["an SVG <style>", `<style>${stylesheet}</style>`],
+    ["a prefixed <style>", `<x:style xmlns:x="http://www.w3.org/2000/svg">${stylesheet}</x:style>`],
+    ["an uppercase <STYLE>", `<STYLE>${stylesheet}</STYLE>`],
+    [
+      "an XHTML <style> in foreignObject",
+      `<foreignObject><style xmlns="${XHTML}">${stylesheet}</style></foreignObject>`,
+    ],
+    ["a <style> in <desc>", `<desc><style>${stylesheet}</style></desc>`],
+  ])("returns null for %s", (_case, element) => {
+    expect(sanitizeMermaidSvg(svgWith(element), ID_PREFIX)).toBeNull();
+  });
+
+  // Chromium nests each var() when it computes styles after insert, in time that doubles with each
+  // level, while each declaration nests only 2 deep.
+  const chainLink = (level: number) => `color-mix(in srgb, var(--d${level}), blue)`;
+  const varChain = (depth: number) =>
+    Array.from({ length: depth }, (_, level) => `--d${level + 1}:${chainLink(level)}`).join(";");
+  it("removes a style that chains custom properties on one element", () => {
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(`<rect style="--d0:#zzz;${varChain(22)};fill:var(--d22)"/>`),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<rect> style"))).toEqual([]);
+  });
+
+  it("removes styles that chain custom properties down nested elements", () => {
+    const groups = Array.from(
+      { length: 20 },
+      (_, level) => `<g style="--d${level + 1}:${chainLink(level)}">`
+    ).join("");
+    const sanitized =
+      sanitizeMermaidSvg(
+        svgWith(
+          `<g style="--d0:#zzz">${groups}<rect style="fill:var(--d20)"/>${"</g>".repeat(21)}`
+        ),
+        ID_PREFIX
+      ) ?? "";
+
+    expect(sanitized).toContain("<g");
+    expect(htmlParts(sanitized).filter((part) => part.startsWith("<g> style"))).toEqual([]);
+  });
+
+  // Pele declares its custom properties only on the root, and each one only reads a theme variable.
+  it.each([
+    ["a Pele property on a rect", svgWith(`<rect style="--_r:var(--pele-radius,4px)"/>`)],
+    ["an unknown property on the root", svgRoot(`style="--d0:var(--pele-bg,#fff)"`)],
+    ["a root property that reads another", svgRoot(`style="--_a:var(--_b)"`)],
+    [
+      "a root property that reads one in a fallback",
+      svgRoot(`style="--_a:var(--pele-a,var(--_b))"`),
+    ],
+    ["a root property that reads a non-theme one", svgRoot(`style="--_a:var(--color-a)"`)],
+    // A ; in a block does not end a custom property, a { block after it joins its value, and a
+    // declaration can start after a } block.
+    [
+      "a root property with a ; in a function",
+      svgRoot(`style="--_a:var(--pele-a,calc(1;var(--_b)))"`),
+    ],
+    ["a root property before a { block", svgRoot(`style="--_a:var(--pele-a,red){;var(--_b)}"`)],
+    ["a root property after a } block", svgRoot(`style="a{}--d0:var(--pele-a,red)"`)],
+  ])("removes a style that declares %s", (_case, svg) => {
+    const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX) ?? "";
+
+    expect(sanitized).toContain("<rect");
+    expect(htmlParts(sanitized).filter((part) => part.includes("> style"))).toEqual([]);
+  });
+
   // CSS reads each of these as one level of nesting.
   it.each([
     ["a quoted value", "font-family:'X'"],
@@ -682,13 +756,24 @@ describe("sanitizeMermaidSvg on Pele's output", () => {
     expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toContain(LABEL);
   });
 
-  it("keeps a label with deeply nested parentheses in its text", () => {
-    const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
-    const { svg } = renderPele(
-      `sequenceDiagram\n  participant A\n  A->>A: ${label}`,
-      peleRenderOptions({ idPrefix: ID_PREFIX, ...fonts })
-    );
+  // Pele wraps the label into tspans where its font measure finds the label too wide, and that
+  // measure differs between machines, so at 94 it wraps everywhere.
+  it.each([undefined, 94])(
+    "keeps a label with deeply nested parentheses in its text at %p",
+    (maxWidth) => {
+      const label = `${"f(".repeat(40)}x${")".repeat(40)}`;
+      const { svg } = renderPele(
+        `sequenceDiagram\n  participant A\n  A->>A: ${label}`,
+        peleRenderOptions({ idPrefix: ID_PREFIX, maxWidth, ...fonts })
+      );
+      const parse = (markup: string) =>
+        new DOMParser().parseFromString(markup, "image/svg+xml").documentElement;
 
-    expect(sanitizeMermaidSvg(svg, ID_PREFIX)).toContain(`>${label}<`);
-  });
+      const sanitized = sanitizeMermaidSvg(svg, ID_PREFIX);
+
+      expect(sanitized).not.toBeNull();
+      expect(sanitized).toBe(parse(svg).outerHTML);
+      expect(parse(sanitized ?? "").textContent).toContain(label);
+    }
+  );
 });
