@@ -222,6 +222,14 @@ function peleNamespace(namespace: string | null): PeleNamespace {
   return rules;
 }
 
+/**
+ * Lowercases A-Z only, like the HTML parser. String.toLowerCase maps the Kelvin sign U+212A to k,
+ * so a name that the browser does not read as stroke would match stroke.
+ */
+function asciiLowerCase(name: string): string {
+  return name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
 // The CSS functions in Pele's output, plus the color functions a chart's styles can use.
 const PELE_CSS_FUNCTIONS = new Set([
   "calc",
@@ -267,7 +275,7 @@ function usesOnlyPeleFunctions(css: string): boolean {
   const tokens = css.match(/[\w-]+|[^ \t\n\r\f]/g) ?? [];
   return tokens.every(
     (token, index) =>
-      token !== "(" || PELE_CSS_FUNCTIONS.has(tokens[index - 1]?.toLowerCase() ?? "")
+      token !== "(" || PELE_CSS_FUNCTIONS.has(asciiLowerCase(tokens[index - 1] ?? ""))
   );
 }
 
@@ -302,7 +310,7 @@ function sanitizeAttributes(element: Element, idPrefix: string): void {
   const rules = peleNamespace(element.namespaceURI);
   for (const attribute of Array.from(element.attributes)) {
     // Lowercase like the HTML parser, which turns an XML FILL attribute into fill.
-    const name = attribute.name.toLowerCase();
+    const name = asciiLowerCase(attribute.name);
     const value = keptAttributeValue(rules, name, attribute.value, idPrefix);
     if (value === null) element.removeAttributeNode(attribute);
     else attribute.value = value;
@@ -312,14 +320,14 @@ function sanitizeAttributes(element: Element, idPrefix: string): void {
 /** A <math> tree that holds only the elements KaTeX emits. */
 function isKatexMathml(math: Element | null): boolean {
   // mutation-equivalent: isPeleMathLabel passes a div's only child, so math is never null
-  if (math?.localName.toLowerCase() !== "math") return false;
+  if (math === null || asciiLowerCase(math.localName) !== "math") return false;
   const { elements } = peleNamespace(MATHML_NS);
   // Lowercase like the HTML parser does with MathML tag names.
   return [math, ...Array.from(math.querySelectorAll("*"))].every(
     (element) =>
       element.namespaceURI === MATHML_NS &&
       element.prefix === null &&
-      elements.has(element.localName.toLowerCase())
+      elements.has(asciiLowerCase(element.localName))
   );
 }
 
@@ -349,7 +357,7 @@ function removeUnknownElements(parent: Element): void {
   const svg = peleNamespace(SVG_NS);
   for (const child of Array.from(parent.children)) {
     const svgName =
-      child.namespaceURI === SVG_NS && child.prefix === null ? child.localName.toLowerCase() : "";
+      child.namespaceURI === SVG_NS && child.prefix === null ? asciiLowerCase(child.localName) : "";
     if (svgName === "foreignobject" && isPeleMathLabel(child)) continue;
     if (!svg.elements.has(svgName)) {
       child.remove();
@@ -386,7 +394,7 @@ export function sanitizeMermaidSvg(svg: string, idPrefix: string): string | null
     return null;
   }
   const svgRoot = xmlDoc.documentElement;
-  if (svgRoot.namespaceURI !== SVG_NS || svgRoot.tagName.toLowerCase() !== "svg") {
+  if (svgRoot.namespaceURI !== SVG_NS || asciiLowerCase(svgRoot.tagName) !== "svg") {
     return null;
   }
 
