@@ -619,8 +619,23 @@ function trustsCursorHook(
   });
 }
 
-function fileReviewDigest(changes: readonly AgentPluginCapabilityChange[]): string {
-  return createHash("sha256").update(JSON.stringify(changes)).digest("hex");
+/**
+ * The rows as shown, plus each entry's kind, mode and content hash (Codex review): a binary or
+ * large file's row shows no bytes, so the rows alone would not change when such a file does.
+ */
+function fileReviewDigest(
+  changes: readonly AgentPluginCapabilityChange[],
+  records: readonly PluginTreeRecord[]
+): string {
+  const entries = records.map((record) => [
+    record.path,
+    record.kind,
+    record.mode,
+    pluginTreeRecordContent(record),
+  ]);
+  return createHash("sha256")
+    .update(JSON.stringify([changes, entries]))
+    .digest("hex");
 }
 
 function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
@@ -654,13 +669,33 @@ function fileReviewRow(
   // A row without the text of a side must say so: an empty row reads as a harmless change.
   const hidden = textHidden(was, before) || textHidden(now, after);
   return {
-    summary: `file ${showOneLineControls(filePath)} ${verb}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
+    summary: `${treeEntryNoun(was, now)} ${showOneLineControls(filePath)} ${verb}${modeNote(was, now)}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
     ...(before !== undefined ? { before } : {}),
     ...(after !== undefined ? { after } : {}),
   };
 }
 
 const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+/**
+ * "file" or "symlink" (Codex review): a symlink's text is its target, so an added symlink must not
+ * read as a file holding that text. A row whose entry changes kind names both.
+ */
+function treeEntryNoun(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined) {
+  const noun = (record: PluginTreeRecord) => (record.kind === "symlink" ? "symlink" : "file");
+  const newest = now ?? was;
+  assert(newest !== undefined, "a review row has a side");
+  if (was === undefined || now === undefined) return noun(newest);
+  return noun(was) === noun(now) ? noun(now) : `${noun(was)} → ${noun(now)}`;
+}
+
+/** A permission change is consent-relevant (sameTreeEntry), and a chmod alone shows no text change. */
+function modeNote(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined): string {
+  const bits = (record: PluginTreeRecord) => (record.mode & 0o7777).toString(8);
+  // A symlink's own mode means nothing on most systems: only a file's bits are shown.
+  if (was?.kind !== "file" || now?.kind !== "file" || bits(was) === bits(now)) return "";
+  return ` (mode ${bits(was)} → ${bits(now)})`;
+}
 
 function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
   return record?.kind === "file" && text === undefined;
@@ -4914,9 +4949,10 @@ export class AgentPluginInstallService {
     trust: PluginHookTrustRecord
   ): Promise<AgentPluginHooks["fileReview"]> {
     if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
-    const changes = fileReviewRows(null, await this.fileReviewRecords(plugin.rootPath));
+    const records = await this.fileReviewRecords(plugin.rootPath);
+    const changes = fileReviewRows(null, records);
     assertReviewFits(changes);
-    return { changes, digest: fileReviewDigest(changes) };
+    return { changes, digest: fileReviewDigest(changes, records) };
   }
 
   /**

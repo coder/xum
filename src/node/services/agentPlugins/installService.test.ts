@@ -9057,13 +9057,48 @@ describe("file review of a Cursor plugin with a runnable command hook (D1, D30)"
     await fsPromises.writeFile(secret, "echo OUTSIDE-SECRET-CONTENT\n");
     await fsPromises.rm(path.join(remoteDir, "hooks", "lib.sh"));
     await fsPromises.symlink(secret, path.join(remoteDir, "hooks", "lib.sh"));
+    await fsPromises.symlink("stop.sh", path.join(remoteDir, "hooks", "link.sh"));
     await commitAll(remoteDir, "link lib");
 
     const review = await service.previewUpdate({ name: "looper" });
-    expect(review.changes.filter((change) => change.summary.startsWith("file "))).toEqual([
-      { summary: "file hooks/lib.sh changed", before: "echo lib\n", after: secret },
+    // The row names the kind: a symlink's text is its target, not the contents of a file.
+    expect(review.changes.filter((change) => /^(file|symlink) /.test(change.summary))).toEqual([
+      { summary: "file → symlink hooks/lib.sh changed", before: "echo lib\n", after: secret },
+      { summary: "symlink hooks/link.sh added", after: "stop.sh" },
     ]);
     expect(JSON.stringify(review)).not.toContain("OUTSIDE-SECRET-CONTENT");
+  });
+
+  test("a permission change alone is listed with both modes", async () => {
+    await install();
+    await fsPromises.chmod(path.join(remoteDir, "hooks", "lib.sh"), 0o755);
+    await commitAll(remoteDir, "chmod lib");
+
+    const [row] = await fileRows();
+    expect(row.summary).toMatch(/^file hooks\/lib\.sh changed \(mode [0-7]+ → [0-7]*7[0-7]{2}\)$/);
+    expect(row.before).toBe(row.after);
+  });
+
+  test("a hidden file that changes after the first-trust review voids that review", async () => {
+    // Its row shows no bytes, so only its content hash in the digest can tell the change.
+    await writeFiles({ "hooks/big.bin": Buffer.alloc(70 * 1024, 1) });
+    await commitAll(remoteDir, "big");
+    await install();
+    const shown = await service.getHooks({ name: "looper" });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "plugins", "looper", "hooks", "big.bin"),
+      Buffer.alloc(70 * 1024, 2)
+    );
+    const [stop] = shown.hooks;
+    await expect(
+      service.setHookTrust({
+        name: "looper",
+        key: stop.key,
+        hash: stop.hash,
+        state: "trusted",
+        fileReviewDigest: shown.fileReview?.digest,
+      })
+    ).rejects.toThrow("This plugin's files changed since you reviewed them. Review them again.");
   });
 
   test("a prose-only SKILL.md change and a changed skill helper each get a file row", async () => {
