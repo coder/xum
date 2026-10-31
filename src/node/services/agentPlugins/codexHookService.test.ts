@@ -596,3 +596,93 @@ describe("CodexPluginHookService", () => {
     });
   });
 });
+
+/**
+ * Cursor command hooks in a workspace, with a real Cursor plugin, registry and trust store, and
+ * the local runtime. The per-call gate rereads the hooks in the Cursor format.
+ */
+describe("CodexPluginHookService with a Cursor plugin", () => {
+  let tmp: DisposableTempDir;
+  let xumHome: string;
+  let spine: EventSpine;
+  let service: CodexPluginHookService;
+
+  const root = () => path.join(xumHome, "plugins", "ralph");
+  const writeHooks = (command: string) =>
+    fs.writeFile(
+      path.join(root(), "hooks", "hooks.json"),
+      JSON.stringify({ version: 1, hooks: { stop: [{ command }] } })
+    );
+  const followup = `echo '{"followup_message":"again"}'`;
+
+  async function installRalph() {
+    await fs.mkdir(path.join(root(), ".cursor-plugin"), { recursive: true });
+    await fs.mkdir(path.join(root(), "hooks"), { recursive: true });
+    await fs.writeFile(
+      path.join(root(), ".cursor-plugin", "plugin.json"),
+      JSON.stringify({ name: "ralph" })
+    );
+    await writeHooks(followup);
+    await fs.writeFile(
+      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("ralph")] })
+    );
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+    for (const hook of plugin?.cursorHooks?.hooks ?? []) {
+      await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
+        key: hook.key,
+        hash: hook.hash,
+        state: "trusted",
+      });
+    }
+  }
+
+  const args = (overrides: Partial<EnsureCodexHooksArgs> = {}): EnsureCodexHooksArgs => ({
+    workspaceId,
+    xumHome,
+    transcriptPath: path.join(xumHome, "sessions", workspaceId, "chat.jsonl"),
+    isProjectTrusted: () => true,
+    // A local multi-project workspace has no plugin MCP: Cursor command hooks still run there.
+    noPluginMcp: true,
+    cursorHookRuntime: new LocalRuntime(xumHome),
+    notifyUser: () => undefined,
+    sideChat: false,
+    ...overrides,
+  });
+
+  const stop = () =>
+    runTurnStopHooks(spine, workspaceId, {
+      messageId: "m1",
+      lastAssistantMessage: "done",
+      turnContinuations: 0,
+      hookContinuations: new Map(),
+      cwd: xumHome,
+    });
+
+  beforeEach(async () => {
+    tmp = new DisposableTempDir("cursor-hook-service");
+    xumHome = await fs.realpath(tmp.path);
+    spine = new EventSpine();
+    service = new CodexPluginHookService(spine);
+    await installRalph();
+  });
+
+  afterEach(async () => {
+    await service.disposeWorkspace(workspaceId);
+    tmp[Symbol.dispose]();
+  });
+
+  test("a trusted hook that hooks/hooks.json still declares runs; a changed command is refused", async () => {
+    await service.ensureWorkspaceHooks(args());
+    expect((await stop()).kind).toBe("continue");
+    await writeHooks(`${followup} # changed`);
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
+  test("no Cursor hook registers in a /side chat or without a host runtime", async () => {
+    await service.ensureWorkspaceHooks(args({ sideChat: true }));
+    expect(spine.hasMiddlewareFor("turn.stop", workspaceId)).toBe(false);
+    await service.ensureWorkspaceHooks(args({ cursorHookRuntime: undefined }));
+    expect(spine.hasMiddlewareFor("turn.stop", workspaceId)).toBe(false);
+  });
+});

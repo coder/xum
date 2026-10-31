@@ -176,7 +176,9 @@ function readHooks(
   if (typeof value === "string") {
     const normalized = claudeComponentPath(value);
     if (normalized !== undefined) return { hooks: normalized };
-    warnings.push(`'hooks' path ${JSON.stringify(value)} is outside the plugin folder; ignoring it`);
+    warnings.push(
+      `'hooks' path ${JSON.stringify(value)} is outside the plugin folder; ignoring it`
+    );
     notApplied.push({
       part: "field",
       name: `hooks: ${value}`,

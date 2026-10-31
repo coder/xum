@@ -587,6 +587,65 @@ describe("turn.stop", () => {
     });
   }
 
+  test("a hard interruptStream while the turn.stop chain runs aborts the chain's abortSignal", async () => {
+    const chainRunning = Promise.withResolvers<void>();
+    let abortedBeforeStop: boolean | undefined;
+    let abortedAfterStop: boolean | undefined;
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          const signal = ctx.abortSignal;
+          assert(signal !== undefined);
+          abortedBeforeStop = signal.aborted;
+          chainRunning.resolve();
+          // As a hook process does: it runs until the Stop kills it (bounded, so a missing abort
+          // fails the assertion below instead of hanging the session).
+          await new Promise((resolve) => {
+            signal.addEventListener("abort", resolve, { once: true });
+            setTimeout(resolve, 2_000);
+          });
+          abortedAfterStop = signal.aborted;
+        },
+        { workspaceId }
+      )
+    );
+    const { h, streams } = await setup();
+    await h.session.sendMessage("fix the tests", options);
+    await chainRunning.promise;
+    await h.session.interruptStream();
+    await h.session.waitForIdle();
+    await settle(h);
+    expect(abortedBeforeStop).toBe(false);
+    expect(abortedAfterStop).toBe(true);
+    expect(streams()).toBe(1);
+  });
+
+  test("a Stop after the stream ends and before the chain starts gives the chain an aborted signal", async () => {
+    let stopEpoch = 0;
+    let abortedAtStart: boolean | undefined;
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        (ctx) => {
+          abortedAtStart = ctx.abortSignal?.aborted;
+        },
+        { workspaceId }
+      )
+    );
+    const { h } = await setup({
+      // The Stop lands while the stream winds down: its epoch moves before the chain starts.
+      whileStreaming: () => {
+        stopEpoch++;
+      },
+      session: { getStopEpoch: () => stopEpoch },
+    });
+    await h.session.sendMessage("fix the tests", options);
+    await h.session.waitForIdle();
+    await settle(h);
+    expect(abortedAtStart).toBe(true);
+  });
+
   test("a goal turn's continuation stays a goal turn of the same goal", async () => {
     let continued = false;
     addConsumer((ctx) => {

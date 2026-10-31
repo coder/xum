@@ -35,10 +35,7 @@ import {
   type OpenAIPluginExtension,
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
-import {
-  normalizeCursorManifest,
-  type CursorManifestResult,
-} from "./cursorManifest";
+import { normalizeCursorManifest, type CursorManifestResult } from "./cursorManifest";
 import { convertCursorRule, cursorRuleName, type CursorRuleRefusal } from "./cursorRules";
 import { loadPluginCursorHooks } from "./cursorHooks";
 import type { PluginHooksLoadResult } from "./codexHooks";
