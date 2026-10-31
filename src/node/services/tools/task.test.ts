@@ -1367,7 +1367,11 @@ describe("task tool", () => {
   describe("a foreground best-of group whose members' launches fail", () => {
     const LAUNCH_FAILURE = "Task fork failed: no space left";
 
-    async function runGroup(failing: ReadonlySet<string>, statusOf: (taskId: string) => unknown) {
+    async function runGroup(
+      failing: ReadonlySet<string>,
+      statusOf: (taskId: string) => unknown,
+      failure = LAUNCH_FAILURE
+    ) {
       using tempDir = new TestTempDir("test-task-tool-best-of-launch-failure");
       const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
       let createCount = 0;
@@ -1382,7 +1386,7 @@ describe("task tool", () => {
         }),
         waitForAgentReport: mock((taskId: string) =>
           failing.has(taskId)
-            ? Promise.reject(new Error(LAUNCH_FAILURE))
+            ? Promise.reject(new Error(failure))
             : Promise.resolve({ reportMarkdown: `report for ${taskId}`, title: `Report ${taskId}` })
         ),
         getAgentTaskStatus: mock(statusOf),
@@ -1418,6 +1422,14 @@ describe("task tool", () => {
           { taskId: "child-task-3", reportMarkdown: "report for child-task-3" },
         ],
       });
+    });
+
+    it("throws a member's wait error while that member's task still runs", async () => {
+      const failure = "report artifact unreadable";
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see
+      await expect(runGroup(new Set(["child-task-2"]), () => "running", failure)).rejects.toThrow(
+        failure
+      );
     });
 
     it("throws the launch error when every member's launch failed", async () => {

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { nodeClock } from "@/node/utils/hostClock";
 
@@ -18,7 +19,7 @@ import {
 } from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
-import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
+import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
 import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
@@ -323,17 +324,28 @@ function toAggregatePendingStatus(
 }
 
 /**
- * The wait error the tool throws: only when every member's wait failed. A group that still has a
- * completed, live or backgrounded member returns them instead, so a model that retries does not
- * duplicate work that still runs.
+ * The wait error the tool throws. A member's wait error ends that member only when its task did
+ * end (`taskEnded`, as a failed launch does); any other wait error is thrown. When every member's
+ * wait failed, the first error is thrown. Otherwise the group returns its completed, live or
+ * backgrounded members, so a model that retries does not duplicate work that still runs.
  */
 function waitFailureToRethrow(
-  outcomes: readonly ForegroundWaitOutcome[]
+  outcomes: readonly ForegroundWaitOutcome[],
+  taskEnded: (index: number) => boolean
 ): Extract<ForegroundWaitOutcome, { kind: "error" }> | undefined {
-  const [first] = outcomes;
-  return first?.kind === "error" && outcomes.every((outcome) => outcome.kind === "error")
-    ? first
-    : undefined;
+  const failures = outcomes.flatMap((outcome, index) =>
+    outcome.kind === "error" ? [{ outcome, index }] : []
+  );
+  const unexplained = failures.find((failure) => !taskEnded(failure.index));
+  if (unexplained != null) return unexplained.outcome;
+  return failures.length === outcomes.length ? failures[0]?.outcome : undefined;
+}
+
+/** A failed launch leaves its row interrupted, or removes it (an unsanitized checkout). */
+function launchEndedTask(taskService: TaskService, taskId: string | undefined): boolean {
+  assert(taskId != null, "every wait outcome belongs to a created task");
+  const status = taskService.getAgentTaskStatus(taskId);
+  return status == null || status === "interrupted";
 }
 
 function endedWithoutReport(outcome: ForegroundWaitOutcome): boolean {
@@ -853,7 +865,9 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         throw new Error("Interrupted");
       }
 
-      const unexpectedFailure = waitFailureToRethrow(waitOutcomes);
+      const unexpectedFailure = waitFailureToRethrow(waitOutcomes, (index) =>
+        launchEndedTask(taskService, createdTasks[index]?.taskId)
+      );
       if (unexpectedFailure) {
         throw unexpectedFailure.error;
       }

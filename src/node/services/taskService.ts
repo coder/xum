@@ -7960,11 +7960,14 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Settles (never rejects) once every launch createMany scheduled so far has settled, its
-   * failure recorded.
+   * Settles (never rejects) once no launch createMany scheduled is in flight, its failure
+   * recorded. A reservation in flight can schedule a launch while this waits: it waits for that
+   * launch too.
    */
-  reservedLaunchesSettled(): Promise<void> {
-    return Promise.all(this.reservedLaunches).then(() => undefined);
+  async reservedLaunchesSettled(): Promise<void> {
+    while (this.reservedLaunches.size > 0) {
+      await Promise.all(this.reservedLaunches);
+    }
   }
 
   /**
@@ -8180,6 +8183,15 @@ export class TaskService implements AgentTaskIntegration {
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
     if (plan.start.kind === "sendMessage") {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
+    }
+    // Once shutdown latched the sessions, the launch would fork and init only to fail at its send
+    // (#4473), and could still be forking after shutdown's join. Leave the reserved row for the
+    // next start: startup recovery requeues a stale `starting` row, as after a crash mid-launch.
+    if (this.workspaceService.isShuttingDown()) {
+      log.info("Task launch skipped during shutdown: leaving the task for startup recovery", {
+        taskId: plan.taskId,
+      });
+      return;
     }
 
     const entryAtStart = this.readLaunchRow(plan.taskId);

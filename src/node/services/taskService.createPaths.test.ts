@@ -7,7 +7,7 @@ import * as path from "node:path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { Ok, Err } from "@/common/types/result";
+import { Ok, Err, type Result } from "@/common/types/result";
 import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import * as resolveNodeAgentAiSettingsModule from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import {
@@ -26,12 +26,14 @@ import {
 } from "@/node/services/taskService.shared.testHarness";
 
 const TASK_ID = "aaaaaaaaaa";
+const SECOND_TASK_ID = "bbbbbbbbbb";
 
 interface Internals {
   attemptLedger: {
     attemptSettlementByTaskId: Map<string, { phase: "closing" | "settled"; source: string }>;
   };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  reservedLaunches: ReadonlySet<Promise<void>>;
 }
 
 function internals(taskService: TaskService): Internals {
@@ -54,7 +56,7 @@ describe("TaskService.create paths", () => {
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
     config = await createTestConfig(rootDir);
-    stubStableIds(config, [TASK_ID], "bbbbbbbbbb");
+    stubStableIds(config, [TASK_ID], SECOND_TASK_ID);
     backgroundInits = [];
   });
   afterEach(async () => {
@@ -330,6 +332,56 @@ describe("TaskService.create paths", () => {
       expect.objectContaining({ id: TASK_ID, taskStatus: "running", parentWorkspaceId: parentId }),
     ]);
     expect(host.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("the launch join also waits for a launch scheduled while it waits", async () => {
+    const sendGates = new Map([
+      [TASK_ID, Promise.withResolvers<void>()],
+      [SECOND_TASK_ID, Promise.withResolvers<void>()],
+    ]);
+    const host = createWorkspaceServiceMocks({
+      sendMessage: mock(async (workspaceId: string): Promise<Result<void>> => {
+        await sendGates.get(workspaceId)?.promise;
+        return Ok(undefined);
+      }),
+    });
+    const { parentId, taskService } = await setup({ workspaceService: host });
+    const spawn = (prompt: string) =>
+      taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentType: "explore",
+        prompt,
+        title: "Test task",
+      });
+    expect((await spawn("first")).success).toBe(true);
+    const [firstLaunch] = internals(taskService).reservedLaunches;
+    assert(firstLaunch != null, "the first spawn must have scheduled its launch");
+    let joined = false;
+    const join = taskService.reservedLaunchesSettled().then(() => {
+      joined = true;
+    });
+    expect((await spawn("second")).success).toBe(true);
+
+    sendGates.get(TASK_ID)?.resolve();
+    await firstLaunch;
+    // The next macrotask runs after every promise reaction of the first launch's end.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(joined).toBe(false);
+
+    sendGates.get(SECOND_TASK_ID)?.resolve();
+    await join;
+    expect(findWorkspaceInConfig(config, SECOND_TASK_ID)?.taskStatus).toBe("running");
+  });
+
+  test("a launch that starts after shutdown latched leaves its reserved row for the next start", async () => {
+    const host = createWorkspaceServiceMocks({ isShuttingDown: mock(() => true) });
+    const { parentId, taskService } = await setup({ workspaceService: host });
+    const created = await createAgentTask(taskService, parentId, "go");
+    expect(created.success).toBe(true);
+    expect(host.sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, TASK_ID)).toMatchObject({ taskStatus: "starting" });
+    expect(findWorkspaceInConfig(config, TASK_ID)?.taskLaunchError).toBeUndefined();
   });
 
   test("a launch failure whose marker write fails leaves the row and the attempt unsettled", async () => {
