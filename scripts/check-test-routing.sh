@@ -27,6 +27,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 other_routes=(
   $'scripts/check-startup-imports.test.ts\tmake check-startup-imports (static-check), right before its analyzer'
   $'scripts/check-test-seam-comments.test.ts\tmake check-test-seam-comments (static-check), right before its checker'
+  $'scripts/check-test-only-exports.test.ts\tmake check-test-only-exports (static-check), right before its checker'
   $'scripts/crap/check.test.ts\tmake test-crap-scripts (static-check-full): needs uv, which Test / Unit does not install'
   $'scripts/crap/agentGate.test.ts\tmake test-crap-scripts (static-check-full): needs uv, which Test / Unit does not install'
   $'scripts/dry/check.test.ts\tmake test-dry-scripts (static-check-full): needs uv, which Test / Unit does not install'
