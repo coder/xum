@@ -141,6 +141,11 @@ async function walkPluginTree(
   return { rootReal, records };
 }
 
+/** What a record compares besides its kind and mode: the content hash, the link text, or "". */
+export function pluginTreeRecordContent(record: PluginTreeRecord): string {
+  return record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "";
+}
+
 function byPath(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -168,7 +173,7 @@ export async function hashPluginTree(root: string, quota: PluginTreeQuota): Prom
     .map((record): [string, number, string] => [
       record.path.split("/").join(path.sep),
       record.mode,
-      record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "",
+      pluginTreeRecordContent(record),
     ])
     .sort(([a], [b]) => byPath(a, b));
   return createHash("sha256")

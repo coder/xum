@@ -155,7 +155,12 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
-import { hashPluginTree, listPluginTreeRecords, type PluginTreeRecord } from "./treeHash";
+import {
+  hashPluginTree,
+  listPluginTreeRecords,
+  pluginTreeRecordContent,
+  type PluginTreeRecord,
+} from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -597,12 +602,12 @@ function fileReviewText(record: PluginTreeRecord | undefined): string | undefine
   }
 }
 
-function treeEntryContent(record: PluginTreeRecord): string {
-  return record.kind === "file" ? record.hash : record.kind === "symlink" ? record.target : "";
-}
-
 function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
-  return a.kind === b.kind && a.mode === b.mode && treeEntryContent(a) === treeEntryContent(b);
+  return (
+    a.kind === b.kind &&
+    a.mode === b.mode &&
+    pluginTreeRecordContent(a) === pluginTreeRecordContent(b)
+  );
 }
 
 /** One file review row: an added row has only `after`, a removed row only `before`. */
