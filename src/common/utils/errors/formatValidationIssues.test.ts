@@ -1,9 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import {
-  formatIssuePath,
-  getMessageWithInputValidationIssues,
-  MAX_SHOWN_VALIDATION_ISSUES,
-} from "./formatValidationIssues";
+import { MAX_SHOWN_VALIDATION_ISSUES } from "@/constants/errors";
+import { formatIssuePath, getMessageWithInputValidationIssues } from "./formatValidationIssues";
 
 describe("formatIssuePath", () => {
   it("renders identifiers, indexes, quoted keys and segment objects as an access path", () => {

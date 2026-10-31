@@ -2,11 +2,8 @@ import { ORPCError, ValidationError } from "@orpc/server";
 import { COMMON_ERROR_STATUS_MAP } from "@orpc/client";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { inspect } from "node:util";
-import {
-  formatIssuePath,
-  isValidationIssue,
-  MAX_SHOWN_VALIDATION_ISSUES,
-} from "@/common/utils/errors/formatValidationIssues";
+import { formatIssuePath, isValidationIssue } from "@/common/utils/errors/formatValidationIssues";
+import { MAX_SHOWN_VALIDATION_ISSUES } from "@/constants/errors";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { WorkflowDeclaredPhasesValidationError } from "@/node/services/workflows/workflowMetadata";
 

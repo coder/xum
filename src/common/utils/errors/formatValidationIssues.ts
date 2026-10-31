@@ -1,4 +1,8 @@
 import type { StandardSchemaV1 } from "@standard-schema/spec";
+import {
+  MAX_SHOWN_VALIDATION_ISSUES,
+  MAX_VALIDATION_ISSUE_MESSAGE_CHARS,
+} from "@/constants/errors";
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
@@ -30,15 +34,11 @@ export function formatIssuePath(path: StandardSchemaV1.Issue["path"]): string {
     .join("");
 }
 
-/** The server log formatter lists the same number, so both sides show the same issues. */
-export const MAX_SHOWN_VALIDATION_ISSUES = 5;
-const MAX_ISSUE_MESSAGE_CHARS = 300;
-
 function formatIssueDetails(issues: readonly StandardSchemaV1.Issue[]): string {
   const details = issues.slice(0, MAX_SHOWN_VALIDATION_ISSUES).map((issue) => {
     const message =
-      issue.message.length > MAX_ISSUE_MESSAGE_CHARS
-        ? `${issue.message.slice(0, MAX_ISSUE_MESSAGE_CHARS)}…`
+      issue.message.length > MAX_VALIDATION_ISSUE_MESSAGE_CHARS
+        ? `${issue.message.slice(0, MAX_VALIDATION_ISSUE_MESSAGE_CHARS)}…`
         : issue.message;
     return `${formatIssuePath(issue.path)}: ${message}`;
   });
