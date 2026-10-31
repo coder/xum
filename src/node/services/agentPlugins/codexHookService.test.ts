@@ -3,7 +3,7 @@
  * store. The MCP manager is a fake that records the server key of each call. Covers the per-call
  * gate (#6042's P1-a and P1-b) and the same-plugin server rule.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
@@ -11,6 +11,7 @@ import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
+import * as discovery from "./discovery";
 import { discoverAgentPluginAt } from "./discovery";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -712,6 +713,37 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     const sent = JSON.parse(await fs.readFile(input, "utf8")) as { workspace_roots: string[] };
     expect(sent.workspace_roots).toEqual([path.join(xumHome, "api"), path.join(xumHome, "web")]);
   });
+
+  test.each([
+    ["the project loses its trust", "project"],
+    ["the user turns the hook off", "hook"],
+  ] as const)(
+    "a hook starts no process when %s while the gate reads the plugin",
+    async (_name, revoke) => {
+      let projectTrusted = true;
+      await service.ensureWorkspaceHooks(args({ isProjectTrusted: () => projectTrusted }));
+      const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+      const hooks = plugin?.cursorHooks?.hooks ?? [];
+      const read = discovery.discoverAgentPluginAt;
+      // The gate's rediscovery is its first await: the revoke lands while it runs.
+      const spy = spyOn(discovery, "discoverAgentPluginAt").mockImplementation(async (options) => {
+        if (revoke === "project") projectTrusted = false;
+        for (const hook of revoke === "hook" ? hooks : []) {
+          await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
+            key: hook.key,
+            hash: hook.hash,
+            state: "disabled",
+          });
+        }
+        return read(options);
+      });
+      try {
+        expect(await stop()).toEqual({ kind: "none" });
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  );
 
   test("no Cursor hook registers in a /side chat or without a host runtime", async () => {
     await service.ensureWorkspaceHooks(args({ sideChat: true }));
