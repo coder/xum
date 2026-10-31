@@ -350,3 +350,40 @@ test("the first trust of a command hook waits until every cut file text is shown
   // After the first trust the files are no longer shown.
   await waitFor(() => expect(view.queryByText("Files (2)")).toBeNull());
 });
+
+test("the update review marks a bidi character in a warning", async () => {
+  const item: AgentPluginListItem = {
+    name: "grill",
+    managed: true,
+    present: true,
+    location: "~/.mux/plugins/grill",
+    lockedSha: "a".repeat(40),
+    skillCount: 0,
+    mcpServerCount: 0,
+  };
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [item],
+      updateChecks: [{ name: "grill", status: "update-available", remoteSha: "b".repeat(40) }],
+      updateReview: {
+        name: "grill",
+        fromSha: "a".repeat(40),
+        toSha: "b".repeat(40),
+        changes: [{ summary: "file hooks/stop.sh changed", before: "echo 1\n", after: "echo 2\n" }],
+        warnings: [BIDI_EVENT_WARNING],
+      },
+    },
+  });
+
+  const view = render(
+    <APIProvider client={api}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+  fireEvent.click(await view.findByRole("button", { name: /^Update/ }));
+
+  await view.findByText("plugin.json#hooks: '<U+202E>stop' must be an array of hooks; ignoring it");
+  expect(view.container.textContent).not.toContain("\u202E");
+});
