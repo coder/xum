@@ -2160,7 +2160,7 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
-  it("keys the shared fetch on the repository a project path resolves to", async () => {
+  it("shares a fetch across paths of one worktree, not across linked worktrees or repositories", async () => {
     const fixture = await createWorktreeManagerFixture();
     const other = await createWorktreeManagerFixture();
     try {
@@ -2177,7 +2177,7 @@ describe("WorktreeManager.createWorkspace", () => {
         await createBranchHead(fixture, "via-symlink", alias),
         await createBranchHead(fixture, "via-linked-worktree", linkedTree),
       ];
-      expect(await uploadPackRuns()).toBe(1);
+      expect(await uploadPackRuns()).toBe(2);
       expect(aliasHeads).toEqual([remoteHead, remoteHead, remoteHead]);
 
       const { remoteHead: otherRemoteHead } = addOriginAheadOfLocalRef(other, {

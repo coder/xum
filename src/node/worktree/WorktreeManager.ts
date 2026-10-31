@@ -75,7 +75,7 @@ type OriginFetchOutcome =
   | { kind: "failed"; message: string };
 
 interface SharedOriginFetch {
-  readonly remote: string;
+  readonly source: string;
   readonly outcome: Promise<OriginFetchOutcome>;
   settledAtMs?: number;
   waiters: number;
@@ -94,14 +94,15 @@ function sweepOriginFetches(now: number): void {
 
 /**
  * Keys a fetch by the ref it writes, refs/remotes/origin/<branch> in the repository's common git
- * dir, so symlinked paths and linked worktrees of one repository share a fetch. `remote` is the
- * origin URL git contacts, so a changed origin fetches again.
+ * dir. `source` is the worktree and the origin URL git contacts from it: only creations from one
+ * worktree share a fetch, because per-worktree config (upload-pack, URL rewrites, transport) can
+ * make the same URL reach another repository, and a changed origin fetches again.
  */
 async function originFetchTarget(
   projectPath: string,
   trunkBranch: string,
   signal: AbortSignal | undefined
-): Promise<{ key: string; remote: string }> {
+): Promise<{ key: string; source: string }> {
   const options = signal ? { signal } : undefined;
   using repoProc = execFileAsync(
     "git",
@@ -130,7 +131,7 @@ async function originFetchTarget(
   ]);
   return {
     key: JSON.stringify([repository, trunkBranch]),
-    remote: originRemoteIdentity(originUrl, worktree),
+    source: JSON.stringify([worktree, originRemoteIdentity(originUrl, worktree)]),
   };
 }
 
@@ -879,14 +880,14 @@ export class WorktreeManager {
     initLogger: InitLogger,
     callerSignal: AbortSignal | undefined
   ): Promise<OriginFetchOutcome> {
-    const { key, remote } = await originFetchTarget(projectPath, trunkBranch, callerSignal);
+    const { key, source } = await originFetchTarget(projectPath, trunkBranch, callerSignal);
     callerSignal?.throwIfAborted();
     const now = performance.now();
     sweepOriginFetches(now);
     let entry = originFetches.get(key);
-    // A fetch from another origin wrote the same ref, so its result says nothing about this one.
-    if (entry?.remote !== remote) {
-      entry = this.startOriginFetch(key, remote, projectPath, trunkBranch);
+    // A fetch from another worktree or origin wrote the same ref, so its result says nothing here.
+    if (entry?.source !== source) {
+      entry = this.startOriginFetch(key, source, projectPath, trunkBranch);
       originFetches.set(key, entry);
     }
     entry.waiters += 1;
@@ -909,7 +910,7 @@ export class WorktreeManager {
 
   private startOriginFetch(
     key: string,
-    remote: string,
+    source: string,
     projectPath: string,
     trunkBranch: string
   ): SharedOriginFetch {
@@ -959,7 +960,7 @@ export class WorktreeManager {
         }
         return outcome;
       }),
-      remote,
+      source,
       waiters: 0,
       controller,
     };
