@@ -10,6 +10,7 @@ import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
 import { REDACTED_BACKUP_VALUE } from "./payload";
+import { pinToShelf } from "@/node/services/artifactShelf";
 import { ProjectService } from "@/node/services/projectService";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { runGit, writeFixtureFile } from "./testHelpers";
@@ -542,6 +543,52 @@ describe("BackupService against a real repository", () => {
     expect(await fs.readFile(path.join(linkPath, "notes.md"), "utf-8")).toBe(
       "written after snapshot\n"
     );
+  });
+
+  it("previews and restores around a pinned artifact whose local shelf entry is now a symlink", async () => {
+    const shelfRoot = path.join(muxRoot, "artifacts");
+    const pinned = await pinToShelf({
+      shelfRoot,
+      scopeDir: path.join(shelfRoot, "global"),
+      relPath: "report.md",
+      bytes: Buffer.from("backed-up report\n"),
+      meta: {
+        sourceWorkspaceId: "ws-1",
+        version: 1,
+        title: "report.md",
+        kind: "markdown",
+        pinnedAtMs: 1,
+        pinnedBy: "user",
+      },
+    });
+    if (!pinned.success) throw new Error(pinned.error);
+    settings = { ...settings, includeGlobalArtifacts: true };
+    await pushOrThrow();
+    const entryPath = path.join(shelfRoot, "global", pinned.name);
+    const sharedEntry = path.join(tempDir, "shared-artifacts", pinned.name);
+    await fs.mkdir(path.dirname(sharedEntry), { recursive: true });
+    await fs.rename(entryPath, sharedEntry);
+    await writeFixtureFile(sharedEntry, "report.md", "shared report\n");
+    await fs.symlink(sharedEntry, entryPath);
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
+    const skipped = [
+      "artifacts/global/report.md/meta.json",
+      "artifacts/global/report.md/report.md",
+    ];
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.symlinkSkipped).toEqual(skipped);
+    expect(preview.data.restoreChanges.map((change) => change.path)).not.toContain(skipped[1]);
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.symlinkSkipped).toEqual(skipped);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+    expect((await fs.lstat(entryPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(sharedEntry, "report.md"), "utf-8")).toBe("shared report\n");
   });
 
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
