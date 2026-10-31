@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import type { AgentPluginMarketplaceListing } from "@/common/orpc/schemas/agentPlugins";
 import {
-  describeMarketplaceEntries,
+  CLAUDE_MARKETPLACE_RELATIVE_PATH,
+  CURSOR_MARKETPLACE_RELATIVE_PATH,
   entryDeclaresComponents,
   findMarketplaceEntry,
+  marketplaceListing,
+  mergeMarketplaces,
   parseClaudeMarketplace,
+  parseMarketplaces,
   resolveEntrySource,
   type ClaudeMarketplace,
 } from "./claudeMarketplace";
@@ -14,6 +19,29 @@ function marketplace(plugins: unknown[], metadata?: unknown): ClaudeMarketplace 
   return parseClaudeMarketplace(
     JSON.stringify({ name: "acme", owner: { name: "Acme" }, metadata, plugins })
   );
+}
+
+function listing(files: {
+  cursor?: ClaudeMarketplace;
+  claude?: ClaudeMarketplace;
+}): AgentPluginMarketplaceListing {
+  return marketplaceListing({
+    marketplaces: {
+      files: { cursor: files.cursor ?? null, claude: files.claude ?? null },
+      warnings: [],
+    },
+    source: { type: "git", url: REMOTE_MARKETPLACE, ref: "main", refType: "branch" },
+    lockedSha: "a".repeat(40),
+    methods: [],
+  });
+}
+
+/** Each row of a one-file listing as its name and its only build. */
+function claudeRows(parsed: ClaudeMarketplace) {
+  return listing({ claude: parsed }).entries.map((row) => {
+    expect(row.builds.length).toBe(1);
+    return { name: row.name, description: row.description, ...row.builds[0] };
+  });
 }
 
 /** The resolved source of the only entry, or the reason it cannot install. */
@@ -52,7 +80,7 @@ describe("parseClaudeMarketplace", () => {
       { name: "run", source: { source: "command", command: "make plugin" } },
       { name: "odd", source: { source: "ftp" } },
     ]);
-    const rows = describeMarketplaceEntries(parsed, REMOTE_MARKETPLACE);
+    const rows = claudeRows(parsed);
     expect(rows.map((row) => [row.name, row.installable])).toEqual([
       ["docs", true],
       ["(entry 2)", false],
@@ -67,6 +95,7 @@ describe("parseClaudeMarketplace", () => {
     expect(rows[0]).toEqual({
       name: "docs",
       description: "Docs",
+      file: "claude",
       sourceKind: "relative",
       source: "./",
       skillCount: 2,
@@ -81,6 +110,121 @@ describe("parseClaudeMarketplace", () => {
   test("a file that is not a marketplace fails with a message", () => {
     expect(() => parseClaudeMarketplace("{")).toThrow("is not valid JSON");
     expect(() => parseClaudeMarketplace("{}")).toThrow("has no 'plugins' list");
+  });
+
+  test("a Cursor file keeps its first 500 entries and warns, as a Claude file does", () => {
+    const plugins = Array.from({ length: 501 }, (_, index) => ({
+      name: `p${index}`,
+      source: `p${index}`,
+    }));
+    const parsed = parseClaudeMarketplace(
+      JSON.stringify({ name: "cursor-plugins", plugins }),
+      CURSOR_MARKETPLACE_RELATIVE_PATH
+    );
+    expect(parsed.entries.length).toBe(500);
+    expect(parsed.entries.at(-1)?.name).toBe("p499");
+    expect(parsed.warnings).toEqual([
+      `${CURSOR_MARKETPLACE_RELATIVE_PATH} lists 501 plugins; Xum shows the first 500.`,
+    ]);
+  });
+
+  test("a broken Cursor file names the Cursor path, not the Claude path", () => {
+    let message = "";
+    try {
+      parseMarketplaces({ cursor: "{", claude: undefined });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain(`${CURSOR_MARKETPLACE_RELATIVE_PATH} is not valid JSON`);
+    expect(message).not.toContain(CLAUDE_MARKETPLACE_RELATIVE_PATH);
+  });
+
+  test("beside a good file, a broken one is a warning; two broken files fail with both", () => {
+    const good = JSON.stringify({ name: "acme", plugins: [{ name: "a", source: "./a" }] });
+    const parsed = parseMarketplaces({ cursor: "{}", claude: good });
+    expect(parsed.files.cursor).toBeNull();
+    expect(parsed.files.claude?.entries.map((entry) => entry.name)).toEqual(["a"]);
+    expect(parsed.warnings).toEqual([`${CURSOR_MARKETPLACE_RELATIVE_PATH} has no 'plugins' list.`]);
+
+    expect(() => parseMarketplaces({ cursor: "{}", claude: "[]" })).toThrow(
+      `${CURSOR_MARKETPLACE_RELATIVE_PATH} has no 'plugins' list. ${CLAUDE_MARKETPLACE_RELATIVE_PATH} has no 'plugins' list.`
+    );
+  });
+});
+
+describe("mergeMarketplaces", () => {
+  const entry = (name: string, source: string) => ({ name, source });
+
+  test("lists the Cursor entries, then the Claude names Cursor lacks; a shared name has both builds", () => {
+    const cursor = marketplace([entry("a", "a"), entry("b", "b")]);
+    const claude = marketplace([entry("b", "./claude/b"), entry("c", "./claude/c")]);
+    const merged = mergeMarketplaces(cursor, claude);
+    expect(merged.map((row) => [row.name, row.builds.map((build) => build.file)])).toEqual([
+      ["a", ["cursor"]],
+      ["b", ["cursor", "claude"]],
+      ["c", ["claude"]],
+    ]);
+    // Each build is its own file's entry.
+    expect(merged[1].builds.map((build) => build.entry.raw.source)).toEqual(["b", "./claude/b"]);
+  });
+
+  test("entries with a problem never merge, even under the same label", () => {
+    const cursor = marketplace(["not an object", entry("b", "b"), entry("b", "again")]);
+    const claude = marketplace(["not an object", entry("b", "./claude/b")]);
+    expect(
+      mergeMarketplaces(cursor, claude).map((row) => [
+        row.name,
+        row.builds.map((build) => `${build.file}:${String(build.entry.raw.source)}`),
+      ])
+    ).toEqual([
+      ["(entry 1)", ["cursor:undefined"]],
+      ["b", ["cursor:b", "claude:./claude/b"]],
+      // A second Cursor 'b' is a problem entry: the Claude build joins the first.
+      ["b", ["cursor:again"]],
+      ["(entry 1)", ["claude:undefined"]],
+    ]);
+  });
+});
+
+describe("marketplaceListing", () => {
+  test("a row reads each build's status from its own file", () => {
+    const cursor = parseClaudeMarketplace(
+      JSON.stringify({
+        name: "cursor-plugins",
+        owner: { name: "Cursor" },
+        plugins: [
+          { name: "pstack", description: "Cursor build", source: { source: "npm", package: "x" } },
+        ],
+      }),
+      CURSOR_MARKETPLACE_RELATIVE_PATH
+    );
+    const claude = marketplace([
+      { name: "pstack", description: "Claude build", source: "./harness/pstack" },
+    ]);
+    const result = listing({ cursor, claude });
+    // The header is the Cursor file's when it parsed.
+    expect([result.name, result.owner]).toEqual(["cursor-plugins", "Cursor"]);
+    expect(result.entries).toEqual([
+      {
+        name: "pstack",
+        description: "Cursor build",
+        builds: [
+          {
+            file: "cursor",
+            sourceKind: "npm",
+            source: "npm",
+            installable: false,
+            reason: "Xum does not install npm packages. Only git sources install.",
+          },
+          {
+            file: "claude",
+            sourceKind: "relative",
+            source: "harness/pstack",
+            installable: true,
+          },
+        ],
+      },
+    ]);
   });
 });
 
@@ -108,9 +252,7 @@ describe("resolveEntrySource", () => {
       { name: "_hidden", source: "./x" },
       { name: "a..b", source: "./x" },
     ]);
-    expect(
-      describeMarketplaceEntries(parsed, REMOTE_MARKETPLACE).map((row) => row.installable)
-    ).toEqual([true, false, false]);
+    expect(claudeRows(parsed).map((row) => row.installable)).toEqual([true, false, false]);
     const entry = (raw: Record<string, unknown>) =>
       marketplace([{ name: "demo", source: "./x", ...raw }]).entries[0];
     expect(entryDeclaresComponents(entry({ mcpServers: {}, lspServers: {} }))).toBe(false);

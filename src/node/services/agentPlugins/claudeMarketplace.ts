@@ -1,5 +1,7 @@
 /**
- * Claude Code marketplace (`.claude-plugin/marketplace.json`) reader.
+ * Claude Code marketplace (`.claude-plugin/marketplace.json`) reader. The Cursor marketplace
+ * (`.cursor-plugin/marketplace.json`) uses the same format, so this reader parses both, and a
+ * repository with both files lists one merged list (mergeMarketplaces).
  *
  * Source: https://code.claude.com/docs/en/plugin-marketplaces.md and the marketplace reference.
  * Xum lists the entries of a marketplace and installs ONE entry per install. Each entry source
@@ -14,13 +16,16 @@
 import * as path from "node:path";
 
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
-import type {
-  AgentPluginInstallMethod,
-  AgentPluginMarketplaceEntry,
-  AgentPluginMarketplaceListing,
+import {
+  AgentPluginMarketplaceBuildSchema,
+  type AgentPluginInstallMethod,
+  type AgentPluginMarketplaceBuild,
+  type AgentPluginMarketplaceEntry,
+  type AgentPluginMarketplaceListing,
 } from "@/common/orpc/schemas/agentPlugins";
 import { isValidMarketplaceEntryName } from "@/common/utils/agentPluginName";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GITHUB_SHORTHAND_PATTERN } from "@/node/utils/gitUrls";
 import { isPlainObject } from "./manifest";
@@ -31,15 +36,35 @@ import {
 } from "./sourceInput";
 
 export const CLAUDE_MARKETPLACE_RELATIVE_PATH = ".claude-plugin/marketplace.json";
+export const CURSOR_MARKETPLACE_RELATIVE_PATH = ".cursor-plugin/marketplace.json";
+
+export type MarketplaceFile = AgentPluginMarketplaceBuild["file"];
+
+/** The repository-relative path of each marketplace file ("/"-separated, as git names it). */
+export const MARKETPLACE_RELATIVE_PATHS: Record<MarketplaceFile, string> = {
+  cursor: CURSOR_MARKETPLACE_RELATIVE_PATH,
+  claude: CLAUDE_MARKETPLACE_RELATIVE_PATH,
+};
+
+/** One marketplace file's entry: what a preview, install or update reads again at a commit. */
+export interface MarketplaceEntryRef {
+  file: MarketplaceFile;
+  entry: string;
+}
+
 /**
  * Marketplaces list many entries, so the cap is far above plugin.json's: anthropics/
- * claude-plugins-community's marketplace.json is about 1.49 MB. The read stays bounded.
+ * claude-plugins-community's marketplace.json is about 1.49 MB. The read stays bounded. Each
+ * marketplace file has its own cap.
  */
 export const MAX_CLAUDE_MARKETPLACE_BYTES = 8 * 1024 * 1024;
-/** Entries past this many are not listed (one warning names the count). */
+/**
+ * Entries past this many are not listed (one warning names the count). Per file, so a merged
+ * list has at most twice as many rows.
+ */
 export const MAX_CLAUDE_MARKETPLACE_ENTRIES = 500;
 
-export type MarketplaceSourceKind = AgentPluginMarketplaceEntry["sourceKind"];
+export type MarketplaceSourceKind = AgentPluginMarketplaceBuild["sourceKind"];
 
 /** Source kinds that Xum refuses, with the reason the listing shows. */
 const REFUSED_SOURCE_REASONS: Partial<Record<MarketplaceSourceKind, string>> = {
@@ -177,23 +202,27 @@ function readPluginRoot(
   }
 }
 
-/** Parse marketplace.json. Throws only when the file is not JSON or has no `plugins` list. */
-export function parseClaudeMarketplace(content: string): ClaudeMarketplace {
+/**
+ * Parse a marketplace file; `relativePath` names it in the diagnostics. Throws only when the file
+ * is not JSON or has no `plugins` list.
+ */
+export function parseClaudeMarketplace(
+  content: string,
+  relativePath = CLAUDE_MARKETPLACE_RELATIVE_PATH
+): ClaudeMarketplace {
   let raw: unknown;
   try {
     raw = JSON.parse(content);
   } catch (error) {
-    throw new Error(
-      `${CLAUDE_MARKETPLACE_RELATIVE_PATH} is not valid JSON: ${getErrorMessage(error)}`
-    );
+    throw new Error(`${relativePath} is not valid JSON: ${getErrorMessage(error)}`);
   }
   if (!isPlainObject(raw) || !Array.isArray(raw.plugins)) {
-    throw new Error(`${CLAUDE_MARKETPLACE_RELATIVE_PATH} has no 'plugins' list.`);
+    throw new Error(`${relativePath} has no 'plugins' list.`);
   }
   const warnings: string[] = [];
   if (raw.plugins.length > MAX_CLAUDE_MARKETPLACE_ENTRIES) {
     warnings.push(
-      `The marketplace lists ${raw.plugins.length} plugins; Xum shows the first ${MAX_CLAUDE_MARKETPLACE_ENTRIES}.`
+      `${relativePath} lists ${raw.plugins.length} plugins; Xum shows the first ${MAX_CLAUDE_MARKETPLACE_ENTRIES}.`
     );
   }
   const seen = new Set<string>();
@@ -201,7 +230,7 @@ export function parseClaudeMarketplace(content: string): ClaudeMarketplace {
     .slice(0, MAX_CLAUDE_MARKETPLACE_ENTRIES)
     .map((value, index) => readEntry(value, index, seen));
   return {
-    ...readMarketplaceHeader(raw, warnings),
+    ...readMarketplaceHeader(raw, warnings, relativePath),
     ...readPluginRoot(raw.metadata),
     entries,
     warnings,
@@ -211,10 +240,11 @@ export function parseClaudeMarketplace(content: string): ClaudeMarketplace {
 /** The display fields: `name` (warns when absent), the description and the owner's name. */
 function readMarketplaceHeader(
   raw: Record<string, unknown>,
-  warnings: string[]
+  warnings: string[],
+  relativePath: string
 ): Pick<ClaudeMarketplace, "name" | "description" | "owner"> {
   const name = optionalString(raw.name);
-  if (name === undefined) warnings.push(`${CLAUDE_MARKETPLACE_RELATIVE_PATH} has no 'name'.`);
+  if (name === undefined) warnings.push(`${relativePath} has no 'name'.`);
   const metadata = isPlainObject(raw.metadata) ? raw.metadata : {};
   const description = optionalString(raw.description) ?? optionalString(metadata.description);
   const owner = isPlainObject(raw.owner) ? optionalString(raw.owner.name) : undefined;
@@ -424,29 +454,99 @@ function sourceLabel(
   return entry.sourceKind;
 }
 
-/** The listing rows: every entry, with the reason when it cannot install. */
-export function describeMarketplaceEntries(
+/** One file's build of a listing row, with the reason when it cannot install. */
+function describeMarketplaceBuild(
   marketplace: ClaudeMarketplace,
-  marketplaceUrl: string
-): AgentPluginMarketplaceEntry[] {
-  return marketplace.entries.map((entry) => {
-    let resolved: ResolvedEntrySource | undefined;
-    let reason: string | undefined;
-    try {
-      resolved = resolveEntrySource(marketplace, marketplaceUrl, entry);
-    } catch (error) {
-      reason = getErrorMessage(error);
+  marketplaceUrl: string,
+  file: MarketplaceFile,
+  entry: ClaudeMarketplaceEntry
+): AgentPluginMarketplaceBuild {
+  let resolved: ResolvedEntrySource | undefined;
+  let reason: string | undefined;
+  try {
+    resolved = resolveEntrySource(marketplace, marketplaceUrl, entry);
+  } catch (error) {
+    reason = getErrorMessage(error);
+  }
+  return {
+    file,
+    sourceKind: entry.sourceKind,
+    source: sourceLabel(entry, resolved),
+    ...(entry.skillCount !== undefined ? { skillCount: entry.skillCount } : {}),
+    installable: reason === undefined,
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** One row of the merged list: a name and the entry of each file that lists it, Cursor first. */
+export interface MergedMarketplaceEntry {
+  name: string;
+  builds: Array<{ file: MarketplaceFile; entry: ClaudeMarketplaceEntry }>;
+}
+
+/**
+ * One list from both marketplace files: the Cursor entries in file order, then each Claude entry
+ * whose name the Cursor rows lack. A Claude entry joins the Cursor row of its name only when
+ * neither entry has a problem, so an "(entry N)" label or a name listed twice never merges.
+ */
+export function mergeMarketplaces(
+  cursor: ClaudeMarketplace | null,
+  claude: ClaudeMarketplace | null
+): MergedMarketplaceEntry[] {
+  const rows: MergedMarketplaceEntry[] = (cursor?.entries ?? []).map((entry) => ({
+    name: entry.name,
+    builds: [{ file: "cursor", entry }],
+  }));
+  // A file lists a name without a problem at most once (readEntry), so each key is one row.
+  const mergeable = new Map(
+    rows.flatMap((row) => (row.builds[0].entry.problem === undefined ? [[row.name, row]] : []))
+  );
+  for (const entry of claude?.entries ?? []) {
+    const row = entry.problem === undefined ? mergeable.get(entry.name) : undefined;
+    if (row === undefined) {
+      rows.push({ name: entry.name, builds: [{ file: "claude", entry }] });
+      continue;
     }
-    return {
-      name: entry.name,
-      ...(entry.description !== undefined ? { description: entry.description } : {}),
-      sourceKind: entry.sourceKind,
-      source: sourceLabel(entry, resolved),
-      ...(entry.skillCount !== undefined ? { skillCount: entry.skillCount } : {}),
-      installable: reason === undefined,
-      ...(reason !== undefined ? { reason } : {}),
-    };
-  });
+    assert(row.builds.length === 1, "mergeMarketplaces: a Cursor row takes one Claude build");
+    row.builds.push({ file: "claude", entry });
+  }
+  return rows;
+}
+
+/** The marketplace files of a repository root, as parsed for its listing. */
+export interface ParsedMarketplaces {
+  /** Null when the file is missing, or failed to parse beside a file that parsed. */
+  files: Record<MarketplaceFile, ClaudeMarketplace | null>;
+  /** The parse error of a file that failed beside a file that parsed. */
+  warnings: string[];
+}
+
+/**
+ * Parse the marketplace files of a root (undefined: the commit has no such file; at least one
+ * exists). One file alone fails the listing when it does not parse, as before Cursor files
+ * existed. With both, a broken file becomes a warning and the other file still lists; only two
+ * broken files fail.
+ */
+export function parseMarketplaces(
+  contents: Record<MarketplaceFile, string | undefined>
+): ParsedMarketplaces {
+  const files: ParsedMarketplaces["files"] = { cursor: null, claude: null };
+  const errors: string[] = [];
+  let present = 0;
+  for (const file of AgentPluginMarketplaceBuildSchema.shape.file.options) {
+    const content = contents[file];
+    if (content === undefined) continue;
+    present++;
+    try {
+      files[file] = parseClaudeMarketplace(content, MARKETPLACE_RELATIVE_PATHS[file]);
+    } catch (error) {
+      errors.push(getErrorMessage(error));
+    }
+  }
+  assert(present > 0, "parseMarketplaces: at least one marketplace file exists");
+  // Each message names its file, so two failures read as one error that names both.
+  if (errors.length === present) throw new Error(errors.join(" "));
+  return { files, warnings: errors };
 }
 
 /** The entry named `name`. Throws when the marketplace does not list it. */
@@ -534,23 +634,44 @@ export function entryAsManifest(entry: ClaudeMarketplaceEntry): {
   return { raw, warnings };
 }
 
-/** The marketplace listing of a repository root (the preview result for a marketplace). */
+/**
+ * The marketplace listing of a repository root (the preview result for a marketplace): one row
+ * per merged entry. The header is the Cursor file's when it parsed, else the Claude file's.
+ */
 export function marketplaceListing(args: {
-  content: string;
+  marketplaces: ParsedMarketplaces;
   source: AgentPluginGitSource;
   lockedSha: string;
   /** The other methods that fit the root (Skills for a repository of SKILL.md files). */
   methods: AgentPluginInstallMethod[];
 }): AgentPluginMarketplaceListing {
-  const marketplace = parseClaudeMarketplace(args.content);
+  const { cursor, claude } = args.marketplaces.files;
+  const header = cursor ?? claude;
+  assert(header !== null, "marketplaceListing: at least one marketplace file parsed");
+  const entries = mergeMarketplaces(cursor, claude).map((row): AgentPluginMarketplaceEntry => {
+    const description = row.builds[0].entry.description;
+    return {
+      name: row.name,
+      ...(description !== undefined ? { description } : {}),
+      builds: row.builds.map(({ file, entry }) => {
+        const marketplace = args.marketplaces.files[file];
+        assert(marketplace !== null, "marketplaceListing: a build's file parsed");
+        return describeMarketplaceBuild(marketplace, args.source.url, file, entry);
+      }),
+    };
+  });
   return {
-    name: marketplace.name,
-    ...(marketplace.description !== undefined ? { description: marketplace.description } : {}),
-    ...(marketplace.owner !== undefined ? { owner: marketplace.owner } : {}),
+    name: header.name,
+    ...(header.description !== undefined ? { description: header.description } : {}),
+    ...(header.owner !== undefined ? { owner: header.owner } : {}),
     source: args.source,
     lockedSha: args.lockedSha,
-    entries: describeMarketplaceEntries(marketplace, args.source.url),
+    entries,
     methods: args.methods,
-    warnings: marketplace.warnings,
+    warnings: [
+      ...(cursor?.warnings ?? []),
+      ...(claude?.warnings ?? []),
+      ...args.marketplaces.warnings,
+    ],
   };
 }
