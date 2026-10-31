@@ -267,6 +267,21 @@ describe("CLI via HTTP", () => {
       expect(result).toBeNull(); // Non-existent workspace returns null
     });
   });
+
+  // The server returns Ok(undefined) and the RPC wire drops the undefined `data` key. The CLI
+  // used to re-validate `{ success: true }` against ResultSchema(z.void()), so a Stop that worked
+  // exited 1 with "Output validation failed" (#7854).
+  test("workspace interrupt-stream resolves with the server's Ok(undefined)", async () => {
+    const result = await runCli([
+      "workspace",
+      "interrupt-stream",
+      "--workspace-id",
+      "nonexistent",
+      "--options",
+      '{"retireBashMonitorAttention":true,"disableAutoRetry":true}',
+    ]);
+    expect(result).toEqual({ success: true, data: undefined });
+  });
 });
 
 describe("CLI Authentication", () => {
