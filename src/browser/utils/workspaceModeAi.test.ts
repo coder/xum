@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { getAgentBases, setAgentBases } from "./aiSelectionIntent";
-import { resolveConfiguredAiDefaults, resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import {
+  resolveConfiguredAiDefaults,
+  resolveInheritedLayerModel,
+  resolveWorkspaceAiSettingsForAgent,
+} from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -462,5 +466,36 @@ describe("resolveConfiguredAiDefaults with a settings base (Cursor model: fast)"
       getAgentBases("settings-base-scope")
     );
     expect(configured.modelString).toBe("custom:m-explore");
+  });
+});
+
+describe("resolveInheritedLayerModel", () => {
+  // ci-watcher's resolved layers when a project exec.md pins a model: Explore, then Exec.
+  const layers = {
+    ancestors: [
+      { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" as const } },
+      { agentId: "exec", definitionAiDefaults: { model: "custom:exec-pin" } },
+    ],
+  };
+
+  test("ranks a layer's Settings model above a later layer's pinned model", () => {
+    expect(
+      resolveInheritedLayerModel("ci-watcher", layers, {
+        explore: { modelString: "custom:m-explore" },
+      })
+    ).toBe("custom:m-explore");
+    expect(resolveInheritedLayerModel("ci-watcher", layers, {})).toBe("custom:exec-pin");
+  });
+
+  test("leaves the agent's own Settings model out", () => {
+    expect(
+      resolveInheritedLayerModel(
+        "ci-watcher",
+        { ancestors: [] },
+        {
+          "ci-watcher": { modelString: "custom:own" },
+        }
+      )
+    ).toBeUndefined();
   });
 });

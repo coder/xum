@@ -148,37 +148,56 @@ export function getAgentAiSettingsBases(
   ]);
 }
 
-/** The closest hop wins, as in the base-merged frontmatter. */
-export function chainSettingsBase(
-  chain: ReadonlyArray<{ ai?: { settingsBase?: string } }>
-): string | undefined {
-  return chain.find((entry) => entry.ai?.settingsBase != null)?.ai?.settingsBase;
+/** The hop whose `ai.settingsBase` applies: the closest, as in the base-merged frontmatter. */
+export function settingsBaseHop<T extends { ai?: { settingsBase?: string } }>(
+  chain: readonly T[]
+): T | undefined {
+  return chain.find((entry) => entry.ai?.settingsBase != null);
 }
 
-export type SettingsBaseIgnoredReason = "missing" | "self" | "cycle" | "nested";
+/** A read chain that stops at a missing or cyclic base: agents.list cannot resolve it. */
+function isIncompleteChain(chain: ReadonlyArray<{ base?: string }>): boolean {
+  return chain.at(-1)?.base != null;
+}
+
+export type SettingsBaseIgnoredReason = "missing" | "incomplete" | "self" | "cycle" | "nested";
+
+interface SettingsBaseChainHop {
+  id: string;
+  base?: string;
+  ai?: { settingsBase?: string };
+}
+
+function settingsBaseIgnoredReason(
+  agentId: string,
+  ownChain: readonly SettingsBaseChainHop[],
+  settingsBaseChain: readonly SettingsBaseChainHop[] | null
+): SettingsBaseIgnoredReason | undefined {
+  // Decided by ID: a same-ID read skips the agent's own scope, as a same-ID `base` does.
+  if (settingsBaseHop(ownChain)?.ai?.settingsBase === agentId) return "self";
+  if (settingsBaseChain === null) return "missing";
+  if ([ownChain, settingsBaseChain].some(isIncompleteChain)) return "incomplete";
+  if (settingsBaseChain.some((entry) => entry.id === agentId)) return "cycle";
+  return settingsBaseHop(settingsBaseChain) != null ? "nested" : undefined;
+}
 
 /**
  * The AI-settings chain of an agent with `ai.settingsBase` (Cursor plugin RFC, D11, D26): the
  * agent's own entries (its same-ID scope refinements), then the settings-base agent's chain in
  * place of the agent's own bases. Both chains are target first. `settingsBaseChain` is null
- * when the settings-base agent could not be read. A missing, self, cyclic or nested settings
- * base (one whose chain sets `ai.settingsBase` again) is ignored: the own chain comes back with
- * the reason, so every consumer falls back to `base` instead of following settings bases further.
+ * when the settings-base agent could not be read. A settings base is ignored when it is
+ * missing, when either chain stops at a missing or cyclic base, when it is the agent itself or
+ * inherits from it, and when its chain sets `ai.settingsBase` again (nested): the own chain
+ * comes back with the reason, so every consumer falls back to `base`.
  */
-export function applySettingsBaseChain<T extends { id: string; ai?: { settingsBase?: string } }>(
+export function applySettingsBaseChain<T extends SettingsBaseChainHop>(
   agentId: string,
   ownChain: readonly T[],
   settingsBaseChain: readonly T[] | null
 ): { chain: T[]; ignored?: SettingsBaseIgnoredReason } {
-  if (settingsBaseChain === null) return { chain: [...ownChain], ignored: "missing" };
+  const ignored = settingsBaseIgnoredReason(agentId, ownChain, settingsBaseChain);
+  if (ignored != null || settingsBaseChain === null) return { chain: [...ownChain], ignored };
   assert(settingsBaseChain.length > 0, "applySettingsBaseChain: a read chain starts at its agent");
-  if (settingsBaseChain[0].id === agentId) return { chain: [...ownChain], ignored: "self" };
-  if (settingsBaseChain.some((entry) => entry.id === agentId)) {
-    return { chain: [...ownChain], ignored: "cycle" };
-  }
-  if (chainSettingsBase(settingsBaseChain) != null) {
-    return { chain: [...ownChain], ignored: "nested" };
-  }
   const firstBase = ownChain.findIndex((entry) => entry.id !== agentId);
   const ownEntries = firstBase === -1 ? ownChain : ownChain.slice(0, firstBase);
   return { chain: [...ownEntries, ...settingsBaseChain] };

@@ -18,6 +18,7 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { resolveInheritedLayerModel } from "@/browser/utils/workspaceModeAi";
 import {
   getAppConfigStore,
   updateUserPreferences,
@@ -1121,8 +1122,9 @@ export function TasksSection() {
     const effectiveModel =
       modelValue !== INHERIT
         ? modelValue
-        : (resolveDefinitionModel(agent) ??
-          inheritedDefaults.modelString ??
+        : ((agent.aiLayers
+            ? resolveInheritedLayerModel(agent.id, agent.aiLayers, agentAiDefaults)
+            : (resolveDefinitionModel(agent) ?? inheritedDefaults.modelString)) ??
           inheritedEffectiveModel);
 
     const agentDefinitionPath = getAgentDefinitionPath(agent);

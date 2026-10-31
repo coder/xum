@@ -87,8 +87,12 @@ export async function resolveAcpAgentAiSettings(
     explicit: extras?.explicit,
     targetWorkspaceSettings: extras?.targetWorkspaceSettings,
     agentAiDefaults: config.agentAiDefaults,
-    targetDefinitionAiDefaults: agentDef && ownAiDefaults(agentDef),
-    ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
+    // agents.list resolves the agent's layers as a run does (its settings base included). Only an
+    // agent whose definition did not resolve walks the listed agents' declared bases.
+    ...(agentDef?.aiLayers ?? {
+      targetDefinitionAiDefaults: agentDef?.aiDefaults,
+      ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
+    }),
     parentRuntime: extras?.parentRuntime,
   });
 }

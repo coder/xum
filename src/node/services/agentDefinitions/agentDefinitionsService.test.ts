@@ -406,7 +406,8 @@ describe("agentDefinitionsService", () => {
     async function listWithPluginAgent(
       agentFile: string,
       agentAiDefaults?: AgentAiDefaults,
-      projectAgents: Record<string, string> = {}
+      projectAgents: Record<string, string> = {},
+      globalAgents: Record<string, string> = {}
     ) {
       using project = new DisposableTempDir("agent-list-settings-base");
       using home = new DisposableTempDir("agent-list-settings-base-home");
@@ -415,6 +416,13 @@ describe("agentDefinitionsService", () => {
       for (const [id, frontmatter] of Object.entries(projectAgents)) {
         await fs.writeFile(
           path.join(projectRoot, `${id}.md`),
+          `---\nname: ${id}\n${frontmatter}---\nBody.`
+        );
+      }
+      await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+      for (const [id, frontmatter] of Object.entries(globalAgents)) {
+        await fs.writeFile(
+          path.join(home.path, "agents", `${id}.md`),
           `---\nname: ${id}\n${frontmatter}---\nBody.`
         );
       }
@@ -475,6 +483,20 @@ describe("agentDefinitionsService", () => {
       ).toBe("custom:m-exec");
     });
 
+    test("lists a global agent's settings-base layers past a project agent of that ID", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, undefined, {
+        explore: "base: exec\nai:\n  model: custom:m-project\n",
+      });
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher?.scope).toBe("global");
+      expect(watcher?.aiSettingsBase).toBe("explore");
+      // The built-in Explore's layer, not the project explore.md's model.
+      expect(watcher?.aiLayers?.ancestors).toEqual([
+        { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+        { agentId: "exec" },
+      ]);
+    });
+
     test("leaves out a settings base that names a missing agent", async () => {
       const agents = await listWithPluginAgent(
         "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: missing-agent\n---\nWatch CI.\n"
@@ -497,6 +519,8 @@ describe("agentDefinitionsService", () => {
         const agents = await listWithPluginAgent(
           "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: helper\n---\nWatch CI.\n",
           agentAiDefaults,
+          {},
+          // Global, as the plugin agent is: a global agent's settings base skips project agents.
           { helper: "base: exec\nai:\n  settingsBase: explore\n" }
         );
         const watcher = agents.find((agent) => agent.id === "ci-watcher");
