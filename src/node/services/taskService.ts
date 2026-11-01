@@ -9058,17 +9058,26 @@ export class TaskService implements AgentTaskIntegration {
     return this.readTaskCreateParentBranch(placement.data);
   }
 
+  /**
+   * Sibling creates of one task(n) call queue behind one another on create's locks, so an abort of
+   * the call, or a stop latch on the parent, can land between them. The aborted call must not add
+   * more children, like the serial loop that checked its abort before each create. An ancestor's
+   * cascade (terminateAllDescendantAgentTasks Phase A, under the same mutex) latches the parent
+   * until the parent's turn settled, so a later create would add a child its snapshot missed.
+   * Other latch holders (a hard Stop's boundary latch, a queued workspace-turn handle's task_stop)
+   * also refuse here; the task tool reports those like any failed create.
+   */
+  private isTaskCreateStopped(parent: TaskCreateParent): boolean {
+    return (
+      parent.args.abortSignal?.aborted === true ||
+      this.isWorkspaceStopInProgress(parent.parentWorkspaceId)
+    );
+  }
+
   /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
   private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
-    const { args, cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
-    // Sibling creates of one task(n) call queue behind one another on these locks, so an abort of
-    // the call, or a stop latch on the parent, can land between them. The aborted call must not
-    // add more children, like the serial loop that checked its abort before each create. An
-    // ancestor's cascade (terminateAllDescendantAgentTasks Phase A, under this mutex) latches the
-    // parent until the parent's turn settled, so a later create would add a child its snapshot
-    // missed. Other latch holders (a hard Stop's boundary latch, a queued workspace-turn handle's
-    // task_stop) also refuse here; the tool reports those like any failed create.
-    if (args.abortSignal?.aborted === true || this.isWorkspaceStopInProgress(parentWorkspaceId)) {
+    const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
+    if (this.isTaskCreateStopped(parent)) {
       return Err(TASK_CREATE_STOPPED_ERROR);
     }
 
