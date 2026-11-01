@@ -387,6 +387,8 @@ else:
         self.assertNotEqual(outside, bulletless)
         borrowed = board.replace("#### Advisory findings (1)", "#### Advisory findings (1)\n\n#### Advisory findings (0)")
         self.assertNotEqual(borrowed, board)
+        headless = re.sub(r"\n#### Advisory findings \(1\)\n", "", bulletless)
+        self.assertNotEqual(headless, bulletless)
 
         def advisory(resolved):
             return thread(
@@ -404,6 +406,7 @@ else:
             ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
             ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
             ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
+            ("findings heading without an advisory header", [headless, receipt], [advisory(True)], head, 1),
             ("no receipt", [board], [advisory(True)], head, 10),
             ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
         ):

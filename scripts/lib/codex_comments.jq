@@ -131,8 +131,10 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           # null flags the bullets are the only finding list, so each advisory header's
           # count must match the bullets under it, up to the next heading: a missing
           # bullet could be a live finding, and a bullet elsewhere must not stand in.
+          # A findings heading without an advisory header is an incomplete inventory.
           | ($security.status == "completed" and $security.headSha == $head
             and $security.mergeGateEnabled == false
+            and ($lines | any(. == "### Security findings")) == ($lines | any(test("^#### Advisory findings")))
             and ([range($lines | length) as $i
               | $lines[$i] | capture("^#### Advisory findings \\((?<n>[0-9]+)\\)$").n | tonumber
               | . == ($lines[($i + 1):] | .[:(map(startswith("#")) | index(true)) // length]
