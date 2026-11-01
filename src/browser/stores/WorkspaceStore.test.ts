@@ -3621,7 +3621,13 @@ describe("WorkspaceStore", () => {
       expect(before.cache?.cacheWriteTokens).toBe(25_000);
       mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
 
-      await send({ ...rollUpDelta("child", 0), byModelDelta: { "claude-opus": child } });
+      await send({
+        type: "session-usage-delta",
+        workspaceId: "parent",
+        sourceWorkspaceId: "child",
+        byModelDelta: { "claude-opus": child },
+        timestamp: 1,
+      });
 
       const after = shown();
       expect(after.tokens).toBe(before.tokens);
