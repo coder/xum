@@ -1567,6 +1567,47 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(engineOptions.stopFence).toBe(stopFence);
   });
 
+  // A ledger read error (EIO, EMFILE) only costs the MUX_COSTS_USD env var, never the send.
+  it.each([
+    {
+      name: "sets MUX_COSTS_USD from the session ledger",
+      getSessionUsage: () =>
+        Promise.resolve({
+          version: 1 as const,
+          byModel: {
+            "openai:gpt-5.2": {
+              input: { tokens: 1, cost_usd: 1.25 },
+              cached: { tokens: 0 },
+              cacheCreate: { tokens: 0 },
+              output: { tokens: 1, cost_usd: 0.5 },
+              reasoning: { tokens: 0 },
+            },
+          },
+        }),
+      expected: "1.75",
+    },
+    {
+      name: "starts the turn without MUX_COSTS_USD when the ledger read fails",
+      getSessionUsage: () => Promise.reject(new Error("EIO: i/o error, read")),
+      expected: undefined,
+    },
+  ])("$name", async ({ getSessionUsage, expected }) => {
+    using xumHome = new DisposableTempDir("ai-service-session-costs");
+    const metadata = createLocalWorkspaceMetadata("session-costs", xumHome.path);
+    const sessionUsageService = { getSessionUsage: mock(getSessionUsage) };
+    const harness = createHarness(xumHome.path, metadata, {
+      sessionUsageService: sessionUsageService as unknown as SessionUsageService,
+    });
+
+    await startTestStream(harness, metadata.id);
+
+    expect(sessionUsageService.getSessionUsage).toHaveBeenCalledWith(metadata.id);
+    expect(harness.startStreamCalls).toHaveLength(1);
+    const { xumEnv } = getToolConfigFromHarness(harness) as { xumEnv?: Record<string, string> };
+    expect(xumEnv?.MUX_COSTS_USD).toBe(expected);
+    expect(xumEnv?.XUM_COSTS_USD).toBe(expected);
+  });
+
   describe("startup transport failures (#4438)", () => {
     const transportError = () => new RuntimeError("ssh: Connection refused", "network");
 
