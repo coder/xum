@@ -20,7 +20,6 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
-  SessionUsageFileSchema,
   SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
 import {
@@ -263,6 +262,24 @@ function sumOpenDescendantUsage(
     }
   }
   return { children };
+}
+
+/**
+ * Self-healing for lock-free reads: a ledger that is not an object with a byModel object reads
+ * as absent, and a model entry that fails the usage schema is dropped, so one bad entry or file
+ * neither rejects a whole batch or projection nor hides the valid entries beside it. Fields the
+ * schema would strip (settledInFlightKeys) stay.
+ */
+function parseLedgerKeepingValidModels(raw: unknown): SessionUsageFile | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const ledger = raw as SessionUsageFile;
+  if (typeof ledger.byModel !== "object" || ledger.byModel === null) return undefined;
+  const byModel = Object.fromEntries(
+    Object.entries(ledger.byModel).filter(
+      ([, usage]) => ChatUsageDisplaySchema.safeParse(usage).success
+    )
+  );
+  return { ...ledger, byModel };
 }
 
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
@@ -866,7 +883,7 @@ export class SessionUsageService {
         );
         const messages = await this.collectFullHistory(workspaceId);
         if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(workspaceId, messages);
+          await this.rebuildAndWriteLedger(workspaceId, messages);
           current = await this.readFile(workspaceId);
         } else {
           current = this.createEmptyUsageFile();
@@ -934,7 +951,7 @@ export class SessionUsageService {
         );
         const messages = await this.collectFullHistory(parentWorkspaceId);
         if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(parentWorkspaceId, messages);
+          await this.rebuildAndWriteLedger(parentWorkspaceId, messages);
           current = await this.readFile(parentWorkspaceId);
         } else {
           current = this.createEmptyUsageFile();
@@ -1070,7 +1087,7 @@ export class SessionUsageService {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         const messages = await this.collectFullHistory(workspaceId);
         if (messages.length > 0) {
-          await this.rebuildFromMessagesInternal(workspaceId, messages);
+          await this.rebuildAndWriteLedger(workspaceId, messages);
           return this.readFile(workspaceId);
         }
         return undefined; // Truly empty session
@@ -1079,7 +1096,7 @@ export class SessionUsageService {
       log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
       const messages = await this.collectFullHistory(workspaceId);
       if (messages.length > 0) {
-        await this.rebuildFromMessagesInternal(workspaceId, messages);
+        await this.rebuildAndWriteLedger(workspaceId, messages);
         return this.readFile(workspaceId);
       }
       return undefined;
@@ -1137,11 +1154,36 @@ export class SessionUsageService {
     }
     const ids = [workspaceId, ...descendants.map((d) => d.id)];
     const views = new Map(
-      await Promise.all(
-        ids.map(async (id) => [id, await this.readUsageViewLockFree(id, true)] as const)
-      )
+      await Promise.all(ids.map(async (id) => [id, await this.readProjectionView(id)] as const))
     );
     return sumOpenDescendantUsage(descendants, views);
+  }
+
+  /**
+   * A missing or unusable ledger is rebuilt from history like a locked read would, but only in
+   * memory: writing it could recreate the session folder of a sub-agent that is being removed.
+   */
+  private async readProjectionView(workspaceId: string): Promise<SessionUsageFile | undefined> {
+    const view = await this.readUsageViewLockFree(workspaceId, true);
+    if (view) {
+      return view;
+    }
+    try {
+      const messages = await this.collectFullHistory(workspaceId);
+      if (messages.length === 0) {
+        return undefined;
+      }
+      const { view: rebuilt } = this.addRunningStreamsToView(
+        workspaceId,
+        await this.rebuildFromMessagesInternal(workspaceId, messages),
+        await this.readInFlightEntries(workspaceId),
+        true
+      );
+      return rebuilt;
+    } catch (error) {
+      log.warn("Failed to rebuild sub-agent usage for the projection", { workspaceId, error });
+      return undefined;
+    }
   }
 
   private async readUsageViewLockFree(
@@ -1151,13 +1193,9 @@ export class SessionUsageService {
     let settled: SessionUsageFile | undefined;
     try {
       const filePath = this.getFilePath(workspaceId);
-      const parsed: unknown = JSON.parse(await this.files.promises.readFile(filePath, "utf-8"));
-      // Self-healing: a malformed ledger (`null`, a missing byModel) reads as absent, so one
-      // bad file does not reject a whole batch or projection. Keep the raw object: the schema
-      // strips fields such as settledInFlightKeys that the view still needs.
-      settled = SessionUsageFileSchema.safeParse(parsed).success
-        ? (parsed as SessionUsageFile)
-        : undefined;
+      settled = parseLedgerKeepingValidModels(
+        JSON.parse(await this.files.promises.readFile(filePath, "utf-8"))
+      );
     } catch {
       settled = undefined;
     }
@@ -1176,10 +1214,18 @@ export class SessionUsageService {
    * Rebuild session usage from messages (for migration/recovery).
    * Internal version - called within lock.
    */
+  private async rebuildAndWriteLedger(workspaceId: string, messages: MuxMessage[]): Promise<void> {
+    await this.writeFile(
+      workspaceId,
+      await this.rebuildFromMessagesInternal(workspaceId, messages)
+    );
+    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+  }
+
   private async rebuildFromMessagesInternal(
     workspaceId: string,
     messages: MuxMessage[]
-  ): Promise<void> {
+  ): Promise<SessionUsageFile> {
     const result: SessionUsageFile = this.createEmptyUsageFile();
     let lastAssistantUsage: { model: string; usage: ChatUsageDisplay } | undefined;
 
@@ -1246,9 +1292,7 @@ export class SessionUsageService {
     }
 
     await this.markInFlightFilesCountedByHistory(workspaceId, result, messageIdsWithUsage);
-
-    await this.writeFile(workspaceId, result);
-    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+    return result;
   }
 
   /**
@@ -1273,7 +1317,7 @@ export class SessionUsageService {
    */
   async rebuildFromMessages(workspaceId: string, messages: MuxMessage[]): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
-      await this.rebuildFromMessagesInternal(workspaceId, messages);
+      await this.rebuildAndWriteLedger(workspaceId, messages);
     });
   }
 }

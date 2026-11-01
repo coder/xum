@@ -372,6 +372,40 @@ describe("SessionUsageService", () => {
       expect(newEntry.agentType).toBe("explore");
       expect(newEntry.model).toBe(model);
     });
+    it("rebuilds an unreadable parent ledger from history before rolling up", async () => {
+      const model = "claude-sonnet-4-20250514";
+      const projectPath = "/tmp/mux-session-usage-test-project";
+      await config.addWorkspace(projectPath, {
+        id: "parent-rebuild",
+        name: "parent-rebuild-branch",
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        "parent-rebuild",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+        "{ not json"
+      );
+
+      await service.rollUpUsageIntoParent("parent-rebuild", "child-rebuild", {
+        [model]: createUsage(7, 3),
+      });
+
+      const after = JSON.parse(
+        await fs.readFile(
+          path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+          "utf-8"
+        )
+      ) as { byModel: Record<string, ChatUsageDisplay> };
+      expect(after.byModel[model].input.tokens).toBe(107);
+    });
   });
   describe("recordUsage", () => {
     it("should accumulate usage for same model (not overwrite)", async () => {
@@ -846,23 +880,44 @@ describe("SessionUsageService", () => {
       expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
     });
 
-    it("reads a malformed sub-agent ledger as absent and keeps its siblings", async () => {
+    it("drops only the malformed entries of a sub-agent ledger", async () => {
       await addWorkspace("root");
       await addWorkspace("broken", "root");
       await addWorkspace("healthy", "root");
       await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
-      await service.recordUsage("broken", model, createUsageWithCosts(1, 1, 1, 1));
-      // Valid JSON with a corrupt model entry: it would fail the IPC output schema and hide
-      // every sibling's usage with it.
+      // Valid JSON with one corrupt model entry: it would fail the IPC output schema and hide
+      // every sub-agent's usage with it.
+      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
       await fs.writeFile(
         path.join(config.sessionsDir, "broken", "session-usage.json"),
-        JSON.stringify({ byModel: { [model]: null }, version: 1 })
+        JSON.stringify({ byModel: { [model]: createUsage(3, 3), "bad:model": null }, version: 1 })
       );
 
       const result = await service.getOpenSubagentUsage("root");
 
-      expect(Object.keys(result.children)).toEqual(["healthy"]);
+      expect(Object.keys(result.children).sort()).toEqual(["broken", "healthy"]);
+      expect(Object.keys(result.children.broken.byModel)).toEqual([model]);
+      expect(result.children.broken.byModel[model].input.tokens).toBe(3);
       expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
+    });
+
+    it("rebuilds a missing sub-agent ledger from history without writing it", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      const ledgerPath = path.join(config.sessionsDir, "child", "session-usage.json");
+      await fs.rm(ledgerPath, { force: true });
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(100);
+      expect(existsSync(ledgerPath)).toBe(false);
     });
 
     it("returns nothing for a workspace without sub-agents", async () => {
