@@ -59,6 +59,18 @@ export class UsageRevisionActivity {
     return usageRevision === undefined ? snapshot : { ...snapshot, usageRevision };
   }
 
+  /** The activity list: a reconnecting renderer compares these with the revisions it saw. */
+  withRevisions(
+    snapshots: Record<string, WorkspaceActivitySnapshot>
+  ): Record<string, WorkspaceActivitySnapshot> {
+    return Object.fromEntries(
+      Object.entries(snapshots).map(([workspaceId, snapshot]) => [
+        workspaceId,
+        this.withRevision(workspaceId, snapshot),
+      ])
+    );
+  }
+
   evict(workspaceId: string): void {
     this.revisions.delete(workspaceId);
   }

@@ -19665,10 +19665,7 @@ export class WorkspaceService
           activityById[workspaceId] = merged;
         }
       }
-      for (const [workspaceId, row] of Object.entries(activityById)) {
-        activityById[workspaceId] = this.usageRevisionActivity.withRevision(workspaceId, row);
-      }
-      return activityById;
+      return this.usageRevisionActivity.withRevisions(activityById);
     } catch (error) {
       log.error("Failed to list activity:", error);
       // null (not {}) so the renderer can tell a read failure from a legitimately

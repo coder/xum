@@ -77,6 +77,11 @@ describe("UsageRevisionActivity", () => {
     expect(revision("ws")).toBeNumber();
     expect(revision("other")).toBeUndefined();
 
+    expect(activity.withRevisions({ ws: SNAPSHOT, other: SNAPSHOT })).toEqual({
+      ws: { ...SNAPSHOT, usageRevision: revision("ws") },
+      other: SNAPSHOT,
+    });
+
     activity.evict("ws");
     expect(activity.withRevision("ws", SNAPSHOT)).toBe(SNAPSHOT);
   });
