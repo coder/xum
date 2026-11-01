@@ -1283,6 +1283,41 @@ describe("task tool", () => {
     expect(error).toMatchObject({ message: "Interrupted" });
   });
 
+  it("throws Interrupted on an abort without waiting for the creates still in flight", async () => {
+    // The parent's Stop cascade runs only after this call returns: waiting for the children's
+    // first sends would let every admitted child reach its provider first.
+    using tempDir = new TestTempDir("test-task-tool-best-of-abort-in-flight");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const controller = new AbortController();
+    const creates = heldCreates((index) => Promise.resolve(spawnedChild(index)));
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create: creates.create } as unknown as TaskService,
+    });
+
+    const outcome = rejectionOf(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare two approaches",
+          title: "Best of 2",
+          run_in_background: true,
+          n: 2,
+        },
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )
+    );
+    await waitUntil(() => creates.create.mock.calls.length === 2);
+    controller.abort();
+    const settledWhileCreatesHeld = await Promise.race([
+      outcome,
+      new Promise<"still waiting">((resolve) => setTimeout(() => resolve("still waiting"), 200)),
+    ]);
+    for (const index of [0, 1]) await creates.settle(index);
+
+    expect(settledWhileCreatesHeld).toMatchObject({ message: "Interrupted" });
+  });
+
   it("reports a stop refusal without an abort like any failed create", async () => {
     // A queued workspace-turn handle's task_stop latches the parent without stopping its turn.
     using tempDir = new TestTempDir("test-task-tool-best-of-latch-without-abort");
@@ -1355,62 +1390,6 @@ describe("task tool", () => {
     expect(enteredBeforeAnySettled).toBe(3);
     expect(pendingAfterEachSettle).toEqual([true, true]);
     expect(await outcome).toBe(firstFailure);
-  });
-
-  it("keeps a single create's own error when the abort lands during that create", async () => {
-    using tempDir = new TestTempDir("test-task-tool-abort-during-failed-create");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-    const controller = new AbortController();
-    const create = mock(() => {
-      controller.abort();
-      return Err("unrelated failure");
-    });
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService: { create } as unknown as TaskService,
-    });
-
-    const error = await rejectionOf(
-      tool.execute!(
-        { subagent_type: "explore", prompt: "do it", title: "Child task", run_in_background: true },
-        { ...mockToolCallOptions, abortSignal: controller.signal }
-      )
-    );
-
-    expect(error).toMatchObject({ message: "unrelated failure" });
-  });
-
-  it("returns the spawned sibling when the abort lands during an unrelated sibling failure", async () => {
-    using tempDir = new TestTempDir("test-task-tool-abort-during-sibling-failure");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-    const controller = new AbortController();
-    const create = mock((args: { bestOf?: { index: number } }) => {
-      if (args.bestOf?.index === 0) return spawnedChild(0);
-      controller.abort();
-      return Err("unrelated failure");
-    });
-    const tool = createTaskTool({
-      ...baseConfig,
-      taskService: { create } as unknown as TaskService,
-    });
-
-    const result: unknown = await Promise.resolve(
-      tool.execute!(
-        {
-          subagent_type: "explore",
-          prompt: "compare two approaches",
-          title: "Best of 2",
-          run_in_background: true,
-          n: 2,
-        },
-        { ...mockToolCallOptions, abortSignal: controller.signal }
-      )
-    );
-
-    expectGroupedQueuedOrRunningTaskToolResult(result, {
-      status: "running",
-      taskIds: ["child-task-1"],
-    });
   });
 
   it("returns one completed report per best-of task when run in foreground", async () => {

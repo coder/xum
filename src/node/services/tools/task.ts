@@ -19,11 +19,8 @@ import {
 import type { Result } from "@/common/types/result";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
-import {
-  ForegroundWaitBackgroundedError,
-  TASK_CREATE_STOPPED_ERROR,
-  type TaskCreateResult,
-} from "@/node/services/taskService";
+import { ForegroundWaitBackgroundedError, type TaskCreateResult } from "@/node/services/taskService";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
 import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
@@ -322,15 +319,13 @@ function emitTaskCreatedEvent(params: {
 /**
  * Splits a task(n) call's create settlements into the spawned tasks and the failures, both in
  * launch order (not settle order: the result and the live card's candidate labels follow it).
- * An Err becomes an Error; a rejection keeps its reason. `stopRefused`: a create was refused at
- * its gate (the call was aborted, or the parent's stop latch was held).
+ * An Err becomes an Error; a rejection keeps its reason.
  */
 function collectTaskGroupCreates(
   settlements: ReadonlyArray<PromiseSettledResult<Result<TaskCreateResult, string>>>
-): { createdTasks: SpawnedTaskInfo[]; failures: unknown[]; stopRefused: boolean } {
+): { createdTasks: SpawnedTaskInfo[]; failures: unknown[] } {
   const createdTasks: SpawnedTaskInfo[] = [];
   const failures: unknown[] = [];
-  let stopRefused = false;
   for (const settlement of settlements) {
     if (settlement.status === "rejected") {
       failures.push(settlement.reason);
@@ -338,7 +333,6 @@ function collectTaskGroupCreates(
     }
     const created = settlement.value;
     if (!created.success) {
-      stopRefused ||= created.error === TASK_CREATE_STOPPED_ERROR;
       failures.push(new Error(created.error));
       continue;
     }
@@ -350,7 +344,7 @@ function collectTaskGroupCreates(
       desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
     });
   }
-  return { createdTasks, failures, stopRefused };
+  return { createdTasks, failures };
 }
 
 function toAggregatePendingStatus(
@@ -733,7 +727,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       // and queue order behind it) is launch order. Each create holds its locks only until its
       // child's first turn is admitted, so the children's first sends overlap. The async mapper
       // turns a synchronous throw into a rejection, so no started create is left unobserved.
-      const settlements = await Promise.allSettled(
+      const creating = Promise.allSettled(
         taskGroupLaunches.map(async (launch) =>
           taskService.create({
             parentWorkspaceId: workspaceId,
@@ -765,7 +759,15 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         )
       );
 
-      const { createdTasks, failures, stopRefused } = collectTaskGroupCreates(settlements);
+      // An abort (the parent's Stop) does not wait for the children's first sends: the Stop's
+      // cascade runs only once this turn ended, so waiting would let every admitted child reach
+      // its provider. Each create still short of its gate refuses on the aborted signal, and each
+      // one past it writes its row before the cascade's snapshot (both hold the global mutex).
+      const created = await raceWithAbortAndTimeout(creating, { signal: abortSignal });
+      if (created.kind !== "ok") {
+        throw new Error("Interrupted");
+      }
+      const { createdTasks, failures } = collectTaskGroupCreates(created.value);
       for (const task of createdTasks) {
         // UI-only signal: expose spawned taskIds once every create of this call settled.
         emitTaskCreatedEvent({
@@ -776,12 +778,8 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
-      // The abort cut the group short: later siblings refused at their gate, like the serial loop
-      // that stopped creating after an abort. A stop latch without an abort (a queued handle's
-      // task_stop) is reported below like any failed create, so the spawned children are listed.
-      if (stopRefused && abortSignal?.aborted === true) {
-        throw new Error("Interrupted");
-      }
+      // A stop-latch refusal without an abort (a queued workspace-turn handle's task_stop) is
+      // reported like any failed create, so the spawned children are listed.
       if (failures.length > 0) {
         if (createdTasks.length === 0) {
           throw failures[0];
