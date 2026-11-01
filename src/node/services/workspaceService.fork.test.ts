@@ -1409,6 +1409,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
       // Failure injection: the usage reset (the LAST failure-prone setup
       // step) rejects, driving the fork into its rollback path.
       const sessionUsageService = {
+        onUsageChanged: () => undefined,
         resetSessionUsage: mock(() => Promise.reject(new Error("usage reset failed"))),
         recordHeadlessUsage: mock(() => Promise.resolve(undefined)),
       } as unknown as SessionUsageService;

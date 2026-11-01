@@ -44,6 +44,31 @@ test("subscription handlers forward the oRPC runtime Clock", async () => {
   expect(workspaceService.listenerCount("activity")).toBe(0);
 });
 
+test("the activity subscription forwards usage-changed events", async () => {
+  const app = makeAppRuntime(TestClock.layer());
+  const workspaceService = new EventEmitter();
+  const controller = new AbortController();
+  const context = { "effect/context": app.context, workspaceService } as unknown as ORPCContext;
+  const iterator = subscribeWorkspaceActivity(context, controller.signal);
+  try {
+    const first = iterator.next();
+    for (
+      let attempt = 0;
+      attempt < 100 && workspaceService.listenerCount("usage-changed") === 0;
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    workspaceService.emit("usage-changed", { workspaceId: "ws" });
+    expect((await first).value).toEqual({ type: "usage-changed", workspaceId: "ws" });
+  } finally {
+    controller.abort();
+    await iterator.return(undefined);
+    await disposeAppRuntime(app.managed);
+  }
+  expect(workspaceService.listenerCount("usage-changed")).toBe(0);
+});
+
 test("onMetadata opens with a snapshot and delivers events emitted while it is built", async () => {
   // #5189: a change published while the snapshot's list is pending must follow the snapshot.
   const app = makeAppRuntime(TestClock.layer());
