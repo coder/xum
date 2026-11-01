@@ -559,6 +559,51 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists Cursor rules as skills and a manual rule only with includeUnadvertised", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-rule-home");
+    using project = new TestTempDir("test-agent-skill-list-rule-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-rule-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "kit");
+        await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+          JSON.stringify({ name: "kit" })
+        );
+        await fs.mkdir(path.join(pluginDir, "rules"));
+        await fs.writeFile(
+          path.join(pluginDir, "rules", "always.mdc"),
+          "---\nalwaysApply: true\n---\nAlways\n"
+        );
+        await fs.writeFile(path.join(pluginDir, "rules", "manual.md"), "Manual\n");
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const list = async (includeUnadvertised: boolean) => {
+          const result = (await tool.execute!(
+            { includeUnadvertised },
+            mockToolCallOptions
+          )) as AgentSkillListToolResult;
+          expect(result.success).toBe(true);
+          return result.success ? result.skills.map((skill) => skill.name) : [];
+        };
+
+        expect(await list(false)).toEqual(["always"]);
+        expect(await list(true)).toEqual(["always", "manual"]);
+      });
+    });
+  });
+
   it("lists only imported plugin skills and refreshes additions without hiding fallback sources", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-imports-home");
     using project = new TestTempDir("test-agent-skill-list-imports-project");

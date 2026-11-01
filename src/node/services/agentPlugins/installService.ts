@@ -17,11 +17,14 @@ import {
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import { getOwn } from "@/common/utils/getOwn";
+import { AgentPluginRuleTypeSchema } from "@/common/orpc/schemas/agentPlugins";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
-  AgentPluginMarketplaceEntry,
+  AgentPluginMarketplaceBuild,
   AgentPluginMarketplaceListing,
+  AgentPluginNotApplied,
+  AgentPluginRuleType,
   AgentPluginSourcePreview,
   AgentPluginComponents,
   AgentPluginHooks,
@@ -41,6 +44,7 @@ import type {
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
 import {
@@ -93,6 +97,7 @@ import {
   chooseStagedMethod,
   detectInstallMethods,
   generatesManifest,
+  isOwnManifestMethod,
   methodLabel,
   installMethodRequest,
   marketplaceManifest,
@@ -104,13 +109,16 @@ import {
   type SkillsPackageRoot,
 } from "./installMethods";
 import {
-  CLAUDE_MARKETPLACE_RELATIVE_PATH,
+  MARKETPLACE_RELATIVE_PATHS,
   MAX_CLAUDE_MARKETPLACE_BYTES,
   findMarketplaceEntry,
   marketplaceListing,
   parseClaudeMarketplace,
+  parseMarketplaces,
   resolveEntrySource,
   type ClaudeMarketplace,
+  type MarketplaceEntryRef,
+  type MarketplaceFile,
 } from "./claudeMarketplace";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
@@ -154,7 +162,13 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
-import { hashPluginTree } from "./treeHash";
+import {
+  hashPluginTree,
+  KeptBytesLimitError,
+  listPluginTreeRecords,
+  pluginTreeRecordContent,
+  type PluginTreeRecord,
+} from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -162,12 +176,14 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
-import { loadPluginCodexHooks } from "./codexHooks";
+import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   readPluginHookTrust,
+  rebindPluginHookTrust,
   removePluginHookTrust,
   reviewStateOf,
   setPluginHookTrust,
+  type PluginHookTrustRecord,
   type PluginHookTrustState,
 } from "./pluginHookTrust";
 import {
@@ -542,30 +558,6 @@ function reviewText(item: ReviewTextSource): string {
 }
 
 /**
- * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
- * default-ignorable code point (zero-width and joiner characters, variation selectors such as
- * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
- * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
- * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
- * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
- * as comment text in the review while the fingerprint approves it.
- */
-const REVIEW_TEXT_CONTROLS =
-  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
-
-/**
- * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
- * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
- * from the character itself.
- */
-function showInvisibleControls(text: string): string {
-  return text.replace(
-    REVIEW_TEXT_CONTROLS,
-    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
-  );
-}
-
-/**
  * Upper bound on the text of one review. Frontmatter fields have no size limit, so a crafted
  * package could make a review too large to send and render. Over the bound, Xum refuses the review
  * (fails closed) instead of truncating text the user would approve.
@@ -589,11 +581,161 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
     0
   );
-  if (size > MAX_REVIEW_TEXT_CHARS) {
-    throw new Error(
-      "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
+  if (size > MAX_REVIEW_TEXT_CHARS) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+}
+
+const REVIEW_TOO_LARGE_MESSAGE =
+  "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher.";
+
+/** A file larger than this shows only its row in the file review, like a binary file. */
+const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
+
+/**
+ * A Cursor command hook can run or source any file of its plugin, so a plugin with one gets a
+ * review of its files (Cursor plugin RFC D1).
+ */
+function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
+  return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
+}
+
+/**
+ * Whether the user trusted a current Cursor hook of the plugin, at any hash, for the installed
+ * commit. Trusting the first one took the full file review (firstTrustFileReview), and every
+ * update this build applied since reviewed its changed files and moved the binding along
+ * (rebindPluginHookTrust). Trust of a hook the plugin no longer has does not count, and neither
+ * does trust bound to another commit (the read drops that binding).
+ */
+function trustsCursorHook(
+  hooks: readonly PluginHookDefinition[],
+  trust: PluginHookTrustRecord
+): boolean {
+  return hooks.some((hook) => {
+    const entry = getOwn(trust, hook.key);
+    return (
+      hook.handler.type === "cursor-command" &&
+      entry?.state === "trusted" &&
+      entry.reviewedSha !== undefined
     );
+  });
+}
+
+/**
+ * The rows as shown, plus each entry's kind, mode and content hash (Codex review): a binary or
+ * large file's row shows no bytes, so the rows alone would not change when such a file does.
+ */
+function fileReviewDigest(
+  changes: readonly AgentPluginCapabilityChange[],
+  records: readonly PluginTreeRecord[]
+): string {
+  // The rows leave directories out, so a directory's mode change must not void the review either.
+  const entries = records
+    .filter((record) => record.kind !== "directory")
+    .map((record) => [record.path, record.kind, record.mode, pluginTreeRecordContent(record)]);
+  return createHash("sha256")
+    .update(JSON.stringify([changes, entries]))
+    .digest("hex");
+}
+
+function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
+  if (record?.kind === "symlink") return showOneLineControls(record.target);
+  if (record?.kind !== "file" || record.bytes === undefined) return undefined;
+  try {
+    // ignoreBOM keeps a leading BOM in the text, so the review marks it instead of dropping it.
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(record.bytes);
+    return showInvisibleControls(text);
+  } catch {
+    return undefined;
   }
+}
+
+function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
+  return (
+    a.kind === b.kind &&
+    a.mode === b.mode &&
+    pluginTreeRecordContent(a) === pluginTreeRecordContent(b)
+  );
+}
+
+function fileReviewRow(
+  filePath: string,
+  was: PluginTreeRecord | undefined,
+  now: PluginTreeRecord | undefined
+): AgentPluginCapabilityChange {
+  const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
+  const before = fileReviewText(was);
+  const after = fileReviewText(now);
+  // A row without the text of a side must say so: an empty row reads as a harmless change.
+  const hidden = textHidden(was, before) || textHidden(now, after);
+  return {
+    summary: `${treeEntryNoun(was, now)} ${showOneLineControls(filePath)} ${verb}${modeNote(was, now)}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
+    ...(before !== undefined ? { before } : {}),
+    ...(after !== undefined ? { after } : {}),
+  };
+}
+
+const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+/**
+ * "file" or "symlink" (Codex review): a symlink's text is its target, so an added symlink must not
+ * read as a file holding that text. A row whose entry changes kind names both.
+ */
+function treeEntryNoun(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined) {
+  const noun = (record: PluginTreeRecord) => (record.kind === "symlink" ? "symlink" : "file");
+  const newest = now ?? was;
+  assert(newest !== undefined, "a review row has a side");
+  if (was === undefined || now === undefined) return noun(newest);
+  return noun(was) === noun(now) ? noun(now) : `${noun(was)} → ${noun(now)}`;
+}
+
+/** A permission change is consent-relevant (sameTreeEntry), and a chmod alone shows no text change. */
+function modeNote(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined): string {
+  const bits = (record: PluginTreeRecord) => (record.mode & 0o7777).toString(8);
+  // A symlink's own mode means nothing on most systems: only a file's bits are shown.
+  if (was?.kind !== "file" || now?.kind !== "file" || bits(was) === bits(now)) return "";
+  return ` (mode ${bits(was)} → ${bits(now)})`;
+}
+
+function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
+  return record?.kind === "file" && text === undefined;
+}
+
+/**
+ * The file review (D1, D30): one row per file or symlink that differs between two plugin trees.
+ * `before: null` is the empty tree, so every file is an added row. A directory gets no row; the
+ * files under it do.
+ */
+function fileReviewRows(
+  before: readonly PluginTreeRecord[] | null,
+  after: readonly PluginTreeRecord[]
+): AgentPluginCapabilityChange[] {
+  const entries = (records: readonly PluginTreeRecord[]) =>
+    new Map(
+      records.filter((record) => record.kind !== "directory").map((record) => [record.path, record])
+    );
+  const old = entries(before ?? []);
+  const next = entries(after);
+  return [...new Set([...old.keys(), ...next.keys()])].sort().flatMap((filePath) => {
+    const was = old.get(filePath);
+    const now = next.get(filePath);
+    return was !== undefined && now !== undefined && sameTreeEntry(was, now)
+      ? []
+      : [fileReviewRow(filePath, was, now)];
+  });
+}
+
+/** Display form: names come from the plugin's files, so they get the agent names' marks (#6629). */
+function shownNotApplied(plugin: Pick<AgentPluginInfo, "notApplied">): AgentPluginNotApplied[] {
+  return plugin.notApplied.map((item) => ({
+    ...item,
+    name: showInvisibleControls(item.name),
+    reason: showInvisibleControls(item.reason),
+  }));
+}
+
+function notAppliedField(plugin: Pick<AgentPluginInfo, "notApplied">): {
+  notApplied?: AgentPluginNotApplied[];
+} {
+  return plugin.notApplied.length > 0 ? { notApplied: shownNotApplied(plugin) } : {};
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -1136,11 +1278,17 @@ function resolvePreviewRef(
   return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
 }
 
-/** The entry name of a `claude-marketplace` method. */
 function marketplaceEntryOf(
   method: AgentPluginInstallMethod | null | undefined
-): string | undefined {
-  return method?.kind === "claude-marketplace" ? method.entry : undefined;
+): MarketplaceEntryRef | undefined {
+  switch (method?.kind) {
+    case "claude-marketplace":
+      return { file: "claude", entry: method.entry };
+    case "cursor-marketplace":
+      return { file: "cursor", entry: method.entry };
+    default:
+      return undefined;
+  }
 }
 
 /** The git source that preview returns and install persists. */
@@ -1273,6 +1421,20 @@ function displayNameWarnings(
   ];
 }
 
+/**
+ * The rule type of a skill that Xum made from a Cursor rule (cursorRules.ts writes it into the
+ * metadata). Only a rule root gets one, so an ordinary skill with that metadata key gets no rule
+ * label.
+ */
+function ruleTypeField(
+  skillsRoot: PluginSkillsRoot,
+  metadata: Record<string, unknown> | undefined
+): { ruleType?: AgentPluginRuleType } {
+  if (skillsRoot.rule === undefined) return {};
+  const parsed = AgentPluginRuleTypeSchema.safeParse(metadata?.["cursor-rule-type"]);
+  return parsed.success ? { ruleType: parsed.data } : {};
+}
+
 /** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
 /** The `contributes.skills` value of a generated manifest (undefined: the default skills/). */
 function declaredSkills(manifest: Record<string, unknown>): string | string[] | undefined {
@@ -1285,9 +1447,10 @@ function declaredSkills(manifest: Record<string, unknown>): string | string[] | 
 
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
-  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // A command or a rule is its file; a single skill folder is the skill itself, and at the plugin root it
   // has no relative path.
   if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
+  if (skillsRoot.rule !== undefined) return path.join(relativeRoot, skillsRoot.rule);
   if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
   return `${relativeRoot}/${name}`;
 }
@@ -2255,6 +2418,40 @@ export class AgentPluginInstallService {
     );
   }
 
+  private async fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
+    try {
+      return await listPluginTreeRecords(dir, this.stagingQuota(), {
+        keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
+        // A UTF-16 unit takes at least one byte and at most three in UTF-8 (a 4-byte character is
+        // two units), so more kept bytes than this always render past the review's size cap.
+        // The walk then stops before it holds the whole staged-tree quota in memory.
+        maxKeptBytes: 3 * MAX_REVIEW_TEXT_CHARS,
+        skipRootGit: true,
+      });
+    } catch (error) {
+      if (error instanceof KeptBytesLimitError) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+      throw error;
+    }
+  }
+
+  /**
+   * The file review rows of a staged plugin with a runnable Cursor command hook; none for any
+   * other plugin. D30: an installed tree (or none) without such a hook never had a file review,
+   * so the staged tree is compared with the empty tree and every file is listed.
+   */
+  private async fileReviewChanges(
+    staged: AgentPluginInfo,
+    installed: AgentPluginInfo | null
+  ): Promise<AgentPluginCapabilityChange[]> {
+    if (!runsCursorCommands((await loadPluginHooks(staged)).hooks)) return [];
+    const reviewed =
+      installed !== null && runsCursorCommands((await loadPluginHooks(installed)).hooks);
+    return fileReviewRows(
+      reviewed ? await this.fileReviewRecords(installed.rootPath) : null,
+      await this.fileReviewRecords(staged.rootPath)
+    );
+  }
+
   /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
    * allow twice the checkout quota (bytes AND file count — loose objects can
@@ -2401,7 +2598,7 @@ export class AgentPluginInstallService {
   private async cloneExactSha(
     source: AgentPluginGitSource,
     sha: string,
-    options?: { readMarketplace: true }
+    options?: { readMarketplace: MarketplaceFile }
   ): Promise<{ dir: string; marketplaceJson: string | undefined }> {
     const subpath = source.subpath;
     const dir = await this.createStagingDir();
@@ -2433,8 +2630,8 @@ export class AgentPluginInstallService {
       // Before stagedPluginRoot: a subpath clone keeps only the plugin folder, and the
       // marketplace file sits at the repository root.
       const marketplaceJson =
-        options?.readMarketplace === true
-          ? await this.readMarketplaceAtCommit(dir, sha)
+        options !== undefined
+          ? await this.readMarketplaceAtCommit(dir, sha, options.readMarketplace)
           : undefined;
       return { dir: await this.stagedPluginRoot(dir, subpath, source.url, sha), marketplaceJson };
     } catch (error) {
@@ -2444,12 +2641,17 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * `.claude-plugin/marketplace.json` at `sha` in a staging clone (which may be partial and
-   * sparse), or undefined when the commit has none. Only a regular file counts: a symlink blob
-   * would name another path. The blob size is checked before its content is read, and a lazy
-   * fetch of the blob runs under the clone's disk quota.
+   * The marketplace file `file` at `sha` in a staging clone (which may be partial and sparse),
+   * or undefined when the commit has none. Only a regular file counts: a symlink blob would name
+   * another path. The blob size is checked before its content is read, and a lazy fetch of the
+   * blob runs under the clone's disk quota.
    */
-  private async readMarketplaceAtCommit(dir: string, sha: string): Promise<string | undefined> {
+  private async readMarketplaceAtCommit(
+    dir: string,
+    sha: string,
+    file: MarketplaceFile
+  ): Promise<string | undefined> {
+    const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
     const listing = await runGit([
       "--literal-pathspecs",
       "-C",
@@ -2458,46 +2660,46 @@ export class AgentPluginInstallService {
       "-z",
       sha,
       "--",
-      CLAUDE_MARKETPLACE_RELATIVE_PATH,
+      relativePath,
     ]);
     const record = listing
       .split("\0")
       .map((line) => /^(\d{6}) blob ([0-9a-f]+)\t([\s\S]*)$/.exec(line))
-      .find((match) => match?.[3] === CLAUDE_MARKETPLACE_RELATIVE_PATH);
+      .find((match) => match?.[3] === relativePath);
     if (record == null) return undefined;
     const [, mode, oid] = record;
     if (mode !== "100644" && mode !== "100755") {
-      throw new Error(`${CLAUDE_MARKETPLACE_RELATIVE_PATH} is not a regular file.`);
+      throw new Error(`${relativePath} is not a regular file.`);
     }
     const diskQuota = this.cloneDiskQuota(dir);
     const size = Number((await runGit(["-C", dir, "cat-file", "-s", oid], { diskQuota })).trim());
     if (!Number.isSafeInteger(size) || size > MAX_CLAUDE_MARKETPLACE_BYTES) {
       throw new Error(
-        `${CLAUDE_MARKETPLACE_RELATIVE_PATH} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / (1024 * 1024)} MiB.`
+        `${relativePath} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / (1024 * 1024)} MiB.`
       );
     }
     return runGit(["-C", dir, "cat-file", "blob", oid], { diskQuota });
   }
 
   /**
-   * cloneExactSha for an install or update, plus the context of marketplace entry `entryName`
-   * (a relative entry whose plugin.json Xum writes), read from marketplace.json at `sha`.
+   * cloneExactSha for an install or update, plus the context of marketplace entry `ref` (a
+   * relative entry whose plugin.json Xum writes), read from its marketplace file at `sha`.
    */
   private async cloneWithEntry(
     source: AgentPluginGitSource,
     sha: string,
-    entryName: string | undefined
+    ref: MarketplaceEntryRef | undefined
   ): Promise<{ stagedDir: string; marketplace: MarketplaceEntryContext | undefined }> {
-    if (entryName === undefined) {
+    if (ref === undefined) {
       return { stagedDir: (await this.cloneExactSha(source, sha)).dir, marketplace: undefined };
     }
     const { dir, marketplaceJson } = await this.cloneExactSha(source, sha, {
-      readMarketplace: true,
+      readMarketplace: ref.file,
     });
     try {
       return {
         stagedDir: dir,
-        marketplace: relativeEntryContext(marketplaceJson, entryName, source),
+        marketplace: relativeEntryContext(marketplaceJson, ref.entry, source, ref.file),
       };
     } catch (error) {
       await this.removeDir(dir);
@@ -3108,6 +3310,7 @@ export class AgentPluginInstallService {
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
     );
+    changes.push(...(await this.fileReviewChanges(stagedPlugin, currentPlugin)));
     assertReviewFits(changes);
     return changes;
   }
@@ -3249,12 +3452,12 @@ export class AgentPluginInstallService {
         continue;
       }
       try {
-        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // A Claude command or a Cursor rule becomes SKILL.md text first, so its review, fingerprint and approved
         // copy are a skill's (the copy is that text, which the runtime check parses as is).
         const content = pluginSkillMarkdown(
           skillName,
           await fsPromises.readFile(containedSkillPath, "utf8"),
-          skillsRoot.command
+          skillsRoot
         );
         const parsed = parseSkillMarkdown({
           content,
@@ -3280,6 +3483,7 @@ export class AgentPluginInstallService {
             ...(parsed.frontmatter.description !== undefined
               ? { description: parsed.frontmatter.description }
               : {}),
+            ...ruleTypeField(skillsRoot, parsed.frontmatter.metadata),
             // Model-visible beyond name/description: whenToUse interpolates
             // into the agent_skill_read tool description, and advertise
             // controls whether the skill appears there at all. Both feed the
@@ -3478,18 +3682,19 @@ export class AgentPluginInstallService {
     const result = await this.previewSource(args);
     if (result.kind === "marketplace") {
       throw new Error(
-        `This repository is the Claude Code marketplace '${result.marketplace.name}'. Preview one of its plugins.`
+        `This repository is the plugin marketplace '${result.marketplace.name}'. Preview one of its plugins.`
       );
     }
     return result.preview;
   }
 
   /**
-   * Preview a source: a plugin to review, or the entries of a Claude Code marketplace. A root
-   * clone without a plugin manifest but with `.claude-plugin/marketplace.json` lists the
-   * marketplace, unless a method was asked for (Skills installs the whole repository). Xum
-   * never looks for a marketplace under a subpath. With a `claude-marketplace` method, the
-   * preview resolves that entry's source and previews its plugin.
+   * Preview a source: a plugin to review, or the entries of a marketplace. A root clone without
+   * a plugin manifest but with `.cursor-plugin/marketplace.json` or
+   * `.claude-plugin/marketplace.json` lists the marketplace, unless a method was asked for
+   * (Skills installs the whole repository). Xum never looks for a marketplace under a subpath.
+   * With a `claude-marketplace` or `cursor-marketplace` method, the preview resolves that
+   * entry's source and previews its plugin.
    */
   async previewSource(args: {
     input: string;
@@ -3501,8 +3706,8 @@ export class AgentPluginInstallService {
     const parsed = parseAgentPluginSourceInput(args.input);
     const ref = resolvePreviewRef(parsed.ref, args.ref);
     const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
-    const entryName = marketplaceEntryOf(args.method);
-    if (entryName !== undefined && subpath !== undefined) {
+    const entryRef = marketplaceEntryOf(args.method);
+    if (entryRef !== undefined && subpath !== undefined) {
       throw new Error("A marketplace entry is picked at the repository root. Remove the folder.");
     }
 
@@ -3511,8 +3716,8 @@ export class AgentPluginInstallService {
     const source = resolvedGitSource(parsed.url, resolved, subpath);
     let stagedDir = staged.dir;
     try {
-      if (entryName !== undefined) {
-        const entry = await this.stageMarketplaceEntry(staged, source, entryName);
+      if (entryRef !== undefined) {
+        const entry = await this.stageMarketplaceEntry(staged, source, entryRef);
         stagedDir = entry.staged.dir;
         return {
           kind: "plugin",
@@ -3538,6 +3743,7 @@ export class AgentPluginInstallService {
   /**
    * The listing when a root clone has a marketplace file and no plugin manifest. Xum looks only
    * at the root, and only when no method was asked for (Skills installs the whole repository).
+   * With both marketplace files, the rows are their merged entries (mergeMarketplaces).
    */
   private async marketplaceListingAt(
     staged: { dir: string; sha: string },
@@ -3545,49 +3751,68 @@ export class AgentPluginInstallService {
     method: AgentPluginInstallMethod | null | undefined
   ): Promise<AgentPluginMarketplaceListing | undefined> {
     if (method != null || source.subpath !== undefined) return undefined;
-    const content = await this.readMarketplaceAtCommit(staged.dir, staged.sha);
-    if (content === undefined) return undefined;
+    // A read error waits for the manifest guard: a root plugin still previews beside a marketplace
+    // file that is not a regular file or is too large.
+    const read = (file: MarketplaceFile) =>
+      this.readMarketplaceAtCommit(staged.dir, staged.sha, file).catch((error: unknown) =>
+        error instanceof Error ? error : new Error(getErrorMessage(error))
+      );
+    const contents = { cursor: await read("cursor"), claude: await read("claude") };
+    if (contents.cursor === undefined && contents.claude === undefined) return undefined;
     const { methods } = await detectInstallMethods(staged.dir);
-    if (
-      methods.some((method) => method.kind === "agent-plugin" || method.kind === "claude-plugin")
-    ) {
-      return undefined;
-    }
-    const listing = marketplaceListing({ content, source, lockedSha: staged.sha, methods });
-    const marketplace = parseClaudeMarketplace(content);
+    if (methods.some(isOwnManifestMethod)) return undefined;
+    const marketplaces = parseMarketplaces(contents);
+    const listing = marketplaceListing({ marketplaces, source, lockedSha: staged.sha, methods });
     // A catalog can list hundreds of entries that share one folder: scan at most
     // MARKETPLACE_SCAN_CONCURRENCY at once, and each distinct folder + skills list once.
     const semaphore = new AsyncSemaphore(MARKETPLACE_SCAN_CONCURRENCY);
     const scans = new Map<string, Promise<Set<string>>>();
     const entries = await Promise.all(
-      listing.entries.map(async (row) => {
-        const slot = await semaphore.acquire();
-        try {
-          return await this.withAcceptedSkillCount(staged.dir, marketplace, source, row, scans);
-        } finally {
-          slot.release();
-        }
-      })
+      listing.entries.map(async (row) => ({
+        ...row,
+        builds: await Promise.all(
+          row.builds.map(async (build) => {
+            const marketplace = marketplaces.files[build.file];
+            assert(marketplace !== null, "marketplaceListingAt: a build's file parsed");
+            const slot = await semaphore.acquire();
+            try {
+              return await this.withAcceptedSkillCount(
+                staged.dir,
+                marketplace,
+                source,
+                row.name,
+                build,
+                scans
+              );
+            } finally {
+              slot.release();
+            }
+          })
+        ),
+      }))
     );
     return { ...listing, entries };
   }
 
   /**
-   * A relative entry's skill count: the skills its preview accepts (collectSkills), not the
-   * paths it lists. An entry in another repository keeps the count of paths: Xum has not cloned it.
+   * A relative build's skill count: the skills its preview accepts (collectSkills), not the
+   * paths its entry lists. An entry in another repository keeps the count of paths: Xum has not
+   * cloned it. Each build reads its own file's entry.
    */
   private async withAcceptedSkillCount(
     stagedDir: string,
     marketplace: ClaudeMarketplace,
     source: AgentPluginGitSource,
-    row: AgentPluginMarketplaceEntry,
+    /** The entry name in the build's file (the row name). */
+    name: string,
+    build: AgentPluginMarketplaceBuild,
     /** Scans of this listing by folder, skills list and plugin name. */
     scans: Map<string, Promise<Set<string>>>
-  ): Promise<AgentPluginMarketplaceEntry> {
-    if (row.skillCount === undefined || !row.installable || row.sourceKind !== "relative") {
-      return row;
+  ): Promise<AgentPluginMarketplaceBuild> {
+    if (build.skillCount === undefined || !build.installable || build.sourceKind !== "relative") {
+      return build;
     }
-    const entry = findMarketplaceEntry(marketplace, row.name);
+    const entry = findMarketplaceEntry(marketplace, name);
     const resolved = resolveEntrySource(marketplace, source.url, entry);
     assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
     const folder = path.join(stagedDir, resolved.subpath ?? "");
@@ -3599,7 +3824,7 @@ export class AgentPluginInstallService {
       // offer it. The reason names the folder, not the staging path.
       const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
       return {
-        ...row,
+        ...build,
         installable: false,
         reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
       };
@@ -3607,13 +3832,14 @@ export class AgentPluginInstallService {
     let manifest: Record<string, unknown>;
     try {
       ({ manifest } = marketplaceManifest({
+        file: build.file,
         entry,
         relative: true,
         rootSource: resolved.subpath === undefined,
       }));
     } catch {
       // No plugin name fits the entry name: its own preview fails with the reason.
-      return row;
+      return build;
     }
     const declared = declaredSkills(manifest);
     const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
@@ -3628,11 +3854,11 @@ export class AgentPluginInstallService {
       scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
       scans.set(key, scan);
     }
-    return { ...row, skillCount: (await scan).size };
+    return { ...build, skillCount: (await scan).size };
   }
 
   /**
-   * Stage the plugin of marketplace entry `entryName` from a root clone of the marketplace. A
+   * Stage the plugin of marketplace entry `ref` from a root clone of the marketplace. A
    * root-source entry is that clone. A folder of the same repository is cloned at the same commit
    * (so the entry and its folder match), and another repository is resolved like a typed source.
    * Consumes `marketplace` when it returns a different folder.
@@ -3640,19 +3866,20 @@ export class AgentPluginInstallService {
   private async stageMarketplaceEntry(
     marketplace: { dir: string; sha: string },
     marketplaceSource: AgentPluginGitSource,
-    entryName: string
+    ref: MarketplaceEntryRef
   ): Promise<{
     staged: { dir: string; sha: string };
     source: AgentPluginGitSource;
     resolved: ResolvedRemoteRef;
     marketplace: MarketplaceEntryContext;
   }> {
-    const content = await this.readMarketplaceAtCommit(marketplace.dir, marketplace.sha);
+    const relativePath = MARKETPLACE_RELATIVE_PATHS[ref.file];
+    const content = await this.readMarketplaceAtCommit(marketplace.dir, marketplace.sha, ref.file);
     if (content === undefined) {
-      throw new Error(`This repository has no ${CLAUDE_MARKETPLACE_RELATIVE_PATH}.`);
+      throw new Error(`This repository has no ${relativePath}.`);
     }
-    const parsed = parseClaudeMarketplace(content);
-    const entry = findMarketplaceEntry(parsed, entryName);
+    const parsed = parseClaudeMarketplace(content, ref.file);
+    const entry = findMarketplaceEntry(parsed, ref.entry);
     const target = resolveEntrySource(parsed, marketplaceSource.url, entry);
     const marketplaceResolved: ResolvedRemoteRef = {
       ref: marketplaceSource.ref,
@@ -3664,7 +3891,7 @@ export class AgentPluginInstallService {
         staged: marketplace,
         source: marketplaceSource,
         resolved: marketplaceResolved,
-        marketplace: { entry, relative: true, rootSource: true },
+        marketplace: { file: ref.file, entry, relative: true, rootSource: true },
       };
     }
     await this.removeDir(marketplace.dir);
@@ -3675,7 +3902,7 @@ export class AgentPluginInstallService {
         staged: { dir, sha: marketplace.sha },
         source,
         resolved: marketplaceResolved,
-        marketplace: { entry, relative: true, rootSource: false },
+        marketplace: { file: ref.file, entry, relative: true, rootSource: false },
       };
     }
     const resolved = await this.resolveRemoteRef(target.url, target.ref);
@@ -3684,7 +3911,7 @@ export class AgentPluginInstallService {
       staged,
       source: resolvedGitSource(target.url, resolved, target.subpath),
       resolved,
-      marketplace: { entry, relative: false, rootSource: false },
+      marketplace: { file: ref.file, entry, relative: false, rootSource: false },
     };
   }
 
@@ -3718,12 +3945,17 @@ export class AgentPluginInstallService {
       warnings
     );
     const hook = this.collectHook(plugin);
-    const codexHooks = await loadPluginCodexHooks(plugin);
+    const codexHooks = await loadPluginHooks(plugin);
     warnings.push(...codexHooks.warnings);
+    const fileChanges = await this.fileReviewChanges(plugin, null);
+    assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
     // Display only: the names a user reads before Install show invisible controls (#6629).
     const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
+    const readonlyAgents = agentFiles.flatMap((agent) =>
+      agent.readonly ? [showInvisibleControls(agent.file)] : []
+    );
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -3772,11 +4004,14 @@ export class AgentPluginInstallService {
       mcpServers,
       ...(hook !== undefined ? { hook } : {}),
       codexHooks: codexHooks.hooks,
+      fileChanges,
       agents,
+      readonlyAgents,
       workflows,
       slashCommands,
       reviewedComponents,
       warnings,
+      notApplied: shownNotApplied(plugin),
       targetPath: shortenHome(targetPath),
       consentDigest,
     };
@@ -3831,7 +4066,8 @@ export class AgentPluginInstallService {
 
     return this.runExclusive(async () => {
       // A marketplace entry without its own plugin.json is read again from the marketplace file
-      // of the consented commit, so install writes the plugin.json that the preview showed.
+      // of the consented commit, so install writes the plugin.json that the preview showed. A
+      // `cursor-marketplace` method fails here: its entry installs through its own manifest.
       const { stagedDir, marketplace } = await this.cloneWithEntry(
         args.source,
         args.expectedSha,
@@ -4600,10 +4836,11 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description, directives }) => ({
+      skills: skills.map(({ name, description, directives, ruleType }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
         ...directivesField(directives),
+        ...(ruleType !== undefined ? { ruleType } : {}),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
@@ -4678,17 +4915,42 @@ export class AgentPluginInstallService {
     // The hook load and the trust read are two reads: an update from another process between
     // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
     // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
-    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+    const { hooks, warnings, trust, fileReview } = await this.readInsideDiscoveryGate(
       "Plugin files changed during hook review. Refresh the hook review.",
-      async () => ({
-        ...(await this.loadManagedPluginHooks(args.name)),
-        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
-      })
+      async () => {
+        const { plugin, ...loaded } = await this.loadManagedPluginHooks(args.name);
+        const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+        return {
+          ...loaded,
+          trust,
+          fileReview: await this.firstTrustFileReview(plugin, loaded.hooks, trust),
+        };
+      }
     );
     return {
       hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
       warnings,
+      ...(fileReview !== undefined ? { fileReview } : {}),
     };
+  }
+
+  /**
+   * D30 at the first trust (Codex review of the RFC, P1): a plugin installed by a build without
+   * the file review never showed its files, and later updates show only changed ones. So while
+   * no Cursor hook of the plugin is trusted, trusting one needs the install preview's review of
+   * every file. Xum keeps no record of which install showed the files, so a plugin installed with
+   * the review shows it once more here.
+   */
+  private async firstTrustFileReview(
+    plugin: AgentPluginInfo,
+    hooks: readonly PluginHookDefinition[],
+    trust: PluginHookTrustRecord
+  ): Promise<AgentPluginHooks["fileReview"]> {
+    if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
+    const records = await this.fileReviewRecords(plugin.rootPath);
+    const changes = fileReviewRows(null, records);
+    assertReviewFits(changes);
+    return { changes, digest: fileReviewDigest(changes, records) };
   }
 
   /**
@@ -4701,11 +4963,13 @@ export class AgentPluginInstallService {
     key: string;
     hash: string;
     state: PluginHookTrustState | null;
+    /** getHooks' `fileReview.digest`, when it showed one. */
+    fileReviewDigest?: string;
   }): Promise<void> {
     // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
     // the trust file between this check and the write, which would recreate it.
     return this.runExclusive(async () => {
-      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const { entry, plugin, hooks } = await this.loadManagedPluginHooks(args.name);
       const hook = hooks.find((candidate) => candidate.key === args.key);
       if (hook?.hash !== args.hash) {
         throw new Error("This hook changed since you reviewed it. Review it again.");
@@ -4713,8 +4977,43 @@ export class AgentPluginInstallService {
       if (args.state === "trusted" && hook.status !== "runnable") {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
-      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+      const instanceId = this.instanceIdFor(args.name);
+      if (args.state === "trusted") {
+        await this.assertFilesReviewed({ plugin, hooks, hook, instanceId }, args.fileReviewDigest);
+      }
+      await setPluginHookTrust(this.config.rootDir, instanceId, {
+        key: args.key,
+        hash: args.hash,
+        state: args.state,
+        // The files of this commit are the ones reviewed: at install, an update, or just above.
+        ...(hook.handler.type === "cursor-command" ? { reviewedSha: entry.lockedSha } : {}),
+      });
     });
+  }
+
+  /**
+   * Before a Cursor command hook's trust: while getHooks shows the first-trust file review, the
+   * trust needs the digest of that review, read again here, not taken from the caller: the trust
+   * covers the files as they are now.
+   */
+  private async assertFilesReviewed(
+    target: {
+      plugin: AgentPluginInfo;
+      hooks: readonly PluginHookDefinition[];
+      hook: PluginHookDefinition;
+      instanceId: string;
+    },
+    fileReviewDigest: string | undefined
+  ): Promise<void> {
+    if (target.hook.handler.type !== "cursor-command") return;
+    const trust = await readPluginHookTrust(this.config.rootDir, target.instanceId);
+    const review = await this.firstTrustFileReview(target.plugin, target.hooks, trust);
+    if (review === undefined || review.digest === fileReviewDigest) return;
+    throw new Error(
+      fileReviewDigest === undefined
+        ? "Review this plugin's files before you trust its first hook."
+        : "This plugin's files changed since you reviewed them. Review them again."
+    );
   }
 
   /**
@@ -4750,13 +5049,13 @@ export class AgentPluginInstallService {
   }
 
   private async loadManagedPluginHooks(name: string) {
-    await this.findOwnRegistryEntry(name);
+    const entry = await this.findOwnRegistryEntry(name);
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
-    return loadPluginCodexHooks(plugin);
+    return { entry, plugin, ...(await loadPluginHooks(plugin)) };
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
@@ -5385,6 +5684,7 @@ export class AgentPluginInstallService {
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
         ...reviewRequiredField(entry, inventory.fingerprints, await countAmbiguousAgents(plugin)),
+        ...notAppliedField(plugin),
       });
     }
 
@@ -6380,7 +6680,9 @@ export class AgentPluginInstallService {
     const { stagedDir, marketplace } = await this.cloneWithEntry(
       entry.source,
       sha,
-      generatedFrom?.kind === "claude-marketplace" ? generatedFrom.entry : undefined
+      generatedFrom?.kind === "claude-marketplace"
+        ? { file: "claude", entry: generatedFrom.entry }
+        : undefined
     );
     try {
       const { plugin, warnings } = await this.validateStagedClone(
@@ -6624,6 +6926,7 @@ export class AgentPluginInstallService {
           ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
           changes,
           warnings,
+          ...notAppliedField(plugin),
         };
       } finally {
         await this.removeDir(stagedDir);
@@ -6906,6 +7209,18 @@ export class AgentPluginInstallService {
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
+        // This update reviewed every changed file a Cursor hook can run: trust bound to the old
+        // commit moves to the new one. A failure only asks the user to review again.
+        await rebindPluginHookTrust(
+          this.config.rootDir,
+          this.instanceIdFor(entry.name),
+          entry.lockedSha
+        ).catch((error: unknown) => {
+          log.warn("Failed to move hook trust to the updated plugin commit", {
+            name: entry.name,
+            error: getErrorMessage(error),
+          });
+        });
         await this.sweepApprovedCopies(updated);
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`

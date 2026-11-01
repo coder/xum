@@ -4,6 +4,8 @@ import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessi
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
+import { z } from "zod";
+import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import {
   getTotalCost,
   sumUsageHistory,
@@ -371,6 +373,40 @@ describe("SessionUsageService", () => {
       expect(newEntry.contextTokens).toBe(4);
       expect(newEntry.agentType).toBe("explore");
       expect(newEntry.model).toBe(model);
+    });
+    it("rebuilds an unreadable parent ledger from history before rolling up", async () => {
+      const model = "claude-sonnet-4-20250514";
+      const projectPath = "/tmp/mux-session-usage-test-project";
+      await config.addWorkspace(projectPath, {
+        id: "parent-rebuild",
+        name: "parent-rebuild-branch",
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        "parent-rebuild",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+        "{ not json"
+      );
+
+      await service.rollUpUsageIntoParent("parent-rebuild", "child-rebuild", {
+        [model]: createUsage(7, 3),
+      });
+
+      const after = JSON.parse(
+        await fs.readFile(
+          path.join(config.sessionsDir, "parent-rebuild", "session-usage.json"),
+          "utf-8"
+        )
+      ) as { byModel: Record<string, ChatUsageDisplay> };
+      expect(after.byModel[model].input.tokens).toBe(107);
     });
   });
   describe("recordUsage", () => {
@@ -795,6 +831,181 @@ describe("SessionUsageService", () => {
         }
       });
     }
+  });
+
+  describe("getOpenSubagentUsage", () => {
+    const projectPath = "/tmp/mux-session-usage-test-project";
+    const model = "claude-sonnet-4-20250514";
+
+    async function addWorkspace(id: string, parentWorkspaceId?: string): Promise<void> {
+      await config.addWorkspace(projectPath, {
+        id,
+        name: `${id}-branch`,
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId,
+      });
+    }
+
+    it("sums open descendants once, skipping rolled-up and unrelated workspaces", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await addWorkspace("removing", "root");
+      await addWorkspace("other-root");
+      await addWorkspace("other-child", "other-root");
+
+      await service.recordUsage("root", model, createUsageWithCosts(100, 50, 1, 2));
+      await service.recordUsage("child", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await service.recordUsage("grandchild", model, createUsageWithCosts(20, 2, 0.3, 0.4));
+      // A removed grandchild rolled into "child": it counts once, through child's ledger.
+      await service.rollUpUsageIntoParent("child", "removed-grandchild", {
+        [model]: createUsageWithCosts(5, 5, 0.5, 0.5),
+      });
+      // "removing" is mid-removal: rolled into root but still in config.
+      await service.recordUsage("removing", model, createUsageWithCosts(40, 4, 4, 4));
+      await service.rollUpUsageIntoParent("root", "removing", {
+        [model]: createUsageWithCosts(40, 4, 4, 4),
+      });
+      await service.recordUsage("other-child", model, createUsageWithCosts(1000, 1000, 9, 9));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // One entry per direct child: "child" covers itself and "grandchild".
+      expect(Object.keys(result.children)).toEqual(["child"]);
+      const subtree = result.children.child;
+      expect(subtree.workspaceCount).toBe(2);
+      const usage = subtree.byModel[model];
+      expect(usage.input.tokens).toBe(10 + 5 + 20);
+      expect(usage.output.tokens).toBe(1 + 5 + 2);
+      expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
+    });
+
+    it("drops only the malformed entries of a sub-agent ledger", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      // Valid JSON with one corrupt model entry: it would fail the IPC output schema and hide
+      // every sub-agent's usage with it.
+      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({ byModel: { [model]: createUsage(3, 3), "bad:model": null }, version: 1 })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children).sort()).toEqual(["broken", "healthy"]);
+      expect(Object.keys(result.children.broken.byModel)).toEqual([model]);
+      expect(result.children.broken.byModel[model].input.tokens).toBe(3);
+      expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
+    });
+
+    it("reads a ledger with corrupt settled keys as absent and keeps its siblings", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: createUsage(3, 3) },
+          settledInFlightKeys: {},
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children)).toEqual(["healthy"]);
+    });
+
+    it("sums a sub-agent ledger whose entry has a null long-context share", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await service.recordUsage("grandchild", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await fs.mkdir(path.join(config.sessionsDir, "child"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "child", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: { ...createUsage(3, 3), longContextTokens: null } },
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // Both land in the child's subtree, so the sum must merge the repaired entry.
+      expect(result.children.child.byModel[model].input.tokens).toBe(13);
+    });
+
+    it("rebuilds a missing sub-agent ledger from history without writing it", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      const ledgerPath = path.join(config.sessionsDir, "child", "session-usage.json");
+      await fs.rm(ledgerPath, { force: true });
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(100);
+      expect(existsSync(ledgerPath)).toBe(false);
+    });
+
+    it("rebuilds a missing ledger from history when a stream is running", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, "child", "session-usage.json"), { force: true });
+      await service.recordInFlightUsage("child", "stream-key", "msg2", model, createUsage(7, 0));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(107);
+    });
+
+    it("returns nothing for a workspace without sub-agents", async () => {
+      await addWorkspace("lonely");
+      await service.recordUsage("lonely", model, createUsage(1, 1));
+
+      expect(await service.getOpenSubagentUsage("lonely")).toEqual({ children: {} });
+    });
+  });
+
+  describe("getSessionUsageBatch", () => {
+    it("reads a ledger with a malformed field as absent and keeps the others", async () => {
+      const model = "claude-sonnet-4-20250514";
+      await service.recordUsage("good", model, createUsage(5, 5));
+      await service.recordUsage("bad", model, createUsage(1, 1));
+      const badPath = path.join(config.sessionsDir, "bad", "session-usage.json");
+      const bad = JSON.parse(await fs.readFile(badPath, "utf-8")) as Record<string, unknown>;
+      await fs.writeFile(badPath, JSON.stringify({ ...bad, lastRequest: null }));
+
+      const result = await service.getSessionUsageBatch(["good", "bad"]);
+
+      // The batch passes its IPC output schema only when no entry is malformed.
+      expect(
+        z.record(z.string(), SessionUsageFileSchema.optional()).safeParse(result).success
+      ).toBe(true);
+      expect(result.bad).toBeUndefined();
+      expect(result.good?.byModel[model].input.tokens).toBe(5);
+    });
   });
 
   describe("getSessionUsage", () => {

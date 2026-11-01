@@ -241,6 +241,10 @@
   justify-content: safe center;
   align-items: center;
   overflow: auto;
+  /* The sanitized SVG keeps Pele's class and style attributes, and an app class such as fixed or
+     an inline position:fixed on its root would otherwise cover the page outside the diagram.
+     Paint containment clips everything to this box, positioned descendants included. */
+  contain: paint;
   max-width: 100%;
 }
 

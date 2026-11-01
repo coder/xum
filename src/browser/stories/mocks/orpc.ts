@@ -1408,6 +1408,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           hooks.hooks = hooks.hooks.map((hook) =>
             hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
           );
+          // As the backend: the first trust's file review is shown only until a hook is trusted.
+          if (input.state === "trusted") delete hooks.fileReview;
         }
         return Promise.resolve({ success: true as const, data: undefined });
       },
@@ -2333,6 +2335,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       getSessionUsage: (input: { workspaceId: string }) =>
         Promise.resolve(sessionUsage.get(input.workspaceId)),
+      getSubagentUsage: () => Promise.resolve({ children: {} }),
       getSessionUsageBatch: (input: { workspaceIds: string[] }) => {
         const result: Record<string, MockSessionUsage | undefined> = {};
         for (const id of input.workspaceIds) {

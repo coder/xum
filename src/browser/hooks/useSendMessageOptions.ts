@@ -9,6 +9,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useAutoRouting, useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
@@ -26,11 +27,7 @@ export function useAutoRoutingSelection(
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const agents = useOptionalAgent()?.agents ?? [];
-  const active = useAutoRouting(
-    workspaceId,
-    dimension,
-    new Map(agents.map((agent) => [agent.id, agent.base]))
-  );
+  const active = useAutoRouting(workspaceId, dimension, getAgentAiSettingsBases(agents));
   return [
     experimentEnabled && active,
     (next) => setAutoRoutingChoice(workspaceId, dimension, next),
@@ -50,7 +47,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const { model: baseModel, serviceTier } = useWorkspaceAiSelection(
     workspaceId,
     agentId,
-    new Map(agents.map((agent) => [agent.id, agent.base]))
+    getAgentAiSettingsBases(agents)
   );
 
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");

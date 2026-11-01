@@ -2528,6 +2528,7 @@ function createMockAPI(options: MockAPIOptions = {}) {
       }
     ),
     getSessionUsage: mock(options.workspace?.getSessionUsage ?? (() => Promise.resolve(undefined))),
+    getSubagentUsage: mock(() => Promise.resolve({ children: {} })),
     onChat: mock(
       options.workspace?.onChat ??
         (async () => {

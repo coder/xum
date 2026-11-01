@@ -40,6 +40,7 @@ export type RemoteProjectAgentPlugin = Pick<
   | "manifest"
   | "codexFallback"
   | "claudeFallback"
+  | "cursorFallback"
   | "skillsOnly"
   | "skillsDirs"
   | "agentsDir"
@@ -157,6 +158,7 @@ function pickSkillsAndAgents(plugin: AgentPluginInfo): RemoteProjectAgentPlugin 
     manifest: plugin.manifest,
     ...(plugin.codexFallback ? { codexFallback: true as const } : {}),
     ...(plugin.claudeFallback ? { claudeFallback: true as const } : {}),
+    ...(plugin.cursorFallback ? { cursorFallback: true as const } : {}),
     ...(plugin.skillsOnly ? { skillsOnly: true as const } : {}),
     ...(plugin.skillsDirs !== undefined ? { skillsDirs: plugin.skillsDirs } : {}),
     ...(plugin.agentsDir !== undefined ? { agentsDir: plugin.agentsDir } : {}),

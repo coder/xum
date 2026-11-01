@@ -41,6 +41,7 @@ import {
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
+import { resolveAgentAiSettingsChain } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { resolveToolPolicyForAgent } from "@/node/services/agentDefinitions/resolveToolPolicy";
 import { log } from "./log";
 import { getTaskDepthFromConfig } from "./taskUtils";
@@ -101,6 +102,8 @@ export interface AgentResolutionResult {
   isSubagentWorkspace: boolean;
   /** Resolved inheritance chain in child → base order for capability checks. */
   agentInheritanceChain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>>;
+  /** The chain the agent's AI settings resolve over (ai.settingsBase applied); see resolveAgentAiSettingsChain. */
+  agentAiSettingsChain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>>;
   /** Whether the resolved agent inherits plan-like behavior (has propose_plan in tool chain). */
   agentIsPlanLike: boolean;
   effectiveMode: "plan" | "exec" | "compact";
@@ -573,6 +576,19 @@ export async function resolveAgentForStream(
     }
   }
 
+  const agentAiSettingsChain = await resolveAgentAiSettingsChain(
+    agentDefinition.id,
+    agentsForInheritance,
+    {
+      runtime: agentDiscoveryRuntime,
+      workspacePath: agentDiscoveryPath,
+      workspaceId,
+      cache,
+      projectPluginsTrusted,
+      runtimeFactory,
+    }
+  );
+
   const agentIsPlanLike = isPlanLikeInResolvedChain(agentsForInheritance);
   const effectiveMode =
     agentDefinition.id === "compact" ? "compact" : agentIsPlanLike ? "plan" : "exec";
@@ -705,6 +721,7 @@ export async function resolveAgentForStream(
     agentDiscoveryPath,
     isSubagentWorkspace,
     agentInheritanceChain: agentsForInheritance,
+    agentAiSettingsChain,
     agentIsPlanLike,
     effectiveMode,
     taskSettings,

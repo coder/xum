@@ -407,6 +407,57 @@ export interface WorkspaceUsageState {
   liveMetadataModel?: string;
   /** Prompt-cache health of the most recent completed assistant turns, newest first. */
   recentTurnCacheHealth?: TurnCacheHealth[];
+  /**
+   * Usage of sub-agents that still exist. Their spend reaches sessionTotal only when they are
+   * removed, so cost displays add this to show what the whole tree has spent so far.
+   */
+  subagentTotal?: ChatUsageDisplay;
+  subagentByModel?: Record<string, ChatUsageDisplay>;
+  /** Open sub-agent workspaces counted in subagentTotal. */
+  subagentCount?: number;
+}
+
+type SubagentUsageByChild = Awaited<
+  ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
+>;
+
+function sumSubtreesNotRolledUp(
+  children: SubagentUsageByChild["children"],
+  rolledUpFrom: Readonly<Record<string, unknown>>
+): { byModel: Record<string, ChatUsageDisplay>; count: number } {
+  const byModel: Record<string, ChatUsageDisplay> = {};
+  let count = 0;
+  for (const [childId, subtree] of Object.entries(children)) {
+    if (rolledUpFrom[childId]) continue;
+    count += subtree.workspaceCount;
+    for (const [model, usage] of Object.entries(subtree.byModel)) {
+      const existing = byModel[model];
+      const sum = existing ? sumUsageHistory([existing, usage]) : usage;
+      assert(sum, "sumSubtreesNotRolledUp: sum of two usages must exist");
+      byModel[model] = sum;
+    }
+  }
+  return { byModel, count };
+}
+
+/**
+ * A child already in the ledger's rolledUpFrom is dropped here, on every read, not when the
+ * projection arrives: the projection and the ledger are separate fetches, and a removal can
+ * roll the child up between them (or a delta can add it later), which would count it twice.
+ */
+function getSubagentUsageFields(
+  data: SubagentUsageByChild | undefined,
+  ledger: { rolledUpFrom?: Readonly<Record<string, unknown>> } | undefined
+): Pick<WorkspaceUsageState, "subagentTotal" | "subagentByModel" | "subagentCount"> {
+  const { byModel, count } = sumSubtreesNotRolledUp(
+    data?.children ?? {},
+    ledger?.rolledUpFrom ?? {}
+  );
+  const models = Object.values(byModel);
+  if (models.length === 0) {
+    return {};
+  }
+  return { subagentByModel: byModel, subagentTotal: sumUsageHistory(models), subagentCount: count };
 }
 
 /**
@@ -863,6 +914,26 @@ function isCostsIncludedEntry(
   return hasTokens;
 }
 
+function repriceUsageByModel(
+  byModel: Record<string, ChatUsageDisplay>,
+  config: ProvidersConfigMap
+): void {
+  for (const [model, entry] of Object.entries(byModel)) {
+    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
+    const resolved = resolveModelForMetadata(model, config);
+    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
+    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
+    byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
+  }
+}
+
+/** The projection has no fingerprint to compare, so it is repriced on every apply. */
+function repriceSubagentUsage(data: SubagentUsageByChild, config: ProvidersConfigMap): void {
+  for (const subtree of Object.values(data.children)) {
+    repriceUsageByModel(subtree.byModel, config);
+  }
+}
+
 /**
  * Recompute cost aggregates for a single session-usage entry so session totals
  * and last-request costs reflect the current model mapping.
@@ -879,13 +950,7 @@ function repriceSessionUsage(
   if (usage.tokenStatsCache?.providersConfigVersion !== providersConfigFingerprint) {
     usage.tokenStatsCache = undefined;
   }
-  for (const [model, entry] of Object.entries(usage.byModel)) {
-    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
-    const resolved = resolveModelForMetadata(model, config);
-    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
-    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
-    usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
-  }
+  repriceUsageByModel(usage.byModel, config);
   if (
     usage.lastRequest &&
     !isCostsIncludedEntry(usage.lastRequest.usage, usage.lastRequest.model, config)
@@ -1175,6 +1240,8 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
+  private subagentUsage = new Map<string, SubagentUsageByChild>();
+  private subagentUsageRequestVersion = new Map<string, number>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1442,14 +1509,28 @@ export class WorkspaceStore {
         version: 1 as const,
       };
 
-      for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-        const existing = current.byModel[model];
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
+      // drops it from the projection. Self deltas (headless spend) repeat and always add.
+      const childId =
+        usageDelta.sourceWorkspaceId === workspaceId ? undefined : usageDelta.sourceWorkspaceId;
+      if (childId === undefined || !current.rolledUpFrom?.[childId]) {
+        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+          const existing = current.byModel[model];
+          const sum = existing ? sumUsageHistory([existing, usage]) : usage;
+          assert(sum, "session-usage-delta: sum of two usages must exist");
+          current.byModel[model] = sum;
+        }
+      }
+      if (childId !== undefined) {
+        current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
       }
 
       this.sessionUsage.set(workspaceId, current);
       this.usageStore.bump(workspaceId);
+      // A ledger fetch still in flight read the file before the roll-up and would overwrite
+      // this merge: refetch, so the newer response wins (it also refreshes the projection).
+      this.refreshSessionUsage(workspaceId);
     },
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1621,6 +1702,7 @@ export class WorkspaceStore {
 
     const requestVersion = (this.sessionUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.sessionUsageRequestVersion.set(workspaceId, requestVersion);
+    this.refreshSubagentUsage(workspaceId);
 
     client.workspace
       .getSessionUsage({ workspaceId })
@@ -1667,6 +1749,83 @@ export class WorkspaceStore {
       });
   }
 
+  private refreshSubagentUsage(workspaceId: string): void {
+    const client = this.client;
+    if (!client || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    // No gate on known children: a parent registers before its children do, so frontend
+    // metadata cannot tell that a workspace has none.
+    const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
+    this.subagentUsageRequestVersion.set(workspaceId, requestVersion);
+    client.workspace
+      .getSubagentUsage({ workspaceId })
+      .then((data) => this.applySubagentUsage(workspaceId, requestVersion, data))
+      .catch((error) => {
+        console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
+      });
+  }
+
+  private applySubagentUsage(
+    workspaceId: string,
+    requestVersion: number,
+    data: SubagentUsageByChild
+  ): void {
+    const isLatest = this.subagentUsageRequestVersion.get(workspaceId) === requestVersion;
+    if (!isLatest || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    if (this.providersConfig) {
+      repriceSubagentUsage(data, this.providersConfig);
+    }
+    this.subagentUsage.set(workspaceId, data);
+    this.usageStore.bump(workspaceId);
+  }
+
+  private refreshAncestorsWhenStreamEnds(
+    workspaceId: string,
+    previous: WorkspaceActivitySnapshot | null,
+    snapshot: WorkspaceActivitySnapshot | null
+  ): void {
+    if (previous?.streaming !== true || snapshot?.streaming === true) {
+      return;
+    }
+    this.refreshAncestorSubagentUsage(workspaceId);
+  }
+
+  /**
+   * A nested sub-agent rolls into its own parent's ledger, and no session-usage-delta reaches the
+   * higher ancestors, so their projections are refetched here.
+   */
+  private refreshAncestorSubagentUsage(workspaceId: string): void {
+    for (const ancestorId of this.listAncestorIds(workspaceId)) {
+      if (this.isWorkspaceOnScreen(ancestorId) || this.usageStore.hasKeySubscribers(ancestorId)) {
+        this.refreshSubagentUsage(ancestorId);
+      }
+    }
+  }
+
+  private listAncestorIds(workspaceId: string): string[] {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([workspaceId]);
+    let parentId = this.workspaceMetadata.get(workspaceId)?.parentWorkspaceId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      ancestors.push(parentId);
+      parentId = this.workspaceMetadata.get(parentId)?.parentWorkspaceId;
+    }
+    return ancestors;
+  }
+
+  private repriceAllUsage(config: ProvidersConfigMap, fingerprint: number): void {
+    for (const [, usage] of this.sessionUsage) {
+      repriceSessionUsage(usage, config, fingerprint);
+    }
+    for (const [, usage] of this.subagentUsage) {
+      repriceSubagentUsage(usage, config);
+    }
+  }
+
   private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
     // Version counter prevents an older, slower response from overwriting a newer one.
     // We bump eagerly so concurrent requests each get unique versions, then only apply
@@ -1695,9 +1854,7 @@ export class WorkspaceStore {
         // so mapped-model changes take effect on next access.
         this.consumerManager.invalidateAll();
 
-        for (const [, usage] of this.sessionUsage) {
-          repriceSessionUsage(usage, config, nextFingerprint);
-        }
+        this.repriceAllUsage(config, nextFingerprint);
       }
 
       // Bump usage-store subscribers AFTER repricing so observers see
@@ -3648,6 +3805,7 @@ export class WorkspaceStore {
       return {
         sessionTotal,
         sessionByModel,
+        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId), sessionData),
         lastRequest,
         lastContextUsage,
         totalTokens,
@@ -4000,6 +4158,8 @@ export class WorkspaceStore {
     if (refreshGoalCount) {
       this.refreshActiveGoalCount();
     }
+
+    this.refreshAncestorsWhenStreamEnds(workspaceId, previous, snapshot);
 
     // Transcript content that lands while a workspace is not the active onChat
     // subscription never reaches its aggregator, so any stream/recency movement
@@ -4837,6 +4997,9 @@ export class WorkspaceStore {
    * Remove a workspace and clean up subscriptions.
    */
   removeWorkspace(workspaceId: string): void {
+    // Before the metadata goes: the ancestor walk reads this workspace's parent link.
+    this.refreshAncestorSubagentUsage(workspaceId);
+
     // Clean up consumer manager state
     this.consumerManager.removeWorkspace(workspaceId);
 
@@ -4906,6 +5069,8 @@ export class WorkspaceStore {
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
+    this.subagentUsage.delete(workspaceId);
+    this.subagentUsageRequestVersion.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
     this.derived.bump("recency");
@@ -6069,6 +6234,18 @@ export function removeEphemeralMessage(workspaceId: string, messageId: string): 
     aggregator.removeMessage(messageId);
     store.bumpState(workspaceId);
   }
+}
+
+/**
+ * Session cost usage as the cost displays show it: the persisted ledger (own turns plus removed
+ * sub-agents), open sub-agents, and the running stream.
+ */
+export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDisplay | undefined {
+  const parts: ChatUsageDisplay[] = [];
+  if (usage.sessionTotal) parts.push(usage.sessionTotal);
+  if (usage.subagentTotal) parts.push(usage.subagentTotal);
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  return parts.length > 0 ? sumUsageHistory(parts) : undefined;
 }
 
 /**

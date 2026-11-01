@@ -22,7 +22,7 @@ import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
+import { ChatStatsSchema, ChatUsageDisplaySchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
@@ -152,8 +152,8 @@ import {
   CreationDraftListSchema,
   CreationDraftSchema,
   CreationDraftScopeSchema,
-  CreationDraftSummarySchema,
   CreationDraftUpdateInputSchema,
+  CreationDraftUpdateOutputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -1299,6 +1299,8 @@ export const agentPlugins = {
       key: z.string(),
       hash: z.string(),
       state: z.enum(["trusted", "disabled"]).nullable(),
+      /** `getHooks().fileReview.digest`: required to trust while that review is shown. */
+      fileReviewDigest: z.string().optional(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -2800,6 +2802,22 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: SessionUsageFileSchema.optional(),
   },
+  /**
+   * Usage of the workspace's sub-agents that still exist (not yet rolled into its ledger).
+   * The Costs tab adds it to the session cost so delegated spend is visible before removal.
+   */
+  getSubagentUsage: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.object({
+      children: z.record(
+        z.string(),
+        z.object({
+          byModel: z.record(z.string(), ChatUsageDisplaySchema),
+          workspaceCount: z.number().int().nonnegative(),
+        })
+      ),
+    }),
+  },
   /** Batch fetch session usage for multiple workspaces (for archived workspaces cost display) */
   getSessionUsageBatch: {
     input: z.object({ workspaceIds: z.array(z.string()) }),
@@ -3877,7 +3895,7 @@ export const drafts = {
   },
   updateCreation: {
     input: CreationDraftUpdateInputSchema,
-    output: CreationDraftSummarySchema,
+    output: CreationDraftUpdateOutputSchema,
   },
   deleteCreation: {
     input: CreationDraftDeleteInputSchema,

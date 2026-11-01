@@ -16,6 +16,7 @@ import { removeSentText, takeSentText } from "@/common/utils/composerDraftText";
 import {
   draftScopeKey,
   summarizeCreationDraft,
+  creationDraftMetadata,
   summarizeDraft,
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
@@ -145,8 +146,13 @@ export function createMockDraftsApi() {
     },
     getCreation: (input: { scope: CreationDraftScope }) =>
       Promise.resolve(creationDrafts.get(input.scope.draftId) ?? null),
-    updateCreation: ({ scope, ...patch }: CreationDraftUpdateInput) =>
-      Promise.resolve(summarizeCreationDraft(putCreation(scope.draftId, patch))),
+    updateCreation: ({ scope, ...patch }: CreationDraftUpdateInput) => {
+      const record = putCreation(scope.draftId, patch);
+      return Promise.resolve({
+        ...summarizeCreationDraft(record),
+        record: creationDraftMetadata(record),
+      });
+    },
     deleteCreation: (input: { scope: CreationDraftScope }) => {
       creationDrafts.delete(input.scope.draftId);
       return Promise.resolve();

@@ -26,9 +26,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright NPM_CONFIG_UPDATE_NOTIFIER=false \
 # git: startApp.ts seeds a git repo for the demo project.
 # xvfb, libgtk-3-0: Xum Electron for the Electron stories (tests/stories/electron). ldd on the
 # Electron binary in this image found only libgtk-3 missing; Xvfb gives it a display.
+# jq: the Cursor ralph-loop plugin's hooks run it, as in Cursor (repros/cursorStopHookLoop.e2e.ts).
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
-    xvfb libgtk-3-0 \
+    xvfb libgtk-3-0 jq \
  && rm -rf /var/lib/apt/lists/*
 # The Chromium build that this playwright-core drives. e2e looks for both the full browser and
 # the headless shell, and `install chromium` gets both.

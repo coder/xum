@@ -13,12 +13,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import { goalActiveMode, isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import { hasGoalBudgetLimit } from "@/common/utils/goals/budgetPricing";
-import {
-  formatCostWithDollar,
-  getTotalCost,
-  sumUsageHistory,
-  type ChatUsageDisplay,
-} from "@/common/utils/tokens/usageAggregator";
+import { formatCostWithDollar, getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
@@ -34,6 +29,7 @@ import {
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
 import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import {
+  sumSessionCostUsage,
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
   workspaceStore,
@@ -137,17 +133,15 @@ function getGoalLimits(goal: GoalSnapshot): string | null {
 }
 
 /**
- * Session cost and tokens, as the Stats tab totals them (persisted session plus live stream).
+ * Session cost and tokens, as the Stats tab totals them (persisted session, open sub-agents and
+ * live stream).
  * `costIncomplete`: some usage has unknown pricing, so `cost` is only the priced part.
  */
 function useSessionStats(
   workspaceId: string
 ): { cost?: number; costIncomplete: boolean; tokens: number } | null {
   const usage = useWorkspaceUsage(workspaceId);
-  const parts: ChatUsageDisplay[] = [];
-  if (usage.sessionTotal) parts.push(usage.sessionTotal);
-  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-  const total = parts.length > 0 ? sumUsageHistory(parts) : undefined;
+  const total = sumSessionCostUsage(usage);
   if (total == null) return null;
   const tokens =
     total.input.tokens +
