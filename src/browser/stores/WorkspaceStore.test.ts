@@ -66,6 +66,7 @@ import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
+  sumSessionCostUsage,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -115,6 +116,9 @@ const mockOnChat = mock(idleOnChat);
 
 const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
 const mockGetSessionUsage = mock(noSessionUsage);
+const noSubagentUsage = (_input: { workspaceId: string }) =>
+  Promise.resolve<unknown>({ children: {} });
+const mockGetSubagentUsage = mock(noSubagentUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
@@ -187,6 +191,7 @@ const mockClient = {
   workspace: {
     onChat: mockOnChat,
     getSessionUsage: mockGetSessionUsage,
+    getSubagentUsage: mockGetSubagentUsage,
     history: {
       loadMore: mockHistoryLoadMore,
     },
@@ -285,6 +290,7 @@ function makeWorkspaceMetadata(
     namedWorkspacePath: options.namedWorkspacePath ?? "/path/to/workspace",
     createdAt: options.createdAt ?? new Date().toISOString(),
     runtimeConfig: options.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
+    ...(options.parentWorkspaceId ? { parentWorkspaceId: options.parentWorkspaceId } : {}),
   };
 }
 
@@ -743,6 +749,8 @@ describe("WorkspaceStore", () => {
     mockOnChat.mockImplementation(idleOnChat);
     mockGetSessionUsage.mockReset();
     mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockGetSubagentUsage.mockReset();
+    mockGetSubagentUsage.mockImplementation(noSubagentUsage);
     mockActivitySubscribe.mockReset();
     mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
@@ -3497,6 +3505,160 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("open sub-agent usage", () => {
+    const usageOf = (inputTokens: number, inputCost: number) => ({
+      input: { tokens: inputTokens, cost_usd: inputCost },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 0, cost_usd: 0 },
+      reasoning: { tokens: 0, cost_usd: 0 },
+    });
+    const ledger = (inputTokens: number, rolledUpFrom?: Record<string, true>) => ({
+      byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      version: 1 as const,
+      ...(rolledUpFrom ? { rolledUpFrom } : {}),
+    });
+    const projection = (children: Record<string, [inputTokens: number, count: number]>) => ({
+      children: Object.fromEntries(
+        Object.entries(children).map(([id, [inputTokens, workspaceCount]]) => [
+          id,
+          { byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) }, workspaceCount },
+        ])
+      ),
+    });
+    const shownInputTokens = (workspaceId: string) =>
+      sumSessionCostUsage(store.getWorkspaceUsage(workspaceId))?.input.tokens;
+    const rollUpDelta = (source: string, inputTokens: number): WorkspaceChatMessage => ({
+      type: "session-usage-delta",
+      workspaceId: "parent",
+      sourceWorkspaceId: source,
+      byModelDelta: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      timestamp: 1,
+    });
+
+    it("adds open sub-agents to the session cost of their parent only", async () => {
+      mockGetSessionUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(workspaceId === "parent" ? ledger(100) : undefined)
+      );
+      mockGetSubagentUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(projection(workspaceId === "parent" ? { child: [500, 3] } : {}))
+      );
+      // Real load order: the parent registers (and fetches usage) before its children exist
+      // in frontend metadata, so the store must not decide from metadata that it has none.
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+
+      expect(store.getWorkspaceUsage("child").subagentTotal).toBeUndefined();
+      const usage = store.getWorkspaceUsage("parent");
+      expect(usage.sessionTotal?.input.tokens).toBe(100);
+      expect(usage.subagentCount).toBe(3);
+      expect(shownInputTokens("parent")).toBe(600);
+      expect(sumSessionCostUsage(usage)?.input.cost_usd).toBe(6);
+    });
+
+    it("counts a child once when the ledger already rolled it up", async () => {
+      // The ledger read ran after the roll-up, the projection read before it.
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1], other: [50, 2] }))
+      );
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+
+      expect(shownInputTokens("parent")).toBe(650);
+      expect(store.getWorkspaceUsage("parent").subagentCount).toBe(2);
+    });
+
+    it("counts a rolled-up child once and refetches the ledger", async () => {
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1] }))
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      expect(shownInputTokens("parent")).toBe(600);
+      mockGetSessionUsage.mockClear();
+      // Hold the refetch, so the delta handler alone decides what the tab shows.
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("keeps the newest projection when an older response arrives last", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
+      );
+      createAndAddWorkspace(store, "other");
+      createAndAddWorkspace(store, "parent");
+      store.setActiveWorkspaceId("other");
+      store.setActiveWorkspaceId("parent");
+      const parentCalls = mockGetSubagentUsage.mock.calls
+        .map((call, index) => ({ workspaceId: call[0].workspaceId, index }))
+        .filter((call) => call.workspaceId === "parent");
+      expect(parentCalls).toHaveLength(2);
+      const [older, newer] = parentCalls.map((call) => responses[call.index]);
+
+      newer(projection({ child: [7, 1] }));
+      await tick(0);
+      older(projection({ child: [999, 1] }));
+      await tick(0);
+
+      expect(shownInputTokens("parent")).toBe(7);
+    });
+
+    it("adds every self delta", async () => {
+      // Headless spend (status titles, bash AI proxy) reports the workspace itself as source.
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send(rollUpDelta("parent", 1), rollUpDelta("parent", 1));
+
+      expect(shownInputTokens("parent")).toBe(2);
+    });
+
+    it("refreshes the parent's projection when a sub-agent's stream ends", async () => {
+      const releaseStop = mockBackgroundActivityTransition(
+        "child",
+        createActivitySnapshot(10, { streaming: true }),
+        [createActivitySnapshot(11, { streaming: false })]
+      );
+      recreateStore();
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      releaseStop();
+      await tick(10);
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("refreshes the ancestors' projections when a nested sub-agent is removed", async () => {
+      // A grandchild rolls into the child's ledger: no delta reaches the parent.
+      createAndAddWorkspace(store, "parent");
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+      createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      store.removeWorkspace("grandchild");
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+  });
+
   // Loaded session usage is repriced against the current provider config, except for
   // costs-included rows, whose zero costs are real: repricing them would inflate totals.
   describe("session usage repricing", () => {
@@ -3653,6 +3815,56 @@ describe("WorkspaceStore", () => {
       const usage = store.getWorkspaceUsage(workspaceId);
       expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
       expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    const projectUnpricedChild = () =>
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: {
+            child: {
+              byModel: {
+                [CUSTOM_MODEL]: usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true }),
+              },
+              workspaceCount: 1,
+            },
+          },
+        })
+      );
+
+    it("prices open sub-agent usage with the loaded provider config", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+      projectUnpricedChild();
+      await loadUsage("reprice-projection", BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+
+      expectCosts(
+        store.getWorkspaceUsage("reprice-projection").subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
+    });
+
+    it("reprices open sub-agent usage when a provider config change maps its model", async () => {
+      projectUnpricedChild();
+      const workspaceId = "reprice-projection-after-mapping";
+      await loadUsage(workspaceId, BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+      expect(store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]).toMatchObject({
+        hasUnknownCosts: true,
+      });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      expectCosts(
+        store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
     });
   });
 

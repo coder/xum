@@ -2574,6 +2574,12 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.sessionUsageService.getSessionUsage(input.workspaceId)
         ),
+      getSubagentUsage: t
+        .input(schemas.workspace.getSubagentUsage.input)
+        .output(schemas.workspace.getSubagentUsage.output)
+        .handler(async ({ context, input }) =>
+          context.sessionUsageService.getOpenSubagentUsage(input.workspaceId)
+        ),
       getSessionUsageBatch: t
         .input(schemas.workspace.getSessionUsageBatch.input)
         .output(schemas.workspace.getSessionUsageBatch.output)
