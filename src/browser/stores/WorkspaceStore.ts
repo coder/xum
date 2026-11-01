@@ -102,7 +102,7 @@ import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggre
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import type { z } from "zod";
-import type { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { isInheritedForkRow, type SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
   applyLiveBashOutputEvent,
@@ -493,15 +493,6 @@ function getTurnCacheHealth(
   const turnUsages = getAssistantMessageModelUsages(metadata);
   if (turnUsages.length === 0) return undefined;
   return { messageId: msg.id, timestamp: metadata.timestamp, ...getCacheHealth(turnUsages) };
-}
-
-/**
- * True for a row a fork copied from its parent: at or before the ledger's `forkedAt`.
- * Rows without a timestamp, and workspaces without the marker (old forks, non-forks),
- * count as the workspace's own.
- */
-function isInheritedForkRow(timestamp: number | undefined, forkedAt: number | undefined): boolean {
-  return timestamp !== undefined && forkedAt !== undefined && timestamp <= forkedAt;
 }
 
 /** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */

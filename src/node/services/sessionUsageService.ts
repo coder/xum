@@ -20,6 +20,7 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
+  isInheritedForkRow,
   RolledUpChildEntrySchema,
   SessionUsageFileSchema,
 } from "@/common/orpc/schemas/chatStats";
@@ -327,6 +328,18 @@ function parseLedgerKeepingValidParts(raw: unknown): ParsedLedger | undefined {
   };
 }
 
+/** The fork marker of an unusable ledger, so its repair keeps the fork's boundary. */
+function readForkBoundary(text: string): number | undefined {
+  try {
+    const raw: unknown = JSON.parse(text);
+    return isPlainObject(raw)
+      ? SessionUsageFileSchema.shape.forkedAt.parse(raw.forkedAt)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The schema strips settledInFlightKeys, but the view reads it into a Set. */
 const SettledInFlightKeysSchema = z.array(z.string()).optional();
 
@@ -401,7 +414,10 @@ export class SessionUsageService {
     this.historyService = historyService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
-  /** Usage rebuild needs every epoch for accurate totals. */
+  /**
+   * Usage rebuild needs every epoch for accurate totals. Throws when history cannot be read:
+   * a repair that took the failure for an empty session would write a ledger without it.
+   */
   private async collectFullHistory(workspaceId: string): Promise<MuxMessage[]> {
     const messages: MuxMessage[] = [];
     const result = await this.historyService.iterateFullHistoryUnderLock(
@@ -412,8 +428,7 @@ export class SessionUsageService {
       }
     );
     if (!result.success) {
-      log.warn(`Failed to iterate history for ${workspaceId}: ${result.error}`);
-      return [];
+      throw new Error(`Failed to iterate history for ${workspaceId}: ${result.error}`);
     }
     return messages;
   }
@@ -581,7 +596,7 @@ export class SessionUsageService {
     const content = await this.parseLedgerText(workspaceId, text);
     if (content !== "unusable") return { ledger: content, countedMessageIds: new Set() };
     log.warn(`session-usage.json unusable for ${workspaceId}, rebuilding`);
-    return (await this.repairLedgerFromHistory(workspaceId)) ?? empty;
+    return (await this.repairLedgerFromHistory(workspaceId, readForkBoundary(text))) ?? empty;
   }
 
   /** The ledger file's text, undefined when missing. Throws on any other read error. */
@@ -634,17 +649,24 @@ export class SessionUsageService {
   }
 
   /**
-   * Rebuilds the ledger from history and writes it; undefined when history is empty. Also
-   * returns the assistant messages it counted, so a settle of one of them is not added again.
+   * Rebuilds the ledger from history and writes it; undefined when there is nothing to keep.
+   * A fork's rows from its parent stay out and its marker stays (`forkedAt`). Also returns the
+   * assistant messages it counted, so a settle of one of them is not added again.
    */
   private async repairLedgerFromHistory(
-    workspaceId: string
+    workspaceId: string,
+    forkedAt?: number
   ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> } | undefined> {
-    const messages = await this.collectFullHistory(workspaceId);
-    if (messages.length === 0) return undefined;
-    const rebuilt = parseLedgerKeepingValidParts(
-      await this.rebuildAndWriteLedger(workspaceId, messages)
+    const messages = (await this.collectFullHistory(workspaceId)).filter(
+      (msg) => !isInheritedForkRow(msg.metadata?.timestamp, forkedAt)
     );
+    if (messages.length === 0 && forkedAt === undefined) return undefined;
+    const repaired = await this.rebuildFromMessagesInternal(workspaceId, messages);
+    repaired.forkedAt = forkedAt;
+    await this.writeFile(workspaceId, repaired);
+    log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+    // Through the parser like every read: a legacy history row can hold a malformed usage.
+    const rebuilt = parseLedgerKeepingValidParts(repaired);
     assert(rebuilt && !rebuilt.settledKeysCorrupt, "a ledger rebuilt from history always parses");
     const countedMessageIds = new Set(
       messages
@@ -1218,12 +1240,11 @@ export class SessionUsageService {
       return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
     }
     // Not in the try: a failed in-flight listing must fail the read, not rebuild the ledger.
-    const content = text === undefined ? undefined : await this.parseLedgerText(workspaceId, text);
-    if (content !== undefined && content !== "unusable") return content;
-    if (content === "unusable") {
-      log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
-    }
-    return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
+    if (text === undefined) return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
+    const content = await this.parseLedgerText(workspaceId, text);
+    if (content !== "unusable") return content;
+    log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
+    return (await this.repairLedgerFromHistory(workspaceId, readForkBoundary(text)))?.ledger;
   }
 
   /**
@@ -1358,14 +1379,12 @@ export class SessionUsageService {
    * Rebuild session usage from messages (for migration/recovery).
    * Internal version - called within lock.
    */
-  private async rebuildAndWriteLedger(
-    workspaceId: string,
-    messages: MuxMessage[]
-  ): Promise<SessionUsageFile> {
-    const rebuilt = await this.rebuildFromMessagesInternal(workspaceId, messages);
-    await this.writeFile(workspaceId, rebuilt);
+  private async rebuildAndWriteLedger(workspaceId: string, messages: MuxMessage[]): Promise<void> {
+    await this.writeFile(
+      workspaceId,
+      await this.rebuildFromMessagesInternal(workspaceId, messages)
+    );
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
-    return rebuilt;
   }
 
   private async rebuildFromMessagesInternal(

@@ -1316,6 +1316,70 @@ describe("SessionUsageService", () => {
       expect(inputTokens(await readThroughIpc())).toBe(307);
     });
 
+    it("keeps a fork's boundary when it rebuilds an unusable ledger", async () => {
+      const forkedAt = Date.now() - 1_000;
+      // beforeEach's msg1 has no timestamp (the fork's own); this one came from the parent.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("inherited", "assistant", "Hi", {
+          model,
+          timestamp: forkedAt - 1,
+          usage: { inputTokens: 5_000, outputTokens: 0, totalTokens: 5_000 },
+        })
+      );
+      await writeLedger({ byModel: null, forkedAt, version: 1 });
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+      const result = await readThroughIpc();
+      expect(inputTokens(result)).toBe(307);
+      expect(result?.forkedAt).toBe(forkedAt);
+    });
+
+    it("keeps a fork's boundary on a read, even with no rows of its own", async () => {
+      const forkedAt = Date.now() - 1_000;
+      const inherited = createMuxMessage("inherited", "assistant", "Hi", {
+        model,
+        timestamp: forkedAt - 1,
+        usage: { inputTokens: 5_000, outputTokens: 0, totalTokens: 5_000 },
+      });
+      const forkOnlyId = "fork-only-inherited";
+      await historyService.appendToHistory(forkOnlyId, inherited);
+      await fs.writeFile(
+        path.join(config.sessionsDir, forkOnlyId, "session-usage.json"),
+        JSON.stringify({ byModel: "x", forkedAt, version: 1 })
+      );
+      await historyService.appendToHistory(workspaceId, inherited);
+      await writeLedger({ byModel: "x", forkedAt, version: 1 });
+
+      const own = getSessionUsageOutput.parse(await service.getSessionUsage(workspaceId));
+      const none = getSessionUsageOutput.parse(await service.getSessionUsage(forkOnlyId));
+
+      expect([inputTokens(own), own?.forkedAt]).toEqual([300, forkedAt]);
+      expect([inputTokens(none), none?.forkedAt]).toEqual([0, forkedAt]);
+    });
+
+    it("fails a repair while history cannot be read, and repairs on the next try", async () => {
+      await writeLedger({ ...ledger, byModel: null });
+      const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock").mockResolvedValue({
+        success: false,
+        error: "EIO",
+      });
+      try {
+        // An empty history would rebuild to nothing: the write would drop the 300 tokens.
+        const result = await service.recordUsage(workspaceId, model, createUsage(7, 0)).then(
+          () => "resolved",
+          () => "rejected"
+        );
+        expect(result).toBe("rejected");
+      } finally {
+        iterateSpy.mockRestore();
+      }
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+      expect(inputTokens(await readThroughIpc())).toBe(307);
+    });
+
     describe("with corrupt settled keys", () => {
       const corrupt = { ...ledger, settledInFlightKeys: {} };
       const inFlightDir = () =>
