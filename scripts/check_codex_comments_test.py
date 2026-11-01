@@ -366,6 +366,78 @@ else:
             data = snapshot([comment(board)], [open_thread], head=head)
             self.assert_gate(1, data, wait=60)
 
+    def test_null_security_flags_pass_beside_cleared_advisories(self):
+        # Codex keeps listing an advisory after its thread is resolved, beside null
+        # security flags (observed on #7859). A cleared bullet must not block that board.
+        board = FIXTURES["review_state_null_security_advisory_summary"]["body"]
+        head = board_head(board)
+        clean = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        receipt = re.sub(r"\*\*Reviewed commit:\*\* `[0-9a-f]+`", f"**Reviewed commit:** `{head[:10]}`", clean)
+        self.assertNotEqual(receipt, clean)
+        discussion = "4433878221"
+        link = f"(https://github.com/coder/xum/pull/7859#discussion_r{discussion})"
+        unlinked = board.replace("[Let Stop preempt grouped task creation]" + link, "Let Stop preempt grouped task creation")
+        self.assertNotEqual(unlinked, board)
+        undercounted = board.replace("#### Advisory findings (1)", "#### Advisory findings (2)")
+        self.assertNotEqual(undercounted, board)
+        bulletless = re.sub(r"\n- 🟡 [^\n]*", "", board)
+        self.assertNotEqual(bulletless, board)
+        bullet = re.search(r"\n- 🟡 [^\n]*", board).group(0)
+        outside = bulletless.replace("\n### Security findings", bullet + "\n\n### Security findings")
+        self.assertNotEqual(outside, bulletless)
+        borrowed = board.replace("#### Advisory findings (1)", "#### Advisory findings (1)\n\n#### Advisory findings (0)")
+        self.assertNotEqual(borrowed, board)
+        headless = re.sub(r"\n#### Advisory findings \(1\)\n", "", bulletless)
+        self.assertNotEqual(headless, bulletless)
+        # Round 4 on #7860: the findings heading must open the inventory, not follow it.
+        misplaced = board.replace("### Security findings\n\n", "").replace(bullet, bullet + "\n\n### Security findings")
+        self.assertNotEqual(misplaced, board)
+        loading = re.sub(
+            r"#### Advisory findings \(1\)\n\n- 🟡 [^\n]*",
+            "Finding details are still loading. Check the individual review comments.",
+            board,
+        )
+        self.assertNotEqual(loading, board)
+        marked = board.replace(bullet, bullet + " · **Resolved**")
+        self.assertNotEqual(marked, board)
+
+        def advisory(resolved, marker="<!-- codex-security-review-finding:v1 -->\n"):
+            return thread(
+                marker + "[P2] Let Stop preempt grouped task creation",
+                resolved=resolved,
+                discussion=discussion,
+                commit=head,
+            )
+
+        code_thread = thread(
+            "[P2] Let Stop preempt grouped task creation\n\n<!-- codex-code-review-finding:v1 -->",
+            resolved=True,
+            discussion=discussion,
+            commit=head,
+        )
+
+        for case, comments, threads, pr_head, expected in (
+            ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
+            ("unresolved advisory", [board, receipt], [advisory(False)], head, 1),
+            ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
+            ("fewer bullets than the declared count", [undercounted, receipt], [advisory(True)], head, 1),
+            ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
+            ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
+            ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
+            ("findings heading without an advisory header", [headless, receipt], [advisory(True)], head, 1),
+            ("findings heading after the inventory", [misplaced, receipt], [advisory(True)], head, 1),
+            ("finding details still loading", [loading, receipt], [advisory(True)], head, 1),
+            ("bullet linking a resolved code-review thread", [board, receipt], [code_thread], head, 1),
+            ("bullet linking a resolved thread without a marker", [board, receipt], [advisory(True, "")], head, 1),
+            ("Resolved marker without a thread", [marked, receipt], [], head, 0),
+            ("no receipt", [board], [advisory(True)], head, 10),
+            ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
     def test_missing_security_receipt_is_requested_once_per_head(self):
         board = FIXTURES["review_state_null_security_summary"]["body"]
         receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]

@@ -66,6 +66,7 @@ def codex_resolved_discussions($bot):
 # Input: review thread nodes. Output: per review-state entry, the commits on
 # which Codex has finding threads of that review kind and all are resolved.
 # Threads without a known marker or commit, and other reviewers', never count.
+# security_discussions: the root comment IDs of resolved Codex security finding threads.
 def codex_resolved_finding_commits($bot):
   [.[] | select(.comments.nodes[0].author.login == $bot)] as $codex
   # A marker counts only in its protocol position: security as the first line,
@@ -82,7 +83,10 @@ def codex_resolved_finding_commits($bot):
         | {commit: .comments.nodes[0].originalCommit.oid, resolved: (.isResolved == true)}
         | select(.commit | type == "string")]
       | group_by(.commit) | map(select(all(.resolved)) | .[0].commit);
-    {code_review: cleared("code_review"), security_review: cleared("security_review")};
+    {code_review: cleared("code_review"), security_review: cleared("security_review"),
+      security_discussions: [$codex[] | select(.isResolved == true
+          and (.comments.nodes[0].body | finding_kind == "security_review"))
+        | .comments.nodes[0].fullDatabaseId // empty]};
 
 def codex_review_row_prefix: "^\\| [^[:alnum:]|]*\\*\\*(Code|Security) Review\\*\\* \\| [^[:alnum:]|]*\\*\\*";
 def codex_review_triggers: "(Manual request|New commits|Draft marked ready|PR opened)";
@@ -95,6 +99,36 @@ def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_
 def codex_commitless_code_review_row:
   "^\\| [^[:alnum:]|]*\\*\\*Code Review\\*\\* \\| [^[:alnum:]|]*\\*\\*Completed\\*\\*( " + codex_relative_time + ")?"
   + " \\| — \\| " + codex_review_triggers + " \\|$";
+
+# The board's fixed lines and review rows, which come before any findings section.
+def codex_board_head_line:
+  . == "## Codex Review Summary"
+  or . == "This comment shows the latest Codex review activity on this pull request."
+  or . == "| Review | Status | Commit | Review trigger |"
+  or . == "| --- | --- | --- | --- |"
+  or test(codex_completed_row)
+  or test(codex_running_row);
+
+def codex_advisory_header: capture("^#### Advisory findings \\((?<n>[0-9]+)\\)$").n | tonumber;
+
+# Whether a board line is an advisory bullet with Codex's Resolved marker or a link to one of $ids.
+# capture() yields empty on a mismatch, so `// false` keeps an unknown line blocking.
+def codex_cleared_advisory_bullet($ids):
+  (first(capture("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r(?<id>[0-9]+)\\)"
+    + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$"))
+    | .marker != null or (.id | IN($ids[]))) // false;
+
+# Input: the board lines after its head lines. Output: whether they are empty or a cleared
+# advisory inventory: one "### Security findings", then advisory headers, each followed by
+# exactly as many bullets as it declares, every bullet cleared by $ids, and nothing else.
+def codex_cleared_advisory_inventory($ids):
+  length == 0
+  or (.[0] == "### Security findings" and (.[1:] as $rest
+    | ($rest | length > 0) and ($rest[0] | [codex_advisory_header] | length == 1)
+    and ($rest | all(([codex_advisory_header] | length == 1) or codex_cleared_advisory_bullet($ids)))
+    and ([range($rest | length) as $i | $rest[$i] | codex_advisory_header
+      | . == (($rest[($i + 1):] | map([codex_advisory_header] | length == 1) | index(true))
+        // ($rest | length - $i - 1))] | all)));
 
 # Parse the review summary board Codex edits in place. Emit "completed" or
 # "running" only when every line has an observed informational shape; emit null
@@ -123,12 +157,18 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           | ([$state[] | .code_review, .security_review]) as $reviews
           # Since 2026-10-28 Codex can finish a security review with null findings flags
           # (coder/xum#7727). That counts as clean only for the current head, beside a
-          # completed security line with the merge gate off, no advisory section, a clean
-          # receipt for this head and no open Codex thread ($cleared.clean_security_receipt,
-          # set by check_codex_comments.sh). Any other null stays unknown, so it blocks.
+          # completed security line with the merge gate off, a clean receipt for this head
+          # and no open Codex thread ($cleared.clean_security_receipt, set by
+          # check_codex_comments.sh). Any other null stays unknown, so it blocks.
+          # Codex keeps listing an advisory after its thread is resolved (#7859). With null
+          # flags the bullets are the only finding list, so the board must end in a complete
+          # inventory (codex_cleared_advisory_inventory) whose bullets each name a resolved
+          # security finding thread. Any other shape stays unknown.
           | ($security.status == "completed" and $security.headSha == $head
             and $security.mergeGateEnabled == false
-            and ($lines | any(. == "### Security findings" or test("^#### Advisory findings")) | not))
+            and ($lines[2:]
+              | .[(map(codex_board_head_line or test(codex_commitless_code_review_row) | not) | index(true)) // length:]
+              | codex_cleared_advisory_inventory($cleared.security_discussions // [])))
             as $null_security_base
           # Runs triggered by a push post no receipt (coder/xum#7731): until a Codex security
           # review request brings one, such a board is pending, so wait budgets cover it.
@@ -176,12 +216,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
               and (.status == "completed" or .status == "running"))
             and ($lines[2:] | length >= 5)
             and ($lines[2:] | all(
-              . == "## Codex Review Summary"
-              or . == "This comment shows the latest Codex review activity on this pull request."
-              or . == "| Review | Status | Commit | Review trigger |"
-              or . == "| --- | --- | --- | --- |"
-              or test(codex_completed_row)
-              or test(codex_running_row)
+              codex_board_head_line
               or (test(codex_commitless_code_review_row) and ($state | any(.code_review.commit_sha == null)))
               # Security advisories stay listed after their review threads are resolved.
               # Codex's Resolved marker can lag or never appear (coder/xum#5045), so a
@@ -189,11 +224,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
               # live finding and keeps blocking; other sections stay unknown.
               or . == "### Security findings"
               or test("^#### Advisory findings \\([0-9]+\\)$")
-              # capture() yields empty on a mismatch, and all() would pass an empty
-              # condition, so `// false` keeps an unknown bullet blocking.
-              or (first(capture("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r(?<id>[0-9]+)\\)"
-                + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$")
-                | .marker != null or (.id | IN($resolved[]))) // false)
+              or codex_cleared_advisory_bullet($resolved)
             ))
             # A commitless code review counts for the head of the security review beside
             # it, which must be the current head: Codex starts both reviews together on
