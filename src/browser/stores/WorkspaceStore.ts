@@ -1840,10 +1840,22 @@ export class WorkspaceStore {
     if (revision === undefined || revision === previous?.usageRevision) {
       return;
     }
-    if (this.isUsageShown(workspaceId)) {
+    if (this.isUsageShown(workspaceId) && !this.isOwnStreamLive(workspaceId)) {
       this.refreshSessionUsage(workspaceId);
     }
     this.refreshAncestorSubagentUsage(workspaceId);
+  }
+
+  /**
+   * The workspace's chat shows its own stream live: its stream-end adds the stream's usage, and
+   * every terminal event refetches the ledger (finalizeUsageStats, stream-error). A revision
+   * refetch before that can already hold the settled stream, and stream-end would add it again.
+   */
+  private isOwnStreamLive(workspaceId: string): boolean {
+    return (
+      this.isOnChatSubscriptionActive(workspaceId) &&
+      this.aggregators.get(workspaceId)?.getActiveStreamMessageId() !== undefined
+    );
   }
 
   /**
@@ -4166,6 +4178,8 @@ export class WorkspaceStore {
     // - Clear liveUsage once the active stream ends
     // - Pick up lastContextUsage changes from merged message metadata
     this.usageStore.bump(workspaceId);
+    // Usage revision moves were skipped while the stream was live (isOwnStreamLive).
+    this.refreshSessionUsage(workspaceId);
 
     // Always schedule consumer calculation (tool calls, text, etc. need tokenization)
     // Even streams without usage metadata need token counts recalculated
@@ -5771,6 +5785,8 @@ export class WorkspaceStore {
       this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
+      // Usage revision moves were skipped while the stream was live (isOwnStreamLive).
+      this.refreshSessionUsage(workspaceId);
       return;
     }
 

@@ -21,8 +21,8 @@ export class UsageRevisionActivity {
   private readonly revisions = new Map<string, number>();
   /** Seeded from the clock, so a restarted backend never reissues a revision a renderer saw. */
   private lastRevision = Date.now();
-  /** Workspaces whose emit waits for its snapshot read. */
-  private readonly pendingEmits = new Set<string>();
+  /** The emit waiting for its snapshot read, per workspace (eviction drops it). */
+  private readonly pendingEmits = new Map<string, symbol>();
 
   constructor(private readonly deps: UsageRevisionActivityDeps) {}
 
@@ -33,10 +33,15 @@ export class UsageRevisionActivity {
     if (this.pendingEmits.has(workspaceId)) {
       return;
     }
-    this.pendingEmits.add(workspaceId);
+    const emit = Symbol(workspaceId);
+    this.pendingEmits.set(workspaceId, emit);
+    // A read that outlived an eviction must not free the slot of the next incarnation's emit.
+    const release = () => {
+      if (this.pendingEmits.get(workspaceId) === emit) this.pendingEmits.delete(workspaceId);
+    };
     void this.deps.getSnapshot(workspaceId, { throwOnError: true }).then(
       (snapshot) => {
-        this.pendingEmits.delete(workspaceId);
+        release();
         // Without an activity entry there is no snapshot to carry the revision; the first
         // snapshot of the workspace will.
         if (snapshot) {
@@ -44,7 +49,7 @@ export class UsageRevisionActivity {
         }
       },
       (error: unknown) => {
-        this.pendingEmits.delete(workspaceId);
+        release();
         // The next snapshot of the workspace, or the re-list after a reconnect, carries it.
         log.debug("Failed to emit activity after a usage change", { workspaceId, error });
       }
@@ -73,5 +78,6 @@ export class UsageRevisionActivity {
 
   evict(workspaceId: string): void {
     this.revisions.delete(workspaceId);
+    this.pendingEmits.delete(workspaceId);
   }
 }

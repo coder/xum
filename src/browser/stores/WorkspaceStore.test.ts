@@ -3780,6 +3780,43 @@ describe("WorkspaceStore", () => {
         expect(projectionFetches()).toEqual(["parent"]);
       });
 
+      it("leaves the own ledger to the end of a stream that is live here", async () => {
+        // A revision refetch during the stream can already hold the settled stream, and
+        // stream-end adds that stream's usage too: the refetch at stream end replaces both.
+        const pushUsage = await openActivity();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
+        mockGetSessionUsage.mockClear();
+
+        await pushUsage("parent", 1);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(150)));
+        await send(streamEndEvent("parent", "stream-1"));
+        await tick(0);
+
+        expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+        expect(shownInputTokens("parent")).toBe(150);
+      });
+
+      it("refetches the own ledger when a stream that is live here fails", async () => {
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
+        mockGetSessionUsage.mockClear();
+
+        await send({
+          type: "stream-error",
+          messageId: "stream-1",
+          error: "provider failed",
+          errorType: "unknown",
+        });
+
+        expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+      });
+
       it("shows a roll-up whose delta never reached the parent's chat", async () => {
         const pushUsage = await openActivity();
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));

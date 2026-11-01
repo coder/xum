@@ -70,6 +70,24 @@ describe("UsageRevisionActivity", () => {
     expect(reads).toHaveLength(3);
   });
 
+  test("an eviction frees the emit slot, and the old read cannot free the new one", async () => {
+    const { activity, reads, emits, revision } = createActivity();
+    activity.onUsageChanged("ws");
+    activity.evict("ws");
+    activity.onUsageChanged("ws");
+    expect(reads).toHaveLength(2);
+
+    // Removal deleted the old incarnation's activity entry.
+    reads[0].resolve(null);
+    await settle();
+    activity.onUsageChanged("ws");
+    expect(reads).toHaveLength(2);
+    reads[1].resolve(SNAPSHOT);
+    await settle();
+
+    expect(emits).toEqual([revision("ws")]);
+  });
+
   test("merges a revision only for a workspace whose usage changed, until evicted", () => {
     const { activity, revision } = createActivity();
     expect(activity.withRevision("ws", SNAPSHOT)).toBe(SNAPSHOT);
