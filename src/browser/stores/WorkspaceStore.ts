@@ -1755,8 +1755,8 @@ export class WorkspaceStore {
       inFlight.trailing = true;
       return;
     }
-    const fetch = { trailing: false };
-    this.subagentUsageFetches.set(workspaceId, fetch);
+    const request = { trailing: false };
+    this.subagentUsageFetches.set(workspaceId, request);
     // No gate on known children: a parent registers before its children do, so frontend
     // metadata cannot tell that a workspace has none.
     const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
@@ -1769,9 +1769,9 @@ export class WorkspaceStore {
       })
       .finally(() => {
         // A removal or client change dropped this fetch; a newer one owns the slot.
-        if (this.subagentUsageFetches.get(workspaceId) !== fetch) return;
+        if (this.subagentUsageFetches.get(workspaceId) !== request) return;
         this.subagentUsageFetches.delete(workspaceId);
-        if (fetch.trailing) {
+        if (request.trailing) {
           this.refreshSubagentUsage(workspaceId);
         }
       });
