@@ -123,12 +123,13 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           | ([$state[] | .code_review, .security_review]) as $reviews
           # Since 2026-10-28 Codex can finish a security review with null findings flags
           # (coder/xum#7727). That counts as clean only for the current head, beside a
-          # completed security line with the merge gate off, no advisory section, a clean
-          # receipt for this head and no open Codex thread ($cleared.clean_security_receipt,
-          # set by check_codex_comments.sh). Any other null stays unknown, so it blocks.
+          # completed security line with the merge gate off, a clean receipt for this head
+          # and no open Codex thread ($cleared.clean_security_receipt, set by
+          # check_codex_comments.sh). Any other null stays unknown, so it blocks.
+          # Codex keeps listing an advisory after its thread is resolved (#7859). The
+          # bullet check below still blocks every advisory bullet that is not cleared.
           | ($security.status == "completed" and $security.headSha == $head
-            and $security.mergeGateEnabled == false
-            and ($lines | any(. == "### Security findings" or test("^#### Advisory findings")) | not))
+            and $security.mergeGateEnabled == false)
             as $null_security_base
           # Runs triggered by a push post no receipt (coder/xum#7731): until a Codex security
           # review request brings one, such a board is pending, so wait budgets cover it.
