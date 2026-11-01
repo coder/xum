@@ -30,7 +30,11 @@ import {
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
-import { summarizeCreationDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
+import {
+  creationDraftMetadata,
+  summarizeCreationDraft,
+  toDraftAttachmentMetadata,
+} from "@/common/utils/drafts";
 
 import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
@@ -96,8 +100,7 @@ const draftBackend = createTestApiClient({
         ...patch,
         createdAt: 0,
       };
-      const { attachments: _attachments, ...stored } = record;
-      return { ...summarizeCreationDraft(record), record: stored };
+      return { ...summarizeCreationDraft(record), record: creationDraftMetadata(record) };
     },
     deleteCreation: () => Promise.resolve(),
   },

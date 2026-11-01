@@ -332,12 +332,18 @@ export const CreationDraftListSchema = z.object({
 });
 
 /**
- * A save's reply: the summary, plus the record as stored after the merge. A delete retry
- * conditions on that record, so another window's earlier save of other fields counts (#7728).
- * Attachments are left out: they can be megabytes, and every debounced save would echo them.
+ * The content fields of a creation draft: each can be megabytes. A save's reply never carries
+ * them, because every debounced save would echo them (#7728).
+ */
+export const CREATION_DRAFT_CONTENT_FIELDS = { text: true, attachments: true } as const;
+
+/**
+ * A save's reply: the summary, plus the stored record after the merge without its content
+ * fields. A delete retry conditions on the stored record, so another window's earlier save of
+ * other fields counts (#7728).
  */
 export const CreationDraftUpdateOutputSchema = CreationDraftSummarySchema.extend({
-  record: CreationDraftSchema.omit({ attachments: true }),
+  record: CreationDraftSchema.omit(CREATION_DRAFT_CONTENT_FIELDS),
 });
 
 /** Partial: omitted fields keep their stored value; only an explicit `projectPath` moves it. */

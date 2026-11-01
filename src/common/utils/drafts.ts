@@ -2,6 +2,7 @@ import {
   DraftAttachmentSchema,
   type CreationDraft,
   type CreationDraftSummary,
+  type CreationDraftUpdateOutput,
   type Draft,
   type DraftAttachment,
   type DraftAttachmentMetadata,
@@ -18,6 +19,12 @@ export function draftScopeKey(scope: DraftScope): string {
 }
 
 /** A creation draft's sidebar row (also computed locally, so a local edit updates it at once). */
+/** A stored record without its content fields (CREATION_DRAFT_CONTENT_FIELDS): a save's reply. */
+export function creationDraftMetadata(draft: CreationDraft): CreationDraftUpdateOutput["record"] {
+  const { text: _text, attachments: _attachments, ...metadata } = draft;
+  return metadata;
+}
+
 export function summarizeCreationDraft(draft: CreationDraft): CreationDraftSummary {
   return {
     draftId: draft.id,

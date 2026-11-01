@@ -776,6 +776,27 @@ describe("CreationDraftStore", () => {
     expect(await service.get(id)).toBeNull();
   });
 
+  test("a delete retry keeps content fields from the last stored copy when a save omits them (#7728)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-retry-content-fill");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "sent" });
+    windowA.update(id, { attachments: [image] });
+    await windowA.flush(id);
+    const windowB = await reopen(harness, id, PROJECT_A);
+    windowB.update(id, { manualName: "named-in-b" });
+    await windowB.flush(id);
+    // A's last save carries neither text nor attachments: both come from its earlier save.
+    windowA.update(id, { auto: { model: false } });
+    await windowA.flush(id);
+
+    control.failDeletes = 1;
+    await windowA.delete(id);
+    windowA.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect(await service.get(id)).toBeNull();
+  });
+
   test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
     using tempDir = new TestTempDir("creation-store-delete-during-save");
     const harness = await createHarness(tempDir);

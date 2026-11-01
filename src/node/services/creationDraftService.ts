@@ -28,6 +28,7 @@ import {
   sanitizeDraft,
   stripStagedDraftAttachments,
   summarizeCreationDraft,
+  creationDraftMetadata,
 } from "@/common/utils/drafts";
 
 /**
@@ -241,8 +242,7 @@ export class CreationDraftService {
       const parsed = CreationDraftSchema.safeParse(next);
       if (!parsed.success) throw new CreationDraftRejectedError("Invalid creation draft.");
       await this.writeRecord(parsed.data);
-      const { attachments: _attachments, ...record } = parsed.data;
-      return { ...summarizeCreationDraft(parsed.data), record };
+      return { ...summarizeCreationDraft(parsed.data), record: creationDraftMetadata(parsed.data) };
     });
   }
 

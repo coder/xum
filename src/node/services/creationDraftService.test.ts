@@ -64,13 +64,10 @@ describe("CreationDraftService", () => {
       execution: { agent: null, runtime: null, trunkBranch: null },
     });
     const reply = await service.update({ scope: scope("d1"), text: "fix it now" });
-    // The reply carries the merged record without its (possibly large) attachments.
-    expect(reply.record).toMatchObject({
-      projectPath: PROJECT_B,
-      text: "fix it now",
-      manualName: "my-name",
-    });
+    // The reply carries the merged record without its (possibly large) content fields.
+    expect(reply.record).toMatchObject({ projectPath: PROJECT_B, manualName: "my-name" });
     expect("attachments" in reply.record).toBe(false);
+    expect("text" in reply.record).toBe(false);
 
     const reloaded = new CreationDraftService(config);
     const record = await reloaded.get("d1");

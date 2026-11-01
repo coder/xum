@@ -22,6 +22,7 @@ import type {
   CreationDraftExecution,
   CreationDraftSummary,
   CreationDraftUpdateOutput,
+  CREATION_DRAFT_CONTENT_FIELDS,
 } from "@/common/orpc/schemas/drafts";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -297,8 +298,9 @@ function nextPendingDelete(
 /**
  * The stored record after a save, not this window's copy: the backend merged only the saved
  * fields, so another window's earlier save of other fields is part of it (#7728). The reply
- * leaves out attachments: use the ones this save sent, else the last known stored ones. If
- * another window changed only those, a delete retry keeps the record (fails safe).
+ * leaves out the content fields (CREATION_DRAFT_CONTENT_FIELDS): each comes from this save, else
+ * the last known stored record. If another window changed one of them, a delete retry keeps
+ * the record (fails safe).
  */
 function storedAfterSave(
   record: CreationDraftUpdateOutput["record"],
@@ -306,10 +308,11 @@ function storedAfterSave(
   previous: CreationDraft | null,
   draft: CreationDraft
 ): CreationDraft {
-  return {
-    ...record,
+  const content = {
+    text: patch.text ?? previous?.text ?? draft.text,
     attachments: patch.attachments ?? previous?.attachments ?? draft.attachments,
-  };
+  } satisfies Record<keyof typeof CREATION_DRAFT_CONTENT_FIELDS, unknown>;
+  return { ...record, ...content };
 }
 
 /** A refused save wrote nothing; other failures may have (most often the reply was lost). */
