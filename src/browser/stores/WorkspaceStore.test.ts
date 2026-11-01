@@ -1,5 +1,6 @@
 import { dismissChatError, peekChatError } from "@/browser/utils/chatErrorToasts";
 import { EventEmitter } from "node:events";
+import { getSessionCacheHealth } from "@/common/utils/tokens/cacheHealth";
 // This integration regression drives the real server replay into the real renderer store.
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
@@ -67,6 +68,7 @@ import {
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
   sumSessionCostUsage,
+  sumSessionTokens,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -3589,6 +3591,49 @@ describe("WorkspaceStore", () => {
       await send(rollUpDelta("child", 500));
       expect(shownInputTokens("parent")).toBe(600);
       expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("a sub-agent's removal leaves the shown tokens and session cache health unchanged", async () => {
+      const cacheUsage = (read: number, write: number) => ({
+        ...usageOf(1_000, 0.01),
+        cached: { tokens: read, cost_usd: read / 1e6 },
+        cacheCreate: { tokens: write, cost_usd: write / 1e5 },
+      });
+      const child = cacheUsage(10_000, 20_000);
+      mockGetSessionUsage.mockImplementation(() =>
+        Promise.resolve({ byModel: { "claude-opus": cacheUsage(30_000, 5_000) }, version: 1 })
+      );
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: { child: { byModel: { "claude-opus": child }, workspaceCount: 1 } },
+        })
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      const shown = () => {
+        const usage = store.getWorkspaceUsage("parent");
+        return { tokens: sumSessionTokens(usage), cache: getSessionCacheHealth(usage) };
+      };
+      const before = shown();
+      expect(before.tokens).toBe(67_000);
+      expect(before.cache?.cacheWriteTokens).toBe(25_000);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send({
+        type: "session-usage-delta",
+        workspaceId: "parent",
+        sourceWorkspaceId: "child",
+        byModelDelta: { "claude-opus": child },
+        timestamp: 1,
+      });
+
+      const after = shown();
+      expect(after.tokens).toBe(before.tokens);
+      expect(after.cache?.cacheWriteTokens).toBe(before.cache?.cacheWriteTokens);
+      expect(after.cache?.readRatio).toBeCloseTo(before.cache?.readRatio ?? NaN, 12);
+      expect(after.cache?.rewriteCostUsd).toBeCloseTo(before.cache?.rewriteCostUsd ?? NaN, 12);
     });
 
     it("keeps the newest projection when an older response arrives last", async () => {

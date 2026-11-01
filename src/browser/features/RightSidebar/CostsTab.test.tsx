@@ -1,9 +1,17 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 
-import { mergeUsageByModel, SubagentCostNote } from "@/browser/features/RightSidebar/CostsTab";
+import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import {
+  CostsTab,
+  mergeUsageByModel,
+  SubagentCostNote,
+} from "@/browser/features/RightSidebar/CostsTab";
+import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as AppConfigStoreModule from "@/browser/stores/AppConfigStore";
+import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { installDom } from "../../../../tests/ui/dom";
 
@@ -72,5 +80,69 @@ describe("mergeUsageByModel", () => {
     expect(
       mergeUsageByModel({ opus: usageCosting(5) }, undefined).get("opus")?.input.cost_usd
     ).toBe(5);
+  });
+});
+
+describe("CostsTab prompt cache", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    spyOn(ProvidersConfigModule, "useProvidersConfig").mockImplementation(() => ({
+      config: null,
+      loading: false,
+      refresh: () => Promise.resolve(),
+      updateOptimistically: () => undefined,
+      updateModelsOptimistically: () => [],
+    }));
+    spyOn(AppConfigStoreModule, "useUserPreferences").mockImplementation(((
+      select: (preferences: object) => unknown
+    ) => select({})) as unknown as typeof AppConfigStoreModule.useUserPreferences);
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const cacheWrites = (tokens: number): ChatUsageDisplay => ({
+    ...usageCosting(0),
+    cacheCreate: { tokens, cost_usd: tokens / 1e6 },
+  });
+
+  const renderCacheSection = (usage: WorkspaceStoreModule.WorkspaceUsageState) => {
+    spyOn(WorkspaceStoreModule, "useWorkspaceUsage").mockImplementation(() => usage);
+    return render(
+      <TooltipProvider>
+        <CostsTab workspaceId="parent" />
+      </TooltipProvider>
+    ).queryByTestId("prompt-cache-health");
+  };
+
+  test("counts open sub-agents' cache writes in the session summary", () => {
+    const section = renderCacheSection({
+      totalTokens: 10,
+      sessionTotal: usageCosting(0),
+      sessionByModel: { opus: usageCosting(0) },
+      subagentTotal: cacheWrites(2_000_000),
+      subagentByModel: { opus: cacheWrites(2_000_000) },
+      liveCostUsage: cacheWrites(500_000),
+    });
+    expect(section?.textContent).toContain("Writes2.5M");
+    expect(section?.textContent).toContain("Rewrite$2.50");
+  });
+
+  test("hides the section when no part touched a prompt cache", () => {
+    expect(
+      renderCacheSection({
+        totalTokens: 10,
+        sessionTotal: usageCosting(1),
+        sessionByModel: { opus: usageCosting(1) },
+        subagentTotal: usageCosting(2),
+        subagentByModel: { opus: usageCosting(2) },
+      })
+    ).toBeNull();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getCacheHealth } from "./cacheHealth";
+import { getCacheHealth, getSessionCacheHealth } from "./cacheHealth";
 import { createDisplayUsage } from "./displayUsage";
 import { getAssistantMessageModelUsages } from "./messageModelUsages";
 import { sumUsageHistory } from "./usageAggregator";
@@ -142,5 +142,61 @@ describe("getCacheHealth", () => {
     const empty = turn({ uncached: 0, read: 0, write: 0 });
     expect(empty.readRatio).toBeUndefined();
     expect(empty.coldStart).toBe(false);
+  });
+});
+
+function cacheUsage(read: number, write: number) {
+  const usage = createDisplayUsage(
+    { inputTokens: 1_000 + read + write, cachedInputTokens: read, outputTokens: 100 },
+    MODEL,
+    { anthropic: { cacheCreationInputTokens: write } }
+  );
+  if (usage === undefined) throw new Error("expected display usage");
+  return usage;
+}
+
+describe("getSessionCacheHealth", () => {
+  test("counts open sub-agents, so a sub-agent's removal leaves it unchanged", () => {
+    const own = cacheUsage(30_000, 5_000);
+    const child = cacheUsage(10_000, 20_000);
+    const live = cacheUsage(4_000, 1_000);
+    const open = getSessionCacheHealth({
+      sessionByModel: { [MODEL]: own },
+      subagentByModel: { [MODEL]: child },
+      liveCostUsage: live,
+    });
+    expect(open?.cacheWriteTokens).toBe(26_000);
+    expect(open?.readRatio).toBeCloseTo(44_000 / (3_000 + 44_000 + 26_000), 12);
+
+    // The removal rolls the child's bucket into the ledger and drops it from the projection.
+    const rolledUp = sumUsageHistory([own, child]);
+    if (rolledUp === undefined) throw new Error("expected a sum");
+    const removed = getSessionCacheHealth({
+      sessionByModel: { [MODEL]: rolledUp },
+      liveCostUsage: live,
+    });
+    expect(removed?.cacheWriteTokens).toBe(open?.cacheWriteTokens);
+    expect(removed?.readRatio).toBeCloseTo(open?.readRatio ?? NaN, 12);
+    expect(removed?.rewriteCostUsd).toBeCloseTo(open?.rewriteCostUsd ?? NaN, 12);
+  });
+
+  test("shows when any part touched a prompt cache, and is hidden when none did", () => {
+    const noCache = cacheUsage(0, 0);
+    const cached = cacheUsage(1_000, 0);
+    expect(
+      getSessionCacheHealth({
+        sessionByModel: { [MODEL]: noCache },
+        subagentByModel: { [MODEL]: noCache },
+        liveCostUsage: noCache,
+      })
+    ).toBeUndefined();
+    expect(getSessionCacheHealth({})).toBeUndefined();
+    for (const usage of [
+      { sessionByModel: { [MODEL]: cached } },
+      { sessionByModel: { [MODEL]: noCache }, subagentByModel: { [MODEL]: cached } },
+      { sessionByModel: { [MODEL]: noCache }, liveCostUsage: cacheUsage(0, 1_000) },
+    ]) {
+      expect(getSessionCacheHealth(usage)).toBeDefined();
+    }
   });
 });

@@ -30,6 +30,7 @@ import { useGitStatus } from "@/browser/stores/GitStatusStore";
 import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import {
   sumSessionCostUsage,
+  sumSessionTokens,
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
   workspaceStore,
@@ -143,12 +144,7 @@ function useSessionStats(
   const usage = useWorkspaceUsage(workspaceId);
   const total = sumSessionCostUsage(usage);
   if (total == null) return null;
-  const tokens =
-    total.input.tokens +
-    total.cached.tokens +
-    total.cacheCreate.tokens +
-    total.output.tokens +
-    total.reasoning.tokens;
+  const tokens = sumSessionTokens(usage);
   const costIncomplete = total.hasUnknownCosts === true;
   const cost = getTotalCost(total);
   // The sum counts unpriced usage as $0, so a session with nothing priced has no cost to show

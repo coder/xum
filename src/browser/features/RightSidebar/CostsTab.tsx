@@ -52,20 +52,6 @@ export function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: numb
   );
 }
 
-/**
- * Prompt-cache health covers this workspace's own requests, so it shows only when they touched
- * a prompt cache; open sub-agents' cache tokens do not count. Hidden for sessions that never
- * did (most non-Anthropic providers report no cache tokens), where a 0% read share is noise.
- */
-function touchedPromptCache(usage: {
-  sessionTotal?: ChatUsageDisplay;
-  liveCostUsage?: ChatUsageDisplay;
-}): boolean {
-  return [usage.sessionTotal, usage.liveCostUsage].some(
-    (entry) => entry !== undefined && entry.cached.tokens + entry.cacheCreate.tokens > 0
-  );
-}
-
 interface CostsTabProps {
   workspaceId: string;
 }
@@ -77,6 +63,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
     useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
   const sessionUsage = sumSessionCostUsage(usage);
+  const sessionCacheHealth = getSessionCacheHealth(usage);
 
   // Per-model session costs. Live streaming usage is not yet folded into the
   // persisted byModel record, so merge it into the active model's bucket to
@@ -373,9 +360,10 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
               </tbody>
             </table>
           )}
-          {touchedPromptCache(usage) && (
+          {sessionCacheHealth && (
+            // The session row counts the whole tree. The turn rows are this workspace's own turns.
             <PromptCacheHealth
-              session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
+              session={sessionCacheHealth}
               turns={usage.recentTurnCacheHealth ?? []}
             />
           )}
