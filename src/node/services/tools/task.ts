@@ -16,9 +16,14 @@ import {
   runtimeModeSupportsSharedTaskWorkspace,
   type RuntimeMode,
 } from "@/common/types/runtime";
+import type { Result } from "@/common/types/result";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
-import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
+import {
+  ForegroundWaitBackgroundedError,
+  TASK_CREATE_PARENT_STOPPING_ERROR,
+  type TaskCreateResult,
+} from "@/node/services/taskService";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
 import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
@@ -312,6 +317,40 @@ function emitTaskCreatedEvent(params: {
     } satisfies TaskCreatedEvent,
     "task"
   );
+}
+
+/**
+ * Splits a task(n) call's create settlements into the spawned tasks and the failures, both in
+ * launch order (not settle order: the result and the live card's candidate labels follow it).
+ * An Err becomes an Error; a rejection keeps its reason. `parentStopping`: a create was refused
+ * because the parent's stop latch was held.
+ */
+function collectTaskGroupCreates(
+  settlements: ReadonlyArray<PromiseSettledResult<Result<TaskCreateResult, string>>>
+): { createdTasks: SpawnedTaskInfo[]; failures: unknown[]; parentStopping: boolean } {
+  const createdTasks: SpawnedTaskInfo[] = [];
+  const failures: unknown[] = [];
+  let parentStopping = false;
+  for (const settlement of settlements) {
+    if (settlement.status === "rejected") {
+      failures.push(settlement.reason);
+      continue;
+    }
+    const created = settlement.value;
+    if (!created.success) {
+      parentStopping ||= created.error === TASK_CREATE_PARENT_STOPPING_ERROR;
+      failures.push(new Error(created.error));
+      continue;
+    }
+    createdTasks.push({
+      taskId: created.data.taskId,
+      status: created.data.status,
+      modelString: created.data.modelString,
+      thinkingLevel: created.data.thinkingLevel,
+      desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
+    });
+  }
+  return { createdTasks, failures, parentStopping };
 }
 
 function toAggregatePendingStatus(
@@ -690,73 +729,72 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       // Parent runtime model and thinking are forwarded as a low-priority fallback so
       // unconfigured delegated runs still inherit the parent's live model. Do not
       // restore the previous top-priority forwarding through explicit task args.
-      const createdTasks: SpawnedTaskInfo[] = [];
-      for (const launch of taskGroupLaunches) {
-        if (abortSignal?.aborted) {
-          throw new Error("Interrupted");
-        }
+      // Every create starts in this one synchronous pass, so tree-lock order (and the createdAt
+      // and queue order behind it) is launch order. Each create holds its locks only until its
+      // child's first turn is admitted, so the children's first sends overlap. The async mapper
+      // turns a synchronous throw into a rejection, so no started create is left unobserved.
+      const settlements = await Promise.allSettled(
+        taskGroupLaunches.map(async (launch) =>
+          taskService.create({
+            parentWorkspaceId: workspaceId,
+            kind: "agent",
+            agentId: requestedAgentId,
+            // Legacy alias (persisted for older clients / on-disk compatibility).
+            agentType: requestedAgentId,
+            prompt: launch.prompt,
+            title,
+            ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
+            ...(aiOverrides.thinkingLevel != null
+              ? { thinkingLevel: aiOverrides.thinkingLevel }
+              : {}),
+            ...(isolation != null ? { isolation } : {}),
+            ...(desktop != null ? { desktop } : {}),
+            ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+            // Background launches are non-blocking with terminal wake-up; foreground/default block.
+            attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+            bestOf:
+              taskGroupId != null
+                ? {
+                    groupId: taskGroupId,
+                    index: launch.index,
+                    total: launch.total,
+                  }
+                : undefined,
+          })
+        )
+      );
 
-        const created = await taskService.create({
-          parentWorkspaceId: workspaceId,
-          kind: "agent",
-          agentId: requestedAgentId,
-          // Legacy alias (persisted for older clients / on-disk compatibility).
-          agentType: requestedAgentId,
-          prompt: launch.prompt,
-          title,
-          ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
-          ...(aiOverrides.thinkingLevel != null
-            ? { thinkingLevel: aiOverrides.thinkingLevel }
-            : {}),
-          ...(isolation != null ? { isolation } : {}),
-          ...(desktop != null ? { desktop } : {}),
-          ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
-          // Background launches are non-blocking with terminal wake-up; foreground/default block.
-          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
-          bestOf:
-            taskGroupId != null
-              ? {
-                  groupId: taskGroupId,
-                  index: launch.index,
-                  total: launch.total,
-                }
-              : undefined,
-        });
-
-        if (!created.success) {
-          if (createdTasks.length > 0) {
-            return parseToolResult(
-              TaskToolResultSchema,
-              buildPendingTaskResult({
-                tasks: createdTasks,
-                note:
-                  `Grouped task creation stopped after spawning ${createdTasks.length} of ${taskGroupCount} task(s): ${created.error}. ` +
-                  "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
-                forceGrouped: taskGroupCount > 1,
-              }),
-              "task"
-            );
-          }
-
-          throw new Error(created.error);
-        }
-
-        const task = {
-          taskId: created.data.taskId,
-          status: created.data.status,
-          modelString: created.data.modelString,
-          thinkingLevel: created.data.thinkingLevel,
-          desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
-        } satisfies SpawnedTaskInfo;
-        createdTasks.push(task);
-
-        // UI-only signal: expose spawned taskIds as soon as the workspaces exist.
+      const { createdTasks, failures, parentStopping } = collectTaskGroupCreates(settlements);
+      for (const task of createdTasks) {
+        // UI-only signal: expose spawned taskIds once every create of this call settled.
         emitTaskCreatedEvent({
           config,
           workspaceId,
           toolCallId,
           taskId: task.taskId,
         });
+      }
+
+      // The parent's Stop latched it while later siblings waited for create's locks. The cascade
+      // that follows this turn stops the siblings that did spawn, so the call is interrupted.
+      if (parentStopping) {
+        throw new Error("Interrupted");
+      }
+      if (failures.length > 0) {
+        if (createdTasks.length === 0) {
+          throw failures[0];
+        }
+        return parseToolResult(
+          TaskToolResultSchema,
+          buildPendingTaskResult({
+            tasks: createdTasks,
+            note:
+              `Grouped task creation spawned ${createdTasks.length} of ${taskGroupCount} task(s); ${failures.length} failed: ${getErrorMessage(failures[0])}. ` +
+              "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
+            forceGrouped: taskGroupCount > 1,
+          }),
+          "task"
+        );
       }
 
       if (run_in_background) {

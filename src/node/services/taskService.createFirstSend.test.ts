@@ -475,10 +475,10 @@ describe("TaskService.create: the first send runs after the create locks are rel
 
   test("refuses a direct create while the parent's stop latch is held", async () => {
     const sends: string[] = [];
-    const { taskService } = await setup(async (workspaceId, _message, _options, internal) => {
+    const { taskService } = await setup((workspaceId, _message, _options, internal) => {
       sends.push(workspaceId);
       admitTurn(internal);
-      return Ok(undefined);
+      return Promise.resolve(Ok(undefined));
     });
 
     const releaseStop = taskService.latchHardInterruptCascade(PARENT_A);
@@ -505,14 +505,14 @@ describe("TaskService.create: the first send runs after the create locks are rel
     const settledListeners = new Set<(workspaceId: string, turn: symbol) => void>();
     let stopping: Promise<string[]> | undefined;
     const harness = await setup(
-      async (workspaceId, _message, _options, internal) => {
+      (workspaceId, _message, _options, internal) => {
         // The ancestor's Stop arrives while the first sibling holds create's locks, so its Phase A
         // queues on the mutex ahead of the sibling creates queued on the tree lock.
         if (workspaceId === CHILD) {
           stopping ??= harness.taskService.terminateAllDescendantAgentTasks(PARENT_A);
         }
         admitTurn(internal);
-        return Ok(undefined);
+        return Promise.resolve(Ok(undefined));
       },
       [
         workspace(INTERMEDIATE, {

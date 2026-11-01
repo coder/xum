@@ -9059,6 +9059,14 @@ export class TaskService implements AgentTaskIntegration {
   /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
   private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
     const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
+    // Sibling creates of one task(n) call queue behind one another, and an ancestor's cascade
+    // (terminateAllDescendantAgentTasks Phase A) or the parent's own hard Stop
+    // (latchHardInterruptCascade) can land between them. The latch is held until the parent's
+    // stopped turn settled, so a later create must not add a child the cascade's snapshot missed.
+    if (this.isWorkspaceStopInProgress(parentWorkspaceId)) {
+      return Err(TASK_CREATE_PARENT_STOPPING_ERROR);
+    }
+
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)

@@ -84,6 +84,14 @@ async function waitUntil(condition: () => boolean, timeoutMs = 500): Promise<voi
   }
 }
 
+/** The tool call's rejection reason, or undefined when it resolved. */
+function rejectionOf(execution: unknown): Promise<unknown> {
+  return Promise.resolve(execution).then(
+    () => undefined,
+    (error: unknown) => error
+  );
+}
+
 /**
  * A TaskService.create mock whose calls stay pending until the test settles them. Once the test
  * settled one, later calls settle at once, so a caller that awaits each create before starting
@@ -1247,7 +1255,7 @@ describe("task tool", () => {
       taskService: { create } as unknown as TaskService,
     });
 
-    const executing = Promise.resolve(
+    const error = await rejectionOf(
       tool.execute!(
         {
           subagent_type: "explore",
@@ -1260,7 +1268,7 @@ describe("task tool", () => {
       )
     );
 
-    await expect(executing).rejects.toThrow("Interrupted");
+    expect(error).toMatchObject({ message: "Interrupted" });
   });
 
   it("throws the first failure in launch order when no create spawns", async () => {
@@ -1276,7 +1284,7 @@ describe("task tool", () => {
     });
 
     let toolSettled = false;
-    const outcome = Promise.resolve(
+    const outcome = rejectionOf(
       tool.execute!(
         {
           subagent_type: "explore",
@@ -1287,16 +1295,9 @@ describe("task tool", () => {
         },
         mockToolCallOptions
       )
-    ).then(
-      () => {
-        toolSettled = true;
-        return undefined;
-      },
-      (error: unknown) => {
-        toolSettled = true;
-        return error;
-      }
-    );
+    ).finally(() => {
+      toolSettled = true;
+    });
     await waitUntil(() => creates.create.mock.calls.length === 3);
     const enteredBeforeAnySettled = creates.create.mock.calls.length;
     // The launch-order first failure settles first; the tool must still wait for the others.
@@ -1325,14 +1326,14 @@ describe("task tool", () => {
       taskService: { create } as unknown as TaskService,
     });
 
-    const executing = Promise.resolve(
+    const error = await rejectionOf(
       tool.execute!(
         { subagent_type: "explore", prompt: "do it", title: "Child task", run_in_background: true },
         { ...mockToolCallOptions, abortSignal: controller.signal }
       )
     );
 
-    await expect(executing).rejects.toThrow("unrelated failure");
+    expect(error).toMatchObject({ message: "unrelated failure" });
   });
 
   it("returns the spawned sibling when the abort lands during an unrelated sibling failure", async () => {
