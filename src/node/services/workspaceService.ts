@@ -472,6 +472,7 @@ import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationA
 import { SendPreflight } from "@/node/services/sendPreflight";
 import { ContextMutationGate } from "@/node/services/contextMutationGate";
 import { BashMonitorActivity } from "@/node/services/bashMonitorActivity";
+import { UsageRevisionActivity } from "@/node/services/usageRevisionActivity";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -2668,6 +2669,11 @@ export class WorkspaceService
   private readonly bashProcessChangeListener = (workspaceId: string): void => {
     this.bashMonitorActivity.onProcessChange(workspaceId);
   };
+  private readonly usageRevisionActivity = new UsageRevisionActivity({
+    getSnapshot: (workspaceId, options) => this.extensionMetadata.getSnapshot(workspaceId, options),
+    emitWorkspaceActivity: (workspaceId, snapshot) =>
+      this.emitWorkspaceActivity(workspaceId, snapshot),
+  });
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2897,6 +2903,9 @@ export class WorkspaceService
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    this.sessionUsageService?.onUsageChanged((workspaceId) =>
+      this.usageRevisionActivity.onUsageChanged(workspaceId)
+    );
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // A cleared tombstone means a removed id was re-registered (downgraded
@@ -4569,13 +4578,14 @@ export class WorkspaceService
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
-    const activity = this.mergeCurrentActiveBashMonitorCount(
+    const merged = this.mergeCurrentActiveBashMonitorCount(
       workspaceId,
       this.mergeCachedActiveWorkflowRuns(
         workspaceId,
         this.overlayPendingGoal(workspaceId, snapshot)
       )
     );
+    const activity = merged && this.usageRevisionActivity.withRevision(workspaceId, merged);
     // A late in-flight producer (e.g. a stream-abort stop-status handler mid
     // todo read) can complete after removal deleted this workspace's
     // metadata entry. Its disk write is already blocked by the write
@@ -18703,6 +18713,7 @@ export class WorkspaceService
   private evictWorkspaceActivityCaches(workspaceId: string): void {
     this.workflowRuns.evictWorkflowRunCaches(workspaceId);
     this.bashMonitorActivity.evictSeenWorkspace(workspaceId);
+    this.usageRevisionActivity.evict(workspaceId);
   }
 
   /**
@@ -19653,6 +19664,9 @@ export class WorkspaceService
         if (merged != null) {
           activityById[workspaceId] = merged;
         }
+      }
+      for (const [workspaceId, row] of Object.entries(activityById)) {
+        activityById[workspaceId] = this.usageRevisionActivity.withRevision(workspaceId, row);
       }
       return activityById;
     } catch (error) {

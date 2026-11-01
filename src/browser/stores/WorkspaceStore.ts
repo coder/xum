@@ -1240,6 +1240,8 @@ export class WorkspaceStore {
   private sessionUsageRequestVersion = new Map<string, number>();
   private subagentUsage = new Map<string, SubagentUsageByChild>();
   private subagentUsageRequestVersion = new Map<string, number>();
+  /** The getSubagentUsage fetch in flight per workspace, and whether another was asked for. */
+  private subagentUsageFetches = new Map<string, { trailing: boolean }>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1500,27 +1502,26 @@ export class WorkspaceStore {
     "session-usage-delta": (workspaceId, _aggregator, data) => {
       const usageDelta = data as Extract<WorkspaceChatMessage, { type: "session-usage-delta" }>;
 
-      const current = this.sessionUsage.get(workspaceId) ?? {
-        byModel: {},
-        version: 1 as const,
-      };
-
-      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
-      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
-      // drops it from the projection. Self deltas (headless spend) repeat and always add.
-      const childId =
-        usageDelta.sourceWorkspaceId === workspaceId ? undefined : usageDelta.sourceWorkspaceId;
-      if (childId === undefined || !current.rolledUpFrom?.[childId]) {
-        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-          addModelUsage(current.byModel, model, usage);
+      // A self delta (headless spend) only refetches: the refetch for its usage revision can
+      // land first, and adding the delta to that ledger would count it twice.
+      const childId = usageDelta.sourceWorkspaceId;
+      if (childId !== workspaceId) {
+        const current = this.sessionUsage.get(workspaceId) ?? {
+          byModel: {},
+          version: 1 as const,
+        };
+        // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+        // holds it, and adding it again would count it twice; recording it in rolledUpFrom
+        // also drops it from the projection.
+        if (!current.rolledUpFrom?.[childId]) {
+          for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+            addModelUsage(current.byModel, model, usage);
+          }
         }
-      }
-      if (childId !== undefined) {
         current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
+        this.sessionUsage.set(workspaceId, current);
+        this.usageStore.bump(workspaceId);
       }
-
-      this.sessionUsage.set(workspaceId, current);
-      this.usageStore.bump(workspaceId);
       // A ledger fetch still in flight read the file before the roll-up and would overwrite
       // this merge: refetch, so the newer response wins (it also refreshes the projection).
       this.refreshSessionUsage(workspaceId);
@@ -1747,6 +1748,15 @@ export class WorkspaceStore {
     if (!client || !this.isWorkspaceRegistered(workspaceId)) {
       return;
     }
+    // One fetch per workspace at a time: a burst of usage changes from many sub-agents asks
+    // again while it runs, and one trailing fetch then reads all of them.
+    const inFlight = this.subagentUsageFetches.get(workspaceId);
+    if (inFlight) {
+      inFlight.trailing = true;
+      return;
+    }
+    const fetch = { trailing: false };
+    this.subagentUsageFetches.set(workspaceId, fetch);
     // No gate on known children: a parent registers before its children do, so frontend
     // metadata cannot tell that a workspace has none.
     const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
@@ -1756,6 +1766,14 @@ export class WorkspaceStore {
       .then((data) => this.applySubagentUsage(workspaceId, requestVersion, data))
       .catch((error) => {
         console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
+      })
+      .finally(() => {
+        // A removal or client change dropped this fetch; a newer one owns the slot.
+        if (this.subagentUsageFetches.get(workspaceId) !== fetch) return;
+        this.subagentUsageFetches.delete(workspaceId);
+        if (fetch.trailing) {
+          this.refreshSubagentUsage(workspaceId);
+        }
       });
   }
 
@@ -1775,13 +1793,22 @@ export class WorkspaceStore {
     this.usageStore.bump(workspaceId);
   }
 
-  private refreshAncestorsWhenStreamEnds(
+  /**
+   * The backend moves usageRevision on every write to a workspace's usage files: a stream's
+   * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
+   * and every ancestor's sub-agent projection can have changed.
+   */
+  private refreshUsageWhenRevisionMoves(
     workspaceId: string,
     previous: WorkspaceActivitySnapshot | null,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
-    if (previous?.streaming !== true || snapshot?.streaming === true) {
+    const revision = snapshot?.usageRevision;
+    if (revision === undefined || revision === previous?.usageRevision) {
       return;
+    }
+    if (this.isUsageShown(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
     }
     this.refreshAncestorSubagentUsage(workspaceId);
   }
@@ -1792,10 +1819,14 @@ export class WorkspaceStore {
    */
   private refreshAncestorSubagentUsage(workspaceId: string): void {
     for (const ancestorId of this.listAncestorIds(workspaceId)) {
-      if (this.isWorkspaceOnScreen(ancestorId) || this.usageStore.hasKeySubscribers(ancestorId)) {
+      if (this.isUsageShown(ancestorId)) {
         this.refreshSubagentUsage(ancestorId);
       }
     }
+  }
+
+  private isUsageShown(workspaceId: string): boolean {
+    return this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId);
   }
 
   private listAncestorIds(workspaceId: string): string[] {
@@ -1951,6 +1982,8 @@ export class WorkspaceStore {
     this.client = client;
     this.clientChangeController.abort();
     this.clientChangeController = new AbortController();
+    // A fetch on the old client may never settle; it must not block the new client's fetches.
+    this.subagentUsageFetches.clear();
 
     this.bumpAllUsageStoreEntries();
 
@@ -4152,7 +4185,7 @@ export class WorkspaceStore {
       this.refreshActiveGoalCount();
     }
 
-    this.refreshAncestorsWhenStreamEnds(workspaceId, previous, snapshot);
+    this.refreshUsageWhenRevisionMoves(workspaceId, previous, snapshot);
 
     // Transcript content that lands while a workspace is not the active onChat
     // subscription never reaches its aggregator, so any stream/recency movement
@@ -5064,6 +5097,7 @@ export class WorkspaceStore {
     this.sessionUsageRequestVersion.delete(workspaceId);
     this.subagentUsage.delete(workspaceId);
     this.subagentUsageRequestVersion.delete(workspaceId);
+    this.subagentUsageFetches.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
     this.derived.bump("recency");

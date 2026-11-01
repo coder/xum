@@ -3636,40 +3636,48 @@ describe("WorkspaceStore", () => {
       expect(after.cache?.rewriteCostUsd).toBeCloseTo(before.cache?.rewriteCostUsd ?? NaN, 12);
     });
 
-    it("keeps the newest projection when an older response arrives last", async () => {
-      const responses: Array<(value: unknown) => void> = [];
+    it("runs one trailing projection fetch for refreshes asked while one is in flight", async () => {
+      const parentResponses: Array<(value: unknown) => void> = [];
       mockGetSubagentUsage.mockImplementation(
-        () => new Promise((resolve) => responses.push(resolve))
+        ({ workspaceId }: { workspaceId: string }) =>
+          new Promise((resolve) => {
+            if (workspaceId === "parent") parentResponses.push(resolve);
+            else resolve(projection({}));
+          })
       );
       createAndAddWorkspace(store, "other");
       createAndAddWorkspace(store, "parent");
       store.setActiveWorkspaceId("other");
       store.setActiveWorkspaceId("parent");
-      const parentCalls = mockGetSubagentUsage.mock.calls
-        .map((call, index) => ({ workspaceId: call[0].workspaceId, index }))
-        .filter((call) => call.workspaceId === "parent");
-      expect(parentCalls).toHaveLength(2);
-      const [older, newer] = parentCalls.map((call) => responses[call.index]);
+      expect(parentResponses).toHaveLength(1);
 
-      newer(projection({ child: [7, 1] }));
+      parentResponses[0](projection({ child: [999, 1] }));
       await tick(0);
-      older(projection({ child: [999, 1] }));
+      expect(shownInputTokens("parent")).toBe(999);
+      expect(parentResponses).toHaveLength(2);
+      parentResponses[1](projection({ child: [7, 1] }));
       await tick(0);
 
       expect(shownInputTokens("parent")).toBe(7);
+      expect(parentResponses).toHaveLength(2);
     });
 
-    it("adds every self delta", async () => {
+    it("refetches the ledger for a self delta instead of adding it", async () => {
       // Headless spend (status titles, bash AI proxy) reports the workspace itself as source.
+      // The refetch for its usage revision can land first: this ledger already holds it.
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(101)));
       const send = openChat("parent");
       createAndAddWorkspace(store, "parent");
       await send(caughtUpEvent());
       await tick(10);
+      expect(shownInputTokens("parent")).toBe(101);
+      mockGetSessionUsage.mockClear();
       mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
 
-      await send(rollUpDelta("parent", 1), rollUpDelta("parent", 1));
+      await send(rollUpDelta("parent", 1));
 
-      expect(shownInputTokens("parent")).toBe(2);
+      expect(shownInputTokens("parent")).toBe(101);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
     });
 
     it("sums model keys named after Object.prototype members", async () => {
@@ -3697,31 +3705,131 @@ describe("WorkspaceStore", () => {
       await send({
         type: "session-usage-delta",
         workspaceId: "parent",
-        sourceWorkspaceId: "parent",
+        sourceWorkspaceId: "removed-child",
         byModelDelta: byModel,
         timestamp: 1,
       });
 
-      // Ledger 100, two sub-agent subtrees of 5 x 10, one self delta of 5 x 10.
+      // Ledger 100, two sub-agent subtrees of 5 x 10, one roll-up delta of 5 x 10.
       expect(shownInputTokens("parent")).toBe(100 + 100 + 50);
     });
 
-    it("refreshes the parent's projection when a sub-agent's stream ends", async () => {
-      const releaseStop = mockBackgroundActivityTransition(
-        "child",
-        createActivitySnapshot(10, { streaming: true }),
-        [createActivitySnapshot(11, { streaming: false })]
+    describe("usage revision", () => {
+      /** Feed the activity subscription; the store is recreated so it subscribes to it. */
+      const openActivity = async () => {
+        const activity = createControllableAsyncIterable<WorkspaceActivityEvent>();
+        mockActivitySubscribe.mockImplementation(async function* (_input, options) {
+          options?.signal?.addEventListener("abort", () => activity.close(), { once: true });
+          yield* activity.iterable;
+        });
+        recreateStore();
+        // The bootstrap list replaces the snapshots it does not list: let it land first.
+        await tick(10);
+        return async (workspaceId: string, usageRevision: number) => {
+          activity.push({
+            type: "activity",
+            workspaceId,
+            activity: createActivitySnapshot(1, { usageRevision }),
+          });
+          await tick(0);
+        };
+      };
+      const addParentWithChildren = async (childIds: string[]) => {
+        createAndAddWorkspace(store, "parent");
+        for (const childId of childIds) {
+          createAndAddWorkspace(store, childId, { parentWorkspaceId: "parent" }, false);
+        }
+        await tick(10);
+        mockGetSessionUsage.mockClear();
+        mockGetSubagentUsage.mockClear();
+      };
+
+      it("refreshes every shown ancestor's projection when a nested sub-agent's usage moves", async () => {
+        const pushUsage = await openActivity();
+        createAndAddWorkspace(store, "parent");
+        createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+        createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
+        await tick(10);
+        mockGetSessionUsage.mockClear();
+        mockGetSubagentUsage.mockClear();
+
+        await pushUsage("grandchild", 1);
+        expect(mockGetSubagentUsage.mock.calls).toEqual([[{ workspaceId: "parent" }]]);
+        // Another snapshot with the same revision (a status change) fetches nothing.
+        await pushUsage("grandchild", 1);
+
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+      });
+
+      it("shows a roll-up whose delta never reached the parent's chat", async () => {
+        const pushUsage = await openActivity();
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+        const send = openChat("parent");
+        await addParentWithChildren(["child"]);
+        await send(caughtUpEvent());
+        expect(shownInputTokens("parent")).toBe(100);
+        mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
+
+        // A hidden workspace's own revision fetches no ledger.
+        await pushUsage("child", 1);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        await pushUsage("parent", 1);
+
+        expect(shownInputTokens("parent")).toBe(600);
+      });
+
+      it("coalesces a burst of 50 sub-agent usage changes into one fetch and one trailing fetch", async () => {
+        const pushUsage = await openActivity();
+        const children = Array.from({ length: 50 }, (_, index) => `child-${index}`);
+        await addParentWithChildren(children);
+        const held: Array<() => void> = [];
+        mockGetSubagentUsage.mockImplementation(
+          () => new Promise((resolve) => held.push(() => resolve(projection({}))))
+        );
+
+        for (const [index, childId] of children.entries()) {
+          await pushUsage(childId, index + 1);
+        }
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
+        held[0]();
+        await tick(0);
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
+        held[1]();
+        await tick(0);
+
+        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
+      });
+    });
+
+    it("does not let a fetch on a replaced client block the new client's projection fetches", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
       );
-      recreateStore();
-      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
       createAndAddWorkspace(store, "parent");
-      await tick(10);
-      mockGetSubagentUsage.mockClear();
+      expect(responses).toHaveLength(1);
 
-      releaseStop();
-      await tick(10);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ ...mockClient } as any);
+      expect(responses).toHaveLength(2);
+      // The old client's fetch settles last: the new client's fetch still holds the slot.
+      responses[0](projection({}));
+      await tick(0);
+      store.setActiveWorkspaceId(null);
+      store.setActiveWorkspaceId("parent");
 
-      expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+      expect(responses).toHaveLength(2);
+    });
+
+    it("starts a fresh projection fetch for a workspace re-added while its old fetch hangs", () => {
+      mockGetSubagentUsage.mockImplementation(() => new Promise(() => undefined));
+      createAndAddWorkspace(store, "parent");
+      store.removeWorkspace("parent");
+      createAndAddWorkspace(store, "parent");
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledTimes(2);
     });
 
     it("refreshes the ancestors' projections when a nested sub-agent is removed", async () => {
