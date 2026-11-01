@@ -117,7 +117,7 @@ const mockOnChat = mock(idleOnChat);
 const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
 const mockGetSessionUsage = mock(noSessionUsage);
 const noSubagentUsage = (_input: { workspaceId: string }) =>
-  Promise.resolve<unknown>({ byModel: {}, workspaceCount: 0 });
+  Promise.resolve<unknown>({ children: {} });
 const mockGetSubagentUsage = mock(noSubagentUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
@@ -3515,21 +3515,35 @@ describe("WorkspaceStore", () => {
       output: { tokens: 0, cost_usd: 0 },
       reasoning: { tokens: 0, cost_usd: 0 },
     });
+    const ledger = (inputTokens: number, rolledUpFrom?: Record<string, true>) => ({
+      byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      version: 1 as const,
+      ...(rolledUpFrom ? { rolledUpFrom } : {}),
+    });
+    const projection = (children: Record<string, [inputTokens: number, count: number]>) => ({
+      children: Object.fromEntries(
+        Object.entries(children).map(([id, [inputTokens, workspaceCount]]) => [
+          id,
+          { byModel: { "claude-opus": usageOf(inputTokens, inputTokens / 100) }, workspaceCount },
+        ])
+      ),
+    });
+    const shownInputTokens = (workspaceId: string) =>
+      sumSessionCostUsage(store.getWorkspaceUsage(workspaceId))?.input.tokens;
+    const rollUpDelta = (source: string, inputTokens: number): WorkspaceChatMessage => ({
+      type: "session-usage-delta",
+      workspaceId: "parent",
+      sourceWorkspaceId: source,
+      byModelDelta: { "claude-opus": usageOf(inputTokens, inputTokens / 100) },
+      timestamp: 1,
+    });
 
     it("adds open sub-agents to the session cost of their parent only", async () => {
       mockGetSessionUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
-        Promise.resolve(
-          workspaceId === "parent"
-            ? { byModel: { "claude-opus": usageOf(100, 1) }, version: 1 as const }
-            : undefined
-        )
+        Promise.resolve(workspaceId === "parent" ? ledger(100) : undefined)
       );
       mockGetSubagentUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
-        Promise.resolve(
-          workspaceId === "parent"
-            ? { byModel: { "claude-opus": usageOf(500, 5) }, workspaceCount: 3 }
-            : { byModel: {}, workspaceCount: 0 }
-        )
+        Promise.resolve(projection(workspaceId === "parent" ? { child: [500, 3] } : {}))
       );
       // Real load order: the parent registers (and fetches usage) before its children exist
       // in frontend metadata, so the store must not decide from metadata that it has none.
@@ -3541,8 +3555,56 @@ describe("WorkspaceStore", () => {
       const usage = store.getWorkspaceUsage("parent");
       expect(usage.sessionTotal?.input.tokens).toBe(100);
       expect(usage.subagentCount).toBe(3);
-      expect(sumSessionCostUsage(usage)?.input.tokens).toBe(600);
+      expect(shownInputTokens("parent")).toBe(600);
       expect(sumSessionCostUsage(usage)?.input.cost_usd).toBe(6);
+    });
+
+    it("counts a child once when the ledger already rolled it up", async () => {
+      // The ledger read ran after the roll-up, the projection read before it.
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1], other: [50, 2] }))
+      );
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+
+      expect(shownInputTokens("parent")).toBe(650);
+      expect(store.getWorkspaceUsage("parent").subagentCount).toBe(2);
+    });
+
+    it("counts a rolled-up child once and refetches the ledger", async () => {
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+      // A stale projection that still lists the child.
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve(projection({ child: [500, 1] }))
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      expect(shownInputTokens("parent")).toBe(600);
+      mockGetSessionUsage.mockClear();
+      // Hold the refetch, so the delta handler alone decides what the tab shows.
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      await send(rollUpDelta("child", 500));
+      expect(shownInputTokens("parent")).toBe(600);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("adds every self delta", async () => {
+      // Headless spend (status titles, bash AI proxy) reports the workspace itself as source.
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send(rollUpDelta("parent", 1), rollUpDelta("parent", 1));
+
+      expect(shownInputTokens("parent")).toBe(2);
     });
 
     it("refreshes the parent's projection when a sub-agent's stream ends", async () => {
@@ -3559,6 +3621,19 @@ describe("WorkspaceStore", () => {
 
       releaseStop();
       await tick(10);
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+
+    it("refreshes the ancestors' projections when a nested sub-agent is removed", async () => {
+      // A grandchild rolls into the child's ledger: no delta reaches the parent.
+      createAndAddWorkspace(store, "parent");
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+      createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      store.removeWorkspace("grandchild");
 
       expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
     });

@@ -836,8 +836,11 @@ describe("SessionUsageService", () => {
 
       const result = await service.getOpenSubagentUsage("root");
 
-      expect(result.workspaceCount).toBe(2);
-      const usage = result.byModel[model];
+      // One entry per direct child: "child" covers itself and "grandchild".
+      expect(Object.keys(result.children)).toEqual(["child"]);
+      const subtree = result.children.child;
+      expect(subtree.workspaceCount).toBe(2);
+      const usage = subtree.byModel[model];
       expect(usage.input.tokens).toBe(10 + 5 + 20);
       expect(usage.output.tokens).toBe(1 + 5 + 2);
       expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
@@ -847,10 +850,7 @@ describe("SessionUsageService", () => {
       await addWorkspace("lonely");
       await service.recordUsage("lonely", model, createUsage(1, 1));
 
-      expect(await service.getOpenSubagentUsage("lonely")).toEqual({
-        byModel: {},
-        workspaceCount: 0,
-      });
+      expect(await service.getOpenSubagentUsage("lonely")).toEqual({ children: {} });
     });
   });
 

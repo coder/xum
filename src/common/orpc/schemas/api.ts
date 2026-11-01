@@ -2809,8 +2809,13 @@ export const workspace = {
   getSubagentUsage: {
     input: z.object({ workspaceId: z.string() }),
     output: z.object({
-      byModel: z.record(z.string(), ChatUsageDisplaySchema),
-      workspaceCount: z.number().int().nonnegative(),
+      children: z.record(
+        z.string(),
+        z.object({
+          byModel: z.record(z.string(), ChatUsageDisplaySchema),
+          workspaceCount: z.number().int().nonnegative(),
+        })
+      ),
     }),
   },
   /** Batch fetch session usage for multiple workspaces (for archived workspaces cost display) */

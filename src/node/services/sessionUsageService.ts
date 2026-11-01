@@ -73,11 +73,20 @@ export interface SessionUsageTokenStatsCacheV1 {
   source?: { historyReceipt: string; inputsKey: string };
 }
 
-export interface OpenSubagentUsage {
-  /** Usage per model, summed over every open (not yet rolled up) descendant workspace. */
+export interface SubagentSubtreeUsage {
+  /** Usage per model, summed over the open (not yet rolled up) workspaces of one subtree. */
   byModel: Record<string, ChatUsageDisplay>;
-  /** Open descendant workspaces that have any usage. */
+  /** Open workspaces of the subtree that have any usage. */
   workspaceCount: number;
+}
+
+export interface OpenSubagentUsage {
+  /**
+   * One entry per direct child, covering that child and its open descendants. Keyed by child so
+   * the store can drop a child its own copy of the parent ledger already counts: the two reads
+   * are separate calls, and a removal can roll the child up between them.
+   */
+  children: Record<string, SubagentSubtreeUsage>;
 }
 
 export interface SessionUsageFile {
@@ -203,27 +212,35 @@ function addModelUsage(
   byModel[model] = sum;
 }
 
-/** Every descendant of `rootId` with its parent, breadth first; cycles are visited once. */
+interface DescendantTask {
+  id: string;
+  parentId: string;
+  /** The direct child of the root whose subtree holds this task. */
+  subtreeId: string;
+}
+
+/** Every descendant of `rootId`, breadth first; cycles are visited once. */
 function listDescendantTasks(
   childrenByParent: ReadonlyMap<string, readonly string[]>,
   rootId: string
-): Array<{ id: string; parentId: string }> {
-  const descendants: Array<{ id: string; parentId: string }> = [];
+): DescendantTask[] {
+  const descendants: DescendantTask[] = [];
   const seen = new Set<string>([rootId]);
-  const queue = [rootId];
-  for (let parentId = queue.shift(); parentId !== undefined; parentId = queue.shift()) {
-    for (const childId of childrenByParent.get(parentId) ?? []) {
+  const queue: Array<{ id: string; subtreeId?: string }> = [{ id: rootId }];
+  for (let parent = queue.shift(); parent !== undefined; parent = queue.shift()) {
+    for (const childId of childrenByParent.get(parent.id) ?? []) {
       if (seen.has(childId)) continue;
       seen.add(childId);
-      descendants.push({ id: childId, parentId });
-      queue.push(childId);
+      const subtreeId = parent.subtreeId ?? childId;
+      descendants.push({ id: childId, parentId: parent.id, subtreeId });
+      queue.push({ id: childId, subtreeId });
     }
   }
   return descendants;
 }
 
 function getOpenDescendantModelUsage(
-  descendant: { id: string; parentId: string },
+  descendant: DescendantTask,
   views: ReadonlyMap<string, SessionUsageFile | undefined>
 ): Array<[string, ChatUsageDisplay]> {
   if (views.get(descendant.parentId)?.rolledUpFrom?.[descendant.id]) return [];
@@ -235,20 +252,20 @@ function getOpenDescendantModelUsage(
  * is mid-removal (already in the parent's ledger) and is skipped so it is not counted twice.
  */
 function sumOpenDescendantUsage(
-  descendants: ReadonlyArray<{ id: string; parentId: string }>,
+  descendants: readonly DescendantTask[],
   views: ReadonlyMap<string, SessionUsageFile | undefined>
 ): OpenSubagentUsage {
-  const byModel: Record<string, ChatUsageDisplay> = {};
-  let workspaceCount = 0;
+  const children: Record<string, SubagentSubtreeUsage> = {};
   for (const descendant of descendants) {
     const entries = getOpenDescendantModelUsage(descendant, views);
     if (entries.length === 0) continue;
-    workspaceCount++;
+    const subtree = (children[descendant.subtreeId] ??= { byModel: {}, workspaceCount: 0 });
+    subtree.workspaceCount++;
     for (const [model, usage] of entries) {
-      addModelUsage(byModel, model, usage);
+      addModelUsage(subtree.byModel, model, usage);
     }
   }
-  return { byModel, workspaceCount };
+  return { children };
 }
 
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
@@ -1122,7 +1139,7 @@ export class SessionUsageService {
     const index = buildAgentTaskIndex(this.config.loadConfigOrDefault());
     const descendants = listDescendantTasks(index.childrenByParent, workspaceId);
     if (descendants.length === 0) {
-      return { byModel: {}, workspaceCount: 0 };
+      return { children: {} };
     }
     const ids = [workspaceId, ...descendants.map((d) => d.id)];
     const views = new Map(

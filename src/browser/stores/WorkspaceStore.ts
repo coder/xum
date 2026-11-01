@@ -418,20 +418,47 @@ export interface WorkspaceUsageState {
   subagentCount?: number;
 }
 
-/** WorkspaceUsageState sub-agent fields; all undefined when no open sub-agent has usage. */
+type SubagentUsageByChild = Awaited<
+  ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
+>;
+
+function sumSubtreesNotRolledUp(
+  children: SubagentUsageByChild["children"],
+  rolledUpFrom: Readonly<Record<string, unknown>>
+): { byModel: Record<string, ChatUsageDisplay>; count: number } {
+  const byModel: Record<string, ChatUsageDisplay> = {};
+  let count = 0;
+  for (const [childId, subtree] of Object.entries(children)) {
+    if (rolledUpFrom[childId]) continue;
+    count += subtree.workspaceCount;
+    for (const [model, usage] of Object.entries(subtree.byModel)) {
+      const existing = byModel[model];
+      byModel[model] = existing ? (sumUsageHistory([existing, usage]) ?? usage) : usage;
+    }
+  }
+  return { byModel, count };
+}
+
+/**
+ * WorkspaceUsageState sub-agent fields; all undefined when no open sub-agent has usage.
+ *
+ * A child already in the ledger's rolledUpFrom is dropped here, on every read, not when the
+ * projection arrives: the projection and the ledger are separate fetches, and a removal can
+ * roll the child up between them (or a delta can add it later), which would count it twice.
+ */
 function getSubagentUsageFields(
-  data: { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number } | undefined
+  data: SubagentUsageByChild | undefined,
+  ledger: { rolledUpFrom?: Readonly<Record<string, unknown>> } | undefined
 ): Pick<WorkspaceUsageState, "subagentTotal" | "subagentByModel" | "subagentCount"> {
-  const models = Object.values(data?.byModel ?? {});
-  if (!data || models.length === 0) {
+  const { byModel, count } = sumSubtreesNotRolledUp(
+    data?.children ?? {},
+    ledger?.rolledUpFrom ?? {}
+  );
+  const models = Object.values(byModel);
+  if (models.length === 0) {
     return {};
   }
-  return {
-    // Shallow copy, like sessionByModel: memoized consumers must see a fresh record.
-    subagentByModel: { ...data.byModel },
-    subagentTotal: sumUsageHistory(models),
-    subagentCount: data.workspaceCount,
-  };
+  return { subagentByModel: byModel, subagentTotal: sumUsageHistory(models), subagentCount: count };
 }
 
 /**
@@ -1200,10 +1227,7 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
-  private subagentUsage = new Map<
-    string,
-    { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number }
-  >();
+  private subagentUsage = new Map<string, SubagentUsageByChild>();
   private subagentUsageRequestVersion = new Map<string, number>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
@@ -1472,17 +1496,27 @@ export class WorkspaceStore {
         version: 1 as const,
       };
 
-      for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-        const existing = current.byModel[model];
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
+      // drops it from the projection. Self deltas (headless spend) repeat and always add.
+      const childId =
+        usageDelta.sourceWorkspaceId === workspaceId ? undefined : usageDelta.sourceWorkspaceId;
+      if (childId === undefined || !current.rolledUpFrom?.[childId]) {
+        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+          const existing = current.byModel[model];
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+          current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+        }
+      }
+      if (childId !== undefined) {
+        current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
       }
 
       this.sessionUsage.set(workspaceId, current);
       this.usageStore.bump(workspaceId);
-      // The delta is a removed sub-agent rolling up: it now counts in sessionTotal, so drop it
-      // from the open sub-agent projection or the tab double counts it.
-      this.refreshSubagentUsage(workspaceId);
+      // A ledger fetch still in flight read the file before the roll-up and would overwrite
+      // this merge: refetch, so the newer response wins (it also refreshes the projection).
+      this.refreshSessionUsage(workspaceId);
     },
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1726,7 +1760,7 @@ export class WorkspaceStore {
   private applySubagentUsage(
     workspaceId: string,
     requestVersion: number,
-    data: { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number }
+    data: SubagentUsageByChild
   ): void {
     // A newer refresh owns the result, and a removed workspace has no usage to show.
     const isLatest = this.subagentUsageRequestVersion.get(workspaceId) === requestVersion;
@@ -1738,8 +1772,7 @@ export class WorkspaceStore {
   }
 
   /**
-   * A sub-agent's spend changes when its stream ends: refresh the projection of every ancestor
-   * whose usage is on screen or subscribed.
+   * A sub-agent's spend changes when its stream ends: refresh its ancestors' projections.
    */
   private refreshAncestorsWhenStreamEnds(
     workspaceId: string,
@@ -1749,6 +1782,15 @@ export class WorkspaceStore {
     if (previous?.streaming !== true || snapshot?.streaming === true) {
       return;
     }
+    this.refreshAncestorSubagentUsage(workspaceId);
+  }
+
+  /**
+   * Refresh the projection of every ancestor whose usage is on screen or subscribed. Called when
+   * a sub-agent's stream ends and when one leaves the workspace list: a nested sub-agent rolls
+   * into its own parent's ledger, and no session-usage-delta reaches the ancestors.
+   */
+  private refreshAncestorSubagentUsage(workspaceId: string): void {
     for (const ancestorId of this.listAncestorIds(workspaceId)) {
       if (this.isWorkspaceOnScreen(ancestorId) || this.usageStore.hasKeySubscribers(ancestorId)) {
         this.refreshSubagentUsage(ancestorId);
@@ -3750,7 +3792,7 @@ export class WorkspaceStore {
       return {
         sessionTotal,
         sessionByModel,
-        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId)),
+        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId), sessionData),
         lastRequest,
         lastContextUsage,
         totalTokens,
@@ -4942,6 +4984,9 @@ export class WorkspaceStore {
    * Remove a workspace and clean up subscriptions.
    */
   removeWorkspace(workspaceId: string): void {
+    // Before the metadata goes: the ancestor walk reads this workspace's parent link.
+    this.refreshAncestorSubagentUsage(workspaceId);
+
     // Clean up consumer manager state
     this.consumerManager.removeWorkspace(workspaceId);
 
