@@ -797,6 +797,63 @@ describe("SessionUsageService", () => {
     }
   });
 
+  describe("getOpenSubagentUsage", () => {
+    const projectPath = "/tmp/mux-session-usage-test-project";
+    const model = "claude-sonnet-4-20250514";
+
+    async function addWorkspace(id: string, parentWorkspaceId?: string): Promise<void> {
+      await config.addWorkspace(projectPath, {
+        id,
+        name: `${id}-branch`,
+        projectName: "test-project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId,
+      });
+    }
+
+    it("sums open descendants once, skipping rolled-up and unrelated workspaces", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await addWorkspace("removing", "root");
+      await addWorkspace("other-root");
+      await addWorkspace("other-child", "other-root");
+
+      await service.recordUsage("root", model, createUsageWithCosts(100, 50, 1, 2));
+      await service.recordUsage("child", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await service.recordUsage("grandchild", model, createUsageWithCosts(20, 2, 0.3, 0.4));
+      // A removed grandchild rolled into "child": it counts once, through child's ledger.
+      await service.rollUpUsageIntoParent("child", "removed-grandchild", {
+        [model]: createUsageWithCosts(5, 5, 0.5, 0.5),
+      });
+      // "removing" is mid-removal: rolled into root but still in config.
+      await service.recordUsage("removing", model, createUsageWithCosts(40, 4, 4, 4));
+      await service.rollUpUsageIntoParent("root", "removing", {
+        [model]: createUsageWithCosts(40, 4, 4, 4),
+      });
+      await service.recordUsage("other-child", model, createUsageWithCosts(1000, 1000, 9, 9));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.workspaceCount).toBe(2);
+      const usage = result.byModel[model];
+      expect(usage.input.tokens).toBe(10 + 5 + 20);
+      expect(usage.output.tokens).toBe(1 + 5 + 2);
+      expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
+    });
+
+    it("returns nothing for a workspace without sub-agents", async () => {
+      await addWorkspace("lonely");
+      await service.recordUsage("lonely", model, createUsage(1, 1));
+
+      expect(await service.getOpenSubagentUsage("lonely")).toEqual({
+        byModel: {},
+        workspaceCount: 0,
+      });
+    });
+  });
+
   describe("getSessionUsage", () => {
     it("should rebuild from messages when file missing (ENOENT)", async () => {
       const workspaceId = "test-workspace";

@@ -407,6 +407,31 @@ export interface WorkspaceUsageState {
   liveMetadataModel?: string;
   /** Prompt-cache health of the most recent completed assistant turns, newest first. */
   recentTurnCacheHealth?: TurnCacheHealth[];
+  /**
+   * Usage of sub-agents that still exist. Their spend reaches sessionTotal only when they are
+   * removed, so cost displays add this to show what the whole tree has spent so far.
+   */
+  subagentTotal?: ChatUsageDisplay;
+  /** Per-model source of subagentTotal. */
+  subagentByModel?: Record<string, ChatUsageDisplay>;
+  /** Open sub-agent workspaces counted in subagentTotal. */
+  subagentCount?: number;
+}
+
+/** WorkspaceUsageState sub-agent fields; all undefined when no open sub-agent has usage. */
+function getSubagentUsageFields(
+  data: { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number } | undefined
+): Pick<WorkspaceUsageState, "subagentTotal" | "subagentByModel" | "subagentCount"> {
+  const models = Object.values(data?.byModel ?? {});
+  if (!data || models.length === 0) {
+    return {};
+  }
+  return {
+    // Shallow copy, like sessionByModel: memoized consumers must see a fresh record.
+    subagentByModel: { ...data.byModel },
+    subagentTotal: sumUsageHistory(models),
+    subagentCount: data.workspaceCount,
+  };
 }
 
 /**
@@ -1175,6 +1200,11 @@ export class WorkspaceStore {
 
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
+  private subagentUsage = new Map<
+    string,
+    { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number }
+  >();
+  private subagentUsageRequestVersion = new Map<string, number>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1450,6 +1480,9 @@ export class WorkspaceStore {
 
       this.sessionUsage.set(workspaceId, current);
       this.usageStore.bump(workspaceId);
+      // The delta is a removed sub-agent rolling up: it now counts in sessionTotal, so drop it
+      // from the open sub-agent projection or the tab double counts it.
+      this.refreshSubagentUsage(workspaceId);
     },
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1621,6 +1654,7 @@ export class WorkspaceStore {
 
     const requestVersion = (this.sessionUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.sessionUsageRequestVersion.set(workspaceId, requestVersion);
+    this.refreshSubagentUsage(workspaceId);
 
     client.workspace
       .getSessionUsage({ workspaceId })
@@ -1665,6 +1699,74 @@ export class WorkspaceStore {
           this.markSessionUsageKnown(workspaceId);
         }
       });
+  }
+
+  /**
+   * Fetch the usage of the workspace's open sub-agents (see WorkspaceUsageState.subagentTotal).
+   * Same stale-response guard as refreshSessionUsage.
+   */
+  private refreshSubagentUsage(workspaceId: string): void {
+    const client = this.client;
+    if (!client || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    // Ask the backend even when no child is known here: frontend metadata can lag config (a
+    // parent registers before its children), and gating on it hid every sub-agent's cost.
+
+    const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
+    this.subagentUsageRequestVersion.set(workspaceId, requestVersion);
+    client.workspace
+      .getSubagentUsage({ workspaceId })
+      .then((data) => this.applySubagentUsage(workspaceId, requestVersion, data))
+      .catch((error) => {
+        console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
+      });
+  }
+
+  private applySubagentUsage(
+    workspaceId: string,
+    requestVersion: number,
+    data: { byModel: Record<string, ChatUsageDisplay>; workspaceCount: number }
+  ): void {
+    // A newer refresh owns the result, and a removed workspace has no usage to show.
+    const isLatest = this.subagentUsageRequestVersion.get(workspaceId) === requestVersion;
+    if (!isLatest || !this.isWorkspaceRegistered(workspaceId)) {
+      return;
+    }
+    this.subagentUsage.set(workspaceId, data);
+    this.usageStore.bump(workspaceId);
+  }
+
+  /**
+   * A sub-agent's spend changes when its stream ends: refresh the projection of every ancestor
+   * whose usage is on screen or subscribed.
+   */
+  private refreshAncestorsWhenStreamEnds(
+    workspaceId: string,
+    previous: WorkspaceActivitySnapshot | null,
+    snapshot: WorkspaceActivitySnapshot | null
+  ): void {
+    if (previous?.streaming !== true || snapshot?.streaming === true) {
+      return;
+    }
+    for (const ancestorId of this.listAncestorIds(workspaceId)) {
+      if (this.isWorkspaceOnScreen(ancestorId) || this.usageStore.hasKeySubscribers(ancestorId)) {
+        this.refreshSubagentUsage(ancestorId);
+      }
+    }
+  }
+
+  /** Parent, grandparent, ... from frontend metadata; stops at a cycle. */
+  private listAncestorIds(workspaceId: string): string[] {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([workspaceId]);
+    let parentId = this.workspaceMetadata.get(workspaceId)?.parentWorkspaceId;
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      ancestors.push(parentId);
+      parentId = this.workspaceMetadata.get(parentId)?.parentWorkspaceId;
+    }
+    return ancestors;
   }
 
   private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
@@ -3648,6 +3750,7 @@ export class WorkspaceStore {
       return {
         sessionTotal,
         sessionByModel,
+        ...getSubagentUsageFields(this.subagentUsage.get(workspaceId)),
         lastRequest,
         lastContextUsage,
         totalTokens,
@@ -4000,6 +4103,8 @@ export class WorkspaceStore {
     if (refreshGoalCount) {
       this.refreshActiveGoalCount();
     }
+
+    this.refreshAncestorsWhenStreamEnds(workspaceId, previous, snapshot);
 
     // Transcript content that lands while a workspace is not the active onChat
     // subscription never reaches its aggregator, so any stream/recency movement
@@ -4906,6 +5011,8 @@ export class WorkspaceStore {
     this.preReplayUsageSnapshot.delete(workspaceId);
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
+    this.subagentUsage.delete(workspaceId);
+    this.subagentUsageRequestVersion.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
     this.derived.bump("recency");
@@ -6075,6 +6182,18 @@ export function removeEphemeralMessage(workspaceId: string, messageId: string): 
  * Hook for usage metadata (instant, no tokenization).
  * Updates immediately when usage metadata arrives from API responses.
  */
+/**
+ * Session cost usage as the cost displays show it: the persisted ledger (own turns plus removed
+ * sub-agents), open sub-agents, and the running stream. Undefined when there is none.
+ */
+export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDisplay | undefined {
+  const parts: ChatUsageDisplay[] = [];
+  if (usage.sessionTotal) parts.push(usage.sessionTotal);
+  if (usage.subagentTotal) parts.push(usage.subagentTotal);
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  return parts.length > 0 ? sumUsageHistory(parts) : undefined;
+}
+
 export function useWorkspaceUsage(workspaceId: string): WorkspaceUsageState {
   const store = getStoreInstance();
   return useSyncExternalStore(

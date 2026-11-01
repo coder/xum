@@ -28,6 +28,7 @@ import {
   parseProcessIdentity,
 } from "@/node/utils/concurrency/processLiveness";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { buildAgentTaskIndex } from "@/node/services/agentTaskIndex";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage } from "@/common/types/message";
@@ -70,6 +71,13 @@ export interface SessionUsageTokenStatsCacheV1 {
   topFilePaths?: Array<{ path: string; tokens: number }>;
   /** Exact inputs of this count; lets the backend serve it without re-reading history. */
   source?: { historyReceipt: string; inputsKey: string };
+}
+
+export interface OpenSubagentUsage {
+  /** Usage per model, summed over every open (not yet rolled up) descendant workspace. */
+  byModel: Record<string, ChatUsageDisplay>;
+  /** Open descendant workspaces that have any usage. */
+  workspaceCount: number;
 }
 
 export interface SessionUsageFile {
@@ -193,6 +201,54 @@ function addModelUsage(
   const sum = existing ? sumUsageHistory([existing, usage]) : usage;
   assert(sum, "addModelUsage: sum of two usages must exist");
   byModel[model] = sum;
+}
+
+/** Every descendant of `rootId` with its parent, breadth first; cycles are visited once. */
+function listDescendantTasks(
+  childrenByParent: ReadonlyMap<string, readonly string[]>,
+  rootId: string
+): Array<{ id: string; parentId: string }> {
+  const descendants: Array<{ id: string; parentId: string }> = [];
+  const seen = new Set<string>([rootId]);
+  const queue = [rootId];
+  for (let parentId = queue.shift(); parentId !== undefined; parentId = queue.shift()) {
+    for (const childId of childrenByParent.get(parentId) ?? []) {
+      if (seen.has(childId)) continue;
+      seen.add(childId);
+      descendants.push({ id: childId, parentId });
+      queue.push(childId);
+    }
+  }
+  return descendants;
+}
+
+function getOpenDescendantModelUsage(
+  descendant: { id: string; parentId: string },
+  views: ReadonlyMap<string, SessionUsageFile | undefined>
+): Array<[string, ChatUsageDisplay]> {
+  if (views.get(descendant.parentId)?.rolledUpFrom?.[descendant.id]) return [];
+  return Object.entries(views.get(descendant.id)?.byModel ?? {});
+}
+
+/**
+ * Sum the usage views of open descendants. A descendant listed in its parent's rolledUpFrom
+ * is mid-removal (already in the parent's ledger) and is skipped so it is not counted twice.
+ */
+function sumOpenDescendantUsage(
+  descendants: ReadonlyArray<{ id: string; parentId: string }>,
+  views: ReadonlyMap<string, SessionUsageFile | undefined>
+): OpenSubagentUsage {
+  const byModel: Record<string, ChatUsageDisplay> = {};
+  let workspaceCount = 0;
+  for (const descendant of descendants) {
+    const entries = getOpenDescendantModelUsage(descendant, views);
+    if (entries.length === 0) continue;
+    workspaceCount++;
+    for (const [model, usage] of entries) {
+      addModelUsage(byModel, model, usage);
+    }
+  }
+  return { byModel, workspaceCount };
 }
 
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
@@ -1041,26 +1097,64 @@ export class SessionUsageService {
     // should already have session-usage.json; skip rebuild to keep batch fast)
     await Promise.all(
       workspaceIds.map(async (workspaceId) => {
-        let settled: SessionUsageFile | undefined;
-        try {
-          const filePath = this.getFilePath(workspaceId);
-          const data = await this.files.promises.readFile(filePath, "utf-8");
-          settled = JSON.parse(data) as SessionUsageFile;
-        } catch {
-          settled = undefined;
-        }
-        // Lock-free and read-only: killed streams are added to the view, not folded.
-        const entries = await this.readInFlightEntries(workspaceId);
-        const { view, addedCount } = this.addRunningStreamsToView(
-          workspaceId,
-          settled ?? this.createEmptyUsageFile(),
-          entries,
-          false
-        );
-        results[workspaceId] = settled === undefined && addedCount === 0 ? undefined : view;
+        results[workspaceId] = await this.readUsageViewLockFree(workspaceId, false);
       })
     );
     return results;
+  }
+
+  /**
+   * Usage of a workspace's sub-agents (and their sub-agents) that still exist.
+   *
+   * A sub-agent's spend reaches its parent's ledger only when the sub-agent workspace is
+   * removed (rollUpUsageIntoParent). Sub-agents that report and stay around therefore hid
+   * most delegated spend from the parent's Costs tab (a parent showed ~$100 while its tree
+   * spent ~$600), so the UI adds this projection to the parent's cost.
+   *
+   * Counted once: each open descendant's ledger already holds its own removed children, and
+   * open grandchildren are visited separately. A descendant listed in its parent's
+   * rolledUpFrom is mid-removal (rolled up, not yet out of config) and is skipped.
+   * Lock-free and read-only, like getSessionUsageBatch; running streams are included because
+   * no other source shows a sub-agent's in-progress spend to the parent.
+   */
+  async getOpenSubagentUsage(workspaceId: string): Promise<OpenSubagentUsage> {
+    assert(workspaceId.trim().length > 0, "getOpenSubagentUsage requires workspaceId");
+    const index = buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const descendants = listDescendantTasks(index.childrenByParent, workspaceId);
+    if (descendants.length === 0) {
+      return { byModel: {}, workspaceCount: 0 };
+    }
+    const ids = [workspaceId, ...descendants.map((d) => d.id)];
+    const views = new Map(
+      await Promise.all(
+        ids.map(async (id) => [id, await this.readUsageViewLockFree(id, true)] as const)
+      )
+    );
+    return sumOpenDescendantUsage(descendants, views);
+  }
+
+  /** Settled ledger plus in-flight files, without folding, locking or rebuilding from history. */
+  private async readUsageViewLockFree(
+    workspaceId: string,
+    includeOwnLiveStreams: boolean
+  ): Promise<SessionUsageFile | undefined> {
+    let settled: SessionUsageFile | undefined;
+    try {
+      const filePath = this.getFilePath(workspaceId);
+      const data = await this.files.promises.readFile(filePath, "utf-8");
+      settled = JSON.parse(data) as SessionUsageFile;
+    } catch {
+      settled = undefined;
+    }
+    // Lock-free and read-only: killed streams are added to the view, not folded.
+    const entries = await this.readInFlightEntries(workspaceId);
+    const { view, addedCount } = this.addRunningStreamsToView(
+      workspaceId,
+      settled ?? this.createEmptyUsageFile(),
+      entries,
+      includeOwnLiveStreams
+    );
+    return settled === undefined && addedCount === 0 ? undefined : view;
   }
 
   /**

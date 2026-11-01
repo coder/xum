@@ -66,6 +66,7 @@ import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
+  sumSessionCostUsage,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -115,6 +116,9 @@ const mockOnChat = mock(idleOnChat);
 
 const noSessionUsage = (_input: { workspaceId: string }) => Promise.resolve<unknown>(undefined);
 const mockGetSessionUsage = mock(noSessionUsage);
+const noSubagentUsage = (_input: { workspaceId: string }) =>
+  Promise.resolve<unknown>({ byModel: {}, workspaceCount: 0 });
+const mockGetSubagentUsage = mock(noSubagentUsage);
 const mockHistoryLoadMore = mock(
   (_input?: {
     workspaceId: string;
@@ -187,6 +191,7 @@ const mockClient = {
   workspace: {
     onChat: mockOnChat,
     getSessionUsage: mockGetSessionUsage,
+    getSubagentUsage: mockGetSubagentUsage,
     history: {
       loadMore: mockHistoryLoadMore,
     },
@@ -285,6 +290,7 @@ function makeWorkspaceMetadata(
     namedWorkspacePath: options.namedWorkspacePath ?? "/path/to/workspace",
     createdAt: options.createdAt ?? new Date().toISOString(),
     runtimeConfig: options.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG,
+    ...(options.parentWorkspaceId ? { parentWorkspaceId: options.parentWorkspaceId } : {}),
   };
 }
 
@@ -743,6 +749,8 @@ describe("WorkspaceStore", () => {
     mockOnChat.mockImplementation(idleOnChat);
     mockGetSessionUsage.mockReset();
     mockGetSessionUsage.mockImplementation(noSessionUsage);
+    mockGetSubagentUsage.mockReset();
+    mockGetSubagentUsage.mockImplementation(noSubagentUsage);
     mockActivitySubscribe.mockReset();
     mockActivitySubscribe.mockImplementation(idleActivitySubscription);
     mockHistoryLoadMore.mockClear();
@@ -3499,6 +3507,63 @@ describe("WorkspaceStore", () => {
 
   // Loaded session usage is repriced against the current provider config, except for
   // costs-included rows, whose zero costs are real: repricing them would inflate totals.
+  describe("open sub-agent usage", () => {
+    const usageOf = (inputTokens: number, inputCost: number) => ({
+      input: { tokens: inputTokens, cost_usd: inputCost },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 0, cost_usd: 0 },
+      reasoning: { tokens: 0, cost_usd: 0 },
+    });
+
+    it("adds open sub-agents to the session cost of their parent only", async () => {
+      mockGetSessionUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(
+          workspaceId === "parent"
+            ? { byModel: { "claude-opus": usageOf(100, 1) }, version: 1 as const }
+            : undefined
+        )
+      );
+      mockGetSubagentUsage.mockImplementation(({ workspaceId }: { workspaceId: string }) =>
+        Promise.resolve(
+          workspaceId === "parent"
+            ? { byModel: { "claude-opus": usageOf(500, 5) }, workspaceCount: 3 }
+            : { byModel: {}, workspaceCount: 0 }
+        )
+      );
+      // Real load order: the parent registers (and fetches usage) before its children exist
+      // in frontend metadata, so the store must not decide from metadata that it has none.
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+
+      expect(store.getWorkspaceUsage("child").subagentTotal).toBeUndefined();
+      const usage = store.getWorkspaceUsage("parent");
+      expect(usage.sessionTotal?.input.tokens).toBe(100);
+      expect(usage.subagentCount).toBe(3);
+      expect(sumSessionCostUsage(usage)?.input.tokens).toBe(600);
+      expect(sumSessionCostUsage(usage)?.input.cost_usd).toBe(6);
+    });
+
+    it("refreshes the parent's projection when a sub-agent's stream ends", async () => {
+      const releaseStop = mockBackgroundActivityTransition(
+        "child",
+        createActivitySnapshot(10, { streaming: true }),
+        [createActivitySnapshot(11, { streaming: false })]
+      );
+      recreateStore();
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      releaseStop();
+      await tick(10);
+
+      expect(mockGetSubagentUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
+    });
+  });
+
   describe("session usage repricing", () => {
     // A flat-priced model: $5/M input and $25/M output tokens.
     const BILLABLE_MODEL = "anthropic:claude-opus-4-5";

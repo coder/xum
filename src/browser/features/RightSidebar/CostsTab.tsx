@@ -1,5 +1,6 @@
 import React from "react";
-import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
+import assert from "@/common/utils/assert";
+import { sumSessionCostUsage, useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
 import {
   sumUsageHistory,
   formatCostWithDollar,
@@ -23,6 +24,38 @@ const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "last-request", label: "Last Request" },
 ];
 
+/** Sum two per-model usage records into one map (either may be missing). */
+function mergeUsageByModel(
+  a: Record<string, ChatUsageDisplay> | undefined,
+  b: Record<string, ChatUsageDisplay> | undefined
+): Map<string, ChatUsageDisplay> {
+  const merged = new Map<string, ChatUsageDisplay>(Object.entries(a ?? {}));
+  for (const [model, entry] of Object.entries(b ?? {})) {
+    const existing = merged.get(model);
+    const sum = existing ? sumUsageHistory([existing, entry]) : entry;
+    assert(sum, "mergeUsageByModel: sum of two usages must exist");
+    merged.set(model, sum);
+  }
+  return merged;
+}
+
+/**
+ * Open sub-agents' spend reaches the session ledger only when they are removed. The session
+ * cost includes it already; this line says how much of it came from them.
+ */
+function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
+  const cost = props.total ? getTotalCost(props.total) : undefined;
+  if (cost === undefined || cost <= 0 || props.count === undefined) {
+    return null;
+  }
+  return (
+    <div data-testid="cost-subagents" className="text-muted -mt-2 mb-1 text-[11px]">
+      Includes {formatCostWithDollar(cost)} from {props.count} open sub-agent
+      {props.count === 1 ? "" : "s"}
+    </div>
+  );
+}
+
 interface CostsTabProps {
   workspaceId: string;
 }
@@ -33,20 +66,16 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const viewMode =
     useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
-  // Session usage for cost calculation
-  // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
-  const sessionUsage = React.useMemo(() => {
-    const parts: ChatUsageDisplay[] = [];
-    if (usage.sessionTotal) parts.push(usage.sessionTotal);
-    if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-    return parts.length > 0 ? sumUsageHistory(parts) : undefined;
-  }, [usage.sessionTotal, usage.liveCostUsage]);
+  // Session usage for cost calculation: sessionTotal (own turns plus removed sub-agents),
+  // open sub-agents, and liveCostUsage (cumulative during streaming).
+  const sessionUsage = sumSessionCostUsage(usage);
 
   // Per-model session costs. Live streaming usage is not yet folded into the
   // persisted byModel record, so merge it into the active model's bucket to
   // keep rows consistent with the session total above.
   const sessionModelRows = (() => {
-    const merged = new Map<string, ChatUsageDisplay>(Object.entries(usage.sessionByModel ?? {}));
+    // Open sub-agents count toward the session total above, so their models do too.
+    const merged = mergeUsageByModel(usage.sessionByModel, usage.subagentByModel);
     const liveModel = usage.liveCostUsage?.model;
     if (usage.liveCostUsage && liveModel) {
       // Same ledger key as the backend and WorkspaceStore deltas: live Coder
@@ -208,6 +237,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   )}
                 </span>
               </div>
+              {viewMode === "session" && (
+                <SubagentCostNote total={usage.subagentTotal} count={usage.subagentCount} />
+              )}
               <div className="relative w-full">
                 <div className="bg-border-light flex h-1.5 w-full overflow-hidden rounded-[3px]">
                   {cachedCostPercentage > 0 && (
