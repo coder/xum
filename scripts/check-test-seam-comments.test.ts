@@ -239,6 +239,7 @@ test("separates production sources from tests, support code, stories and generat
     "src/node/runtime/testRemoteRuntime.ts",
     "src/node/utils/concurrency/fileLockTestHelpers.ts",
     "src/browser/features/Tools/GoogleSearchToolCall.fixtures.ts",
+    "src/browser/features/Settings/Sections/settingsStoryUtils.tsx",
     "src/node/services/__tests__/foo.ts",
     "src/common/utils/testing/fuzzHelpers.ts",
     "src/browser/stories/mocks/orpc.ts",

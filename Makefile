@@ -100,7 +100,7 @@ include fmt.mk
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
-.PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
+.PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments check-test-only-exports test-bench-scripts
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -539,7 +539,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
 # ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
 # findings that a change surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-test-only-exports check-oxlint-config lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -621,6 +621,11 @@ check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
 	@bun test ./scripts/check-test-seam-comments.test.ts
 	@bun scripts/check-test-seam-comments.ts
+
+# ~3 s: fails when a production export under src/ has no non-test reference (see the script).
+check-test-only-exports: node_modules/.installed ## Fail when a production export under src/ is unlisted and only tests (or nothing) reference it
+	@bun test ./scripts/check-test-only-exports.test.ts
+	@bun scripts/check-test-only-exports.ts
 
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
