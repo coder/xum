@@ -1316,6 +1316,25 @@ describe("SessionUsageService", () => {
       expect(inputTokens(await readThroughIpc())).toBe(307);
     });
 
+    it("fails a read of an unreadable ledger without rebuilding it", async () => {
+      await writeLedger(ledger);
+      const readSpy = spyOn(historyService.files.promises, "readFile").mockRejectedValueOnce(
+        Object.assign(new Error("EIO"), { code: "EIO" })
+      );
+      try {
+        const result = await service.getSessionUsage(workspaceId).then(
+          () => "resolved",
+          () => "rejected"
+        );
+        expect(result).toBe("rejected");
+      } finally {
+        readSpy.mockRestore();
+      }
+
+      // Not rebuilt from history (300): the ledger keeps its rolled-up spend.
+      expect(inputTokens(await readThroughIpc())).toBe(100);
+    });
+
     it("keeps a fork's boundary when it rebuilds an unusable ledger", async () => {
       const forkedAt = Date.now() - 1_000;
       // beforeEach's msg1 has no timestamp (the fork's own); this one came from the parent.
@@ -1433,6 +1452,30 @@ describe("SessionUsageService", () => {
           "rejected"
         );
         expect(await settled(service.getSessionUsage(workspaceId))).toBe("rejected");
+        await config.addWorkspace("/tmp/mux-session-usage-test-project", {
+          id: workspaceId,
+          name: "shape-branch",
+          projectName: "test-project",
+          projectPath: "/tmp/mux-session-usage-test-project",
+          runtimeConfig: { type: "local" },
+        });
+        const cache: SessionUsageTokenStatsCacheV1 = {
+          version: 1,
+          computedAt: 1,
+          model,
+          tokenizerName: "claude",
+          history: { messageCount: 1 },
+          consumers: [],
+          totalTokens: 0,
+        };
+        expect(await settled(service.setTokenStatsCache(workspaceId, cache))).toBe("rejected");
+        expect(
+          await settled(
+            service.rollUpUsageIntoParent(workspaceId, "other-child", {
+              [model]: createUsage(1, 0),
+            })
+          )
+        ).toBe("rejected");
 
         // The ledger was neither rebuilt nor written without its markers.
         await fs.rm(inFlightDir());

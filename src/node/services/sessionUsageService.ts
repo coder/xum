@@ -1036,18 +1036,7 @@ export class SessionUsageService {
         return;
       }
 
-      let current: SessionUsageFile;
-      try {
-        current = await this.readFile(workspaceId);
-      } catch {
-        // Read failures - best-effort rebuild.
-        log.warn(
-          `session-usage.json unreadable for ${workspaceId}, rebuilding before token stats cache update`
-        );
-        current =
-          (await this.repairLedgerFromHistory(workspaceId))?.ledger ?? this.createEmptyUsageFile();
-      }
-
+      const current = await this.readFile(workspaceId);
       current.tokenStatsCache = cache;
       await this.writeFile(workspaceId, current);
     });
@@ -1098,18 +1087,7 @@ export class SessionUsageService {
     }
 
     return this.fileLocks.withLock(parentWorkspaceId, async () => {
-      let current: SessionUsageFile;
-      try {
-        current = await this.readFile(parentWorkspaceId);
-      } catch {
-        // Read failures - best-effort rebuild.
-        log.warn(
-          `session-usage.json unreadable for ${parentWorkspaceId}, rebuilding before roll-up`
-        );
-        current =
-          (await this.repairLedgerFromHistory(parentWorkspaceId))?.ledger ??
-          this.createEmptyUsageFile();
-      }
+      const current = await this.readFile(parentWorkspaceId);
 
       if (current.rolledUpFrom?.[childWorkspaceId]) {
         return { didRollUp: false };
@@ -1226,20 +1204,14 @@ export class SessionUsageService {
   }
 
   /**
-   * The settled ledger, rebuilt from history when missing, unusable or unreadable; undefined
-   * for an empty session. Caller holds the lock.
+   * The settled ledger, rebuilt from history when missing or unusable; undefined for an empty
+   * session. A read error throws and writes nothing: the file can still hold spend that history
+   * lacks, and the next read retries. Caller holds the lock.
    */
   private async readSettledLedgerLocked(
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
-    let text: string | undefined;
-    try {
-      text = await this.readLedgerText(workspaceId);
-    } catch (error) {
-      log.warn(`session-usage.json unreadable for ${workspaceId}, rebuilding`, { error });
-      return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
-    }
-    // Not in the try: a failed in-flight listing must fail the read, not rebuild the ledger.
+    const text = await this.readLedgerText(workspaceId);
     if (text === undefined) return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
     const content = await this.parseLedgerText(workspaceId, text);
     if (content !== "unusable") return content;
