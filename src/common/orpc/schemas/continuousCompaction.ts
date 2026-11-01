@@ -1,6 +1,5 @@
 import { z } from "zod";
 import type { MuxMessage } from "@/common/types/message";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import {
   MuxMessageSchema,
   MuxTextPartSchema,
@@ -27,56 +26,6 @@ const row: z.ZodType<MuxMessage> = MuxMessageSchema.extend({
     ])
   ),
 }).passthrough();
-const attachment: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("plan_file_reference"),
-    planFilePath: z.string(),
-    planContent: z.string(),
-  }),
-  z.object({
-    type: z.literal("todo_list"),
-    todos: z.array(
-      z.object({ content: z.string(), status: z.enum(["pending", "in_progress", "completed"]) })
-    ),
-  }),
-  z.object({
-    type: z.literal("edited_files_reference"),
-    files: z.array(z.object({ path: z.string(), diff: z.string(), truncated: z.boolean() })),
-  }),
-  z.object({
-    type: z.literal("loaded_skills_snapshot"),
-    skills: z.array(
-      z.object({
-        name: z.string(),
-        scope: z.enum(["project", "global", "built-in"]),
-        sha256: z.string(),
-        body: z.string(),
-        frontmatterYaml: z.string().optional(),
-        truncated: z.boolean().optional(),
-      })
-    ),
-  }),
-  z.object({
-    type: z.literal("completed_reports_index"),
-    reports: z.array(
-      z.object({
-        id: z.string(),
-        kind: z.enum(["task", "workflow"]),
-        title: z.string().optional(),
-        completedAtMs: z.number(),
-        reportTokenEstimate: z.number().optional(),
-      })
-    ),
-  }),
-  z.object({ type: z.literal("read_files_reference"), paths: z.array(z.string()) }),
-  z.object({
-    type: z.literal("artifacts_index"),
-    artifacts: z.array(
-      z.object({ path: z.string(), latestVersion: z.number(), label: z.string().nullable() })
-    ),
-  }),
-]);
-
 /** The journal is the write-ahead record for a request-only prefix swap, not a history boundary. */
 export const ContinuousCompactionJournalSchema = z
   .object({
@@ -92,7 +41,9 @@ export const ContinuousCompactionJournalSchema = z
       partIndex: z.number().int().nonnegative(),
       metadataTemplate: metadata,
     }),
-    postCompactionAttachments: z.array(attachment),
+    // Unused since the boundary row carries the header. Older builds require the key, so new
+    // journals write an empty list and stay readable after a downgrade.
+    postCompactionAttachments: z.array(z.json()).optional(),
     // JSON wire prefix when representable; otherwise the pinned pipeline inputs below rebuild it.
     prefix: z.array(z.json()).optional(),
     // Preserve the initial request too: a fallback can rebuild system/tool context.

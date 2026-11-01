@@ -78,6 +78,29 @@ describe("AgentSession change detection", () => {
       expect(attachments[0].snippet).toContain("New step");
     });
 
+    it("clearExcept keeps only the named file's baseline, so only its edit is still detected", async () => {
+      const tracker = new FileChangeTracker();
+      const planFile = join(tmpDir, "plan.md");
+      const otherFile = join(tmpDir, "other.md");
+      await writeFile(planFile, "v1");
+      await writeFile(otherFile, "o1");
+      await tracker.record(planFile, { content: "v1", timestamp: await getMtime(planFile) });
+      await tracker.record(otherFile, { content: "o1", timestamp: await getMtime(otherFile) });
+
+      await tracker.clearExcept(planFile);
+      const newMtime = Date.now() + 1000;
+      for (const [file, content] of [
+        [planFile, "v2"],
+        [otherFile, "o2"],
+      ]) {
+        await writeFile(file, content);
+        await utimes(file, newMtime / 1000, newMtime / 1000);
+      }
+
+      const { attachments } = await tracker.getChangedAttachments();
+      expect(attachments.map((attachment) => attachment.filename)).toEqual([planFile]);
+    });
+
     it("should update stored state only after commit()", async () => {
       const tracker = new FileChangeTracker();
       const testFile = join(tmpDir, "plan.md");

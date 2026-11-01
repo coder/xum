@@ -410,7 +410,7 @@ describe("SSH plans are installation-scoped (#5174)", () => {
         owner(),
         harness.historyService.locks
       );
-      expect(await AttachmentService.generatePlanFileReference(location, host)).toBeNull();
+      expect(await AttachmentService.readPlan(location, host)).toBeNull();
       expect(await readIfExists(await scopedPlanPath())).toBeUndefined();
     });
   });
@@ -525,7 +525,7 @@ describe("SSH plans are installation-scoped (#5174)", () => {
       expect(location).toEqual({
         planPath: await resolvePlanFilePath(harness.config, host, owner()),
       });
-      const attachments = await AttachmentService.generatePostCompactionAttachments(
+      const { attachments } = await AttachmentService.generatePostCompactionAttachments(
         location,
         [{ path: location.planPath, diff: "@@ -1 +1 @@", truncated: false }],
         [],

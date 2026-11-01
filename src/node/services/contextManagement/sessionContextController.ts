@@ -71,6 +71,7 @@ export class SessionContextController {
         host.onCompactionComplete?.(metadata);
       },
       onIdleCompactionOutcome: (success) => host.onIdleCompactionOutcome?.(success),
+      buildPostCompactionContext: (input) => host.buildPostCompactionContext(input),
     });
     // Keep the handler receiver intact while limiting the session's permanent API surface.
     this.compaction = this.compactionHandler;

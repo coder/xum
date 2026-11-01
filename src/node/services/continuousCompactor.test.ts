@@ -775,7 +775,7 @@ describe("ContinuousCompactor", () => {
             toolNamesForSentinel: ["bash"],
             effectiveThinkingLevel: "off",
           },
-          attachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
+          postCompactionContext: { text: "Read kept.txt", skillNames: [] },
           systemPrefix: [],
           cacheEnabled: true,
         }),
@@ -887,6 +887,28 @@ describe("ContinuousCompactor", () => {
     });
     expect(full.filter((row) => row.id === "resolve-mid-stream")).toHaveLength(1);
     expect(full.filter((row) => row.id === journal.boundary.id)).toHaveLength(1);
+  });
+
+  it("keeps the post-compaction header from the journal boundary through recovery", async () => {
+    const { journal, journalStore, swap } = await activateJournaledSwap();
+    const header = { text: "Read kept.txt", skillNames: [] };
+    expect(journal.boundary.metadata?.postCompactionContext).toEqual(header);
+    expect(JSON.stringify(swap.prefix)).toContain(header.text);
+    // Older builds also wrote the attachments into the journal; such a journal still folds.
+    await writeFile(
+      journalStore.path,
+      JSON.stringify({
+        ...journal,
+        postCompactionAttachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
+      })
+    );
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    const boundary = (await rows())[0];
+    expect(boundary.id).toBe(journal.boundary.id);
+    expect(boundary.metadata?.postCompactionContext).toEqual(header);
+    expect(await journalStore.read()).toBeNull();
   });
 
   it("recovers a journal whose source fingerprint an earlier build took over raw rows", async () => {
@@ -1095,7 +1117,7 @@ describe("ContinuousCompactor", () => {
           effectiveThinkingLevel: "off",
           toolNamesForSentinel: ["bash"],
         },
-        attachments: [],
+        postCompactionContext: null,
         systemPrefix: [],
         cacheEnabled: true,
       });
@@ -1111,6 +1133,46 @@ describe("ContinuousCompactor", () => {
     expect(JSON.stringify(current.slice(1))).not.toContain("committed investigation");
     expect(JSON.stringify(current.slice(1))).toContain("committed-tool");
     expect(current[0].metadata?.compactionBoundary).toBe(true);
+  });
+
+  it("uses the durable fallback when the swap header no longer fits the window", async () => {
+    const answer = await seedLiveTurn();
+    assert(live, "Live fixture missing");
+    const toolPart: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      toolCallId: "tail-tool",
+      toolName: "bash",
+      state: "output-available",
+      input: { script: "pwd" },
+      output: { success: true },
+    };
+    live.parts[1] = toolPart;
+    answer.parts[1] = toolPart;
+    const deps = Reflect.get(compactor, "deps") as Dependencies;
+    const setSwap = mock(() => true);
+    deps.streamManager.setPrefixSwap = setSwap;
+    // The eager estimate counted a small header; the header built at swap time is huge.
+    deps.prepareSwap = () =>
+      Promise.resolve({
+        preparation: {
+          modelString: context.model,
+          providerForMessages: "anthropic",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: ["bash"],
+        },
+        postCompactionContext: { text: "kept header line ".repeat(40_000), skillNames: [] },
+        systemPrefix: [],
+        cacheEnabled: true,
+      });
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(
+      await compactor.observe(context.thresholdPercent, { ...context, phase: "mid-stream" })
+    ).toBe("applied");
+    expect(setSwap).not.toHaveBeenCalled();
+    expect(fastApply).toHaveBeenCalledTimes(1);
   });
 
   it("seamlessly rebuilds an internal committed cut as static prefix context and anchors the live step", async () => {
@@ -1401,13 +1463,13 @@ describe("ContinuousCompactor", () => {
     expect(copy.metadata?.usage).toBeUndefined();
     expect(copy.metadata?.contextUsage).toBeUndefined();
     expect(copy.metadata?.compactionBoundary).toBeUndefined();
+    // The handler builds no header, so the attachment estimate is not counted.
     const expectedInput =
       context.systemMessageTokens! +
-      context.attachmentTokens! +
       persisted.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
     expect(boundary.metadata?.contextUsage?.inputTokens).toBe(expectedInput);
     expect(boundary.metadata?.contextUsage?.inputTokens).toBeGreaterThan(
-      estimateMuxMessageTokens(boundary) + context.systemMessageTokens! + context.attachmentTokens!
+      estimateMuxMessageTokens(boundary) + context.systemMessageTokens!
     );
     expect(boundary.metadata?.usage).toBeUndefined();
     expect(completed).toHaveBeenCalledTimes(1);

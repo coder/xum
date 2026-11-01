@@ -11,6 +11,7 @@ import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -61,7 +62,7 @@ interface PrivateSessionAccess {
     cache?: Map<string, unknown>,
     persistence?: { windowKey: string | undefined }
   ) => Promise<MemorySessionContext | undefined>;
-  getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
+  consumePendingPostCompactionState: (history: readonly MuxMessage[]) => Promise<void>;
   clearPostCompactionState: () => Promise<void>;
   applyContextResetSideEffects: () => Promise<void>;
 }
@@ -346,7 +347,7 @@ describe("AgentSession memory context", () => {
         else if (boundary === "new segment") await priv.clearPostCompactionState();
         else {
           await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
-          await priv.getPostCompactionAttachmentsIfNeeded();
+          await priv.consumePendingPostCompactionState([]);
         }
       } finally {
         await before.dispose();
@@ -474,7 +475,7 @@ describe("AgentSession memory context", () => {
       // Consume a pending compaction boundary (first stream after compaction).
       version = 2;
       await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
-      await priv.getPostCompactionAttachmentsIfNeeded();
+      await priv.consumePendingPostCompactionState([]);
 
       expect(nameOf(await priv.resolveMemoryContext("test-model"))).toBe("/memories/global/v2.md");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
