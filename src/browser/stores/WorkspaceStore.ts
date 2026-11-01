@@ -98,7 +98,7 @@ import { computeProvidersConfigFingerprint } from "@/common/utils/providers/conf
 import { isDurableCompactionBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { WorkspaceConsumerManager } from "./WorkspaceConsumerManager";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import type { z } from "zod";
@@ -432,10 +432,7 @@ function sumSubtreesNotRolledUp(
     if (rolledUpFrom[childId]) continue;
     count += subtree.workspaceCount;
     for (const [model, usage] of Object.entries(subtree.byModel)) {
-      const existing = byModel[model];
-      const sum = existing ? sumUsageHistory([existing, usage]) : usage;
-      assert(sum, "sumSubtreesNotRolledUp: sum of two usages must exist");
-      byModel[model] = sum;
+      addModelUsage(byModel, model, usage);
     }
   }
   return { byModel, count };
@@ -1375,10 +1372,8 @@ export class WorkspaceStore {
             byModel: {},
             version: 1 as const,
           };
-          const existing = current.byModel[normalizedModel];
           // CRITICAL: Accumulate, don't overwrite (same logic as backend)
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-          current.byModel[normalizedModel] = existing ? sumUsageHistory([existing, usage])! : usage;
+          addModelUsage(current.byModel, normalizedModel, usage);
           current.lastRequest = { model: normalizedModel, usage, timestamp: Date.now() };
           this.sessionUsage.set(workspaceId, current);
         }
@@ -1517,10 +1512,7 @@ export class WorkspaceStore {
         usageDelta.sourceWorkspaceId === workspaceId ? undefined : usageDelta.sourceWorkspaceId;
       if (childId === undefined || !current.rolledUpFrom?.[childId]) {
         for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-          const existing = current.byModel[model];
-          const sum = existing ? sumUsageHistory([existing, usage]) : usage;
-          assert(sum, "session-usage-delta: sum of two usages must exist");
-          current.byModel[model] = sum;
+          addModelUsage(current.byModel, model, usage);
         }
       }
       if (childId !== undefined) {
