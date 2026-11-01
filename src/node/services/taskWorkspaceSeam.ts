@@ -129,6 +129,11 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * Direct create only (createMany takes its own): once aborted, the create refuses at its gate,
+   * before it counts, forks or writes a row. A create past the gate finishes as before.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export function formatSubagentReportUserMessage(params: {

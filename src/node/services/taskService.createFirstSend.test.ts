@@ -9,7 +9,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
-import { TASK_CREATE_PARENT_STOPPING_ERROR, type TaskService } from "@/node/services/taskService";
+import { TASK_CREATE_STOPPED_ERROR, type TaskService } from "@/node/services/taskService";
 import {
   createAgentTask,
   createTaskServiceHarness,
@@ -489,13 +489,41 @@ describe("TaskService.create: the first send runs after the create locks are rel
       releaseStop();
     }
 
-    expect(refused).toEqual(Err(TASK_CREATE_PARENT_STOPPING_ERROR));
+    expect(refused).toEqual(Err(TASK_CREATE_STOPPED_ERROR));
     expect(childRows(PARENT_A)).toEqual([]);
     expect(sends).toEqual([]);
     expect(await createAgentTask(taskService, PARENT_A, "go")).toMatchObject({
       success: true,
       data: { status: "running" },
     });
+  });
+
+  test("an aborted spawning call refuses its sibling creates still waiting on the locks", async () => {
+    const controller = new AbortController();
+    const sends: string[] = [];
+    const { taskService } = await setup((workspaceId, _message, _options, internal) => {
+      sends.push(workspaceId);
+      // The call aborts while the first sibling holds create's locks.
+      controller.abort();
+      admitTurn(internal);
+      return Promise.resolve(Ok(undefined));
+    });
+
+    const created = await Promise.all(
+      CHILD_IDS.map((_, index) =>
+        createAgentTask(taskService, PARENT_A, `part ${index}`, {
+          abortSignal: controller.signal,
+        })
+      )
+    );
+
+    expect(created[0]).toMatchObject({ success: true, data: { status: "running" } });
+    expect(created.slice(1)).toEqual([
+      Err(TASK_CREATE_STOPPED_ERROR),
+      Err(TASK_CREATE_STOPPED_ERROR),
+    ]);
+    expect(childRows(PARENT_A).map((child) => child.id)).toEqual([CHILD]);
+    expect(sends).toEqual([CHILD]);
   });
 
   test("an ancestor's Stop between queued sibling creates leaves no child it did not stop", async () => {
@@ -555,8 +583,8 @@ describe("TaskService.create: the first send runs after the create locks are rel
       }))
     ).toEqual([{ id: CHILD, stopped: true, taskStatus: "interrupted" }]);
     expect(created.slice(1)).toEqual([
-      Err(TASK_CREATE_PARENT_STOPPING_ERROR),
-      Err(TASK_CREATE_PARENT_STOPPING_ERROR),
+      Err(TASK_CREATE_STOPPED_ERROR),
+      Err(TASK_CREATE_STOPPED_ERROR),
     ]);
   });
 });

@@ -24,7 +24,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
 import {
   ForegroundWaitBackgroundedError,
-  TASK_CREATE_PARENT_STOPPING_ERROR,
+  TASK_CREATE_STOPPED_ERROR,
   type TaskService,
 } from "@/node/services/taskService";
 
@@ -1244,12 +1244,19 @@ describe("task tool", () => {
     expect(note).toContain("workspace creation failed");
   });
 
-  it("throws Interrupted when a later sibling is refused because the parent is stopping", async () => {
-    using tempDir = new TestTempDir("test-task-tool-best-of-parent-stopping");
+  it("throws Interrupted when the aborted call's later siblings are refused at their gate", async () => {
+    using tempDir = new TestTempDir("test-task-tool-best-of-aborted");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
-    const create = mock((args: { bestOf?: { index: number } }) =>
-      args.bestOf?.index === 0 ? spawnedChild(0) : Err(TASK_CREATE_PARENT_STOPPING_ERROR)
-    );
+    const controller = new AbortController();
+    const create = mock((args: { bestOf?: { index: number }; abortSignal?: AbortSignal }) => {
+      if (args.bestOf?.index === 0) {
+        controller.abort();
+        return spawnedChild(0);
+      }
+      return args.abortSignal?.aborted === true
+        ? Err(TASK_CREATE_STOPPED_ERROR)
+        : spawnedChild(args.bestOf?.index ?? 0);
+    });
     const tool = createTaskTool({
       ...baseConfig,
       taskService: { create } as unknown as TaskService,
@@ -1264,11 +1271,48 @@ describe("task tool", () => {
           run_in_background: true,
           n: 3,
         },
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )
+    );
+
+    expect(create.mock.calls.map(([args]) => args.abortSignal)).toEqual([
+      controller.signal,
+      controller.signal,
+      controller.signal,
+    ]);
+    expect(error).toMatchObject({ message: "Interrupted" });
+  });
+
+  it("reports a stop refusal without an abort like any failed create", async () => {
+    // A queued workspace-turn handle's task_stop latches the parent without stopping its turn.
+    using tempDir = new TestTempDir("test-task-tool-best-of-latch-without-abort");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const create = mock((args: { bestOf?: { index: number } }) =>
+      args.bestOf?.index === 0 ? spawnedChild(0) : Err(TASK_CREATE_STOPPED_ERROR)
+    );
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          subagent_type: "explore",
+          prompt: "compare three approaches",
+          title: "Best of 3",
+          run_in_background: true,
+          n: 3,
+        },
         mockToolCallOptions
       )
     );
 
-    expect(error).toMatchObject({ message: "Interrupted" });
+    expectGroupedQueuedOrRunningTaskToolResult(result, {
+      status: "running",
+      taskIds: ["child-task-1"],
+    });
+    expect((result as { note: string }).note).toContain(TASK_CREATE_STOPPED_ERROR);
   });
 
   it("throws the first failure in launch order when no create spawns", async () => {

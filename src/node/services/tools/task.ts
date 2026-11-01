@@ -21,7 +21,7 @@ import type { TaskCreatedEvent } from "@/common/types/stream";
 import { log } from "@/node/services/log";
 import {
   ForegroundWaitBackgroundedError,
-  TASK_CREATE_PARENT_STOPPING_ERROR,
+  TASK_CREATE_STOPPED_ERROR,
   type TaskCreateResult,
 } from "@/node/services/taskService";
 
@@ -322,15 +322,15 @@ function emitTaskCreatedEvent(params: {
 /**
  * Splits a task(n) call's create settlements into the spawned tasks and the failures, both in
  * launch order (not settle order: the result and the live card's candidate labels follow it).
- * An Err becomes an Error; a rejection keeps its reason. `parentStopping`: a create was refused
- * because the parent's stop latch was held.
+ * An Err becomes an Error; a rejection keeps its reason. `stopRefused`: a create was refused at
+ * its gate (the call was aborted, or the parent's stop latch was held).
  */
 function collectTaskGroupCreates(
   settlements: ReadonlyArray<PromiseSettledResult<Result<TaskCreateResult, string>>>
-): { createdTasks: SpawnedTaskInfo[]; failures: unknown[]; parentStopping: boolean } {
+): { createdTasks: SpawnedTaskInfo[]; failures: unknown[]; stopRefused: boolean } {
   const createdTasks: SpawnedTaskInfo[] = [];
   const failures: unknown[] = [];
-  let parentStopping = false;
+  let stopRefused = false;
   for (const settlement of settlements) {
     if (settlement.status === "rejected") {
       failures.push(settlement.reason);
@@ -338,7 +338,7 @@ function collectTaskGroupCreates(
     }
     const created = settlement.value;
     if (!created.success) {
-      parentStopping ||= created.error === TASK_CREATE_PARENT_STOPPING_ERROR;
+      stopRefused ||= created.error === TASK_CREATE_STOPPED_ERROR;
       failures.push(new Error(created.error));
       continue;
     }
@@ -350,7 +350,7 @@ function collectTaskGroupCreates(
       desktopOwnerWorkspaceId: created.data.desktopOwnerWorkspaceId,
     });
   }
-  return { createdTasks, failures, parentStopping };
+  return { createdTasks, failures, stopRefused };
 }
 
 function toAggregatePendingStatus(
@@ -752,6 +752,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
             // Background launches are non-blocking with terminal wake-up; foreground/default block.
             attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
+            abortSignal,
             bestOf:
               taskGroupId != null
                 ? {
@@ -764,7 +765,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         )
       );
 
-      const { createdTasks, failures, parentStopping } = collectTaskGroupCreates(settlements);
+      const { createdTasks, failures, stopRefused } = collectTaskGroupCreates(settlements);
       for (const task of createdTasks) {
         // UI-only signal: expose spawned taskIds once every create of this call settled.
         emitTaskCreatedEvent({
@@ -775,9 +776,10 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
-      // The parent's Stop latched it while later siblings waited for create's locks. The cascade
-      // that follows this turn stops the siblings that did spawn, so the call is interrupted.
-      if (parentStopping) {
+      // The abort cut the group short: later siblings refused at their gate, like the serial loop
+      // that stopped creating after an abort. A stop latch without an abort (a queued handle's
+      // task_stop) is reported below like any failed create, so the spawned children are listed.
+      if (stopRefused && abortSignal?.aborted === true) {
         throw new Error("Interrupted");
       }
       if (failures.length > 0) {

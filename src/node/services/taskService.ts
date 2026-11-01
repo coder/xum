@@ -491,7 +491,9 @@ export interface AgentTaskTimestamps {
   reportedAt?: string;
 }
 
-type RpcTaskCreateArgs = Omit<TaskCreateArgs, "thinkingLevel"> & { thinkingLevel?: string };
+type RpcTaskCreateArgs = Omit<TaskCreateArgs, "thinkingLevel" | "abortSignal"> & {
+  thinkingLevel?: string;
+};
 
 function normalizeRpcTaskThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
   return value === "off" ||
@@ -806,9 +808,9 @@ function isAgentRunnableAsChild(
   return params.workflowOwned && frontmatter.subagent?.workflow_runnable === true;
 }
 
-/** Task.create refused because the parent's stop latch is held (a Stop is still settling). */
-export const TASK_CREATE_PARENT_STOPPING_ERROR =
-  "Task.create: cannot spawn new tasks while the parent workspace is being stopped";
+/** Task.create refused at its gate: the spawning call was aborted, or the parent's stop latch is held. */
+export const TASK_CREATE_STOPPED_ERROR =
+  "Task.create: refused because the spawning call was aborted or the parent workspace is being stopped";
 
 export interface TaskCreateResult {
   desktopOwnerWorkspaceId?: string;
@@ -9058,13 +9060,16 @@ export class TaskService implements AgentTaskIntegration {
 
   /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
   private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
-    const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
-    // Sibling creates of one task(n) call queue behind one another, and an ancestor's cascade
-    // (terminateAllDescendantAgentTasks Phase A) or the parent's own hard Stop
-    // (latchHardInterruptCascade) can land between them. The latch is held until the parent's
-    // stopped turn settled, so a later create must not add a child the cascade's snapshot missed.
-    if (this.isWorkspaceStopInProgress(parentWorkspaceId)) {
-      return Err(TASK_CREATE_PARENT_STOPPING_ERROR);
+    const { args, cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
+    // Sibling creates of one task(n) call queue behind one another on these locks, so an abort of
+    // the call, or a stop latch on the parent, can land between them. The aborted call must not
+    // add more children, like the serial loop that checked its abort before each create. An
+    // ancestor's cascade (terminateAllDescendantAgentTasks Phase A, under this mutex) latches the
+    // parent until the parent's turn settled, so a later create would add a child its snapshot
+    // missed. Other latch holders (a hard Stop's boundary latch, a queued workspace-turn handle's
+    // task_stop) also refuse here; the tool reports those like any failed create.
+    if (args.abortSignal?.aborted === true || this.isWorkspaceStopInProgress(parentWorkspaceId)) {
+      return Err(TASK_CREATE_STOPPED_ERROR);
     }
 
     if (
