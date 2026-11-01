@@ -625,13 +625,15 @@ export class CreationDraftStore {
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
-      await client.drafts.updateCreation({
+      const reply = await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
       });
       entry.saving = false;
       entry.persisted = true;
-      entry.stored = draft;
+      // The stored record, not this window's copy: the backend merged only this save's fields, so
+      // another window's earlier save of other fields is part of it (#7728).
+      entry.stored = reply.record;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {

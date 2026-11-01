@@ -1,5 +1,8 @@
 import { getDraftStore } from "@/browser/stores/DraftStore";
-import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import {
+  createBlankCreationDraft,
+  getCreationDraftStore,
+} from "@/browser/stores/CreationDraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
@@ -27,7 +30,7 @@ import {
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
-import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
+import { summarizeCreationDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
@@ -87,14 +90,13 @@ const draftBackend = createTestApiClient({
     updateCreation: async (input) => {
       await creationSaveGate;
       if (failCreationSaves) throw new Error("draft save refused");
-      return {
-        draftId: input.scope.draftId,
-        projectPath: input.projectPath ?? TEST_PROJECT_PATH,
-        subProjectPath: null,
+      const { scope, ...patch } = input;
+      const record = {
+        ...createBlankCreationDraft(scope.draftId, TEST_PROJECT_PATH, null),
+        ...patch,
         createdAt: 0,
-        manualName: input.manualName ?? "",
-        preview: "",
       };
+      return { ...summarizeCreationDraft(record), record };
     },
     deleteCreation: () => Promise.resolve(),
   },

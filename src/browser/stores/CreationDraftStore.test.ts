@@ -751,6 +751,29 @@ describe("CreationDraftStore", () => {
     expect((await service.get(id))?.manualName).toBe("named-in-b");
   });
 
+  test("a delete retry removes a record another window changed before this window's last save (#7728)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-retry-merged-save");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "draft" });
+    await windowA.flush(id);
+    // Window B names the draft, then window A saves only its text: the backend merges both.
+    const windowB = await reopen(harness, id, PROJECT_A);
+    windowB.update(id, { manualName: "named-in-b" });
+    await windowB.flush(id);
+    windowA.update(id, { text: "sent" });
+    await windowA.flush(id);
+    expect(await service.get(id)).toMatchObject({ text: "sent", manualName: "named-in-b" });
+
+    // A sends it, its first delete fails, and the resend on the next connection must delete it:
+    // nothing changed after the first request, so the sent text must not be listed again.
+    control.failDeletes = 1;
+    await windowA.delete(id);
+    windowA.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect(await service.get(id)).toBeNull();
+  });
+
   test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
     using tempDir = new TestTempDir("creation-store-delete-during-save");
     const harness = await createHarness(tempDir);

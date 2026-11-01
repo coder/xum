@@ -20,6 +20,7 @@ import {
   type CreationDraftList,
   type CreationDraftSummary,
   type CreationDraftUpdateInput,
+  type CreationDraftUpdateOutput,
   type DraftAttachment,
 } from "@/common/orpc/schemas/drafts";
 import {
@@ -217,7 +218,7 @@ export class CreationDraftService {
     return this.readRecord(draftId);
   }
 
-  async update(input: CreationDraftUpdateInput): Promise<CreationDraftSummary> {
+  async update(input: CreationDraftUpdateInput): Promise<CreationDraftUpdateOutput> {
     const { scope, ...patch } = input;
     const filePath = this.filePathFor(scope.draftId);
     await this.ensureLoaded();
@@ -240,7 +241,7 @@ export class CreationDraftService {
       const parsed = CreationDraftSchema.safeParse(next);
       if (!parsed.success) throw new CreationDraftRejectedError("Invalid creation draft.");
       await this.writeRecord(parsed.data);
-      return summarizeCreationDraft(parsed.data);
+      return { ...summarizeCreationDraft(parsed.data), record: parsed.data };
     });
   }
 
