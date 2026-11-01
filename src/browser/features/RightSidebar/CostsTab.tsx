@@ -45,10 +45,24 @@ function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
     return null;
   }
   return (
-    <div data-testid="cost-subagents" className="text-muted -mt-2 mb-1 text-[11px]">
+    <div data-testid="cost-subagents" className="text-muted counter-nums -mt-2 mb-1 text-[11px]">
       Includes {formatCostWithDollar(cost)} from {props.count} open sub-agent
       {props.count === 1 ? "" : "s"}
     </div>
+  );
+}
+
+/**
+ * Prompt-cache health covers this workspace's own requests, so it shows only when they touched
+ * a prompt cache; open sub-agents' cache tokens do not count. Hidden for sessions that never
+ * did (most non-Anthropic providers report no cache tokens), where a 0% read share is noise.
+ */
+function touchedPromptCache(usage: {
+  sessionTotal?: ChatUsageDisplay;
+  liveCostUsage?: ChatUsageDisplay;
+}): boolean {
+  return [usage.sessionTotal, usage.liveCostUsage].some(
+    (entry) => entry !== undefined && entry.cached.tokens + entry.cacheCreate.tokens > 0
   );
 }
 
@@ -359,15 +373,12 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
               </tbody>
             </table>
           )}
-          {/* Hidden for sessions that never touched a prompt cache (e.g. most non-Anthropic
-              providers report no cache tokens), where a 0% read share is noise. */}
-          {sessionUsage !== undefined &&
-            sessionUsage.cached.tokens + sessionUsage.cacheCreate.tokens > 0 && (
-              <PromptCacheHealth
-                session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
-                turns={usage.recentTurnCacheHealth ?? []}
-              />
-            )}
+          {touchedPromptCache(usage) && (
+            <PromptCacheHealth
+              session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
+              turns={usage.recentTurnCacheHealth ?? []}
+            />
+          )}
         </div>
       </div>
     </div>

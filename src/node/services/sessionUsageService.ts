@@ -20,6 +20,7 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
+  SessionUsageFileSchema,
   SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
 import {
@@ -1150,8 +1151,13 @@ export class SessionUsageService {
     let settled: SessionUsageFile | undefined;
     try {
       const filePath = this.getFilePath(workspaceId);
-      const data = await this.files.promises.readFile(filePath, "utf-8");
-      settled = JSON.parse(data) as SessionUsageFile;
+      const parsed: unknown = JSON.parse(await this.files.promises.readFile(filePath, "utf-8"));
+      // Self-healing: a malformed ledger (`null`, a missing byModel) reads as absent, so one
+      // bad file does not reject a whole batch or projection. Keep the raw object: the schema
+      // strips fields such as settledInFlightKeys that the view still needs.
+      settled = SessionUsageFileSchema.safeParse(parsed).success
+        ? (parsed as SessionUsageFile)
+        : undefined;
     } catch {
       settled = undefined;
     }

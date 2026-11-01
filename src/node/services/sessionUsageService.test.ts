@@ -846,6 +846,25 @@ describe("SessionUsageService", () => {
       expect(getTotalCost(usage)).toBeCloseTo(0.1 + 0.2 + 0.5 + 0.5 + 0.3 + 0.4, 10);
     });
 
+    it("reads a malformed sub-agent ledger as absent and keeps its siblings", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await service.recordUsage("broken", model, createUsageWithCosts(1, 1, 1, 1));
+      // Valid JSON with a corrupt model entry: it would fail the IPC output schema and hide
+      // every sibling's usage with it.
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({ byModel: { [model]: null }, version: 1 })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children)).toEqual(["healthy"]);
+      expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
+    });
+
     it("returns nothing for a workspace without sub-agents", async () => {
       await addWorkspace("lonely");
       await service.recordUsage("lonely", model, createUsage(1, 1));

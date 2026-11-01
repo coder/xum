@@ -914,6 +914,26 @@ function isCostsIncludedEntry(
   return hasTokens;
 }
 
+function repriceUsageByModel(
+  byModel: Record<string, ChatUsageDisplay>,
+  config: ProvidersConfigMap
+): void {
+  for (const [model, entry] of Object.entries(byModel)) {
+    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
+    const resolved = resolveModelForMetadata(model, config);
+    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
+    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
+    byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
+  }
+}
+
+/** The projection has no fingerprint to compare, so it is repriced on every apply. */
+function repriceSubagentUsage(data: SubagentUsageByChild, config: ProvidersConfigMap): void {
+  for (const subtree of Object.values(data.children)) {
+    repriceUsageByModel(subtree.byModel, config);
+  }
+}
+
 /**
  * Recompute cost aggregates for a single session-usage entry so session totals
  * and last-request costs reflect the current model mapping.
@@ -930,13 +950,7 @@ function repriceSessionUsage(
   if (usage.tokenStatsCache?.providersConfigVersion !== providersConfigFingerprint) {
     usage.tokenStatsCache = undefined;
   }
-  for (const [model, entry] of Object.entries(usage.byModel)) {
-    if (!model.includes(":") || isCostsIncludedEntry(entry, model, config)) continue;
-    const resolved = resolveModelForMetadata(model, config);
-    // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
-    // the summed token totals alone. recomputeUsageCosts() keeps their recorded costs.
-    usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
-  }
+  repriceUsageByModel(usage.byModel, config);
   if (
     usage.lastRequest &&
     !isCostsIncludedEntry(usage.lastRequest.usage, usage.lastRequest.model, config)
@@ -1761,6 +1775,9 @@ export class WorkspaceStore {
     if (!isLatest || !this.isWorkspaceRegistered(workspaceId)) {
       return;
     }
+    if (this.providersConfig) {
+      repriceSubagentUsage(data, this.providersConfig);
+    }
     this.subagentUsage.set(workspaceId, data);
     this.usageStore.bump(workspaceId);
   }
@@ -1830,6 +1847,9 @@ export class WorkspaceStore {
 
         for (const [, usage] of this.sessionUsage) {
           repriceSessionUsage(usage, config, nextFingerprint);
+        }
+        for (const [, usage] of this.subagentUsage) {
+          repriceSubagentUsage(usage, config);
         }
       }
 

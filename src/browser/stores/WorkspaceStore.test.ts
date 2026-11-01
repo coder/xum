@@ -3793,6 +3793,56 @@ describe("WorkspaceStore", () => {
       expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
       expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
     });
+
+    const projectUnpricedChild = () =>
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: {
+            child: {
+              byModel: {
+                [CUSTOM_MODEL]: usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true }),
+              },
+              workspaceCount: 1,
+            },
+          },
+        })
+      );
+
+    it("prices open sub-agent usage with the loaded provider config", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+      projectUnpricedChild();
+      await loadUsage("reprice-projection", BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+
+      expectCosts(
+        store.getWorkspaceUsage("reprice-projection").subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
+    });
+
+    it("reprices open sub-agent usage when a provider config change maps its model", async () => {
+      projectUnpricedChild();
+      const workspaceId = "reprice-projection-after-mapping";
+      await loadUsage(workspaceId, BILLABLE_MODEL, usageRow({ input: 0, output: 1 }));
+      expect(store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]).toMatchObject({
+        hasUnknownCosts: true,
+      });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      expectCosts(
+        store.getWorkspaceUsage(workspaceId).subagentByModel?.[CUSTOM_MODEL],
+        OPUS_COST_OF_1000_IN_100_OUT
+      );
+    });
   });
 
   describe("syncWorkspaces", () => {
