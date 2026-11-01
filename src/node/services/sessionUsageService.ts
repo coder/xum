@@ -290,19 +290,23 @@ interface ParsedLedger {
  * The one parser of session-usage.json, for locked and lock-free reads. A part in a wrong
  * shape is dropped (a model entry, lastRequest, tokenStatsCache, rolledUpFrom) and the rest
  * is kept: a rebuild from history would lose spend that history lacks, such as rolled-up
- * children. Undefined when nothing usable is left (no byModel object, or not version 1); the
- * locked reads then rebuild from history, as for a parse error.
+ * children. Undefined when nothing usable is left (no byModel object, no valid entry in a
+ * non-empty one, or not version 1); the locked reads then rebuild from history, as for a parse
+ * error.
  */
 function parseLedgerKeepingValidParts(raw: unknown): ParsedLedger | undefined {
   if (!isPlainObject(raw) || !isPlainObject(raw.byModel)) return undefined;
+  const modelEntries = Object.entries(raw.byModel);
   // Use the parsed values, not the raw ones: the schema repairs some fields (a null
   // longContextTokens becomes undefined) that would still throw when usages are summed.
   const byModel = Object.fromEntries(
-    Object.entries(raw.byModel).flatMap(([model, usage]) => {
+    modelEntries.flatMap(([model, usage]) => {
       const entry = ChatUsageDisplaySchema.safeParse(usage);
       return entry.success ? [[model, entry.data]] : [];
     })
   );
+  // No valid entry left of a non-empty byModel: nothing to keep, so history is the better source.
+  if (modelEntries.length > 0 && Object.keys(byModel).length === 0) return undefined;
   const rolledUpFrom = keepRolledUpChildren(raw.rolledUpFrom);
   const parsed = SessionUsageFileSchema.safeParse({
     ...raw,
@@ -414,11 +418,8 @@ export class SessionUsageService {
     this.historyService = historyService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
-  /**
-   * Usage rebuild needs every epoch for accurate totals. Throws when history cannot be read:
-   * a repair that took the failure for an empty session would write a ledger without it.
-   */
-  private async collectFullHistory(workspaceId: string): Promise<MuxMessage[]> {
+  /** Usage rebuild needs every epoch for accurate totals. Undefined when history cannot be read. */
+  private async collectFullHistory(workspaceId: string): Promise<MuxMessage[] | undefined> {
     const messages: MuxMessage[] = [];
     const result = await this.historyService.iterateFullHistoryUnderLock(
       workspaceId,
@@ -428,7 +429,8 @@ export class SessionUsageService {
       }
     );
     if (!result.success) {
-      throw new Error(`Failed to iterate history for ${workspaceId}: ${result.error}`);
+      log.warn(`Failed to iterate history for ${workspaceId}: ${result.error}`);
+      return undefined;
     }
     return messages;
   }
@@ -657,10 +659,19 @@ export class SessionUsageService {
     workspaceId: string,
     forkedAt?: number
   ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> } | undefined> {
-    const messages = (await this.collectFullHistory(workspaceId)).filter(
+    // The repair overwrites the ledger, so it fails, and the next read retries, while history
+    // or an in-flight file cannot be read: it would drop that spend or the settled key of a file
+    // its history already counts (markInFlightFilesCountedByHistory).
+    const history = await this.collectFullHistory(workspaceId);
+    if (!history) throw new Error(`history of ${workspaceId} cannot be read`);
+    const messages = history.filter(
       (msg) => !isInheritedForkRow(msg.metadata?.timestamp, forkedAt)
     );
     if (messages.length === 0 && forkedAt === undefined) return undefined;
+    const entries = await this.readInFlightEntries(workspaceId);
+    if (!entries || entries.some((entry) => entry.unreadable)) {
+      throw new Error(`in-flight usage files of ${workspaceId} cannot be read`);
+    }
     const repaired = await this.rebuildFromMessagesInternal(workspaceId, messages);
     repaired.forkedAt = forkedAt;
     await this.writeFile(workspaceId, repaired);
@@ -1302,7 +1313,7 @@ export class SessionUsageService {
       // collectFullHistory requires the workspace lock (in memory; it creates no files).
       return await this.fileLocks.withLock(workspaceId, async () => {
         // An empty history still runs: a running stream's in-flight file must count.
-        const messages = await this.collectFullHistory(workspaceId);
+        const messages = (await this.collectFullHistory(workspaceId)) ?? [];
         const { view: rebuilt } = this.addRunningStreamsToView(
           workspaceId,
           await this.rebuildFromMessagesInternal(workspaceId, messages),
@@ -1440,10 +1451,7 @@ export class SessionUsageService {
     rebuilt: SessionUsageFile,
     messageIdsWithUsage: Set<string>
   ): Promise<void> {
-    const entries = await this.readInFlightEntries(workspaceId);
-    // A rebuild written now would miss the keys of files no one can see: fail, retry later.
-    if (!entries) throw new Error(`in-flight usage files of ${workspaceId} cannot be listed`);
-    for (const entry of entries) {
+    for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
       const messageId = entry.file?.messageId;
       if (messageId && messageIdsWithUsage.has(messageId)) {
         withSettledInFlightKey(rebuilt, entry.key);

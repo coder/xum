@@ -1008,6 +1008,22 @@ describe("SessionUsageService", () => {
       expect(result.children.child.byModel[model].input.tokens).toBe(107);
     });
 
+    it("still shows a running stream while the sub-agent's history cannot be read", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg2", model, createUsage(7, 0));
+      const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock").mockResolvedValue({
+        success: false,
+        error: "EIO",
+      });
+      try {
+        const result = await service.getOpenSubagentUsage("root");
+        expect(result.children.child.byModel[model].input.tokens).toBe(7);
+      } finally {
+        iterateSpy.mockRestore();
+      }
+    });
+
     it("sums model keys named after Object.prototype members", async () => {
       await addWorkspace("root");
       await addWorkspace("child", "root");
@@ -1203,6 +1219,7 @@ describe("SessionUsageService", () => {
       ["a null byModel", { ...ledger, byModel: null }],
       ["a string byModel", { ...ledger, byModel: "x" }],
       ["an array byModel", { ...ledger, byModel: [] }],
+      ["only invalid model entries", { ...ledger, byModel: { a: null, b: 5 } }],
       ["version 2", { ...ledger, version: 2 }],
       ["no version", { byModel: ledger.byModel }],
       ["a JSON null", null],
@@ -1333,6 +1350,22 @@ describe("SessionUsageService", () => {
       ) as { byModel: unknown };
       expect(onDisk.byModel).toBeNull();
       await fs.rm(inFlightDir);
+      expect(inputTokens(await readThroughIpc())).toBe(300);
+    });
+
+    it("fails a repair while an in-flight file cannot be read", async () => {
+      // A directory at the file's path: reading it fails, as an EIO would.
+      const stuck = path.join(config.sessionsDir, workspaceId, "session-usage.in-flight", "k.json");
+      await fs.mkdir(stuck, { recursive: true });
+      await writeLedger({ ...ledger, byModel: null });
+
+      const result = await service.getSessionUsage(workspaceId).then(
+        () => "resolved",
+        () => "rejected"
+      );
+
+      expect(result).toBe("rejected");
+      await fs.rm(stuck, { recursive: true });
       expect(inputTokens(await readThroughIpc())).toBe(300);
     });
 
