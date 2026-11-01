@@ -268,22 +268,25 @@ function sumOpenDescendantUsage(
 /**
  * Self-healing for lock-free reads: a model entry that fails the usage schema is dropped, and a
  * ledger that still fails the file schema reads as absent, so one bad entry or file neither
- * rejects a whole batch or projection nor hides the valid entries beside it. The raw object is
- * returned: the schema would strip fields the view needs (settledInFlightKeys).
+ * rejects a whole batch or projection nor hides the valid entries beside it. The schema strips
+ * settledInFlightKeys, which the view needs, so it is validated and put back.
  */
 function parseLedgerKeepingValidModels(raw: unknown): SessionUsageFile | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const ledger = raw as SessionUsageFile;
   if (typeof ledger.byModel !== "object" || ledger.byModel === null) return undefined;
   const byModel = Object.fromEntries(
-    Object.entries(ledger.byModel).filter(
-      ([, usage]) => ChatUsageDisplaySchema.safeParse(usage).success
-    )
+    Object.entries(ledger.byModel).flatMap(([model, usage]) => {
+      const entry = ChatUsageDisplaySchema.safeParse(usage);
+      return entry.success ? [[model, entry.data]] : [];
+    })
   );
-  const candidate = { ...ledger, byModel };
-  return SessionUsageFileSchema.safeParse(candidate).success &&
-    SettledInFlightKeysSchema.safeParse(ledger.settledInFlightKeys).success
-    ? candidate
+  // Use the parsed values, not the raw ones: the schema repairs some fields (a null
+  // longContextTokens becomes undefined) that would still throw when usages are summed.
+  const parsed = SessionUsageFileSchema.safeParse({ ...ledger, byModel });
+  const keys = SettledInFlightKeysSchema.safeParse(ledger.settledInFlightKeys);
+  return parsed.success && keys.success
+    ? { ...parsed.data, settledInFlightKeys: keys.data }
     : undefined;
 }
 
@@ -1169,7 +1172,7 @@ export class SessionUsageService {
             [
               id,
               id === workspaceId
-                ? await this.readUsageViewLockFree(id, true)
+                ? await this.readUsageViewLockFree(id, true).catch(() => undefined)
                 : await this.readProjectionView(id),
             ] as const
         )
@@ -1183,11 +1186,12 @@ export class SessionUsageService {
    * memory: writing it could recreate the session folder of a sub-agent that is being removed.
    */
   private async readProjectionView(workspaceId: string): Promise<SessionUsageFile | undefined> {
-    // Any failure reading one sub-agent counts as a missing ledger, so it cannot reject the
-    // whole projection and hide every sibling's spend.
-    const view = await this.readUsageViewLockFree(workspaceId, true).catch(() => undefined);
-    if (view) {
-      return view;
+    // Decide on the settled ledger, not the view: a view of only a running stream would
+    // skip the rebuild and hide every settled turn. Any read failure counts as missing, so
+    // one sub-agent cannot reject the whole projection and hide its siblings' spend.
+    const settled = await this.readSettledLedgerLockFree(workspaceId);
+    if (settled) {
+      return this.readUsageViewLockFree(workspaceId, true, settled).catch(() => settled);
     }
     try {
       // collectFullHistory requires the workspace lock (in memory; it creates no files).
@@ -1210,19 +1214,25 @@ export class SessionUsageService {
     }
   }
 
-  private async readUsageViewLockFree(
-    workspaceId: string,
-    includeOwnLiveStreams: boolean
+  private async readSettledLedgerLockFree(
+    workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
-    let settled: SessionUsageFile | undefined;
     try {
       const filePath = this.getFilePath(workspaceId);
-      settled = parseLedgerKeepingValidModels(
+      return parseLedgerKeepingValidModels(
         JSON.parse(await this.files.promises.readFile(filePath, "utf-8"))
       );
     } catch {
-      settled = undefined;
+      return undefined;
     }
+  }
+
+  private async readUsageViewLockFree(
+    workspaceId: string,
+    includeOwnLiveStreams: boolean,
+    settledLedger?: SessionUsageFile
+  ): Promise<SessionUsageFile | undefined> {
+    const settled = settledLedger ?? (await this.readSettledLedgerLockFree(workspaceId));
     // Lock-free and read-only: killed streams are added to the view, not folded.
     const entries = await this.readInFlightEntries(workspaceId);
     const { view, addedCount } = this.addRunningStreamsToView(

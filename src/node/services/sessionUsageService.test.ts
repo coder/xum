@@ -923,6 +923,26 @@ describe("SessionUsageService", () => {
       expect(Object.keys(result.children)).toEqual(["healthy"]);
     });
 
+    it("sums a sub-agent ledger whose entry has a null long-context share", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      await service.recordUsage("grandchild", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await fs.mkdir(path.join(config.sessionsDir, "child"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "child", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: { ...createUsage(3, 3), longContextTokens: null } },
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // Both land in the child's subtree, so the sum must merge the repaired entry.
+      expect(result.children.child.byModel[model].input.tokens).toBe(13);
+    });
+
     it("rebuilds a missing sub-agent ledger from history without writing it", async () => {
       await addWorkspace("root");
       await addWorkspace("child", "root");
@@ -940,6 +960,24 @@ describe("SessionUsageService", () => {
 
       expect(result.children.child.byModel[model].input.tokens).toBe(100);
       expect(existsSync(ledgerPath)).toBe(false);
+    });
+
+    it("rebuilds a missing ledger from history when a stream is running", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, "child", "session-usage.json"), { force: true });
+      await service.recordInFlightUsage("child", "stream-key", "msg2", model, createUsage(7, 0));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(107);
     });
 
     it("returns nothing for a workspace without sub-agents", async () => {
