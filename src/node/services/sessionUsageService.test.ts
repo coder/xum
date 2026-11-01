@@ -803,6 +803,36 @@ describe("SessionUsageService", () => {
 
       expect(changed).toEqual([workspaceId]);
     });
+
+    it("does not report a repair whose rebuilt ledger fails to parse", async () => {
+      const workspaceId = "notify-repair-unparseable";
+      // Object-valued token fields: the rebuild keeps them, and the parser rejects them.
+      const malformedUsage = { inputTokens: { n: 1 }, outputTokens: 50, totalTokens: 150 };
+      // History is untrusted on read, so the test writes a shape the types forbid.
+      const metadata = {
+        model: "claude-sonnet-4-20250514",
+        usage: malformedUsage,
+      } as unknown as Parameters<typeof createMuxMessage>[3];
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", metadata)
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "session-usage.json"),
+        "{ invalid json"
+      );
+      const changed: string[] = [];
+      service.onUsageChanged((id) => changed.push(id));
+
+      const error = await service.getSessionUsage(workspaceId).then(
+        () => undefined,
+        (readError: unknown) => readError
+      );
+      expect(String(error)).toContain("a ledger rebuilt from history always parses");
+
+      // A notify here starts a refetch that repairs, fails and notifies again, forever.
+      expect(changed).toEqual([]);
+    });
   });
 
   describe("resetSessionUsage", () => {

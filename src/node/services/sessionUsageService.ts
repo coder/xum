@@ -691,14 +691,15 @@ export class SessionUsageService {
     const repaired = await this.rebuildFromMessagesInternal(workspaceId, messages);
     repaired.forkedAt = forkedAt;
     await this.writeFile(workspaceId, repaired);
-    // The repaired totals can differ from what lock-free readers showed (an ancestor's
-    // projection rebuilds without the fork boundary, the archived list shows none). The
-    // refetch this starts finds a usable ledger and repairs nothing, so it cannot loop.
-    this.notifyUsageChanged(workspaceId);
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
     // Through the parser like every read: a legacy history row can hold a malformed usage.
     const rebuilt = parseLedgerKeepingValidParts(repaired);
     assert(rebuilt && !rebuilt.settledKeysCorrupt, "a ledger rebuilt from history always parses");
+    // The repaired totals can differ from what lock-free readers showed (an ancestor's
+    // projection rebuilds without the fork boundary, the archived list shows none). Notify
+    // only once the ledger parses: the refetch this starts then repairs nothing. A ledger
+    // that fails the assert would be repaired, and notified, again on every refetch.
+    this.notifyUsageChanged(workspaceId);
     const countedMessageIds = new Set(
       messages
         .filter(
