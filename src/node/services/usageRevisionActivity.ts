@@ -76,6 +76,7 @@ export class UsageRevisionActivity {
     );
   }
 
+  // dry-duplicate-ok: two map deletes; the matches clear other services' unrelated per-key state
   evict(workspaceId: string): void {
     this.revisions.delete(workspaceId);
     this.pendingEmits.delete(workspaceId);
