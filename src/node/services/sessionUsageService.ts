@@ -402,6 +402,7 @@ export class SessionUsageService {
   private readonly inFlightOwnerId = randomUUID();
   /** In-flight keys of streams this process is still running, per workspace. */
   private readonly liveInFlightKeys = new Map<string, Set<string>>();
+  private readonly usageChangedListeners: Array<(workspaceId: string) => void> = [];
 
   constructor(
     config: Config,
@@ -418,6 +419,21 @@ export class SessionUsageService {
     this.historyService = historyService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
+  /**
+   * Called after each write that changes a workspace's usage totals: its ledger (a settled
+   * stream, headless usage, a sub-agent rolled up into it, a reset or rebuild) or a running
+   * stream's in-flight file.
+   */
+  onUsageChanged(listener: (workspaceId: string) => void): void {
+    this.usageChangedListeners.push(listener);
+  }
+
+  private notifyUsageChanged(workspaceId: string): void {
+    for (const listener of this.usageChangedListeners) {
+      listener(workspaceId);
+    }
+  }
+
   /** Usage rebuild needs every epoch for accurate totals. Undefined when history cannot be read. */
   private async collectFullHistory(workspaceId: string): Promise<MuxMessage[] | undefined> {
     const messages: MuxMessage[] = [];
@@ -753,6 +769,7 @@ export class SessionUsageService {
         filesToDelete.push(this.getInFlightFilePath(workspaceId, settlesKey));
       }
       await this.deleteFiles(filesToDelete);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -793,6 +810,7 @@ export class SessionUsageService {
         if (!wasLive) this.forgetLiveKey(workspaceId, key);
         throw error;
       }
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -804,6 +822,7 @@ export class SessionUsageService {
       // usage that was meant to be dropped (a restart then counts it: it was billed).
       await this.files.promises.rm(filePath, { force: true });
       this.forgetLiveKey(workspaceId, key);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -1172,6 +1191,7 @@ export class SessionUsageService {
         },
       };
       await this.writeFile(parentWorkspaceId, current);
+      this.notifyUsageChanged(parentWorkspaceId);
 
       return { didRollUp: true };
     });
@@ -1240,6 +1260,7 @@ export class SessionUsageService {
   async resetSessionUsage(workspaceId: string, forkedAt?: number): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.writeFile(workspaceId, { ...this.createEmptyUsageFile(), forkedAt });
+      this.notifyUsageChanged(workspaceId);
     });
   }
 
@@ -1465,6 +1486,7 @@ export class SessionUsageService {
   async rebuildFromMessages(workspaceId: string, messages: MuxMessage[]): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.rebuildAndWriteLedger(workspaceId, messages);
+      this.notifyUsageChanged(workspaceId);
     });
   }
 }

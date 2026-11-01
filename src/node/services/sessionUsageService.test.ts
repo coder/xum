@@ -727,6 +727,61 @@ describe("SessionUsageService", () => {
     });
   });
 
+  describe("onUsageChanged", () => {
+    it("reports every write that changes a workspace's usage, and no read", async () => {
+      const projectPath = "/tmp/mux-session-usage-test-project";
+      const model = "claude-sonnet-4-20250514";
+      const parentId = "notify-parent";
+      const childId = "notify-child";
+      for (const [id, parentWorkspaceId] of [
+        [parentId, undefined],
+        [childId, parentId],
+      ] as const) {
+        await config.addWorkspace(projectPath, {
+          id,
+          name: id,
+          projectName: "test-project",
+          projectPath,
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId,
+        });
+      }
+      const changed: string[] = [];
+      service.onUsageChanged((workspaceId) => changed.push(workspaceId));
+      const usage = createUsage(10, 5);
+
+      await service.recordInFlightUsage(childId, "step-key", "message-1", model, usage);
+      await service.recordUsage(childId, model, usage, { settlesInFlightKey: "step-key" });
+      await service.recordInFlightUsage(childId, "dropped-key", "message-2", model, usage);
+      await service.discardInFlightUsage(childId, "dropped-key");
+      await service.recordHeadlessUsage(childId, model, {
+        inputTokens: 3,
+        outputTokens: 1,
+        totalTokens: 4,
+      });
+      await service.rollUpUsageIntoParent(parentId, childId, { [model]: usage });
+      await service.resetSessionUsage(childId);
+      await service.rebuildFromMessages(childId, []);
+      expect(changed).toEqual([
+        childId,
+        childId,
+        childId,
+        childId,
+        childId,
+        parentId,
+        childId,
+        childId,
+      ]);
+
+      changed.length = 0;
+      await service.getSessionUsage(parentId);
+      await service.getOpenSubagentUsage(parentId);
+      // The parent's ledger already has this child: the second roll-up writes nothing.
+      await service.rollUpUsageIntoParent(parentId, childId, { [model]: usage });
+      expect(changed).toEqual([]);
+    });
+  });
+
   describe("resetSessionUsage", () => {
     it("should replace existing usage with an explicit empty ledger", async () => {
       const workspaceId = "test-workspace";

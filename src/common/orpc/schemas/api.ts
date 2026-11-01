@@ -2608,6 +2608,11 @@ export const workspace = {
             workspaceId: z.string(),
             activity: WorkspaceActivitySnapshotSchema.nullable(),
           }),
+          // A write changed this workspace's session usage (its ledger or a running stream's).
+          z.object({
+            type: z.literal("usage-changed"),
+            workspaceId: z.string(),
+          }),
           HeartbeatEventSchema,
         ])
       ),
