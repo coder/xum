@@ -433,7 +433,9 @@ function sumSubtreesNotRolledUp(
     count += subtree.workspaceCount;
     for (const [model, usage] of Object.entries(subtree.byModel)) {
       const existing = byModel[model];
-      byModel[model] = existing ? (sumUsageHistory([existing, usage]) ?? usage) : usage;
+      const sum = existing ? sumUsageHistory([existing, usage]) : usage;
+      assert(sum, "sumSubtreesNotRolledUp: sum of two usages must exist");
+      byModel[model] = sum;
     }
   }
   return { byModel, count };
@@ -1744,9 +1746,8 @@ export class WorkspaceStore {
     if (!client || !this.isWorkspaceRegistered(workspaceId)) {
       return;
     }
-    // Ask the backend even when no child is known here: frontend metadata can lag config (a
-    // parent registers before its children), and gating on it hid every sub-agent's cost.
-
+    // No gate on known children: a parent registers before its children do, so frontend
+    // metadata cannot tell that a workspace has none.
     const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.subagentUsageRequestVersion.set(workspaceId, requestVersion);
     client.workspace
