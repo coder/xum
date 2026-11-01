@@ -427,6 +427,13 @@ type SubagentUsageByChild = Awaited<
   ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
 >;
 
+type ActivitySubscriptionEvent =
+  Awaited<
+    ReturnType<RouterClient<AppRouter>["workspace"]["activity"]["subscribe"]>
+  > extends AsyncIterable<infer TEvent>
+    ? TEvent
+    : never;
+
 function sumSubtreesNotRolledUp(
   children: SubagentUsageByChild["children"],
   rolledUpFrom: Readonly<Record<string, unknown>>
@@ -1817,8 +1824,8 @@ export class WorkspaceStore {
    * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
    * and every ancestor's sub-agent projection can have changed.
    */
-  private applyUsageRevision(workspaceId: string, usageRevision: number): void {
-    if (this.usageRevisions.get(workspaceId) === usageRevision) {
+  private applyUsageRevision(workspaceId: string, usageRevision: number | undefined): void {
+    if (usageRevision === undefined || this.usageRevisions.get(workspaceId) === usageRevision) {
       return;
     }
     this.usageRevisions.set(workspaceId, usageRevision);
@@ -4214,11 +4221,6 @@ export class WorkspaceStore {
       this.refreshActiveGoalCount();
     }
 
-    // Only activity.list sets it: a reconnect learns of moves the subscription missed.
-    if (snapshot?.usageRevision !== undefined) {
-      this.applyUsageRevision(workspaceId, snapshot.usageRevision);
-    }
-
     // Transcript content that lands while a workspace is not the active onChat
     // subscription never reaches its aggregator, so any stream/recency movement
     // means the cached rows are missing backend content (see isTranscriptStale).
@@ -4373,6 +4375,8 @@ export class WorkspaceStore {
         continue;
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, snapshot, false);
+      // Only the list carries revisions: a resubscribe learns of moves the subscription missed.
+      this.applyUsageRevision(workspaceId, snapshot.usageRevision);
     }
 
     // An empty list is a valid all-idle result (backend read failures arrive as null
@@ -4566,13 +4570,7 @@ export class WorkspaceStore {
         if (event.type === "heartbeat") return;
         queueMicrotask(() => {
           if (signal.aborted || attemptSignal.aborted) return;
-          if (event.type === "usage-revision") {
-            // Not a delta tracked for a list retry: it carries no activity to keep from the list.
-            this.applyUsageRevision(event.workspaceId, event.usageRevision);
-            return;
-          }
-          this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
-          this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+          this.applyActivityEvent(event);
         });
       },
       onUnexpectedEnd: () =>
@@ -4587,6 +4585,18 @@ export class WorkspaceStore {
         }
       },
     });
+  }
+
+  private applyActivityEvent(
+    event: Exclude<ActivitySubscriptionEvent, { type: "heartbeat" }>
+  ): void {
+    if (event.type === "usage-revision") {
+      // Not tracked for a list retry: the list's activity for this id is still the newest.
+      this.applyUsageRevision(event.workspaceId, event.usageRevision);
+      return;
+    }
+    this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
+    this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
   }
 
   /**

@@ -3779,14 +3779,20 @@ describe("WorkspaceStore", () => {
         const { pushUsage, resubscribe } = await openActivity();
         await addParentWithChildren(["child"]);
         await pushUsage("child", 1);
+        await pushUsage("parent", 1);
+        mockGetSessionUsage.mockClear();
         mockGetSubagentUsage.mockClear();
 
+        // A listed snapshot without a revision (no usage write since the backend started) is
+        // no move.
         mockActivityList.mockResolvedValue({
+          parent: createActivitySnapshot(1),
           child: createActivitySnapshot(1, { usageRevision: 2 }),
         });
         await resubscribe();
 
         expect(projectionFetches()).toEqual(["parent"]);
+        expect(mockGetSessionUsage).not.toHaveBeenCalled();
       });
 
       it("leaves the own ledger to the end of a stream that is live here", async () => {
