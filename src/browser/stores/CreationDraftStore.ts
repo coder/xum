@@ -21,6 +21,8 @@ import type {
   CreationDraft,
   CreationDraftExecution,
   CreationDraftSummary,
+  CreationDraftUpdateOutput,
+  CREATION_DRAFT_CONTENT_FIELDS,
 } from "@/common/orpc/schemas/drafts";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -291,6 +293,26 @@ function nextPendingDelete(
     ifStored = fields;
   }
   return { ifStored, sent: existing?.sent ?? false };
+}
+
+/**
+ * The stored record after a save, not this window's copy: the backend merged only the saved
+ * fields, so another window's earlier save of other fields is part of it (#7728). The reply
+ * leaves out the content fields (CREATION_DRAFT_CONTENT_FIELDS): each comes from this save, else
+ * the last known stored record. If another window changed one of them, a delete retry keeps
+ * the record (fails safe).
+ */
+function storedAfterSave(
+  record: CreationDraftUpdateOutput["record"],
+  patch: CreationDraftPatch,
+  previous: CreationDraft | null,
+  draft: CreationDraft
+): CreationDraft {
+  const content = {
+    text: patch.text ?? previous?.text ?? draft.text,
+    attachments: patch.attachments ?? previous?.attachments ?? draft.attachments,
+  } satisfies Record<keyof typeof CREATION_DRAFT_CONTENT_FIELDS, unknown>;
+  return { ...record, ...content };
 }
 
 /** A refused save wrote nothing; other failures may have (most often the reply was lost). */
@@ -625,13 +647,16 @@ export class CreationDraftStore {
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
-      await client.drafts.updateCreation({
+      const reply = await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
       });
       entry.saving = false;
       entry.persisted = true;
-      entry.stored = draft;
+      // An older backend (a renderer that skipped its bundle reload) sends no record: keep this
+      // window's copy then, as before #7728's fix, so a delete retry still sends a full record.
+      const { record } = reply as Partial<CreationDraftUpdateOutput>;
+      entry.stored = record ? storedAfterSave(record, patch, entry.stored, draft) : draft;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {

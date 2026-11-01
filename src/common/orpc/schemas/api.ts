@@ -152,8 +152,8 @@ import {
   CreationDraftListSchema,
   CreationDraftSchema,
   CreationDraftScopeSchema,
-  CreationDraftSummarySchema,
   CreationDraftUpdateInputSchema,
+  CreationDraftUpdateOutputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -3895,7 +3895,7 @@ export const drafts = {
   },
   updateCreation: {
     input: CreationDraftUpdateInputSchema,
-    output: CreationDraftSummarySchema,
+    output: CreationDraftUpdateOutputSchema,
   },
   deleteCreation: {
     input: CreationDraftDeleteInputSchema,

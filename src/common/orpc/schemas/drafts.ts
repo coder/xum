@@ -331,6 +331,21 @@ export const CreationDraftListSchema = z.object({
   drafts: z.array(CreationDraftSummarySchema),
 });
 
+/**
+ * The content fields of a creation draft: each can be megabytes. A save's reply never carries
+ * them, because every debounced save would echo them (#7728).
+ */
+export const CREATION_DRAFT_CONTENT_FIELDS = { text: true, attachments: true } as const;
+
+/**
+ * A save's reply: the summary, plus the stored record after the merge without its content
+ * fields. A delete retry conditions on the stored record, so another window's earlier save of
+ * other fields counts (#7728).
+ */
+export const CreationDraftUpdateOutputSchema = CreationDraftSummarySchema.extend({
+  record: CreationDraftSchema.omit(CREATION_DRAFT_CONTENT_FIELDS),
+});
+
 /** Partial: omitted fields keep their stored value; only an explicit `projectPath` moves it. */
 export const CreationDraftUpdateInputSchema = CreationDraftSchema.omit({ id: true })
   .partial()
@@ -382,5 +397,6 @@ export type CreationDraftExecution = z.infer<typeof CreationDraftExecutionSchema
 export type CreationDraftSummary = z.infer<typeof CreationDraftSummarySchema>;
 export type CreationDraftList = z.infer<typeof CreationDraftListSchema>;
 export type CreationDraftUpdateInput = z.infer<typeof CreationDraftUpdateInputSchema>;
+export type CreationDraftUpdateOutput = z.infer<typeof CreationDraftUpdateOutputSchema>;
 export type CreationDraftDeleteInput = z.infer<typeof CreationDraftDeleteInputSchema>;
 export type CreationDraftImportLegacyInput = z.infer<typeof CreationDraftImportLegacyInputSchema>;
