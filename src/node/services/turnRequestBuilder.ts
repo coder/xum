@@ -1646,6 +1646,23 @@ export class TurnRequestBuilder {
     }
   }
 
+  /**
+   * Cumulative session cost for the MUX_COSTS_USD env var. A ledger read error (EIO, EMFILE)
+   * leaves the variable unset: the cost is informational and must not fail the user's send.
+   */
+  private async loadSessionCostsUsd(workspaceId: string): Promise<number | undefined> {
+    const sessionUsageService = this.dependencies.sessionUsageService;
+    if (!sessionUsageService) return undefined;
+    try {
+      const sessionUsage = await sessionUsageService.getSessionUsage(workspaceId);
+      if (!sessionUsage) return undefined;
+      return getTotalCost(sumUsageHistory(Object.values(sessionUsage.byModel)));
+    } catch (error) {
+      log.warn("Failed to read session usage; MUX_COSTS_USD stays unset", { workspaceId, error });
+      return undefined;
+    }
+  }
+
   private async prepareOrThrow(
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
@@ -2814,16 +2831,8 @@ export class TurnRequestBuilder {
     );
     recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
-    // Calculate cumulative session costs for MUX_COSTS_USD env var
-    let sessionCostsUsd: number | undefined;
     const loadSessionUsageStartedAt = this.hostClock.nowMs();
-    if (this.dependencies.sessionUsageService) {
-      const sessionUsage = await this.dependencies.sessionUsageService.getSessionUsage(workspaceId);
-      if (sessionUsage) {
-        const allUsage = sumUsageHistory(Object.values(sessionUsage.byModel));
-        sessionCostsUsd = getTotalCost(allUsage);
-      }
-    }
+    const sessionCostsUsd = await this.loadSessionCostsUsd(workspaceId);
     recordStartupPhaseTiming("loadSessionUsageMs", loadSessionUsageStartedAt);
 
     emitStartupBreadcrumb("loading_tools");

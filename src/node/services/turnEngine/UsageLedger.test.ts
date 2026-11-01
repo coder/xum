@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
-import { MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
+import { createMuxMessage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
@@ -118,6 +118,21 @@ describe("UsageLedger", () => {
       expect(await inFlightFiles()).toEqual([]);
       expect(totalTokens(await sessionUsage.getSessionUsage(WORKSPACE_ID))).toBe(2_200);
       expect(totalTokens(await afterRestart())).toBe(2_200);
+    });
+
+    test("a settle without in-flight writes counts a message an unusable-ledger repair restored once", async () => {
+      await historyService.appendToHistory(
+        WORKSPACE_ID,
+        createMuxMessage("msg-1", "assistant", "done", { model: MODEL, usage: STEP })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, WORKSPACE_ID, "session-usage.json"),
+        JSON.stringify({ byModel: null, version: 1 })
+      );
+
+      await ledger.settle(WORKSPACE_ID, turn(), STEP, undefined, "settle failed", "warn");
+
+      expect(totalTokens(await sessionUsage.getSessionUsage(WORKSPACE_ID))).toBe(1_100);
     });
 
     test("a failed final ledger write keeps the in-flight file, and the next read counts it once", async () => {

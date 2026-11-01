@@ -134,6 +134,18 @@ function isPlausibleForkBoundary(timestamp: number): boolean {
   );
 }
 
+/**
+ * True for a row a fork copied from its parent: at or before the ledger's `forkedAt`.
+ * Rows without a timestamp, and workspaces without the marker (old forks, non-forks),
+ * count as the workspace's own.
+ */
+export function isInheritedForkRow(
+  timestamp: number | undefined,
+  forkedAt: number | undefined
+): boolean {
+  return timestamp !== undefined && forkedAt !== undefined && timestamp <= forkedAt;
+}
+
 export const SessionUsageFileSchema = z.object({
   byModel: z.record(z.string(), ChatUsageDisplaySchema),
   lastRequest: z
