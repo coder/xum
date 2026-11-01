@@ -21,6 +21,7 @@ import type {
   CreationDraft,
   CreationDraftExecution,
   CreationDraftSummary,
+  CreationDraftUpdateOutput,
 } from "@/common/orpc/schemas/drafts";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -291,6 +292,24 @@ function nextPendingDelete(
     ifStored = fields;
   }
   return { ifStored, sent: existing?.sent ?? false };
+}
+
+/**
+ * The stored record after a save, not this window's copy: the backend merged only the saved
+ * fields, so another window's earlier save of other fields is part of it (#7728). The reply
+ * leaves out attachments: use the ones this save sent, else the last known stored ones. If
+ * another window changed only those, a delete retry keeps the record (fails safe).
+ */
+function storedAfterSave(
+  record: CreationDraftUpdateOutput["record"],
+  patch: CreationDraftPatch,
+  previous: CreationDraft | null,
+  draft: CreationDraft
+): CreationDraft {
+  return {
+    ...record,
+    attachments: patch.attachments ?? previous?.attachments ?? draft.attachments,
+  };
 }
 
 /** A refused save wrote nothing; other failures may have (most often the reply was lost). */
@@ -631,14 +650,7 @@ export class CreationDraftStore {
       });
       entry.saving = false;
       entry.persisted = true;
-      // The stored record, not this window's copy: the backend merged only this save's fields, so
-      // another window's earlier save of other fields is part of it (#7728). The reply leaves out
-      // attachments: use the ones this save sent, else the last known stored ones. If another
-      // window changed only those, a delete retry keeps the record (fails safe).
-      entry.stored = {
-        ...reply.record,
-        attachments: patch.attachments ?? entry.stored?.attachments ?? draft.attachments,
-      };
+      entry.stored = storedAfterSave(reply.record, patch, entry.stored, draft);
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {
