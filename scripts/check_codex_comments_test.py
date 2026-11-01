@@ -366,6 +366,39 @@ else:
             data = snapshot([comment(board)], [open_thread], head=head)
             self.assert_gate(1, data, wait=60)
 
+    def test_null_security_flags_pass_beside_cleared_advisories(self):
+        # Codex keeps listing an advisory after its thread is resolved, beside null
+        # security flags (observed on #7859). A cleared bullet must not block that board.
+        board = FIXTURES["review_state_null_security_advisory_summary"]["body"]
+        head = board_head(board)
+        clean = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        receipt = re.sub(r"\*\*Reviewed commit:\*\* `[0-9a-f]+`", f"**Reviewed commit:** `{head[:10]}`", clean)
+        self.assertNotEqual(receipt, clean)
+        discussion = "4433878221"
+        link = f"(https://github.com/coder/xum/pull/7859#discussion_r{discussion})"
+        unlinked = board.replace("[Let Stop preempt grouped task creation]" + link, "Let Stop preempt grouped task creation")
+        self.assertNotEqual(unlinked, board)
+
+        def advisory(resolved):
+            return thread(
+                "<!-- codex-security-review-finding:v1 -->\n[P2] Let Stop preempt grouped task creation",
+                resolved=resolved,
+                discussion=discussion,
+                commit=head,
+            )
+
+        for case, comments, threads, pr_head, expected in (
+            ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
+            ("unresolved advisory", [board, receipt], [advisory(False)], head, 1),
+            ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
+            ("no receipt", [board], [advisory(True)], head, 10),
+            ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
     def test_missing_security_receipt_is_requested_once_per_head(self):
         board = FIXTURES["review_state_null_security_summary"]["body"]
         receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
