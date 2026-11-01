@@ -113,12 +113,20 @@ describe("getModelStats", () => {
     }
   );
 
-  test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
-    const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
+  test("resolves GPT-6 Astra by id, dated snapshot, and gateway prefix", () => {
+    // The `astra` alias moved to GPT-6.2 Astra; the retired id keeps its own stats.
+    const astra = expectStats("openai:gpt-6-astra");
     expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
     expect(expectStats("coder:openai/gpt-6-astra")).toEqual(astra);
     // OpenAI has published no Astra variants; do not resolve unknown ids to it.
     expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
+  });
+
+  test("resolves the astra alias target (GPT-6.2 Astra) by id, dated snapshot, and gateway prefix", () => {
+    const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(expectStats("openai:gpt-6.2-astra-2026-11-20")).toEqual(astra);
+    expect(expectStats("coder:openai/gpt-6.2-astra")).toEqual(astra);
+    expect(getModelStats("openai:gpt-6.2-astra-mini")).toBeNull();
   });
 
   test("resolves Gemini 3.8 Flash with the billed introductory pricing and limits", () => {

@@ -57,6 +57,12 @@ describe("Known Models Integration", () => {
     expect(MODEL_ABBREVIATIONS.gpt).toBe(MODEL_ABBREVIATIONS.sol);
   });
 
+  // GPT-6.2 Astra took over `astra`; the retired id is a custom string, never an alias for 6.2.
+  test("astra alias resolves to gpt-6.2-astra and the retired gpt-6-astra id is not an alias", () => {
+    expect(MODEL_ABBREVIATIONS.astra).toBe("openai:gpt-6.2-astra");
+    expect(MODEL_ABBREVIATIONS["gpt-6-astra"]).toBeUndefined();
+  });
+
   // Exact-id lookup for retired-but-documented custom model strings must keep
   // resolving to an approximate tokenizer instead of falling back (with a
   // warning) to the generic per-provider tokenizer.
@@ -64,6 +70,7 @@ describe("Known Models Integration", () => {
     ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
     ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
     ["anthropic:claude-haiku-4-5", "anthropic/claude-3.5-haiku"],
+    ["openai:gpt-6-astra", "openai/gpt-5"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

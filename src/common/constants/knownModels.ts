@@ -150,12 +150,17 @@ const MODEL_DEFINITIONS = {
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
+  // GPT-6.2 Astra - PROVISIONAL: prepared ahead of an unannounced launch (the
+  // `gpt-6.2-astra` id comes from a leaked label; OpenAI's catalog does not list it as
+  // of 2026-11-01). Limits, pricing and capabilities copy GPT-6 Astra's until its model
+  // page confirms them. GPT-6 Astra stays usable as the custom model string
+  // `openai:gpt-6-astra` (not an alias here, so it never resolves to 6.2).
   // Astra stays a separate frontier-tier choice rather than taking over `gpt`.
   // Not warmed: its tokenizer override is already warmed via GPT.
   GPT_6_ASTRA: {
     provider: "openai",
-    providerModelId: "gpt-6-astra",
-    aliases: ["astra", "gpt-6-astra"],
+    providerModelId: "gpt-6.2-astra",
+    aliases: ["astra", "gpt-6.2-astra"],
     // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
     // Same Daybreak constraint as GPT (see its cyberAccessProgram).
@@ -300,6 +305,7 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:gpt-6-astra": "openai/gpt-5",
   "openai:daybreak-blue-latest": "openai/gpt-5",
   "openai:daybreak-red-latest": "openai/gpt-5",
 };

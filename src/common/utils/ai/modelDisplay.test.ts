@@ -11,6 +11,7 @@ describe("formatCompactModelDisplayName", () => {
   test("keeps the GPT-6 Astra tier in constrained labels, but not named variants", () => {
     expect(formatCompactModelDisplayName("gpt-6-astra")).toBe("Astra");
     expect(formatCompactModelDisplayName("gpt-6-astra-2026-09-30")).toBe("Astra");
+    expect(formatCompactModelDisplayName("gpt-6.2-astra")).toBe("Astra");
     // A hypothetical variant keeps its full name so the qualifier is not lost.
     expect(formatCompactModelDisplayName("gpt-6-astra-mini")).toBe("GPT-6 Astra Mini");
   });
@@ -70,6 +71,7 @@ describe("formatModelDisplayName", () => {
       expect(formatModelDisplayName("gpt-4o")).toBe("GPT-4o");
       expect(formatModelDisplayName("gpt-4o-mini")).toBe("GPT-4o Mini");
       expect(formatModelDisplayName("gpt-6-astra")).toBe("GPT-6 Astra");
+      expect(formatModelDisplayName("gpt-6.2-astra")).toBe("GPT-6.2 Astra");
     });
 
     test("formats Codex models with Codex branding", () => {
