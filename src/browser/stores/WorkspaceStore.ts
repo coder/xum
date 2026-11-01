@@ -1503,8 +1503,9 @@ export class WorkspaceStore {
       if (childId === undefined || !current.rolledUpFrom?.[childId]) {
         for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
           const existing = current.byModel[model];
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-          current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+          const sum = existing ? sumUsageHistory([existing, usage]) : usage;
+          assert(sum, "session-usage-delta: sum of two usages must exist");
+          current.byModel[model] = sum;
         }
       }
       if (childId !== undefined) {
