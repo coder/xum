@@ -285,9 +285,6 @@ interface ParsedLedger {
   settledKeysCorrupt: boolean;
 }
 
-/** A ledger read: "unusable" is bad JSON or a wrong shape (parseLedgerKeepingValidParts). */
-type LedgerContent = SessionUsageFile | "missing" | "unusable";
-
 /**
  * The one parser of session-usage.json, for locked and lock-free reads. A part in a wrong
  * shape is dropped (a model entry, lastRequest, tokenStatsCache, rolledUpFrom) and the rest
@@ -296,9 +293,7 @@ type LedgerContent = SessionUsageFile | "missing" | "unusable";
  * locked reads then rebuild from history, as for a parse error.
  */
 function parseLedgerKeepingValidParts(raw: unknown): ParsedLedger | undefined {
-  if (!isPlainObject(raw) || typeof raw.byModel !== "object" || raw.byModel === null) {
-    return undefined;
-  }
+  if (!isPlainObject(raw) || !isPlainObject(raw.byModel)) return undefined;
   // Use the parsed values, not the raw ones: the schema repairs some fields (a null
   // longContextTokens becomes undefined) that would still throw when usages are summed.
   const byModel = Object.fromEntries(
@@ -573,27 +568,43 @@ export class SessionUsageService {
    * Throws on a read error (EIO...): the file can still hold spend that a write would lose.
    */
   private async readFile(workspaceId: string): Promise<SessionUsageFile> {
-    const content = await this.readLedgerContent(workspaceId);
-    if (content === "missing") return this.createEmptyUsageFile();
-    if (content === "unusable") {
-      log.warn(`session-usage.json unusable for ${workspaceId}, rebuilding`);
-      return (await this.repairLedgerFromHistory(workspaceId)) ?? this.createEmptyUsageFile();
-    }
-    return content;
+    return (await this.readLedgerForWrite(workspaceId)).ledger;
   }
 
-  /** Every ledger read goes through here. Throws on a read error other than ENOENT. */
-  private async readLedgerContent(workspaceId: string): Promise<LedgerContent> {
-    let data: string;
+  /** readFile, plus the assistant messages a repair from history counted. */
+  private async readLedgerForWrite(
+    workspaceId: string
+  ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> }> {
+    const empty = { ledger: this.createEmptyUsageFile(), countedMessageIds: new Set<string>() };
+    const text = await this.readLedgerText(workspaceId);
+    if (text === undefined) return empty;
+    const content = await this.parseLedgerText(workspaceId, text);
+    if (content !== "unusable") return { ledger: content, countedMessageIds: new Set() };
+    log.warn(`session-usage.json unusable for ${workspaceId}, rebuilding`);
+    return (await this.repairLedgerFromHistory(workspaceId)) ?? empty;
+  }
+
+  /** The ledger file's text, undefined when missing. Throws on any other read error. */
+  private async readLedgerText(workspaceId: string): Promise<string | undefined> {
     try {
-      data = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
+      return await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return "missing";
+      if (isErrnoWithCode(error, "ENOENT")) return undefined;
       throw error;
     }
+  }
+
+  /**
+   * Every ledger read parses here. Throws when the settled keys are corrupt and the in-flight
+   * files cannot be listed (markOrphansSettled).
+   */
+  private async parseLedgerText(
+    workspaceId: string,
+    text: string
+  ): Promise<SessionUsageFile | "unusable"> {
     let parsed: ParsedLedger | undefined;
     try {
-      parsed = parseLedgerKeepingValidParts(JSON.parse(data));
+      parsed = parseLedgerKeepingValidParts(JSON.parse(text));
     } catch {
       return "unusable";
     }
@@ -605,24 +616,45 @@ export class SessionUsageService {
   }
 
   /**
-   * The settled keys are unreadable, so the ledger may already count any orphaned in-flight
-   * file: count none of them (never twice), and the next fold deletes them. Running streams
-   * stay unsettled, so their settle still records their usage.
+   * The settled keys are unreadable, so the ledger may already count any in-flight file a dead
+   * stream left: count none of them (never twice), and the next fold deletes them. An
+   * unreadable file can be one too. Only this process's running streams are known to be
+   * uncounted, and their settle still records their usage.
    */
   private async markOrphansSettled(workspaceId: string, ledger: SessionUsageFile): Promise<void> {
-    for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
-      if (this.isOrphan(workspaceId, entry)) withSettledInFlightKey(ledger, entry.key);
+    const entries = await this.readInFlightEntries(workspaceId);
+    // A write now would drop the markers of files no one can see: fail, and retry later.
+    if (!entries) throw new Error(`in-flight usage files of ${workspaceId} cannot be listed`);
+    for (const entry of entries) {
+      const ownRunning = this.liveInFlightKeys.get(workspaceId)?.has(entry.key) ?? false;
+      if (entry.unreadable ? !ownRunning : this.isOrphan(workspaceId, entry)) {
+        withSettledInFlightKey(ledger, entry.key);
+      }
     }
   }
 
-  /** Rebuilds the ledger from history and writes it; undefined when history is empty. */
+  /**
+   * Rebuilds the ledger from history and writes it; undefined when history is empty. Also
+   * returns the assistant messages it counted, so a settle of one of them is not added again.
+   */
   private async repairLedgerFromHistory(
     workspaceId: string
-  ): Promise<SessionUsageFile | undefined> {
+  ): Promise<{ ledger: SessionUsageFile; countedMessageIds: ReadonlySet<string> } | undefined> {
     const messages = await this.collectFullHistory(workspaceId);
     if (messages.length === 0) return undefined;
-    const rebuilt = await this.rebuildAndWriteLedger(workspaceId, messages);
-    return parseLedgerKeepingValidParts(rebuilt)?.ledger;
+    const rebuilt = parseLedgerKeepingValidParts(
+      await this.rebuildAndWriteLedger(workspaceId, messages)
+    );
+    assert(rebuilt && !rebuilt.settledKeysCorrupt, "a ledger rebuilt from history always parses");
+    const countedMessageIds = new Set(
+      messages
+        .filter(
+          (msg) =>
+            msg.role === "assistant" && getAssistantMessageModelUsages(msg.metadata).length > 0
+        )
+        .map((msg) => msg.id)
+    );
+    return { ledger: rebuilt.ledger, countedMessageIds };
   }
 
   private async writeFile(workspaceId: string, data: SessionUsageFile): Promise<void> {
@@ -654,16 +686,24 @@ export class SessionUsageService {
        * and mark the key settled in one ledger write, then delete the stream's file.
        */
       settlesInFlightKey?: string;
+      /**
+       * The assistant message this usage belongs to. A repair of an unusable ledger counts
+       * the messages already in history, so it is not added again.
+       */
+      messageId?: string;
     }
   ): Promise<void> {
     const settlesKey = options?.settlesInFlightKey;
     return this.fileLocks.withLock(workspaceId, async () => {
-      const current = await this.readFile(workspaceId);
+      const { ledger: current, countedMessageIds } = await this.readLedgerForWrite(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
       const { filesToDelete } = this.foldOrphanedInFlightUsage(workspaceId, current, entries);
       // CRITICAL: Accumulate, don't overwrite. A key a rebuild already settled is counted
       // through its final message in history (markInFlightFilesCountedByHistory).
-      if (settlesKey === undefined || !current.settledInFlightKeys?.includes(settlesKey)) {
+      const countedByRebuild =
+        (settlesKey !== undefined && current.settledInFlightKeys?.includes(settlesKey) === true) ||
+        (options?.messageId !== undefined && countedMessageIds.has(options.messageId));
+      if (!countedByRebuild) {
         addModelUsage(current.byModel, model, usage);
       }
       if (options?.skipLastRequestUpdate !== true) {
@@ -982,7 +1022,8 @@ export class SessionUsageService {
         log.warn(
           `session-usage.json unreadable for ${workspaceId}, rebuilding before token stats cache update`
         );
-        current = (await this.repairLedgerFromHistory(workspaceId)) ?? this.createEmptyUsageFile();
+        current =
+          (await this.repairLedgerFromHistory(workspaceId))?.ledger ?? this.createEmptyUsageFile();
       }
 
       current.tokenStatsCache = cache;
@@ -1044,7 +1085,8 @@ export class SessionUsageService {
           `session-usage.json unreadable for ${parentWorkspaceId}, rebuilding before roll-up`
         );
         current =
-          (await this.repairLedgerFromHistory(parentWorkspaceId)) ?? this.createEmptyUsageFile();
+          (await this.repairLedgerFromHistory(parentWorkspaceId))?.ledger ??
+          this.createEmptyUsageFile();
       }
 
       if (current.rolledUpFrom?.[childWorkspaceId]) {
@@ -1168,17 +1210,20 @@ export class SessionUsageService {
   private async readSettledLedgerLocked(
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
-    let content: LedgerContent;
+    let text: string | undefined;
     try {
-      content = await this.readLedgerContent(workspaceId);
-    } catch {
-      content = "unusable";
+      text = await this.readLedgerText(workspaceId);
+    } catch (error) {
+      log.warn(`session-usage.json unreadable for ${workspaceId}, rebuilding`, { error });
+      return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
     }
-    if (typeof content === "object") return content;
+    // Not in the try: a failed in-flight listing must fail the read, not rebuild the ledger.
+    const content = text === undefined ? undefined : await this.parseLedgerText(workspaceId, text);
+    if (content !== undefined && content !== "unusable") return content;
     if (content === "unusable") {
       log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
     }
-    return this.repairLedgerFromHistory(workspaceId);
+    return (await this.repairLedgerFromHistory(workspaceId))?.ledger;
   }
 
   /**
@@ -1283,8 +1328,10 @@ export class SessionUsageService {
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
     try {
-      const content = await this.readLedgerContent(workspaceId);
-      return typeof content === "object" ? content : undefined;
+      const text = await this.readLedgerText(workspaceId);
+      const content =
+        text === undefined ? undefined : await this.parseLedgerText(workspaceId, text);
+      return content === "unusable" ? undefined : content;
     } catch {
       return undefined;
     }

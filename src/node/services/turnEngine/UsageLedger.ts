@@ -432,7 +432,7 @@ export class UsageLedger {
 
   private async recordUsage(
     workspaceId: string,
-    turn: Pick<UsageTurn, "workspaceName" | "metadataModel">,
+    turn: Pick<UsageTurn, "workspaceName" | "metadataModel" | "messageId">,
     model: string,
     usage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
@@ -451,12 +451,10 @@ export class UsageLedger {
     const workspaceLog = this.deps.workspaceLogger(workspaceId, turn);
     const ledgerModel = this.attributionModel(model, turn.metadataModel);
     try {
-      await sessionUsageService.recordUsage(
-        workspaceId,
-        ledgerModel,
-        messageUsage,
-        settlesInFlightKey !== undefined ? { settlesInFlightKey } : undefined
-      );
+      await sessionUsageService.recordUsage(workspaceId, ledgerModel, messageUsage, {
+        messageId: turn.messageId,
+        ...(settlesInFlightKey !== undefined ? { settlesInFlightKey } : {}),
+      });
       return "recorded";
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });

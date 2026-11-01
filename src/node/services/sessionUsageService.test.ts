@@ -1202,6 +1202,7 @@ describe("SessionUsageService", () => {
     const unusable: Array<[string, unknown]> = [
       ["a null byModel", { ...ledger, byModel: null }],
       ["a string byModel", { ...ledger, byModel: "x" }],
+      ["an array byModel", { ...ledger, byModel: [] }],
       ["version 2", { ...ledger, version: 2 }],
       ["no version", { byModel: ledger.byModel }],
       ["a JSON null", null],
@@ -1305,8 +1306,75 @@ describe("SessionUsageService", () => {
       expect(Object.keys(onDisk.byModel as object)).toEqual([model]);
     });
 
+    it("records a settle once when the repair from history already counts its message", async () => {
+      await writeLedger({ ...ledger, byModel: null });
+
+      // msg1 is in history (300 tokens): its settle must not add it again.
+      await service.recordUsage(workspaceId, model, createUsage(300, 0), { messageId: "msg1" });
+      await service.recordUsage(workspaceId, model, createUsage(7, 0), { messageId: "msg2" });
+
+      expect(inputTokens(await readThroughIpc())).toBe(307);
+    });
+
     describe("with corrupt settled keys", () => {
       const corrupt = { ...ledger, settledInFlightKeys: {} };
+      const inFlightDir = () =>
+        path.join(config.sessionsDir, workspaceId, "session-usage.in-flight");
+      const deadOrphan = JSON.stringify({
+        version: 1,
+        owner: { pid: 2147483000, id: "dead" },
+        messageId: "msg-x",
+        model,
+        usage: createUsage(60, 0),
+        updatedAt: 1,
+      });
+
+      it("counts no unreadable in-flight file once it becomes readable", async () => {
+        // A directory at the file's path: reading it fails, as an EIO would.
+        await fs.mkdir(path.join(inFlightDir(), "stuck.json"), { recursive: true });
+        await writeLedger(corrupt);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+        await fs.rm(path.join(inFlightDir(), "stuck.json"), { recursive: true });
+        await fs.writeFile(path.join(inFlightDir(), "stuck.json"), deadOrphan);
+
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+
+      it("still records a running stream's settle while its file is unreadable", async () => {
+        await service.recordInFlightUsage(workspaceId, "live", "msg-x", model, createUsage(60, 0));
+        await fs.rm(path.join(inFlightDir(), "live.json"));
+        await fs.mkdir(path.join(inFlightDir(), "live.json"));
+        await writeLedger(corrupt);
+
+        await service.recordUsage(workspaceId, model, createUsage(60, 0), {
+          settlesInFlightKey: "live",
+        });
+
+        expect(inputTokens(await readThroughIpc())).toBe(160);
+      });
+
+      it("fails a read or write while the in-flight files cannot be listed", async () => {
+        // A file at the directory's path: listing it fails, as an EIO would.
+        await fs.mkdir(path.join(config.sessionsDir, workspaceId), { recursive: true });
+        await fs.writeFile(inFlightDir(), "");
+        await writeLedger(corrupt);
+
+        const settled = (promise: Promise<unknown>) =>
+          promise.then(
+            () => "resolved",
+            () => "rejected"
+          );
+        expect(await settled(service.recordUsage(workspaceId, model, createUsage(7, 0)))).toBe(
+          "rejected"
+        );
+        expect(await settled(service.getSessionUsage(workspaceId))).toBe("rejected");
+
+        // The ledger was neither rebuilt nor written without its markers.
+        await fs.rm(inFlightDir());
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
 
       it("counts no orphaned in-flight file, since the ledger may already hold it", async () => {
         await service.recordInFlightUsage(
