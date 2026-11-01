@@ -271,17 +271,20 @@ export function anthropicSupportsNativeXhigh(modelString: string): boolean {
 }
 
 /**
- * GPT-6 Astra matcher (released September 3, 2026 under the API id
- * `gpt-6-astra`; there is no bare `gpt-6` alias). Accepts only the bare id or a
+ * Astra family matcher: GPT-6 Astra (released September 3, 2026 under the API id
+ * `gpt-6-astra`; there is no bare `gpt-6` alias) and the unreleased GPT-6.2 Astra
+ * (`gpt-6.2-astra`, PROVISIONAL: assumed to share 6 Astra's reasoning surface
+ * until its model page confirms it). Rejecting `none` is the fail-safe direction:
+ * off clamps to low instead of risking a 400. Accepts only those two ids or a
  * dated snapshot (`-YYYY-MM-DD` / `-YYYYMMDD`, e.g. gpt-6-astra-2026-09-30) and
- * is anchored so any other qualifier, named (`gpt-6-astra-mini`) or numeric
- * (`gpt-6-astra-2-mini`, `gpt-6-astra-2026-preview`), stays outside it. A false
- * match would apply Astra's reasoning surface (native `max`, no `none`) to a
- * model that may reject it.
+ * is anchored so other point versions (`gpt-6.1-astra`) and any other qualifier,
+ * named (`gpt-6-astra-mini`) or numeric (`gpt-6-astra-2-mini`,
+ * `gpt-6-astra-2026-preview`), stay outside it. A false match would apply
+ * Astra's reasoning surface (native `max`, no `none`) to a model that may reject it.
  */
 export function isGpt6AstraModel(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+  return /^gpt-6(?:\.2)?-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
 /**
