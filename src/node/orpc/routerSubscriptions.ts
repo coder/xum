@@ -66,7 +66,7 @@ interface WorkspaceChatSubscriptionInput {
 
 type WorkspaceActivityEvent =
   | { type: "activity"; workspaceId: string; activity: WorkspaceActivitySnapshot | null }
-  | { type: "usage-revision"; workspaceId: string; usageRevision: number }
+  | { type: "usage-changed"; workspaceId: string }
   | { type: "heartbeat" };
 
 type TerminalAttachMessage =
@@ -575,13 +575,13 @@ export function subscribeWorkspaceActivity(
         workspaceId: string;
         activity: WorkspaceActivitySnapshot | null;
       }) => emit.push({ type: "activity", ...event });
-      const onUsageRevision = (event: { workspaceId: string; usageRevision: number }) =>
-        emit.push({ type: "usage-revision", ...event });
+      const onUsageChanged = (event: { workspaceId: string }) =>
+        emit.push({ type: "usage-changed", ...event });
       context.workspaceService.on("activity", onActivity);
-      context.workspaceService.on("usage-revision", onUsageRevision);
+      context.workspaceService.on("usage-changed", onUsageChanged);
       return () => {
         context.workspaceService.off("activity", onActivity);
-        context.workspaceService.off("usage-revision", onUsageRevision);
+        context.workspaceService.off("usage-changed", onUsageChanged);
       };
     },
   });

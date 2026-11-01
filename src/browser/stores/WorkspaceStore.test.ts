@@ -144,9 +144,8 @@ type WorkspaceActivityEvent =
       activity: WorkspaceActivitySnapshot | null;
     }
   | {
-      type: "usage-revision";
+      type: "usage-changed";
       workspaceId: string;
-      usageRevision: number;
     }
   | {
       type: "heartbeat";
@@ -3667,9 +3666,9 @@ describe("WorkspaceStore", () => {
       expect(parentResponses).toHaveLength(2);
     });
 
-    it("leaves a self delta to the refetch for its usage revision", async () => {
+    it("leaves a self delta to the refetch for its usage change", async () => {
       // Headless spend (status titles, bash AI proxy) reports the workspace itself as source and
-      // moves its usage revision. That refetch can land first: this ledger already holds it.
+      // sends usage-changed, whose ledger refetch can land first: this ledger already holds it.
       mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(101)));
       const send = openChat("parent");
       createAndAddWorkspace(store, "parent");
@@ -3718,7 +3717,7 @@ describe("WorkspaceStore", () => {
       expect(shownInputTokens("parent")).toBe(100 + 100 + 50);
     });
 
-    describe("usage revision", () => {
+    describe("usage changes", () => {
       /** Feed the activity subscription; the store is recreated so it subscribes to it. */
       const openActivity = async () => {
         const subscriptions: Array<
@@ -3732,8 +3731,8 @@ describe("WorkspaceStore", () => {
         });
         recreateStore();
         await tick(10);
-        const pushUsage = async (workspaceId: string, usageRevision: number) => {
-          subscriptions.at(-1)!.push({ type: "usage-revision", workspaceId, usageRevision });
+        const pushUsage = async (workspaceId: string) => {
+          subscriptions.at(-1)!.push({ type: "usage-changed", workspaceId });
           await tick(0);
         };
         /** The subscription ends, and the store subscribes again and lists activity. */
@@ -3766,37 +3765,52 @@ describe("WorkspaceStore", () => {
         mockGetSessionUsage.mockClear();
         mockGetSubagentUsage.mockClear();
 
-        await pushUsage("grandchild", 1);
-        expect(projectionFetches()).toEqual(["parent"]);
-        // A revision the store already saw is no move.
-        await pushUsage("grandchild", 1);
+        await pushUsage("grandchild");
 
-        expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
+        expect(projectionFetches()).toEqual(["parent"]);
         expect(mockGetSessionUsage).not.toHaveBeenCalled();
       });
 
-      it("refreshes for a revision that moved while the activity subscription was down", async () => {
-        const { pushUsage, resubscribe } = await openActivity();
+      it("refetches the shown usage when the activity subscription resubscribes", async () => {
+        // Usage changes while the subscription was down are not replayed.
+        const { resubscribe } = await openActivity();
         await addParentWithChildren(["child"]);
-        await pushUsage("child", 1);
-        await pushUsage("parent", 1);
+
+        await resubscribe();
+
+        expect(mockGetSessionUsage.mock.calls.map(([input]) => input.workspaceId)).toEqual([
+          "parent",
+        ]);
+        expect(projectionFetches()).toEqual(["parent"]);
+      });
+
+      it("refetches only the projection on resubscribe while the own stream is live here", async () => {
+        const { resubscribe } = await openActivity();
+        const send = openChat("parent");
+        await addParentWithChildren([]);
+        await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
         mockGetSessionUsage.mockClear();
         mockGetSubagentUsage.mockClear();
 
-        // A listed snapshot without a revision (no usage write since the backend started) is
-        // no move.
-        mockActivityList.mockResolvedValue({
-          parent: createActivitySnapshot(1),
-          child: createActivitySnapshot(1, { usageRevision: 2 }),
-        });
         await resubscribe();
 
-        expect(projectionFetches()).toEqual(["parent"]);
         expect(mockGetSessionUsage).not.toHaveBeenCalled();
+        expect(projectionFetches()).toEqual(["parent"]);
+      });
+
+      it("refetches nothing more for the first activity list", async () => {
+        // Registration and activation fetch the usage: the first list is no resubscribe.
+        recreateStore();
+        createAndAddWorkspace(store, "parent");
+        const registrationFetches = mockGetSessionUsage.mock.calls.length;
+
+        await tick(10);
+
+        expect(mockGetSessionUsage).toHaveBeenCalledTimes(registrationFetches);
       });
 
       it("leaves the own ledger to the end of a stream that is live here", async () => {
-        // A revision refetch during the stream can already hold the settled stream, and
+        // A usage-change refetch during the stream can already hold the settled stream, and
         // stream-end adds that stream's usage too: the refetch at stream end replaces both.
         const { pushUsage } = await openActivity();
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
@@ -3805,7 +3819,7 @@ describe("WorkspaceStore", () => {
         await send(caughtUpEvent(), streamStartEvent("parent", "stream-1"));
         mockGetSessionUsage.mockClear();
 
-        await pushUsage("parent", 1);
+        await pushUsage("parent");
         expect(mockGetSessionUsage).not.toHaveBeenCalled();
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(150)));
         await send(streamEndEvent("parent", "stream-1"));
@@ -3841,10 +3855,10 @@ describe("WorkspaceStore", () => {
         expect(shownInputTokens("parent")).toBe(100);
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(600, { child: true })));
 
-        // A hidden workspace's own revision fetches no ledger.
-        await pushUsage("child", 1);
+        // A hidden workspace's own usage change fetches no ledger.
+        await pushUsage("child");
         expect(mockGetSessionUsage).not.toHaveBeenCalled();
-        await pushUsage("parent", 1);
+        await pushUsage("parent");
 
         expect(shownInputTokens("parent")).toBe(600);
       });
@@ -3858,8 +3872,8 @@ describe("WorkspaceStore", () => {
           () => new Promise((resolve) => held.push(() => resolve(projection({}))))
         );
 
-        for (const [index, childId] of children.entries()) {
-          await pushUsage(childId, index + 1);
+        for (const childId of children) {
+          await pushUsage(childId);
         }
         expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
         held[0]();
@@ -3930,7 +3944,7 @@ describe("WorkspaceStore", () => {
     });
 
     it("refreshes the shown ancestors' projections when a sub-agent registers", async () => {
-      // Its usage revision can move before its parent link reaches this store.
+      // Its usage can change before its parent link reaches this store.
       createAndAddWorkspace(store, "parent");
       await tick(10);
       mockGetSubagentUsage.mockClear();

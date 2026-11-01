@@ -44,7 +44,7 @@ test("subscription handlers forward the oRPC runtime Clock", async () => {
   expect(workspaceService.listenerCount("activity")).toBe(0);
 });
 
-test("the activity subscription forwards usage revision moves", async () => {
+test("the activity subscription forwards usage-changed events", async () => {
   const app = makeAppRuntime(TestClock.layer());
   const workspaceService = new EventEmitter();
   const controller = new AbortController();
@@ -54,23 +54,19 @@ test("the activity subscription forwards usage revision moves", async () => {
     const first = iterator.next();
     for (
       let attempt = 0;
-      attempt < 100 && workspaceService.listenerCount("usage-revision") === 0;
+      attempt < 100 && workspaceService.listenerCount("usage-changed") === 0;
       attempt++
     ) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
-    workspaceService.emit("usage-revision", { workspaceId: "ws", usageRevision: 7 });
-    expect((await first).value).toEqual({
-      type: "usage-revision",
-      workspaceId: "ws",
-      usageRevision: 7,
-    });
+    workspaceService.emit("usage-changed", { workspaceId: "ws" });
+    expect((await first).value).toEqual({ type: "usage-changed", workspaceId: "ws" });
   } finally {
     controller.abort();
     await iterator.return(undefined);
     await disposeAppRuntime(app.managed);
   }
-  expect(workspaceService.listenerCount("usage-revision")).toBe(0);
+  expect(workspaceService.listenerCount("usage-changed")).toBe(0);
 });
 
 test("onMetadata opens with a snapshot and delivers events emitted while it is built", async () => {

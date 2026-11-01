@@ -1258,8 +1258,6 @@ export class WorkspaceStore {
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
   private subagentUsage = new Map<string, SubagentUsageByChild>();
-  /** The last usage revision seen per workspace (activity subscription and list). */
-  private usageRevisions = new Map<string, number>();
   /** The getSubagentUsage fetch in flight per workspace. */
   private subagentUsageFetches = new Map<string, SubagentUsageFetch>();
 
@@ -1522,8 +1520,8 @@ export class WorkspaceStore {
     "session-usage-delta": (workspaceId, _aggregator, data) => {
       const usageDelta = data as Extract<WorkspaceChatMessage, { type: "session-usage-delta" }>;
 
-      // A self delta (headless spend) also moved this workspace's usage revision, and the
-      // ledger refetch for that move shows it. Adding it here could count it twice (that
+      // A self delta's write (headless spend) also sent usage-changed for this workspace, and
+      // the ledger refetch for it shows the spend. Adding it here could count it twice (that
       // refetch can land first), and refetching again would supersede that refetch.
       const childId = usageDelta.sourceWorkspaceId;
       if (childId === workspaceId) {
@@ -1820,15 +1818,11 @@ export class WorkspaceStore {
   }
 
   /**
-   * The backend moves usageRevision on every write to a workspace's usage files: a stream's
+   * The backend sends usage-changed on every write to a workspace's usage files: a stream's
    * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
    * and every ancestor's sub-agent projection can have changed.
    */
-  private applyUsageRevision(workspaceId: string, usageRevision: number | undefined): void {
-    if (usageRevision === undefined || this.usageRevisions.get(workspaceId) === usageRevision) {
-      return;
-    }
-    this.usageRevisions.set(workspaceId, usageRevision);
+  private refreshUsageAfterChange(workspaceId: string): void {
     if (this.isUsageShown(workspaceId) && !this.isOwnStreamLive(workspaceId)) {
       this.refreshSessionUsage(workspaceId);
     }
@@ -1837,7 +1831,7 @@ export class WorkspaceStore {
 
   /**
    * The workspace's chat shows its own stream live: its stream-end adds the stream's usage, and
-   * every terminal event refetches the ledger (finalizeUsageStats, stream-error). A revision
+   * every terminal event refetches the ledger (finalizeUsageStats, stream-error). A usage-change
    * refetch before that can already hold the settled stream, and stream-end would add it again.
    */
   private isOwnStreamLive(workspaceId: string): boolean {
@@ -4167,7 +4161,7 @@ export class WorkspaceStore {
     // - Clear liveUsage once the active stream ends
     // - Pick up lastContextUsage changes from merged message metadata
     this.usageStore.bump(workspaceId);
-    // Usage revision moves were skipped while the stream was live (isOwnStreamLive).
+    // Usage changes were skipped while the stream was live (isOwnStreamLive).
     this.refreshSessionUsage(workspaceId);
 
     // Always schedule consumer calculation (tool calls, text, etc. need tokenization)
@@ -4367,6 +4361,7 @@ export class WorkspaceStore {
     snapshots: Record<string, WorkspaceActivitySnapshot>,
     skipWorkspaceIds?: ReadonlySet<string>
   ): void {
+    this.refreshShownUsageAfterResubscribe();
     const seenWorkspaceIds = new Set<string>();
 
     for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
@@ -4375,8 +4370,6 @@ export class WorkspaceStore {
         continue;
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, snapshot, false);
-      // Only the list carries revisions: a resubscribe learns of moves the subscription missed.
-      this.applyUsageRevision(workspaceId, snapshot.usageRevision);
     }
 
     // An empty list is a valid all-idle result (backend read failures arrive as null
@@ -4590,13 +4583,35 @@ export class WorkspaceStore {
   private applyActivityEvent(
     event: Exclude<ActivitySubscriptionEvent, { type: "heartbeat" }>
   ): void {
-    if (event.type === "usage-revision") {
+    if (event.type === "usage-changed") {
       // Not tracked for a list retry: the list's activity for this id is still the newest.
-      this.applyUsageRevision(event.workspaceId, event.usageRevision);
+      this.refreshUsageAfterChange(event.workspaceId);
       return;
     }
     this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
     this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+  }
+
+  /**
+   * A resubscribed activity subscription does not replay the usage-changed events it missed,
+   * so every shown workspace refetches its usage as for a change of its own. The first list
+   * needs none: registration and activation fetch.
+   */
+  private refreshShownUsageAfterResubscribe(): void {
+    if (!this.activityAuthoritative) {
+      return;
+    }
+    for (const workspaceId of this.workspaceMetadata.keys()) {
+      if (!this.isUsageShown(workspaceId)) {
+        continue;
+      }
+      // The ledger waits for a live own stream's end (isOwnStreamLive); the projection does not.
+      if (this.isOwnStreamLive(workspaceId)) {
+        this.refreshSubagentUsage(workspaceId);
+      } else {
+        this.refreshSessionUsage(workspaceId);
+      }
+    }
   }
 
   /**
@@ -4967,8 +4982,8 @@ export class WorkspaceStore {
     // Store metadata for name lookup
     this.workspaceMetadata.set(workspaceId, metadata);
     this.derived.bump("workspaces");
-    // A new sub-agent changes its ancestors' open sub-agents, and its usage revision may have
-    // moved before this parent link was known (listAncestorIds found no ancestors then).
+    // A new sub-agent changes its ancestors' open sub-agents, and its usage may have changed
+    // before this parent link was known (listAncestorIds found no ancestors then).
     this.refreshAncestorSubagentUsage(workspaceId);
 
     // Backend guarantees createdAt via config.ts - this should never be undefined
@@ -5146,7 +5161,6 @@ export class WorkspaceStore {
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
     this.subagentUsage.delete(workspaceId);
-    this.usageRevisions.delete(workspaceId);
     this.subagentUsageFetches.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
@@ -5790,7 +5804,7 @@ export class WorkspaceStore {
       this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
-      // Usage revision moves were skipped while the stream was live (isOwnStreamLive).
+      // Usage changes were skipped while the stream was live (isOwnStreamLive).
       this.refreshSessionUsage(workspaceId);
       return;
     }

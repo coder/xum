@@ -15,8 +15,8 @@ const USAGE = {
   reasoning: { tokens: 0 },
 };
 
-describe("WorkspaceService usage revision", () => {
-  test("a usage write emits a usage-revision event, not an activity snapshot, and lists it", async () => {
+describe("WorkspaceService usage-changed", () => {
+  test("every usage write emits usage-changed and no activity snapshot", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const projectPath = path.join(config.rootDir, "project");
@@ -38,29 +38,18 @@ describe("WorkspaceService usage revision", () => {
         extensionMetadata,
         sessionUsageService,
       });
-      expect((await workspaceService.getActivityList())?.ws?.usageRevision).toBeUndefined();
-      const revisions: number[] = [];
+      const changed: string[] = [];
       const activity: Array<WorkspaceActivitySnapshot | null> = [];
-      workspaceService.on("usage-revision", (event) => {
-        if (event.workspaceId === "ws") revisions.push(event.usageRevision);
-      });
+      workspaceService.on("usage-changed", (event) => changed.push(event.workspaceId));
       workspaceService.on("activity", (event) => activity.push(event.activity));
 
       await sessionUsageService.recordUsage("ws", MODEL, USAGE);
-      expect(revisions).toHaveLength(1);
-      expect((await workspaceService.getActivityList())?.ws?.usageRevision).toBe(revisions[0]);
-
       await sessionUsageService.recordInFlightUsage("ws", "step-key", "message-1", MODEL, USAGE);
-      expect(revisions).toHaveLength(2);
-      expect(revisions[1]).toBeGreaterThan(revisions[0]);
-      // A snapshot read for a usage move could land after a newer activity emit and resend
-      // older activity: usage moves never broadcast activity.
-      expect(activity).toEqual([]);
 
-      // A late usage write after removal announces nothing for the removed id.
-      await extensionMetadata.deleteWorkspace("ws");
-      await sessionUsageService.recordUsage("ws", MODEL, USAGE);
-      expect(revisions).toHaveLength(2);
+      expect(changed).toEqual(["ws", "ws"]);
+      // A usage-triggered snapshot read could land after a newer activity emit and resend older
+      // activity: usage writes never broadcast activity.
+      expect(activity).toEqual([]);
     } finally {
       await cleanup();
     }

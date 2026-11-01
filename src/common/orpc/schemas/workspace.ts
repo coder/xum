@@ -483,10 +483,6 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   goal: GoalSnapshotSchema.nullable().optional().meta({
     description: "Current workspace goal snapshot for sidebar indicators and the Goal tab",
   }),
-  usageRevision: z.number().optional().meta({
-    description:
-      "Changes on every write to this workspace's session usage (its ledger or a running stream's usage). Only activity.list sets it; the subscription announces moves as usage-revision events. Compare for equality only.",
-  }),
   transientGoalOnly: z.boolean().optional().meta({
     description:
       "Internal frontend hint: merge only the goal field from this activity event; do not replace persisted activity fields.",

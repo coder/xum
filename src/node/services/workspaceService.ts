@@ -472,7 +472,6 @@ import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationA
 import { SendPreflight } from "@/node/services/sendPreflight";
 import { ContextMutationGate } from "@/node/services/contextMutationGate";
 import { BashMonitorActivity } from "@/node/services/bashMonitorActivity";
-import { UsageRevisionActivity } from "@/node/services/usageRevisionActivity";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -2263,8 +2262,13 @@ export interface WorkspaceServiceEvents {
     removedParentWorkspaceId?: string;
   }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
-  /** The workspace's usage files changed (see UsageRevisionActivity). */
-  "usage-revision": (event: { workspaceId: string; usageRevision: number }) => void;
+  /**
+   * A write changed the workspace's session usage (SessionUsageService.onUsageChanged), so a
+   * renderer refetches it and its ancestors' sub-agent projections. A session-usage-delta
+   * reaches only a live session's subscribed chat, and nothing else announces a sub-agent's
+   * in-flight or headless spend.
+   */
+  "usage-changed": (event: { workspaceId: string }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
@@ -2671,13 +2675,6 @@ export class WorkspaceService
   private readonly bashProcessChangeListener = (workspaceId: string): void => {
     this.bashMonitorActivity.onProcessChange(workspaceId);
   };
-  private readonly usageRevisionActivity = new UsageRevisionActivity({
-    emitUsageRevision: (workspaceId, usageRevision) => {
-      // A late usage write after removal must not re-insert the removed id in a renderer.
-      if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) return;
-      this.emit("usage-revision", { workspaceId, usageRevision });
-    },
-  });
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2908,7 +2905,7 @@ export class WorkspaceService
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
     this.sessionUsageService?.onUsageChanged((workspaceId) =>
-      this.usageRevisionActivity.onUsageChanged(workspaceId)
+      this.emit("usage-changed", { workspaceId })
     );
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
@@ -18716,7 +18713,6 @@ export class WorkspaceService
   private evictWorkspaceActivityCaches(workspaceId: string): void {
     this.workflowRuns.evictWorkflowRunCaches(workspaceId);
     this.bashMonitorActivity.evictSeenWorkspace(workspaceId);
-    this.usageRevisionActivity.evict(workspaceId);
   }
 
   /**
@@ -19668,7 +19664,7 @@ export class WorkspaceService
           activityById[workspaceId] = merged;
         }
       }
-      return this.usageRevisionActivity.withRevisions(activityById);
+      return activityById;
     } catch (error) {
       log.error("Failed to list activity:", error);
       // null (not {}) so the renderer can tell a read failure from a legitimately
