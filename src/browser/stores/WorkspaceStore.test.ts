@@ -3896,6 +3896,37 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => mockGetSubagentUsage.mock.calls.length === 2)).toBe(true);
     });
 
+    it("drops the projection of a fetch that outlived its workspace's removal", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
+      );
+      createAndAddWorkspace(store, "parent");
+      store.removeWorkspace("parent");
+      createAndAddWorkspace(store, "parent");
+      expect(responses).toHaveLength(2);
+
+      responses[1](projection({ child: [7, 1] }));
+      await tick(0);
+      responses[0](projection({ child: [999, 1] }));
+      await tick(0);
+
+      expect(shownInputTokens("parent")).toBe(7);
+    });
+
+    it("refreshes the shown ancestors' projections when a sub-agent registers", async () => {
+      // Its usage revision can move before its parent link reaches this store.
+      createAndAddWorkspace(store, "parent");
+      await tick(10);
+      mockGetSubagentUsage.mockClear();
+
+      createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
+
+      expect(mockGetSubagentUsage.mock.calls.map(([input]) => input.workspaceId)).toEqual([
+        "parent",
+      ]);
+    });
+
     it("starts a fresh projection fetch for a workspace re-added while its old fetch hangs", () => {
       mockGetSubagentUsage.mockImplementation(() => new Promise(() => undefined));
       createAndAddWorkspace(store, "parent");

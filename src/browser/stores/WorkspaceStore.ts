@@ -418,6 +418,11 @@ export interface WorkspaceUsageState {
   subagentCount?: number;
 }
 
+/** trailing: another refresh was asked for while this fetch ran. */
+interface SubagentUsageFetch {
+  trailing: boolean;
+}
+
 type SubagentUsageByChild = Awaited<
   ReturnType<RouterClient<AppRouter>["workspace"]["getSubagentUsage"]>
 >;
@@ -1265,9 +1270,8 @@ export class WorkspaceStore {
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
   private subagentUsage = new Map<string, SubagentUsageByChild>();
-  private subagentUsageRequestVersion = new Map<string, number>();
-  /** The getSubagentUsage fetch in flight per workspace, and whether another was asked for. */
-  private subagentUsageFetches = new Map<string, { trailing: boolean }>();
+  /** The getSubagentUsage fetch in flight per workspace. */
+  private subagentUsageFetches = new Map<string, SubagentUsageFetch>();
 
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
@@ -1789,14 +1793,12 @@ export class WorkspaceStore {
     this.subagentUsageFetches.set(workspaceId, request);
     // No gate on known children: a parent registers before its children do, so frontend
     // metadata cannot tell that a workspace has none.
-    const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
-    this.subagentUsageRequestVersion.set(workspaceId, requestVersion);
     client.workspace
       .getSubagentUsage(
         { workspaceId },
         { signal: AbortSignal.timeout(this.subagentUsageFetchTimeoutMs) }
       )
-      .then((data) => this.applySubagentUsage(workspaceId, requestVersion, data))
+      .then((data) => this.applySubagentUsage(workspaceId, request, data))
       .catch((error) => {
         console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
       })
@@ -1812,11 +1814,12 @@ export class WorkspaceStore {
 
   private applySubagentUsage(
     workspaceId: string,
-    requestVersion: number,
+    request: SubagentUsageFetch,
     data: SubagentUsageByChild
   ): void {
-    const isLatest = this.subagentUsageRequestVersion.get(workspaceId) === requestVersion;
-    if (!isLatest || !this.isWorkspaceRegistered(workspaceId)) {
+    // A removal or client change dropped this fetch: the workspace can be a new incarnation
+    // with its own fetch.
+    if (this.subagentUsageFetches.get(workspaceId) !== request) {
       return;
     }
     if (this.providersConfig) {
@@ -4965,6 +4968,9 @@ export class WorkspaceStore {
     // Store metadata for name lookup
     this.workspaceMetadata.set(workspaceId, metadata);
     this.derived.bump("workspaces");
+    // A new sub-agent changes its ancestors' open sub-agents, and its usage revision may have
+    // moved before this parent link was known (listAncestorIds found no ancestors then).
+    this.refreshAncestorSubagentUsage(workspaceId);
 
     // Backend guarantees createdAt via config.ts - this should never be undefined
     assert(
@@ -5141,7 +5147,6 @@ export class WorkspaceStore {
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
     this.subagentUsage.delete(workspaceId);
-    this.subagentUsageRequestVersion.delete(workspaceId);
     this.subagentUsageFetches.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();
