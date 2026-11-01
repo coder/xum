@@ -491,7 +491,9 @@ export interface AgentTaskTimestamps {
   reportedAt?: string;
 }
 
-type RpcTaskCreateArgs = Omit<TaskCreateArgs, "thinkingLevel"> & { thinkingLevel?: string };
+type RpcTaskCreateArgs = Omit<TaskCreateArgs, "thinkingLevel" | "abortSignal"> & {
+  thinkingLevel?: string;
+};
 
 function normalizeRpcTaskThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
   return value === "off" ||
@@ -805,6 +807,10 @@ function isAgentRunnableAsChild(
   }
   return params.workflowOwned && frontmatter.subagent?.workflow_runnable === true;
 }
+
+/** Task.create refused at its gate: the spawning call was aborted, or the parent's stop latch is held. */
+export const TASK_CREATE_STOPPED_ERROR =
+  "Task.create: refused because the spawning call was aborted or the parent workspace is being stopped";
 
 export interface TaskCreateResult {
   desktopOwnerWorkspaceId?: string;
@@ -9052,9 +9058,29 @@ export class TaskService implements AgentTaskIntegration {
     return this.readTaskCreateParentBranch(placement.data);
   }
 
+  /**
+   * Sibling creates of one task(n) call queue behind one another on create's locks, so an abort of
+   * the call, or a stop latch on the parent, can land between them. The aborted call must not add
+   * more children, like the serial loop that checked its abort before each create. An ancestor's
+   * cascade (terminateAllDescendantAgentTasks Phase A, under the same mutex) latches the parent
+   * until the parent's turn settled, so a later create would add a child its snapshot missed.
+   * Other latch holders (a hard Stop's boundary latch, a queued workspace-turn handle's task_stop)
+   * also refuse here; the task tool reports those like any failed create.
+   */
+  private isTaskCreateStopped(parent: TaskCreateParent): boolean {
+    return (
+      parent.args.abortSignal?.aborted === true ||
+      this.isWorkspaceStopInProgress(parent.parentWorkspaceId)
+    );
+  }
+
   /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
   private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
     const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
+    if (this.isTaskCreateStopped(parent)) {
+      return Err(TASK_CREATE_STOPPED_ERROR);
+    }
+
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
