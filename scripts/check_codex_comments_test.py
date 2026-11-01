@@ -382,6 +382,11 @@ else:
         self.assertNotEqual(undercounted, board)
         bulletless = re.sub(r"\n- 🟡 [^\n]*", "", board)
         self.assertNotEqual(bulletless, board)
+        bullet = re.search(r"\n- 🟡 [^\n]*", board).group(0)
+        outside = bulletless.replace("\n### Security findings", bullet + "\n\n### Security findings")
+        self.assertNotEqual(outside, bulletless)
+        borrowed = board.replace("#### Advisory findings (1)", "#### Advisory findings (1)\n\n#### Advisory findings (0)")
+        self.assertNotEqual(borrowed, board)
 
         def advisory(resolved):
             return thread(
@@ -397,6 +402,8 @@ else:
             ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
             ("fewer bullets than the declared count", [undercounted, receipt], [advisory(True)], head, 1),
             ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
+            ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
+            ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
             ("no receipt", [board], [advisory(True)], head, 10),
             ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
         ):
