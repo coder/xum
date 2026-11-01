@@ -394,6 +394,7 @@ export interface WorkspaceUsageState {
   };
   /** Last message's context usage (last step only, for context window display) */
   lastContextUsage?: ChatUsageDisplay;
+  /** Tokens of sessionTotal only (no open sub-agents or live stream); displays use sumSessionTokens. */
   totalTokens: number;
   /** Live context usage during streaming (last step's inputTokens = current context window) */
   liveUsage?: ChatUsageDisplay;
@@ -6246,6 +6247,19 @@ export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDispla
   if (usage.subagentTotal) parts.push(usage.subagentTotal);
   if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
   return parts.length > 0 ? sumUsageHistory(parts) : undefined;
+}
+
+/** Token count of sumSessionCostUsage, so every session token display shows the same tree total. */
+export function sumSessionTokens(usage: WorkspaceUsageState): number {
+  const total = sumSessionCostUsage(usage);
+  if (!total) return 0;
+  return (
+    total.input.tokens +
+    total.cached.tokens +
+    total.cacheCreate.tokens +
+    total.output.tokens +
+    total.reasoning.tokens
+  );
 }
 
 /**
