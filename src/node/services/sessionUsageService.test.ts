@@ -780,6 +780,29 @@ describe("SessionUsageService", () => {
       await service.rollUpUsageIntoParent(parentId, childId, { [model]: usage });
       expect(changed).toEqual([]);
     });
+
+    it("reports a read that repairs an unusable ledger, once", async () => {
+      const workspaceId = "notify-repair";
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model: "claude-sonnet-4-20250514",
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "session-usage.json"),
+        "{ invalid json"
+      );
+      const changed: string[] = [];
+      service.onUsageChanged((id) => changed.push(id));
+
+      await service.getSessionUsage(workspaceId);
+      // The repaired ledger is usable: the refetch a notification starts writes nothing.
+      await service.getSessionUsage(workspaceId);
+
+      expect(changed).toEqual([workspaceId]);
+    });
   });
 
   describe("resetSessionUsage", () => {
