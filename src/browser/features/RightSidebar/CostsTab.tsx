@@ -24,7 +24,6 @@ const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "last-request", label: "Last Request" },
 ];
 
-/** Sum two per-model usage records into one map (either may be missing). */
 function mergeUsageByModel(
   a: Record<string, ChatUsageDisplay> | undefined,
   b: Record<string, ChatUsageDisplay> | undefined
@@ -39,10 +38,7 @@ function mergeUsageByModel(
   return merged;
 }
 
-/**
- * Open sub-agents' spend reaches the session ledger only when they are removed. The session
- * cost includes it already; this line says how much of it came from them.
- */
+/** The session cost already includes this spend: the note only says how much came from it. */
 function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
   const cost = props.total ? getTotalCost(props.total) : undefined;
   if (cost === undefined || cost <= 0 || props.count === undefined) {
@@ -66,8 +62,6 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const viewMode =
     useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
-  // Session usage for cost calculation: sessionTotal (own turns plus removed sub-agents),
-  // open sub-agents, and liveCostUsage (cumulative during streaming).
   const sessionUsage = sumSessionCostUsage(usage);
 
   // Per-model session costs. Live streaming usage is not yet folded into the

@@ -219,7 +219,6 @@ interface DescendantTask {
   subtreeId: string;
 }
 
-/** Every descendant of `rootId`, breadth first; cycles are visited once. */
 function listDescendantTasks(
   childrenByParent: ReadonlyMap<string, readonly string[]>,
   rootId: string
@@ -243,14 +242,11 @@ function getOpenDescendantModelUsage(
   descendant: DescendantTask,
   views: ReadonlyMap<string, SessionUsageFile | undefined>
 ): Array<[string, ChatUsageDisplay]> {
+  // Mid-removal: the parent's ledger already holds this descendant's roll-up.
   if (views.get(descendant.parentId)?.rolledUpFrom?.[descendant.id]) return [];
   return Object.entries(views.get(descendant.id)?.byModel ?? {});
 }
 
-/**
- * Sum the usage views of open descendants. A descendant listed in its parent's rolledUpFrom
- * is mid-removal (already in the parent's ledger) and is skipped so it is not counted twice.
- */
 function sumOpenDescendantUsage(
   descendants: readonly DescendantTask[],
   views: ReadonlyMap<string, SessionUsageFile | undefined>
@@ -1124,15 +1120,12 @@ export class SessionUsageService {
    * Usage of a workspace's sub-agents (and their sub-agents) that still exist.
    *
    * A sub-agent's spend reaches its parent's ledger only when the sub-agent workspace is
-   * removed (rollUpUsageIntoParent). Sub-agents that report and stay around therefore hid
-   * most delegated spend from the parent's Costs tab (a parent showed ~$100 while its tree
-   * spent ~$600), so the UI adds this projection to the parent's cost.
+   * removed (rollUpUsageIntoParent), so sub-agents that report and stay around hid most
+   * delegated spend from the parent's Costs tab. The UI adds this projection to the parent's cost.
    *
    * Counted once: each open descendant's ledger already holds its own removed children, and
-   * open grandchildren are visited separately. A descendant listed in its parent's
-   * rolledUpFrom is mid-removal (rolled up, not yet out of config) and is skipped.
-   * Lock-free and read-only, like getSessionUsageBatch; running streams are included because
-   * no other source shows a sub-agent's in-progress spend to the parent.
+   * open grandchildren are visited separately. Running streams are included because no other
+   * source shows a sub-agent's in-progress spend to the parent.
    */
   async getOpenSubagentUsage(workspaceId: string): Promise<OpenSubagentUsage> {
     assert(workspaceId.trim().length > 0, "getOpenSubagentUsage requires workspaceId");
@@ -1150,7 +1143,6 @@ export class SessionUsageService {
     return sumOpenDescendantUsage(descendants, views);
   }
 
-  /** Settled ledger plus in-flight files, without folding, locking or rebuilding from history. */
   private async readUsageViewLockFree(
     workspaceId: string,
     includeOwnLiveStreams: boolean

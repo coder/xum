@@ -3505,8 +3505,6 @@ describe("WorkspaceStore", () => {
     });
   });
 
-  // Loaded session usage is repriced against the current provider config, except for
-  // costs-included rows, whose zero costs are real: repricing them would inflate totals.
   describe("open sub-agent usage", () => {
     const usageOf = (inputTokens: number, inputCost: number) => ({
       input: { tokens: inputTokens, cost_usd: inputCost },
@@ -3574,7 +3572,6 @@ describe("WorkspaceStore", () => {
 
     it("counts a rolled-up child once and refetches the ledger", async () => {
       mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
-      // A stale projection that still lists the child.
       mockGetSubagentUsage.mockImplementation(() =>
         Promise.resolve(projection({ child: [500, 1] }))
       );
@@ -3639,6 +3636,8 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // Loaded session usage is repriced against the current provider config, except for
+  // costs-included rows, whose zero costs are real: repricing them would inflate totals.
   describe("session usage repricing", () => {
     // A flat-priced model: $5/M input and $25/M output tokens.
     const BILLABLE_MODEL = "anthropic:claude-opus-4-5";

@@ -412,7 +412,6 @@ export interface WorkspaceUsageState {
    * removed, so cost displays add this to show what the whole tree has spent so far.
    */
   subagentTotal?: ChatUsageDisplay;
-  /** Per-model source of subagentTotal. */
   subagentByModel?: Record<string, ChatUsageDisplay>;
   /** Open sub-agent workspaces counted in subagentTotal. */
   subagentCount?: number;
@@ -442,8 +441,6 @@ function sumSubtreesNotRolledUp(
 }
 
 /**
- * WorkspaceUsageState sub-agent fields; all undefined when no open sub-agent has usage.
- *
  * A child already in the ledger's rolledUpFrom is dropped here, on every read, not when the
  * projection arrives: the projection and the ledger are separate fetches, and a removal can
  * roll the child up between them (or a delta can add it later), which would count it twice.
@@ -1737,10 +1734,6 @@ export class WorkspaceStore {
       });
   }
 
-  /**
-   * Fetch the usage of the workspace's open sub-agents (see WorkspaceUsageState.subagentTotal).
-   * Same stale-response guard as refreshSessionUsage.
-   */
   private refreshSubagentUsage(workspaceId: string): void {
     const client = this.client;
     if (!client || !this.isWorkspaceRegistered(workspaceId)) {
@@ -1763,7 +1756,6 @@ export class WorkspaceStore {
     requestVersion: number,
     data: SubagentUsageByChild
   ): void {
-    // A newer refresh owns the result, and a removed workspace has no usage to show.
     const isLatest = this.subagentUsageRequestVersion.get(workspaceId) === requestVersion;
     if (!isLatest || !this.isWorkspaceRegistered(workspaceId)) {
       return;
@@ -1772,9 +1764,6 @@ export class WorkspaceStore {
     this.usageStore.bump(workspaceId);
   }
 
-  /**
-   * A sub-agent's spend changes when its stream ends: refresh its ancestors' projections.
-   */
   private refreshAncestorsWhenStreamEnds(
     workspaceId: string,
     previous: WorkspaceActivitySnapshot | null,
@@ -1787,9 +1776,8 @@ export class WorkspaceStore {
   }
 
   /**
-   * Refresh the projection of every ancestor whose usage is on screen or subscribed. Called when
-   * a sub-agent's stream ends and when one leaves the workspace list: a nested sub-agent rolls
-   * into its own parent's ledger, and no session-usage-delta reaches the ancestors.
+   * A nested sub-agent rolls into its own parent's ledger, and no session-usage-delta reaches the
+   * higher ancestors, so their projections are refetched here.
    */
   private refreshAncestorSubagentUsage(workspaceId: string): void {
     for (const ancestorId of this.listAncestorIds(workspaceId)) {
@@ -1799,7 +1787,6 @@ export class WorkspaceStore {
     }
   }
 
-  /** Parent, grandparent, ... from frontend metadata; stops at a cycle. */
   private listAncestorIds(workspaceId: string): string[] {
     const ancestors: string[] = [];
     const seen = new Set<string>([workspaceId]);
@@ -6225,12 +6212,8 @@ export function removeEphemeralMessage(workspaceId: string, messageId: string): 
 }
 
 /**
- * Hook for usage metadata (instant, no tokenization).
- * Updates immediately when usage metadata arrives from API responses.
- */
-/**
  * Session cost usage as the cost displays show it: the persisted ledger (own turns plus removed
- * sub-agents), open sub-agents, and the running stream. Undefined when there is none.
+ * sub-agents), open sub-agents, and the running stream.
  */
 export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDisplay | undefined {
   const parts: ChatUsageDisplay[] = [];
@@ -6240,6 +6223,10 @@ export function sumSessionCostUsage(usage: WorkspaceUsageState): ChatUsageDispla
   return parts.length > 0 ? sumUsageHistory(parts) : undefined;
 }
 
+/**
+ * Hook for usage metadata (instant, no tokenization).
+ * Updates immediately when usage metadata arrives from API responses.
+ */
 export function useWorkspaceUsage(workspaceId: string): WorkspaceUsageState {
   const store = getStoreInstance();
   return useSyncExternalStore(
