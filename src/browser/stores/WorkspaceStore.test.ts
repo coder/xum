@@ -3591,6 +3591,29 @@ describe("WorkspaceStore", () => {
       expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "parent" });
     });
 
+    it("keeps the newest projection when an older response arrives last", async () => {
+      const responses: Array<(value: unknown) => void> = [];
+      mockGetSubagentUsage.mockImplementation(
+        () => new Promise((resolve) => responses.push(resolve))
+      );
+      createAndAddWorkspace(store, "other");
+      createAndAddWorkspace(store, "parent");
+      store.setActiveWorkspaceId("other");
+      store.setActiveWorkspaceId("parent");
+      const parentCalls = mockGetSubagentUsage.mock.calls
+        .map((call, index) => ({ workspaceId: call[0].workspaceId, index }))
+        .filter((call) => call.workspaceId === "parent");
+      expect(parentCalls).toHaveLength(2);
+      const [older, newer] = parentCalls.map((call) => responses[call.index]);
+
+      newer(projection({ child: [7, 1] }));
+      await tick(0);
+      older(projection({ child: [999, 1] }));
+      await tick(0);
+
+      expect(shownInputTokens("parent")).toBe(7);
+    });
+
     it("adds every self delta", async () => {
       // Headless spend (status titles, bash AI proxy) reports the workspace itself as source.
       const send = openChat("parent");

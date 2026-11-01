@@ -1817,6 +1817,15 @@ export class WorkspaceStore {
     return ancestors;
   }
 
+  private repriceAllUsage(config: ProvidersConfigMap, fingerprint: number): void {
+    for (const [, usage] of this.sessionUsage) {
+      repriceSessionUsage(usage, config, fingerprint);
+    }
+    for (const [, usage] of this.subagentUsage) {
+      repriceSubagentUsage(usage, config);
+    }
+  }
+
   private async refreshProvidersConfig(client: RouterClient<AppRouter>): Promise<void> {
     // Version counter prevents an older, slower response from overwriting a newer one.
     // We bump eagerly so concurrent requests each get unique versions, then only apply
@@ -1845,12 +1854,7 @@ export class WorkspaceStore {
         // so mapped-model changes take effect on next access.
         this.consumerManager.invalidateAll();
 
-        for (const [, usage] of this.sessionUsage) {
-          repriceSessionUsage(usage, config, nextFingerprint);
-        }
-        for (const [, usage] of this.subagentUsage) {
-          repriceSubagentUsage(usage, config);
-        }
+        this.repriceAllUsage(config, nextFingerprint);
       }
 
       // Bump usage-store subscribers AFTER repricing so observers see
