@@ -3627,6 +3627,40 @@ describe("WorkspaceStore", () => {
       expect(shownInputTokens("parent")).toBe(2);
     });
 
+    it("sums model keys named after Object.prototype members", async () => {
+      const byModel = Object.fromEntries(
+        ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"].map((key) => [
+          key,
+          usageOf(10, 0.1),
+        ])
+      );
+      mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
+      mockGetSubagentUsage.mockImplementation(() =>
+        Promise.resolve({
+          children: {
+            a: { byModel, workspaceCount: 1 },
+            b: { byModel, workspaceCount: 1 },
+          },
+        })
+      );
+      const send = openChat("parent");
+      createAndAddWorkspace(store, "parent");
+      await send(caughtUpEvent());
+      await tick(10);
+      mockGetSessionUsage.mockImplementation(() => new Promise(() => undefined));
+
+      await send({
+        type: "session-usage-delta",
+        workspaceId: "parent",
+        sourceWorkspaceId: "parent",
+        byModelDelta: byModel,
+        timestamp: 1,
+      });
+
+      // Ledger 100, two sub-agent subtrees of 5 x 10, one self delta of 5 x 10.
+      expect(shownInputTokens("parent")).toBe(100 + 100 + 50);
+    });
+
     it("refreshes the parent's projection when a sub-agent's stream ends", async () => {
       const releaseStop = mockBackgroundActivityTransition(
         "child",

@@ -9,7 +9,7 @@ import { withTargetMutationLock } from "@/node/services/refinement/targetMutatio
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import { addModelUsage, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
 import {
@@ -200,17 +200,6 @@ async function readInFlightUsageFile(
   } catch {
     return undefined;
   }
-}
-
-function addModelUsage(
-  byModel: Record<string, ChatUsageDisplay>,
-  model: string,
-  usage: ChatUsageDisplay
-): void {
-  const existing = byModel[model];
-  const sum = existing ? sumUsageHistory([existing, usage]) : usage;
-  assert(sum, "addModelUsage: sum of two usages must exist");
-  byModel[model] = sum;
 }
 
 interface DescendantTask {
@@ -574,8 +563,11 @@ export class SessionUsageService {
       const current = await this.readFile(workspaceId);
       const entries = await this.readInFlightEntries(workspaceId);
       const { filesToDelete } = this.foldOrphanedInFlightUsage(workspaceId, current, entries);
-      // CRITICAL: Accumulate, don't overwrite
-      addModelUsage(current.byModel, model, usage);
+      // CRITICAL: Accumulate, don't overwrite. A key a rebuild already settled is counted
+      // through its final message in history (markInFlightFilesCountedByHistory).
+      if (settlesKey === undefined || !current.settledInFlightKeys?.includes(settlesKey)) {
+        addModelUsage(current.byModel, model, usage);
+      }
       if (options?.skipLastRequestUpdate !== true) {
         current.lastRequest = { model, usage, timestamp: Date.now() };
       }
@@ -974,9 +966,7 @@ export class SessionUsageService {
       }
 
       for (const [model, usage] of entries) {
-        const existing = current.byModel[model];
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+        addModelUsage(current.byModel, model, usage);
       }
 
       let totalTokens = 0;
@@ -1196,10 +1186,8 @@ export class SessionUsageService {
     try {
       // collectFullHistory requires the workspace lock (in memory; it creates no files).
       return await this.fileLocks.withLock(workspaceId, async () => {
+        // An empty history still runs: a running stream's in-flight file must count.
         const messages = await this.collectFullHistory(workspaceId);
-        if (messages.length === 0) {
-          return undefined;
-        }
         const { view: rebuilt } = this.addRunningStreamsToView(
           workspaceId,
           await this.rebuildFromMessagesInternal(workspaceId, messages),
@@ -1281,10 +1269,7 @@ export class SessionUsageService {
       usage: ChatUsageDisplay,
       metadataModel?: string
     ): void => {
-      const model = usageBucketKey(rawModel, metadataModel);
-      const existing = result.byModel[model];
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
+      addModelUsage(result.byModel, usageBucketKey(rawModel, metadataModel), usage);
     };
 
     const messageIdsWithUsage = new Set<string>();
@@ -1330,8 +1315,10 @@ export class SessionUsageService {
   }
 
   /**
-   * A leftover in-flight file whose message reached history with usage (its final ledger
-   * write failed after the message was saved) is already counted by a rebuild: mark it settled.
+   * An in-flight file whose message reached history with usage is already counted by a
+   * rebuild: mark it settled. Its stream can be gone (the final ledger write failed after the
+   * message was saved) or still running: stream end commits the final message to history
+   * before its settle takes the lock, so a rebuild can run in between.
    */
   private async markInFlightFilesCountedByHistory(
     workspaceId: string,
@@ -1340,7 +1327,7 @@ export class SessionUsageService {
   ): Promise<void> {
     for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
       const messageId = entry.file?.messageId;
-      if (messageId && messageIdsWithUsage.has(messageId) && this.isOrphan(workspaceId, entry)) {
+      if (messageId && messageIdsWithUsage.has(messageId)) {
         withSettledInFlightKey(rebuilt, entry.key);
       }
     }

@@ -44,6 +44,10 @@ function createUsageWithCosts(
     reasoning: { tokens: 0 },
   };
 }
+
+/** Model keys a plain object inherits a value for. */
+const PROTOTYPE_MEMBER_KEYS = ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"];
+
 describe("SessionUsageService", () => {
   let service: SessionUsageService;
   let config: Config;
@@ -455,6 +459,21 @@ describe("SessionUsageService", () => {
       expect(result?.byModel[nestedToolModel]).toEqual(nestedToolUsage);
       expect(result?.lastRequest?.model).toBe(nestedToolModel);
       expect(result?.lastRequest?.usage).toEqual(nestedToolUsage);
+    });
+
+    it("accumulates model keys named after Object.prototype members", async () => {
+      const workspaceId = "test-workspace";
+      for (const model of PROTOTYPE_MEMBER_KEYS) {
+        await service.recordUsage(workspaceId, model, createUsage(1, 1));
+        await service.recordUsage(workspaceId, model, createUsage(2, 2));
+      }
+
+      const result = await service.getSessionUsage(workspaceId);
+
+      for (const model of PROTOTYPE_MEMBER_KEYS) {
+        expect(Object.hasOwn(result!.byModel, model)).toBe(true);
+        expect(result!.byModel[model].input.tokens).toBe(3);
+      }
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -980,6 +999,69 @@ describe("SessionUsageService", () => {
       expect(result.children.child.byModel[model].input.tokens).toBe(107);
     });
 
+    it("sums model keys named after Object.prototype members", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await addWorkspace("grandchild", "child");
+      const byModel = Object.fromEntries(
+        PROTOTYPE_MEMBER_KEYS.map((key) => [key, createUsage(3, 3)])
+      );
+      for (const id of ["child", "grandchild"]) {
+        await fs.mkdir(path.join(config.sessionsDir, id), { recursive: true });
+        await fs.writeFile(
+          path.join(config.sessionsDir, id, "session-usage.json"),
+          JSON.stringify({ byModel, version: 1 })
+        );
+      }
+      await service.recordInFlightUsage(
+        "child",
+        "stream-key",
+        "msg1",
+        "valueOf",
+        createUsage(7, 0)
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      // The ledger schema drops a "__proto__" key; every other key is summed.
+      const subtree = result.children.child.byModel;
+      const inputTokens = (key: string) => subtree[key].input.tokens;
+      expect(inputTokens("toString")).toBe(6);
+      expect(inputTokens("constructor")).toBe(6);
+      expect(inputTokens("hasOwnProperty")).toBe(6);
+      expect(inputTokens("valueOf")).toBe(13);
+    });
+
+    it("counts a running stream of a sub-agent with an empty history and no ledger", async () => {
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg1", model, createUsage(7, 0));
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(7);
+    });
+
+    it("counts a stream once when its final message reached history before it settled", async () => {
+      // Stream end commits the final message to history, then settles the in-flight key in a
+      // separate lock turn: a projection read can run in between.
+      await addWorkspace("root");
+      await addWorkspace("child", "root");
+      await service.recordInFlightUsage("child", "stream-key", "msg1", model, createUsage(60, 0));
+      await historyService.appendToHistory(
+        "child",
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, "child", "session-usage.json"), { force: true });
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(result.children.child.byModel[model].input.tokens).toBe(100);
+    });
+
     it("returns nothing for a workspace without sub-agents", async () => {
       await addWorkspace("lonely");
       await service.recordUsage("lonely", model, createUsage(1, 1));
@@ -1036,6 +1118,38 @@ describe("SessionUsageService", () => {
       expect(result).toBeDefined();
       // Should have rebuilt and summed the usage
       expect(result!.byModel["claude-sonnet-4-20250514"]).toBeDefined();
+    });
+
+    it("counts a stream once when a rebuild ran between its history commit and its settle", async () => {
+      const workspaceId = "test-workspace";
+      const model = "claude-sonnet-4-20250514";
+      await service.recordInFlightUsage(
+        workspaceId,
+        "stream-key",
+        "msg1",
+        model,
+        createUsage(60, 0)
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        })
+      );
+      await fs.rm(path.join(config.sessionsDir, workspaceId, "session-usage.json"), {
+        force: true,
+      });
+      // The rebuild counts the final message from history and writes the ledger.
+      expect((await service.getSessionUsage(workspaceId))?.byModel[model].input.tokens).toBe(100);
+
+      await service.recordUsage(workspaceId, model, createUsage(100, 50), {
+        settlesInFlightKey: "stream-key",
+      });
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.byModel[model].input.tokens).toBe(100);
+      expect(result?.lastRequest?.usage.input.tokens).toBe(100);
     });
   });
 
