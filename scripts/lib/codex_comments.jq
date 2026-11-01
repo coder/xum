@@ -127,9 +127,13 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           # and no open Codex thread ($cleared.clean_security_receipt, set by
           # check_codex_comments.sh). Any other null stays unknown, so it blocks.
           # Codex keeps listing an advisory after its thread is resolved (#7859). The
-          # bullet check below still blocks every advisory bullet that is not cleared.
+          # bullet check below still blocks every advisory bullet that is not cleared. With
+          # null flags the bullets are the only finding list, so their count must match
+          # the declared one: a missing bullet could be a live finding.
           | ($security.status == "completed" and $security.headSha == $head
-            and $security.mergeGateEnabled == false)
+            and $security.mergeGateEnabled == false
+            and ([$lines[] | capture("^#### Advisory findings \\((?<n>[0-9]+)\\)$").n | tonumber] | add // 0)
+              == ([$lines[] | select(startswith("- "))] | length))
             as $null_security_base
           # Runs triggered by a push post no receipt (coder/xum#7731): until a Codex security
           # review request brings one, such a board is pending, so wait budgets cover it.

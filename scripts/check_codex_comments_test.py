@@ -378,6 +378,10 @@ else:
         link = f"(https://github.com/coder/xum/pull/7859#discussion_r{discussion})"
         unlinked = board.replace("[Let Stop preempt grouped task creation]" + link, "Let Stop preempt grouped task creation")
         self.assertNotEqual(unlinked, board)
+        undercounted = board.replace("#### Advisory findings (1)", "#### Advisory findings (2)")
+        self.assertNotEqual(undercounted, board)
+        bulletless = re.sub(r"\n- 🟡 [^\n]*", "", board)
+        self.assertNotEqual(bulletless, board)
 
         def advisory(resolved):
             return thread(
@@ -391,6 +395,8 @@ else:
             ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
             ("unresolved advisory", [board, receipt], [advisory(False)], head, 1),
             ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
+            ("fewer bullets than the declared count", [undercounted, receipt], [advisory(True)], head, 1),
+            ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
             ("no receipt", [board], [advisory(True)], head, 10),
             ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
         ):
