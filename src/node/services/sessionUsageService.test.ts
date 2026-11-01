@@ -1,6 +1,10 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
+import {
+  SessionUsageService,
+  type SessionUsageFile,
+  type SessionUsageTokenStatsCacheV1,
+} from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
@@ -1224,10 +1228,15 @@ describe("SessionUsageService", () => {
       });
     }
 
-    // The third column is the rolledUpFrom a read returns, when not the ledger's own.
-    const partlyBad: Array<[string, Record<string, unknown>, unknown?]> = [
-      ["a null model entry", { ...ledger, byModel: { ...ledger.byModel, bad: null } }],
-      ["a model entry in a wrong shape", { ...ledger, byModel: { ...ledger.byModel, bad: 5 } }],
+    const kept = ledger.rolledUpFrom;
+    // The third column is the rolledUpFrom a read returns.
+    const partlyBad: Array<[string, Record<string, unknown>, SessionUsageFile["rolledUpFrom"]]> = [
+      ["a null model entry", { ...ledger, byModel: { ...ledger.byModel, bad: null } }, kept],
+      [
+        "a model entry in a wrong shape",
+        { ...ledger, byModel: { ...ledger.byModel, bad: 5 } },
+        kept,
+      ],
       ["a null rolledUpFrom", { ...ledger, rolledUpFrom: null }, undefined],
       ["a string rolledUpFrom", { ...ledger, rolledUpFrom: "child" }, undefined],
       ["an array rolledUpFrom", { ...ledger, rolledUpFrom: ["child"] }, undefined],
@@ -1236,22 +1245,20 @@ describe("SessionUsageService", () => {
         { ...ledger, rolledUpFrom: { child: 5 } },
         { child: true },
       ],
-      ["a malformed lastRequest", { ...ledger, lastRequest: { model: 1 } }],
-      ["a malformed tokenStatsCache", { ...ledger, tokenStatsCache: 5 }],
-      ["an object settledInFlightKeys", { ...ledger, settledInFlightKeys: {} }],
-      ["a null settledInFlightKeys", { ...ledger, settledInFlightKeys: null }],
-      ["non-string settledInFlightKeys", { ...ledger, settledInFlightKeys: [1, 2] }],
+      ["a malformed lastRequest", { ...ledger, lastRequest: { model: 1 } }, kept],
+      ["a malformed tokenStatsCache", { ...ledger, tokenStatsCache: 5 }, kept],
+      ["an object settledInFlightKeys", { ...ledger, settledInFlightKeys: {} }, kept],
+      ["a null settledInFlightKeys", { ...ledger, settledInFlightKeys: null }, kept],
+      ["non-string settledInFlightKeys", { ...ledger, settledInFlightKeys: [1, 2] }, kept],
     ];
-    for (const [name, raw, ...rolledUpFrom] of partlyBad) {
+    for (const [name, raw, rolledUpFrom] of partlyBad) {
       // History can be shorter than the ledger (rolled-up children, edited history): a
       // rebuild would lose that spend, so only the bad part is dropped.
       it(`keeps the valid spend of a ledger with ${name}`, async () => {
         await writeLedger(raw);
         const result = await readThroughIpc();
         expect(inputTokens(result)).toBe(100);
-        expect(result?.rolledUpFrom).toEqual(
-          rolledUpFrom.length > 0 ? rolledUpFrom[0] : ledger.rolledUpFrom
-        );
+        expect(result?.rolledUpFrom).toEqual(rolledUpFrom);
       });
 
       it(`records usage after a ledger with ${name}, keeping its valid spend`, async () => {
