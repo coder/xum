@@ -146,8 +146,8 @@ export function createMockDraftsApi() {
     getCreation: (input: { scope: CreationDraftScope }) =>
       Promise.resolve(creationDrafts.get(input.scope.draftId) ?? null),
     updateCreation: ({ scope, ...patch }: CreationDraftUpdateInput) => {
-      const record = putCreation(scope.draftId, patch);
-      return Promise.resolve({ ...summarizeCreationDraft(record), record });
+      const { attachments: _attachments, ...record } = putCreation(scope.draftId, patch);
+      return Promise.resolve({ ...summarizeCreationDraft({ ...record, attachments: [] }), record });
     },
     deleteCreation: (input: { scope: CreationDraftScope }) => {
       creationDrafts.delete(input.scope.draftId);

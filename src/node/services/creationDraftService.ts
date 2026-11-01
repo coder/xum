@@ -241,7 +241,8 @@ export class CreationDraftService {
       const parsed = CreationDraftSchema.safeParse(next);
       if (!parsed.success) throw new CreationDraftRejectedError("Invalid creation draft.");
       await this.writeRecord(parsed.data);
-      return { ...summarizeCreationDraft(parsed.data), record: parsed.data };
+      const { attachments: _attachments, ...record } = parsed.data;
+      return { ...summarizeCreationDraft(parsed.data), record };
     });
   }
 

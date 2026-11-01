@@ -96,7 +96,8 @@ const draftBackend = createTestApiClient({
         ...patch,
         createdAt: 0,
       };
-      return { ...summarizeCreationDraft(record), record };
+      const { attachments: _attachments, ...stored } = record;
+      return { ...summarizeCreationDraft(record), record: stored };
     },
     deleteCreation: () => Promise.resolve(),
   },

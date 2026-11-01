@@ -63,7 +63,14 @@ describe("CreationDraftService", () => {
       projectPath: PROJECT_B,
       execution: { agent: null, runtime: null, trunkBranch: null },
     });
-    await service.update({ scope: scope("d1"), text: "fix it now" });
+    const reply = await service.update({ scope: scope("d1"), text: "fix it now" });
+    // The reply carries the merged record without its (possibly large) attachments.
+    expect(reply.record).toMatchObject({
+      projectPath: PROJECT_B,
+      text: "fix it now",
+      manualName: "my-name",
+    });
+    expect("attachments" in reply.record).toBe(false);
 
     const reloaded = new CreationDraftService(config);
     const record = await reloaded.get("d1");

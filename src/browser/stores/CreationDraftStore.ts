@@ -632,8 +632,13 @@ export class CreationDraftStore {
       entry.saving = false;
       entry.persisted = true;
       // The stored record, not this window's copy: the backend merged only this save's fields, so
-      // another window's earlier save of other fields is part of it (#7728).
-      entry.stored = reply.record;
+      // another window's earlier save of other fields is part of it (#7728). The reply leaves out
+      // attachments: use the ones this save sent, else the last known stored ones. If another
+      // window changed only those, a delete retry keeps the record (fails safe).
+      entry.stored = {
+        ...reply.record,
+        attachments: patch.attachments ?? entry.stored?.attachments ?? draft.attachments,
+      };
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {

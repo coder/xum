@@ -756,6 +756,8 @@ describe("CreationDraftStore", () => {
     const harness = await createHarness(tempDir);
     const { store: windowA, control, service } = harness;
     const id = windowA.create(PROJECT_A, null, { text: "draft" });
+    // Save replies leave out attachments: the condition takes them from this window's saves.
+    windowA.update(id, { attachments: [image] });
     await windowA.flush(id);
     // Window B names the draft, then window A saves only its text: the backend merges both.
     const windowB = await reopen(harness, id, PROJECT_A);
