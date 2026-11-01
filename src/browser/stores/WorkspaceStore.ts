@@ -746,8 +746,33 @@ function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): str
 // cached-rows-plus-dock-shimmer catch-up UI.
 const STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS = 10_000;
 
+// One getSubagentUsage fetch runs per workspace at a time, so one that never settles (a stalled
+// backend read) would hold back every later refresh: past this deadline it fails and the
+// trailing fetch runs. A projection read normally takes milliseconds.
+const SUBAGENT_USAGE_FETCH_TIMEOUT_MS = 30_000;
+
 export interface WorkspaceStoreOptions {
   staleTranscriptSkeletonTimeoutMs?: number;
+  subagentUsageFetchTimeoutMs?: number;
+}
+
+/**
+ * A transientGoalOnly snapshot updates only the goal of the snapshot the store has. It still
+ * carries the latest usage revision, which a later snapshot must deliver when an emit is lost.
+ */
+function mergeTransientGoalSnapshot(
+  previous: WorkspaceActivitySnapshot | null,
+  snapshot: WorkspaceActivitySnapshot
+): WorkspaceActivitySnapshot {
+  if (!previous) {
+    const snapshotWithoutHint: WorkspaceActivitySnapshot = { ...snapshot };
+    delete snapshotWithoutHint.transientGoalOnly;
+    return snapshotWithoutHint;
+  }
+  const merged = { ...previous, goal: snapshot.goal };
+  return snapshot.usageRevision === undefined
+    ? merged
+    : { ...merged, usageRevision: snapshot.usageRevision };
 }
 
 function createInitialChatTransientState(): WorkspaceChatTransientState {
@@ -1157,6 +1182,7 @@ export class WorkspaceStore {
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
   private readonly staleSkeletonTimeoutMs: number;
+  private readonly subagentUsageFetchTimeoutMs: number;
   // Per-workspace bound on the stale-cache skeleton for the current subscribe attempt.
   private staleSkeletonDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
   // Recency timestamp observed when a workspace transitions into streaming=true.
@@ -1502,26 +1528,28 @@ export class WorkspaceStore {
     "session-usage-delta": (workspaceId, _aggregator, data) => {
       const usageDelta = data as Extract<WorkspaceChatMessage, { type: "session-usage-delta" }>;
 
-      // A self delta (headless spend) only refetches: the refetch for its usage revision can
-      // land first, and adding the delta to that ledger would count it twice.
+      // A self delta (headless spend) also moved this workspace's usage revision, and the
+      // ledger refetch for that move shows it. Adding it here could count it twice (that
+      // refetch can land first), and refetching again would supersede that refetch.
       const childId = usageDelta.sourceWorkspaceId;
-      if (childId !== workspaceId) {
-        const current = this.sessionUsage.get(workspaceId) ?? {
-          byModel: {},
-          version: 1 as const,
-        };
-        // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
-        // holds it, and adding it again would count it twice; recording it in rolledUpFrom
-        // also drops it from the projection.
-        if (!current.rolledUpFrom?.[childId]) {
-          for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
-            addModelUsage(current.byModel, model, usage);
-          }
-        }
-        current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
-        this.sessionUsage.set(workspaceId, current);
-        this.usageStore.bump(workspaceId);
+      if (childId === workspaceId) {
+        return;
       }
+      const current = this.sessionUsage.get(workspaceId) ?? {
+        byModel: {},
+        version: 1 as const,
+      };
+      // A child's delta is its one-time roll-up. A ledger fetched after the roll-up already
+      // holds it, and adding it again would count it twice; recording it in rolledUpFrom also
+      // drops it from the projection.
+      if (!current.rolledUpFrom?.[childId]) {
+        for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
+          addModelUsage(current.byModel, model, usage);
+        }
+      }
+      current.rolledUpFrom = { ...current.rolledUpFrom, [childId]: true };
+      this.sessionUsage.set(workspaceId, current);
+      this.usageStore.bump(workspaceId);
       // A ledger fetch still in flight read the file before the roll-up and would overwrite
       // this merge: refetch, so the newer response wins (it also refreshes the projection).
       this.refreshSessionUsage(workspaceId);
@@ -1659,6 +1687,8 @@ export class WorkspaceStore {
     this.onModelUsed = onModelUsed;
     this.staleSkeletonTimeoutMs =
       options?.staleTranscriptSkeletonTimeoutMs ?? STALE_TRANSCRIPT_SKELETON_TIMEOUT_MS;
+    this.subagentUsageFetchTimeoutMs =
+      options?.subagentUsageFetchTimeoutMs ?? SUBAGENT_USAGE_FETCH_TIMEOUT_MS;
 
     // Initialize consumer calculation manager
     this.consumerManager = new WorkspaceConsumerManager(
@@ -1762,7 +1792,10 @@ export class WorkspaceStore {
     const requestVersion = (this.subagentUsageRequestVersion.get(workspaceId) ?? 0) + 1;
     this.subagentUsageRequestVersion.set(workspaceId, requestVersion);
     client.workspace
-      .getSubagentUsage({ workspaceId })
+      .getSubagentUsage(
+        { workspaceId },
+        { signal: AbortSignal.timeout(this.subagentUsageFetchTimeoutMs) }
+      )
       .then((data) => this.applySubagentUsage(workspaceId, requestVersion, data))
       .catch((error) => {
         console.warn(`Failed to fetch sub-agent usage for ${workspaceId}:`, error);
@@ -4170,9 +4203,7 @@ export class WorkspaceStore {
     const previous = this.workspaceActivity.get(workspaceId) ?? null;
 
     if (snapshot?.transientGoalOnly === true) {
-      const snapshotWithoutHint: WorkspaceActivitySnapshot = { ...snapshot };
-      delete snapshotWithoutHint.transientGoalOnly;
-      snapshot = previous ? { ...previous, goal: snapshot.goal } : snapshotWithoutHint;
+      snapshot = mergeTransientGoalSnapshot(previous, snapshot);
     }
 
     if (snapshot) {
