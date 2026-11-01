@@ -653,7 +653,10 @@ export class CreationDraftStore {
       });
       entry.saving = false;
       entry.persisted = true;
-      entry.stored = storedAfterSave(reply.record, patch, entry.stored, draft);
+      // An older backend (a renderer that skipped its bundle reload) sends no record: keep this
+      // window's copy then, as before #7728's fix, so a delete retry still sends a full record.
+      const { record } = reply as Partial<CreationDraftUpdateOutput>;
+      entry.stored = record ? storedAfterSave(record, patch, entry.stored, draft) : draft;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {

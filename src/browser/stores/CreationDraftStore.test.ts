@@ -797,6 +797,32 @@ describe("CreationDraftStore", () => {
     expect(await service.get(id)).toBeNull();
   });
 
+  test("a save reply from an older backend (no record) keeps a full delete condition", async () => {
+    using tempDir = new TestTempDir("creation-store-legacy-save-reply");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const drafts = harness.newClient().drafts;
+    // An older backend's reply: the summary only.
+    const legacyClient = createTestApiClient({
+      drafts: {
+        ...drafts,
+        updateCreation: async (input: CreationDraftUpdateInput) => {
+          const { record: _record, ...summary } = await drafts.updateCreation(input);
+          return summary as Awaited<ReturnType<typeof drafts.updateCreation>>;
+        },
+      },
+    });
+    store.setClient(legacyClient);
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+
+    control.failDeletes = 1;
+    await store.delete(id);
+    store.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect(await service.get(id)).toBeNull();
+  });
+
   test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
     using tempDir = new TestTempDir("creation-store-delete-during-save");
     const harness = await createHarness(tempDir);
