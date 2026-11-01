@@ -6,6 +6,7 @@ import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { z } from "zod";
 import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
+import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import {
   getTotalCost,
   sumUsageHistory,
@@ -591,14 +592,14 @@ describe("SessionUsageService", () => {
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(40);
     });
 
-    it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
+    it("still appends the analytics sidecar when the usage ledger is unreadable", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
       const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
-      // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
+      // Unreadable ledger (a directory at its path): the read throws, which must
       // not block the sidecar — headless spend has no chat-row fallback.
-      await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{not json");
+      await fs.mkdir(path.join(sessionDir, "session-usage.json"));
 
       const recorded = await service.recordHeadlessUsage(
         workspaceId,
@@ -922,12 +923,14 @@ describe("SessionUsageService", () => {
       expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
     });
 
-    it("reads a ledger with corrupt settled keys as absent and keeps its siblings", async () => {
+    it("keeps a sub-agent ledger with corrupt settled keys, counting no orphaned stream", async () => {
       await addWorkspace("root");
       await addWorkspace("broken", "root");
       await addWorkspace("healthy", "root");
       await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
-      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
+      // The ledger may already count this file: the keys that would say so are unreadable.
+      await service.recordInFlightUsage("broken", "orphan", "msg-x", model, createUsage(60, 0));
+      service.releaseInFlightUsage("broken", "orphan");
       await fs.writeFile(
         path.join(config.sessionsDir, "broken", "session-usage.json"),
         JSON.stringify({
@@ -939,7 +942,9 @@ describe("SessionUsageService", () => {
 
       const result = await service.getOpenSubagentUsage("root");
 
-      expect(Object.keys(result.children)).toEqual(["healthy"]);
+      expect(Object.keys(result.children).sort()).toEqual(["broken", "healthy"]);
+      expect(result.children.broken.byModel[model].input.tokens).toBe(3);
+      expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
     });
 
     it("sums a sub-agent ledger whose entry has a null long-context share", async () => {
@@ -1071,7 +1076,7 @@ describe("SessionUsageService", () => {
   });
 
   describe("getSessionUsageBatch", () => {
-    it("reads a ledger with a malformed field as absent and keeps the others", async () => {
+    it("drops a malformed field of a ledger and keeps the rest", async () => {
       const model = "claude-sonnet-4-20250514";
       await service.recordUsage("good", model, createUsage(5, 5));
       await service.recordUsage("bad", model, createUsage(1, 1));
@@ -1085,7 +1090,8 @@ describe("SessionUsageService", () => {
       expect(
         z.record(z.string(), SessionUsageFileSchema.optional()).safeParse(result).success
       ).toBe(true);
-      expect(result.bad).toBeUndefined();
+      expect(result.bad?.lastRequest).toBeUndefined();
+      expect(result.bad?.byModel[model].input.tokens).toBe(1);
       expect(result.good?.byModel[model].input.tokens).toBe(5);
     });
   });
@@ -1150,6 +1156,185 @@ describe("SessionUsageService", () => {
       const result = await service.getSessionUsage(workspaceId);
       expect(result?.byModel[model].input.tokens).toBe(100);
       expect(result?.lastRequest?.usage.input.tokens).toBe(100);
+    });
+  });
+
+  describe("a workspace's own ledger in a wrong shape", () => {
+    const workspaceId = "shape-workspace";
+    const model = "claude-sonnet-4-20250514";
+    const getSessionUsageOutput = workspaceApi.getSessionUsage.output;
+    // The ledger holds 100 input tokens, 40 of them rolled up from a removed child; history,
+    // which lacks the child, holds 300. A rebuild from history reads 300, a kept ledger 100.
+    const ledger = {
+      byModel: { [model]: createUsage(100, 0) },
+      rolledUpFrom: { child: { totalTokens: 40, rolledUpAtMs: 1 } },
+      version: 1,
+    };
+
+    const writeLedger = async (raw: unknown) => {
+      const dir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "session-usage.json"), JSON.stringify(raw));
+    };
+    const inputTokens = (file: { byModel: Record<string, ChatUsageDisplay> } | undefined) =>
+      Object.values(file?.byModel ?? {}).reduce((sum, usage) => sum + usage.input.tokens, 0);
+    /** What the Costs tab gets: the IPC output schema must accept it. */
+    const readThroughIpc = async () => {
+      const parsed = getSessionUsageOutput.safeParse(await service.getSessionUsage(workspaceId));
+      expect(parsed.error).toBeUndefined();
+      return parsed.data;
+    };
+
+    beforeEach(async () => {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "assistant", "Hello", {
+          model,
+          usage: { inputTokens: 300, outputTokens: 0, totalTokens: 300 },
+        })
+      );
+    });
+
+    const unusable: Array<[string, unknown]> = [
+      ["a null byModel", { ...ledger, byModel: null }],
+      ["a string byModel", { ...ledger, byModel: "x" }],
+      ["version 2", { ...ledger, version: 2 }],
+      ["no version", { byModel: ledger.byModel }],
+      ["a JSON null", null],
+      ["a JSON array", [ledger]],
+    ];
+    for (const [name, raw] of unusable) {
+      it(`rebuilds a ledger with ${name} from history`, async () => {
+        await writeLedger(raw);
+        expect(inputTokens(await readThroughIpc())).toBe(300);
+        // The repaired ledger is on disk: the next read does not rebuild again.
+        const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock");
+        try {
+          expect(inputTokens(await readThroughIpc())).toBe(300);
+          expect(iterateSpy).not.toHaveBeenCalled();
+        } finally {
+          iterateSpy.mockRestore();
+        }
+      });
+
+      it(`records usage after a ledger with ${name}, keeping the spend history has`, async () => {
+        await writeLedger(raw);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(307);
+      });
+    }
+
+    // The third column is the rolledUpFrom a read returns, when not the ledger's own.
+    const partlyBad: Array<[string, Record<string, unknown>, unknown?]> = [
+      ["a null model entry", { ...ledger, byModel: { ...ledger.byModel, bad: null } }],
+      ["a model entry in a wrong shape", { ...ledger, byModel: { ...ledger.byModel, bad: 5 } }],
+      ["a null rolledUpFrom", { ...ledger, rolledUpFrom: null }, undefined],
+      ["a string rolledUpFrom", { ...ledger, rolledUpFrom: "child" }, undefined],
+      ["an array rolledUpFrom", { ...ledger, rolledUpFrom: ["child"] }, undefined],
+      [
+        "a malformed rolledUpFrom entry",
+        { ...ledger, rolledUpFrom: { child: 5 } },
+        { child: true },
+      ],
+      ["a malformed lastRequest", { ...ledger, lastRequest: { model: 1 } }],
+      ["a malformed tokenStatsCache", { ...ledger, tokenStatsCache: 5 }],
+      ["an object settledInFlightKeys", { ...ledger, settledInFlightKeys: {} }],
+      ["a null settledInFlightKeys", { ...ledger, settledInFlightKeys: null }],
+      ["non-string settledInFlightKeys", { ...ledger, settledInFlightKeys: [1, 2] }],
+    ];
+    for (const [name, raw, ...rolledUpFrom] of partlyBad) {
+      // History can be shorter than the ledger (rolled-up children, edited history): a
+      // rebuild would lose that spend, so only the bad part is dropped.
+      it(`keeps the valid spend of a ledger with ${name}`, async () => {
+        await writeLedger(raw);
+        const result = await readThroughIpc();
+        expect(inputTokens(result)).toBe(100);
+        expect(result?.rolledUpFrom).toEqual(
+          rolledUpFrom.length > 0 ? rolledUpFrom[0] : ledger.rolledUpFrom
+        );
+      });
+
+      it(`records usage after a ledger with ${name}, keeping its valid spend`, async () => {
+        await writeLedger(raw);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+    }
+
+    it("keeps the rolled-up children of a partly bad ledger, so a retried roll-up counts once", async () => {
+      await config.addWorkspace("/tmp/mux-session-usage-test-project", {
+        id: workspaceId,
+        name: "shape-branch",
+        projectName: "test-project",
+        projectPath: "/tmp/mux-session-usage-test-project",
+        runtimeConfig: { type: "local" },
+      });
+      await writeLedger({
+        ...ledger,
+        byModel: { ...ledger.byModel, bad: null },
+        rolledUpFrom: { child: { totalTokens: "40" }, falsy: null },
+      });
+
+      const retry = await service.rollUpUsageIntoParent(workspaceId, "child", {
+        [model]: createUsage(40, 0),
+      });
+
+      expect(retry.didRollUp).toBe(false);
+      const result = await readThroughIpc();
+      expect(inputTokens(result)).toBe(100);
+      // A malformed entry still says the child was counted; a falsy one never did.
+      expect(result?.rolledUpFrom).toEqual({ child: true });
+    });
+
+    it("keeps the fields a newer Xum stored when it repairs and records", async () => {
+      await writeLedger({ ...ledger, byModel: { ...ledger.byModel, bad: null }, future: [1] });
+
+      await service.recordUsage(workspaceId, model, createUsage(7, 0));
+
+      const onDisk = JSON.parse(
+        await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
+      ) as Record<string, unknown>;
+      expect(onDisk.future).toEqual([1]);
+      expect(Object.keys(onDisk.byModel as object)).toEqual([model]);
+    });
+
+    describe("with corrupt settled keys", () => {
+      const corrupt = { ...ledger, settledInFlightKeys: {} };
+
+      it("counts no orphaned in-flight file, since the ledger may already hold it", async () => {
+        await service.recordInFlightUsage(
+          workspaceId,
+          "orphan",
+          "msg-x",
+          model,
+          createUsage(60, 0)
+        );
+        service.releaseInFlightUsage(workspaceId, "orphan");
+        await writeLedger(corrupt);
+
+        expect(inputTokens(await readThroughIpc())).toBe(100);
+        expect(
+          existsSync(
+            path.join(config.sessionsDir, workspaceId, "session-usage.in-flight", "orphan.json")
+          )
+        ).toBe(false);
+        await service.recordUsage(workspaceId, model, createUsage(7, 0));
+        expect(inputTokens(await readThroughIpc())).toBe(107);
+      });
+
+      it("still records a running stream's settle", async () => {
+        await service.recordInFlightUsage(workspaceId, "live", "msg-x", model, createUsage(60, 0));
+        await writeLedger(corrupt);
+
+        const live = getSessionUsageOutput.parse(
+          await service.getSessionUsage(workspaceId, { includeLiveStreams: true })
+        );
+        expect(inputTokens(live)).toBe(160);
+        await service.recordUsage(workspaceId, model, createUsage(60, 0), {
+          settlesInFlightKey: "live",
+        });
+        expect(inputTokens(await readThroughIpc())).toBe(160);
+      });
     });
   });
 

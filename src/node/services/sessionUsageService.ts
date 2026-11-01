@@ -20,8 +20,8 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
+  RolledUpChildEntrySchema,
   SessionUsageFileSchema,
-  SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
 import {
   getSelfIdentity,
@@ -254,29 +254,82 @@ function sumOpenDescendantUsage(
   return { children };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const RolledUpFromEntrySchema = z.union([z.literal(true), RolledUpChildEntrySchema]);
+
 /**
- * Self-healing for lock-free reads: a model entry that fails the usage schema is dropped, and a
- * ledger that still fails the file schema reads as absent, so one bad entry or file neither
- * rejects a whole batch or projection nor hides the valid entries beside it. The schema strips
- * settledInFlightKeys, which the view needs, so it is validated and put back.
+ * A malformed entry still says the child's usage was merged: it stays as the legacy `true`
+ * marker, so a retried roll-up does not count the child twice. A falsy one never said so.
  */
-function parseLedgerKeepingValidModels(raw: unknown): SessionUsageFile | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined;
-  const ledger = raw as SessionUsageFile;
-  if (typeof ledger.byModel !== "object" || ledger.byModel === null) return undefined;
+function keepRolledUpChildren(value: unknown): SessionUsageFile["rolledUpFrom"] {
+  if (!isPlainObject(value)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([childId, entry]) => {
+      const parsed = RolledUpFromEntrySchema.safeParse(entry);
+      if (parsed.success) return [[childId, parsed.data]];
+      return entry ? [[childId, true as const]] : [];
+    })
+  );
+}
+
+interface ParsedLedger {
+  ledger: SessionUsageFile;
+  /**
+   * settledInFlightKeys is present but not a list of keys. It is the only record of which
+   * in-flight files the ledger already counts, so the ledger is kept without it and the reader
+   * counts no orphaned file (markOrphansSettled).
+   */
+  settledKeysCorrupt: boolean;
+}
+
+/** A ledger read: "unusable" is bad JSON or a wrong shape (parseLedgerKeepingValidParts). */
+type LedgerContent = SessionUsageFile | "missing" | "unusable";
+
+/**
+ * The one parser of session-usage.json, for locked and lock-free reads. A part in a wrong
+ * shape is dropped (a model entry, lastRequest, tokenStatsCache, rolledUpFrom) and the rest
+ * is kept: a rebuild from history would lose spend that history lacks, such as rolled-up
+ * children. Undefined when nothing usable is left (no byModel object, or not version 1); the
+ * locked reads then rebuild from history, as for a parse error.
+ */
+function parseLedgerKeepingValidParts(raw: unknown): ParsedLedger | undefined {
+  if (!isPlainObject(raw) || typeof raw.byModel !== "object" || raw.byModel === null) {
+    return undefined;
+  }
+  // Use the parsed values, not the raw ones: the schema repairs some fields (a null
+  // longContextTokens becomes undefined) that would still throw when usages are summed.
   const byModel = Object.fromEntries(
-    Object.entries(ledger.byModel).flatMap(([model, usage]) => {
+    Object.entries(raw.byModel).flatMap(([model, usage]) => {
       const entry = ChatUsageDisplaySchema.safeParse(usage);
       return entry.success ? [[model, entry.data]] : [];
     })
   );
-  // Use the parsed values, not the raw ones: the schema repairs some fields (a null
-  // longContextTokens becomes undefined) that would still throw when usages are summed.
-  const parsed = SessionUsageFileSchema.safeParse({ ...ledger, byModel });
-  const keys = SettledInFlightKeysSchema.safeParse(ledger.settledInFlightKeys);
-  return parsed.success && keys.success
-    ? { ...parsed.data, settledInFlightKeys: keys.data }
-    : undefined;
+  const rolledUpFrom = keepRolledUpChildren(raw.rolledUpFrom);
+  const parsed = SessionUsageFileSchema.safeParse({
+    ...raw,
+    byModel,
+    lastRequest: SessionUsageFileSchema.shape.lastRequest.safeParse(raw.lastRequest).data,
+    rolledUpFrom,
+    tokenStatsCache: SessionUsageFileSchema.shape.tokenStatsCache.safeParse(raw.tokenStatsCache)
+      .data,
+  });
+  if (!parsed.success) return undefined;
+  const keys = SettledInFlightKeysSchema.safeParse(raw.settledInFlightKeys);
+  return {
+    // Fields this version does not know stay (from raw), so its writes keep what a newer Xum
+    // stored. The schema's records drop a "__proto__" key, so the entries parsed above stay.
+    ledger: {
+      ...raw,
+      ...parsed.data,
+      byModel,
+      rolledUpFrom,
+      settledInFlightKeys: keys.data,
+    },
+    settledKeysCorrupt: !keys.success,
+  };
 }
 
 /** The schema strips settledInFlightKeys, but the view reads it into a Set. */
@@ -515,16 +568,61 @@ export class SessionUsageService {
     return { byModel: {}, version: 1 };
   }
 
+  /**
+   * The ledger for a locked write: empty when missing, rebuilt from history when unusable.
+   * Throws on a read error (EIO...): the file can still hold spend that a write would lose.
+   */
   private async readFile(workspaceId: string): Promise<SessionUsageFile> {
+    const content = await this.readLedgerContent(workspaceId);
+    if (content === "missing") return this.createEmptyUsageFile();
+    if (content === "unusable") {
+      log.warn(`session-usage.json unusable for ${workspaceId}, rebuilding`);
+      return (await this.repairLedgerFromHistory(workspaceId)) ?? this.createEmptyUsageFile();
+    }
+    return content;
+  }
+
+  /** Every ledger read goes through here. Throws on a read error other than ENOENT. */
+  private async readLedgerContent(workspaceId: string): Promise<LedgerContent> {
+    let data: string;
     try {
-      const data = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
-      return JSON.parse(data) as SessionUsageFile;
+      data = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return this.createEmptyUsageFile();
-      }
+      if (isErrnoWithCode(error, "ENOENT")) return "missing";
       throw error;
     }
+    let parsed: ParsedLedger | undefined;
+    try {
+      parsed = parseLedgerKeepingValidParts(JSON.parse(data));
+    } catch {
+      return "unusable";
+    }
+    if (!parsed) return "unusable";
+    if (parsed.settledKeysCorrupt) {
+      await this.markOrphansSettled(workspaceId, parsed.ledger);
+    }
+    return parsed.ledger;
+  }
+
+  /**
+   * The settled keys are unreadable, so the ledger may already count any orphaned in-flight
+   * file: count none of them (never twice), and the next fold deletes them. Running streams
+   * stay unsettled, so their settle still records their usage.
+   */
+  private async markOrphansSettled(workspaceId: string, ledger: SessionUsageFile): Promise<void> {
+    for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
+      if (this.isOrphan(workspaceId, entry)) withSettledInFlightKey(ledger, entry.key);
+    }
+  }
+
+  /** Rebuilds the ledger from history and writes it; undefined when history is empty. */
+  private async repairLedgerFromHistory(
+    workspaceId: string
+  ): Promise<SessionUsageFile | undefined> {
+    const messages = await this.collectFullHistory(workspaceId);
+    if (messages.length === 0) return undefined;
+    const rebuilt = await this.rebuildAndWriteLedger(workspaceId, messages);
+    return parseLedgerKeepingValidParts(rebuilt)?.ledger;
   }
 
   private async writeFile(workspaceId: string, data: SessionUsageFile): Promise<void> {
@@ -880,17 +978,11 @@ export class SessionUsageService {
       try {
         current = await this.readFile(workspaceId);
       } catch {
-        // Parse errors or other read failures - best-effort rebuild.
+        // Read failures - best-effort rebuild.
         log.warn(
           `session-usage.json unreadable for ${workspaceId}, rebuilding before token stats cache update`
         );
-        const messages = await this.collectFullHistory(workspaceId);
-        if (messages.length > 0) {
-          await this.rebuildAndWriteLedger(workspaceId, messages);
-          current = await this.readFile(workspaceId);
-        } else {
-          current = this.createEmptyUsageFile();
-        }
+        current = (await this.repairLedgerFromHistory(workspaceId)) ?? this.createEmptyUsageFile();
       }
 
       current.tokenStatsCache = cache;
@@ -904,8 +996,7 @@ export class SessionUsageService {
   ): Promise<SessionUsageTokenStatsCacheV1 | undefined> {
     try {
       const raw = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
-      const file = JSON.parse(raw) as Partial<SessionUsageFile>;
-      return SessionUsageTokenStatsCacheSchema.safeParse(file.tokenStatsCache).data;
+      return parseLedgerKeepingValidParts(JSON.parse(raw))?.ledger.tokenStatsCache;
     } catch {
       return undefined;
     }
@@ -948,17 +1039,12 @@ export class SessionUsageService {
       try {
         current = await this.readFile(parentWorkspaceId);
       } catch {
-        // Parse errors or other read failures - best-effort rebuild.
+        // Read failures - best-effort rebuild.
         log.warn(
           `session-usage.json unreadable for ${parentWorkspaceId}, rebuilding before roll-up`
         );
-        const messages = await this.collectFullHistory(parentWorkspaceId);
-        if (messages.length > 0) {
-          await this.rebuildAndWriteLedger(parentWorkspaceId, messages);
-          current = await this.readFile(parentWorkspaceId);
-        } else {
-          current = this.createEmptyUsageFile();
-        }
+        current =
+          (await this.repairLedgerFromHistory(parentWorkspaceId)) ?? this.createEmptyUsageFile();
       }
 
       if (current.rolledUpFrom?.[childWorkspaceId]) {
@@ -1075,33 +1161,24 @@ export class SessionUsageService {
     });
   }
 
-  /** The settled ledger (rebuilt from history when missing or corrupt). Caller holds the lock. */
+  /**
+   * The settled ledger, rebuilt from history when missing, unusable or unreadable; undefined
+   * for an empty session. Caller holds the lock.
+   */
   private async readSettledLedgerLocked(
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
+    let content: LedgerContent;
     try {
-      const filePath = this.getFilePath(workspaceId);
-      const data = await this.files.promises.readFile(filePath, "utf-8");
-      return JSON.parse(data) as SessionUsageFile;
-    } catch (error) {
-      // File missing or corrupted - try to rebuild from messages
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        const messages = await this.collectFullHistory(workspaceId);
-        if (messages.length > 0) {
-          await this.rebuildAndWriteLedger(workspaceId, messages);
-          return this.readFile(workspaceId);
-        }
-        return undefined; // Truly empty session
-      }
-      // Parse error - try rebuild
-      log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
-      const messages = await this.collectFullHistory(workspaceId);
-      if (messages.length > 0) {
-        await this.rebuildAndWriteLedger(workspaceId, messages);
-        return this.readFile(workspaceId);
-      }
-      return undefined;
+      content = await this.readLedgerContent(workspaceId);
+    } catch {
+      content = "unusable";
     }
+    if (typeof content === "object") return content;
+    if (content === "unusable") {
+      log.warn(`session-usage.json corrupted for ${workspaceId}, rebuilding`);
+    }
+    return this.repairLedgerFromHistory(workspaceId);
   }
 
   /**
@@ -1206,10 +1283,8 @@ export class SessionUsageService {
     workspaceId: string
   ): Promise<SessionUsageFile | undefined> {
     try {
-      const filePath = this.getFilePath(workspaceId);
-      return parseLedgerKeepingValidModels(
-        JSON.parse(await this.files.promises.readFile(filePath, "utf-8"))
-      );
+      const content = await this.readLedgerContent(workspaceId);
+      return typeof content === "object" ? content : undefined;
     } catch {
       return undefined;
     }
@@ -1236,12 +1311,14 @@ export class SessionUsageService {
    * Rebuild session usage from messages (for migration/recovery).
    * Internal version - called within lock.
    */
-  private async rebuildAndWriteLedger(workspaceId: string, messages: MuxMessage[]): Promise<void> {
-    await this.writeFile(
-      workspaceId,
-      await this.rebuildFromMessagesInternal(workspaceId, messages)
-    );
+  private async rebuildAndWriteLedger(
+    workspaceId: string,
+    messages: MuxMessage[]
+  ): Promise<SessionUsageFile> {
+    const rebuilt = await this.rebuildFromMessagesInternal(workspaceId, messages);
+    await this.writeFile(workspaceId, rebuilt);
     log.info(`Rebuilt session-usage.json for ${workspaceId} from ${messages.length} messages`);
+    return rebuilt;
   }
 
   private async rebuildFromMessagesInternal(
