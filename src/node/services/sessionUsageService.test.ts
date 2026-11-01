@@ -1316,6 +1316,26 @@ describe("SessionUsageService", () => {
       expect(inputTokens(await readThroughIpc())).toBe(307);
     });
 
+    it("fails a repair while the in-flight files cannot be listed", async () => {
+      // A file at the directory's path: listing it fails, as an EIO would.
+      const inFlightDir = path.join(config.sessionsDir, workspaceId, "session-usage.in-flight");
+      await fs.writeFile(inFlightDir, "");
+      await writeLedger({ ...ledger, byModel: null });
+
+      const result = await service.getSessionUsage(workspaceId).then(
+        () => "resolved",
+        () => "rejected"
+      );
+
+      expect(result).toBe("rejected");
+      const onDisk = JSON.parse(
+        await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
+      ) as { byModel: unknown };
+      expect(onDisk.byModel).toBeNull();
+      await fs.rm(inFlightDir);
+      expect(inputTokens(await readThroughIpc())).toBe(300);
+    });
+
     it("fails a read of an unreadable ledger without rebuilding it", async () => {
       await writeLedger(ledger);
       const readSpy = spyOn(historyService.files.promises, "readFile").mockRejectedValueOnce(

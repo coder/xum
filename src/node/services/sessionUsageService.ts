@@ -1440,7 +1440,10 @@ export class SessionUsageService {
     rebuilt: SessionUsageFile,
     messageIdsWithUsage: Set<string>
   ): Promise<void> {
-    for (const entry of (await this.readInFlightEntries(workspaceId)) ?? []) {
+    const entries = await this.readInFlightEntries(workspaceId);
+    // A rebuild written now would miss the keys of files no one can see: fail, retry later.
+    if (!entries) throw new Error(`in-flight usage files of ${workspaceId} cannot be listed`);
+    for (const entry of entries) {
       const messageId = entry.file?.messageId;
       if (messageId && messageIdsWithUsage.has(messageId)) {
         withSettledInFlightKey(rebuilt, entry.key);
