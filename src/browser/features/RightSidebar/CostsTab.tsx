@@ -24,7 +24,7 @@ const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "last-request", label: "Last Request" },
 ];
 
-function mergeUsageByModel(
+export function mergeUsageByModel(
   a: Record<string, ChatUsageDisplay> | undefined,
   b: Record<string, ChatUsageDisplay> | undefined
 ): Map<string, ChatUsageDisplay> {
@@ -39,7 +39,7 @@ function mergeUsageByModel(
 }
 
 /** The session cost already includes this spend: the note only says how much came from it. */
-function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
+export function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
   const cost = props.total ? getTotalCost(props.total) : undefined;
   if (cost === undefined || cost <= 0 || props.count === undefined) {
     return null;
