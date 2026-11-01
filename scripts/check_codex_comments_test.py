@@ -389,14 +389,32 @@ else:
         self.assertNotEqual(borrowed, board)
         headless = re.sub(r"\n#### Advisory findings \(1\)\n", "", bulletless)
         self.assertNotEqual(headless, bulletless)
+        # Round 4 on #7860: the findings heading must open the inventory, not follow it.
+        misplaced = board.replace("### Security findings\n\n", "").replace(bullet, bullet + "\n\n### Security findings")
+        self.assertNotEqual(misplaced, board)
+        loading = re.sub(
+            r"#### Advisory findings \(1\)\n\n- 🟡 [^\n]*",
+            "Finding details are still loading. Check the individual review comments.",
+            board,
+        )
+        self.assertNotEqual(loading, board)
+        marked = board.replace(bullet, bullet + " · **Resolved**")
+        self.assertNotEqual(marked, board)
 
-        def advisory(resolved):
+        def advisory(resolved, marker="<!-- codex-security-review-finding:v1 -->\n"):
             return thread(
-                "<!-- codex-security-review-finding:v1 -->\n[P2] Let Stop preempt grouped task creation",
+                marker + "[P2] Let Stop preempt grouped task creation",
                 resolved=resolved,
                 discussion=discussion,
                 commit=head,
             )
+
+        code_thread = thread(
+            "[P2] Let Stop preempt grouped task creation\n\n<!-- codex-code-review-finding:v1 -->",
+            resolved=True,
+            discussion=discussion,
+            commit=head,
+        )
 
         for case, comments, threads, pr_head, expected in (
             ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
@@ -407,6 +425,11 @@ else:
             ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
             ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
             ("findings heading without an advisory header", [headless, receipt], [advisory(True)], head, 1),
+            ("findings heading after the inventory", [misplaced, receipt], [advisory(True)], head, 1),
+            ("finding details still loading", [loading, receipt], [advisory(True)], head, 1),
+            ("bullet linking a resolved code-review thread", [board, receipt], [code_thread], head, 1),
+            ("bullet linking a resolved thread without a marker", [board, receipt], [advisory(True, "")], head, 1),
+            ("Resolved marker without a thread", [marked, receipt], [], head, 0),
             ("no receipt", [board], [advisory(True)], head, 10),
             ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
         ):
