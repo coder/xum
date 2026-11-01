@@ -1038,6 +1038,17 @@ describe("OpenAI service-tier pricing (#4352)", () => {
     }
   });
 
+  test("prices provisional GPT-6.2 Astra tiers like GPT-6 Astra", () => {
+    for (const tier of [undefined, "flex", "priority", "ultrafast"]) {
+      for (const inputTokens of [100_000, 300_000]) {
+        expect(cost("openai:gpt-6.2-astra", inputTokens, tier)).toBeCloseTo(
+          cost("openai:gpt-6-astra", inputTokens, tier),
+          9
+        );
+      }
+    }
+  });
+
   test("keeps included costs at zero whatever tier was reported", () => {
     const usage = createDisplayUsage(
       { inputTokens: 100_000, outputTokens: 1_000 },

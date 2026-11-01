@@ -11,6 +11,8 @@ describe("codexOAuth model gating", () => {
     ["gpt-6-astra", 272_000],
     ["gpt-6.1-sol", 272_000],
     ["gpt-6-luna", 272_000],
+    // Provisional fail-safe cap until the Codex catalog lists GPT-6.2 Astra.
+    ["gpt-6.2-astra", 272_000],
   ])("allows %s through Codex OAuth with a %d context cap", (model, contextLimit) => {
     for (const id of [model, `openai:${model}`]) {
       expect(isCodexOauthAllowedModelId(id)).toBe(true);

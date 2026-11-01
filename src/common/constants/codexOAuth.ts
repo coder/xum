@@ -104,6 +104,10 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   // in the public API. Without this entry an OAuth-only user selecting Astra
   // falls to the API-key path and fails with api_key_not_found.
   "gpt-6-astra",
+  // GPT-6.2 Astra (PROVISIONAL, unreleased): the `astra` alias targets it, so
+  // without this entry OAuth-only users hit api_key_not_found. Check at launch
+  // that Codex serves it.
+  "gpt-6.2-astra",
   // GPT-6 Luna (September 22, 2026): listed in the Codex model catalog (see the
   // context-window overrides below), so the `luna` alias keeps working for
   // OAuth-only users.
@@ -129,6 +133,10 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-6-luna": 272_000,
   // GPT-6.1 Sol: https://github.com/openai/codex/blob/b1e72963c3b71a9265a551e54beff078384efed9/codex-rs/models-manager/models.json
   "gpt-6.1-sol": 272_000,
+  // GPT-6.2 Astra: PROVISIONAL fail-safe cap, not from a catalog row (the model is
+  // unreleased). A too-small cap only compacts early; a too-large one overflows.
+  // Replace with the openai/codex models.json row at launch.
+  "gpt-6.2-astra": 272_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {
