@@ -2263,6 +2263,8 @@ export interface WorkspaceServiceEvents {
     removedParentWorkspaceId?: string;
   }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
+  /** The workspace's usage files changed (see UsageRevisionActivity). */
+  "usage-revision": (event: { workspaceId: string; usageRevision: number }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
@@ -2670,9 +2672,11 @@ export class WorkspaceService
     this.bashMonitorActivity.onProcessChange(workspaceId);
   };
   private readonly usageRevisionActivity = new UsageRevisionActivity({
-    getSnapshot: (workspaceId, options) => this.extensionMetadata.getSnapshot(workspaceId, options),
-    emitWorkspaceActivity: (workspaceId, snapshot) =>
-      this.emitWorkspaceActivity(workspaceId, snapshot),
+    emitUsageRevision: (workspaceId, usageRevision) => {
+      // A late usage write after removal must not re-insert the removed id in a renderer.
+      if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) return;
+      this.emit("usage-revision", { workspaceId, usageRevision });
+    },
   });
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
@@ -4578,14 +4582,13 @@ export class WorkspaceService
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
-    const merged = this.mergeCurrentActiveBashMonitorCount(
+    const activity = this.mergeCurrentActiveBashMonitorCount(
       workspaceId,
       this.mergeCachedActiveWorkflowRuns(
         workspaceId,
         this.overlayPendingGoal(workspaceId, snapshot)
       )
     );
-    const activity = merged && this.usageRevisionActivity.withRevision(workspaceId, merged);
     // A late in-flight producer (e.g. a stream-abort stop-status handler mid
     // todo read) can complete after removal deleted this workspace's
     // metadata entry. Its disk write is already blocked by the write

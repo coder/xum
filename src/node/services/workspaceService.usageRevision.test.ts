@@ -15,15 +15,8 @@ const USAGE = {
   reasoning: { tokens: 0 },
 };
 
-async function waitFor(condition: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 200 && !condition(); attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  expect(condition()).toBe(true);
-}
-
 describe("WorkspaceService usage revision", () => {
-  test("a usage write moves the revision on emitted and listed activity", async () => {
+  test("a usage write emits a usage-revision event, not an activity snapshot, and lists it", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const projectPath = path.join(config.rootDir, "project");
@@ -46,20 +39,28 @@ describe("WorkspaceService usage revision", () => {
         sessionUsageService,
       });
       expect((await workspaceService.getActivityList())?.ws?.usageRevision).toBeUndefined();
-      const emitted: Array<WorkspaceActivitySnapshot | null> = [];
-      workspaceService.on("activity", (event) => {
-        if (event.workspaceId === "ws") emitted.push(event.activity);
+      const revisions: number[] = [];
+      const activity: Array<WorkspaceActivitySnapshot | null> = [];
+      workspaceService.on("usage-revision", (event) => {
+        if (event.workspaceId === "ws") revisions.push(event.usageRevision);
       });
+      workspaceService.on("activity", (event) => activity.push(event.activity));
 
       await sessionUsageService.recordUsage("ws", MODEL, USAGE);
-      await waitFor(() => emitted.length === 1);
-      const first = emitted[0]?.usageRevision;
-      expect(first).toBeNumber();
-      expect((await workspaceService.getActivityList())?.ws?.usageRevision).toBe(first);
+      expect(revisions).toHaveLength(1);
+      expect((await workspaceService.getActivityList())?.ws?.usageRevision).toBe(revisions[0]);
 
       await sessionUsageService.recordInFlightUsage("ws", "step-key", "message-1", MODEL, USAGE);
-      await waitFor(() => emitted.length === 2);
-      expect(emitted[1]?.usageRevision).toBeGreaterThan(first!);
+      expect(revisions).toHaveLength(2);
+      expect(revisions[1]).toBeGreaterThan(revisions[0]);
+      // A snapshot read for a usage move could land after a newer activity emit and resend
+      // older activity: usage moves never broadcast activity.
+      expect(activity).toEqual([]);
+
+      // A late usage write after removal announces nothing for the removed id.
+      await extensionMetadata.deleteWorkspace("ws");
+      await sessionUsageService.recordUsage("ws", MODEL, USAGE);
+      expect(revisions).toHaveLength(2);
     } finally {
       await cleanup();
     }

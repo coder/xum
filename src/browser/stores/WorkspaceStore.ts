@@ -761,25 +761,6 @@ export interface WorkspaceStoreOptions {
   subagentUsageFetchTimeoutMs?: number;
 }
 
-/**
- * A transientGoalOnly snapshot updates only the goal of the snapshot the store has. It still
- * carries the latest usage revision, which a later snapshot must deliver when an emit is lost.
- */
-function mergeTransientGoalSnapshot(
-  previous: WorkspaceActivitySnapshot | null,
-  snapshot: WorkspaceActivitySnapshot
-): WorkspaceActivitySnapshot {
-  if (!previous) {
-    const snapshotWithoutHint: WorkspaceActivitySnapshot = { ...snapshot };
-    delete snapshotWithoutHint.transientGoalOnly;
-    return snapshotWithoutHint;
-  }
-  const merged = { ...previous, goal: snapshot.goal };
-  return snapshot.usageRevision === undefined
-    ? merged
-    : { ...merged, usageRevision: snapshot.usageRevision };
-}
-
 function createInitialChatTransientState(): WorkspaceChatTransientState {
   return {
     caughtUp: false,
@@ -1270,6 +1251,8 @@ export class WorkspaceStore {
   private sessionUsage = new Map<string, z.infer<typeof SessionUsageFileSchema>>();
   private sessionUsageRequestVersion = new Map<string, number>();
   private subagentUsage = new Map<string, SubagentUsageByChild>();
+  /** The last usage revision seen per workspace (activity subscription and list). */
+  private usageRevisions = new Map<string, number>();
   /** The getSubagentUsage fetch in flight per workspace. */
   private subagentUsageFetches = new Map<string, SubagentUsageFetch>();
 
@@ -1834,15 +1817,11 @@ export class WorkspaceStore {
    * finished step or its settle, headless usage, a sub-agent rolled up into it. Its own ledger
    * and every ancestor's sub-agent projection can have changed.
    */
-  private refreshUsageWhenRevisionMoves(
-    workspaceId: string,
-    previous: WorkspaceActivitySnapshot | null,
-    snapshot: WorkspaceActivitySnapshot | null
-  ): void {
-    const revision = snapshot?.usageRevision;
-    if (revision === undefined || revision === previous?.usageRevision) {
+  private applyUsageRevision(workspaceId: string, usageRevision: number): void {
+    if (this.usageRevisions.get(workspaceId) === usageRevision) {
       return;
     }
+    this.usageRevisions.set(workspaceId, usageRevision);
     if (this.isUsageShown(workspaceId) && !this.isOwnStreamLive(workspaceId)) {
       this.refreshSessionUsage(workspaceId);
     }
@@ -4220,7 +4199,9 @@ export class WorkspaceStore {
     const previous = this.workspaceActivity.get(workspaceId) ?? null;
 
     if (snapshot?.transientGoalOnly === true) {
-      snapshot = mergeTransientGoalSnapshot(previous, snapshot);
+      const snapshotWithoutHint: WorkspaceActivitySnapshot = { ...snapshot };
+      delete snapshotWithoutHint.transientGoalOnly;
+      snapshot = previous ? { ...previous, goal: snapshot.goal } : snapshotWithoutHint;
     }
 
     if (snapshot) {
@@ -4233,7 +4214,10 @@ export class WorkspaceStore {
       this.refreshActiveGoalCount();
     }
 
-    this.refreshUsageWhenRevisionMoves(workspaceId, previous, snapshot);
+    // Only activity.list sets it: a reconnect learns of moves the subscription missed.
+    if (snapshot?.usageRevision !== undefined) {
+      this.applyUsageRevision(workspaceId, snapshot.usageRevision);
+    }
 
     // Transcript content that lands while a workspace is not the active onChat
     // subscription never reaches its aggregator, so any stream/recency movement
@@ -4582,6 +4566,11 @@ export class WorkspaceStore {
         if (event.type === "heartbeat") return;
         queueMicrotask(() => {
           if (signal.aborted || attemptSignal.aborted) return;
+          if (event.type === "usage-revision") {
+            // Not a delta tracked for a list retry: it carries no activity to keep from the list.
+            this.applyUsageRevision(event.workspaceId, event.usageRevision);
+            return;
+          }
           this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
           this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
         });
@@ -5147,6 +5136,7 @@ export class WorkspaceStore {
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
     this.subagentUsage.delete(workspaceId);
+    this.usageRevisions.delete(workspaceId);
     this.subagentUsageFetches.delete(workspaceId);
 
     this.ensureOnChatSubscriptions();

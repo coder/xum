@@ -144,6 +144,11 @@ type WorkspaceActivityEvent =
       activity: WorkspaceActivitySnapshot | null;
     }
   | {
+      type: "usage-revision";
+      workspaceId: string;
+      usageRevision: number;
+    }
+  | {
       type: "heartbeat";
     };
 
@@ -3716,26 +3721,29 @@ describe("WorkspaceStore", () => {
     describe("usage revision", () => {
       /** Feed the activity subscription; the store is recreated so it subscribes to it. */
       const openActivity = async () => {
-        const activity = createControllableAsyncIterable<WorkspaceActivityEvent>();
+        const subscriptions: Array<
+          ReturnType<typeof createControllableAsyncIterable<WorkspaceActivityEvent>>
+        > = [];
         mockActivitySubscribe.mockImplementation(async function* (_input, options) {
+          const activity = createControllableAsyncIterable<WorkspaceActivityEvent>();
+          subscriptions.push(activity);
           options?.signal?.addEventListener("abort", () => activity.close(), { once: true });
           yield* activity.iterable;
         });
         recreateStore();
-        // The bootstrap list replaces the snapshots it does not list: let it land first.
         await tick(10);
-        return async (
-          workspaceId: string,
-          usageRevision: number,
-          overrides: Partial<WorkspaceActivitySnapshot> = {}
-        ) => {
-          activity.push({
-            type: "activity",
-            workspaceId,
-            activity: createActivitySnapshot(1, { usageRevision, ...overrides }),
-          });
+        const pushUsage = async (workspaceId: string, usageRevision: number) => {
+          subscriptions.at(-1)!.push({ type: "usage-revision", workspaceId, usageRevision });
           await tick(0);
         };
+        /** The subscription ends, and the store subscribes again and lists activity. */
+        const resubscribe = async () => {
+          const count = subscriptions.length;
+          subscriptions.at(-1)!.close();
+          expect(await waitUntil(() => subscriptions.length > count)).toBe(true);
+          await tick(10);
+        };
+        return { pushUsage, resubscribe };
       };
       const projectionFetches = () =>
         mockGetSubagentUsage.mock.calls.map(([input]) => input.workspaceId);
@@ -3750,7 +3758,7 @@ describe("WorkspaceStore", () => {
       };
 
       it("refreshes every shown ancestor's projection when a nested sub-agent's usage moves", async () => {
-        const pushUsage = await openActivity();
+        const { pushUsage } = await openActivity();
         createAndAddWorkspace(store, "parent");
         createAndAddWorkspace(store, "child", { parentWorkspaceId: "parent" }, false);
         createAndAddWorkspace(store, "grandchild", { parentWorkspaceId: "child" }, false);
@@ -3760,22 +3768,23 @@ describe("WorkspaceStore", () => {
 
         await pushUsage("grandchild", 1);
         expect(projectionFetches()).toEqual(["parent"]);
-        // Another snapshot with the same revision (a status change) fetches nothing.
+        // A revision the store already saw is no move.
         await pushUsage("grandchild", 1);
 
         expect(mockGetSubagentUsage).toHaveBeenCalledTimes(1);
         expect(mockGetSessionUsage).not.toHaveBeenCalled();
       });
 
-      it("takes the usage revision a goal-only snapshot carries", async () => {
-        // A goal-only snapshot updates just the goal, but it may be the first snapshot since a
-        // lost emit: its revision must still count as a move.
-        const pushUsage = await openActivity();
+      it("refreshes for a revision that moved while the activity subscription was down", async () => {
+        const { pushUsage, resubscribe } = await openActivity();
         await addParentWithChildren(["child"]);
         await pushUsage("child", 1);
         mockGetSubagentUsage.mockClear();
 
-        await pushUsage("child", 2, { transientGoalOnly: true, goal: null });
+        mockActivityList.mockResolvedValue({
+          child: createActivitySnapshot(1, { usageRevision: 2 }),
+        });
+        await resubscribe();
 
         expect(projectionFetches()).toEqual(["parent"]);
       });
@@ -3783,7 +3792,7 @@ describe("WorkspaceStore", () => {
       it("leaves the own ledger to the end of a stream that is live here", async () => {
         // A revision refetch during the stream can already hold the settled stream, and
         // stream-end adds that stream's usage too: the refetch at stream end replaces both.
-        const pushUsage = await openActivity();
+        const { pushUsage } = await openActivity();
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
         const send = openChat("parent");
         await addParentWithChildren([]);
@@ -3818,7 +3827,7 @@ describe("WorkspaceStore", () => {
       });
 
       it("shows a roll-up whose delta never reached the parent's chat", async () => {
-        const pushUsage = await openActivity();
+        const { pushUsage } = await openActivity();
         mockGetSessionUsage.mockImplementation(() => Promise.resolve(ledger(100)));
         const send = openChat("parent");
         await addParentWithChildren(["child"]);
@@ -3835,7 +3844,7 @@ describe("WorkspaceStore", () => {
       });
 
       it("coalesces a burst of 50 sub-agent usage changes into one fetch and one trailing fetch", async () => {
-        const pushUsage = await openActivity();
+        const { pushUsage } = await openActivity();
         const children = Array.from({ length: 50 }, (_, index) => `child-${index}`);
         await addParentWithChildren(children);
         const held: Array<() => void> = [];

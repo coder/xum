@@ -2608,6 +2608,14 @@ export const workspace = {
             workspaceId: z.string(),
             activity: WorkspaceActivitySnapshotSchema.nullable(),
           }),
+          z.object({
+            type: z.literal("usage-revision"),
+            workspaceId: z.string(),
+            usageRevision: z.number().meta({
+              description:
+                "The workspace's new usage revision (see WorkspaceActivitySnapshot.usageRevision)",
+            }),
+          }),
           HeartbeatEventSchema,
         ])
       ),

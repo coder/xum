@@ -485,7 +485,7 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   }),
   usageRevision: z.number().optional().meta({
     description:
-      "Changes on every write to this workspace's session usage (its ledger or a running stream's usage). Compare for equality only.",
+      "Changes on every write to this workspace's session usage (its ledger or a running stream's usage). Only activity.list sets it; the subscription announces moves as usage-revision events. Compare for equality only.",
   }),
   transientGoalOnly: z.boolean().optional().meta({
     description:
