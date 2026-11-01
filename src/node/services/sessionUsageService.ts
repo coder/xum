@@ -20,6 +20,7 @@ import {
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import {
   ChatUsageDisplaySchema,
+  SessionUsageFileSchema,
   SessionUsageTokenStatsCacheSchema,
 } from "@/common/orpc/schemas/chatStats";
 import {
@@ -265,10 +266,10 @@ function sumOpenDescendantUsage(
 }
 
 /**
- * Self-healing for lock-free reads: a ledger that is not an object with a byModel object reads
- * as absent, and a model entry that fails the usage schema is dropped, so one bad entry or file
- * neither rejects a whole batch or projection nor hides the valid entries beside it. Fields the
- * schema would strip (settledInFlightKeys) stay.
+ * Self-healing for lock-free reads: a model entry that fails the usage schema is dropped, and a
+ * ledger that still fails the file schema reads as absent, so one bad entry or file neither
+ * rejects a whole batch or projection nor hides the valid entries beside it. The raw object is
+ * returned: the schema would strip fields the view needs (settledInFlightKeys).
  */
 function parseLedgerKeepingValidModels(raw: unknown): SessionUsageFile | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
@@ -279,8 +280,15 @@ function parseLedgerKeepingValidModels(raw: unknown): SessionUsageFile | undefin
       ([, usage]) => ChatUsageDisplaySchema.safeParse(usage).success
     )
   );
-  return { ...ledger, byModel };
+  const candidate = { ...ledger, byModel };
+  return SessionUsageFileSchema.safeParse(candidate).success &&
+    SettledInFlightKeysSchema.safeParse(ledger.settledInFlightKeys).success
+    ? candidate
+    : undefined;
 }
+
+/** The schema strips settledInFlightKeys, but the view reads it into a Set. */
+const SettledInFlightKeysSchema = z.array(z.string()).optional();
 
 function withSettledInFlightKey(file: SessionUsageFile, key: string): void {
   const keys = (file.settledInFlightKeys ?? []).filter((existing) => existing !== key);
@@ -1153,8 +1161,19 @@ export class SessionUsageService {
       return { children: {} };
     }
     const ids = [workspaceId, ...descendants.map((d) => d.id)];
+    // The root's view only supplies rolledUpFrom, which a history rebuild never has.
     const views = new Map(
-      await Promise.all(ids.map(async (id) => [id, await this.readProjectionView(id)] as const))
+      await Promise.all(
+        ids.map(
+          async (id) =>
+            [
+              id,
+              id === workspaceId
+                ? await this.readUsageViewLockFree(id, true)
+                : await this.readProjectionView(id),
+            ] as const
+        )
+      )
     );
     return sumOpenDescendantUsage(descendants, views);
   }
@@ -1164,22 +1183,27 @@ export class SessionUsageService {
    * memory: writing it could recreate the session folder of a sub-agent that is being removed.
    */
   private async readProjectionView(workspaceId: string): Promise<SessionUsageFile | undefined> {
-    const view = await this.readUsageViewLockFree(workspaceId, true);
+    // Any failure reading one sub-agent counts as a missing ledger, so it cannot reject the
+    // whole projection and hide every sibling's spend.
+    const view = await this.readUsageViewLockFree(workspaceId, true).catch(() => undefined);
     if (view) {
       return view;
     }
     try {
-      const messages = await this.collectFullHistory(workspaceId);
-      if (messages.length === 0) {
-        return undefined;
-      }
-      const { view: rebuilt } = this.addRunningStreamsToView(
-        workspaceId,
-        await this.rebuildFromMessagesInternal(workspaceId, messages),
-        await this.readInFlightEntries(workspaceId),
-        true
-      );
-      return rebuilt;
+      // collectFullHistory requires the workspace lock (in memory; it creates no files).
+      return await this.fileLocks.withLock(workspaceId, async () => {
+        const messages = await this.collectFullHistory(workspaceId);
+        if (messages.length === 0) {
+          return undefined;
+        }
+        const { view: rebuilt } = this.addRunningStreamsToView(
+          workspaceId,
+          await this.rebuildFromMessagesInternal(workspaceId, messages),
+          await this.readInFlightEntries(workspaceId),
+          true
+        );
+        return rebuilt;
+      });
     } catch (error) {
       log.warn("Failed to rebuild sub-agent usage for the projection", { workspaceId, error });
       return undefined;

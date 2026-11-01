@@ -4,6 +4,8 @@ import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessi
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
+import { z } from "zod";
+import { SessionUsageFileSchema } from "@/common/orpc/schemas/chatStats";
 import {
   getTotalCost,
   sumUsageHistory,
@@ -901,6 +903,26 @@ describe("SessionUsageService", () => {
       expect(result.children.healthy.byModel[model].input.tokens).toBe(10);
     });
 
+    it("reads a ledger with corrupt settled keys as absent and keeps its siblings", async () => {
+      await addWorkspace("root");
+      await addWorkspace("broken", "root");
+      await addWorkspace("healthy", "root");
+      await service.recordUsage("healthy", model, createUsageWithCosts(10, 1, 0.1, 0.2));
+      await fs.mkdir(path.join(config.sessionsDir, "broken"), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, "broken", "session-usage.json"),
+        JSON.stringify({
+          byModel: { [model]: createUsage(3, 3) },
+          settledInFlightKeys: {},
+          version: 1,
+        })
+      );
+
+      const result = await service.getOpenSubagentUsage("root");
+
+      expect(Object.keys(result.children)).toEqual(["healthy"]);
+    });
+
     it("rebuilds a missing sub-agent ledger from history without writing it", async () => {
       await addWorkspace("root");
       await addWorkspace("child", "root");
@@ -925,6 +947,26 @@ describe("SessionUsageService", () => {
       await service.recordUsage("lonely", model, createUsage(1, 1));
 
       expect(await service.getOpenSubagentUsage("lonely")).toEqual({ children: {} });
+    });
+  });
+
+  describe("getSessionUsageBatch", () => {
+    it("reads a ledger with a malformed field as absent and keeps the others", async () => {
+      const model = "claude-sonnet-4-20250514";
+      await service.recordUsage("good", model, createUsage(5, 5));
+      await service.recordUsage("bad", model, createUsage(1, 1));
+      const badPath = path.join(config.sessionsDir, "bad", "session-usage.json");
+      const bad = JSON.parse(await fs.readFile(badPath, "utf-8")) as Record<string, unknown>;
+      await fs.writeFile(badPath, JSON.stringify({ ...bad, lastRequest: null }));
+
+      const result = await service.getSessionUsageBatch(["good", "bad"]);
+
+      // The batch passes its IPC output schema only when no entry is malformed.
+      expect(
+        z.record(z.string(), SessionUsageFileSchema.optional()).safeParse(result).success
+      ).toBe(true);
+      expect(result.bad).toBeUndefined();
+      expect(result.good?.byModel[model].input.tokens).toBe(5);
     });
   });
 
