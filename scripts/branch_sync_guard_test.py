@@ -165,6 +165,27 @@ class CheckoutGuardTest(unittest.TestCase):
                 self.assertIn("1 commit(s) ahead", result.stderr)
         self.assertEqual(self.git("rev-parse", "origin/feature"), self.env["FAKE_PR_HEAD_OID"])
 
+    def test_a_pasted_push_hint_pushes_the_pr_branch_and_runs_nothing_else(self):
+        # Git allows `$(...)` in branch names, so a PR author controls this text.
+        branch = "feature-$(touch${IFS}pwned)"
+        self.git("switch", "--quiet", "-c", branch)
+        self.git("push", "--quiet", "-u", "origin", branch)
+        self.pr_head(branch)
+        self.git("commit", "--quiet", "--allow-empty", "-m", "unpushed work")
+        result = self.assert_blocked_before_gates("wait_pr_checks.sh", SYNC_ERROR)
+        hint = next(line for line in result.stderr.splitlines() if line.startswith("Push your changes with: "))
+        paste = Path(self.calls_file).parent / "paste"
+        (paste / "bin").mkdir(parents=True)
+        recorder = paste / "bin" / "git"
+        recorder.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        recorder.chmod(0o755)
+        pasted = subprocess.run(
+            ["bash", "-c", hint.removeprefix("Push your changes with: ")], cwd=paste, text=True, capture_output=True,
+            env=dict(self.env, PATH=str(paste / "bin") + os.pathsep + self.env["PATH"]), check=True,
+        )
+        self.assertEqual(json.loads(pasted.stdout), ["push", "origin", branch])
+        self.assertFalse((paste / "pwned").exists())
+
     def test_uncommitted_changes_on_the_pr_branch_are_blocked(self):
         (self.work / "tracked.txt").write_text("edited\n")
         self.assert_blocked_before_gates("wait_pr_checks.sh", "uncommitted changes")

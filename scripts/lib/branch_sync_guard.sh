@@ -20,6 +20,7 @@ assert_pr_checkout_synced() {
   local head_oid
   local current_branch
   local local_hash
+  local quoted_ref
 
   if ! pr_head=$(gh pr view "$pr_number" --json headRefName,headRefOid); then
     echo "❌ Error: Failed to read PR #$pr_number's head branch with 'gh pr view'." >&2
@@ -61,14 +62,16 @@ assert_pr_checkout_synced() {
 
   # Fetch the PR's branch so the ahead/behind report can reach a PR head pushed from elsewhere.
   git fetch origin "$head_ref" --quiet 2>/dev/null || true
+  # Git allows shell syntax such as `$(...)` in branch names, so quote the ref in pasteable hints.
+  printf -v quoted_ref '%q' "$head_ref"
   if ! git cat-file -e "$head_oid^{commit}" 2>/dev/null; then
-    echo "The PR head commit is not in this checkout. Fetch it with: git fetch origin $head_ref" >&2
+    echo "The PR head commit is not in this checkout. Fetch it with: git fetch origin $quoted_ref" >&2
   elif git merge-base --is-ancestor "$head_oid" HEAD; then
     echo "Your branch is $(git rev-list --count "$head_oid"..HEAD) commit(s) ahead of PR #$pr_number." >&2
-    echo "Push your changes with: git push origin $head_ref" >&2
+    echo "Push your changes with: git push origin $quoted_ref" >&2
   elif git merge-base --is-ancestor HEAD "$head_oid"; then
     echo "Your branch is $(git rev-list --count HEAD.."$head_oid") commit(s) behind PR #$pr_number." >&2
-    echo "Pull the latest changes with: git pull origin $head_ref" >&2
+    echo "Pull the latest changes with: git pull origin $quoted_ref" >&2
   else
     echo "Your branch has diverged from PR #$pr_number." >&2
     echo "You may need to rebase or merge." >&2
