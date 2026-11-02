@@ -71,7 +71,7 @@ VIOLATION floor-cc     src/x.ts:10-25 route: CC 30 -> 31 (head CRAP 31 above 30:
    CC 10 or less). A test must
    assert behavior that would fail if the code broke.
 
-To shrink an async function without changing its behaviour, keep the timing:
+To shrink an async function, keep its awaits and locks where they are:
 
 - Every `await` stays where it was. A step with no `await` is a plain
   function, because an `async` wrapper adds a microtask, and one extra
@@ -82,6 +82,9 @@ To shrink an async function without changing its behaviour, keep the timing:
   A bare `return promise` releases the lock while the step still runs.
 - Shared `let` variables go on one record that the steps share. A copied
   boolean that a callback sets reads `false` forever.
+- Each extracted async step still settles the outer promise one or more
+  microtasks later. When a caller or a test depends on that completion order,
+  check it with a race test at the call boundary, or keep the tail inline.
 
 ## Anti-gaming rules
 

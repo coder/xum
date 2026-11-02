@@ -49,12 +49,13 @@ _Automated by the `<workflow-name>` workflow (GitHub Actions)._
 - `wait_pr_ready.sh` polls the Codex, CI checks, and (when requested) `coder-agents-review` gates together and fails fast on the first terminal failure.
 - Use `./scripts/wait_pr_checks.sh <pr_number>` and `./scripts/wait_pr_codex.sh <pr_number>` directly only when you need to debug a specific gate.
 - If asked to fix an issue in CI, first replicate it locally, get it to pass locally, then use `wait_pr_ready.sh`.
-- When a required gate fails while the signal it checks is green (Codex approved, the tests pass), run `git log origin/main -- <the gate's scripts>` first, and read the gate at `origin/main`, not in your checkout. A rerun of the job replays the old merge commit, so it cannot pick up a gate fix on main. A new `pull_request` event (a push, or merging `origin/main` into the branch) runs on a fresh merge ref and does.
+- When a required gate fails while the signal it checks is green (Codex approved, the tests pass), run `git fetch origin` and then `git log origin/main -- <the gate's scripts>` first, and read the gate at `origin/main`, not in your checkout. A rerun of the job replays the old merge commit, so it cannot pick up a gate fix on main. A new `pull_request` event (a push, or merging `origin/main` into the branch) runs on a fresh merge ref and does.
 
 ### Landing a stack through the merge queue
 
 - `gh stack merge <stack#> --yes` only adds the stack to the queue. "All or nothing" covers that step, not the landing. The queue merges in groups: a failed group removes its PR (`RemovedFromMergeQueueEvent.reason` reads `failed_checks`) and every PR above it (`stack_invalidated`), while the PRs below stay merged.
 - After the enqueue, watch every member until it is merged or removed. `gh pr view --json` has no merge-queue field, so read `mergeQueueEntry{state}` and the removal event through `gh api graphql`, and treat a failed query as an error, not as "still queued".
+- Read each removed member's `state`, head and base before you touch the stack. A member whose base branch was deleted can be closed instead of rebased: reopen it and retarget it to `main` before you push anything above it.
 - When a lower PR merged, GitHub rebases the removed PRs onto `main`: wait for `Required` and a new Codex review on their new heads. When the bottom PR failed, the heads do not change: fix the failure, or confirm it is a flake. Then run `gh stack merge` again. It re-adds only the PRs that did not merge.
 - An enqueue that exits 4 with `Required status check "Required" is expected` added nothing: one member's head has no `Required` run yet.
 
