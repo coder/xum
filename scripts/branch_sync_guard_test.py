@@ -28,7 +28,12 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['FAKE_GH_CALLS'], 'a') as calls:
     calls.write(json.dumps(args) + '\\n')
-pr = {'state': 'CLOSED', 'headRefName': os.environ['FAKE_PR_HEAD_REF'], 'headRefOid': os.environ['FAKE_PR_HEAD_OID']}
+pr = {
+    'state': 'CLOSED',
+    'headRefName': os.environ['FAKE_PR_HEAD_REF'],
+    'headRefOid': os.environ['FAKE_PR_HEAD_OID'],
+    'isCrossRepository': os.environ.get('FAKE_PR_FROM_FORK') == '1',
+}
 if args[:2] == ['repo', 'view']:
     print(json.dumps({'owner': 'fixture', 'name': 'repo'}))
 elif args[:2] == ['pr', 'view']:
@@ -183,8 +188,24 @@ class CheckoutGuardTest(unittest.TestCase):
             ["bash", "-c", hint.removeprefix("Push your changes with: ")], cwd=paste, text=True, capture_output=True,
             env=dict(self.env, PATH=str(paste / "bin") + os.pathsep + self.env["PATH"]), check=True,
         )
-        self.assertEqual(json.loads(pasted.stdout), ["push", "origin", branch])
+        self.assertEqual(json.loads(pasted.stdout), ["push", "origin", f"refs/heads/{branch}"])
         self.assertFalse((paste / "pwned").exists())
+
+    def test_a_fork_pr_sharing_the_checkout_branch_name_does_not_block_the_pr(self):
+        # The fork's `feature` is unrelated to this checkout's `feature`, and origin is not the fork.
+        self.env["FAKE_PR_FROM_FORK"] = "1"
+        self.env["FAKE_PR_HEAD_OID"] = "f" * 40
+        self.assert_reaches_gates("wait_pr_checks.sh")
+
+    def test_a_pr_head_pushed_elsewhere_is_fetched_by_branch_even_when_a_tag_shares_its_name(self):
+        self.git("push", "--quiet", "origin", "main:refs/tags/feature")
+        other = Path(self.calls_file).parent / "other"
+        subprocess.run(["git", "clone", "--quiet", "-b", "feature", str(self.origin), str(other)], env=self.env, check=True)
+        subprocess.run(["git", "commit", "--quiet", "--allow-empty", "-m", "pushed elsewhere"], cwd=other, env=self.env, check=True)
+        subprocess.run(["git", "push", "--quiet", "origin", "HEAD:refs/heads/feature"], cwd=other, env=self.env, check=True)
+        self.env["FAKE_PR_HEAD_OID"] = self.git("ls-remote", "origin", "refs/heads/feature").split()[0]
+        result = self.assert_blocked_before_gates("wait_pr_checks.sh", SYNC_ERROR)
+        self.assertIn("1 commit(s) behind", result.stderr)
 
     def test_uncommitted_changes_on_the_pr_branch_are_blocked(self):
         (self.work / "tracked.txt").write_text("edited\n")

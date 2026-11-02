@@ -9,7 +9,8 @@
 # on a PR that is missing local work. Agents often watch several stacked PRs from one
 # checkout (#7877). On any other branch the local state says nothing about the PR, so the
 # guard passes. It never pushes, and it never reads @{u}: a stack branch's upstream is
-# often its parent's branch (#7874).
+# often its parent's branch (#7874). A fork PR's branch name says nothing about this
+# checkout either: an unrelated local branch can share it, and origin is not the fork.
 
 set -euo pipefail
 
@@ -20,18 +21,25 @@ assert_pr_checkout_synced() {
   local head_oid
   local current_branch
   local local_hash
+  local from_fork
   local quoted_ref
 
-  if ! pr_head=$(gh pr view "$pr_number" --json headRefName,headRefOid); then
+  if ! pr_head=$(gh pr view "$pr_number" --json headRefName,headRefOid,isCrossRepository); then
     echo "❌ Error: Failed to read PR #$pr_number's head branch with 'gh pr view'." >&2
     return 1
   fi
   head_ref=$(jq -r '.headRefName // empty' <<<"$pr_head")
   head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_head")
-  if [[ -z "$head_ref" ]] || ! [[ "$head_oid" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "❌ assertion failed: gh returned no head branch or head commit for PR #$pr_number" >&2
+  from_fork=$(jq -r '.isCrossRepository' <<<"$pr_head")
+  if [[ -z "$head_ref" ]] || ! [[ "$head_oid" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$from_fork" =~ ^(true|false)$ ]]; then
+    echo "❌ assertion failed: gh returned no head branch, head commit or fork flag for PR #$pr_number" >&2
     echo "$pr_head" >&2
     return 1
+  fi
+
+  if [[ "$from_fork" == "true" ]]; then
+    echo "ℹ️  Skipping the local sync check: PR #$pr_number comes from a fork." >&2
+    return 0
   fi
 
   current_branch=$(git rev-parse --abbrev-ref HEAD)
@@ -61,9 +69,10 @@ assert_pr_checkout_synced() {
   echo "" >&2
 
   # Fetch the PR's branch so the ahead/behind report can reach a PR head pushed from elsewhere.
-  git fetch origin "$head_ref" --quiet 2>/dev/null || true
+  # Full refs/heads/ names: a short name resolves to a tag of the same name first.
+  git fetch origin "refs/heads/$head_ref" --quiet 2>/dev/null || true
   # Git allows shell syntax such as `$(...)` in branch names, so quote the ref in pasteable hints.
-  printf -v quoted_ref '%q' "$head_ref"
+  printf -v quoted_ref '%q' "refs/heads/$head_ref"
   if ! git cat-file -e "$head_oid^{commit}" 2>/dev/null; then
     echo "The PR head commit is not in this checkout. Fetch it with: git fetch origin $quoted_ref" >&2
   elif git merge-base --is-ancestor "$head_oid" HEAD; then
