@@ -725,7 +725,7 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
-.PHONY: test-codex-comments test-pr-checks test-required-superseded
+.PHONY: test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
 
@@ -734,6 +734,9 @@ test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fix
 
 test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
 	@python3 scripts/required_superseded_test.py
+
+test-branch-sync-guard: ## Test the wait_pr_* checkout guard against real git clones with offline GitHub fixtures
+	@python3 scripts/branch_sync_guard_test.py
 
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src
