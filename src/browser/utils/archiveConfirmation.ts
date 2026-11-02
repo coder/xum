@@ -6,14 +6,19 @@ const MAX_DISPLAYED_UNTRACKED_PATHS = 10;
  */
 export function buildArchiveConfirmDescription(
   isStreaming: boolean,
-  untrackedPaths: string[] | null | undefined
+  untrackedPaths: string[] | null | undefined,
+  includesSubagents = false
 ): string {
   const parts: string[] = [];
   if (isStreaming) {
     parts.push("This workspace is currently streaming a response.");
   }
   if (untrackedPaths && untrackedPaths.length > 0) {
-    parts.push("Archive snapshots cannot preserve untracked files in this workspace.");
+    parts.push(
+      includesSubagents
+        ? "Archive snapshots cannot preserve untracked files in this workspace or its sub-agents."
+        : "Archive snapshots cannot preserve untracked files in this workspace."
+    );
   }
   return parts.join(" ");
 }

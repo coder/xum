@@ -2153,7 +2153,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.preflightArchive.input)
         .output(schemas.workspace.preflightArchive.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.preflightArchive(input.workspaceId)
+          context.workspaceService.preflightArchiveWithSubagents(input.workspaceId)
         ),
       archive: t
         .input(schemas.workspace.archive.input)
@@ -2161,7 +2161,11 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.archive(
             input.workspaceId,
-            input.acknowledgedUntrackedPaths ?? undefined
+            input.acknowledgedUntrackedPaths ?? undefined,
+            {
+              acknowledgedSubagentUntrackedPaths:
+                input.acknowledgedSubagentUntrackedPaths ?? undefined,
+            }
           )
         ),
       unarchive: t

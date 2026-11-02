@@ -11562,6 +11562,30 @@ export class WorkspaceService
   }
 
   /**
+   * The user's archive preflight. It adds the untracked files each sub-agent's snapshot archive
+   * would lose to the target's own, so one dialog confirms the whole cascade: without them the
+   * archive refuses at the first lossy sub-agent and the user has no way to confirm it.
+   */
+  async preflightArchiveWithSubagents(
+    workspaceId: string
+  ): Promise<Result<ArchivePreflightResult>> {
+    const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+    // A "delete" archive snapshots nothing, and the cascade preflight refuses it for the
+    // model-facing caller only.
+    if (
+      worktreeArchiveBehavior === "delete" ||
+      this.listUnarchivedDescendants(workspaceId).length === 0
+    ) {
+      return await this.preflightArchive(workspaceId);
+    }
+    const cascade = await this.preflightArchiveCascade(workspaceId, worktreeArchiveBehavior);
+    if (!cascade.success) return Err(cascade.error);
+    const { targetPaths, subagents } = cascade.data;
+    if (targetPaths.length === 0 && subagents.length === 0) return Ok({ kind: "ready" });
+    return Ok({ kind: "confirm-lossy-untracked-files", paths: targetPaths, subagents });
+  }
+
+  /**
    * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
    * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
    * "delete" deletes their checkouts, "snapshot" snapshots them. The Coder archive policy applies
@@ -11742,7 +11766,8 @@ export class WorkspaceService
     const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
-        const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
+        const acknowledged = options?.acknowledgedSubagentUntrackedPaths?.[descendant.workspaceId];
+        const result = await this.archiveUnlocked(descendant.workspaceId, acknowledged, {
           // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
           // user-facing archive passes none of them.
           forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
@@ -11755,8 +11780,9 @@ export class WorkspaceService
         const failure = !result.success
           ? result.error
           : result.data.kind !== "archived"
-            ? // Its untracked files need their own confirmation: the parent's does not cover them.
-              "its untracked files would be lost by the snapshot archive; archive it on its own to review them"
+            ? // Untracked files that the user did not confirm (or that appeared after the
+              // confirmation) refuse; the dialog's retry preflights again and lists them.
+              "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them"
             : null;
         if (failure != null) {
           return Err(
