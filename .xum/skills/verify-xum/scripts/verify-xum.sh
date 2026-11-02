@@ -15,8 +15,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum}
-LOCK=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-path verify-xum.lock)
+ONE_SERVER_PER_CHECKOUT_LOCK=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-path verify-xum.lock)
 READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-300}
+DISCARD_BASE_URL=http://127.0.0.1:9/v1
 
 die() {
   echo "verify-xum: $*" >&2
@@ -49,7 +50,7 @@ json_string() {
   node -p 'JSON.stringify(process.argv[1])' "$1"
 }
 
-json_field() {
+json_field_or_empty() {
   node -e '
     const fs = require("fs");
     try {
@@ -62,11 +63,13 @@ json_field() {
 backend_ready() {
   node -e '
     const fs = require("fs");
-    const [lock, stamp, t0] = process.argv.slice(1);
+    const [serverLock, buildStamp, launchSeconds] = process.argv.slice(1);
     try {
-      const built = Number(fs.readFileSync(stamp, "utf8"));
-      const started = Date.parse(JSON.parse(fs.readFileSync(lock, "utf8")).startedAt);
-      process.exit(built >= Number(t0) * 1000 && started > built ? 0 : 1);
+      const buildStampMs = Number(fs.readFileSync(buildStamp, "utf8"));
+      const serverStartedMs = Date.parse(JSON.parse(fs.readFileSync(serverLock, "utf8")).startedAt);
+      const builtSinceLaunch = buildStampMs >= Number(launchSeconds) * 1000;
+      const serverRestartedAfterBuild = serverStartedMs > buildStampMs;
+      process.exit(builtSinceLaunch && serverRestartedAfterBuild ? 0 : 1);
     } catch {
       process.exit(1);
     }' "$VERIFY_XUM_ROOT/server.lock" "$CHECKOUT/dist/.main-build-complete" "$1" \
@@ -102,21 +105,25 @@ create_demo_repo() {
     -c commit.gpgsign=false commit -qm init
 }
 
+seed_unreachable_fake_provider() {
+  api providers/setProviderConfig '{"provider":"anthropic","keyPath":["apiKey"],"value":"sk-ant-verify-xum-fake"}' >/dev/null
+  api providers/setProviderConfig "{\"provider\":\"anthropic\",\"keyPath\":[\"baseUrl\"],\"value\":\"$DISCARD_BASE_URL\"}" >/dev/null
+}
+
 seed() {
   local created status_file status i
   api splashScreens/markSplashScreenViewed '{"splashId":"onboarding-wizard-v1"}' >/dev/null
-  api providers/setProviderConfig '{"provider":"anthropic","keyPath":["apiKey"],"value":"sk-ant-verify-xum-fake"}' >/dev/null
-  api providers/setProviderConfig '{"provider":"anthropic","keyPath":["baseUrl"],"value":"http://127.0.0.1:9/v1"}' >/dev/null
+  seed_unreachable_fake_provider
   create_demo_repo "$VERIFY_XUM_PROJECT"
   api projects/create "{\"projectPath\":$(json_string "$VERIFY_XUM_PROJECT")}" >/dev/null
   api projects/setTrust "{\"projectPath\":$(json_string "$VERIFY_XUM_PROJECT"),\"trusted\":true}" >/dev/null
   created="$VERIFY_XUM_RUN/scratch/workspace-create.json"
   api workspace/create "{\"projectPath\":$(json_string "$VERIFY_XUM_PROJECT"),\"branchName\":\"verify-playground\",\"trunkBranch\":\"main\",\"title\":\"Verify playground\"}" >"$created"
-  VERIFY_XUM_WORKSPACE_ID=$(json_field "$created" metadata.id)
+  VERIFY_XUM_WORKSPACE_ID=$(json_field_or_empty "$created" metadata.id)
   [[ -n $VERIFY_XUM_WORKSPACE_ID ]] || die "workspace/create returned no id: $(head -c 400 "$created")"
   status_file="$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/init-status.json"
   for ((i = 0; i < 120; i++)); do
-    status=$(json_field "$status_file" status)
+    status=$(json_field_or_empty "$status_file" status)
     [[ $status == success ]] && break
     [[ $status == error ]] && die "workspace setup failed, see $status_file"
     sleep 0.5
@@ -136,12 +143,12 @@ cmd_launch() {
   local old run_id t0 i backend_port vite_port log pidfile
   need git curl node bun make setsid ss agent-browser
   check_bun
-  if [[ -f $LOCK ]]; then
-    old=$(cat "$LOCK")
+  if [[ -f $ONE_SERVER_PER_CHECKOUT_LOCK ]]; then
+    old=$(cat "$ONE_SERVER_PER_CHECKOUT_LOCK")
     if group_alive "$old"; then
-      die "a verify-xum server already runs from this checkout (process group $old). Run verify-xum.sh cleanup first."
+      die "a verify-xum server already runs from this checkout (process group $old), and two would share dist/ and node_modules/.vite. Run verify-xum.sh cleanup first."
     fi
-    rm -f "$LOCK"
+    rm -f "$ONE_SERVER_PER_CHECKOUT_LOCK"
   fi
 
   run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
@@ -156,12 +163,12 @@ cmd_launch() {
   pidfile="$VERIFY_XUM_RUN/scratch/pgid"
   t0=$(date +%s)
 
+  local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
+    TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1)
   # setsid(1) forks when its caller already leads a process group, so $! can miss the new
   # group. The inner sh records its own pid, which is the new group id.
   # shellcheck disable=SC2016
-  setsid sh -c 'echo "$$" >"$1"; shift; exec "$@"' sh "$pidfile" \
-    env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" TERM=dumb \
-    TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1 \
+  setsid sh -c 'echo "$$" >"$1"; shift; exec "$@"' sh "$pidfile" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
     >"$log" 2>&1 </dev/null &
   for ((i = 0; i < 50; i++)); do
@@ -169,7 +176,7 @@ cmd_launch() {
     sleep 0.1
   done
   VERIFY_XUM_PGID=$(cat "$pidfile")
-  echo "$VERIFY_XUM_PGID" >"$LOCK"
+  echo "$VERIFY_XUM_PGID" >"$ONE_SERVER_PER_CHECKOUT_LOCK"
   write_state
   ln -sfn "$VERIFY_XUM_RUN" "$VERIFY_XUM_HOME/current"
   trap launch_failed EXIT
@@ -224,15 +231,15 @@ cmd_doctor() {
   }
 
   check "process group $VERIFY_XUM_PGID is alive" group_alive "$VERIFY_XUM_PGID"
-  check "checkout lock $LOCK names this run" test "$(cat "$LOCK" 2>/dev/null)" = "$VERIFY_XUM_PGID"
-  backend_pid=$(json_field "$VERIFY_XUM_ROOT/server.lock" pid)
+  check "checkout lock $ONE_SERVER_PER_CHECKOUT_LOCK names this run" test "$(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null)" = "$VERIFY_XUM_PGID"
+  backend_pid=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" pid)
   check "backend pid ${backend_pid:-none} (server.lock in $VERIFY_XUM_ROOT) belongs to this run" \
     pid_in_group "$backend_pid" "$VERIFY_XUM_PGID"
   check "server.lock names $VERIFY_XUM_BACKEND" \
-    test "$(json_field "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
+    test "$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
   check "GET $VERIFY_XUM_BACKEND/health answers" curl -fsS -o /dev/null "$VERIFY_XUM_BACKEND/health"
   curl -fsS "$VERIFY_XUM_BACKEND/version" -o "$VERIFY_XUM_RUN/scratch/version.json" 2>/dev/null || true
-  version=$(json_field "$VERIFY_XUM_RUN/scratch/version.json" git_commit)
+  version=$(json_field_or_empty "$VERIFY_XUM_RUN/scratch/version.json" git_commit)
   check "backend build ${version:-unknown} is the launch commit $VERIFY_XUM_COMMIT" \
     test -n "$version" -a "${VERIFY_XUM_COMMIT#"$version"}" != "$VERIFY_XUM_COMMIT"
   if [[ $(git -C "$VERIFY_XUM_CHECKOUT" rev-parse HEAD) != "$VERIFY_XUM_COMMIT" ]]; then
@@ -263,9 +270,9 @@ cmd_capture() {
   echo "$base.png $base.aria.txt $base.url.txt"
 }
 
-IDLE_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
-IDLE_JS="(() => {
-  if ($IDLE_FAILED_JS) return true;
+CHUNK_LOAD_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
+SETTLED_OR_CHUNK_FAILED_JS="(() => {
+  if ($CHUNK_LOAD_FAILED_JS) return true;
   const log = document.querySelector('[role=\"log\"][aria-label=\"Conversation transcript\"]');
   if (location.pathname.startsWith('/workspace/') && log?.getAttribute('aria-busy') !== 'false') return false;
   return !document.getAnimations().some((a) => a instanceof CSSTransition);
@@ -273,8 +280,8 @@ IDLE_JS="(() => {
 
 cmd_idle() {
   load_run "${1:-}"
-  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$IDLE_JS" >/dev/null
-  if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$IDLE_FAILED_JS") == true ]]; then
+  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null
+  if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then
     echo "verify-xum: the page shows '<name> failed to load.': a module fetch from Vite failed. Run agent-browser reload, then repeat the step." >&2
     exit 3
   fi
@@ -284,6 +291,10 @@ cmd_send_ready() {
   load_run "${1:-}"
   agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn \
     "document.querySelector('[aria-label=\"Send message\"]')?.disabled === false" >/dev/null
+}
+
+is_dev_server_sandbox_root() {
+  [[ -n $1 && -d $1 && $(basename "$1") == mux-dev-server-* ]]
 }
 
 cmd_cleanup() {
@@ -301,11 +312,11 @@ cmd_cleanup() {
     done
     group_alive "$VERIFY_XUM_PGID" && kill -KILL -- "-$VERIFY_XUM_PGID" 2>/dev/null
   fi
-  if [[ -n $VERIFY_XUM_ROOT && -d $VERIFY_XUM_ROOT && $(basename "$VERIFY_XUM_ROOT") == mux-dev-server-* ]]; then
+  if is_dev_server_sandbox_root "$VERIFY_XUM_ROOT"; then
     rm -rf "$VERIFY_XUM_ROOT"
   fi
   rm -rf "$VERIFY_XUM_RUN/scratch"
-  [[ $(cat "$LOCK" 2>/dev/null) == "$VERIFY_XUM_PGID" ]] && rm -f "$LOCK"
+  [[ $(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null) == "$VERIFY_XUM_PGID" ]] && rm -f "$ONE_SERVER_PER_CHECKOUT_LOCK"
   [[ $(readlink "$VERIFY_XUM_HOME/current" 2>/dev/null) == "$VERIFY_XUM_RUN" ]] && rm -f "$VERIFY_XUM_HOME/current"
   echo "stopped group $VERIFY_XUM_PGID; evidence kept in $VERIFY_XUM_EVIDENCE ($(find "$VERIFY_XUM_EVIDENCE" -type f | wc -l | tr -d ' ') files) and $VERIFY_XUM_RUN/server.log"
 }
