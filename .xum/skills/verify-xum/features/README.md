@@ -29,6 +29,8 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 - `find` does not wait. After a step that navigates or opens a view, the recipe waits for the next
   target first, with `agent-browser wait '[aria-label="<name>"]'` or
   `agent-browser wait --text "<text>"`. Keep those waits when you adapt a recipe.
+- When a wait times out, run `verify-xum.sh idle`. Exit 3 means a module failed to load (SKILL.md
+  Gotchas): run `agent-browser reload`, repeat the step, and note the reload with the evidence.
 - Run recipes in the order of this index when you drive more than one. A recipe that changes a
   setting restores it at its end.
 - Shortcuts are the Linux bindings that agent-browser presses. `src/browser/utils/ui/keybinds.ts`

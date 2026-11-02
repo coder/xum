@@ -5,7 +5,7 @@
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
 #   verify-xum.sh env [RUN]        print the run's `export` lines (eval them)
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
-#   verify-xum.sh idle [RUN]       wait until the open transcript is quiet and no CSS transition runs
+#   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
 #   verify-xum.sh cleanup [RUN]    stop the run's processes, delete its XUM_ROOT, keep evidence
 #
@@ -271,12 +271,24 @@ cmd_capture() {
   echo "$base.png $base.aria.txt $base.url.txt"
 }
 
-# A click during a CSS transition (the right sidebar slides open in about 250 ms) can land where
-# the target was, so idle also waits for running transitions to end.
+# Settled: no lazy chunk failed to load, no CSS transition runs (a click while the right sidebar
+# slides open lands where the target was), and on a workspace page the transcript is neither
+# loading nor streaming. A failed chunk exits 3: the page needs a reload.
+IDLE_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
+IDLE_JS="(() => {
+  if ($IDLE_FAILED_JS) return true;
+  const log = document.querySelector('[role=\"log\"][aria-label=\"Conversation transcript\"]');
+  if (location.pathname.startsWith('/workspace/') && log?.getAttribute('aria-busy') !== 'false') return false;
+  return !document.getAnimations().some((a) => a instanceof CSSTransition);
+})()"
+
 cmd_idle() {
   load_run "${1:-}"
-  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn \
-    "document.querySelector('[role=log][aria-label=\"Conversation transcript\"]')?.getAttribute('aria-busy') === 'false' && !document.getAnimations().some((a) => a instanceof CSSTransition)" >/dev/null
+  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$IDLE_JS" >/dev/null
+  if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$IDLE_FAILED_JS") == true ]]; then
+    echo "verify-xum: the page shows '<name> failed to load.': a module fetch from Vite failed. Run agent-browser reload, then repeat the step." >&2
+    exit 3
+  fi
 }
 
 cmd_send_ready() {

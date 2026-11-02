@@ -84,9 +84,10 @@ agent-browser find role button click --name "Open settings" --exact
 - Prefer `find role <role> <action> --name "<accessible name>" --exact` and the names in the
   feature map over `@eN` refs, which change with every snapshot. Without `--exact`, `--name`
   matches substrings and can act on a different element.
-- `idle` waits until the open transcript is neither loading nor streaming (`aria-busy="false"` on
-  the `Conversation transcript` log) and no CSS transition runs. A click while the right sidebar
-  slides open lands where the target was and is lost. It needs an open workspace.
+- `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
+  `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
+  while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
+  when the page shows `<name> failed to load.` (see Gotchas).
 - `send-ready` waits until the composer's `Send message` button is enabled. Fill the message, run
   `send-ready`, then send. The workspace composer keeps Send disabled until the transcript has
   caught up, and the new-workspace composer until the branch list has loaded and the draft is
@@ -151,6 +152,11 @@ a run other than the newest.
   drops them with `env -i`. Never start a server or CLI by hand without the same care.
 - The first open of a lazily loaded panel on a cold Vite cache (Review, for one) reloads the page:
   `server.log` shows `optimized dependencies changed. reloading`. Repeat the step after the reload.
+- Now and then a lazily loaded module request from agent-browser to Vite never completes. The
+  page or panel then shows `<name> failed to load.` with a `Reload` button, and the console logs
+  `Failed to fetch dynamically imported module`. curl gets the same module at once, so it is not
+  a product failure. `verify-xum.sh idle` exits 3 on it. Run `agent-browser reload`, then repeat
+  the step, and note the reload in your report.
 - A page that stays on `Loading Xum` under host load recovers with `agent-browser reload`.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
