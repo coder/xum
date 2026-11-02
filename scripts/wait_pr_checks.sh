@@ -63,17 +63,7 @@ if [ "$SKIP_FETCH_SYNC" != "0" ] && [ "$SKIP_FETCH_SYNC" != "1" ]; then
 fi
 
 if [ "$SKIP_FETCH_SYNC" = "0" ]; then
-  # Check for dirty working tree
-  if ! git diff-index --quiet HEAD --; then
-    echo "❌ Error: You have uncommitted changes in your working directory." >&2
-    echo "" >&2
-    git status --short >&2
-    echo "" >&2
-    echo "Please commit or stash your changes before checking PR status." >&2
-    exit 1
-  fi
-
-  assert_branch_synced || exit 1
+  assert_pr_checkout_synced "$PR_NUMBER" || exit 1
 fi
 
 LAST_MERGE_STATE="UNKNOWN"

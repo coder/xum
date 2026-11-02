@@ -123,7 +123,6 @@ class CheckoutGuardTest(unittest.TestCase):
         self.assertEqual(result.gate_calls, [], output)
         return result
 
-    @unittest.expectedFailure
     def test_another_stack_branch_ahead_of_its_upstream_does_not_block_the_pr(self):
         self.git("switch", "--quiet", "-c", "stack-b")
         self.git("push", "--quiet", "-u", "origin", "stack-b")
@@ -132,7 +131,6 @@ class CheckoutGuardTest(unittest.TestCase):
             with self.subTest(script=script):
                 self.assert_reaches_gates(script)
 
-    @unittest.expectedFailure
     def test_an_unpushed_branch_is_never_pushed(self):
         self.git("switch", "--quiet", "-c", "scratch")
         self.git("commit", "--quiet", "--allow-empty", "-m", "local only")
@@ -141,13 +139,11 @@ class CheckoutGuardTest(unittest.TestCase):
                 self.assert_reaches_gates(script)
                 self.assertNotIn("refs/heads/scratch", self.remote_heads())
 
-    @unittest.expectedFailure
     def test_uncommitted_changes_on_another_branch_do_not_block_the_pr(self):
         self.git("switch", "--quiet", "-c", "stack-b")
         (self.work / "tracked.txt").write_text("edited\n")
         self.assert_reaches_gates("wait_pr_checks.sh")
 
-    @unittest.expectedFailure
     def test_a_stack_branch_tracking_its_parent_is_compared_with_its_own_pr(self):
         # `git switch -c <branch> origin/<parent>` makes the parent PR's branch the upstream (#7874).
         self.git("switch", "--quiet", "-c", "stack-b", "origin/feature")
