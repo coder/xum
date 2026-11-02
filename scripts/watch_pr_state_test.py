@@ -321,6 +321,10 @@ class WatchPrStateTest(unittest.TestCase):
         self.assertIn("timed out", result.stderr)
         self.assertEqual(self.result, "RESULT error 101:queued(queued)")
 
+    def test_skipped_and_neutral_checks_count_as_done(self):
+        self.assert_watch(0, [reply(checked(101, [check("Lint", "SKIPPED"), check("Docs", "NEUTRAL"), pixel()], "CLEAN"))], "101")
+        self.assertEqual(self.lines, ["#101 ready head 1111111"])
+
     def test_unstable_without_a_visual_cause_stays_pending(self):
         self.assert_watch(3, [reply(checked(101, [check(), pixel("SUCCESS")], "UNSTABLE"))] * 2, "101", "--deadline-mins", "1")
         self.assertEqual(self.lines, ["#101 pending head 1111111 checks passed, merge state UNSTABLE"])

@@ -13,8 +13,9 @@
 #
 # Without --queue, checks on the head and merge commit count as in wait_pr_checks.sh:
 #   pending, and the final states ready, blocked, failed, conflicting, behind, draft,
-#   closed, merged. ready means every non-visual check passed and GitHub's merge state is
-#   CLEAN, or UNSTABLE only from visual checks. It does not cover review threads or Codex.
+#   closed, merged. ready means every non-visual check passed or was skipped (SKIPPED or
+#   NEUTRAL, as GitHub counts them) and GitHub's merge state is CLEAN, or UNSTABLE only from
+#   visual checks. It does not cover review threads or Codex.
 #   blocked means every check passed, including each check the base branch's rules
 #   require, and GitHub still blocks the merge (for example on a required review). Like a
 #   queue removal, blocked is final only when two polls in a row read it.
@@ -169,7 +170,7 @@ def checks_state($pr; $p):
       # Codex skips drafts and the queue refuses them, so checks alone do not make one ready.
       elif $p.isDraft then ["draft", $at]
       elif any($checks[]; is_failed_check) then ["failed", "\($at) failed: \([$checks[] | select(is_failed_check)] | names)"]
-      elif any($checks[]; is_pending_check) or (any($checks[]; is_passing_check) | not)
+      elif any($checks[]; is_pending_check) or (any($checks[]; is_passing_check or is_skipped_check) | not)
       then ["pending", "\($at) \([$checks[] | select(is_pending_check | not)] | length)/\($checks | length) checks done"]
       elif $p.mergeStateStatus == "CLEAN"
         or ($p.mergeStateStatus == "UNSTABLE" and any($all[]; is_visual_review_check and is_unready_check))
