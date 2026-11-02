@@ -224,7 +224,11 @@ describe("AgentSession.sendMessage budget gate", () => {
     });
 
     const userTypedText = "Switch to my local model and keep going";
-    const result = await session.sendMessage(userTypedText, UNPRICED_OPTIONS);
+    // The scenario this guards is the queue-drain path (composer already
+    // cleared): sendQueuedMessages stamps dequeued on dispatch, and the
+    // preservation contract is scoped to dequeued sends — a rejected DIRECT
+    // send restores the composer draft instead of appending a row.
+    const result = await session.sendMessage(userTypedText, UNPRICED_OPTIONS, { dequeued: true });
     expect(result.success).toBe(false);
 
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -274,7 +278,11 @@ describe("AgentSession.sendMessage budget gate", () => {
     // A budgeted goal makes the pricing gate reject the unpriced send after it persists the row.
     await setGoalOk(goalService, { workspaceId, objective: "Stay under budget", budgetCents: 500 });
     const before = Date.now();
-    const result = await session.sendMessage("Typed on a TestClock", UNPRICED_OPTIONS);
+    // A redispatched follow-up: the composer already cleared, so the refusal keeps a row (a
+    // direct send instead hands its text back to the composer and writes none).
+    const result = await session.sendMessage("Typed on a TestClock", UNPRICED_OPTIONS, {
+      preserveGateRejections: { onPreserved: () => undefined },
+    });
     const after = Date.now();
     expect(result.success).toBe(false);
 
@@ -305,8 +313,11 @@ describe("AgentSession.sendMessage budget gate", () => {
       budgetCents: 500,
     });
 
+    // enqueuedAtMs + dequeued mirror what sendQueuedMessages stamps on a
+    // queue-drained dispatch — the preservation contract is dequeued-scoped.
     const result = await session.sendMessage("Typed before the goal existed", UNPRICED_OPTIONS, {
       enqueuedAtMs,
+      dequeued: true,
     });
     expect(result.success).toBe(false);
 
@@ -434,7 +445,9 @@ describe("AgentSession.sendMessage budget gate", () => {
     // Step 3: the previously-queued unpriced send now drains. The AS gate
     // re-evaluates with the freshly-budgeted goal and rejects.
     const queuedText = "Queued unpriced";
-    const racedResult = await session.sendMessage(queuedText, UNPRICED_OPTIONS);
+    const racedResult = await session.sendMessage(queuedText, UNPRICED_OPTIONS, {
+      dequeued: true,
+    });
     expect(racedResult.success).toBe(false);
     if (!racedResult.success) {
       expect(racedResult.error.type).toBe("unknown");

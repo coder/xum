@@ -1175,7 +1175,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(
@@ -1510,7 +1514,11 @@ describe("TaskService", () => {
     });
 
     const report = await waiter;
-    expect(report).toEqual({ reportMarkdown: "Hello from child", title: "Result" });
+    expect(report).toEqual({
+      reportMarkdown: "Hello from child",
+      title: "Result",
+      carriesProjectSkillContent: false,
+    });
 
     const artifactAfterStreamEnd = await readSubagentGitPatchArtifact(parentSessionDir, childId);
     expect(

@@ -535,6 +535,10 @@ export class RefusalFallback {
       onStepMessages: streamInfo.request.onStepMessages,
       onStepSettled: streamInfo.request.onStepSettled,
       contextBudgetLimit: prepared.contextBudgetLimit,
+      // The fallback attempt ships the same routed project-skill turn: the
+      // per-step consent gate must ride along or the fallback provider gets
+      // the content with no verdict.
+      preDispatchConsentGate: streamInfo.request.preDispatchConsentGate,
       contextBudgetTurnAnchor: prepared.contextBudgetTurnAnchor,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.

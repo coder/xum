@@ -89,6 +89,8 @@ export type {
   ContextBudgetStepDecision,
   SettledStepOutcome,
   OnStepSettled,
+  PreDispatchConsentGate,
+  PreDispatchConsentGateContext,
   ModelFallbackPrepareOptions,
   ModelFallbackOptions,
   StopStreamOptions,

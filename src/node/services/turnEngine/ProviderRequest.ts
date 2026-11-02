@@ -59,8 +59,18 @@ import {
   extractStatusCode,
 } from "./providerWire";
 export type { StreamRequestConfig } from "@/node/services/turnEngine/types";
+import type { PreDispatchConsentGate } from "@/node/services/turnEngine/types";
 
 export interface StreamRequestOptions {
+  /**
+   * Routed project-skill turns: final consent verdict for EVERY provider
+   * request of this turn. Invoked in the stream-start critical section and
+   * again in prepareStep immediately before each step's provider call
+   * (fallback and retry recreations inherit it via the request config).
+   * Returns the error to surface (null = proceed); rejection bookkeeping
+   * happens inside the callback.
+   */
+  preDispatchConsentGate?: PreDispatchConsentGate;
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
@@ -327,6 +337,7 @@ export class ProviderRequest {
       forcedFirstStepToolNames,
       providersConfigSnapshot,
       rebuildFirstStepForThinkingLevel,
+      preDispatchConsentGate,
     } = input;
     // The request's pinned providers-config snapshot keeps type-derived output limits
     // aligned with the config that created the SDK model.
@@ -383,6 +394,7 @@ export class ProviderRequest {
       forcedFirstStepToolNames,
       rebuildProviderOptionsForThinkingLevel,
       rebuildFirstStepForThinkingLevel,
+      preDispatchConsentGate,
     };
   }
 

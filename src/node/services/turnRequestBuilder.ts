@@ -1,3 +1,4 @@
+import { stepMessagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
@@ -51,6 +52,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { MuxMessage, MuxMessageMetadata, SystemSectionRecords } from "@/common/types/message";
+import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -163,6 +165,11 @@ import {
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
+import {
+  observeProjectSkillContentInToolOutputs,
+  toolExcludesProjectSkillContent,
+  withToolDescriptionProvenance,
+} from "@/node/services/tools/projectSkillContentGate";
 import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
 import { skillIndexSectionFor } from "@/node/services/tools/agent_skill_read";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
@@ -339,6 +346,16 @@ export interface StreamMessageOptions {
   messages: MuxMessage[];
   workspaceId: string;
   modelString: string;
+  /**
+   * Routed project-skill turns: last consent check before the provider
+   * operation starts. Invoked by AIService immediately before
+   * streamManager.startStream — request building is the final revocation
+   * window. Performs its own rejection bookkeeping and returns the error to
+   * surface (null = proceed). Per-step re-verification passes
+   * `midStream: true` (the stream's error path then owns the visible
+   * emission). Never sourced from IPC schemas.
+   */
+  preDispatchConsentGate?: PreDispatchConsentGate;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;
@@ -383,6 +400,16 @@ export interface StreamMessageOptions {
    * context for the whole segment.
    */
   resolveMemoryContext?: (modelString: string) => Promise<MemorySessionContext | undefined>;
+  /**
+   * The request's rows or attachments carry project skill content: memory
+   * files the turn writes inherit that provenance (the model can copy the
+   * content into them), so later routed requests can withhold them.
+   */
+  memoryWritesCarryProjectSkillContent?: boolean;
+  /** Routed turn without Project Trust: tools refuse or leave out project skill content. */
+  excludeProjectSkillContent?: boolean;
+  /** Routed turn under trust: trust re-read at tool calls (ToolConfiguration.projectSkillContentStillReadable). */
+  projectSkillContentStillReadable?: () => Promise<boolean>;
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
@@ -928,7 +955,9 @@ interface WorkflowResultContinuationSender {
       requireIdle?: boolean;
       startStreamInBackground?: boolean;
     }
-  ): Promise<Result<void, SendMessageError>>;
+    // The continuation sender ignores the accepted-send payload; unknown keeps
+    // this structural type compatible with WorkspaceService.sendMessage.
+  ): Promise<Result<unknown, SendMessageError>>;
 }
 
 interface TurnRequestBuildStartupState {
@@ -1705,6 +1734,9 @@ export class TurnRequestBuilder {
       recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
+      memoryWritesCarryProjectSkillContent,
+      excludeProjectSkillContent,
+      projectSkillContentStillReadable,
       workspaceGoalService,
       goalTurnKind,
       goalTurnGoalId,
@@ -2691,7 +2723,10 @@ export class TurnRequestBuilder {
     } = prePolicyStreamSystemContext;
     turnInstructionSources.current = instructionSources;
     // The agent_skill_read index the tools are built with, found again by the assembler.
-    const skillIndexSection = skillIndexSectionFor(availableSkills);
+    const skillIndexSection = skillIndexSectionFor(
+      availableSkills,
+      excludeProjectSkillContent === true
+    );
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -3049,6 +3084,10 @@ export class TurnRequestBuilder {
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
+    // Live per-stream project provenance: set by onStepMessages below when a
+    // step's messages carry project skill content (a project skill read by an
+    // earlier step), read by the memory tool at each write.
+    const liveProjectTaint = { carries: false };
     // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
     // One object for every attempt: each attempt sets the model it streams with, so a refusal
     // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
@@ -3056,6 +3095,7 @@ export class TurnRequestBuilder {
     const hookTurn = { turnId: assistantMessageId, model: modelString };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
+      projectSkillContentInContext: () => liveProjectTaint.carries,
       cwd: workspacePath,
       clock: this.hostClock,
       hookTurn,
@@ -3161,6 +3201,13 @@ export class TurnRequestBuilder {
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
       memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
+      // Write provenance: the request's own project content, or a preloaded /
+      // indexed memory that already carries it.
+      memoryWriteCarriesProjectSkillContent:
+        memoryWritesCarryProjectSkillContent === true ||
+        memoryContext?.carriesProjectSkillContent === true,
+      excludeProjectSkillContent: excludeProjectSkillContent === true,
+      projectSkillContentStillReadable,
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
@@ -3314,10 +3361,18 @@ export class TurnRequestBuilder {
         const applyPolicyStartedAt = this.hostClock.nowMs();
         let attemptTools = await applyToolPolicyAndExperiments({
           capabilityGrants,
-          allTools: this.dependencies.wrapToolsForDelegation(
-            workspaceId,
-            withExecutionScope(allTools, executionScope),
-            delegatedToolNames
+          // Outputs are classified as they return: a project skill read inside
+          // a PTC program taints the live provenance before the evaluation's
+          // later sinks run, not only at onStepMessages.
+          allTools: observeProjectSkillContentInToolOutputs(
+            this.dependencies.wrapToolsForDelegation(
+              workspaceId,
+              withExecutionScope(allTools, executionScope),
+              delegatedToolNames
+            ),
+            () => {
+              liveProjectTaint.carries = true;
+            }
           ),
           // Runtime extras may shadow a granted built-in name with arbitrary execution.
           extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
@@ -3336,6 +3391,10 @@ export class TurnRequestBuilder {
             kernelFileLoader,
             locks: this.dependencies.historyService.locks,
           },
+          // A queued child report distilled from project skill content is
+          // withheld when the kernel drains it for a turn that excludes such
+          // content; re-read at the call, like the tools' own gates.
+          excludesProjectSkillContent: () => toolExcludesProjectSkillContent(toolsForModelConfig),
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
@@ -4241,8 +4300,25 @@ export class TurnRequestBuilder {
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
       emitStartupBreadcrumb("starting_stream");
+      // agent_skill_read's description lists each advertised skill's
+      // repository-controlled description: project-scope entries kept under
+      // trust are project content the row scan never sees, so they arm the
+      // gate like a snapshot row (an untrusted routed turn filters them out of
+      // the description instead — see buildSkillReadDescription).
+      const toolDescriptionsCarryProjectSkillContent =
+        excludeProjectSkillContent !== true &&
+        (availableSkills ?? []).some(
+          (skill) => skill.scope === "project" && skill.advertise !== false
+        );
+      const preDispatchConsentGate = withToolDescriptionProvenance(
+        opts.preDispatchConsentGate,
+        toolDescriptionsCarryProjectSkillContent
+      );
       const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
+        // Threaded to the stream-start critical section (see
+        // TurnExecutionOptions.preDispatchConsentGate).
+        ...(preDispatchConsentGate != null ? { preDispatchConsentGate } : {}),
         messages: streamFinalMessages,
         model: modelResult.data.model,
         modelString,
@@ -4266,6 +4342,11 @@ export class TurnRequestBuilder {
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
+          // The reply was produced with those descriptions in context and can
+          // quote them; no row records that channel, so the turn's own row is
+          // stamped (MuxMetadata.carriesProjectSkillContent) and a later
+          // routed request that excludes project skill content withholds it.
+          ...(toolDescriptionsCarryProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           // When Auto set the thinking level, the record names the level this request starts
           // at: the tier's choice clamped to the model that runs (the composer's after a
           // model-only fallback), not the raw tier value.
@@ -4289,6 +4370,14 @@ export class TurnRequestBuilder {
         thinkingLevel: streamThinkingLevel,
         headers: requestHeaders,
         callSettingsOverrides: resolvedOverrides.standard,
+        onStepMessages: (stepMessages) => {
+          // A project skill read by an earlier step rides in these messages
+          // before this step's tool calls execute: later memory writes of the
+          // stream record the provenance.
+          if (!liveProjectTaint.carries && stepMessagesCarryProjectSkillContent(stepMessages)) {
+            liveProjectTaint.carries = true;
+          }
+        },
         providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
         toolSearchState: toolSearchRuntime?.state,
