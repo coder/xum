@@ -5,6 +5,7 @@ import {
   KEYBINDS,
   matchesKeybind,
   matchesNewSidebarTabKeybind,
+  matchesOpenPlanTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 
@@ -27,7 +28,6 @@ const SIDEBAR_EVENTS = [
 const SIDEBAR_KEYBINDS = [
   ...([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => KEYBINDS[`SIDEBAR_TAB_${n}`]),
   KEYBINDS.OPEN_ARTIFACTS_TAB,
-  KEYBINDS.OPEN_PLAN_TAB,
   KEYBINDS.CLOSE_TAB,
 ];
 
@@ -42,6 +42,7 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
     const sidebarKey =
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
       matchesNewSidebarTabKeybind(e) || // its own matcher: AltGr does not count
+      matchesOpenPlanTabKeybind(e) || // likewise
       // Shift+I types a letter in a text field, where the sidebar ignores it.
       (matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE) && !isEditableElement(e.target));
     if (!sidebarKey) return;
@@ -107,7 +108,8 @@ export function guardSidebarKeys(): () => void {
   const guard = (e: KeyboardEvent) => {
     const sidebarKey =
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
-      matchesNewSidebarTabKeybind(e);
+      matchesNewSidebarTabKeybind(e) ||
+      matchesOpenPlanTabKeybind(e);
     if (sidebarKey) e.preventDefault();
   };
   window.addEventListener("keydown", guard);
