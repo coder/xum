@@ -7,7 +7,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
     "SKILL.md": [
       "---",
       "name: background-monitors",
-      "description: Run bounded background monitors that wake the agent only when a condition changes or the monitor finishes",
+      "description: Run bounded background monitors that wake the agent only when a condition changes or the monitor finishes. Use before you write any watcher, poll loop or background wait for CI, PR checks, Codex or review verdicts, the merge queue, deployments or logs.",
       "---",
       "",
       "# Background monitors",
