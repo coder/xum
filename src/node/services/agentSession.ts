@@ -2485,6 +2485,9 @@ export class AgentSession {
     const turn = this.coordinator.turnId;
     await this.loadAutoRetryEnabledPreference(isCurrent);
     if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
+    // A task Stop releases its latch once this turn settles, after its cleanup abandoned the
+    // retry, so a retry armed now would restart the stopped workspace.
+    if (this.isStopInProgress()) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -2537,6 +2540,11 @@ export class AgentSession {
     const request = this.lastAutoRetryResumeRequest;
     if (request?.goalKind == null || request.goalId !== goalId) return;
     this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+  }
+
+  /** End the auto-retry loop for a Stop that does not run interruptStream (a task Stop). */
+  abandonAutoRetry(reason: string): void {
+    this.retryManager.abandon(reason);
   }
 
   private async retryActiveStream(

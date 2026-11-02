@@ -13,6 +13,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     markDelegatedCreationInterrupted: () => Promise.resolve(false),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
+    abandonAutoRetry: () => undefined,
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
     refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),

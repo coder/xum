@@ -510,6 +510,8 @@ export interface WorkspaceTurnHost {
     workspaceId: string,
     options?: { cancelReason?: string; preserveUserInput?: boolean }
   ): Result<void>;
+  /** Cancel the session's scheduled or starting auto-retry, as a user Stop does. */
+  abandonAutoRetry(workspaceId: string, reason: string): void;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,

@@ -20645,6 +20645,10 @@ export class WorkspaceService
     this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
   }
 
+  abandonAutoRetry(workspaceId: string, reason: string): void {
+    this.sessions.get(workspaceId)?.abandonAutoRetry(reason);
+  }
+
   async getGoalContinuationKickoffSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {

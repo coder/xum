@@ -29,7 +29,10 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 export interface TaskStopLatchDeps {
   config: () => Pick<Config, "loadConfigOrDefault">;
   aiService: () => Pick<AIService, "stopStream">;
-  workspaceService: () => Pick<WorkspaceHost, "getActiveTurnGeneration" | "clearQueue">;
+  workspaceService: () => Pick<
+    WorkspaceHost,
+    "getActiveTurnGeneration" | "clearQueue" | "abandonAutoRetry"
+  >;
   turnManager: () => Pick<
     WorkspaceTurnManager,
     | "getLiveWorkspaceTurnRegistration"
@@ -289,6 +292,12 @@ export class TaskStopLatch {
           } catch (error: unknown) {
             log.debug(`${options.label}: clearQueue threw`, { taskId: id, error });
           }
+        }
+        // A backoff left armed would restart the stopped task once the latch drops.
+        try {
+          this.deps.workspaceService().abandonAutoRetry(id, "task_stopped");
+        } catch (error: unknown) {
+          log.debug(`${options.label}: abandonAutoRetry threw`, { taskId: id, error });
         }
         const execution = options.capturedExecutionsById?.get(id);
         if (execution != null) {
