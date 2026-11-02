@@ -43,7 +43,8 @@ Preconditions:
   hunk shows the three added lines of `sub`, and the tab reads `Review 0/1`. Capture
   `review/diff`.
 - **Mark as read.** Run
-  `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads `Review 1/1`, and the hunk reads `Hunk marked as read`.
+  `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads
+  `Review 1/1`, and the hunk reads `Hunk marked as read`.
   `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has
   `"isRead": true` for that hunk within a second. Capture `review/read`.
 - **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
