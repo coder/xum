@@ -85,6 +85,12 @@ Use these scripts to check, resolve, and wait on Codex review comments:
 
 The PR readiness definition, the review loop, and its early-stop cases live in the PR Workflow section of AGENTS.md; follow them there.
 
+#### Security review receipts and round cost
+
+- The `Codex Comments` check needs a Codex security review receipt that names the PR head. Codex posts one only for a review that a comment asked for, not for the review that runs automatically on PR open or on a push. Without it, `check_codex_comments.sh` exits 10 with "No Codex security review was requested for <head>: request one".
+- `wait_pr_codex.sh` (and so `wait_pr_ready.sh`) posts that request itself, once per head, as `@codex security review`, a blank line, and `Head: <sha>`. It does this only when the PR already has a human `@codex review` comment. On a PR where only the automatic reviews ran, it stops with "No '@codex review' comment found", so post the request by hand in the same format.
+- Each pushed head therefore costs two Codex review rounds: the automatic review and the security review request. Batch every fix for a round into one push.
+
 ## Coder Agents Review Workflow
 
 When `/coder-agents-review` is used or the `coder-agents-review` bot has participated:
