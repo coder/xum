@@ -27,6 +27,9 @@ assert args[6] == '-f' and args[7].startswith('query=') and len(args) == 8, args
 polls = json.loads(pathlib.Path(os.environ['WATCH_FIXTURE']).read_text())
 reply = polls[len(calls.read_text().splitlines()) - 1]
 if reply.get('hang'):
+    if reply.get('child'):
+        import subprocess
+        subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], stderr=subprocess.DEVNULL)
     pathlib.Path(os.environ['WATCH_HUNG']).touch()
     time.sleep(120)
 out = reply.get('stdout')
@@ -131,10 +134,6 @@ def checked(number, nodes, merge_state="CLEAN", mergeable="MERGEABLE", more=Fals
         "mergeable": mergeable,
         "mergeStateStatus": merge_state,
         "headRefOid": HEAD,
-        "baseRef": {"rules": {"pageInfo": {"hasNextPage": False}, "nodes": [
-            {"type": "MERGE_QUEUE", "parameters": {}},
-            {"type": "REQUIRED_STATUS_CHECKS", "parameters": {"requiredStatusChecks": [{"context": "Required"}]}},
-        ]}},
         "commits": {"nodes": [{"commit": {"oid": HEAD, "statusCheckRollup": rollup(nodes, more)}}]},
         "potentialMergeCommit": None if merge_nodes is None else {"oid": MERGE, "statusCheckRollup": rollup(merge_nodes)},
     }
@@ -302,7 +301,7 @@ class WatchPrStateTest(unittest.TestCase):
         ])
         self.assertEqual(self.result, "RESULT ok 101:ready 102:ready")
 
-    def test_blocked_after_every_required_check_passed_ends_on_the_second_read(self):
+    def test_blocked_is_final_only_on_the_second_read_in_a_row(self):
         done = [check("Detect Changes"), check()]
         self.assert_watch(1, [
             reply(checked(101, [check("Detect Changes")], "BLOCKED")),
@@ -311,15 +310,18 @@ class WatchPrStateTest(unittest.TestCase):
             reply(checked(101, done, "BLOCKED")),
         ], "101")
         self.assertEqual(self.lines, [
-            "#101 pending head 1111111 waiting for required checks: Required",
+            "#101 blocked head 1111111 checks passed, merge state BLOCKED",
+            "#101 pending head 1111111 1/2 checks done",
             "#101 blocked head 1111111 checks passed, merge state BLOCKED",
         ])
         self.assertEqual(self.result, "RESULT fail 101:blocked")
 
     def test_a_hung_read_is_an_error_not_pending(self):
-        result = self.assert_watch(2, [reply(queued(101, "QUEUED")), {"hang": True}], "101", "--queue")
-        self.assertIn("timed out", result.stderr)
-        self.assertEqual(self.result, "RESULT error 101:queued(queued)")
+        for hang in ({"hang": True}, {"hang": True, "child": True}):
+            with self.subTest(hang=hang):
+                result = self.assert_watch(2, [reply(queued(101, "QUEUED")), hang], "101", "--queue")
+                self.assertIn("timed out", result.stderr)
+                self.assertEqual(self.result, "RESULT error 101:queued(queued)")
 
     def test_skipped_and_neutral_checks_count_as_done(self):
         self.assert_watch(0, [reply(checked(101, [check("Lint", "SKIPPED"), check("Docs", "NEUTRAL"), pixel()], "CLEAN"))], "101")
@@ -355,13 +357,6 @@ class WatchPrStateTest(unittest.TestCase):
             (checked(101, [check()], "CLEAN", "MAYBE"), "unknown mergeable value MAYBE"),
             (dict(checked(101, [check()]), isDraft=None), "unknown draft flag null"),
             (moved, "is not the last listed commit"),
-            (dict(checked(101, [check()], "BLOCKED"), baseRef=None), "unreadable base branch rules"),
-            (
-                dict(checked(101, [check()], "BLOCKED"), baseRef={"rules": {"pageInfo": {"hasNextPage": False}, "nodes": [
-                    {"type": "REQUIRED_STATUS_CHECKS", "parameters": {}},
-                ]}}),
-                "malformed required status checks rule",
-            ),
         ):
             with self.subTest(needle=needle):
                 result = self.assert_watch(2, [reply(pr)], "101")

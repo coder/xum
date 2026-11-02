@@ -16,9 +16,10 @@
 #   closed, merged. ready means every non-visual check passed or was skipped (SKIPPED or
 #   NEUTRAL, as GitHub counts them) and GitHub's merge state is CLEAN, or UNSTABLE only from
 #   visual checks. It does not cover review threads or Codex.
-#   blocked means every check passed, including each check the base branch's rules
-#   require, and GitHub still blocks the merge (for example on a required review). Like a
-#   queue removal, blocked is final only when two polls in a row read it.
+#   blocked means every listed check passed and GitHub still blocks the merge (for example
+#   on a required review). Like a queue removal, blocked is final only when two polls in a
+#   row read it: GitHub creates the check of a job only once the jobs it needs finish, so
+#   for a moment every listed check can pass while a required check is still to come.
 # With --queue:
 #   queued(<entry state>), queued(no_entry) (GitHub lists the PR as added but shows no
 #   entry yet or any more), and the final states merged, closed, removed(<reason>) and
@@ -49,6 +50,7 @@ DEADLINE_MINS=120
 
 finish() {
   trap - EXIT
+  rm -f "${RESPONSE_FILE:-}"
   local line="RESULT $1" i
   for i in "${!PRS[@]}"; do
     line+=" ${PRS[i]}:${FINAL[i]:-${STATE[i]:-unread}}"
@@ -89,6 +91,7 @@ TIMEOUT=$(command -v timeout || command -v gtimeout) || {
 }
 # Any other exit (a failed date or jq under set -e) still ends with a RESULT line.
 trap 'echo "❌ Unexpected failure (exit $?)" >&2; finish error 2' EXIT
+RESPONSE_FILE=$(mktemp)
 
 ROLLUP="statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { $(check_context_graphql_fields) } } }"
 if [[ $MODE == queue ]]; then
@@ -102,8 +105,6 @@ if [[ $MODE == queue ]]; then
     }'
 else
   FIELDS="number state isDraft mergeable mergeStateStatus headRefOid
-    baseRef { rules(first: 100) { pageInfo { hasNextPage } nodes { type
-      parameters { ... on RequiredStatusChecksParameters { requiredStatusChecks { context } } } } } }
     commits(last: 1) { nodes { commit { oid $ROLLUP } } }
     potentialMergeCommit { oid $ROLLUP }"
 fi
@@ -142,14 +143,6 @@ def queue_state($pr; $p):
       else ["removed(\($event.reason | token))", "at \($event.createdAt)"] end
   end;
 
-def required_checks($pr; $p):
-  if ($p.baseRef.rules.nodes | type) != "array" or $p.baseRef.rules.pageInfo.hasNextPage != false
-  then fail($pr; "unreadable base branch rules")
-  else [$p.baseRef.rules.nodes[] | select(.type == "REQUIRED_STATUS_CHECKS") | .parameters.requiredStatusChecks
-    | if type == "array" and all(.[]; (.context | type) == "string") then .[].context
-      else fail($pr; "malformed required status checks rule") end]
-  end;
-
 def checks_state($pr; $p):
   if ($p.mergeable | IN("MERGEABLE", "CONFLICTING", "UNKNOWN") | not)
   then fail($pr; "unknown mergeable value \($p.mergeable)")
@@ -175,13 +168,8 @@ def checks_state($pr; $p):
       elif $p.mergeStateStatus == "CLEAN"
         or ($p.mergeStateStatus == "UNSTABLE" and any($all[]; is_visual_review_check and is_unready_check))
       then ["ready", $at]
-      elif $p.mergeStateStatus != "BLOCKED" then ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"]
-      # GitHub creates the check of a job only once the jobs it needs finish, so a required
-      # check can be missing while every listed check has passed.
-      else (required_checks($pr; $p) - [$all[] | select(is_passing_check or is_skipped_check) | .name]) as $missing
-        | if $missing != [] then ["pending", "\($at) waiting for required checks: \($missing | unique | join(", "))"]
-          else ["blocked", "\($at) checks passed, merge state BLOCKED"] end
-      end
+      elif $p.mergeStateStatus == "BLOCKED" then ["blocked", "\($at) checks passed, merge state BLOCKED"]
+      else ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"] end
   end;
 
 if (.errors // []) != [] then error("GraphQL errors: \(.errors | map(.message) | join("; "))")
@@ -221,9 +209,11 @@ poll() {
 
   # gh prints GraphQL errors on stdout and HTTP errors on stderr: show both. gh has no
   # timeout of its own. timeout signals the whole process group of the read, and -k kills
-  # a read that ignores the first signal. Not --foreground: it spares the children of gh,
-  # and a child that keeps stdout open keeps this read open too.
-  response=$("$TIMEOUT" -k 5 "$READ_TIMEOUT_SECS" gh api graphql -F owner='{owner}' -F name='{repo}' -f query="$query") || rc=$?
+  # a read that ignores the first signal. The reply goes to a file, not $(...), because a
+  # command substitution also waits for any child of gh that still holds stdout.
+  "$TIMEOUT" -k 5 "$READ_TIMEOUT_SECS" gh api graphql -F owner='{owner}' -F name='{repo}' -f query="$query" \
+    >"$RESPONSE_FILE" || rc=$?
+  response=$(<"$RESPONSE_FILE")
   if ((rc != 0)); then
     printf '%s\n' "$response" >&2
     if ((rc == 124 || rc == 137)); then
