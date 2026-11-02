@@ -729,8 +729,9 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
 
-test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
+test-pr-checks: ## Test PR check discovery, readiness and the PR state watcher with offline GitHub fixtures
 	@python3 scripts/pr_checks_test.py
+	@python3 scripts/watch_pr_state_test.py
 
 test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
 	@python3 scripts/required_superseded_test.py
