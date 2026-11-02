@@ -2077,7 +2077,7 @@ export const workspace = {
       workspaceId: z.string(),
       acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
       /** Per sub-agent workspace ID: the untracked paths the user confirmed losing. */
-      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).nullish(),
+      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).optional(),
     }),
     output: ResultSchema(ArchiveWorkspaceResultSchema, z.string()),
   },

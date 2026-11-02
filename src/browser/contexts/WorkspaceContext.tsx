@@ -1434,8 +1434,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           () =>
             liveApi.workspace.archive({
               workspaceId,
-              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-              acknowledgedSubagentUntrackedPaths: options?.acknowledgedSubagentUntrackedPaths,
+              ...options,
             })
         );
         if (result.success) {

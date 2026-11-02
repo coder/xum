@@ -2162,10 +2162,7 @@ export const router = (authToken?: string) => {
           context.workspaceService.archive(
             input.workspaceId,
             input.acknowledgedUntrackedPaths ?? undefined,
-            {
-              acknowledgedSubagentUntrackedPaths:
-                input.acknowledgedSubagentUntrackedPaths ?? undefined,
-            }
+            { acknowledgedSubagentUntrackedPaths: input.acknowledgedSubagentUntrackedPaths }
           )
         ),
       unarchive: t

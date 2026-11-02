@@ -11766,24 +11766,11 @@ export class WorkspaceService
     const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
-        const acknowledged = options?.acknowledgedSubagentUntrackedPaths?.[descendant.workspaceId];
-        const result = await this.archiveUnlocked(descendant.workspaceId, acknowledged, {
-          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
-          // user-facing archive passes none of them.
-          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
-          refuseLiveUserActivity: options?.refuseLiveUserActivity,
-          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
-          worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-          coderWorkspaceArchiveBehaviorOverride: "keep",
-          mutationGateHeld: true,
-        });
-        const failure = !result.success
-          ? result.error
-          : result.data.kind !== "archived"
-            ? // Untracked files that the user did not confirm (or that appeared after the
-              // confirmation) refuse; the dialog's retry preflights again and lists them.
-              "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them"
-            : null;
+        const failure = await this.archiveCascadeDescendant(
+          descendant.workspaceId,
+          worktreeArchiveBehavior,
+          options
+        );
         if (failure != null) {
           return Err(
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
@@ -11809,6 +11796,37 @@ export class WorkspaceService
       // The task-tree lock remains held, so nested removal must not reacquire that lock.
       for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
+  }
+
+  /**
+   * Archive one sub-agent of a cascade under the tree's held gate and pinned behavior. Returns
+   * why it refused, or null once it is archived.
+   */
+  private async archiveCascadeDescendant(
+    descendantId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options: ArchiveWorkspaceOptions | undefined
+  ): Promise<string | null> {
+    const result = await this.archiveUnlocked(
+      descendantId,
+      options?.acknowledgedSubagentUntrackedPaths?.[descendantId],
+      {
+        // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+        // user-facing archive passes none of them.
+        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        refuseLiveUserActivity: options?.refuseLiveUserActivity,
+        forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: "keep",
+        mutationGateHeld: true,
+      }
+    );
+    if (!result.success) return result.error;
+    // Untracked files that the user did not confirm (or that appeared after the confirmation)
+    // refuse; the dialog's retry preflights again and lists them.
+    return result.data.kind === "archived"
+      ? null
+      : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 
   /**

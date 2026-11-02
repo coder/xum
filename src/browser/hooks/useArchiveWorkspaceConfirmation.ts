@@ -3,20 +3,13 @@ import type { ConfirmationModal } from "@/browser/components/ConfirmationModal/C
 import type { WorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import type { ArchiveLossyUntrackedFilesConfirmation } from "@/common/orpc/schemas/api";
 import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
+  buildArchiveConfirmText,
+  flattenLossyPaths,
+  type ArchiveConfirmTextInput,
 } from "@/browser/utils/archiveConfirmation";
 
-interface ArchiveConfirmation {
+interface ArchiveConfirmation extends ArchiveConfirmTextInput {
   workspaceId: string;
-  displayTitle: string | undefined;
-  /**
-   * When set, the confirmation warns about permanent deletion of untracked files, the target's
-   * own and those of the sub-agents its archive cascades over.
-   */
-  lossy?: ArchiveLossyUntrackedFilesConfirmation;
-  /** Whether the workspace has an active stream that will be interrupted. */
-  isStreaming: boolean;
 }
 
 export interface UseArchiveWorkspaceConfirmationOptions {
@@ -32,37 +25,19 @@ export interface UseArchiveWorkspaceConfirmationOptions {
   showError: (workspaceId: string, error: string, anchorEl?: HTMLElement) => void;
 }
 
-/** One key per at-risk path, tagged with its sub-agent so equal paths in two checkouts differ. */
-function lossyPathKeys(lossy: ArchiveLossyUntrackedFilesConfirmation): string[] {
-  return [
-    ...lossy.paths,
-    ...(lossy.subagents ?? []).flatMap((subagent) =>
-      subagent.paths.map((path) => `${subagent.workspaceId}\0${path}`)
-    ),
-  ];
-}
-
 function didUntrackedPathSetChange(
   acknowledged: ArchiveLossyUntrackedFilesConfirmation,
   latest: ArchiveLossyUntrackedFilesConfirmation
 ): boolean {
-  const acknowledgedKeys = lossyPathKeys(acknowledged);
-  const latestKeys = lossyPathKeys(latest);
+  // Tag sub-agent paths with their workspace so equal paths in two checkouts differ.
+  const tag = (subagent: { workspaceId: string }) => `${subagent.workspaceId}\0`;
+  const acknowledgedKeys = flattenLossyPaths(acknowledged, tag);
+  const latestKeys = flattenLossyPaths(latest, tag);
   if (acknowledgedKeys.length !== latestKeys.length) {
     return true;
   }
   const acknowledgedSet = new Set(acknowledgedKeys);
   return latestKeys.some((key) => !acknowledgedSet.has(key));
-}
-
-/** The paths the dialog lists: the target's as they are, each sub-agent's under its title. */
-function displayedLossyPaths(lossy: ArchiveLossyUntrackedFilesConfirmation): string[] {
-  return [
-    ...lossy.paths,
-    ...(lossy.subagents ?? []).flatMap((subagent) =>
-      subagent.paths.map((path) => `${subagent.title}: ${path}`)
-    ),
-  ];
 }
 
 function archiveAcknowledgement(lossy: ArchiveLossyUntrackedFilesConfirmation) {
@@ -164,23 +139,9 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
     await performArchive(workspaceId, anchorEl);
   };
 
-  const lossy = confirmation?.lossy;
-  const untrackedPaths = lossy ? displayedLossyPaths(lossy) : undefined;
-  const isStreaming = confirmation?.isStreaming ?? false;
   const modalProps: ComponentProps<typeof ConfirmationModal> = {
     isOpen: confirmation !== null,
-    title: untrackedPaths
-      ? "Archive workspace with untracked files?"
-      : confirmation?.displayTitle
-        ? `Archive "${confirmation.displayTitle}" while streaming?`
-        : "Archive workspace?",
-    description: buildArchiveConfirmDescription(
-      isStreaming,
-      untrackedPaths,
-      (lossy?.subagents ?? []).length > 0
-    ),
-    warning: buildArchiveConfirmWarning(isStreaming, untrackedPaths),
-    confirmLabel: untrackedPaths ? "Archive and delete files" : "Archive",
+    ...buildArchiveConfirmText(confirmation),
     confirmVariant: "destructive",
     onConfirm: async () => {
       if (!confirmation) return;
