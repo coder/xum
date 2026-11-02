@@ -92,6 +92,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
+.PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
@@ -610,6 +611,9 @@ MUTATE_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group 
 test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate-check end to end (needs uv)
 	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
 	@bun test ./scripts/mutate/check.test.ts
+
+formal-check: ## Model-check the TLA+ models of the formal-verification skills (Java 11+; see .xum/skills/formal-stop-retry)
+	@./.xum/skills/formal-stop-retry/check.sh
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
