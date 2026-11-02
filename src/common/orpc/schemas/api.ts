@@ -1462,6 +1462,10 @@ const DebugLlmRequestSnapshotSchema = z
 const ArchiveLossyUntrackedFilesConfirmationSchema = z.object({
   kind: z.literal("confirm-lossy-untracked-files"),
   paths: z.array(z.string()),
+  /** Sub-agents the archive cascades over whose snapshot archives would lose these paths. */
+  subagents: z
+    .array(z.object({ workspaceId: z.string(), title: z.string(), paths: z.array(z.string()) }))
+    .optional(),
 });
 
 const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
@@ -2072,6 +2076,8 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
+      /** Per sub-agent workspace ID: the untracked paths the user confirmed losing. */
+      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).optional(),
     }),
     output: ResultSchema(ArchiveWorkspaceResultSchema, z.string()),
   },

@@ -4212,7 +4212,7 @@ export class WorkspaceTurnManager {
                   .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
                   .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
                 "This tool cannot approve that loss, and you must not delete the files to get around it. " +
-                "Ask the user to archive those sub-agents manually first; the archive dialog lists the files and asks for confirmation.",
+                "Ask the user to archive this workspace manually; the archive dialog lists the sub-agents' files and asks for confirmation.",
             });
           }
           if (targetPaths.length > 0) {

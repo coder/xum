@@ -288,6 +288,12 @@ export interface ArchiveCascadePreflight {
 
 export interface ArchiveWorkspaceOptions {
   /**
+   * Per sub-agent workspace ID, the untracked paths the user confirmed losing to its snapshot
+   * archive. Only the user's archive sets it: no tool acknowledgement can approve losing a
+   * sub-agent's work (#4930).
+   */
+  acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+  /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
    * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
    * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
