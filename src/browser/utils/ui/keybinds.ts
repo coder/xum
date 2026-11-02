@@ -64,6 +64,11 @@ export function matchesNewSidebarTabKeybind(event: React.KeyboardEvent | Keyboar
   return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.NEW_SIDEBAR_TAB);
 }
 
+/** OPEN_PLAN_TAB is a Ctrl/Cmd+Alt+Shift chord, so it ignores AltGr input like NEW_SIDEBAR_TAB. */
+export function matchesOpenPlanTabKeybind(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.OPEN_PLAN_TAB);
+}
+
 export function matchesKeybind(
   event: React.KeyboardEvent | KeyboardEvent,
   keybind: Keybind
@@ -627,7 +632,7 @@ export const KEYBINDS = {
   STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
   /** Open (or focus) the Plan tab in the right sidebar */
-  OPEN_PLAN_TAB: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
+  OPEN_PLAN_TAB: { key: "l", code: "KeyL", ctrl: true, alt: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.

@@ -5,6 +5,7 @@ import {
   isMac,
   matchesKeybind,
   matchesNewSidebarTabKeybind,
+  matchesOpenPlanTabKeybind,
   isKeybindDeprecated,
   KEYBINDS,
   getSideChatPaneWorkspaceId,
@@ -47,6 +48,21 @@ describe("NEW_SIDEBAR_TAB keybind", () => {
     // AltGr reports Ctrl+Alt on Windows/Linux layouts, where AltGr+N types a character.
     expect(
       matchesNewSidebarTabKeybind(
+        createEvent({ ...chord, getModifierState: (key: string) => key === "AltGraph" })
+      )
+    ).toBe(false);
+  });
+});
+
+describe("OPEN_PLAN_TAB keybind", () => {
+  test("matches Ctrl+Alt+Shift+L but not the same chord produced by AltGr", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    const chord = { key: "L", code: "KeyL", ctrlKey: true, altKey: true, shiftKey: true };
+
+    expect(matchesOpenPlanTabKeybind(createEvent(chord))).toBe(true);
+    // AltGr+Shift reports Ctrl+Alt+Shift on Windows/Linux layouts, where it types a character.
+    expect(
+      matchesOpenPlanTabKeybind(
         createEvent({ ...chord, getModifierState: (key: string) => key === "AltGraph" })
       )
     ).toBe(false);

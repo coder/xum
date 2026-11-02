@@ -26,6 +26,7 @@ import {
   isTerminalFocused,
   KEYBINDS,
   matchesKeybind,
+  matchesOpenPlanTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
@@ -451,7 +452,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     const open = () => openSidebarTab("plan", activeElement());
     const onKeyDown = (e: KeyboardEvent) => {
       if (
-        !matchesKeybind(e, KEYBINDS.OPEN_PLAN_TAB) ||
+        !matchesOpenPlanTabKeybind(e) ||
         isDialogOpen() ||
         !isTimelineSidebarHidden() ||
         isTerminalFocused(e.target) ||
