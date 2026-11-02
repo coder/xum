@@ -67,6 +67,7 @@ import {
   isDesktopViewportFocused,
   isTerminalFocused,
   matchesNewSidebarTabKeybind,
+  matchesOpenPlanTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { Button } from "@/browser/components/Button/Button";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
@@ -1968,7 +1969,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     const handler = (e: KeyboardEvent) => {
       const container = sidebarContainerRef.current;
       if (
-        !matchesKeybind(e, KEYBINDS.OPEN_PLAN_TAB) ||
+        !matchesOpenPlanTabKeybind(e) ||
         (container != null && isRightSidebarResponsivelyHidden(container)) ||
         isDialogOpen() ||
         // Remote desktops, browsers and terminals own their keystrokes.
@@ -2101,6 +2102,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, target.tabsetId));
           } else if (target?.tab === "artifacts") {
             setArtifactsFocusTabsetId(target.tabsetId);
+          } else if (target?.tab === "plan") {
+            // Its single-key shortcuts, too, need focus inside the panel.
+            setPlanFocusTabsetId(target.tabsetId);
           }
 
           // A per-iteration copy: React Compiler can't lower `i++` on a variable a closure captures.
