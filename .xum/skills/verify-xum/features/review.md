@@ -1,0 +1,61 @@
+# Review
+
+The Review tab in the right sidebar shows the workspace's diff against its base branch, one hunk
+per change. The user includes uncommitted edits, reads the diff, and marks a hunk as read. The tab
+label counts read hunks against all hunks.
+
+## Sub-features
+
+- `review-open` opens the Review tab from the right sidebar.
+- `review-uncommitted` shows uncommitted worktree edits once `Uncommitted:` is checked.
+- `review-read` marks a hunk as read and updates the `Review <read>/<total>` count.
+- `review-toggle` hides and shows the right sidebar with the keyboard and keeps the open tab.
+
+## How to get to it (user POV)
+
+- Choose `Expand right sidebar`, then choose `Review` under `Open a tool`.
+- Press Ctrl+Shift+B to collapse the right sidebar and to open it again on its last tab.
+
+## Driving it with agent-browser
+
+Preconditions:
+
+- Baseline state. The worktree `$VERIFY_XUM_WORKTREE` has no changes.
+- The app is open on `Verify playground`, and the right sidebar is collapsed.
+
+- **Edit a file.** Change the worktree the way an editor would:
+
+  ```bash
+  printf 'export function sub(a: number, b: number): number {\n  return a - b;\n}\n' >>"$VERIFY_XUM_WORKTREE/src/math.ts"
+  ```
+
+  `git -C "$VERIFY_XUM_WORKTREE" status --short` prints ` M src/math.ts`.
+- **Open the sidebar.** Run
+  `agent-browser find role button click --name "Expand right sidebar" --exact`,
+  `agent-browser wait --text "Open a tool"` and `verify-xum.sh idle`. The heading `Open a tool`
+  lists a `Review` button.
+- **Open Review.** Run `agent-browser find role button click --name "Review" --exact` and
+  `agent-browser wait --text "Uncommitted:"`. The tab `Review Close Review` is selected, and the
+  panel reads `No changes found` with `Uncommitted:` unchecked.
+- **Include uncommitted edits.** Run
+  `agent-browser find role checkbox check --name "Uncommitted:" --exact` and
+  `agent-browser wait --text "math.ts"`. The file tree lists `src` and `math.ts` with `+3`, the
+  hunk shows the three added lines of `sub`, and the tab reads `Review 0/1`. Capture
+  `review/diff`.
+- **Mark as read.** Run
+  `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads `Review 1/1`, and the hunk reads `Hunk marked as read`.
+  `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has
+  `"isRead": true` for that hunk within a second. Capture `review/read`.
+- **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
+  button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
+  button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
+- **Restore.** Run `git -C "$VERIFY_XUM_WORKTREE" checkout -- src/math.ts`.
+
+## Gotchas
+
+- `find role ... --name` matches substrings without `--exact`. The hunk itself is a button whose
+  name starts with `Mark as read (M)`, so the call without `--exact` selects the hunk and marks
+  nothing.
+- On a cold Vite cache the first open of Review reloads the page (see SKILL.md Gotchas). Open it
+  again after the reload.
+- A click on `Review` while the sidebar still slides open is lost. Keep the `idle` call before it.

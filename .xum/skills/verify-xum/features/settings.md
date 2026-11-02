@@ -1,0 +1,59 @@
+# Settings
+
+Settings is a dialog over the app with one section per area (General, Providers, Models, and
+more). Each section has its own route under `/settings/`. A change applies at once and persists in
+the server's `config.json`.
+
+## Sub-features
+
+- `settings-open` opens the dialog from the sidebar button, the palette, and its route.
+- `settings-toggle` changes the `Flat chat list` switch and shows its effect on the sidebar.
+- `settings-persist` keeps the change across a reload and in `config.json`.
+
+## How to get to it (user POV)
+
+- Choose `Open settings` (the gear in the sidebar header).
+- Press F4, type `Open Settings`, and press Enter.
+- Open `$VERIFY_XUM_URL/settings/general`.
+
+## Driving it with agent-browser
+
+Preconditions:
+
+- Baseline state. `Flat chat list` is off.
+- The app is open on `Verify playground`.
+
+- **Open from the button.** Run
+  `agent-browser find role button click --name "Open settings" --exact` and
+  `agent-browser wait --text "Choose your preferred theme"`. The URL is `/settings/general`, and a
+  full `snapshot` shows the dialog `Settings` with the section buttons `General`, `Providers` and
+  `Models`. Run `agent-browser press Escape`. The URL is back on the
+  workspace.
+- **Open from the palette.** Run `agent-browser press F4`,
+  `agent-browser wait '[aria-label="Command palette"]'`,
+  `agent-browser keyboard type "Open Settings"`, `agent-browser press Enter` and
+  `agent-browser wait --text "Choose your preferred theme"`. The URL is `/settings/general`.
+- **Change a setting.** Run
+  `agent-browser find role switch click --name "Toggle flat chat list" --exact`. The switch is
+  `checked=true`, and `$VERIFY_XUM_ROOT/config.json` has `"sidebarFlatMode": true` under
+  `userPreferences.ui`. Capture `settings/flat-on`.
+- **See the effect.** Run `agent-browser press Escape` and `agent-browser wait --text "RECENT"`.
+  The sidebar has a `RECENT` group, and the workspace row is
+  `Select workspace Verify playground (demo-app)`.
+- **Reload.** Run `agent-browser reload`,
+  `agent-browser open "$VERIFY_XUM_URL/settings/general"` and
+  `agent-browser wait --text "Choose your preferred theme"`. The switch `Toggle flat chat list` is
+  still `checked=true`. Capture `settings/persisted`.
+- **Restore.** Run
+  `agent-browser find role switch click --name "Toggle flat chat list" --exact` and
+  `agent-browser press Escape`. `config.json` has `"sidebarFlatMode": false`.
+
+## Gotchas
+
+- `snapshot -i` lists only the dialog's buttons and switches. Use a full `snapshot` to read the
+  section text.
+- Flat mode renames sidebar rows to `Select workspace <title> (<project>)`. Restore it before you
+  drive another recipe.
+- Read where a control saves before you name its side effect. `Flat chat list` calls
+  `updateUserPreferences` (`src/browser/features/Settings/Sections/GeneralSection.tsx`), and other
+  controls there call other routes.
