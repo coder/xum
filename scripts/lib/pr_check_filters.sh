@@ -17,7 +17,22 @@ def is_pending_check:
   or (.state | IN("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"));
 def is_passing_check:
   (.bucket == "pass") or (.state == "SUCCESS");
+def is_skipped_check: .state | IN("SKIPPED", "NEUTRAL");
 def is_unready_check: is_failed_check or is_pending_check;
+# One statusCheckRollup context, as selected by check_context_graphql_fields.
+def normalize_check($oid):
+  if .__typename == "CheckRun" then
+    {id, name, state: (if .status == "COMPLETED" then .conclusion // "PENDING" else .status end),
+     link: .detailsUrl, description: "", workflow: (.checkSuite.workflowRun.workflow.name // ""),
+     suite: .checkSuite.id}
+  elif .__typename == "StatusContext" then
+    {id, name: .context, state, link: .targetUrl, description, workflow: ""}
+  else error("Unknown check context") end
+  | .commit = $oid
+  | .bucket = (if .state == "CANCELLED" then "cancel"
+    elif is_failed_check then "fail" elif is_passing_check then "pass"
+    elif is_skipped_check then "skipping"
+    else "pending" end);
 def check_line:
   [
     (.name // "<unnamed>"),
@@ -28,6 +43,18 @@ def check_line:
     (.commit // "")
   ] | @tsv;
 JQ
+}
+
+# The fields normalize_check reads from one statusCheckRollup context node.
+check_context_graphql_fields() {
+  cat <<'GRAPHQL'
+__typename
+... on CheckRun {
+  id name status conclusion detailsUrl
+  checkSuite { id workflowRun { workflow { name } } }
+}
+... on StatusContext { id context state targetUrl description }
+GRAPHQL
 }
 
 # shellcheck disable=SC2016 # These are GraphQL variables, not shell variables.
@@ -76,14 +103,7 @@ fetch_pr_checks() {
               statusCheckRollup {
                 contexts(first: 100, after: $endCursor) {
                   pageInfo { hasNextPage endCursor }
-                  nodes {
-                    __typename
-                    ... on CheckRun {
-                      id name status conclusion detailsUrl
-                      checkSuite { id workflowRun { workflow { name } } }
-                    }
-                    ... on StatusContext { id context state targetUrl description }
-                  }
+                  nodes { '"$(check_context_graphql_fields)"' }
                 }
               }
             }
@@ -100,20 +120,7 @@ fetch_pr_checks() {
         or (.[-1].data.repository.object.statusCheckRollup |
           . != null and .contexts.pageInfo.hasNextPage != false)
       then error("Incomplete check pagination")
-      else [ .[].data.repository.object.statusCheckRollup.contexts.nodes[]? |
-        if .__typename == "CheckRun" then
-          {id, name, state: (if .status == "COMPLETED" then .conclusion // "PENDING" else .status end),
-           link: .detailsUrl, description: "", workflow: (.checkSuite.workflowRun.workflow.name // ""),
-           suite: .checkSuite.id}
-        elif .__typename == "StatusContext" then
-          {id, name: .context, state, link: .targetUrl, description, workflow: ""}
-        else error("Unknown check context") end
-        | .commit = $oid
-        | .bucket = (if .state == "CANCELLED" then "cancel"
-          elif is_failed_check then "fail" elif is_passing_check then "pass"
-          elif .state == "SKIPPED" or .state == "NEUTRAL" then "skipping"
-          else "pending" end)
-      ] end
+      else [ .[].data.repository.object.statusCheckRollup.contexts.nodes[]? | normalize_check($oid) ] end
     ' <<<"$pages") || return 1
     checks=$(printf '%s\n%s\n' "$checks" "$normalized" | jq -cs 'add') || return 1
   done
