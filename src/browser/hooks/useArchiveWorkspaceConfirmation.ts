@@ -25,6 +25,11 @@ export interface UseArchiveWorkspaceConfirmationOptions {
   showError: (workspaceId: string, error: string, anchorEl?: HTMLElement) => void;
 }
 
+const NOTHING_ACKNOWLEDGED: ArchiveLossyUntrackedFilesConfirmation = {
+  kind: "confirm-lossy-untracked-files",
+  paths: [],
+};
+
 function didUntrackedPathSetChange(
   acknowledged: ArchiveLossyUntrackedFilesConfirmation,
   latest: ArchiveLossyUntrackedFilesConfirmation
@@ -84,23 +89,22 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       return;
     }
 
-    if (acknowledged != null) {
-      // Archive may fail if new untracked files appear between confirmation and capture.
-      // Re-run preflight so we can reopen the modal with the latest paths.
-      const preflight = await options.preflightArchiveWorkspace(workspaceId);
-      if (
-        preflight.success &&
-        preflight.data?.kind === "confirm-lossy-untracked-files" &&
-        didUntrackedPathSetChange(acknowledged, preflight.data)
-      ) {
-        setConfirmation({
-          workspaceId,
-          displayTitle: options.getDisplayTitle(workspaceId),
-          lossy: preflight.data,
-          isStreaming: options.isStreaming(workspaceId),
-        });
-        return;
-      }
+    // Archive may fail if new untracked files appear after the preflight or the confirmation,
+    // in the workspace or in a sub-agent its archive cascades over. Re-run preflight so we can
+    // reopen the modal with the latest paths.
+    const preflight = await options.preflightArchiveWorkspace(workspaceId);
+    if (
+      preflight.success &&
+      preflight.data?.kind === "confirm-lossy-untracked-files" &&
+      didUntrackedPathSetChange(acknowledged ?? NOTHING_ACKNOWLEDGED, preflight.data)
+    ) {
+      setConfirmation({
+        workspaceId,
+        displayTitle: options.getDisplayTitle(workspaceId),
+        lossy: preflight.data,
+        isStreaming: options.isStreaming(workspaceId),
+      });
+      return;
     }
 
     options.showError(workspaceId, result.error ?? "Failed to archive workspace", anchorEl);
