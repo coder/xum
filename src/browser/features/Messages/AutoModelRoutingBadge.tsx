@@ -1,10 +1,12 @@
 import React from "react";
 import { Route } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { cn } from "@/common/lib/utils";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { getThinkingDisplayLabel } from "@/common/types/thinking";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 function describeTier(record: AutoModelRoutingRecord): string {
   return record.tierLabel ?? record.tierId ?? "unknown tier";
@@ -14,13 +16,16 @@ function describeTier(record: AutoModelRoutingRecord): string {
  * Present only when Auto set the thinking level; labeled against the model that ran. A
  * turn that escalated mid-way finished at the last raise's level, so that is the one shown.
  */
-function describeThinking(record: AutoModelRoutingRecord): string | undefined {
+function describeThinking(record: AutoModelRoutingRecord, labelModel: string): string | undefined {
   const level = record.escalations?.at(-1)?.to ?? record.thinkingLevel;
-  return level != null ? getThinkingDisplayLabel(level, record.model) : undefined;
+  return level != null ? getThinkingDisplayLabel(level, labelModel) : undefined;
 }
 
-export function buildAutoModelRoutingBadgeLabel(record: AutoModelRoutingRecord): string {
-  const thinking = describeThinking(record);
+export function buildAutoModelRoutingBadgeLabel(
+  record: AutoModelRoutingRecord,
+  labelModel = record.model
+): string {
+  const thinking = describeThinking(record, labelModel);
   const head = `Auto: ${describeTier(record)}${thinking ? ` · ${thinking}` : ""}`;
   switch (record.status) {
     case "routed":
@@ -44,7 +49,10 @@ export function formatPercent(value: number): string {
  * Exported for unit tests: Radix tooltip content renders through a portal that
  * happy-dom can't observe, so the formatting branches are tested directly.
  */
-export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord): string[] {
+export function buildAutoModelRoutingTooltipLines(
+  record: AutoModelRoutingRecord,
+  labelModel = record.model
+): string[] {
   const lines: string[] = [];
   const fallbackModel = formatModelStringForDisplay(record.requestedFallbackModel);
   // Some reasons arrive as full sentences; avoid a doubled period.
@@ -63,8 +71,7 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
     // The run line names the level the turn started at; a resumed record is restamped with
     // the raised level, so the first raise's origin is the reliable start.
     const startedAt = record.escalations?.[0]?.from ?? record.thinkingLevel;
-    const thinking =
-      startedAt != null ? getThinkingDisplayLabel(startedAt, record.model) : undefined;
+    const thinking = startedAt != null ? getThinkingDisplayLabel(startedAt, labelModel) : undefined;
     lines.push(
       record.status === "routed"
         ? `Ran on ${formatModelStringForDisplay(record.model)}${thinking ? ` at ${thinking} thinking` : ""}.`
@@ -74,7 +81,7 @@ export function buildAutoModelRoutingTooltipLines(record: AutoModelRoutingRecord
     );
     for (const escalation of record.escalations ?? []) {
       lines.push(
-        `Escalated to ${getThinkingDisplayLabel(escalation.to, record.model)} thinking at step ${escalation.step}: ${escalation.reason}.`
+        `Escalated to ${getThinkingDisplayLabel(escalation.to, labelModel)} thinking at step ${escalation.step}: ${escalation.reason}.`
       );
     }
   }
@@ -94,7 +101,11 @@ interface AutoModelRoutingBadgeProps {
  * already shows the effective model; this explains which tier picked it.
  */
 export const AutoModelRoutingBadge: React.FC<AutoModelRoutingBadgeProps> = (props) => {
-  const lines = buildAutoModelRoutingTooltipLines(props.record);
+  const { config: providersConfig } = useProvidersConfig();
+  // Label from the mapped target, as the thinking selector does: an alias id alone
+  // labels a native-max target's max as xhigh.
+  const labelModel = resolveModelForMetadata(props.record.model, providersConfig);
+  const lines = buildAutoModelRoutingTooltipLines(props.record, labelModel);
   const isFallback = props.record.status !== "routed";
   return (
     <Tooltip>
@@ -110,7 +121,7 @@ export const AutoModelRoutingBadge: React.FC<AutoModelRoutingBadgeProps> = (prop
         >
           <Route aria-hidden="true" className="h-3 w-3" />
           <span className="max-w-[12rem] truncate">
-            {buildAutoModelRoutingBadgeLabel(props.record)}
+            {buildAutoModelRoutingBadgeLabel(props.record, labelModel)}
           </span>
         </span>
       </TooltipTrigger>

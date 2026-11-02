@@ -12,6 +12,11 @@
 # ==============================================================================
 # Stage 1: Build
 # ==============================================================================
+# node:22-slim is deliberately not pinned by digest (unlike the bug-bash sandbox): each release
+# build must pick up the newest Node 22 security release, as the unpinned apt packages below do
+# for Debian. Docker reviews and builds every Official Image update. The runtime stage fails the
+# build when the tag still resolves to a Node affected by CVE-2026-111497 (for example a stale
+# cached base).
 FROM node:22-slim AS builder
 
 WORKDIR /app
@@ -19,8 +24,9 @@ WORKDIR /app
 # Optional release tag passed by CI to stamp src/version.ts in Docker builds.
 ARG RELEASE_TAG
 
-# Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.4.3
+# Install bun (used for package management and build tooling) from its official image, pinned
+# by digest like the bug-bash sandbox's.
+COPY --from=oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 /usr/local/bin/bun /usr/local/bin/bun
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball
@@ -47,7 +53,9 @@ RUN ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
 COPY Makefile fmt.mk ./
 
 # Copy source files needed for build.
-# Keep the `docker` path filter in .github/workflows/pr.yml in sync with these COPY lines.
+# Keep the `docker` path filter in .github/workflows/pr.yml in sync with these COPY lines, except
+# the app sources (src/, docs/, public/, static/, the HTML entries): the merge queue builds the
+# image for those, and PRs build it only when the build setup changes.
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
@@ -160,6 +168,15 @@ ENV MUX_ROOT=/root/.mux
 # Remove the flag when this image moves to Node 24.
 # Fail the build if this Node rejects the flag or ignores it.
 RUN node --experimental-async-context-frame -e 'const { AsyncLocalStorage } = require("node:async_hooks"); if (!String(AsyncLocalStorage).includes("AsyncContextFrame")) { console.error("AsyncContextFrame is not active"); process.exit(1); }'
+
+# Fail the build if this Node is unsupported or affected by CVE-2026-111497 (crafted Brotli data
+# runs code). The check reuses the CLI's warning (src/cli/nodeVersion.ts) and its table of fixed
+# releases (src/node/utils/nodeBrotliFix.ts). Both files keep their dist/ paths, because the
+# compiled nodeVersion.js requires the table by a relative path.
+COPY --from=builder /app/dist/cli/nodeVersion.js /tmp/node-check/cli/nodeVersion.js
+COPY --from=builder /app/dist/node/utils/nodeBrotliFix.js /tmp/node-check/node/utils/nodeBrotliFix.js
+RUN node -e 'const warning = require("/tmp/node-check/cli/nodeVersion.js").nodeVersionWarning(process.versions); if (warning !== undefined) { console.error(warning); process.exit(1); }' && \
+    rm -rf /tmp/node-check
 
 # Expose server port
 EXPOSE 3000

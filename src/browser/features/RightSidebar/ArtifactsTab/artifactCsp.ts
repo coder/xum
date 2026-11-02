@@ -9,12 +9,12 @@
  * directives exact; the escape-attempt stories and unit tests pin them. CSP cannot stop
  * WebRTC (STUN/TURN), so the bridge script deletes the RTC globals (artifactBridge.ts).
  *
- * Known residual risk (documented in the setting text): with CDN scripts allowed, a hostile
+ * Known residual risk (documented in the setting text): with CDN assets allowed, a hostile
  * artifact can encode data into the request path of an allowlisted CDN URL. Turning the
- * "Allow CDN scripts in artifacts" setting off drops every CDN host, Google Fonts included.
+ * "Allow CDN assets in artifacts" setting off drops every CDN host, Google Fonts included.
  */
 
-/** Script hosts allowed when the user keeps "Allow CDN scripts in artifacts" on. */
+/** Script hosts allowed when the user keeps "Allow CDN assets in artifacts" on. */
 export const ARTIFACT_CDN_SCRIPT_SOURCES = [
   "https://cdnjs.cloudflare.com",
   "https://unpkg.com",
@@ -23,8 +23,17 @@ export const ARTIFACT_CDN_SCRIPT_SOURCES = [
   "https://cdn.jsdelivr.net/npm/",
 ] as const;
 
-export const ARTIFACT_CDN_STYLE_SOURCES = ["https://fonts.googleapis.com"] as const;
-export const ARTIFACT_CDN_FONT_SOURCES = ["https://fonts.gstatic.com"] as const;
+// Styles and fonts may also come from the script CDNs (e.g. highlight.js themes, KaTeX and its
+// fonts on jsDelivr). This adds no new leak: a script from the same hosts can already send the
+// same request paths, and do more than a stylesheet can.
+export const ARTIFACT_CDN_STYLE_SOURCES = [
+  ...ARTIFACT_CDN_SCRIPT_SOURCES,
+  "https://fonts.googleapis.com",
+] as const;
+export const ARTIFACT_CDN_FONT_SOURCES = [
+  ...ARTIFACT_CDN_SCRIPT_SOURCES,
+  "https://fonts.gstatic.com",
+] as const;
 
 export interface ArtifactCspOptions {
   allowCdn: boolean;
@@ -51,16 +60,22 @@ export function buildArtifactCsp(options: ArtifactCspOptions): string {
  * True when the CSP built with `options` lets the frame load `url` as a script or stylesheet.
  * Used only to decide which absolute URLs get an "External asset blocked" notice; the CSP
  * itself is what enforces the rule.
+ *
+ * `baseUrl` is the frame's base URL. A srcdoc frame inherits the parent document's base (the
+ * CSP's `base-uri 'none'` blocks a <base> override), so a protocol-relative `//unpkg.com/x.css`
+ * loads over https: in server mode over HTTPS and not under a file:// base. Parsing without a
+ * base threw on those links and showed a false "blocked" notice.
  */
 export function isArtifactCdnUrl(
   url: string,
   type: "script" | "style",
-  options: ArtifactCspOptions
+  options: ArtifactCspOptions,
+  baseUrl: string
 ): boolean {
   if (!options.allowCdn) return false;
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(url, baseUrl);
   } catch {
     return false;
   }

@@ -16,6 +16,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
+import { clickWhenReady } from "./storyPlayHelpers";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
@@ -306,11 +307,9 @@ export const RemoveCurrentWorkspaceRefused: AppStory = {
     await userEvent.keyboard(">Remove Current Workspace");
     const body = within(canvasElement.ownerDocument.body);
     await userEvent.click(await body.findByText("Remove Current Workspace…"));
-    const confirm = await body.findByRole("button", { name: "Remove" });
     // The confirm dialog mounts while the closing palette dialog still holds
     // `pointer-events: none` on the page; clicking before it lifts fails under load.
-    await waitFor(() => expect(getComputedStyle(confirm).pointerEvents).not.toBe("none"));
-    await userEvent.click(confirm);
+    await clickWhenReady(await body.findByRole("button", { name: "Remove" }));
     const alert = await body.findByRole("alert", {}, { timeout: 5000 });
     await expect(alert).toHaveTextContent("Failed to remove workspace");
     await expect(alert).toHaveTextContent(REMOVE_REFUSAL);
@@ -422,9 +421,7 @@ export const RemoveSubagentLeftoverWarning: AppStory = {
       await userEvent.click(await body.findByText("Remove Workspace…"));
       await userEvent.keyboard(name);
       await userEvent.click(await body.findByText(`my-app/${name}`));
-      const confirm = await body.findByRole("button", { name: /Remove sub-agent/ });
-      await waitFor(() => expect(getComputedStyle(confirm).pointerEvents).not.toBe("none"));
-      await userEvent.click(confirm);
+      await clickWhenReady(await body.findByRole("button", { name: /Remove sub-agent/ }));
     };
 
     await removeViaPrompt("agent_exec_auth");

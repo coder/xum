@@ -95,8 +95,8 @@ export function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
 }
 
 /**
- * Toggles the right sidebar for a hotkey (TOGGLE_RIGHT_SIDEBAR, and OPEN_ARTIFACTS_TAB while the
- * Artifacts tab shows). A collapse unmounts the focused control, and focus then fell to <body>
+ * Toggles the right sidebar for a hotkey (TOGGLE_RIGHT_SIDEBAR, and OPEN_ARTIFACTS_TAB while focus
+ * is in the Artifacts tab). A collapse unmounts the focused control, and focus then fell to <body>
  * (bug bash RS3), so focus moves to the header toggle. Returns whether the sidebar toggled.
  */
 export function toggleRightSidebarFromKey(workspaceId: string, shell: Element | null): boolean {

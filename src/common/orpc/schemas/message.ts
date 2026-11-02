@@ -236,7 +236,6 @@ export const MuxMessageSchema = z.object({
       model: z.string().optional(),
       metadataModel: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
-      routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(), // Preserve replayed/non-stream route attribution.
       // Self-healing read path (like agentId/compactionEpoch): the badge is purely
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"
@@ -257,6 +256,19 @@ export const MuxMessageSchema = z.object({
         .catch(undefined),
       // Volatile system-tail record (MuxMetadata.volatileSystemTail); corrupt degrades to none.
       volatileSystemTail: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      // Same shape for the custom-instructions block, the skill index and the tool instructions.
+      customInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      skillIndex: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      toolInstructions: z
         .object({ text: z.string(), placement: z.enum(["system", "row"]) })
         .optional()
         .catch(undefined),

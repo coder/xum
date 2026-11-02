@@ -24,6 +24,11 @@ interface ToolMessageProps {
   bashOutputGroup?: BashOutputGroupInfo;
   /** Optional task report linking context (computed at render-time) */
   taskReportLinking?: TaskReportLinking;
+  /**
+   * False where another surface owns the row's hook output: the ask_user_question dock renders
+   * the same row as the transcript, so its hook output stays with the transcript row.
+   */
+  showHookOutput?: boolean;
 }
 
 export const ToolMessage: React.FC<ToolMessageProps> = ({
@@ -34,6 +39,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   isLatestProposePlan,
   bashOutputGroup,
   taskReportLinking,
+  showHookOutput = true,
 }) => {
   const { toolName, args, result, status, toolCallId } = message;
 
@@ -56,7 +62,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
       : undefined;
 
   // Extract hook output if present (only shown when hook produced output)
-  const hookOutput = extractHookOutput(result);
+  const hookOutput = showHookOutput ? extractHookOutput(result) : undefined;
   const hookDuration = extractHookDuration(result);
   return (
     <div className={className}>

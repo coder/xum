@@ -61,3 +61,13 @@ export function LazyProposePlanToolCall(props: ComponentProps<ToolCards["Propose
   const cards = useToolCards();
   return cards ? <cards.ProposePlanToolCall {...props} /> : <LoadToolCards />;
 }
+
+/** The dock's chained non-blocking question form; the collapsed card header until it loads. */
+export function LazyAskUserQuestionChain(props: ComponentProps<ToolCards["AskUserQuestionChain"]>) {
+  const cards = useToolCards();
+  return cards ? (
+    <cards.AskUserQuestionChain {...props} />
+  ) : (
+    <ToolCardFallback toolName="ask_user_question" status={props.rows[0]?.status ?? "completed"} />
+  );
+}

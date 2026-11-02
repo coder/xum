@@ -60,6 +60,7 @@ import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/comm
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
@@ -161,8 +162,14 @@ export interface MockORPCClientOptions {
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** The error agentPlugins.preview returns when it fails. */
+    previewError?: string;
     /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
     previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
+    marketplace?: AgentPluginMarketplaceListing;
+    /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
+    previewsByEntry?: Record<string, AgentPluginInstallPreview>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -252,6 +259,8 @@ export interface MockORPCClientOptions {
     shelfFiles?: Record<string, ArtifactReadResult>;
     /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
     states?: Record<string, unknown>;
+    /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
+    sendInteractionError?: string;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -720,8 +729,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
-  let muxGatewayEnabled: boolean | undefined = undefined;
-  let muxGatewayModels: string[] | undefined = undefined;
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
@@ -961,8 +968,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({
           userPreferences,
           taskSettings,
-          muxGatewayEnabled,
-          muxGatewayModels,
           routePriority,
           routeOverrides,
           coderWorkspaceArchiveBehavior,
@@ -1072,15 +1077,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },
         });
-      },
-      updateMuxGatewayPrefs: (input: {
-        muxGatewayEnabled: boolean;
-        muxGatewayModels: string[];
-      }) => {
-        muxGatewayEnabled = input.muxGatewayEnabled ? undefined : false;
-        muxGatewayModels = input.muxGatewayModels.length > 0 ? input.muxGatewayModels : undefined;
-        notifyConfigChanged();
-        return Promise.resolve(undefined);
       },
       updateRoutePreferences: (input: {
         routePriority: string[];
@@ -1287,16 +1283,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
-    muxGateway: {
-      getAccountStatus: () =>
-        Promise.resolve({
-          success: true,
-          data: {
-            remaining_microdollars: 134_598_127,
-            ai_gateway_concurrent_requests_per_user: 20,
-          },
-        }),
-    },
     analytics: {
       getDelegationSummary: (_input: {
         projectPath?: string | null;
@@ -1439,20 +1425,31 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           hooks.hooks = hooks.hooks.map((hook) =>
             hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
           );
+          // As the backend: the first trust's file review is shown only until a hook is trusted.
+          if (input.state === "trusted") delete hooks.fileReview;
         }
         return Promise.resolve({ success: true as const, data: undefined });
       },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const method = input.method;
+        if (method == null && agentPluginsMock?.marketplace !== undefined) {
+          return Promise.resolve({
+            success: true as const,
+            data: { kind: "marketplace" as const, marketplace: agentPluginsMock.marketplace },
+          });
+        }
         const preview =
-          (input.method != null ? agentPluginsMock?.previewsByMethod?.[input.method.kind] : null) ??
-          agentPluginsMock?.preview;
+          method?.kind === "claude-marketplace"
+            ? agentPluginsMock?.previewsByEntry?.[method.entry]
+            : ((method != null ? agentPluginsMock?.previewsByMethod?.[method.kind] : null) ??
+              agentPluginsMock?.preview);
         return preview
-          ? Promise.resolve({ success: true as const, data: preview })
+          ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
           : Promise.resolve({
               success: false as const,
-              error: "No preview configured in this story",
+              error: agentPluginsMock?.previewError ?? "No preview configured in this story",
             });
       },
       // Like the backend's command, from the typed source (the backend normalizes it first).
@@ -2355,6 +2352,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       getSessionUsage: (input: { workspaceId: string }) =>
         Promise.resolve(sessionUsage.get(input.workspaceId)),
+      getSubagentUsage: () => Promise.resolve({ children: {} }),
       getSessionUsageBatch: (input: { workspaceIds: string[] }) => {
         const result: Record<string, MockSessionUsage | undefined> = {};
         for (const id of input.workspaceIds) {
@@ -2648,7 +2646,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       setState: () => Promise.resolve({ success: true as const, data: undefined }),
       sendInteraction: () =>
-        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
+        Promise.resolve(
+          artifacts.sendInteractionError != null
+            ? { success: false as const, error: artifacts.sendInteractionError }
+            : { success: true as const, data: { id: "story-interaction" } }
+        ),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {

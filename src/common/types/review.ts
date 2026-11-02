@@ -64,18 +64,6 @@ export interface HunkReadState {
 }
 
 /**
- * Workspace review state (persisted to localStorage)
- */
-export interface ReviewState {
-  /** Workspace ID this review belongs to */
-  workspaceId: string;
-  /** Read state keyed by hunk ID */
-  readState: Record<string, HunkReadState>;
-  /** Timestamp of last update */
-  lastUpdated: number;
-}
-
-/**
  * Sort order options for review panel hunks
  */
 export const REVIEW_SORT_ORDERS = ["file-order", "last-edit"] as const;
@@ -227,19 +215,6 @@ export interface Review {
   createdAt: number;
   /** Timestamp when status changed (checked/unchecked) */
   statusChangedAt?: number;
-}
-
-/**
- * Persisted state for reviews (per workspace)
- * Contains reviews in all states: pending, attached, and checked
- */
-export interface ReviewsState {
-  /** Workspace ID */
-  workspaceId: string;
-  /** All reviews keyed by ID */
-  reviews: Record<string, Review>;
-  /** Last update timestamp */
-  lastUpdated: number;
 }
 
 /**

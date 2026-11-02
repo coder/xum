@@ -55,7 +55,7 @@ export async function getWorkspacePlanContent(context: ORPCContext, workspaceId:
     const runtime = createRuntimeForWorkspace(metadata);
     result = await readPlanFile(
       runtime,
-      await resolvePlanFileLocation(context.config, runtime, metadata)
+      await resolvePlanFileLocation(context.config, runtime, metadata, context.historyService.locks)
     );
   } catch (error) {
     // An unreachable runtime is not a missing plan (#4826); report it through the same

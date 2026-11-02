@@ -1,7 +1,7 @@
 // Deterministic repros of races in goal continuation and heartbeat delivery. All are fixed: each
 // test fails at its "Target assertion" with its fix reverted. Each paired control runs the same
 // harness without the racing step.
-import { promises as fsPromises } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";

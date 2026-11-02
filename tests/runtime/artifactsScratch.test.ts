@@ -131,6 +131,7 @@ break.md"`,
         expect(await readArtifactOnRuntime(runtime, artifactsDir, relPath, 1024)).toEqual({
           success: false,
           error: `Artifact not found: ${relPath}`,
+          missing: true,
         });
       }
 

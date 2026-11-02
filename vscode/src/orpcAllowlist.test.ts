@@ -8,38 +8,27 @@ import {
 
 describe("isAllowedOrpcPath", () => {
   test("allows known procedures", () => {
-    expect(isAllowedOrpcPath(["general", "ping"]))
-      .toBe(true);
-    expect(isAllowedOrpcPath(["workspace", "sendMessage"]))
-      .toBe(true);
-    expect(isAllowedOrpcPath(["providers", "getConfig"]))
-      .toBe(true);
+    expect(isAllowedOrpcPath(["general", "ping"])).toBe(true);
+    expect(isAllowedOrpcPath(["workspace", "sendMessage"])).toBe(true);
+    expect(isAllowedOrpcPath(["providers", "getConfig"])).toBe(true);
   });
 
   test("rejects unknown roots and procedures", () => {
-    expect(isAllowedOrpcPath(["server", "getApiServerStatus"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "create"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["providers", "setProviderConfig"]))
-      .toBe(false);
+    expect(isAllowedOrpcPath(["server", "getApiServerStatus"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "create"])).toBe(false);
+    expect(isAllowedOrpcPath(["providers", "setProviderConfig"])).toBe(false);
   });
 
   test("rejects nested routers other than the background processes strip's", () => {
-    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "goal", "get"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"]))
-      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "sendToBackground"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "goal", "get"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "backgroundBashes", "subscribe", "x"])).toBe(false);
   });
 
   test("rejects invalid segments", () => {
     expect(isAllowedOrpcPath([])).toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "__proto__"]))
-      .toBe(false);
-    expect(isAllowedOrpcPath(["workspace", "send-message"]))
-      .toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "__proto__"])).toBe(false);
+    expect(isAllowedOrpcPath(["workspace", "send-message"])).toBe(false);
   });
 });
 
@@ -368,7 +357,7 @@ describe("app and providers config (#4766)", () => {
 
   test("projects config.getConfig to the model-routing, thinking-floor and model-preference fields", () => {
     const config = {
-      routePriority: ["mux-gateway", "direct"],
+      routePriority: ["openrouter", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
       defaultModel: "openai:gpt-5.6-terra",
@@ -378,7 +367,7 @@ describe("app and providers config (#4766)", () => {
       taskSettings: { maxParallelAgentTasks: 3 },
     };
     expect(redactWebviewOrpcResult(["config", "getConfig"], config)).toEqual({
-      routePriority: ["mux-gateway", "direct"],
+      routePriority: ["openrouter", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
       defaultModel: "openai:gpt-5.6-terra",

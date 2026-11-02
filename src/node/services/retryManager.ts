@@ -11,6 +11,7 @@ import {
   isNonRetryableStreamError,
 } from "@/common/utils/messages/retryEligibility";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
+import { nodeClock } from "@/node/utils/hostClock";
 
 export interface RetryFailureError {
   type: string;
@@ -120,7 +121,8 @@ export class RetryManager {
       type: "auto-retry-scheduled",
       attempt: this.state.attempt,
       delayMs: delay,
-      scheduledAt: Date.now(),
+      // Wall clock: the renderer counts down from it with Date.now() (#7282).
+      scheduledAt: nodeClock.nowMs(),
     };
     this.pendingScheduledEvent = scheduledEvent;
     this.retryPending = true;

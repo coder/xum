@@ -6,11 +6,7 @@
  */
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import {
-  CUSTOM_MODEL_HIDDEN_PROVIDERS,
-  PROVIDER_DISPLAY_NAMES,
-  isValidProvider,
-} from "@/common/constants/providers";
+import { PROVIDER_DISPLAY_NAMES, isValidProvider } from "@/common/constants/providers";
 import type {
   ModelCatalogEntry,
   ModelCatalogSearchInput,
@@ -83,7 +79,7 @@ function getCatalogIndex(): IndexedCatalogEntry[] {
     const catalogProvider = catalogId.slice(0, colonIndex);
     const providerModelId = catalogId.slice(colonIndex + 1);
     const provider = resolveXumProvider(catalogProvider, providerModelId);
-    if (!isValidProvider(provider) || CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) {
+    if (!isValidProvider(provider)) {
       continue;
     }
     const id = `${provider}:${providerModelId}`;

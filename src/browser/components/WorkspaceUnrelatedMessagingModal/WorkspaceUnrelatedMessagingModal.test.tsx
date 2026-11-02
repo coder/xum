@@ -143,7 +143,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     onSetEnabled.mockImplementation(() => Promise.resolve(Ok(undefined) as Result<void, string>));
     fireEvent.click(consentSwitch(view));
     await waitFor(() => {
-      expect(view.queryByRole("alert")).toBeNull();
+      expect(view.queryByRole("alert") === null).toBe(true);
     });
   });
 
@@ -256,7 +256,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     });
     pending.resolve(Ok(undefined));
     await waitFor(() => {
-      expect(view.queryByRole("status")).toBeNull();
+      expect(view.queryByRole("status") === null).toBe(true);
     });
   });
 });

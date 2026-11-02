@@ -7,6 +7,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createTestPluginInstallEntry,
@@ -22,10 +24,13 @@ import {
 } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   assertStoredPluginWorkflowReviewed,
   resolveWorkflowScript,
 } from "./workflowScriptResolver";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 async function writeWorkflowFile(
   root: string,
@@ -50,6 +55,7 @@ describe("resolveWorkflowScript", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("Research");
@@ -72,6 +78,7 @@ describe("resolveWorkflowScript", () => {
       runtime: new TrueRemotePathMappedRuntime(tempDir.path, remoteWorkspacePath),
       workspacePath: remoteWorkspacePath,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("RemoteResearch");
@@ -95,6 +102,7 @@ describe("resolveWorkflowScript", () => {
       workspacePath: remoteSubprojectPath,
       projectSearchRoot: remoteCheckoutPath,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("ParentFlow");
@@ -124,6 +132,7 @@ describe("resolveWorkflowScript", () => {
         projectStorageAuthority: "host-local",
         checkoutRoot,
       },
+      runtimeFactory,
     });
 
     const resolved = await resolveWorkflowScript({
@@ -132,12 +141,76 @@ describe("resolveWorkflowScript", () => {
       workspacePath: "/workspace/packages/app",
       projectTrusted: true,
       skillStorageContext,
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("HostParentFlow");
     expect(resolved.resolvedPath).toBe(
       path.join(checkoutRoot, ".xum", "skills", "parent-flow", "workflow.js")
     );
+  });
+
+  test("a remote checkout's plugin skill runs its workflow script only in a trusted project (#6426)", async () => {
+    using tempDir = new TestTempDir("workflow-script-remote-plugin-skill");
+    const checkout = await fs.realpath(tempDir.path);
+    const pluginRoot = path.join(checkout, ".xum", "plugins", "kit");
+    const skillDir = path.join(pluginRoot, "skills", "flow");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: flow\ndescription: d\n---\n");
+    await fs.writeFile(
+      path.join(skillDir, "workflow.js"),
+      "export default function RemoteFlow() {}\n"
+    );
+    const resolve = (projectTrusted: boolean) =>
+      resolveWorkflowScript({
+        scriptPath: "skill://flow/workflow.js",
+        runtime: new HostKeyShellRemoteRuntime(checkout, `workflow-remote-${projectTrusted}`),
+        workspacePath: checkout,
+        projectTrusted,
+        runtimeFactory,
+      });
+
+    // Same rules as a plain remote .xum/skills workflow: project trust, then a live remote read.
+    const resolved = await resolve(true);
+    expect(resolved.source).toContain("RemoteFlow");
+    expect(resolved.resolvedPath).toBe(path.join(skillDir, "workflow.js"));
+    // Untrusted: the project's plugins are not even listed, so the skill does not exist.
+    await expect(resolve(false)).rejects.toThrow("not found");
+  });
+
+  // #7216: the project-automation kill switch wins over trust for a project plugin's workflow.
+  test("a trusted project's plugin skill workflow is not found under the kill switch", async () => {
+    using tempDir = new TestTempDir("workflow-script-plugin-kill-switch");
+    const skillDir = path.join(tempDir.path, ".xum", "plugins", "kit", "skills", "flow");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(tempDir.path, ".xum", "plugins", "kit", "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: flow\ndescription: d\n---\n");
+    await fs.writeFile(path.join(skillDir, "workflow.js"), "export default function Flow() {}\n");
+    const resolve = () =>
+      resolveWorkflowScript({
+        scriptPath: "skill://flow/workflow.js",
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        runtimeFactory,
+      });
+
+    expect((await resolve()).source).toContain("Flow");
+    const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      await expect(resolve()).rejects.toThrow("not found");
+    } finally {
+      if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+    }
   });
 
   test("blocks project skill workflow scripts when the project is untrusted", async () => {
@@ -152,6 +225,7 @@ describe("resolveWorkflowScript", () => {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
         projectTrusted: false,
+        runtimeFactory,
       })
     ).rejects.toThrow("Project trust is required");
   });
@@ -172,6 +246,7 @@ describe("resolveWorkflowScript", () => {
         projectRoot: path.join(tempDir.path, ".mux", "skills"),
         globalRoot: path.join(xumHome, "skills"),
       },
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("global");
@@ -187,6 +262,7 @@ describe("resolveWorkflowScript", () => {
       workspacePath: tempDir.path,
       projectTrusted: false,
       roots: createIsolatedAgentSkillsRoots(tempDir.path),
+      runtimeFactory,
     });
 
     expect(resolved.source).toContain("Deep Research");
@@ -207,6 +283,7 @@ describe("resolveWorkflowScript", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     expect(resolved).toMatchObject({
@@ -228,6 +305,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: false,
+        runtimeFactory,
       })
     ).rejects.toThrow("Project trust is required to run inline workflow scripts");
     await expect(
@@ -236,6 +314,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("Inline workflow script source must not be blank");
     await expect(
@@ -244,6 +323,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("use script_source instead");
     await expect(
@@ -252,6 +332,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("Inline workflow script source is too large");
   });
@@ -269,6 +350,7 @@ describe("resolveWorkflowScript", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     expect(resolved.sourceKind).toBe("workspace-file");
@@ -289,6 +371,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow();
     await expect(
@@ -297,6 +380,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("regular JavaScript file");
     await expect(
@@ -305,6 +389,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow(".js");
     await expect(
@@ -313,6 +398,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("outside the workspace");
     await expect(
@@ -321,6 +407,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: false,
+        runtimeFactory,
       })
     ).rejects.toThrow("Project trust is required");
   });
@@ -335,6 +422,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("must include a relative .js file path");
     await expect(
@@ -343,6 +431,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow("path traversal");
     await expect(
@@ -351,6 +440,7 @@ describe("resolveWorkflowScript", () => {
         runtime,
         workspacePath: tempDir.path,
         projectTrusted: true,
+        runtimeFactory,
       })
     ).rejects.toThrow(".js");
   });
@@ -414,6 +504,7 @@ describe("resolveWorkflowScript", () => {
           workspacePath: tempDir.path,
           projectTrusted: true,
           roots: pluginRoots(tempDir, container),
+          runtimeFactory,
         });
 
       expect((await resolve("plain-skills-flow")).sourceKind).toBe("skill");
@@ -431,6 +522,7 @@ describe("resolveWorkflowScript", () => {
         workspacePath: tempDir.path,
         projectTrusted: true,
         roots: pluginRoots(tempDir, container),
+        runtimeFactory,
       });
 
       expect(resolved.sourceKind).toBe("plugin");
@@ -461,17 +553,61 @@ describe("resolveWorkflowScript", () => {
         workspacePath: tempDir.path,
         projectTrusted: true,
         roots: pluginRoots(tempDir, container),
+        runtimeFactory,
       };
 
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "plugin://kit/release.js" })
+        resolveWorkflowScript({ ...input, scriptPath: "plugin://kit/release.js", runtimeFactory })
       ).rejects.toThrow("not found");
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "skill://review/workflow.js" })
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "skill://review/workflow.js",
+          runtimeFactory,
+        })
       ).rejects.toThrow("is a Claude command");
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js" })
+        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js", runtimeFactory })
       ).rejects.toThrow("comes from a Claude Code plugin");
+    });
+
+    test("a Cursor package runs no workflow code: no workflows/, rule or skill script", async () => {
+      using tempDir = new TestTempDir("workflow-script-cursor-plugin");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      const pluginDir = path.join(container, "kit");
+      await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "kit" })
+      );
+      await writeWorkflowFile(path.join(pluginDir, "workflows"), "release.js");
+      // A script next to the rule: the rule's skill directory is the rules folder.
+      await writeWorkflowFile(path.join(pluginDir, "rules"), "workflow.js");
+      await fs.writeFile(path.join(pluginDir, "rules", "review.mdc"), "Review\n");
+      const skillDir = path.join(pluginDir, "skills", "flow");
+      await writeWorkflowFile(skillDir, "SKILL.md", "---\nname: flow\ndescription: d\n---\nBody\n");
+      await writeWorkflowFile(skillDir, "workflow.js");
+      const input = {
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        roots: pluginRoots(tempDir, container),
+        runtimeFactory,
+      };
+
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "plugin://kit/release.js", runtimeFactory })
+      ).rejects.toThrow("not found");
+      await expect(
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "skill://review/workflow.js",
+          runtimeFactory,
+        })
+      ).rejects.toThrow("is a Cursor rule");
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js", runtimeFactory })
+      ).rejects.toThrow("comes from a Cursor plugin");
     });
 
     test("plugin workflows retain a global fallback after rejecting an outward project alias", async () => {
@@ -492,6 +628,7 @@ describe("resolveWorkflowScript", () => {
           projectPluginRoots: [alias],
           globalPluginRoots: [globalContainer],
         },
+        runtimeFactory,
       };
       const resolved = await resolveWorkflowScript(input);
       expect(resolved.scope).toBe("global");
@@ -499,7 +636,11 @@ describe("resolveWorkflowScript", () => {
         await fs.realpath(path.join(globalContainer, "fallback-plugin", "workflows", "release.js"))
       );
       await expect(
-        resolveWorkflowScript({ ...input, roots: { ...input.roots, globalPluginRoots: [] } })
+        resolveWorkflowScript({
+          ...input,
+          roots: { ...input.roots, globalPluginRoots: [] },
+          runtimeFactory,
+        })
       ).rejects.toThrow("not found");
     });
 
@@ -515,6 +656,7 @@ describe("resolveWorkflowScript", () => {
           workspacePath: tempDir.path,
           projectTrusted: false,
           roots: pluginRoots(tempDir, container),
+          runtimeFactory,
         })
       ).rejects.toThrow("not found");
     });
@@ -528,13 +670,22 @@ describe("resolveWorkflowScript", () => {
         workspacePath: tempDir.path,
         projectTrusted: true,
         roots: pluginRoots(tempDir, container),
+        runtimeFactory,
       };
 
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/../release.js" })
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "plugin://my-plugin/../release.js",
+          runtimeFactory,
+        })
       ).rejects.toThrow("path traversal");
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/release.ts" })
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "plugin://my-plugin/release.ts",
+          runtimeFactory,
+        })
       ).rejects.toThrow(".js");
     });
 
@@ -572,6 +723,7 @@ describe("resolveWorkflowScript", () => {
           workspacePath: tempDir.path,
           projectTrusted: false,
           roots,
+          runtimeFactory,
         });
 
       await fs.writeFile(path.join(pluginDir, "workflows", "release.js"), "const v = 'plugin-v2';");
@@ -593,6 +745,7 @@ describe("resolveWorkflowScript", () => {
             roots,
             containment: { kind: "none" },
           },
+          runtimeFactory,
         });
         const listedPaths = listed.map((workflow) => workflow.scriptPath);
         expect(listedPaths).toContain("plugin://my-plugin/release.js");
@@ -643,10 +796,15 @@ describe("resolveWorkflowScript", () => {
         workspacePath: tempDir.path,
         projectTrusted: true,
         roots: pluginRoots(tempDir, container),
+        runtimeFactory,
       };
 
       await expect(
-        resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/private/hidden.js" })
+        resolveWorkflowScript({
+          ...input,
+          scriptPath: "plugin://my-plugin/private/hidden.js",
+          runtimeFactory,
+        })
       ).rejects.toThrow("top-level");
     });
   });
@@ -661,6 +819,7 @@ describe("resolveWorkflowScript", () => {
       runtime,
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
 
     test("a plain (non-plugin) skill's run resumes: no consent record applies", async () => {

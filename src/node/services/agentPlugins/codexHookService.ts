@@ -1,7 +1,8 @@
 /**
- * Per-workspace lifecycle for Codex-format plugin hooks (hooks.json): discovers the managed
- * global plugins, registers each plugin's runnable hooks (codexHookRunner.ts) on the event spine,
- * and supplies the runner's dependencies.
+ * Per-workspace lifecycle for plugin hooks.json hooks: discovers the managed global plugins,
+ * registers each plugin's runnable hooks on the event spine (Codex `mcp_tool` hooks through
+ * codexHookRunner.ts, Cursor command hooks through cursorHookRunner.ts), and supplies the runners'
+ * dependencies.
  *
  * Scope: managed global plugins only (`~/.xum/plugins`, in the install registry). Project
  * plugins and unmanaged global plugins never run hooks.json hooks: their trust review is a
@@ -10,11 +11,13 @@
  * The gate before EACH hook call (the fix for #6042's P1-a and P1-b) reads, at that moment:
  * 1. the workspace's project trust (live config read);
  * 2. the trust store (pluginHookTrust.ts): this exact hash must be trusted;
- * 3. the plugin's hooks on disk: the hook must still be declared with this hash, so an edit,
- *    an update or an uninstall stops it before the next registration catches up.
+ * 3. the plugin's hooks on disk, in the plugin's own format: the hook must still be declared with
+ *    this hash, so an edit, an update or an uninstall stops it before the next registration
+ *    catches up.
  * The MCP call itself then requires the plugin's server to be enabled and running in this
  * workspace (MCPServerManager.callToolForPluginHook).
  */
+import assert from "node:assert";
 import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
 import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
@@ -22,12 +25,20 @@ import { log } from "@/node/services/log";
 import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
+import { VERSION } from "@/version";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { isAgentToolsDisabled, isTerminalsDisabled } from "@/node/utils/agentToolsDisabled";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
-import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
+import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import { registerCodexPluginHooks, type CodexHookRunnerDeps } from "./codexHookRunner";
+import { registerCursorPluginHooks, type CursorHookGate } from "./cursorHookRunner";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
-import { isPluginHookTrusted, readPluginHookTrust } from "./pluginHookTrust";
+import {
+  isPluginHookTrusted,
+  readPluginHookTrust,
+  readPluginHookTrustChecked,
+} from "./pluginHookTrust";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
 
 export interface EnsureCodexHooksArgs {
@@ -36,7 +47,8 @@ export interface EnsureCodexHooksArgs {
   xumHome: string;
   /** Live project-trust read for this workspace; called before every hook call. */
   isProjectTrusted: () => boolean;
-  mcp: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
+  /** Codex hooks call plugin MCP servers through it; absent: no Codex hook registers. */
+  mcp?: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
   /** Shows a hook's systemMessage to the user (never the model). */
   notifyUser: (pluginName: string, message: string) => void;
   /**
@@ -50,6 +62,14 @@ export interface EnsureCodexHooksArgs {
    * startup preflight (Codex PRRT_kwDOPxxmWM6rSBix).
    */
   noPluginMcp?: boolean;
+  /**
+   * The runtime Cursor command hooks run through. Present only for a local or worktree workspace
+   * (D7), also a multi-project one: SSH, Docker and devcontainer workspaces start no hook process.
+   */
+  cursorHookRuntime?: Runtime;
+  /** Cursor `workspace_roots` for a hook call in `cwd`; read on each call (a project can be added). */
+  cursorWorkspaceRoots?: (cwd: string) => string[];
+  transcriptPath: string;
 }
 
 interface WorkspaceRegistration {
@@ -65,7 +85,25 @@ interface WorkspaceRegistration {
  * Codex PRRT_kwDOPxxmWM6rPrkn).
  */
 function canRunCodexHooks(args: EnsureCodexHooksArgs): boolean {
-  return !args.sideChat && args.noPluginMcp !== true && !isAgentToolsDisabled();
+  return (
+    !args.sideChat && args.noPluginMcp !== true && args.mcp !== undefined && !isAgentToolsDisabled()
+  );
+}
+
+/**
+ * False where no Cursor command hook may run. Its own gate, not the Codex one: a command hook
+ * needs no plugin MCP (a local multi-project workspace has none), only its runtime limits (D7), a
+ * chat that is not `/side`, and none of the kill switches (D6). The runner checks the switches and
+ * the runtime again on every call.
+ */
+function canRunCursorHooks(args: EnsureCodexHooksArgs): boolean {
+  return (
+    !args.sideChat &&
+    args.cursorHookRuntime !== undefined &&
+    !isAgentToolsDisabled() &&
+    !isTerminalsDisabled() &&
+    !projectAutomationDisabled()
+  );
 }
 
 export class CodexPluginHookService {
@@ -82,34 +120,20 @@ export class CodexPluginHookService {
       this.locks.set(args.workspaceId, lock);
     }
     await using _guard = await lock.acquire();
-    if (!canRunCodexHooks(args)) {
+    const codexAllowed = canRunCodexHooks(args);
+    const cursorAllowed = canRunCursorHooks(args);
+    if (!codexAllowed && !cursorAllowed) {
       this.registrations.get(args.workspaceId)?.unregister();
       this.registrations.delete(args.workspaceId);
       return;
     }
-    const plugins = await this.discoverManagedPlugins(args.xumHome);
-    const loaded = await Promise.all(
-      plugins.map(async (plugin) => ({ plugin, ...(await loadPluginCodexHooks(plugin)) }))
+    const plugins = (await this.discoverManagedPlugins(args.xumHome)).filter((plugin) =>
+      plugin.cursorFallback === true ? cursorAllowed : codexAllowed
     );
-    // Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
-    // catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
-    // per-call gate still refuses a revoked hook, and this refresh runs on every send and turn,
-    // so a newly trusted hook registers on the next one (the fingerprint changes).
-    const projectTrusted = args.isProjectTrusted();
-    const runnable = (
-      await Promise.all(
-        loaded.map(async (entry) => {
-          if (!projectTrusted) return { ...entry, hooks: [] };
-          const trust = await readPluginHookTrust(args.xumHome, instanceIdOf(entry.plugin));
-          return {
-            ...entry,
-            hooks: entry.hooks.filter(
-              (hook) => hook.status === "runnable" && isPluginHookTrusted(trust, hook)
-            ),
-          };
-        })
-      )
-    ).filter((entry) => entry.hooks.length > 0);
+    const loaded = await Promise.all(
+      plugins.map(async (plugin) => ({ plugin, ...(await loadPluginHooks(plugin)) }))
+    );
+    const runnable = await trustedRunnableHooks(loaded, args);
     // Key and hash: the per-call gate matches both, so a hook that only moved (new key, same
     // hash) must re-register or its stale key is refused forever.
     const fingerprint = JSON.stringify(
@@ -122,13 +146,7 @@ export class CodexPluginHookService {
     if (existing?.fingerprint === fingerprint) return;
     existing?.unregister();
     const unregisters = runnable.map((entry, order) =>
-      registerCodexPluginHooks(this.spine, {
-        workspaceId: args.workspaceId,
-        pluginName: entry.plugin.name,
-        order,
-        hooks: entry.hooks,
-        deps: this.depsFor(entry.plugin, args),
-      })
+      this.registerPluginHooks(entry.plugin, entry.hooks, order, args)
     );
     const promptTimeouts: number[] = [];
     for (const hook of runnable.flatMap((entry) => entry.hooks)) {
@@ -209,28 +227,60 @@ export class CodexPluginHookService {
     return plugins.filter((plugin) => plugin.componentPolicy !== undefined);
   }
 
+  private registerPluginHooks(
+    plugin: AgentPluginInfo,
+    hooks: PluginHookDefinition[],
+    order: number,
+    args: EnsureCodexHooksArgs
+  ): () => void {
+    if (plugin.cursorFallback === true) return this.registerCursorHooks(plugin, hooks, order, args);
+    return registerCodexPluginHooks(this.spine, {
+      workspaceId: args.workspaceId,
+      pluginName: plugin.name,
+      pluginInstanceId: instanceIdOf(plugin),
+      order,
+      hooks,
+      deps: this.depsFor(plugin, args),
+    });
+  }
+
+  private registerCursorHooks(
+    plugin: AgentPluginInfo,
+    hooks: PluginHookDefinition[],
+    order: number,
+    args: EnsureCodexHooksArgs
+  ): () => void {
+    assert(args.cursorHookRuntime !== undefined, "Cursor hooks register only with a runtime");
+    return registerCursorPluginHooks(this.spine, {
+      workspaceId: args.workspaceId,
+      pluginName: plugin.name,
+      pluginInstanceId: instanceIdOf(plugin),
+      pluginRoot: plugin.rootPath,
+      transcriptPath: args.transcriptPath,
+      cursorVersion: `xum-${VERSION.git_describe}`,
+      order,
+      hooks,
+      deps: {
+        checkHook: (hook) => checkHook(plugin, hook, args),
+        runtime: args.cursorHookRuntime,
+        notifyUser: (message) => args.notifyUser(plugin.name, message),
+        ...(args.cursorWorkspaceRoots !== undefined
+          ? { workspaceRoots: args.cursorWorkspaceRoots }
+          : {}),
+      },
+    });
+  }
+
   private depsFor(plugin: AgentPluginInfo, args: EnsureCodexHooksArgs): CodexHookRunnerDeps {
     const instanceId = instanceIdOf(plugin);
+    const mcp = args.mcp;
+    assert(mcp !== undefined, "Codex hooks register only with an MCP server manager");
     return {
-      isHookAllowed: async (hook: PluginHookDefinition) => {
-        if (!args.isProjectTrusted()) return false;
-        const trust = await readPluginHookTrust(args.xumHome, instanceId);
-        if (!isPluginHookTrusted(trust, hook)) return false;
-        // The CURRENT manifest decides which hooks file is declared (Codex PRRT_kwDOPxxmWM6rN77w):
-        // the discovery snapshot would keep a hook that plugin.json no longer points at.
-        const now = await rediscover(plugin);
-        if (now === undefined) return false;
-        const current = await loadPluginCodexHooks(now);
-        const stillDeclared = current.hooks.some(
-          (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
-        );
-        if (!stillDeclared)
-          log.debug("Plugin hooks: a hook changed on disk; skipping it", { key: hook.key });
-        return stillDeclared;
-      },
+      isHookAllowed: async (hook: PluginHookDefinition) =>
+        (await checkHook(plugin, hook, args)) === "allowed",
       // The key is built from THIS plugin's instance: a hook names a server, never a key.
       callPluginTool: (call) =>
-        args.mcp.callToolForPluginHook(
+        mcp.callToolForPluginHook(
           args.workspaceId,
           buildPluginServerKey(instanceId, call.server),
           call.tool,
@@ -238,7 +288,7 @@ export class CodexPluginHookService {
           { signal: call.signal }
         ),
       canCallPluginTool: (call) =>
-        args.mcp.canCallToolForPluginHook(
+        mcp.canCallToolForPluginHook(
           args.workspaceId,
           buildPluginServerKey(instanceId, call.server),
           call.tool
@@ -246,6 +296,62 @@ export class CodexPluginHookService {
       notifyUser: (message) => args.notifyUser(plugin.name, message),
     };
   }
+}
+
+/**
+ * Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
+ * catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
+ * per-call gate still refuses a
+ * revoked hook, and the refresh runs on every send and turn, so a newly trusted hook registers on
+ * the next one (the fingerprint changes).
+ */
+async function trustedRunnableHooks(
+  loaded: Array<{ plugin: AgentPluginInfo; hooks: PluginHookDefinition[] }>,
+  args: EnsureCodexHooksArgs
+): Promise<Array<{ plugin: AgentPluginInfo; hooks: PluginHookDefinition[] }>> {
+  if (!args.isProjectTrusted()) return [];
+  const entries = await Promise.all(
+    loaded.map(async (entry) => {
+      const trust = await readPluginHookTrust(args.xumHome, instanceIdOf(entry.plugin));
+      return {
+        plugin: entry.plugin,
+        hooks: entry.hooks.filter(
+          (hook) => hook.status === "runnable" && isPluginHookTrusted(trust, hook)
+        ),
+      };
+    })
+  );
+  return entries.filter((entry) => entry.hooks.length > 0);
+}
+
+/**
+ * The gate before each hook call (see the module doc). The CURRENT manifest decides which hooks
+ * file is declared (Codex PRRT_kwDOPxxmWM6rN77w): the discovery snapshot would keep a hook that
+ * the manifest no longer points at.
+ */
+async function checkHook(
+  plugin: AgentPluginInfo,
+  hook: PluginHookDefinition,
+  args: EnsureCodexHooksArgs
+): Promise<CursorHookGate> {
+  const now = await rediscover(plugin);
+  if (now === undefined) return "refused";
+  const current = await loadPluginHooks(now);
+  const stillDeclared = current.hooks.some(
+    (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
+  );
+  if (!stillDeclared) {
+    log.debug("Plugin hooks: a hook changed on disk; skipping it", { key: hook.key });
+    return "refused";
+  }
+  // The trust decisions come last, after the plugin reads: a hook turned off, or a project
+  // untrusted, while those reads ran stops this call (Codex review). The trust read is the last
+  // await. The exec that follows still awaits its folder check before the spawn: a revoke in
+  // that window is a known gap (PR follow-up).
+  const trust = await readPluginHookTrustChecked(args.xumHome, instanceIdOf(plugin));
+  if (!args.isProjectTrusted()) return "refused";
+  if (trust === "unreadable") return "trust-store-unreadable";
+  return isPluginHookTrusted(trust, hook) ? "allowed" : "refused";
 }
 
 /** Same identity as the install service and the plugin's MCP server keys. */

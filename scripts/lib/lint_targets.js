@@ -23,6 +23,8 @@ const LINT_FILE_PATTERNS = [
   /^src\/node\/builtinSkills\/.+\.js$/,
   /^src\/node\/workflowRuntime\/[^/]+\.js$/,
   /^scripts\/lib\/[^/]+\.js$/,
+  /^scripts\/.+\.test\.ts$/,
+  /^vscode\/src\/.+\.tsx?$/,
 ];
 
 // Changes that can alter findings in files the branch did not edit, so only a full run is
@@ -32,6 +34,10 @@ const FULL_LINT_TRIGGERS = [
   /^eslint-local-rules\.mjs$/,
   /^package\.json$/,
   /^bun\.lock$/,
+  // vscode/src is linted with the extension's own types (@types/vscode), so an update to its
+  // dependencies can surface findings in unchanged files.
+  /^vscode\/package\.json$/,
+  /^vscode\/bun\.lock$/,
   /^tsconfig[^/]*\.json$/,
   /^scripts\/lint\.sh$/,
   /^scripts\/lib\/lint_targets\.js$/,
@@ -109,13 +115,18 @@ function listChangedFiles(cwd, base) {
  * oxlint walks these directories itself: a list of every file would exceed the Windows
  * command-line limit (~32K characters). Every file that LINT_FILE_PATTERNS matches is inside one.
  */
-const OXLINT_ROOTS = ["src", "tests", "scripts/lib"];
+const OXLINT_ROOTS = ["src", "tests", "scripts", "vscode/src"];
 // The extensions oxlint lints when it walks a directory.
 const OXLINT_FILE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
 
 function listFiles(cwd, args) {
   return (
-    git(["ls-files", "-z", ...args, "--", ...OXLINT_ROOTS], cwd)
+    // Exclude node_modules in the query itself: an installed scripts/mintlify/node_modules
+    // lists megabytes of ignored paths, more than execFileSync's output buffer holds.
+    git(
+      ["ls-files", "-z", ...args, "--", ...OXLINT_ROOTS, ":(exclude,glob)**/node_modules/**"],
+      cwd
+    )
       .split("\0")
       .filter((file) => file !== "")
       // ESLint never lints node_modules.

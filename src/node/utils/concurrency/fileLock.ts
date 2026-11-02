@@ -117,8 +117,15 @@ const FILE_LOCK_RENEW_INTERVAL_MS = FILE_LOCK_LEASE_MS / 4;
 export type ReclaimSeamPhase = "post-guard" | "pre-restore";
 
 export interface ProcessFileLockOptions {
-  /** Absolute or relative lockfile path; the parent directory is created. */
+  /** Absolute or relative lockfile path; the parent directory is created (see createParentDir). */
   lockPath: string;
+  /**
+   * Default true. False: the parent directory must already exist, and a
+   * missing one fails acquisition with ENOENT. A session-dir writer that can
+   * run after workspace removal passes false, so it cannot recreate the
+   * deleted directory just by taking the lock (#7474).
+   */
+  createParentDir?: boolean;
   /** Max milliseconds to wait before acquisition fails. */
   timeoutMs: number;
   /** Human label for error/log messages (e.g. "append lock", "blob lock"). */
@@ -253,6 +260,19 @@ function parseLockToken(raw: string): HolderEvidence | null {
   return null;
 }
 
+/**
+ * Whether lockPath's lock file exists: a holder, live or dead, has it. One stat, so a caller
+ * that only needs to know if a holder may exist (branchSummary's marker reader) neither creates
+ * the lock's folder nor contends with the holder.
+ */
+export async function processFileLockExists(lockPath: string): Promise<boolean> {
+  assert(lockPath.length > 0, "processFileLockExists requires a lock path");
+  return await fs.stat(lockPath).then(
+    () => true,
+    () => false
+  );
+}
+
 export async function acquireProcessFileLock(
   options: ProcessFileLockOptions
 ): Promise<ProcessFileLock> {
@@ -264,7 +284,9 @@ export async function acquireProcessFileLock(
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
   try {
-    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    if (options.createParentDir !== false) {
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    }
     await fs.writeFile(tempPath, token, "utf-8");
     for (;;) {
       try {
@@ -305,9 +327,7 @@ export async function acquireProcessFileLock(
       }
       const blocker = await reclaimStaleFileLock(lockPath, label, 0, options.testOnlyReclaimSeam);
       if (Date.now() >= deadline) {
-        throw new Error(
-          `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`
-        );
+        throw new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, blocker));
       }
       await new Promise((resolve) =>
         setTimeout(resolve, FILE_LOCK_RETRY_MS + Math.random() * FILE_LOCK_RETRY_MS)
@@ -361,13 +381,14 @@ async function assertLockOwned(lockPath: string, token: string, label: string): 
 }
 
 /** Why an observed lock was not reclaimed; the timeout error reports the last one. */
-interface Blocker {
+export interface FileLockBlocker {
   /** Absent for a malformed token (no owner to name). */
   holder?: HolderEvidence;
   why: string;
   /** What is held, when not the lock itself (its reclaim guard). */
   subject?: string;
 }
+type Blocker = FileLockBlocker;
 
 /**
  * Judge the lock's owner by the shared rule (see processLiveness.judgeHolder):
@@ -403,6 +424,19 @@ function describeBlocker(blocker: Blocker | undefined): string {
     `${hostname != null ? ` on ${hostname}` : ""}) and was not taken over because ` +
     `${blocker.why}. Stop that process to free the lock.`
   );
+}
+
+/**
+ * The text of an acquire timeout. Exported so the SessionLocks test layers
+ * refuse with today's text, byte for byte.
+ */
+export function fileLockTimeoutMessage(
+  label: string,
+  lockPath: string,
+  timeoutMs: number,
+  blocker: FileLockBlocker | undefined
+): string {
+  return `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`;
 }
 
 /** True when the lockfile's mtime is older than the stale-lock lease. */

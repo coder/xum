@@ -25,7 +25,7 @@ import {
   createTaskServiceHarness,
   createTaskServiceTestRoot,
   flushTerminalAttentionDrains,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
@@ -292,8 +292,6 @@ describe("TaskService withdrawn workspace-turn continuations (#5261)", () => {
         projectWorkspace(projectPath, "target", "target", {
           parentWorkspaceId: "parent-root",
           taskStatus: "reported",
-          taskExecutionStatus: "running",
-          taskExecutionId: "wst_live",
           unrelatedWorkspaceConsent: "consent",
           agentId: "explore",
         }),
@@ -306,7 +304,11 @@ describe("TaskService withdrawn workspace-turn continuations (#5261)", () => {
       ...session.hostMocks,
     });
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", "parent-root");
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "parent-root",
+      workspaceId: "target",
+      handleId: "wst_live",
+    });
     const correlation = workspaceTurnMuxMetadata("parent-root", "wst_live", "wst_live-turn");
 
     expect(await taskService.sendAgentTreeMessage("sender", "target", "Status?")).toMatchObject(

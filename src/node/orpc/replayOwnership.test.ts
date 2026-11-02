@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { createAgentSessionHarness } from "../services/agentSession.testHarness";
 import { subscribeWorkspaceChat } from "./routerSubscriptions";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { createMuxMessage } from "@/common/types/message";
 import type { OnChatMode, OnChatEvent } from "@/common/orpc/types";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
@@ -66,9 +66,9 @@ async function setup(
     workspaceId,
     createMuxMessage("seed", "user", "seed")
   );
-  const context = {
+  const context = orpcContextFromDoubles({
     workspaceService: { getOrCreateSession: () => harness.session },
-  } as unknown as ORPCContext;
+  });
   const clients: Array<{ stop: () => Promise<void> }> = [];
   const subscribe = (mode?: OnChatMode) => {
     const abort = new AbortController();
@@ -401,9 +401,9 @@ test("a constructed session reserves an existing engine before a lazy subscripti
   const h = await setup();
   const send = spyOn(h.session, "sendMessage").mockResolvedValue(Ok(undefined));
   try {
-    const context = {
+    const context = orpcContextFromDoubles({
       workspaceService: { getOrCreateSession: () => h.session },
-    } as unknown as ORPCContext;
+    });
     const subscription = subscribeWorkspaceChat(context, { workspaceId: h.workspaceId });
     expect(h.session.isBusy()).toBe(true);
     h.session.queueMessage("manual before first pull");

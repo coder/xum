@@ -778,7 +778,7 @@ describe("appendEvents", () => {
       }),
       // Gateway route canonicalizes; coder without a pinned identity keeps
       // its raw (only durable) key.
-      makeAssistantLine({ sequence: 2, model: "mux-gateway:anthropic/claude-opus-4-5" }),
+      makeAssistantLine({ sequence: 2, model: "openrouter:anthropic/claude-opus-4-5" }),
       makeAssistantLine({ sequence: 3, model: "coder:unmapped/some-model" }),
     ]);
 

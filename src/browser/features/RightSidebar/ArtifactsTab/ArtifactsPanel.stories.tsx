@@ -207,14 +207,18 @@ function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing 
 function renderPanel(
   selectedPath: string,
   files: Record<string, ArtifactReadResult> = FILES,
-  options: { allowCdn?: boolean; workspaceId?: string } = {}
+  options: { allowCdn?: boolean; workspaceId?: string; sendInteractionError?: string } = {}
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
   writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
   return (
     <APIProvider
       client={createMockORPCClient({
-        artifacts: { listing: listingFor(files), files },
+        artifacts: {
+          listing: listingFor(files),
+          files,
+          sendInteractionError: options.sendInteractionError,
+        },
         userPreferences: { ui: { artifactsAllowCdnScripts: options.allowCdn ?? true } },
       })}
     >
@@ -521,23 +525,26 @@ const INTERACTIVE_CANVAS = JSON.stringify({
 });
 
 /**
- * Host-owned controls around an artifact (M5b): the confirm strip after the canvas button asked
- * to send (nothing is sent without the user's click), and annotate mode with a text selection's
- * comment box open.
+ * Host-owned controls around an artifact (M5b): the confirm strip with its error after a clicked
+ * canvas send failed (a clicked send that works shows no strip), and annotate mode with a text
+ * selection's comment box open.
  */
 export const SendStripAndAnnotate: Story = {
   parameters: {
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
   },
   render: () =>
-    renderPanel("rollout.canvas.json", {
-      "rollout.canvas.json": ok("rollout.canvas.json", INTERACTIVE_CANVAS),
-    }),
+    renderPanel(
+      "rollout.canvas.json",
+      { "rollout.canvas.json": ok("rollout.canvas.json", INTERACTIVE_CANVAS) },
+      { sendInteractionError: "Workspace not found: story" }
+    ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: "Approve plan B" }));
     const strip = await canvas.findByTestId("artifact-send-strip");
     await within(strip).findByText("Approve plan B.");
+    await within(strip).findByText("Workspace not found: story");
     // Send arms shortly after the strip appears; wait so the snapshot is stable.
     const send = within(strip).getByRole("button", { name: "Send" });
     await waitFor(() => expect(send).toBeEnabled(), { timeout: 5000 });

@@ -6,7 +6,7 @@
  * Shiki only for the languages Highlights does not know (ini, nginx, prisma, ...).
  *
  * Output contract: the same HTML shape Shiki's `codeToHtml` produces, so every caller
- * (`extractShikiLines`, `highlightDiffChunk`, the contrast stories) works unchanged:
+ * (`extractShikiLines`, `highlightDiffChunks`, the contrast stories) works unchanged:
  *   <pre class="shiki"><code><span class="line">TOKENS</span>\n<span class="line">…</span></code></pre>
  * Each token is `<span style="color:#rrggbb[;font-style:italic][;font-weight:bold]">TEXT</span>`.
  * We do not use Highlights' own `codeToHtml()`: it has no per-line spans, and one span can

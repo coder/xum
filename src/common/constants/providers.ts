@@ -18,7 +18,6 @@ import { normalizeOpenAICompatibleBaseURL } from "@/common/utils/providers/baseU
  * Union type of all supported provider names
  */
 export type ProviderName =
-  | "mux-gateway"
   | "anthropic"
   | "openai"
   | "google"
@@ -53,8 +52,6 @@ interface ProviderDefinition {
   fromGatewayModelId?: (gatewayModelId: string) => { origin: string; modelId: string } | null;
   /** True when gateway is a transparent proxy and preserves canonical identity */
   passthrough?: boolean;
-  /** Whether this provider uses stroke-based icon styling instead of fill */
-  strokeBasedIcon?: boolean;
 }
 
 const toSlashSeparatedGatewayModelId = (origin: string, modelId: string): string =>
@@ -115,18 +112,6 @@ const fromDotSeparatedGatewayModelId = (
 
 // Order determines display order in UI (Settings, model selectors, etc.)
 export const PROVIDER_DEFINITIONS = {
-  "mux-gateway": {
-    displayName: "Xum Gateway",
-    import: () => import("ai"),
-    factoryName: "createGateway",
-    requiresApiKey: true, // Uses couponCode
-    kind: "gateway",
-    routes: ["anthropic", "openai", "google", "xai"],
-    passthrough: true,
-    toGatewayModelId: toSlashSeparatedGatewayModelId,
-    fromGatewayModelId: fromSlashSeparatedGatewayModelId,
-    strokeBasedIcon: true,
-  },
   anthropic: {
     displayName: "Anthropic",
     import: () => import("@ai-sdk/anthropic"),
@@ -273,12 +258,6 @@ export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
  * Array of all supported provider names (for UI lists, iteration, etc.)
  */
 export const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_DEFINITIONS) as ProviderName[];
-
-/**
- * Providers users cannot add custom models under: mux-gateway is a routing
- * layer enabled per model, not a standalone model list.
- */
-export const CUSTOM_MODEL_HIDDEN_PROVIDERS: ReadonlySet<string> = new Set(["mux-gateway"]);
 
 /**
  * Display names for providers (proper casing for UI)

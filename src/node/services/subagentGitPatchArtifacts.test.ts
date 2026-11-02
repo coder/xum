@@ -10,6 +10,7 @@ import {
   readSubagentGitPatchArtifactsFile,
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("subagentGitPatchArtifacts", () => {
   let testDir: string;
@@ -34,6 +35,7 @@ describe("subagentGitPatchArtifacts", () => {
     const createdAtMs = Date.now();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -89,6 +91,7 @@ describe("subagentGitPatchArtifacts", () => {
     const createdAtMs = Date.now();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -125,6 +128,7 @@ describe("subagentGitPatchArtifacts", () => {
 
     const appliedAtMs = createdAtMs + 1234;
     const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -171,6 +175,7 @@ describe("subagentGitPatchArtifacts", () => {
 
     const appliedAtMs = 456;
     const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -262,6 +267,7 @@ describe("subagentGitPatchArtifacts", () => {
     expect(Object.keys(file.artifactsByChildTaskId)).toEqual(["child-kept"]);
 
     const updated = await markSubagentGitPatchArtifactApplied({
+      locks: nodeSessionLocks,
       workspaceId: "parent-1",
       workspaceSessionDir: testDir,
       childTaskId: "child-kept",

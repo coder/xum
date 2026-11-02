@@ -12,6 +12,7 @@ import * as RealStore from "@/browser/features/Tools/Shared/toolCardsStore";
 import * as RealLoader from "@/browser/features/Tools/Shared/toolCardsLoader";
 import { getToolComponent } from "@/browser/features/Tools/Shared/getToolComponent";
 import { ProposePlanToolCall } from "@/browser/features/Tools/ProposePlanToolCall";
+import { AskUserQuestionChain } from "@/browser/features/Tools/AskUserQuestion/AskUserQuestionChain";
 import type { DisplayedMessage } from "@/common/types/message";
 import { ToolMessage } from "./ToolMessage";
 
@@ -76,7 +77,7 @@ describe("ToolMessage with lazy tool cards", () => {
     expect(view.queryByText("echo lazy")).toBeNull();
 
     act(() => {
-      fakeCards = { getToolComponent, ProposePlanToolCall };
+      fakeCards = { getToolComponent, ProposePlanToolCall, AskUserQuestionChain };
       for (const listener of listeners) listener();
     });
     expect(view.queryByTestId("tool-card-fallback")).toBeNull();

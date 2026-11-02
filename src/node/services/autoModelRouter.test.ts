@@ -431,7 +431,7 @@ describe("evaluation model factory", () => {
   });
 
   it("rejects model strings outside the evaluation-capable providers", () => {
-    for (const modelString of ["coder:openai/gpt-5", "typesafe", "openai:", "mux-gateway:x"]) {
+    for (const modelString of ["coder:openai/gpt-5", "typesafe", "openai:", "unknown-provider:x"]) {
       expect(
         resolveEvaluationModelTarget(modelString, deps({ openai: { apiKey: "k" } }))
       ).toMatchObject({

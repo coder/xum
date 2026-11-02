@@ -11,7 +11,7 @@
  *     (selfCheckRun.ts, `make bug-bash-sandbox-check`, against a fake upstream)
  *   bun sandbox/launch.ts --recover   (make bug-bash-sandbox-recover; see recover())
  *
- * The container runs the e2e CLI, Chromium and the seeded app with the pinned image (runner.ts).
+ * The container runs the e2e CLI, Chromium and the seeded app with the sandbox image (runner.ts).
  * It gets no network, no capabilities, a read-only root, copies of the git-listed inputs, and
  * read-only dist/ and node_modules/ (inputs.ts). Its output folder, the app log included, comes
  * back on its stdout as an export stream (exportStream.ts).
@@ -49,7 +49,7 @@ import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
 import { namesAgentTag, onlyAgentTag } from "../hostPause";
-import { type CleanupState, IMAGE, Refusal, Session, Stopped } from "./runner";
+import { type CleanupState, Refusal, Session, Stopped } from "./runner";
 import { DEFAULT_APP_MODEL } from "../aiMode";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
@@ -236,8 +236,9 @@ export async function probeApp(
 }
 
 /**
- * The Docker part of a preflight: the local daemon answers, it is supported, and the pinned
- * image is present (pulled when missing). The Makefile runs it before the build, so a missing
+ * The Docker part of a preflight: the local daemon answers, it is supported, and the image of
+ * this checkout's inputs key is present (pulled, or built when no verified image exists, which
+ * the jobs then reuse). The Makefile runs it before the build, so a missing
  * daemon refuses in about a second instead of after it. Throws a Refusal (or Stopped); leaves no
  * folder. Returns the cleanup state: an `unknown` one (a process group still runs) outranks a
  * refusal, as in launchJob, and the caller exits 3.
@@ -497,15 +498,6 @@ function checkJob(args: string[], o: LaunchOptions) {
   // A model-driven `e2e run`: every test needs the explorer model, so the launcher probes it.
   const drivenRun = mcpApps || stories || electron || agentRepros;
   const driven = drivenRun || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
-  // The stale-key local build: CI's bugbash-sandbox job sets BUGBASH_SANDBOX_BUILD_STALE=1, so a pull request that
-  // changes the image inputs can pass before main publishes its image. Only the self-check and
-  // exact-step repros may use a local build: they reach no real model. By the job kind, not by
-  // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite, the
-  // story suite, the agent repros and checkDocker (the preflight of make bug-bash, make
-  // mcp-apps-e2e and make test-stories) keep the pinned digest.
-  // A positive check, not "none of the others": a job kind added later must not qualify by default.
-  const localBuild =
-    o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || (exactStep && !agentRepros));
   // The job's folder: its cwd in the container, and where its output comes back.
   const storyJob = stories || electron;
   const dir = storyJob ? storiesDir : bugbash;
@@ -517,7 +509,7 @@ function checkJob(args: string[], o: LaunchOptions) {
     storyJob && judgeSpec !== ""
       ? pricedAnthropic(judgeSpec, `BUGBASH_JUDGE_MODEL ${JSON.stringify(judgeSpec)}`)
       : undefined;
-  return { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron };
+  return { dir, drivenRun, selfCheck, ai, driven, judgeModel, storyJob, electron };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -529,8 +521,10 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron } =
-    checkJob(args, o);
+  const { dir, drivenRun, selfCheck, ai, driven, judgeModel, storyJob, electron } = checkJob(
+    args,
+    o
+  );
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -598,13 +592,13 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           ? `leftover: ${entry.id.slice(0, 12)} cannot be inspected (${entry.error})`
           : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
       );
-    const image = await session.ensureImage({ localBuild });
+    const { ref: image, local } = await session.ensureImage();
     // On stderr, not `log`: the self-check's log is not shown, and this must not be missed.
-    if (!image.startsWith(`${IMAGE}@`)) {
+    if (local != null) {
       const warning =
-        `sandbox: LOCAL IMAGE ${image.slice(0, 19)}, built from this checkout, not the pinned ` +
-        `digest in image.json. Publish from main (workflow "Bug-bash sandbox image"), then ` +
-        `update tests/bugbash/sandbox/image.json.`;
+        `sandbox: LOCAL IMAGE ${image.slice(0, 19)}, built from this checkout: no verified ` +
+        `image of main's publish workflow for this inputs key (${local}). Main publishes it ` +
+        `after the merge.`;
       console.error(o.env.GITHUB_ACTIONS === "true" ? `::warning::${warning}` : warning);
     }
     // Another job's cleanup can remove the empty per-checkout folder between the two mkdirs.

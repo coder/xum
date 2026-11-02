@@ -1,9 +1,5 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import {
-  eventSpine,
-  type RequestAssemblySnapshot,
-  type TurnStopContext,
-} from "./events/eventSpine";
+import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
 import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import {
@@ -11,11 +7,11 @@ import {
   runTurnStopHooks,
   type MessageSendHookInput,
   type MessageSendHookOutcome,
+  type TurnStopHookInput,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
-import * as fs from "fs/promises";
 
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
@@ -24,9 +20,9 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
+  type LoopHostServices,
   type TurnRequestBuilderBindings,
   resolveXumToolScope,
   type StreamMessageOptions,
@@ -56,13 +52,10 @@ import {
   type Config,
   type WorkspaceMetadataOptions,
 } from "@/node/config";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  createRuntimeContextForWorkspace,
-  createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
   type WorkspaceRuntimeContext,
@@ -76,6 +69,7 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
+import { nodeClock } from "@/node/utils/hostClock";
 import { resolveAgentForStream } from "./agentResolution";
 import { formatSendMessageError } from "./utils/sendMessageError";
 import {
@@ -100,7 +94,6 @@ import {
   resolveMemoryProjectIdentity,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -109,6 +102,13 @@ import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset"
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
+import {
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
@@ -179,6 +179,8 @@ export class AIService extends EventEmitter {
   private readonly devToolsService?: DevToolsService;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly experimentsService?: ExperimentsService;
+  /** Builds every runtime of this service and of its sessions (AgentSessionAIService). */
+  readonly runtimeFactory: RuntimeFactory;
 
   /**
    * Tracks queued DevTools run metadata by assistant message id so stream-end/abort
@@ -215,7 +217,9 @@ export class AIService extends EventEmitter {
     providersConfigStore?: ProvidersConfigStore,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /** Absent members: the Node layer (`new AIService(` in tests passes none). */
+    private readonly hostServices: LoopHostServices = {}
   ) {
     super();
     // No listener cap: every live AgentSession adds one listener per forwarded event, and a
@@ -225,6 +229,7 @@ export class AIService extends EventEmitter {
     // disposed session that keeps its listeners) is caught by
     // workspaceService.sessionListeners.test.ts instead.
     this.setMaxListeners(0);
+    this.runtimeFactory = hostServices.runtimeFactory ?? nodeRuntimeFactory;
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -268,6 +273,8 @@ export class AIService extends EventEmitter {
       experimentsService: this.experimentsService,
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
+      hostServices,
+      runtimeFactory: this.runtimeFactory,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),
@@ -307,9 +314,8 @@ export class AIService extends EventEmitter {
 
   /**
    * Build the session-segment memory context: the index snapshot advertised
-   * in the memory tool description, plus the hot-memories block (pinned +
-   * frequently used memory files; memory-hot-set sub-experiment). Returns
-   * null when the memory experiment is off.
+   * in the memory tool description. Returns null when the memory experiment
+   * is off.
    *
    * Callers (AgentSession) cache the result per model and recompute it only
    * on the first use of a model in a session segment, or at compaction
@@ -320,15 +326,14 @@ export class AIService extends EventEmitter {
    */
   async buildMemorySessionContext(
     workspaceId: string,
-    // The byte-budgeted context no longer depends on the model; the parameter
-    // keeps AgentSession's per-model cache contract unchanged.
+    // The memory context does not depend on the model; the parameter keeps
+    // AgentSession's per-model cache contract unchanged.
     _modelString: string,
     options?: {
-      includeHotMemories?: boolean;
       /**
        * Routed turn without Project Trust: memories carrying project skill
-       * provenance stay out of the index and the preload (least privilege,
-       * mirroring the request's own withholding).
+       * provenance stay out of the index (least privilege, mirroring the
+       * request's own withholding).
        */
       excludeProjectSkillContent?: boolean;
     }
@@ -341,7 +346,7 @@ export class AIService extends EventEmitter {
       const metadataResult = await this.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) return null;
       const metadata = metadataResult.data;
-      const runtime = createRuntimeForWorkspace(metadata);
+      const runtime = this.runtimeFactory.createRuntimeForWorkspace(metadata);
       const ctx = {
         runtime,
         checkoutCwd: "",
@@ -355,45 +360,10 @@ export class AIService extends EventEmitter {
       ).filter(
         (entry) => options?.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
       );
-      // Hot preloading is a sub-experiment: without it, memories stay
-      // pull-based like skills (index only, contents fetched on demand).
-      let hotMemoriesBlock: string | null = null;
-      let hotMemoriesCarryProjectSkillContent = false;
-      if (
-        options?.includeHotMemories !== false &&
-        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
-      ) {
-        try {
-          // Sub-agents preload pinned files only: auto-hot files mirror the
-          // parent's usage, and every child would otherwise pay for the same
-          // block again. The index and on-demand reads stay available.
-          const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
-            pinnedOnly: metadata.parentWorkspaceId != null,
-            excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
-          });
-          hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
-          hotMemoriesCarryProjectSkillContent = items.some(
-            (item) => item.carriesProjectSkillContent === true
-          );
-        } catch (error) {
-          // Hot preloading is best-effort context. Preserve the pull-based
-          // memory index when ranked selection fails.
-          log.warn("Failed to build hot memories; continuing with memory index only", {
-            workspaceId,
-            error,
-          });
-        }
-      }
-      return {
-        indexEntries,
-        hotMemoriesBlock,
-        // Preloaded files are a subset of the index, but a file's provenance is
-        // re-checked at its preload read (it can turn tainted after the index
-        // snapshot), so both channels contribute.
-        carriesProjectSkillContent:
-          indexEntries.some((entry) => entry.carriesProjectSkillContent) ||
-          hotMemoriesCarryProjectSkillContent,
-      };
+      // Set only when an entry carries provenance: a clean context keeps its plain shape.
+      return indexEntries.some((entry) => entry.carriesProjectSkillContent)
+        ? { indexEntries, carriesProjectSkillContent: true }
+        : { indexEntries };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });
@@ -442,7 +412,8 @@ export class AIService extends EventEmitter {
       // copy and measure only the response. Re-cloning and re-serializing the whole request
       // here doubled the per-turn event-loop cost at a full context (#6912).
       const response = structuredClone({
-        capturedAt: Date.now(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
         metadata: event.metadata,
         parts: event.parts,
       });
@@ -565,7 +536,7 @@ export class AIService extends EventEmitter {
 
   private async ensureSessionsDir(): Promise<void> {
     try {
-      await ensurePrivateDir(this.config.sessionsDir);
+      await this.historyService.files.ensurePrivateDir(this.config.sessionsDir);
     } catch (error) {
       log.error("Failed to create sessions directory:", error);
     }
@@ -577,7 +548,11 @@ export class AIService extends EventEmitter {
    * vars-snapshot writer (independent instances would corrupt seq ordering).
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
+    // The history's layers: a memory graph keeps the turn's journal rows and blobs in its volume.
+    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId), {
+      files: this.historyService.files,
+      locks: this.historyService.locks,
+    });
   }
 
   /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */
@@ -594,6 +569,8 @@ export class AIService extends EventEmitter {
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
       mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
+      hostFiles: this.hostServices.hostFiles,
+      hostPaths: this.hostServices.hostPaths,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
@@ -641,12 +618,51 @@ export class AIService extends EventEmitter {
   /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
   async runTurnStopHooks(
     workspaceId: string,
-    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
+    input: TurnStopHookInput
   ): Promise<TurnStopHookOutcome> {
     const cwd = eventSpine.hasMiddlewareFor("turn.stop", workspaceId)
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;
     return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /**
+   * The Agent interface view's turn-end status page nudge that the turn that streamed `messageId`
+   * earns (needsStatusPageTurnEndNudge), or null. In status page agent mode it asks for a
+   * status_update call instead of an edit. Consumes the turn's state, so a second call is null.
+   */
+  async statusPageTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<string | null> {
+    const taken = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
+      workspaceId,
+      input.messageId
+    );
+    // Switched off since the turn started: the status page agent drops its queued updates, so
+    // a status_update the turn sent counts for nothing and the agent must edit the page.
+    const turn = taken && {
+      ...taken,
+      statusPageAgent: taken.statusPageAgent === true && this.isStatusPageAgentStillOn(),
+    };
+    const needed = await needsStatusPageTurnEndNudge({
+      turn,
+      viewEnabled:
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      parts: input.parts,
+    });
+    if (!needed) return null;
+    return turn?.statusPageAgent === true
+      ? STATUS_PAGE_AGENT_TURN_END_NUDGE
+      : STATUS_PAGE_TURN_END_NUDGE;
+  }
+
+  private isStatusPageAgentStillOn(): boolean {
+    return (
+      this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT) &&
+      isStatusPageAgentEnabledInSettings(this.config.loadConfigOrDefault())
+    );
   }
 
   /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */
@@ -904,6 +920,7 @@ export class AIService extends EventEmitter {
         metadata: metadata.data,
         runtime: context.data.runtime,
         workspacePath: context.data.workspacePath,
+        runtimeFactory: this.runtimeFactory,
         requestedAgentId: options.agentId,
         disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
         automaticGoalTurn: true,
@@ -950,35 +967,32 @@ export class AIService extends EventEmitter {
 
     const singleProjectContext = isMultiProject(metadata)
       ? undefined
-      : createRuntimeContextForWorkspace(metadataWithPath);
+      : this.runtimeFactory.createRuntimeContextForWorkspace(metadataWithPath);
     const runtime = singleProjectContext
       ? singleProjectContext.runtime
-      : new MultiProjectRuntime(
-          new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
-          getProjects(metadata).map((project) => ({
+      : this.runtimeFactory.createMultiProjectRuntime({
+          runtimeConfig: metadata.runtimeConfig,
+          srcBaseDir: getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir,
+          workspaceName: metadata.name,
+          projects: getProjects(metadata).map((project) => ({
             projectPath: project.projectPath,
             projectName: project.projectName,
-            runtime: createRuntime(metadata.runtimeConfig, {
-              projectPath: project.projectPath,
-              workspaceName: metadata.name,
-              workspacePath: isSSHRuntime(metadata.runtimeConfig)
-                ? getWorkspacePathHintForProject(
-                    {
-                      workspaceId,
-                      workspaceName: metadata.name,
-                      workspacePath: workspace.workspacePath,
-                      runtimeConfig: metadata.runtimeConfig,
-                      projectPath: metadata.projectPath,
-                      projectName: metadata.projectName,
-                      projects: metadata.projects,
-                    },
-                    project.projectPath
-                  )
-                : undefined,
-            }),
+            workspacePath: isSSHRuntime(metadata.runtimeConfig)
+              ? getWorkspacePathHintForProject(
+                  {
+                    workspaceId,
+                    workspaceName: metadata.name,
+                    workspacePath: workspace.workspacePath,
+                    runtimeConfig: metadata.runtimeConfig,
+                    projectPath: metadata.projectPath,
+                    projectName: metadata.projectName,
+                    projects: metadata.projects,
+                  },
+                  project.projectPath
+                )
+              : undefined,
           })),
-          metadata.name
-        );
+        });
 
     const workspacePath =
       singleProjectContext?.workspacePath ??
@@ -1072,11 +1086,11 @@ export class AIService extends EventEmitter {
         ? AbortSignal.any([opts.abortSignal, controller.signal])
         : controller.signal,
       syntheticMessageId: createAssistantMessageId(),
-      startTime: Date.now(),
+      startTime: this.streamManager.hostClock.nowMs(),
       startupPhaseTimingsMs,
       startupState: { pendingRunMetadataId: null },
       recordStartupPhaseTiming: (phase, started) => {
-        startupPhaseTimingsMs[phase] = Date.now() - started;
+        startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - started;
       },
       admissionOnly: true,
     };
@@ -1118,7 +1132,7 @@ export class AIService extends EventEmitter {
       abortSignal,
       acpPromptId: opts.acpPromptId,
     });
-    const startTime = prepared?.context.startTime ?? Date.now();
+    const startTime = prepared?.context.startTime ?? this.streamManager.hostClock.nowMs();
     const syntheticMessageId = pendingStart.syntheticMessageId;
     opts.onStreamStarting?.(syntheticMessageId);
     const combinedAbortSignal = pendingStart.abortSignal;
@@ -1128,7 +1142,7 @@ export class AIService extends EventEmitter {
     if (combinedAbortSignal.aborted) forwardCancellation();
     else combinedAbortSignal.addEventListener("abort", forwardCancellation, { once: true });
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
-      startupPhaseTimingsMs[phase] = Date.now() - phaseStartedAt;
+      startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - phaseStartedAt;
     };
     const startupState = prepared?.context.startupState ?? {
       pendingRunMetadataId: null as string | null,
@@ -1169,12 +1183,12 @@ export class AIService extends EventEmitter {
           lastMessage?.role
       );
 
-      const commitPartialStartedAt = Date.now();
+      const commitPartialStartedAt = this.streamManager.hostClock.nowMs();
       await this.historyService.commitPartial(workspaceId);
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
       const buildOutcome = prepared
-        ? await prepared.request.start(opts.activeTurnThinkingOverride)
+        ? await prepared.request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage)
         : await this.turnRequestBuilder.build(opts, {
             abortSignal: combinedAbortSignal,
             syntheticMessageId,
@@ -1211,7 +1225,7 @@ export class AIService extends EventEmitter {
         buildOutcome.logStartOutcome("stream_start_failed", "stop_in_progress");
         pendingStart.abort("startup");
       }
-      const startStreamStartedAt = Date.now();
+      const startStreamStartedAt = this.streamManager.hostClock.nowMs();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 
@@ -1293,7 +1307,7 @@ export class AIService extends EventEmitter {
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {
     try {
       const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
-      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await this.historyService.files.promises.rm(workspaceDir, { recursive: true, force: true });
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);

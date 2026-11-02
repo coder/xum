@@ -10,6 +10,8 @@ import {
   readAdditionalSystemContext,
   writeAdditionalSystemContext,
 } from "./additionalSystemContext";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 
 function createSessionDirProvider(root: string) {
   return {
@@ -43,6 +45,35 @@ describe("additionalSystemContext", () => {
     await expect(
       fs.readFile(path.join(tempDir, "workspace-1", ADDITIONAL_SYSTEM_CONTEXT_FILENAME), "utf-8")
     ).resolves.toBe("Remember the API contract.");
+  });
+
+  test("reads and writes the scratchpad through the SessionFiles it was given", async () => {
+    // The turn reads the scratchpad through the history's SessionFiles (phase 5): with memory
+    // files, the content and the disabled marker live in the memory volume, not under tempDir.
+    const config = createSessionDirProvider(tempDir);
+    const files = buildSessionFiles(SessionFilesMemory);
+    await writeAdditionalSystemContext(
+      config,
+      "workspace-1",
+      { content: "in memory", enabled: false },
+      files
+    );
+
+    expect(await readAdditionalSystemContext(config, "workspace-1", files)).toEqual({
+      content: "in memory",
+      enabled: false,
+    });
+    expect(
+      await files.promises.readFile(
+        path.join(tempDir, "workspace-1", ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME),
+        "utf-8"
+      )
+    ).toBe("");
+    expect(await readAdditionalSystemContext(config, "workspace-1")).toEqual({
+      content: "",
+      enabled: true,
+    });
+    expect(await fs.readdir(tempDir)).toEqual([]);
   });
 
   test("empty content removes durable scratchpad file and disabled marker", async () => {

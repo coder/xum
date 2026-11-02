@@ -38,7 +38,7 @@ import {
 import {
   createTaskServiceHarness,
   createTaskServiceTestRoot,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 
@@ -257,6 +257,7 @@ describe("peer-message limits", () => {
       projectPath,
       [
         ...senders.map((id) => projectWorkspace(projectPath, id, id)),
+        projectWorkspace(projectPath, "owner", "owner"),
         projectWorkspace(projectPath, "target", "target", {
           agentId: "exec",
           unrelatedWorkspaceConsent: "consent",
@@ -278,13 +279,13 @@ describe("peer-message limits", () => {
       countQueuedAgentPeerMessages,
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "target",
-      "wst_foreign",
-      "owner",
-      "accepted"
-    );
+    // `owner` delegated a turn to the target it created earlier.
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "owner",
+      workspaceId: "target",
+      handleId: "wst_foreign",
+      ownerCreatedWorkspace: true,
+    });
 
     let now = Date.now();
     setSystemTime(new Date(now));
@@ -309,8 +310,10 @@ describe("peer-message limits", () => {
     await fresh;
     // Let the drain deliver every waiting message (it unregisters the list once empty).
     const parkedByTarget = (
-      taskService as unknown as { parkedPeerSendsByTarget: Map<string, unknown> }
-    ).parkedPeerSendsByTarget;
+      taskService as unknown as {
+        peerSendParking: { parkedPeerSendsByTarget: Map<string, unknown> };
+      }
+    ).peerSendParking.parkedPeerSendsByTarget;
     for (let spin = 0; spin < 200 && parkedByTarget.has("target"); spin++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }

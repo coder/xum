@@ -16,6 +16,8 @@ import {
   readRefinementEvents,
   seedForeignTargetLock,
 } from "@/node/services/refinement/refinementTestHelpers";
+import { targetMutationLockFilePath } from "@/node/services/refinement/targetMutationLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { SKILL_FILENAME } from "./skillFileUtils";
@@ -52,6 +54,32 @@ async function createDeleteTool(
 }
 
 describe("agent_skill_delete", () => {
+  it("takes the target lock from the config's session locks", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-delete-locks");
+    await writeSkillWithReference(tempDir.path, "demo-skill");
+    // A copy of the Node locks whose file lock records its calls (#7326).
+    const locks = { ...nodeSessionLocks };
+    const acquire = spyOn(locks, "acquireProcessFileLock");
+    const tool = createAgentSkillDeleteTool({
+      ...createTestToolConfig(tempDir.path, {
+        workspaceId: GLOBAL_WORKSPACE_ID,
+        sessionsDir: await createWorkspaceSessionDir(tempDir.path, GLOBAL_WORKSPACE_ID),
+      }),
+      sessionLocks: locks,
+    });
+
+    const result = (await tool.execute!(
+      { name: "demo-skill", target: "skill", confirm: true },
+      mockToolCallOptions
+    )) as AgentSkillDeleteToolResult;
+
+    expect(result.success).toBe(true);
+    const skillsRoot = path.resolve(tempDir.path, "skills");
+    expect(acquire.mock.calls.map(([options]) => options.lockPath)).toContain(
+      targetMutationLockFilePath(tempDir.path, skillsRoot)
+    );
+  });
+
   it("requires confirm: true before deleting", async () => {
     using tempDir = new TestTempDir("test-agent-skill-delete-confirm");
 

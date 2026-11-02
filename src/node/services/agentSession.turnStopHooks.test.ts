@@ -9,14 +9,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
+import { isPluginHookNoticeEvent } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { Ok } from "@/common/types/result";
+import { createMuxMessage } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
-import { eventSpine, type TurnStopContext } from "./events/eventSpine";
+import { eventSpine, type TurnStopContext, type TurnStopContinueReason } from "./events/eventSpine";
+import { registerCodexPluginHooks } from "./agentPlugins/codexHookRunner";
 import type { TurnCompletion } from "./streamManager";
 import {
   createAgentSessionHarness,
@@ -24,6 +28,7 @@ import {
   type AgentSessionHarnessOptions,
 } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -80,6 +85,8 @@ async function setup(
     fallbackModel?: (turn: number) => string | undefined;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
+    /** Every turn's status page earns the Agent interface view's turn-end nudge. */
+    statusPageNeedsNudge?: boolean;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
@@ -92,6 +99,9 @@ async function setup(
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
+      ...(input.statusPageNeedsNudge === true
+        ? { statusPageTurnEndNudge: () => Promise.resolve(STATUS_PAGE_TURN_END_NUDGE) }
+        : {}),
       streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
         requests.push(request);
         const messageId = `a${++turns}`;
@@ -196,9 +206,59 @@ async function userTexts(h: AgentSessionHarness): Promise<string[]> {
     .map((row) => row.parts.map((part) => (part.type === "text" ? part.text : "")).join(""));
 }
 
+function stopReason(
+  text: string,
+  hook: Partial<Omit<TurnStopContinueReason, "text">> = {}
+): TurnStopContinueReason {
+  return { text, pluginName: "guard", hookKey: "guard:hooks/hooks.json#Stop[0][0]", ...hook };
+}
+
 const keepGoing = (ctx: TurnStopContext) => {
-  ctx.continueReasons.push("Run the failing tests again.");
+  ctx.continueReasons.push(stopReason("Run the failing tests again."));
 };
+
+function pluginNotices(h: AgentSessionHarness) {
+  return h.events.filter(isPluginHookNoticeEvent);
+}
+
+/**
+ * A Codex plugin with one Stop hook at the default hooks file's first slot, through the real
+ * runner. `reason(call)` is the block reason of its 1-based call, or null to let the turn end.
+ */
+function addCodexStopHook(
+  plugin: { name: string; instanceId: string },
+  reason: (call: number) => string | null
+): void {
+  let calls = 0;
+  unregisters.push(
+    registerCodexPluginHooks(eventSpine, {
+      workspaceId,
+      pluginName: plugin.name,
+      pluginInstanceId: plugin.instanceId,
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#Stop[0][0]",
+          hash: "h".repeat(64),
+          event: "Stop",
+          handler: { type: "mcp_tool", server: plugin.name, tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () => {
+          const text = reason(++calls);
+          const output = text == null ? {} : { decision: "block", reason: text };
+          return Promise.resolve({ content: [{ type: "text", text: JSON.stringify(output) }] });
+        },
+        notifyUser: () => undefined,
+      },
+    })
+  );
+}
 
 describe("turn.stop", () => {
   test("a continuation sends its reason as the next prompt, at most 3 times per turn", async () => {
@@ -233,6 +293,189 @@ describe("turn.stop", () => {
     expect(streams()).toBe(8);
   });
 
+  for (const row of [
+    { loopLimit: 2, continuations: 2 },
+    // No per-hook limit: the ceiling of 50 per user turn ends the loop.
+    { loopLimit: null, continuations: 50 },
+  ]) {
+    test(`a hook with loopLimit ${String(row.loopLimit)} continues ${row.continuations} times`, async () => {
+      addConsumer((ctx) => {
+        ctx.continueReasons.push(stopReason("Keep looping.", { loopLimit: row.loopLimit }));
+      });
+      const { h, streams } = await setup();
+
+      await h.session.sendMessage("fix the tests", options);
+      await settle(h);
+
+      expect(streams()).toBe(row.continuations + 1);
+    });
+  }
+
+  test("two hooks each continue 3 times per user turn, and each sees its own count first", async () => {
+    const first = stopReason("First.");
+    const second = stopReason("Second.", { hookKey: "guard:hooks/hooks.json#Stop[1][0]" });
+    const seen: Array<{ turn: number; first: number; second: number }> = [];
+    addConsumer((ctx) => {
+      seen.push({
+        turn: ctx.turnContinuations,
+        first: ctx.hookContinuations.get(first.hookKey) ?? 0,
+        second: ctx.hookContinuations.get(second.hookKey) ?? 0,
+      });
+      ctx.continueReasons.push({ ...first });
+      // The second hook starts once the first used its 3: one shared count would end here.
+      if (seen.length > 3) ctx.continueReasons.push({ ...second });
+    });
+    const { h } = await setup();
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+    expect(await userTexts(h)).toEqual([
+      "fix the tests",
+      ...Array<string>(3).fill("First."),
+      ...Array<string>(3).fill("Second."),
+    ]);
+    expect(seen).toEqual([
+      { turn: 0, first: 0, second: 0 },
+      { turn: 1, first: 1, second: 0 },
+      { turn: 2, first: 2, second: 0 },
+      { turn: 3, first: 3, second: 0 },
+      { turn: 4, first: 3, second: 1 },
+      { turn: 5, first: 3, second: 2 },
+      { turn: 6, first: 3, second: 3 },
+    ]);
+
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect((await userTexts(h)).slice(7)).toEqual([
+      "now lint",
+      ...Array<string>(3).fill("First.\n\nSecond."),
+    ]);
+    expect(seen[7]).toEqual({ turn: 0, first: 0, second: 0 });
+  });
+
+  test("a user Stop during the loop adds no continuation", async () => {
+    const calls: StopCall[] = [];
+    addConsumer((ctx) => {
+      ctx.continueReasons.push(stopReason("Keep looping.", { loopLimit: null }));
+    }, calls);
+    // The user stops the first continuation's turn.
+    const { h, streams } = await setup({
+      ending: (turn) => (turn === 2 ? "aborted" : "completed"),
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a Codex Stop hook continues 3 times per user turn", async () => {
+    addCodexStopHook({ name: "guard", instanceId: "1111111111111111" }, () => "Again.");
+    const { h, streams } = await setup();
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(4);
+    expect(await userTexts(h)).toEqual(["fix the tests", ...Array<string>(3).fill("Again.")]);
+  });
+
+  test("two Codex plugins with the same hook key count separately", async () => {
+    addCodexStopHook({ name: "guard", instanceId: "1111111111111111" }, () => "Guard.");
+    // The second plugin starts once the first used its 3: a shared count would refuse it.
+    addCodexStopHook({ name: "tidy", instanceId: "2222222222222222" }, (call) =>
+      call > 3 ? "Tidy." : null
+    );
+    const { h } = await setup();
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual([
+      "fix the tests",
+      ...Array<string>(3).fill("Guard."),
+      ...Array<string>(3).fill("Tidy."),
+    ]);
+  });
+
+  test("each continuation shows the plugin's notice with the turn's continuation count", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ session: { captureEvents: true } });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(pluginNotices(h)).toEqual(
+      [1, 2, 3].map((n) => ({
+        type: "plugin-hook-notice",
+        workspaceId,
+        plugin: "guard",
+        message: `plugin continued turn ${n} of 50`,
+        severity: "info",
+      }))
+    );
+  });
+
+  for (const row of [
+    // The first reason fills the prompt: none of the second hook's text reaches the model.
+    {
+      cut: "wholly",
+      firstChars: TURN_STOP_PROMPT_MAX_CHARS,
+      plugins: ["guard", "guard, tidy", "guard"],
+    },
+    // Part of the second hook's text survives the cut, so that hook continued the turn.
+    {
+      cut: "mid-way",
+      firstChars: TURN_STOP_PROMPT_MAX_CHARS - 5,
+      plugins: ["guard, tidy", "guard", "guard"],
+    },
+  ]) {
+    test(`a reason cut ${row.cut} by the prompt cap counts only if some of it is in the prompt`, async () => {
+      let stops = 0;
+      addConsumer((ctx) => {
+        ctx.continueReasons.push(
+          stopReason(++stops === 1 ? "x".repeat(row.firstChars) : "First."),
+          stopReason("Second.", {
+            pluginName: "tidy",
+            hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+            loopLimit: 1,
+          })
+        );
+      });
+      const { h } = await setup({ session: { captureEvents: true } });
+
+      await h.session.sendMessage("fix the tests", options);
+      await settle(h);
+
+      // tidy's one continuation goes to the first prompt that holds its text.
+      expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual(row.plugins);
+    });
+  }
+
+  test("the notice names only the plugins whose reasons the continuation kept", async () => {
+    addConsumer((ctx) => {
+      ctx.continueReasons.push(
+        stopReason("Guard."),
+        stopReason("Tidy.", {
+          pluginName: "tidy",
+          hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+          loopLimit: 1,
+        })
+      );
+    });
+    const { h } = await setup({ session: { captureEvents: true } });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual([
+      "guard, tidy",
+      "guard",
+      "guard",
+    ]);
+  });
+
   test("the Stop hooks see the model that answered after a refusal fallback", async () => {
     // Codex PRRT_kwDOPxxmWM6sbewj: only the stream-end reports the fallback model.
     const calls: StopCall[] = [];
@@ -251,7 +494,7 @@ describe("turn.stop", () => {
     // Tool events send the raw provider-qualified string (gateway prefix kept): Stop matches it.
     const calls: StopCall[] = [];
     addConsumer(() => undefined, calls);
-    const gateway = "mux-gateway:anthropic/claude-haiku-4-5";
+    const gateway = "openrouter:anthropic/claude-haiku-4-5";
     const { h } = await setup();
 
     await h.session.sendMessage("fix the tests", { ...options, model: gateway });
@@ -343,6 +586,91 @@ describe("turn.stop", () => {
       expect(streams()).toBe(1);
     });
   }
+
+  test("a hard interruptStream while the turn.stop chain runs aborts the chain's abortSignal", async () => {
+    const chainRunning = Promise.withResolvers<void>();
+    let abortedBeforeStop: boolean | undefined;
+    let abortedAfterStop: boolean | undefined;
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          const signal = ctx.abortSignal;
+          assert(signal !== undefined);
+          abortedBeforeStop = signal.aborted;
+          chainRunning.resolve();
+          // As a hook process does: it runs until the Stop kills it (bounded, so a missing abort
+          // fails the assertion below instead of hanging the session).
+          await new Promise((resolve) => {
+            signal.addEventListener("abort", resolve, { once: true });
+            setTimeout(resolve, 2_000);
+          });
+          abortedAfterStop = signal.aborted;
+        },
+        { workspaceId }
+      )
+    );
+    const { h, streams } = await setup();
+    await h.session.sendMessage("fix the tests", options);
+    await chainRunning.promise;
+    await h.session.interruptStream();
+    await h.session.waitForIdle();
+    await settle(h);
+    expect(abortedBeforeStop).toBe(false);
+    expect(abortedAfterStop).toBe(true);
+    expect(streams()).toBe(1);
+  });
+
+  test("a session shutdown while the turn.stop chain runs aborts the chain's abortSignal", async () => {
+    const chainRunning = Promise.withResolvers<void>();
+    const chainEnded = Promise.withResolvers<boolean>();
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          const signal = ctx.abortSignal;
+          assert(signal !== undefined);
+          chainRunning.resolve();
+          await new Promise((resolve) => {
+            signal.addEventListener("abort", resolve, { once: true });
+            setTimeout(resolve, 2_000);
+          });
+          chainEnded.resolve(signal.aborted);
+        },
+        { workspaceId }
+      )
+    );
+    const { h } = await setup();
+    await h.session.sendMessage("fix the tests", options);
+    await chainRunning.promise;
+    h.session.beginShutdown();
+    expect(await chainEnded.promise).toBe(true);
+  });
+
+  test("a Stop after the stream ends and before the chain starts gives the chain an aborted signal", async () => {
+    let stopEpoch = 0;
+    let abortedAtStart: boolean | undefined;
+    unregisters.push(
+      eventSpine.useBefore(
+        "turn.stop",
+        (ctx) => {
+          abortedAtStart = ctx.abortSignal?.aborted;
+        },
+        { workspaceId }
+      )
+    );
+    const { h } = await setup({
+      // The Stop lands while the stream winds down: its epoch moves before the chain starts.
+      whileStreaming: () => {
+        stopEpoch++;
+      },
+      session: { getStopEpoch: () => stopEpoch },
+    });
+    await h.session.sendMessage("fix the tests", options);
+    await h.session.waitForIdle();
+    await settle(h);
+    expect(abortedAtStart).toBe(true);
+  });
 
   test("a goal turn's continuation stays a goal turn of the same goal", async () => {
     let continued = false;
@@ -775,6 +1103,68 @@ describe("todo turn-end nudge", () => {
     expect(streams()).toBe(4);
   });
 
+  test("the nudge reads the list in the session's SessionFiles", async () => {
+    const history = await createTestHistoryService({ files: SessionFilesMemory });
+    unregisters.push(() => void history.cleanup());
+    const { h, streams } = await setup({
+      parts: todoWriteThenReply,
+      session: { config: history.config, historyService: history.historyService },
+    });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await history.files.promises.mkdir(sessionDir, { recursive: true });
+    await history.files.promises.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
+  test("a reason the nudge pushes out of the prompt neither counts nor is named", async () => {
+    // Without the nudge both reasons fit; the nudge's room cuts the second one away.
+    expect(TODO_TURN_END_NUDGE.length).toBeGreaterThan(20);
+    let stops = 0;
+    addConsumer((ctx) => {
+      ctx.continueReasons.push(
+        stopReason(++stops === 1 ? "x".repeat(TURN_STOP_PROMPT_MAX_CHARS - 20) : "First."),
+        stopReason("Second.", {
+          pluginName: "tidy",
+          hookKey: "tidy:hooks/hooks.json#Stop[0][0]",
+          loopLimit: 1,
+        })
+      );
+    });
+    const { h } = await setup({ parts: todoWriteThenReply, session: { captureEvents: true } });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, nudged] = await userTexts(h);
+    expect(nudged.endsWith(TODO_TURN_END_NUDGE)).toBe(true);
+    expect(nudged).not.toContain("Second.");
+    expect(pluginNotices(h).map((notice) => notice.plugin)).toEqual([
+      "guard",
+      "guard, tidy",
+      "guard",
+    ]);
+  });
+
+  test("a continuation of the nudge alone shows no plugin notice", async () => {
+    const { h, streams } = await setup({
+      parts: todoWriteThenReply,
+      session: { captureEvents: true },
+    });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(pluginNotices(h)).toEqual([]);
+  });
+
   test("a plugin continuation and the nudge share one continuation prompt", async () => {
     addConsumer(keepGoing);
     const { h, requests } = await setup({ parts: todoWriteThenReply });
@@ -791,7 +1181,7 @@ describe("todo turn-end nudge", () => {
 
   test("the merged continuation prompt keeps the continuation size cap", async () => {
     const longReason = "x".repeat(TURN_STOP_PROMPT_MAX_CHARS);
-    addConsumer((ctx) => void ctx.continueReasons.push(longReason));
+    addConsumer((ctx) => void ctx.continueReasons.push(stopReason(longReason)));
     const { h } = await setup({ parts: todoWriteThenReply });
     await writeTodos(h, openTodos);
 
@@ -820,6 +1210,272 @@ describe("todo turn-end nudge", () => {
             : todoWriteThenReply,
     });
     await writeTodos(h, row.todos ?? openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
+    expect(streams()).toBe(1);
+  });
+
+  test.each([
+    {
+      name: "a background wake",
+      text: "Background sub-agent task(s) have completed.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true },
+    },
+    // Heartbeats carry no agentInitiated, so the gate must not rely on it.
+    {
+      name: "a heartbeat",
+      text: "[Heartbeat] Check on the workspace.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+    },
+    // A visible automatic send (a task brief) is not a message the user sent either.
+    {
+      name: "an automatic visible send",
+      text: "Work on the task.",
+      internal: { acceptanceOrigin: "automatic" },
+    },
+  ] as const)("a turn $name started gets no nudge", async (row) => {
+    const { h, streams } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage(row.text, options, row.internal);
+    await settle(h);
+    expect(streams()).toBe(1);
+
+    // The next message the user sends is a user turn again and gets its nudge.
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(streams()).toBe(3);
+    expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
+  // Compaction requests are automatic: after a user turn, neither a heartbeat's compaction
+  // (idle-compaction) nor an auto-compaction passes the user origin on to its follow-up.
+  test.each([
+    { source: "idle-compaction", nudged: false },
+    { source: "auto-compaction", nudged: false },
+  ] as const)(
+    "after a user turn, a compaction request with source $source starts a machine turn",
+    async (row) => {
+      // Only the follow-up (turn 3) writes todos.
+      const { h, streams } = await setup({
+        parts: (turn) => (turn === 3 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+      });
+      await writeTodos(h, openTodos);
+      await h.session.sendMessage("first", options);
+      await settle(h);
+      // The compaction stream runs; its summary is seeded below instead of written by the handler.
+      const session = h.session as unknown as {
+        contextController: {
+          compaction: { handleCompletion(...args: unknown[]): Promise<boolean> };
+        };
+      };
+      spyOn(session.contextController.compaction, "handleCompletion").mockResolvedValue(false);
+      await h.session.sendMessage(
+        "Please compact",
+        {
+          ...options,
+          agentId: "compact",
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {},
+            source: row.source,
+          },
+        },
+        { acceptanceOrigin: "automatic", synthetic: true }
+      );
+      await settle(h);
+      const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "check the workspace", model, agentId: "exec" },
+        },
+      });
+      assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+      expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+      await settle(h);
+
+      expect(streams()).toBe(row.nudged ? 4 : 3);
+      expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+    }
+  );
+
+  // A resume starts a stream without a new message: an automatic one (the prompt-free resume after
+  // a sub-agent report) is a machine wake, and a manual one continues the user's turn.
+  test.each([
+    { name: "an automatic resume", internal: { acceptanceOrigin: "automatic" }, nudged: false },
+    { name: "a manual resume", internal: { acceptanceOrigin: "manual" }, nudged: true },
+  ] as const)("$name after a user turn keeps the right origin", async (row) => {
+    // Only the resumed stream (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options);
+    await settle(h);
+
+    const resumed = await h.session.resumeStream(options, {
+      ...row.internal,
+      agentInitiated: true,
+    });
+    assert(resumed.success);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+  });
+
+  // A compaction follow-up is an automatic synthetic send: a machine turn, even after a user turn.
+  test.each([
+    { name: "a user turn", internal: undefined, nudged: false },
+    {
+      name: "a machine wake",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+      nudged: false,
+    },
+  ] as const)("a compaction follow-up after $name gets no nudge", async (row) => {
+    // Only the follow-up (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options, row.internal);
+    await settle(h);
+    const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "fix the bug", model, agentId: "exec" },
+      },
+    });
+    assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+  });
+});
+
+describe("status page turn-end nudge", () => {
+  test("a turn whose status page needs it gets exactly one nudge per user turn", async () => {
+    // The nudge's own turn would earn it too: only the first stream of a user turn is nudged.
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(await userTexts(h)).toEqual(["fix the bug", STATUS_PAGE_TURN_END_NUDGE]);
+
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect(streams()).toBe(4);
+  });
+
+  test("a plugin continuation carries the nudge once, and its own turns get none", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual([
+      "fix the bug",
+      `Run the failing tests again.\n\n${STATUS_PAGE_TURN_END_NUDGE}`,
+      "Run the failing tests again.",
+      "Run the failing tests again.",
+    ]);
+  });
+
+  test("with the TODO nudge and a capped plugin prompt, both nudges arrive whole, TODO first", async () => {
+    const todoWrite: CompletedMessagePart = {
+      type: "dynamic-tool",
+      toolCallId: "todo-1",
+      toolName: "todo_write",
+      input: { todos: [] },
+      state: "output-available",
+      output: { success: true },
+    };
+    addConsumer(
+      (ctx) => void ctx.continueReasons.push(stopReason("x".repeat(TURN_STOP_PROMPT_MAX_CHARS)))
+    );
+    const { h } = await setup({ statusPageNeedsNudge: true, parts: () => [todoWrite] });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const openTodos: TodoItem[] = [{ content: "Verify the fix", status: "in_progress" }];
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, continuation] = await userTexts(h);
+    expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
+    expect(
+      continuation.endsWith(`x\n\n${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}`)
+    ).toBe(true);
+  });
+
+  test("a Stop that finished while the turn's last event arrived ends the turn without a nudge", async () => {
+    // The stream still ends normally, and the Stop is over before the stream-end work reaches
+    // the nudge: only the epoch the turn was admitted under shows the turn was stopped.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      whileStreaming: () => void stopEpoch++,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a Stop while the nudge row is written rolls the row back", async () => {
+    // Past dequeue, queue clearing no longer sees the continuation: its admission must.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+    const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+      async (id, capture, operation, observer) => {
+        const result = await accept(id, capture, operation, observer);
+        const nudgeRow =
+          operation.kind === "append" &&
+          operation.messages.some((row) =>
+            row.parts.some(
+              (part) => part.type === "text" && part.text === STATUS_PAGE_TURN_END_NUDGE
+            )
+          );
+        if (nudgeRow) stopEpoch++;
+        return result;
+      }
+    );
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test.each([
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+  ])("$name gets no nudge", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
 
     await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
     await settle(h);

@@ -15,6 +15,7 @@ import { createStreamManagerForTests, fakeStreamText } from "./streamManager.tes
 import { closeScopeBounded } from "./di/appRuntime";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createTestLanguageModel } from "./streamManager.suite.testHarness";
 import {
@@ -34,7 +35,9 @@ let historyService: HistoryService;
 let historyCleanup: () => Promise<void>;
 
 beforeEach(async () => {
-  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService({
+    files: SessionFilesMemory,
+  }));
 });
 
 afterEach(async () => {

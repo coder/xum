@@ -1,0 +1,115 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import * as http from "node:http";
+import * as net from "node:net";
+import * as zlib from "node:zlib";
+import { Client, Dispatcher, fetch } from "undici/index.js";
+import {
+  dispatcherToGuard,
+  isBrotliResponseGuardNeeded,
+  refuseBrotliResponses,
+} from "./brotliResponseGuard";
+
+let server: http.Server;
+let baseUrl: string;
+const sentAcceptEncoding: Array<string | undefined> = [];
+
+beforeAll(async () => {
+  server = http.createServer((req, res) => {
+    sentAcceptEncoding.push(req.headers["accept-encoding"]);
+    const brotli = req.url === "/br";
+    res.writeHead(200, { "content-encoding": brotli ? "br" : "gzip" });
+    res.end(brotli ? zlib.brotliCompressSync("secret") : zlib.gzipSync("hello"));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  baseUrl = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+});
+
+afterAll(async () => {
+  await new Promise((resolve) => server.close(resolve));
+});
+
+describe("refuseBrotliResponses", () => {
+  test("refuses a Brotli-encoded response, which fetch would otherwise decode", async () => {
+    const plain = await fetch(`${baseUrl}/br`, { dispatcher: new Client(baseUrl) });
+    expect(await plain.text()).toBe("secret");
+
+    const guarded = new Client(baseUrl).compose(refuseBrotliResponses);
+    const failure = await fetch(`${baseUrl}/br`, { dispatcher: guarded }).catch(
+      (error: unknown) => error
+    );
+    expect(failure).toBeInstanceOf(TypeError);
+    const cause = (failure as TypeError).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect((cause as Error).message).toContain("Brotli");
+  });
+
+  test("forwards an informational response such as 103 Early Hints before the final one", async () => {
+    const body = zlib.gzipSync("hello");
+    const earlyHints = net.createServer((socket) => {
+      socket.once("data", () => {
+        const head =
+          "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n" +
+          `HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`;
+        socket.end(Buffer.concat([Buffer.from(head), body]));
+      });
+    });
+    await new Promise<void>((resolve) => earlyHints.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(earlyHints.address() as net.AddressInfo).port}`;
+    try {
+      const response = await fetch(url, {
+        dispatcher: new Client(url).compose(refuseBrotliResponses),
+      });
+      expect(await response.text()).toBe("hello");
+    } finally {
+      await new Promise((resolve) => earlyHints.close(resolve));
+    }
+  });
+
+  test.each([
+    ["br, gzip, deflate", "gzip, deflate"],
+    ["BR;q=1.0, gzip;q=0.5", "gzip;q=0.5"],
+    ["br", "identity"],
+    ["*", "identity"],
+    ["gzip", "gzip"],
+  ])("asks for %p as %p and still decodes gzip", async (requested, sent) => {
+    sentAcceptEncoding.length = 0;
+    const response = await fetch(`${baseUrl}/gzip`, {
+      dispatcher: new Client(baseUrl).compose(refuseBrotliResponses),
+      headers: { "accept-encoding": requested },
+    });
+    expect(await response.text()).toBe("hello");
+    expect(sentAcceptEncoding).toEqual([sent]);
+  });
+});
+
+describe("dispatcherToGuard", () => {
+  // Stands in for a dispatcher from the undici bundled with Node, which is another class.
+  const nodeOwnDispatcher = Object.create(null) as Dispatcher;
+
+  test("keeps a dispatcher from this undici on any Node", async () => {
+    const client = new Client(baseUrl);
+    expect(dispatcherToGuard(client, "6.21.2")).toBe(client);
+    await client.close();
+  });
+
+  test("keeps Node's own dispatcher when Node bundles undici 7", () => {
+    expect(dispatcherToGuard(nodeOwnDispatcher, "7.29.1")).toBe(nodeOwnDispatcher);
+  });
+
+  test("replaces Node's own undici 6 dispatcher, which calls the older handler methods", async () => {
+    const replacement = dispatcherToGuard(nodeOwnDispatcher, "6.21.2");
+    expect(replacement).not.toBe(nodeOwnDispatcher);
+    expect(replacement).toBeInstanceOf(Dispatcher);
+    await replacement.close();
+  });
+});
+
+test.each([
+  [{ node: "24.21.0", electron: "44.5.1" }, true],
+  [{ node: "22.20.0" }, true],
+  [{ node: "24.22.1", electron: "44.9.4" }, false],
+  [{ node: "26.12.1" }, false],
+  [{ node: "24.3.0", bun: "1.4.3" }, false],
+])("isBrotliResponseGuardNeeded(%p) is %p", (versions, needed) => {
+  expect(isBrotliResponseGuardNeeded(versions)).toBe(needed);
+});

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { matchesSkillPaths, normalizeSkillPaths } from "./skillPaths";
+import { createSkillPathsMatcher, normalizeSkillPaths } from "./skillPaths";
 
 describe("normalizeSkillPaths", () => {
   test("splits a comma string on top-level commas only and keeps list entries whole", () => {
@@ -58,13 +58,15 @@ describe("normalizeSkillPaths", () => {
   });
 });
 
-describe("matchesSkillPaths", () => {
+describe("createSkillPathsMatcher", () => {
   test("matches workspace-relative POSIX paths, including root files and dot dirs", () => {
-    expect(matchesSkillPaths(["**/*.ts"], "src/foo.ts")).toBe(true);
-    expect(matchesSkillPaths(["**/*.ts"], "foo.ts")).toBe(true);
-    expect(matchesSkillPaths(["**/*.ts"], ".github/scripts/x.ts")).toBe(true);
-    expect(matchesSkillPaths(["**/*.ts"], "src/foo.md")).toBe(false);
-    expect(matchesSkillPaths(["docs/*.md", "src/**"], "src/a/b.md")).toBe(true);
-    expect(matchesSkillPaths(["docs/*.md"], "docs/a/b.md")).toBe(false);
+    const matches = (paths: readonly string[], relativePosixPath: string) =>
+      createSkillPathsMatcher(paths)(relativePosixPath);
+    expect(matches(["**/*.ts"], "src/foo.ts")).toBe(true);
+    expect(matches(["**/*.ts"], "foo.ts")).toBe(true);
+    expect(matches(["**/*.ts"], ".github/scripts/x.ts")).toBe(true);
+    expect(matches(["**/*.ts"], "src/foo.md")).toBe(false);
+    expect(matches(["docs/*.md", "src/**"], "src/a/b.md")).toBe(true);
+    expect(matches(["docs/*.md"], "docs/a/b.md")).toBe(false);
   });
 });

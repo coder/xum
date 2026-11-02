@@ -85,11 +85,6 @@ export interface ProjectsConfig {
   taskSettings?: TaskSettings;
   /** Let chat transcripts use the full chat pane width instead of the default readable column. */
   chatTranscriptFullWidth?: boolean;
-  /**
-   * Xum Gateway routing preferences (shared via ~/.xum/config.json).
-   * Mirrors browser localStorage so switching server ports doesn't reset the UI.
-   */
-  muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
   /**
@@ -125,7 +120,6 @@ export interface ProjectsConfig {
   goalDefaults?: GoalDefaults;
   /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
   evaluationDefaults?: EvaluationDefaults;
-  muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   /**

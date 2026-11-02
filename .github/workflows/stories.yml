@@ -107,9 +107,6 @@ jobs:
       # failed download apart from the jobs.
       - name: make electron-binary
         run: make electron-binary
-      # make test-stories refuses a stale sandbox image key (a PR that changes the Dockerfile):
-      # BUGBASH_SANDBOX_BUILD_STALE does not apply to model-driven jobs (launch.ts), so such a PR
-      # fails here until main publishes the image and image.json pins it.
       # One more run only when every failed job got a provider 5xx (summary.ts --upstream-fault):
       # the user's rule, so that an overloaded provider does not fail a queue entry. A test
       # failure, a 4xx or a refusal fails at once. Before that run, the first run's outputs move
@@ -135,6 +132,9 @@ jobs:
           # The cap per job, so one run spends at most three times this, six with the retry. $3
           # unless the caller passes budget_usd ($1 for the PR lane).
           BUGBASH_BUDGET_USD: ${{ inputs.budget_usd || '3' }}
+          # The launcher's gh verifies the published sandbox image's attestation on the host. It
+          # never reaches Docker or a job container (the container env drops it).
+          GH_TOKEN: ${{ github.token }}
       # The e2e page of each job, as in the PR comment (summary.ts).
       - name: Summary
         if: always()

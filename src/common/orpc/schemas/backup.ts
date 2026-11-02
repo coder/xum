@@ -128,6 +128,8 @@ export const backup = {
         projectBundleSkipped: z.boolean(),
         /** Artifact shelf files left out of the push or a restore, each with its reason. */
         shelfSkipped: z.array(z.string()).optional(),
+        /** Backed-up files left untouched because their local path is a symlink. */
+        symlinkSkipped: z.array(z.string()).optional(),
         /**
          * Why the push half could not be computed, if it could not. The restore half is
          * still reported so a local export problem never blocks reviewing or approving
@@ -171,6 +173,8 @@ export const backup = {
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
         shelfSkipped: z.array(z.string()).optional(),
+        /** Backed-up files left untouched because their local path is a symlink. */
+        symlinkSkipped: z.array(z.string()).optional(),
         /**
          * Candidates left unimported for lack of approval (no preview, or unchecked). Fresh
          * tokens, so the UI can offer them for approval right away.

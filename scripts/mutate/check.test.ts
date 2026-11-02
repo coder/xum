@@ -34,7 +34,10 @@ function check(): { status: number | null; report: MutateReport | null } {
     env: GIT_ENV,
     encoding: "utf8",
   });
-  return { status: result.status, report: result.status === 2 ? null : JSON.parse(result.stdout) };
+  return {
+    status: result.status,
+    report: result.status === 2 ? null : (JSON.parse(result.stdout) as MutateReport),
+  };
 }
 
 function outcomes(report: MutateReport | null): string[] {

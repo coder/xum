@@ -65,6 +65,7 @@ import type { Config } from "@/node/config";
 import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { excludeRejectedTurnRows } from "@/common/types/message";
@@ -186,7 +187,8 @@ export async function resolveHeadlessAgentBody(
   muxRoot: string,
   agentId: string
 ): Promise<string | null> {
-  return (await resolveHeadlessAgentDefinition(muxRoot, agentId))?.body ?? null;
+  // Outside the agent loop: headless memory runs read the host Xum home.
+  return (await resolveHeadlessAgentDefinition(muxRoot, agentId, nodeRuntimeFactory))?.body ?? null;
 }
 
 export function resolveDreamModelString(config: Config, workspaceId: string): string {

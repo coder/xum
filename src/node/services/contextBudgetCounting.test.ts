@@ -8,10 +8,14 @@ import {
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
 import type { JSONSchema7 } from "@ai-sdk/provider";
+import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { CLAUDE_ENCODING_BUDGET_FACTOR } from "@/constants/tokenizerCorrection";
 import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
+  createTurnBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
   estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
@@ -194,41 +198,62 @@ describe("real-encoding budget guards", () => {
     ).toBeUndefined();
   });
 
-  test("encrypted OpenAI reasoning does not inflate either count or mutate the request", async () => {
-    const payload = (encrypted: string) => ({
+  test.each([
+    {
+      name: "OpenAI encrypted reasoning",
+      type: "reasoning",
+      options: (v: string) => ({ openai: { reasoningEncryptedContent: v } }),
+    },
+    {
+      name: "an Anthropic thinking signature",
+      type: "reasoning",
+      options: (v: string) => ({ anthropic: { signature: v } }),
+    },
+    {
+      name: "Anthropic redacted thinking",
+      type: "reasoning",
+      options: (v: string) => ({ anthropic: { redactedData: v } }),
+    },
+    {
+      name: "a Google thought signature",
+      type: "text",
+      options: (v: string) => ({ google: { thoughtSignature: v } }),
+    },
+    {
+      name: "OpenRouter reasoning details",
+      type: "tool-call",
+      options: (v: string) => ({
+        openrouter: { reasoning_details: [{ type: "reasoning.encrypted", data: v }] },
+      }),
+    },
+  ])("$name does not inflate either count or mutate the request", async ({ type, options }) => {
+    const payload = (secret: string) => ({
       messages: [
         {
           role: "assistant",
           content: [
             {
-              type: "reasoning",
-              text: "Check the result.",
-              providerOptions: { openai: { reasoningEncryptedContent: encrypted } },
+              ...(type === "tool-call"
+                ? { type, toolCallId: "call", toolName: "read", input: {} }
+                : { type, text: "Check the result." }),
+              providerOptions: options(secret),
             },
           ],
         },
       ],
     });
-    const encrypted = "a0b1c2d3e4f5".repeat(4000);
-    const request = payload(encrypted);
+    const secret = "a0b1c2d3e4f5".repeat(4000);
+    const request = payload(secret);
     expect(estimateAssembledRequestTokens(request)).toBe(
       estimateAssembledRequestTokens(payload("short"))
     );
     expect(
       await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 })
     ).toBeUndefined();
-    expect(request.messages[0].content[0].providerOptions.openai.reasoningEncryptedContent).toBe(
-      encrypted
-    );
+    expect(request.messages[0].content[0].providerOptions).toEqual(options(secret));
   });
 
-  test.each([
-    "text",
-    "other-openai-field",
-    "other-provider",
-    "nested-field",
-    "non-string",
-  ] as const)("reasoning still counts %s beside encrypted OpenAI metadata", async (kind) => {
+  test("reasoning text still counts beside replay metadata", async () => {
     const large = "a0b1c2d3e4f5".repeat(4000);
     const request = {
       messages: [
@@ -237,17 +262,8 @@ describe("real-encoding budget guards", () => {
           content: [
             {
               type: "reasoning",
-              text: kind === "text" ? large : "Check the result.",
-              providerOptions: {
-                openai: {
-                  reasoningEncryptedContent: kind === "non-string" ? { text: large } : large,
-                  ...(kind === "other-openai-field" ? { extra: large } : {}),
-                  ...(kind === "nested-field"
-                    ? { extra: { reasoningEncryptedContent: large } }
-                    : {}),
-                },
-                ...(kind === "other-provider" ? { xai: { reasoningEncryptedContent: large } } : {}),
-              },
+              text: large,
+              providerOptions: { openai: { reasoningEncryptedContent: large } },
             },
           ],
         },
@@ -260,6 +276,27 @@ describe("real-encoding budget guards", () => {
       (await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 }))
         ?.type
     ).toBe("context_budget_exceeded");
+  });
+
+  test("request options on a user part still count", async () => {
+    // Anthropic sends a document part's context option to the model as text.
+    const attachment = {
+      type: "file",
+      mediaType: "application/pdf",
+      data: "JVBERi0xLjQ=",
+      providerOptions: { anthropic: { context: "a0b1c2d3e4f5".repeat(4000) } },
+    };
+    const request = { messages: [{ role: "user", content: [attachment] }] };
+    expect(
+      (await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 }))
+        ?.type
+    ).toBe("context_budget_exceeded");
+    expect(
+      await estimateFreshRequestTokensForModel(
+        { userText: "Summarize it.", attachments: [attachment], modelContextLimit: 10000 },
+        { model }
+      )
+    ).toBeGreaterThan(getContextBudgetHardCeiling(10000));
   });
 
   test.each(["tool-json", "tool-content", "tool-input", "user-text"] as const)(
@@ -805,6 +842,233 @@ describe("anchored request estimate (#4858)", () => {
   });
 });
 
+describe("turn-start anchor (#7662)", () => {
+  const history = [{ role: "user", content: "long history ".repeat(4000) }];
+  const reply = { role: "assistant", content: "answer ".repeat(2000) };
+  const prompt = { role: "user", content: "follow-up question ".repeat(20) };
+  const payload = { messages: [...history, reply, prompt] };
+  const options = { model, modelContextLimit: 200_000 };
+  const system = "Answer briefly and cite the files you read.";
+  const systemTokens = async (forModel: string, text = system) =>
+    (await tokenizerModule.getTokenizerForModel(forModel)).countTokens(text);
+  const request: {
+    model: string;
+    metadataModel?: string;
+    agentId: string;
+    routeProvider: string;
+    thinkingLevel: ThinkingLevel;
+    system: string;
+  } = { model, agentId: "exec", routeProvider: "openai", thinkingLevel: "high", system };
+  const anchorFor = async (
+    metadata?: Partial<MuxMetadata>,
+    overrides?: Partial<typeof request>,
+    parts?: MuxMessage["parts"]
+  ) => {
+    const reply = createMuxMessage(
+      "a1",
+      "assistant",
+      parts == null ? "answer" : "",
+      {
+        model,
+        agentId: "exec",
+        routeProvider: "openai",
+        thinkingLevel: "high",
+        systemMessageTokens: await systemTokens(overrides?.model ?? model),
+        contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+        ...metadata,
+      },
+      parts
+    );
+    return createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi"), reply], {
+      ...request,
+      ...overrides,
+    });
+  };
+
+  test("costs the previous reply's input plus the messages from its last step on", async () => {
+    const anchored = await estimateAnchoredRequestTokensForModel(
+      payload,
+      options,
+      await anchorFor()
+    );
+    const delta = (await estimateAssembledRequestTokensForModel(
+      { messages: [reply, prompt] },
+      options
+    ))!.estimate;
+    expect(anchored).toEqual({
+      estimate: 1000 + delta,
+      hardCeiling: getContextBudgetHardCeiling(200_000),
+    });
+    expect(anchored!.estimate).toBeLessThan(
+      (await estimateAssembledRequestTokensForModel(payload, options))!.estimate
+    );
+  });
+
+  test("counts cache reads and writes once, and adds the reply's reasoning and system growth", async () => {
+    const contextUsage = {
+      inputTokens: 1000,
+      outputTokens: 80,
+      cachedInputTokens: 600,
+      reasoningTokens: 50,
+      totalTokens: 1080,
+    };
+    // Rows keep cache writes in provider metadata: 300 uncached + 600 read + 100 written.
+    const contextProviderMetadata = { anthropic: { cacheCreationInputTokens: 100 } };
+    // Long enough that 30 fewer saved tokens is still a valid (non-negative) count.
+    const longSystem = { system: system.repeat(20) };
+    const sent = await systemTokens(model, longSystem.system);
+    const cached = { contextUsage, contextProviderMetadata, systemMessageTokens: sent };
+    expect((await anchorFor(cached, longSystem))?.providerTokens).toBe(1050);
+    const grown = { contextUsage, systemMessageTokens: sent - 30 };
+    expect((await anchorFor(grown, longSystem))?.providerTokens).toBe(1080);
+    const shrunk = { contextUsage, systemMessageTokens: sent + 30 };
+    expect((await anchorFor(shrunk, longSystem))?.providerTokens).toBe(1050);
+    // Claude-encoded growth is scaled like every other claude count (#5219). Tests default to
+    // the approximate tokenizer, which has no claude encoding.
+    const original = process.env.XUM_FORCE_REAL_TOKENIZER;
+    process.env.XUM_FORCE_REAL_TOKENIZER = "1";
+    try {
+      const claude = "anthropic:claude-opus-5-5";
+      const claudeGrown = {
+        model: claude,
+        metadataModel: claude,
+        contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+        systemMessageTokens: (await systemTokens(claude, longSystem.system)) - 30,
+      };
+      const claudeRequest = { model: claude, metadataModel: claude, ...longSystem };
+      expect((await anchorFor(claudeGrown, claudeRequest))?.providerTokens).toBe(
+        1000 + Math.ceil(30 * CLAUDE_ENCODING_BUDGET_FACTOR)
+      );
+    } finally {
+      if (original == null) delete process.env.XUM_FORCE_REAL_TOKENIZER;
+      else process.env.XUM_FORCE_REAL_TOKENIZER = original;
+    }
+  });
+
+  test.each<[string, Partial<MuxMetadata>, Partial<typeof request>]>([
+    ["a partial reply", { partial: true }, {}],
+    ["a synthetic reply", { synthetic: true }, {}],
+    ["a failed reply", { error: "boom" }, {}],
+    ["a reply with an error type", { errorType: "unknown" }, {}],
+    ["a compaction summary", { compacted: "user" }, {}],
+    ["a context boundary", { compactionBoundary: true }, {}],
+    ["a reply without usage", { contextUsage: undefined }, {}],
+    [
+      "a reply without input",
+      { contextUsage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 } },
+      {},
+    ],
+    [
+      "a negative reasoning count",
+      {
+        contextUsage: {
+          inputTokens: 1000,
+          outputTokens: 5,
+          totalTokens: 1005,
+          reasoningTokens: -900,
+        },
+      },
+      {},
+    ],
+    [
+      "a negative cache-read count",
+      {
+        contextUsage: {
+          inputTokens: 1000,
+          outputTokens: 5,
+          totalTokens: 1005,
+          cachedInputTokens: -900,
+        },
+      },
+      {},
+    ],
+    ["a reply without its system count", { systemMessageTokens: undefined }, {}],
+    ["a negative system count", { systemMessageTokens: -100_000 }, {}],
+    ["a fractional system count", { systemMessageTokens: 1.5 }, {}],
+    ["a reply without its model", { model: undefined }, {}],
+    ["another model", {}, { model: "openai:gpt-4.1" }],
+    // A providers.jsonc mapping changes the resolved model and keeps the model.
+    ["another resolved model", { metadataModel: "openai:gpt-4.1" }, { metadataModel: model }],
+    ["a reply without its resolved model", {}, { metadataModel: model }],
+    ["another route", {}, { routeProvider: "openrouter" }],
+    ["a reply without its route", { routeProvider: undefined }, {}],
+    ["a direct-route request after a routed reply", {}, { routeProvider: undefined }],
+    ["another agent", {}, { agentId: "plan" }],
+    ["a reply without its agent", { agentId: undefined }, {}],
+    // Anthropic history keeps signed reasoning with thinking on and strips it at "off".
+    ["another thinking level", {}, { thinkingLevel: "off" }],
+    ["a reply without its thinking level", { thinkingLevel: undefined }, {}],
+  ])("%s yields no turn anchor", async (_name, metadata, overrides) => {
+    expect(await anchorFor(metadata, overrides)).toBeUndefined();
+  });
+
+  // The next request replays the last step's thinking at its full count; the estimator sees at
+  // most its summary text (Anthropic redacted thinking and OpenAI encrypted reasoning have none).
+  const thinking = { type: "reasoning" as const, text: "" };
+  const text = (value: string) => ({ type: "text" as const, text: value });
+  const toolCall = {
+    type: "dynamic-tool" as const,
+    toolCallId: "call-1",
+    toolName: "web_search",
+    state: "output-available" as const,
+    input: { query: "docs" },
+    output: "results ".repeat(500),
+  };
+  test.each<[string, MuxMessage["parts"], Partial<MuxMetadata>, number | undefined]>([
+    ["last-step reasoning without a reported count", [thinking], {}, undefined],
+    [
+      "last-step reasoning counted only in provider metadata",
+      [thinking],
+      { contextProviderMetadata: { openai: { reasoningTokens: 40 } } },
+      1040,
+    ],
+    [
+      "reasoning only before the last step",
+      [thinking, text("step one"), text("answer")],
+      { stepStartPartIndices: [0, 2] },
+      1000,
+    ],
+    // The rebuild sends the tool call and its result before the trailing text message.
+    [
+      "text after a last-step tool call",
+      [text("searching"), toolCall, text("answer")],
+      {},
+      undefined,
+    ],
+    ["a tool call that ends the last step", [text("checking"), toolCall], {}, 1000],
+    [
+      "a tool call only before the last step",
+      [toolCall, text("answer")],
+      { stepStartPartIndices: [0, 1] },
+      1000,
+    ],
+  ])("a reply with %s", async (_name, parts, metadata, providerTokens) => {
+    expect((await anchorFor(metadata, {}, parts))?.providerTokens).toBe(providerTokens);
+  });
+
+  test("a reply marked as not compacted still anchors", async () => {
+    expect((await anchorFor({ compacted: false }))?.providerTokens).toBe(1000);
+  });
+
+  test("a direct route on both sides anchors; history without a reply does not", async () => {
+    expect(
+      (await anchorFor({ routeProvider: undefined }, { routeProvider: undefined }))?.providerTokens
+    ).toBe(1000);
+    expect(
+      await createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi")], request)
+    ).toBeUndefined();
+  });
+
+  test.each([
+    ["no assistant message", { messages: [...history, prompt] }, options],
+    ["another model", payload, { ...options, model: "openai:gpt-4.1" }],
+  ])("%s falls back to the full estimate", async (_name, input, opts) => {
+    expect(await estimateAnchoredRequestTokensForModel(input, opts, await anchorFor())).toEqual(
+      await estimateAssembledRequestTokensForModel(input, opts)
+    );
+  });
+});
+
 describe("repeated native tool references (#5413)", () => {
   // Anthropic expands every tool_reference into the full definition, repeats included.
   const claude = "anthropic:claude-opus-5-5";
@@ -876,6 +1140,14 @@ describe("repeated native tool references (#5413)", () => {
     expect(anchor).toBeDefined();
     const payload = { tools, messages: twice };
     expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual(
+      await estimateAssembledRequestTokensForModel(payload, options)
+    );
+  });
+
+  test("a reference after the turn anchor's reply falls back to the full estimate", async () => {
+    const turnAnchor = { model: claude, providerTokens: 1000 };
+    const payload = { tools, messages: once };
+    expect(await estimateAnchoredRequestTokensForModel(payload, options, turnAnchor)).toEqual(
       await estimateAssembledRequestTokensForModel(payload, options)
     );
   });

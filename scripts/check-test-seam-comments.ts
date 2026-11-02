@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Fails when a production source file carries a comment that declares a test seam
- * ("Exported for tests", "Test seam", "test-only: ...") on a symbol that is not in
+ * ("Exported for tests", "Test seam", "test-only: ...") or declares a symbol named
+ * `...ForTests`/`...ForTesting`, when that symbol is not in
  * scripts/check-test-seam-comments.allowlist.json.
  *
  * Why: the 2026-09 test audit found production exports and options that existed only
@@ -33,7 +34,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Exported for tests only", "visible for testing".
   /\b(?:exported|exposed|visible)\s+(?:only\s+)?for\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
   // "Used for testing.", "(used by tests)", "Used in tests to reset ...", "used only by unit tests".
-  /\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
+  // A negated claim ("must never be used in tests") says the opposite, so it stays quiet.
+  /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
   // "Test seam", "test seams", "@VisibleForTesting".
   /\btest[- ]?seams?\b/i,
   /\bvisibleForTesting\b/i,
@@ -49,10 +51,31 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "overridable for tests only", "set by tests only". The seam verb is required so behavior
   // notes such as "runs in tests only when isolation is enabled" stay quiet.
   /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,
+  // "Override for tests; production reads ...", "Overrides for tests only".
+  /\boverrides?\s+(?:only\s+)?for\s+(?:unit\s+|integration\s+)?tests\b/i,
+  // "Shorten the idle window in tests". Bare "in tests" is common prose ("a TestClock in tests",
+  // "spied/overridden in tests", "a no-op in tests/CI"), so the claim must open its sentence with
+  // a seam verb, and "tests/" or "tests-" (a list or a compound) does not count.
+  /(?:^|[.!?]\s)\s*(?:shorten|lengthen|override|replace|stub|inject|reset|force)s?\b[^.!?]{0,80}?\bin\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
+  // "Useful in tests for checking ...", "needed only in tests".
+  // "This callback must never be called in tests" is negated, so it stays quiet.
+  /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
 ];
 
-/** Unanchored twin of the no-caller pattern, used only by the whole-file prefilter. */
-const NO_CALLER_PREFILTER = /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i;
+/**
+ * Unanchored twins of the sentence-anchored patterns, used only by the whole-file prefilter
+ * (collapsing the whole file loses comment and sentence starts).
+ */
+const ANCHORED_PATTERN_PREFILTERS: readonly RegExp[] = [
+  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i,
+  /\bin\s+(?:unit\s+|integration\s+)?tests\b/i,
+];
+
+/**
+ * Declarations named like a test hook (`resetForTests`, `setIdleTimeoutMsForTests`,
+ * `visibleForTesting`) are seams by name, comment or not, so each needs an allowlist entry too.
+ */
+export const TEST_HOOK_NAME = /For(?:Tests|Testing)$/;
 
 export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
 
@@ -230,19 +253,139 @@ function coalesceLineComments(text: string, comments: OwnedComment[]): OwnedComm
   return merged;
 }
 
+function parseSource(file: string, text: string): ts.SourceFile {
+  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+}
+
+/**
+ * Returns why `tsModule` cannot parse sources, or undefined when it can. Without an install,
+ * Bun resolves `typescript` to a built-in stub that has only `version`, and the scan would
+ * crash on `ts.ScriptTarget`.
+ */
+export function typescriptProblem(tsModule: unknown): string | undefined {
+  const candidate = tsModule as Partial<typeof ts> | undefined;
+  if (typeof candidate?.createSourceFile === "function") return undefined;
+  return "the typescript package is not installed (Bun loaded a stub without its parser); run `bun install --frozen-lockfile` first";
+}
+
+/** Declarations that put a name on a module, class, object or type surface. */
+function isSurfaceDeclaration(node: ts.Node): node is ts.NamedDeclaration {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isMethodSignature(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertySignature(node) ||
+    ts.isPropertyAssignment(node) ||
+    ts.isShorthandPropertyAssignment(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isClassDeclaration(node) ||
+    ts.isInterfaceDeclaration(node) ||
+    ts.isTypeAliasDeclaration(node) ||
+    ts.isEnumDeclaration(node) ||
+    ts.isEnumMember(node) ||
+    ts.isModuleDeclaration(node) ||
+    ts.isExportSpecifier(node) ||
+    // `constructor(public resetForTests: () => void)` declares a class property.
+    (ts.isParameter(node) && ts.isParameterPropertyDeclaration(node, node.parent))
+  );
+}
+
+/**
+ * For a name bound by `export const { aForTests } = api`, the variable declaration that binds
+ * it. Exporting puts the name on the module surface, so it is a declaration, while the same
+ * destructuring without `export` only uses `api.aForTests`.
+ */
+function exportedBindingDeclaration(node: ts.Node): ts.VariableDeclaration | undefined {
+  if (!ts.isBindingElement(node)) return undefined;
+  let parent: ts.Node = node.parent;
+  while (
+    ts.isBindingElement(parent) ||
+    ts.isObjectBindingPattern(parent) ||
+    ts.isArrayBindingPattern(parent)
+  ) {
+    parent = parent.parent;
+  }
+  if (!ts.isVariableDeclaration(parent)) return undefined;
+  const statement = parent.parent.parent;
+  const exported =
+    ts.isVariableStatement(statement) &&
+    (ts.getModifiers(statement) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+  return exported ? parent : undefined;
+}
+
+/** The nearest ancestor of a declaration that is not its own variable list or statement. */
+function enclosingDeclaration(node: ts.Node): ts.Node {
+  let parent = node.parent;
+  while (
+    ts.isVariableDeclarationList(parent) ||
+    ts.isVariableStatement(parent) ||
+    ts.isNamedExports(parent) ||
+    ts.isExportDeclaration(parent)
+  ) {
+    parent = parent.parent;
+  }
+  return parent;
+}
+
+/** The static text of a declaration name: `a`, `#a`, `"a"` or `["a"]`. */
+function staticName(name: ts.Node | undefined): string | undefined {
+  if (name === undefined) return undefined;
+  if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name) || ts.isStringLiteralLike(name)) {
+    return name.text;
+  }
+  if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
+    return name.expression.text;
+  }
+  return undefined;
+}
+
+/**
+ * Finds declarations whose name ends in ForTests/ForTesting. The phrase is the name, so the
+ * report says why the symbol matched. Call sites (`pool.resetForTests()`), imports and
+ * destructured bindings are uses, not declarations, so they do not count.
+ */
+export function findTestHookNames(file: string, text: string): SeamComment[] {
+  if (!/For(?:Tests|Testing)\b/.test(text)) return [];
+  const sourceFile = parseSource(file, text);
+  const found: SeamComment[] = [];
+  const visit = (node: ts.Node) => {
+    const binding = exportedBindingDeclaration(node);
+    const name =
+      isSurfaceDeclaration(node) || binding !== undefined
+        ? staticName((node as ts.NamedDeclaration).name)
+        : undefined;
+    if (name !== undefined && TEST_HOOK_NAME.test(name)) {
+      // Key by the enclosing declarations plus this name: symbolChain would name a variable by
+      // its list's first declarator (`const first = 1, aForTests = ...`) and drops computed
+      // names (`["aForTests"]()`).
+      const owner = symbolChain(enclosingDeclaration(binding ?? node));
+      found.push({
+        file,
+        line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+        symbol: owner === "(file)" ? name : `${owner}.${name}`,
+        phrase: name,
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
 /** Finds seam comments in one file. `file` is only used for reporting and TSX detection. */
 export function findSeamComments(file: string, text: string): SeamComment[] {
-  // Cheap prefilter: most files never mention a seam phrase anywhere. Collapsing the whole file
-  // loses comment and sentence starts, so the anchored no-caller pattern gets a loose twin here.
+  // Cheap prefilter: most files never mention a seam phrase anywhere.
   const fileBody = commentBody(text);
-  if (firstMatch(fileBody) === undefined && !NO_CALLER_PREFILTER.test(fileBody)) return [];
-  const sourceFile = ts.createSourceFile(
-    file,
-    text,
-    ts.ScriptTarget.Latest,
-    true,
-    scriptKind(file)
-  );
+  if (
+    firstMatch(fileBody) === undefined &&
+    !ANCHORED_PATTERN_PREFILTERS.some((pattern) => pattern.test(fileBody))
+  ) {
+    return [];
+  }
+  const sourceFile = parseSource(file, text);
   // Every comment is leading trivia of some token (or trailing trivia on its line), so
   // visiting all tokens finds all comments. The deepest node wins as the owner.
   const owners = new Map<number, { range: ts.CommentRange; owner: ts.Node }>();
@@ -372,6 +515,12 @@ export function checkSeamComments(
 }
 
 function main(): number {
+  const tag = "check-test-seam-comments:";
+  const problem = typescriptProblem(ts);
+  if (problem !== undefined) {
+    console.error(`${tag} ${problem}`);
+    return 2;
+  }
   const root = path.resolve(import.meta.dir, "..");
   const files = [...new Bun.Glob(SOURCE_GLOB).scanSync({ cwd: root })]
     .map((file) => file.split(path.sep).join("/"))
@@ -379,9 +528,10 @@ function main(): number {
     .sort();
   assert(files.length > 100, `expected production sources under src/, found ${files.length}`);
 
-  const comments = files.flatMap((file) =>
-    findSeamComments(file, readFileSync(path.join(root, file), "utf8"))
-  );
+  const comments = files.flatMap((file) => {
+    const text = readFileSync(path.join(root, file), "utf8");
+    return [...findSeamComments(file, text), ...findTestHookNames(file, text)];
+  });
   const allowlist = parseAllowlist(
     JSON.parse(readFileSync(path.join(root, ALLOWLIST_PATH), "utf8")) as unknown
   );
@@ -390,10 +540,10 @@ function main(): number {
     allowlist
   );
 
-  const tag = "check-test-seam-comments:";
   for (const comment of unlisted) {
+    const what = TEST_HOOK_NAME.test(comment.phrase) ? "test-hook name" : "test-seam comment";
     console.error(
-      `${tag} ${comment.file}:${comment.line} test-seam comment on \`${comment.symbol}\` ("${comment.phrase}")`
+      `${tag} ${comment.file}:${comment.line} ${what} on \`${comment.symbol}\` ("${comment.phrase}")`
     );
   }
   if (unlisted.length > 0) {
@@ -407,10 +557,14 @@ function main(): number {
         `that is the only witness of a retention contract, add it to "allowed" in`,
         `${ALLOWLIST_PATH} and name that caller (or the test and the contract it witnesses) in the reason`,
         `("knownDebt" is a shrink-only baseline; do not add to it):`,
-        ...unlisted.map(
-          (comment) =>
-            `  { "file": "${comment.file}", "symbol": "${comment.symbol}", "reason": "<production caller, or the test and the contract it witnesses>" }`
-        ),
+        // A symbol can match by comment and by name; suggest one entry for it.
+        ...[...new Set(unlisted.map(entryKey))].map((key) => {
+          // Split at the first "#": a symbol can be a #private name.
+          const at = key.indexOf("#");
+          const file = key.slice(0, at);
+          const symbol = key.slice(at + 1);
+          return `  { "file": "${file}", "symbol": "${symbol}", "reason": "<production caller, or the test and the contract it witnesses>" }`;
+        }),
       ].join("\n")
     );
   }

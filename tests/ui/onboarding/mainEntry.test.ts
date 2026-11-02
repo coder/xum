@@ -48,7 +48,7 @@ test("registers the service worker on the window load event", async () => {
   jest.spyOn(document, "readyState", "get").mockReturnValue("loading");
   await loadEntry();
   expect(register).not.toHaveBeenCalled();
-  window.dispatchEvent(new Event("load"));
+  window.dispatchEvent(new window.Event("load"));
   await settle();
   expect(register).toHaveBeenCalled();
 });

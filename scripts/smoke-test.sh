@@ -43,11 +43,6 @@ cleanup() {
     rm -rf "$TEST_DIR"
   fi
 
-  # Remove repack directory (created when SKIP_SHRINKWRAP=1)
-  if [[ -n "${REPACK_DIR:-}" ]] && [[ -d "$REPACK_DIR" ]]; then
-    rm -rf "$REPACK_DIR"
-  fi
-
   if [[ $exit_code -eq 0 ]]; then
     log_info "✅ Smoke test completed successfully"
   else
@@ -66,7 +61,7 @@ SERVER_HOST="${SERVER_HOST:-localhost}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-30}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-10}"
 AUTH_TOKEN="smoke-test-token-$(date +%s)"
-# When set to "1", strip npm-shrinkwrap.json from the package before installing.
+# When set to "1", install without npm-shrinkwrap.json, resolving every dependency afresh.
 # This simulates package managers like `bun x` that ignore shrinkwrap, catching
 # dependency resolution issues that the lockfile would otherwise mask.
 SKIP_SHRINKWRAP="${SKIP_SHRINKWRAP:-0}"
@@ -94,40 +89,25 @@ log_info "Created test directory: $TEST_DIR"
 
 cd "$TEST_DIR"
 
-# Initialize a minimal package.json to avoid npm warnings
-cat >package.json <<EOF
-{
-  "name": "xum-smoke-test",
-  "version": "1.0.0",
-  "private": true
-}
-EOF
-
-# Optionally strip shrinkwrap to simulate `bun x` / lockfile-free resolution.
-# When a user runs `bun x @coder/xum@latest`, bun ignores npm-shrinkwrap.json and resolves
-# dependencies from scratch. This can resolve to different (potentially broken) versions
-# than what the shrinkwrap locks to. Testing without shrinkwrap catches these mismatches.
-if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
-  log_warning "SKIP_SHRINKWRAP=1: stripping npm-shrinkwrap.json from package (simulating bun x)"
-  REPACK_DIR=$(mktemp -d)
-  tar -xzf "$PACKAGE_TARBALL" -C "$REPACK_DIR"
-  if [[ -f "$REPACK_DIR/package/npm-shrinkwrap.json" ]]; then
-    rm "$REPACK_DIR/package/npm-shrinkwrap.json"
-    log_info "Removed npm-shrinkwrap.json from package"
-  else
-    log_warning "No npm-shrinkwrap.json found in package (nothing to strip)"
-  fi
-  STRIPPED_TARBALL="$REPACK_DIR/xum-no-shrinkwrap.tgz"
-  tar -czf "$STRIPPED_TARBALL" -C "$REPACK_DIR" package
-  PACKAGE_TARBALL="$STRIPPED_TARBALL"
-  log_info "Repacked tarball without shrinkwrap: $PACKAGE_TARBALL"
-fi
-
-# Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+# npm ignores the shrinkwrap of a tarball file, so `npm install <tarball>` would resolve every
+# dependency afresh. By default, install the way npm installs the published package from the
+# registry: exactly its npm-shrinkwrap.json, nested under node_modules/@coder/xum. `npm ci` fails
+# if the shrinkwrap leaves anything to resolve.
 log_info "Installing package..."
-if ! "$SCRIPT_DIR/retry.sh" 5 60 npm install --no-save "$PACKAGE_TARBALL"; then
-  log_error "Failed to install package"
-  exit 1
+if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
+  log_warning "SKIP_SHRINKWRAP=1: resolving dependencies without npm-shrinkwrap.json (simulating bun x)"
+  echo '{"name":"xum-smoke-test","version":"1.0.0","private":true}' >package.json
+  # Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+  if ! "$SCRIPT_DIR/retry.sh" 5 60 npm install --no-save "$PACKAGE_TARBALL"; then
+    log_error "Failed to install package"
+    exit 1
+  fi
+else
+  bun "$SCRIPT_DIR/generate-npm-shrinkwrap.ts" --tarball-install "$TEST_DIR" "$PACKAGE_TARBALL"
+  if ! "$SCRIPT_DIR/retry.sh" 3 30 npm ci --no-audit --no-fund; then
+    log_error "Failed to install package from its npm-shrinkwrap.json"
+    exit 1
+  fi
 fi
 
 log_info "✅ Package installed successfully"
@@ -249,9 +229,9 @@ touch "$PROJECT_DIR/README.md"
 git -C "$PROJECT_DIR" add .
 git -C "$PROJECT_DIR" commit -m "Initial commit" >/dev/null 2>&1
 
-# Run oRPC tests via Node.js using the installed xum package's dependencies.
-# The xum package includes @orpc/client which we can use.
-node -e "
+# Run oRPC tests via Node.js using the installed xum package's dependencies, resolved from the
+# package's folder because npm nests them there. The xum package includes @orpc/client.
+(cd node_modules/@coder/xum && node -e "
 const { RPCLink } = require('@orpc/client/fetch');
 const { createORPCClient } = require('@orpc/client');
 const WebSocket = require('ws');
@@ -322,7 +302,7 @@ runTests().catch(err => {
   console.error('oRPC test failed:', err.message);
   process.exit(1);
 });
-" 2>&1
+") 2>&1
 
 ORPC_EXIT_CODE=$?
 if [[ $ORPC_EXIT_CODE -ne 0 ]]; then

@@ -141,9 +141,10 @@ async function verifyUnpackedSharpAssets(
       `Missing ${architecture} sharp binding directory: ${bindingDir}`
     );
 
+    // sharp 0.35 names the binary with its version (sharp-darwin-arm64-0.35.5.node).
     const sharpBinaryPath = await findFileMatching(
       bindingDir,
-      new RegExp(`${runtimePackages.binding}\\.node$`)
+      new RegExp(`${runtimePackages.binding}(?:-\\d+\\.\\d+\\.\\d+)?\\.node$`)
     );
     assert(
       sharpBinaryPath != null,

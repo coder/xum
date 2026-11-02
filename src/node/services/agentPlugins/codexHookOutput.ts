@@ -2,10 +2,11 @@
  * Reads a Codex `mcp_tool` hook's output into one decision per event, with Codex's rules
  * (openai/codex codex-rs/hooks/src/engine/output_parser.rs and hooks/src/events/*.rs).
  *
- * Two failure kinds, both fail open in the runner:
+ * Two failure kinds:
  * - `parse*` throws when the output does not match Codex's output schema: an unknown field
  *   (Codex's wire structs use `deny_unknown_fields`; the generated output schemas set
- *   `additionalProperties: false`), a wrong type or a value outside an enum. Nothing of it applies.
+ *   `additionalProperties: false`), a wrong type, a value outside an enum, or text that starts
+ *   with `{` or `[` and is not a JSON object. Nothing of it applies.
  * - A result with `invalid` set parsed but breaks a semantic rule (a reason without a decision, a
  *   field the event does not support). Codex still shows its `systemMessage` and ignores the rest.
  *
@@ -13,7 +14,8 @@
  * - An explicit PreToolUse deny and a PostToolUse block or stop always apply, also when Codex
  *   would void the output for a semantic rule (no reason, suppressOutput, continue: false next to
  *   a deny). A trusted guard's refusal must not let a model-controlled call through (Codex
- *   security review PRRT_kwDOPxxmWM6sQaTD). Only a malformed output fails open.
+ *   security review PRRT_kwDOPxxmWM6sQaTD).
+ * - A malformed PreToolUse output blocks the call (Codex fails it open, D8).
  * - JSON null on any optional field reads as absent (Codex PRRT_kwDOPxxmWM6rgpoH).
  * - `structuredContent` is read when the result has no text (Codex reads text only).
  */
@@ -165,8 +167,7 @@ function hasSpecificDecision(specific: Record<string, unknown>): boolean {
 /**
  * Xum honors an explicit deny even when Codex would void the output for a missing reason or an
  * extra field next to it (Codex security review PRRT_kwDOPxxmWM6sQaTD): a trusted guard that
- * denies a model-controlled call must not let it run. Only a malformed output (readWire) fails
- * open, as in Codex.
+ * denies a model-controlled call must not let it run.
  */
 const NO_REASON = "No reason given by the hook.";
 
@@ -337,8 +338,8 @@ interface Wire {
 
 /**
  * The output object, checked against Codex's schema for `event`. Returns null for an empty
- * result (no text, no structuredContent) and for a result that is not an object (Codex ignores
- * both); throws for a malformed one.
+ * result (no text, no object structuredContent) and for plain text (Codex ignores both); throws
+ * for a malformed one.
  */
 function readWire(
   result: unknown,
@@ -380,14 +381,22 @@ function checkFieldTypes(
   }
 }
 
-/** JSON text; text that looks like JSON but does not parse is a malformed output. */
-function parseText(text: string, event: HookEventName): unknown {
+/**
+ * The output object in JSON text, or undefined for plain text. Codex's looks_like_json rule: text
+ * that starts with `{` or `[` must be a JSON object, so a PreToolUse guard that answers with a
+ * list of findings cannot let the call through (D8). Other text, a bare JSON scalar such as `true`
+ * included, is plain text.
+ */
+function parseText(text: string, event: HookEventName): Record<string, unknown> | undefined {
+  if (!looksLikeJson(text)) return undefined;
+  let value: unknown;
   try {
-    return JSON.parse(text);
+    value = JSON.parse(text);
   } catch {
-    if (looksLikeJson(text)) throw new Error(`returned invalid ${event} JSON output`);
-    return undefined;
+    throw new Error(`returned invalid ${event} JSON output`);
   }
+  if (!isPlainObject(value)) throw new Error(`returned ${event} JSON output that is not an object`);
+  return value;
 }
 
 /** Codex requires hookSpecificOutput.hookEventName to name this event. */
@@ -430,15 +439,18 @@ function looksLikeJson(text: string): boolean {
   return text.startsWith("{") || text.startsWith("[");
 }
 
-/** The first field the event's Codex schema does not list, as a semantic error message. */
+/**
+ * A semantic error message when a field is not in the event's Codex schema. It never names the
+ * field: a PreToolUse block shows this message to the model and the user, and a hook's field
+ * name can hold a secret.
+ */
 function findUnknown(
   record: Record<string, unknown>,
   allowed: string[],
   where: string
 ): string | undefined {
-  const key = Object.keys(record).find((candidate) => !allowed.includes(candidate));
-  return key !== undefined
-    ? `returned ${where} with the unknown field ${JSON.stringify(key).slice(0, 80)}`
+  return Object.keys(record).some((key) => !allowed.includes(key))
+    ? `returned ${where} with an unknown field`
     : undefined;
 }
 
@@ -451,12 +463,15 @@ function typed(record: Record<string, unknown>, fields: string[], type: string) 
   }
 }
 
-/** Codex's enums allow only these exact values (" deny ", "Block" are malformed). */
+/**
+ * Codex's enums allow only these exact values (" deny ", "Block" are malformed). The error never
+ * quotes the value, for the reason in findUnknown.
+ */
 function enumField(record: Record<string, unknown>, field: string, allowed: string[]) {
   const value = record[field];
   if (value == null) return undefined;
   if (typeof value !== "string" || !allowed.includes(value)) {
-    throw new Error(`invalid ${field} ${JSON.stringify(value).slice(0, 80)}`);
+    throw new Error(`invalid ${field} value`);
   }
   return value;
 }

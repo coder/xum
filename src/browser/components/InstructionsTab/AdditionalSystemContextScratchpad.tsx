@@ -334,6 +334,7 @@ export function ChatInstructionsChatDecoration(props: { workspaceId: string }) {
     focusInstructionsTab(props.workspaceId);
     requestAdditionalSystemContextFocus(props.workspaceId);
   };
+  const preview = getChatInstructionsFirstLinePreview(snapshot.content);
 
   return (
     <ChatInputDecoration
@@ -342,6 +343,24 @@ export function ChatInstructionsChatDecoration(props: { workspaceId: string }) {
       expanded={false}
       onToggle={handleOpenInPanel}
       dataComponent="ChatInstructionsChatDecoration"
+      activityId="chat-instructions"
+      chipLabel={`${CHAT_INSTRUCTIONS_LABEL}: ${preview}`}
+      // The chip carries icons only, so the preview moves to its tooltip.
+      chipTooltip={`${CHAT_INSTRUCTIONS_LABEL} · ${preview}`}
+      chip={
+        <>
+          <BookOpen className="size-3.5 shrink-0" />
+          <ArrowUpRight aria-hidden="true" className="size-3 shrink-0" />
+        </>
+      }
+      // Its entry in the "+N" chip's list, when the line has no room for the chip.
+      tab={
+        <>
+          <BookOpen className="size-4 shrink-0" />
+          <span>{CHAT_INSTRUCTIONS_LABEL}</span>
+          <ArrowUpRight aria-hidden="true" className="text-muted size-3.5 shrink-0" />
+        </>
+      }
       trailingIcon={
         <ArrowUpRight
           aria-hidden="true"
@@ -353,9 +372,7 @@ export function ChatInstructionsChatDecoration(props: { workspaceId: string }) {
           <BookOpen className="text-muted group-hover:text-secondary size-3.5 shrink-0 transition-colors" />
           <span className="text-muted group-hover:text-secondary flex min-w-0 items-center gap-1 transition-colors">
             <span className="shrink-0 font-medium">{CHAT_INSTRUCTIONS_LABEL}</span>
-            <span className="min-w-0 truncate">
-              · {getChatInstructionsFirstLinePreview(snapshot.content)}
-            </span>
+            <span className="min-w-0 truncate">· {preview}</span>
           </span>
         </>
       }

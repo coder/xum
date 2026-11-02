@@ -34,6 +34,7 @@ import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { hasOpenAIApiKey } from "@/common/utils/providers/codexOauthRouting";
 import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
@@ -45,6 +46,7 @@ import {
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getCreationDraftScopeId,
@@ -53,10 +55,11 @@ import {
   getWorkspaceLastReadKey,
 } from "@/common/constants/storage";
 import {
-  prepareCompactionMessage,
+  NO_INLINE_REFS,
   processSlashCommand,
   type CommandAction,
   type SlashCommandEnv,
+  type SlashCommandInlineRefs,
 } from "@/browser/utils/chatCommands";
 import {
   addWorkflowRunCardMessageForRun,
@@ -144,7 +147,6 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-  withMcpPromptRefs,
 } from "@/common/types/message";
 import {
   getModelCapabilities,
@@ -221,6 +223,7 @@ import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
 import { useSendMarkEditTracking } from "./useSendMarkEditTracking";
+import { useWorkspaceSwitchAutoFocus } from "./useWorkspaceSwitchAutoFocus";
 import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
@@ -687,10 +690,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const [muxGatewayCouponSet, setMuxGatewayCouponSet] = useState(false);
-  const [muxGatewayEnabled, setMuxGatewayEnabled] = useState(true);
-  const isTranscriptionAvailable =
-    (openAIProviderEnabled && openAIKeySet) || (muxGatewayEnabled && muxGatewayCouponSet);
+  const isTranscriptionAvailable = openAIProviderEnabled && openAIKeySet;
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({
@@ -710,7 +710,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.";
+    "Voice input requires an enabled OpenAI provider with an API key. Configure in Settings → Providers.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {
@@ -906,7 +906,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           message: creationNameMessage,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
-          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+          agentBaseById: getAgentAiSettingsBases(agents),
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -1176,7 +1176,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // otherwise send the first prompt with the ambient model and Pro gated off
     // until WorkspaceModeAISync corrects the workspace.
     const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    const agentBaseById = getAgentAiSettingsBases(agents);
     const {
       resolvedModel,
       resolvedThinking,
@@ -1574,10 +1574,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         async () => {
           const config = await api.providers.getConfig();
           if (!signal.aborted) {
-            setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
+            // VoiceService resolves keys from config, key files and env vars alike. Codex OAuth
+            // alone cannot transcribe, so isConfigured is not enough.
+            setOpenAIKeySet(hasOpenAIApiKey(config?.openai));
             setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
-            setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
-            setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
           }
         },
         () => {
@@ -1932,62 +1932,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
-  // Auto-focus chat input when workspace changes (workspace only).
-  const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const maxFrames = 10;
-    setChatInputAutoFocusState("pending");
-
-    let cancelled = false;
-    let rafId: number | null = null;
-    let attempts = 0;
-
-    const step = () => {
-      if (cancelled) return;
-
-      attempts += 1;
-
-      const input = inputRef.current;
-      const active = document.activeElement;
-
-      if (
-        active instanceof HTMLElement &&
-        active !== document.body &&
-        active !== document.documentElement
-      ) {
-        const isWithinChatInput = !!chatInputSectionRef.current?.contains(active);
-        const isInput = !!input && active === input;
-        if (!isWithinChatInput && !isInput) {
-          setChatInputAutoFocusState("done");
-          return;
-        }
-      }
-
-      focusMessageInput();
-
-      const isFocused = !!input && document.activeElement === input;
-      const isDone = isFocused || attempts >= maxFrames;
-
-      if (isDone) {
-        setChatInputAutoFocusState("done");
-        return;
-      }
-
-      rafId = requestAnimationFrame(step);
-    };
-
-    rafId = requestAnimationFrame(step);
-
-    return () => {
-      cancelled = true;
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-      }
-      setChatInputAutoFocusState("done");
-    };
-  }, [variant, workspaceIdForFocus, focusMessageInput, setChatInputAutoFocusState]);
+  useWorkspaceSwitchAutoFocus({
+    workspaceId: variant === "workspace" ? props.workspaceId : null,
+    inputRef,
+    sectionRef: chatInputSectionRef,
+    focusInput: focusMessageInput,
+    setAutoFocusState: setChatInputAutoFocusState,
+  });
 
   // Shared slash command execution for creation + workspace inputs.
   const commandWorkspaceId = variant === "workspace" ? props.workspaceId : undefined;
@@ -2040,7 +1991,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const executeParsedCommand = async (
     parsed: ParsedCommand | null,
     restoreInput: string,
-    options?: {
+    options: {
+      inlineRefs: SlashCommandInlineRefs;
       skipConfirmation?: boolean;
       queueDispatchMode?: QueueDispatchMode;
       goalInterventionPolicy?: GoalInterventionPolicy;
@@ -2067,7 +2019,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const isDestructive = parsed.type === "clear" && parsed.mode === "hard";
-    if (isDestructive && variant === "workspace" && !options?.skipConfirmation) {
+    if (isDestructive && variant === "workspace" && !options.skipConfirmation) {
       setPendingDestructiveCommand(true);
       return true;
     }
@@ -2086,12 +2038,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return true;
     }
 
-    const reviewsData = options?.reviews ? options.reviews.data : reviewData;
-    const dispatchMode = options?.queueDispatchMode ?? "tool-end";
+    const reviewsData = options.reviews ? options.reviews.data : reviewData;
+    const dispatchMode = options.queueDispatchMode ?? "tool-end";
     // Thread dispatch mode into send options so queued command sends stay in sync with normal sends.
     const commandSendMessageOptions: SendMessageOptions = {
       ...sendMessageOptions,
-      ...(options?.goalInterventionPolicy
+      ...(options.goalInterventionPolicy
         ? { goalInterventionPolicy: options.goalInterventionPolicy }
         : {}),
       ...(dispatchMode === "tool-end" ? {} : { queueDispatchMode: dispatchMode }),
@@ -2102,6 +2054,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const commandEnv: SlashCommandEnv = {
       // Commands report "Not connected to server" themselves when there is no live client.
       api: liveApi,
+      inlineRefs: options.inlineRefs,
       aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
@@ -2118,7 +2071,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
-      attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      attachedReviewIds: options.reviews ? options.reviews.ids : reviewIdsForCheck,
       isSideChat:
         commandWorkspaceId != null &&
         workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
@@ -2178,7 +2131,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               props.onCheckReviews?.(action.reviewIds);
             }
             // Emitted once the command's message was accepted (/compact).
-            if (options?.reviews) warnIfReviewsUnavailable(options.reviews);
+            if (options.reviews) warnIfReviewsUnavailable(options.reviews);
             break;
           case "message-sent":
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
@@ -2236,7 +2189,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const parsedCommand: ParsedCommand = { type: "clear", mode: "hard" };
 
     setPendingDestructiveCommand(false);
-    await executeParsedCommand(parsedCommand, input, { skipConfirmation: true });
+    await executeParsedCommand(parsedCommand, input, {
+      inlineRefs: NO_INLINE_REFS,
+      skipConfirmation: true,
+    });
   };
 
   const handleDestructiveCommandCancel = useCallback(() => {
@@ -2495,6 +2451,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       combinedSkillRefs,
       combinedMcpPromptRefs,
     } = resolved;
+    const inlineRefs: SlashCommandInlineRefs = {
+      agentSkillRefs: combinedSkillRefs,
+      mcpPromptRefs: combinedMcpPromptRefs,
+    };
 
     // The barrier is re-checked here, after the resolution awaits and before any command runs:
     // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
@@ -2530,7 +2490,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         !goalCommandBypassedForAttachments &&
         parsed?.type !== "workflow-run"
       ) {
-        const commandHandled = await executeParsedCommand(parsed, input);
+        const commandHandled = await executeParsedCommand(parsed, input, { inlineRefs });
         if (commandHandled) {
           return;
         }
@@ -2640,6 +2600,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         modelOneShot || goalCommandBypassedForAttachments
           ? false
           : await executeParsedCommand(parsed, input, {
+              inlineRefs,
               goalInterventionPolicy: overrides?.goalInterventionPolicy,
               queueDispatchMode: overrides?.queueDispatchMode,
               reviews: reviewsForSend,
@@ -2818,67 +2779,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const sendPreparedMessage = async () => {
         // Prepare file parts if any
         const fileParts = chatAttachmentsToFileParts(sendAttachments, { validate: true });
-        const sendFileParts = editMessageForSend
-          ? fileParts
-          : fileParts.length > 0
-            ? fileParts
-            : undefined;
 
-        // Prepare reviews data (used for both compaction continueMessage and normal send),
-        // read after hydration by readReviewsForSend.
+        // Review notes as hydrated by readReviewsForSend.
         const reviewsData = reviewsForSend.data;
         const reviewIdsToCheck = reviewsForSend.ids;
-
-        // When editing a /compact command, regenerate the actual summarization request
-        let actualMessageText = messageTextForSend;
-        let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata ?? promptMuxMetadata;
-        let compactionOptions: Partial<SendMessageOptions> = {};
-
-        let appendStagedNoticeToUserMessage = true;
-        if (editMessageForSend && actualMessageText.startsWith("/")) {
-          const parsed = parseCommand(messageText);
-          if (parsed?.type === "compact") {
-            // Inline refs ride the follow-up message so their snapshots
-            // materialize after compaction, not on the summarization turn.
-            const followUpMuxMetadata = withMcpPromptRefs(
-              withAgentSkillRefs(undefined, combinedSkillRefs),
-              combinedMcpPromptRefs
-            );
-            const {
-              messageText: regeneratedText,
-              metadata,
-              sendOptions,
-            } = prepareCompactionMessage({
-              api: liveApi,
-              workspaceId: props.workspaceId,
-              maxOutputTokens: parsed.maxOutputTokens,
-              // Include current attachments + reviews in followUpContent so they're queued
-              // after compaction completes, not just attached to the compaction request.
-              followUpContent:
-                parsed.continueMessage ||
-                sendFileParts?.length ||
-                reviewsData?.length ||
-                getStagedAttachments(sendAttachments).length ||
-                followUpMuxMetadata
-                  ? {
-                      text: appendStagedAttachmentNotice(
-                        parsed.continueMessage ?? "",
-                        sendAttachments
-                      ),
-                      fileParts: sendFileParts,
-                      reviews: reviewsData,
-                      ...(followUpMuxMetadata ? { muxMetadata: followUpMuxMetadata } : {}),
-                    }
-                  : undefined,
-              model: parsed.model,
-              sendMessageOptions,
-            });
-            appendStagedNoticeToUserMessage = false;
-            actualMessageText = regeneratedText;
-            muxMetadata = metadata;
-            compactionOptions = sendOptions;
-          }
-        }
 
         const preparedMessage = prepareMessagePayload({
           messageText,
@@ -2892,13 +2796,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           historyEditPrecondition: editMessageForSend
             ? getEditSendPrecondition(editMessageForSend)
             : undefined,
-          baseMetadata: muxMetadata,
+          baseMetadata: skillMuxMetadata ?? promptMuxMetadata,
           agentSkillRefs: combinedSkillRefs,
           mcpPromptRefs: combinedMcpPromptRefs,
           sendMessageOptions,
-          compactionOptions,
-          compactionMessageText: actualMessageText,
-          appendStagedNotice: appendStagedNoticeToUserMessage,
           modelOneShot,
           // One-shot composed with a skill invocation ("/haiku+0 /done"):
           // option overrides ride the invocation, not a bare model-oneshot.
@@ -3582,15 +3483,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
-                    // Creation favors prompt space; workspaces preserve transcript space. Mobile
-                    // hides the shortcut hints the workspace floor exists for, so that room is
-                    // dead space on a screen that has none to spare.
-                    className={
-                      variant === "creation" ? "min-h-36" : isMobileTouch ? "min-h-9" : "min-h-22"
-                    }
+                    // Creation favors prompt space; workspaces keep a one-line floor because the
+                    // user asked for a shorter chat box. Workspaces hide the shortcut hints, so a
+                    // taller floor reserved for them would only be dead space. Long placeholders
+                    // (tips, edit/compacting hints) stay on that one line instead of wrapping into
+                    // a second line the empty one-line box would clip.
+                    className={variant === "creation" ? "min-h-36" : "min-h-9 placeholder:truncate"}
                   />
-                  {/* Keep shortcuts visible in both creation + workspace without bloating the footer or crowding it. */}
-                  {input.trim() === "" && !editingMessageForUi && (
+                  {/* Shortcut hints only show in creation, which has room below the prompt. */}
+                  {variant === "creation" && input.trim() === "" && (
                     <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
                       <span className="shrink-0">
                         <span className="font-mono">{formatKeybind(KEYBINDS.FOCUS_CHAT)}</span>

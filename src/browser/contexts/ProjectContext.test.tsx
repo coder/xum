@@ -6,6 +6,7 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
+import { subscribeProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 
 // Keep the client local to each test instead of using bun's process-global
 // mock.module registry for API, which leaks across context suites.
@@ -113,6 +114,62 @@ describe("ProjectContext", () => {
 
     await waitFor(() => expect(ctx().userProjects.size).toBe(2));
     expect(projectsApi.list.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // #7216: trust granted or revoked outside this renderer (the `xum trust` CLI, another client)
+  // reaches it only as a config change, so the re-list must refresh the trust-gated lists.
+  test("publishes a project trust change only when a re-listed project's trust differs", async () => {
+    let projects: Array<[string, ProjectConfig]> = [["/alpha", { workspaces: [] }]];
+    createMockAPI({ list: () => Promise.resolve(projects) });
+    // The shared AppConfigStore subscribes too, so signal every subscriber.
+    const triggers: Array<() => void> = [];
+    const onConfigChanged = mock(() =>
+      Promise.resolve(
+        (async function* () {
+          for (;;) {
+            await new Promise<void>((resolve) => triggers.push(resolve));
+            yield undefined;
+          }
+        })()
+      )
+    );
+    currentClientMock = { ...currentClientMock, config: { onConfigChanged } };
+    let trustChanges = 0;
+    const unsubscribe = subscribeProjectTrustChanged(() => trustChanges++);
+    const changeConfig = (next: Array<[string, ProjectConfig]>) => {
+      projects = next;
+      act(() => {
+        for (const trigger of triggers.splice(0)) trigger();
+      });
+    };
+
+    try {
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().userProjects.size).toBe(1));
+      await waitFor(() => expect(triggers.length).toBeGreaterThan(0));
+
+      // A config change that leaves trust as it was: no trust notification.
+      changeConfig([["/alpha", { workspaces: [], displayName: "Alpha" }]]);
+      await waitFor(() => expect(ctx().userProjects.get("/alpha")?.displayName).toBe("Alpha"));
+      expect(trustChanges).toBe(0);
+
+      await waitFor(() => expect(triggers.length).toBeGreaterThan(0));
+      changeConfig([["/alpha", { workspaces: [], displayName: "Alpha", trusted: true }]]);
+      await waitFor(() => expect(trustChanges).toBe(1));
+
+      // A new untrusted parent project changes its trusted child's effective trust.
+      await waitFor(() => expect(triggers.length).toBeGreaterThan(0));
+      changeConfig([
+        ["/root", { workspaces: [] }],
+        [
+          "/alpha",
+          { workspaces: [], displayName: "Alpha", trusted: true, parentProjectPath: "/root" },
+        ],
+      ]);
+      await waitFor(() => expect(trustChanges).toBe(2));
+    } finally {
+      unsubscribe();
+    }
   });
 
   test("exposes project list load failures without marking projects as loaded", async () => {
@@ -729,7 +786,24 @@ async function setup() {
   return () => contextRef.current!;
 }
 
-function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
+// ProjectContext reads secrets from the top-level `secrets` router, so `overrides.secrets` is
+// typed as that router (not as `projects.secrets`).
+function createMockAPI(
+  overrides: Omit<TestApiOverrides<APIClient["projects"]>, "secrets"> & {
+    secrets?: TestApiOverrides<APIClient["secrets"]>;
+  }
+) {
+  const secrets = {
+    get: mock(overrides.secrets?.get ?? (() => Promise.resolve([]))),
+    update: mock(
+      overrides.secrets?.update ??
+        (() =>
+          Promise.resolve({
+            success: true as const,
+            data: undefined,
+          }))
+    ),
+  };
   const projects = {
     create: mock(
       overrides.create ??
@@ -753,23 +827,12 @@ function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
     ),
     setDisplayName: mock(overrides.setDisplayName ?? (() => Promise.resolve())),
     pickDirectory: mock(overrides.pickDirectory ?? (() => Promise.resolve(null))),
-    secrets: {
-      get: mock(overrides.secrets?.get ?? (() => Promise.resolve([]))),
-      update: mock(
-        overrides.secrets?.update ??
-          (() =>
-            Promise.resolve({
-              success: true as const,
-              data: undefined,
-            }))
-      ),
-    },
   };
 
   // Update the global mock
   currentClientMock = {
-    projects: projects as unknown as TestApiOverrides<APIClient["projects"]>,
-    secrets: projects.secrets as unknown as TestApiOverrides<APIClient["secrets"]>,
+    projects,
+    secrets,
   };
 
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
@@ -777,5 +840,5 @@ function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
   globalThis.localStorage = globalThis.window.localStorage;
   globalThis.localStorage = globalThis.window.localStorage;
 
-  return projects;
+  return { ...projects, secrets };
 }

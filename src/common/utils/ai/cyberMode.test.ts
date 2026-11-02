@@ -12,7 +12,6 @@ const enabledOpenAI = {
 
 const providersConfig: ProvidersConfigMap = {
   openai: enabledOpenAI,
-  "mux-gateway": { apiKeySet: true, isEnabled: true, isConfigured: true },
   openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
   coder: {
     apiKeySet: false,
@@ -82,11 +81,10 @@ describe("openaiCyberAccessProgram", () => {
   });
 
   test.each([
-    ["mux-gateway:openai/gpt-6.1-sol", undefined],
     ["openrouter:openai/gpt-6.1-sol", undefined],
     ["coder:openai/gpt-6.1-sol", undefined],
     ["team:gpt-6.1-sol", undefined],
-    ["openai:gpt-6.1-sol", "mux-gateway"],
+    ["openai:gpt-6.1-sol", "openrouter"],
     ["openai:gpt-6.1-sol", "coder"],
   ] as const)("is unavailable off the direct OpenAI route: %p via %p", (model, route) => {
     expect(

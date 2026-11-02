@@ -15,8 +15,10 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
   async function createSessionHarness(workspaceId: string, tokenBudget = false) {
-    const streamMessage = mock((opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
+    // The turn ends when the session closes: the harness cleanup disposes the session, and the
+    // mocked stopStream never aborts the turn's own abortSignal (#7526).
+    const streamMessage = mock((_opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
     const harness = await createAgentSessionHarness({
       workspaceId,

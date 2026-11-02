@@ -10,7 +10,7 @@ import {
   getAuthenticPlanReviewRecord,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import type { CompactionMonitor } from "./compactionMonitor";
+import { CompactionMonitor } from "./compactionMonitor";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { HistoryService } from "./historyService";
 import { getPlanReviewState, hashPlanSnapshotContent } from "./planReviewService";
@@ -25,6 +25,23 @@ const options: SendMessageOptions = { model: "openai:gpt-4o", agentId: "plan" };
 const fixtures: AgentSessionHarness[] = [];
 
 /**
+ * Makes every session's on-send check divert to compaction (or not). The spies sit on the
+ * prototype because each session builds its monitor internally (#4666); afterEach's
+ * mock.restore() removes them.
+ */
+function setMonitor(divert: boolean): void {
+  spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockReturnValue({
+    shouldShowWarning: divert,
+    shouldForceCompact: divert,
+    usagePercentage: divert ? 99 : 10,
+    thresholdPercentage: 85,
+    contextTokens: 0,
+    maxTokens: undefined,
+  });
+  spyOn(CompactionMonitor.prototype, "checkMidStream").mockReturnValue(false);
+}
+
+/**
  * planReviewSubmitFeedback sends the feedback envelope through the ordinary user-message path.
  * When that send trips ON-SEND auto-compaction, sendMessage durably appends only a
  * compaction-request row whose nested follow-up (metadata.parsed.followUpContent) carries the
@@ -35,22 +52,7 @@ async function fixture() {
   const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
   fixtures.push(h);
   // Force the divert: every pre-send check says "compact first".
-  (
-    h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
-  ).contextController.compactionMonitor = {
-    checkBeforeSend: mock(() => ({
-      shouldShowWarning: true,
-      shouldForceCompact: true,
-      usagePercentage: 99,
-      thresholdPercentage: 85,
-    })),
-    checkMidStream: mock(() => false),
-    resetForNewStream: mock(() => undefined),
-    noteUserTurn: mock(() => undefined),
-    noteAutoCompactionRequested: mock(() => undefined),
-    noteAutoCompactionCompleted: mock(() => undefined),
-    suppressRepeatedAutoCompaction: mock(() => false),
-  } as unknown as CompactionMonitor;
+  setMonitor(true);
   const rows = async (): Promise<MuxMessage[]> => {
     const result = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     assert(result.success);
@@ -163,22 +165,7 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
     await seedSnapshot(h);
     await sendDivertedFeedback(h);
     // Let the follow-up itself stream normally (no second divert).
-    (
-      h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
-    ).contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: false,
-        shouldForceCompact: false,
-        usagePercentage: 10,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      noteUserTurn: mock(() => undefined),
-      noteAutoCompactionRequested: mock(() => undefined),
-      noteAutoCompactionCompleted: mock(() => undefined),
-      suppressRepeatedAutoCompaction: mock(() => false),
-    } as unknown as CompactionMonitor;
+    setMonitor(false);
 
     await runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
@@ -251,24 +238,7 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       historyService: new HistoryService(h.config),
     });
     fixtures.push(restarted);
-    (
-      restarted.session as unknown as {
-        contextController: { compactionMonitor: CompactionMonitor };
-      }
-    ).contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: false,
-        shouldForceCompact: false,
-        usagePercentage: 10,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      noteUserTurn: mock(() => undefined),
-      noteAutoCompactionRequested: mock(() => undefined),
-      noteAutoCompactionCompleted: mock(() => undefined),
-      suppressRepeatedAutoCompaction: mock(() => false),
-    } as unknown as CompactionMonitor;
+    setMonitor(false);
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
     const feedbackRows = authenticFeedbackRows(await h.allRows());
     expect(feedbackRows).toHaveLength(1);
@@ -365,25 +335,6 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
  * HistoryService over the same config, which shares the cross-process history write lock.
  */
 describe("plan-review feedback whose snapshot or threads leave history before its append", () => {
-  function setMonitor(h: Awaited<ReturnType<typeof fixture>>, divert: boolean) {
-    (
-      h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
-    ).contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: divert,
-        shouldForceCompact: divert,
-        usagePercentage: divert ? 99 : 10,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      noteUserTurn: mock(() => undefined),
-      noteAutoCompactionRequested: mock(() => undefined),
-      noteAutoCompactionCompleted: mock(() => undefined),
-      suppressRepeatedAutoCompaction: mock(() => false),
-    } as unknown as CompactionMonitor;
-  }
-
   /** Rows after the snapshot, each larger than it, so a small token cut removes only the snapshot. */
   async function seedFillers(h: Awaited<ReturnType<typeof fixture>>) {
     for (const id of ["filler-1", "filler-2", "filler-3"]) {
@@ -408,7 +359,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
 
   test("(5) feedback sent after a sibling truncation removed its snapshot is refused at the append", async () => {
     const h = await fixture();
-    setMonitor(h, false);
+    setMonitor(false);
     await seedSnapshot(h);
     await seedFillers(h);
     await siblingTruncateSnapshot(h);
@@ -448,7 +399,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
     await seedSnapshot(h);
     await seedFillers(h);
     await sendDivertedFeedback(h);
-    setMonitor(h, false);
+    setMonitor(false);
     // The sibling cuts right after the summary lands, before the follow-up dispatch appends
     // (a cut while the compaction still streams fails that compaction instead). The snapshot now
     // sits before the boundary, so this cut does not touch the active context at all.
@@ -488,7 +439,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
 
   test("(8) a reply to a thread whose feedback row a sibling removed is refused", async () => {
     const h = await fixture();
-    setMonitor(h, false);
+    setMonitor(false);
     await seedSnapshot(h);
     const opened = await h.historyService.appendToHistory(
       workspaceId,
@@ -523,7 +474,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
 
   test("(9) sibling appends before the send do not refuse feedback", async () => {
     const h = await fixture();
-    setMonitor(h, false);
+    setMonitor(false);
     await seedSnapshot(h);
     const appended = await new HistoryService(h.config).appendToHistory(
       workspaceId,
@@ -546,7 +497,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
     const h = await fixture();
     await seedSnapshot(h);
     await sendDivertedFeedback(h);
-    setMonitor(h, false);
+    setMonitor(false);
     await runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
       workspaceId,
@@ -580,7 +531,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
 
   test("(11) an intact copy repairs an earlier partial copy of the same record", async () => {
     const h = await fixture();
-    setMonitor(h, false);
+    setMonitor(false);
     await seedSnapshot(h);
     // A damaged crash duplicate of the same record: its only comment anchor points past the
     // snapshot, so the projection accepts the feedback without its thread (partial).
@@ -618,7 +569,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
 
   test("(12) a damaged record whose two replies share one replyId is refused", async () => {
     const h = await fixture();
-    setMonitor(h, false);
+    setMonitor(false);
     await seedSnapshot(h);
     const opened = await h.historyService.appendToHistory(
       workspaceId,

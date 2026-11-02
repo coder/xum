@@ -462,6 +462,19 @@ export type EnsureReadyResult =
  */
 export const WORKSPACE_REPO_MISSING_ERROR = "Workspace setup incomplete: repository not found.";
 
+/** See Runtime.location. */
+export type RuntimeLocation = "local" | "devcontainer" | "remote";
+
+/** Same answer as `runtime instanceof LocalBaseRuntime` (local, worktree, devcontainer). */
+export function isLocalBaseRuntime(runtime: Runtime | undefined): boolean {
+  return runtime?.location === "local" || runtime?.location === "devcontainer";
+}
+
+/** Same answer as `runtime instanceof RemoteRuntime` (SSH, Coder SSH, Docker). */
+export function isRemoteRuntime(runtime: Runtime | undefined): boolean {
+  return runtime?.location === "remote";
+}
+
 /**
  * Runtime interface - minimal, low-level abstraction for tool execution environments.
  *
@@ -474,6 +487,14 @@ export interface Runtime {
    * If not provided, defaults to standard behavior (no flags set).
    */
   readonly createFlags?: RuntimeCreateFlags;
+  /**
+   * The runtime family, for code that branches on it without importing a runtime class
+   * (agent-loop files may not: local/no-host-imports). LocalBaseRuntime gives "local",
+   * DevcontainerRuntime (a LocalBaseRuntime) gives "devcontainer", and RemoteRuntime gives
+   * "remote", as prototype getters that subclasses and Object.create doubles inherit.
+   * MultiProjectRuntime and object doubles leave it absent, as instanceof is false for them.
+   */
+  readonly location?: RuntimeLocation;
   /**
    * Execute a bash command with streaming I/O.
    * cwd and pathEnv values are host-namespace paths translated by the adapter.

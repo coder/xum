@@ -1,21 +1,15 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { EventEmitter } from "events";
-import path from "path";
 
 import { Ok } from "@/common/types/result";
-import type { AIService } from "./aiService";
-import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { InitStateManager } from "./initStateManager";
 import type { TurnCompletion } from "./streamManager";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { TaskTurnAdmission, TurnAdmissionToken } from "./taskWorkspaceSeam";
 import { createTestHistoryService } from "./testHistoryService";
-import { WorkspaceService } from "./workspaceService";
-import { createMockAIService } from "./workspaceService.testHarness";
+import {
+  addToRenamingWorkspaces,
+  createRealHostWorkspaceService,
+  type RealHostWorkspaceService,
+} from "./workspaceService.testHarness";
 
 /**
  * The task-attempt fence at WorkspaceService's session handoff: a send into a workspace the task
@@ -53,7 +47,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
   const workspaceId = "fenced-task-workspace";
   const model = "anthropic:claude-sonnet-4-5";
   let cleanup: (() => Promise<void>) | undefined;
-  let session: AgentSession | undefined;
+  let host: RealHostWorkspaceService | undefined;
   const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
 
   afterEach(async () => {
@@ -61,8 +55,8 @@ describe("WorkspaceService task-attempt admission fence", () => {
       completion.resolve({ status: "aborted", abortReason: "user" });
     }
     completions.length = 0;
-    await session?.dispose();
-    session = undefined;
+    await host?.dispose();
+    host = undefined;
     await cleanup?.();
     cleanup = undefined;
   });
@@ -76,22 +70,14 @@ describe("WorkspaceService task-attempt admission fence", () => {
       name: workspaceId,
       projectName: "fenced-project",
       projectPath: "/tmp/fenced-project",
+      // A project-dir local workspace runs in its project directory.
+      namedWorkspacePath: "/tmp/fenced-project",
       runtimeConfig: { type: "local" },
     });
-    const backgroundProcessManager = Object.assign(new EventEmitter(), {
-      cleanup: mock(() => Promise.resolve()),
-      hasRunningBackgroundProcesses: mock(() => false),
-      hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-      getForegroundToolCallIds: mock(() => []),
-    }) as unknown as BackgroundProcessManager;
-    const aiEmitter = new EventEmitter();
     let streaming = false;
-    const harness = await createAgentSessionHarness({
-      workspaceId,
+    host = createRealHostWorkspaceService({
       config,
       historyService,
-      backgroundProcessManager,
-      aiEmitter,
       aiServiceOverrides: {
         isStreaming: () => streaming,
         streamMessage: mock(() => {
@@ -99,7 +85,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
           completions.push(completion);
           streaming = true;
           const messageId = `assistant-${completions.length}`;
-          aiEmitter.emit("stream-start", {
+          host?.aiEmitter.emit("stream-start", {
             type: "stream-start",
             workspaceId,
             messageId,
@@ -110,35 +96,12 @@ describe("WorkspaceService task-attempt admission fence", () => {
         }),
       },
     });
-    session = harness.session;
-    const initStateManager = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-      getInitState: mock(() => undefined),
-      waitForInit: mock(() => Promise.resolve()),
-      clearInMemoryState: mock(() => undefined),
-      getUnsanitizedCheckoutError: mock(() => undefined),
-    } as unknown as InitStateManager;
-    // The service listens on the session's AI emitter, as the real shared AIService does.
-    const aiService = createMockAIService({
-      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
-      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
-      isStreaming: () => streaming,
-    });
-    const service = new WorkspaceService(
-      config,
+    return {
+      service: host.service,
+      session: host.session(workspaceId),
+      aiService: host.aiService,
       historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      initStateManager,
-      new ExtensionMetadataService(path.join(config.rootDir, "fence-extension-metadata.json")),
-      backgroundProcessManager
-    );
-    (service as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      workspaceId,
-      harness.session
-    );
-    return { service, session: harness.session, aiService: harness.aiService, historyService };
+    };
   }
 
   function integration(
@@ -342,9 +305,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
         })
       );
       if (exit === "workspace being renamed") {
-        (service as unknown as { renamingWorkspaces: Set<string> }).renamingWorkspaces.add(
-          workspaceId
-        );
+        addToRenamingWorkspaces(service, workspaceId);
       }
       if (exit === "compaction capture failed") {
         spyOn(historyService, "captureCompactionReplacement").mockResolvedValue({

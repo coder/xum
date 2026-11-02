@@ -315,7 +315,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact data.json" });
     expect(pressed(dialog, "raw")).toBe("true");
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     expect(pressed(first.container, "raw")).toBe("true");
 
     // Switching sidebar tabs unmounts the panel.
@@ -370,7 +370,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact tree.json" });
     toggled(dialog);
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     toggled(first.container);
 
     // Switching sidebar tabs unmounts the panel.
@@ -540,7 +540,7 @@ describe("ArtifactsPanel", () => {
     window.addEventListener("keydown", windowListener);
     fireEvent.keyDown(dialog, { key: "Escape" });
     window.removeEventListener("keydown", windowListener);
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(escapeReachedWindowUnhandled).toBe(false);
     expect(outside.inert).toBe(false);
     expect(view.getByText("alpha")).toBe(viewerNode);
@@ -589,7 +589,7 @@ describe("ArtifactsPanel", () => {
       expect(region.querySelector(".left-sidebar-toggle-host") != null).toBe(leftSidebarCollapsed);
 
       fireEvent.keyDown(region, { key: "Escape" });
-      await waitFor(() => expect(view.queryByRole("region")).toBeNull());
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
       expect(chat.inert).toBe(false);
       await waitFor(() => expect(document.activeElement).toBe(panel));
 
@@ -599,7 +599,7 @@ describe("ArtifactsPanel", () => {
       await view.findByRole("region", { name: "Artifact a.txt" });
       leftSidebar.focus();
       expect(fireEvent.keyDown(leftSidebar, { key: "Escape" })).toBe(false);
-      await waitFor(() => expect(view.queryByRole("region")).toBeNull());
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
       expect(chat.inert).toBe(false);
       leftSidebar.remove();
       shell.remove();
@@ -639,7 +639,7 @@ describe("ArtifactsPanel", () => {
     expect(dialog.style.left).toBe("");
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(leftSidebar.inert).toBe(false);
     leftSidebar.remove();
     shell.remove();
@@ -683,7 +683,7 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
     expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     // Leaving the panel drops the ring.
     act(() => chatInput.focus());
     expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
@@ -808,7 +808,7 @@ describe("ArtifactsPanel", () => {
     // Opening the changed artifact clears its marker.
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
-    await waitFor(() => expect(view.queryByLabelText("1 changed")).toBeNull());
+    await waitFor(() => expect(view.queryByLabelText("1 changed") === null).toBe(true));
   });
 
   test("retries a failed preview on the next refresh", async () => {
@@ -1822,7 +1822,7 @@ describe("ArtifactsPanel", () => {
     expect(await within(dialog).findByText("alpha")).toBeTruthy();
 
     fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
@@ -1847,7 +1847,7 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(dialog));
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(document.activeElement).toBe(button);
     // J/K still reach the panel from the button.
     fireEvent.keyDown(button, { key: "j" });
@@ -2115,14 +2115,16 @@ describe("ArtifactsPanel", () => {
 
     // Keys go to whatever has focus, as a real key press would.
     fireEvent.keyDown(textarea, { key: "Escape" });
-    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("artifact-annotation-popover") === null).toBe(true)
+    );
     expect(document.activeElement).toBe(panel);
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
       "false"
     );
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 
   // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
@@ -2147,7 +2149,7 @@ describe("ArtifactsPanel", () => {
     act(() => toggle.focus());
 
     fireEvent.keyDown(toggle, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(toggle.isConnected).toBe(true);
     expect(document.activeElement).toBe(panel);
   });
@@ -2187,7 +2189,7 @@ describe("ArtifactsPanel", () => {
 
     await pick();
     fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
     // Annotate mode itself stays on: only the box, tied to the old layout, goes.
     expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
@@ -2224,6 +2226,6 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("dialog")).not.toBeNull();
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 });

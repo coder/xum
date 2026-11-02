@@ -296,8 +296,6 @@ describeIntegration("RightSidebar (UI)", () => {
       for (const name of ["Stats", "Review", "Instructions", "Goal", "Terminal"]) {
         expect(within(launcher).getByRole("button", { name })).toBeTruthy();
       }
-      // The only tab is already the New tab, so it offers no close button.
-      expect(sidebar.querySelector('button[aria-label^="Close"]')).toBeNull();
     } finally {
       await cleanup();
     }
@@ -428,8 +426,17 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("closing tabs: a static tab closes, and closing the last tab leaves the New tab", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs", "review"]));
+  const isCollapsed = () => readPersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+  const waitForCollapse = (sidebar: HTMLElement) =>
+    waitFor(() => {
+      if (sidebar.querySelector('[role="tablist"]')) throw new Error("sidebar did not collapse");
+      expect(isCollapsed()).toBe(true);
+    });
+
+  test("closing tabs: a static tab closes, and closing the last tab closes the sidebar", async () => {
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "review"])
+    );
 
     try {
       fireEvent.click(
@@ -440,9 +447,11 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
+      expect(isCollapsed()).toBe(false);
 
+      // User request: the sidebar closes instead of showing the New tab in the last tab's place.
       fireEvent.click(
         await findRequiredElement(
           sidebar,
@@ -450,18 +459,41 @@ describeIntegration("RightSidebar (UI)", () => {
           "Close Stats not found"
         )
       );
+      await waitForCollapse(sidebar);
+
+      // The next expand shows the New tab alone, and closing it closes the sidebar too.
+      fireEvent.click(within(view.container).getByRole("button", { name: "Expand right sidebar" }));
       await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => {
-        expect(getTabs(sidebar)).toHaveLength(1);
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).toBeNull();
-      });
+      expect(getTabs(sidebar)).toHaveLength(1);
+      fireEvent.click(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close New tab"]',
+          "Close New tab not found"
+        )
+      );
+      await waitForCollapse(sidebar);
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("closing the last tab when it is a terminal closes the sidebar", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView();
+
+    try {
+      const terminalTab = await createTerminalTab(sidebar);
+      expect(getTabs(sidebar)).toHaveLength(1);
+      fireEvent.click(within(terminalTab).getByRole("button", { name: "Close terminal" }));
+      await waitForCollapse(sidebar);
     } finally {
       await cleanup();
     }
   }, 60_000);
 
   // #6117 covered a close that leaves tabs in the pane. These cover the close of a pane's last
-  // tab: the pane empties (or collapses), and focus must still land on a tab, not <body>.
+  // tab: the pane collapses into its sibling, or the sidebar closes, and focus must still land
+  // on a control, not <body>.
   const closeByKeyboard = (close: HTMLElement) => {
     close.focus();
     // A focused button turns Enter into a click on itself.
@@ -474,7 +506,7 @@ describeIntegration("RightSidebar (UI)", () => {
       : (active?.tagName ?? "none");
   };
 
-  test("closing the only pane's last tab by keyboard focuses the New tab", async () => {
+  test("closing the only pane's last tab by keyboard focuses the sidebar toggle", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
     try {
       closeByKeyboard(
@@ -484,8 +516,10 @@ describeIntegration("RightSidebar (UI)", () => {
           "Close Stats not found"
         )
       );
-      await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-new$/));
+      await waitForCollapse(sidebar);
+      await waitFor(() =>
+        expect(document.activeElement?.getAttribute("aria-label")).toBe("Expand right sidebar")
+      );
     } finally {
       await cleanup();
     }
@@ -520,7 +554,7 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-costs$/));
     } finally {
@@ -549,7 +583,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Outside the viewport the same chord still closes the active tab.
       fireEvent.keyDown(window, closeTab);
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
     } finally {
       viewport.remove();
@@ -632,7 +666,7 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("Ctrl+Shift+K opens the Artifacts tab, and collapses the sidebar while it shows", async () => {
+  test("Ctrl+Shift+K opens and focuses the Artifacts tab, and collapses the sidebar from it", async () => {
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
     const { sidebar, cleanup } = await setupRightSidebarView();
     const chord = { key: "K", code: "KeyK", ctrlKey: true, shiftKey: true };
@@ -674,8 +708,23 @@ describeIntegration("RightSidebar (UI)", () => {
         }
       }
 
-      // Artifacts shows: the key collapses the whole sidebar, like Ctrl+Shift+B.
-      fireEvent.keyDown(window, chord);
+      // Artifacts shows but focus is elsewhere: the key moves focus into the tab and keeps the
+      // sidebar open.
+      const panel = () => sidebar.querySelector<HTMLElement>('[data-testid="artifacts-panel"]');
+      const outside = document.body.appendChild(document.createElement("button"));
+      try {
+        outside.focus();
+        fireEvent.keyDown(outside, chord);
+        await waitFor(() => expect(document.activeElement).toBe(panel()));
+        expect(collapsed()).toBe(false);
+      } finally {
+        outside.remove();
+      }
+
+      // Focus is in the tab: the key collapses the whole sidebar, like TOGGLE_RIGHT_SIDEBAR.
+      const focusedPanel = panel();
+      if (!focusedPanel) throw new Error("the Artifacts panel should be mounted");
+      fireEvent.keyDown(focusedPanel, chord);
       await waitFor(() => expect(collapsed()).toBe(true));
 
       // Collapsed: the key opens the sidebar on Artifacts again.
@@ -766,7 +815,7 @@ describeIntegration("RightSidebar (UI)", () => {
       toggle.focus();
       fireEvent.mouseUp(toggle);
       fireEvent.click(toggle);
-      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]')).toBeNull());
+      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]') === null).toBe(true));
       fireEvent.click(toggle);
 
       await findSidebarTab(sidebar, "costs");
@@ -815,7 +864,7 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(panel()).not.toBeNull();
       running = null;
       closing.finish();
-      await waitFor(() => expect(panel()).toBeNull());
+      await waitFor(() => expect(panel() === null).toBe(true));
       expect(card()).not.toBeNull();
 
       const opening = new FakeCSSTransition();
@@ -1100,7 +1149,7 @@ describeIntegration("RightSidebar (UI)", () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       // Force a narrow viewport so the right sidebar max clamp is exercised.
       Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
-      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new window.Event("resize"));
     });
 
     try {
@@ -1274,7 +1323,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.keyDown(reviewPanel, { key: "w", ctrlKey: true });
 
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).not.toBeNull();
     } finally {

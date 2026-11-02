@@ -44,7 +44,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS,
   GOAL_STREAM_ERROR_RESUME_MAX_ATTEMPTS,
@@ -609,7 +609,14 @@ export interface WorkspaceGoalServiceOptions {
 }
 
 export class WorkspaceGoalService {
-  private readonly fileLocks = workspaceFileLocks;
+  /**
+   * The one workspace FIFO, from the HistoryService's SessionLocks (phase 4), so a
+   * memory or foreign-holder layer reaches these writes too. Read at each use, not
+   * at construction: tests that pass a partial HistoryService keep working.
+   */
+  private get fileLocks(): SessionLocks["workspaceFiles"] {
+    return this.historyService.locks.workspaceFiles;
+  }
   private readonly continuationCooldownMs: number;
   private readonly allowUserOriginBudgetWrapup: boolean;
   private readonly suppressKickoffContinuation: boolean;

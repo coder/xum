@@ -11,7 +11,7 @@
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { disableTutorials, todoNudgeToolPolicies } from "../bugbash/repros/helpers";
+import { disableTutorials, sendMessage, todoNudgeToolPolicies } from "../bugbash/repros/helpers";
 import { openPlayground } from "./helpers";
 
 const NUDGE_REPLY = "Verified the fix in README.md. The TODO list is complete.";
@@ -28,10 +28,8 @@ test(
     // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
     await openPlayground(screen);
     const before = (await todoNudgeToolPolicies(app)).length;
-    await agent.act(
-      "type exactly '[mock:todo-nudge] fix the login bug' into the message box, send it, and " +
-        "wait until the agent stops replying"
-    );
+    // exact step: an agent step that types here stops replaying when the placeholder tip rotates.
+    await sendMessage(screen, "[mock:todo-nudge] fix the login bug");
     await expect(transcript).toContainText(NUDGE_REPLY, { timeout: 60_000 });
     await expect(transcript).toContainText(
       "Asked the agent to update its TODO list and finish open items"

@@ -434,25 +434,6 @@ export function reorderTabInTabset(
   };
 }
 
-export function selectTabInFocusedTabset(
-  state: RightSidebarLayoutState,
-  tab: TabType
-): RightSidebarLayoutState {
-  const focused = findTabset(state.root, state.focusedTabsetId);
-  if (focused?.type !== "tabset") {
-    return state;
-  }
-
-  if (focused.activeTab === tab && focused.tabs.includes(tab)) {
-    return state;
-  }
-
-  return {
-    ...state,
-    root: updateNode(state.root, focused.id, (ts) => insertTab(ts, tab, true)),
-  };
-}
-
 export function splitFocusedTabset(
   state: RightSidebarLayoutState,
   direction: "horizontal" | "vertical"
@@ -606,13 +587,6 @@ export function getFocusedActiveTab(state: RightSidebarLayoutState, fallback: Ta
   if (focused?.type === "tabset") return focused.activeTab;
   return fallback;
 }
-export function addToolToFocusedTabset(
-  state: RightSidebarLayoutState,
-  tab: TabType
-): RightSidebarLayoutState {
-  return selectTabInFocusedTabset(state, tab);
-}
-
 /**
  * Add a tab to the focused tabset without changing the active tab.
  * Used for feature-flagged tabs that should be available but not auto-selected.
@@ -733,8 +707,9 @@ function removeTabFromTabset(
 
 /**
  * Close one tab of one tabset (the strip's X, middle-click, Close Tab shortcut). A tabset left
- * empty collapses into its sibling; when it was the last tabset, the New tab takes its place.
- * Closing the New tab when it is the only tab of the layout does nothing.
+ * empty collapses into its sibling; when it was the last tabset, the New tab takes its place
+ * (RightSidebar closes the sidebar then, so it shows on the next expand). Closing the New tab
+ * when it is the only tab of the layout does nothing.
  *
  * Scoped to a tabset (unlike removeTabEverywhere) because each tabset may hold its own New tab.
  */

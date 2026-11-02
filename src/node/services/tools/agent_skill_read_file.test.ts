@@ -8,6 +8,8 @@ import {
 } from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -22,6 +24,8 @@ import {
   writeGlobalSkill,
   writeProjectSkill,
 } from "./testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 type ReadFileTool = ReturnType<typeof createAgentSkillReadFileTool>;
 type ReadFileArgs = Parameters<NonNullable<ReadFileTool["execute"]>>[0];
@@ -190,6 +194,52 @@ describe("agent_skill_read_file", () => {
     }
   );
 
+  it("reads a remote plugin skill's files from its snapshot, inside the skill folder only", async () => {
+    using tmp = new TestTempDir("remote-plugin-skill-read-file");
+    const checkout = await fs.realpath(tmp.path);
+    const pluginRoot = path.join(checkout, ".xum", "plugins", "kit");
+    const skillDir = path.join(pluginRoot, "skills", "kit-skill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: kit-skill\ndescription: d\n---\n"
+    );
+    await fs.writeFile(path.join(skillDir, "data.txt"), "remote data");
+    // Inside the plugin, but outside the skill folder.
+    await fs.symlink(path.join(pluginRoot, "plugin.json"), path.join(skillDir, "manifest.json"));
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "read-file-remote-plugin");
+    const tool = createAgentSkillReadFileTool(
+      createTestToolConfig(checkout, {
+        runtime,
+        xumScope: {
+          type: "project",
+          xumHome: checkout,
+          projectRoot: checkout,
+          projectStorageAuthority: "runtime",
+          projectPluginsTrusted: true,
+        },
+      })
+    );
+
+    expect(await executeReadFile(tool, { name: "kit-skill", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\tremote data",
+    });
+    expect(
+      await executeReadFile(tool, { name: "kit-skill", filePath: "manifest.json" })
+    ).toMatchObject({
+      success: false,
+      error: "Resolved file path points outside the skill directory: manifest.json",
+    });
+    // One listing, and the file itself never went over the remote runtime.
+    expect(runtime.pluginListings).toBe(1);
+    expect(runtime.commands.some((command) => command.includes("data.txt"))).toBe(false);
+  });
+
   it("reads a file from the plugin named by <plugin>:<skill>", async () => {
     using tmp = new TestTempDir("plugin-read-file-namespace");
     for (const plugin of ["alpha", "beta"]) {
@@ -254,10 +304,12 @@ describe("agent_skill_read_file", () => {
       runtime: config.runtime,
       workspacePath: config.cwd,
       xumScope: config.xumScope,
+      runtimeFactory,
     });
     const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
       roots: ctx.roots,
       containment: ctx.containment,
+      runtimeFactory,
     });
     const tool = createAgentSkillReadFileTool({
       ...config,

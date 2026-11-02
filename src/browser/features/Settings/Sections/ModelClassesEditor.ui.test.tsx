@@ -46,6 +46,7 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
 }));
 
 import { ModelClassesEditor } from "./ModelClassesEditor";
+import { settle } from "@/browser/contexts/connection.testHarness";
 
 function createApiMock(modelClasses: Record<string, string>) {
   return {
@@ -227,8 +228,9 @@ describe("ModelClassesEditor", () => {
     // The hook subscribes, starts the fetch, then observes the stream die.
     await waitFor(() => expect(apiMock?.config.getConfig).toHaveBeenCalled());
     configGate.resolve?.({ modelClasses: { small: "anthropic:claude-haiku-4-5+0" } });
-    // Let any (wrongly) accepted state publish before asserting.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Let any (wrongly) accepted state publish before asserting: the promise chains settle,
+    // so a late publication cannot slip past the check.
+    await settle();
 
     // Whether the fetch was discarded outright (no row value surfaces) or
     // published display-only (row rendered but disabled), editing must be
@@ -237,7 +239,7 @@ describe("ModelClassesEditor", () => {
     if (clearButton) {
       fireEvent.click(clearButton);
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await settle();
     expect(apiMock.config.updateModelClass).not.toHaveBeenCalled();
   });
 
@@ -331,7 +333,7 @@ describe("ModelClassesEditor", () => {
     const clearButton = getByLabelText("Clear model class small") as HTMLButtonElement;
     expect(clearButton.disabled).toBe(true);
     fireEvent.click(clearButton);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await settle();
     expect(apiMock.config.updateModelClass).not.toHaveBeenCalled();
 
     // The refetch publishes the peer's value and re-enables editing.

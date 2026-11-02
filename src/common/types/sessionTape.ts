@@ -116,14 +116,6 @@ export const SessionTapeTrailerSchema = z.object({
   }),
 });
 
-export const SessionTapeLineSchema = z.union([
-  SessionTapeHeaderSchema,
-  SessionTapeEventLineSchema,
-  SessionTapeTrailerSchema,
-]);
-
 export type SessionTapeHeader = z.infer<typeof SessionTapeHeaderSchema>;
-export type SessionTapeEventLine = z.infer<typeof SessionTapeEventLineSchema>;
 export type SessionTapeEndReason = z.infer<typeof SessionTapeEndReasonSchema>;
 export type SessionTapeTrailer = z.infer<typeof SessionTapeTrailerSchema>;
-export type SessionTapeLine = z.infer<typeof SessionTapeLineSchema>;

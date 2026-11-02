@@ -1,19 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
 import { Err, Ok } from "@/common/types/result";
-import {
-  createAgentSessionHarness,
-  runSessionTerminalPolicy,
-} from "@/node/services/agentSession.testHarness";
-import type { AgentSession } from "@/node/services/agentSession";
-import type { AIService } from "@/node/services/aiService";
-import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
-import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import { InitStateManager } from "@/node/services/initStateManager";
+import { runSessionTerminalPolicy } from "@/node/services/agentSession.testHarness";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { createRealHostWorkspaceService } from "@/node/services/workspaceService.testHarness";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
 import * as schemas from "@/common/orpc/schemas";
@@ -32,7 +24,6 @@ import {
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
-import { WorkspaceService } from "@/node/services/workspaceService";
 import { eventSpine } from "@/node/services/events/eventSpine";
 
 /**
@@ -92,26 +83,16 @@ describe("idempotent sends (real host)", () => {
       ],
       testTaskSettings()
     );
-    const aiEmitter = new EventEmitter();
     const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
     /** Per stream start, in order: "fail" makes that start fail after the user row is durable. */
     const startPlan: Array<"ok" | "fail"> = [];
     let streamCalls = 0;
     let streaming = false;
-    // The stopStream override runs after the harness exists; it reaches the session through this.
-    const sessionRef: { current?: AgentSession } = {};
-    const harness = await createAgentSessionHarness({
-      workspaceId,
+    const host = createRealHostWorkspaceService({
       config,
       historyService,
-      aiEmitter,
-      captureEvents: true,
       aiServiceOverrides: {
         isStreaming: () => streaming,
-        getWorkspaceMetadata: mock(async (id: string) => {
-          const found = (await config.getAllWorkspaceMetadata()).find((m) => m.id === id);
-          return found ? Ok(found) : Err("not found");
-        }),
         streamMessage: mock(() => {
           streamCalls++;
           if (startPlan.shift() === "fail") {
@@ -121,7 +102,7 @@ describe("idempotent sends (real host)", () => {
           completions.push(completion);
           streaming = true;
           const messageId = `assistant-${completions.length}`;
-          aiEmitter.emit("stream-start", {
+          host.aiEmitter.emit("stream-start", {
             type: "stream-start",
             workspaceId,
             messageId,
@@ -134,7 +115,7 @@ describe("idempotent sends (real host)", () => {
           streaming = false;
           completions.at(-1)?.resolve({ status: "aborted", abortReason: "user" });
           // The abort reaches the session's terminal policy the way StreamManager reports it.
-          void runSessionTerminalPolicy(sessionRef.current!, aiEmitter, {
+          void runSessionTerminalPolicy(session, host.aiEmitter, {
             type: "stream-abort",
             workspaceId,
             messageId: `assistant-${completions.length}`,
@@ -144,32 +125,13 @@ describe("idempotent sends (real host)", () => {
         }),
       },
     });
-    sessionRef.current = harness.session;
-    const aiService = harness.aiService as unknown as AIService;
-    const workspaceService = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      new InitStateManager(config),
-      new ExtensionMetadataService(path.join(config.rootDir, "send-ids-extension-metadata.json")),
-      new BackgroundProcessManager(path.join(config.rootDir, "send-ids-background-processes"))
-    );
-    (workspaceService as unknown as { sessions: Map<string, unknown> }).sessions.set(
-      workspaceId,
-      harness.session
-    );
+    const workspaceService = host.service;
+    const session = host.session(workspaceId);
     cleanups.push(async () => {
       for (const completion of completions) {
         completion.resolve({ status: "aborted", abortReason: "user" });
       }
-      workspaceService.beginShutdown();
-      await harness.session.dispose();
-      const pending = (
-        workspaceService as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> }
-      ).pendingWorkspaceCleanup;
-      while (pending.size > 0) await Promise.all([...pending]);
-      await harness.cleanup();
+      await host.dispose();
     });
     const userRows = async () => {
       const rows = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -209,7 +171,7 @@ describe("idempotent sends (real host)", () => {
         parts: [{ type: "text" as const, text: "done" }],
       };
       streaming = false;
-      const policy = runSessionTerminalPolicy(harness.session, aiEmitter, event);
+      const policy = runSessionTerminalPolicy(session, host.aiEmitter, event);
       completions[index]?.resolve({
         status: "completed",
         streamEnd: event as unknown as Extract<
@@ -221,7 +183,7 @@ describe("idempotent sends (real host)", () => {
     };
     return {
       workspaceService,
-      session: harness.session,
+      session,
       endStream,
       startPlan,
       streamCalls: () => streamCalls,

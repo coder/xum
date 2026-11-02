@@ -12,6 +12,7 @@ import {
 } from "@/constants/rlmCompaction";
 import type { HistoryService } from "../historyService";
 import { createTestHistoryService } from "../testHistoryService";
+import { SessionFilesMemory } from "../sessionFiles/memorySessionFiles.testHarness";
 import { computeKeepRecentTailStamp } from "./compactionRequests";
 
 const workspaceId = "keep-recent-tail-workspace";
@@ -48,7 +49,7 @@ describe("computeKeepRecentTailStamp", () => {
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ historyService, cleanup } = await createTestHistoryService());
+    ({ historyService, cleanup } = await createTestHistoryService({ files: SessionFilesMemory }));
   });
 
   afterEach(async () => {

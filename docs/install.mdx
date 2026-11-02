@@ -130,7 +130,7 @@ Or install globally:
 npm install -g @coder/xum
 ```
 
-The CLI and `xum server` need Node 22 or newer. On an older Node, the CLI prints a warning at startup.
+The CLI and `xum server` need Node 22.23.4 or a later 22.x, 24.22.1 or a later 24.x, or 26.12.1 or newer. Older releases are affected by CVE-2026-111497, which lets crafted Brotli data run code. On an older or affected Node, the CLI prints a warning at startup.
 
 The legacy `mux` package and command forward to the matching Xum release during the transition. See [Mux compatibility](/reference/mux-compatibility) for storage, environment-variable, and downgrade details.
 

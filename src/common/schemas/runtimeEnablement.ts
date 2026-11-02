@@ -6,5 +6,3 @@ import { z } from "zod";
 // runtime IDs survive upgrade→downgrade cycles without blocking unrelated edits.
 // The runtime normalizer in config.ts filters to known IDs at load time.
 export const RuntimeEnablementOverridesSchema = z.record(z.string(), z.literal(false));
-
-export type RuntimeEnablementOverrides = z.infer<typeof RuntimeEnablementOverridesSchema>;

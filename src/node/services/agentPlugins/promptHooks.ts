@@ -13,7 +13,9 @@ import type {
   MessageSendContext,
   MessageSendOrigin,
   TurnStopContext,
+  TurnStopContinueReason,
 } from "@/node/services/events/eventSpine";
+import { MAX_STOP_HOOK_CONTINUATIONS } from "@/constants/pluginHooks";
 import type { PluginHookContextEntry } from "@/common/types/message";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -126,6 +128,7 @@ function capContextEntries(
 
 /** turn.stop reply text is cut to this length. */
 const TURN_STOP_TEXT_MAX_CHARS = 16 * 1024;
+const LEADING_LONE_LOW_SURROGATE = /^[\uDC00-\uDFFF]/;
 /** A continuation prompt is a new user row; longer prompts are cut. */
 export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 
@@ -133,18 +136,38 @@ export const TURN_STOP_PROMPT_MAX_CHARS = 32_000;
 export type TurnStopHookOutcome =
   | { kind: "none" }
   | { kind: "halted" }
-  | { kind: "continue"; prompt: string };
+  | {
+      kind: "continue";
+      /** Trimmed, in chain order, each hook under its limit. joinTurnStopReasons builds the prompt. */
+      reasons: TurnStopContinueReason[];
+    };
 
+export type TurnStopHookInput = Pick<
+  TurnStopContext,
+  | "messageId"
+  | "lastAssistantMessage"
+  | "model"
+  | "turnContinuations"
+  | "hookContinuations"
+  | "abortSignal"
+>;
+
+/**
+ * Runs the chain, then drops each reason whose hook reached its limit (its `loopLimit`, or the
+ * shared default). The per-user-turn ceiling is the caller's.
+ */
 export async function runTurnStopHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: Pick<
-    TurnStopContext,
-    "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd" | "model"
-  >
+  input: TurnStopHookInput & Pick<TurnStopContext, "cwd">
 ): Promise<TurnStopHookOutcome> {
   if (!spine.hasMiddlewareFor("turn.stop", workspaceId)) return { kind: "none" };
-  const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };
+  const ctx: TurnStopContext = {
+    workspaceId,
+    ...input,
+    stopHookActive: input.turnContinuations > 0,
+    continueReasons: [],
+  };
   try {
     await spine.run("turn.stop", ctx);
   } catch (error) {
@@ -156,19 +179,57 @@ export async function runTurnStopHooks(
   }
   // Codex: a `continue: false` from any Stop hook wins over every continuation.
   if (ctx.halted != null) return { kind: "halted" };
-  const prompt = ctx.continueReasons
-    .map((reason) => reason.trim())
-    .filter((reason) => reason.length > 0)
-    .join("\n\n")
-    .slice(0, TURN_STOP_PROMPT_MAX_CHARS);
-  return prompt.length > 0 ? { kind: "continue", prompt } : { kind: "none" };
+  const kept = ctx.continueReasons
+    .map((reason) => ({ ...reason, text: reason.text.trim() }))
+    .filter(
+      (reason) => reason.text.length > 0 && hasContinuationsLeft(reason, input.hookContinuations)
+    );
+  return kept.length > 0 ? { kind: "continue", reasons: kept } : { kind: "none" };
+}
+
+const REASON_SEPARATOR = "\n\n";
+
+/**
+ * The reasons' prompt, cut to `maxChars`, and the hooks it continues: only those with some text
+ * left after the cut, so a hook whose whole reason was cut away neither counts nor is named.
+ */
+export function joinTurnStopReasons(
+  reasons: readonly TurnStopContinueReason[],
+  maxChars: number
+): { prompt: string; hookKeys: string[]; pluginNames: string[] } {
+  // slice(0, negative) would cut from the end: no room means no reason text at all.
+  const prompt = reasons
+    .map((reason) => reason.text)
+    .join(REASON_SEPARATOR)
+    .slice(0, Math.max(0, maxChars));
+  let start = 0;
+  const inPrompt = reasons.filter((reason) => {
+    const kept = start < prompt.length;
+    start += reason.text.length + REASON_SEPARATOR.length;
+    return kept;
+  });
+  return {
+    prompt,
+    hookKeys: [...new Set(inPrompt.map((reason) => reason.hookKey))],
+    pluginNames: [...new Set(inPrompt.map((reason) => reason.pluginName))],
+  };
+}
+
+function hasContinuationsLeft(
+  reason: TurnStopContinueReason,
+  counts: ReadonlyMap<string, number>
+): boolean {
+  if (reason.loopLimit === null) return true;
+  const limit = reason.loopLimit ?? MAX_STOP_HOOK_CONTINUATIONS;
+  return (counts.get(reason.hookKey) ?? 0) < limit;
 }
 
 /**
  * The reply's trailing text run (Codex last_assistant_message). Text before a later tool call is
  * an intermediate step, not the reply, so a turn that ends on a tool part gets null (#6067).
  * Reasoning parts are skipped. Taken from the stream-end parts, not a history read, so rows
- * appended after the reply cannot hide it (#6062).
+ * appended after the reply cannot hide it (#6062). A long run keeps its end, because a completion
+ * promise sits at the end of a reply.
  */
 export function lastAssistantText(parts: readonly CompletedMessagePart[]): string | null {
   let text = "";
@@ -178,5 +239,6 @@ export function lastAssistantText(parts: readonly CompletedMessagePart[]): strin
     if (part.type !== "text") break;
     text = part.text + text;
   }
-  return text.trim().length > 0 ? text.slice(0, TURN_STOP_TEXT_MAX_CHARS) : null;
+  if (text.trim().length === 0) return null;
+  return text.slice(-TURN_STOP_TEXT_MAX_CHARS).replace(LEADING_LONE_LOW_SURROGATE, "");
 }

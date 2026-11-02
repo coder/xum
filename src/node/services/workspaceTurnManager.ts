@@ -3,10 +3,9 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import {
-  acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
-  inspectCrossProcessLock,
-} from "@/node/utils/main/crossProcessLock";
+  type SessionLocks,
+} from "@/node/services/sessionLocks/sessionLocks";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -42,6 +41,8 @@ import {
   agentReportProgressDedupePrefix,
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
+// Outside the agent loop: WorkspaceTurnManager passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -123,7 +124,10 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { StreamErrorType } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
-import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import {
+  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+  type CoderWorkspaceArchiveBehavior,
+} from "@/common/config/coderArchiveBehavior";
 import { isSSHRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import {
   TaskHandleStore,
@@ -452,9 +456,10 @@ const WORKSPACE_TURN_OWNER_LOCK_STALE_MS = 5 * 60 * 1000;
 class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
   constructor(
     config: Config,
-    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>
+    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>,
+    locks: SessionLocks
   ) {
-    super(config);
+    super(config, locks);
   }
 
   override async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
@@ -697,6 +702,20 @@ class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegist
   }
 }
 
+/**
+ * Why an agent-driven archive must refuse a permanent remote deletion: a dedicated Coder
+ * workspace under the Coder "delete" policy, which unarchive cannot recreate.
+ */
+function remoteBoxDeletionRefusal(
+  isDedicatedCoderWorkspace: boolean,
+  coderArchiveBehavior: CoderWorkspaceArchiveBehavior
+): string | undefined {
+  if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
+    return 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".';
+  }
+  return undefined;
+}
+
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
@@ -719,8 +738,12 @@ export class WorkspaceTurnManager {
     private readonly streamManager?: StreamManager,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
-      this.afterHandleWrite(record)
+    // Phase 4: every lock of this manager (publication, live owner, its probe) comes from the
+    // history service's SessionLocks, so a test layer can play another backend's owner.
+    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(
+      config,
+      (record) => this.afterHandleWrite(record),
+      historyService.locks
     );
   }
 
@@ -743,7 +766,7 @@ export class WorkspaceTurnManager {
   private async acquireTurnOwnerLock(handleId: string): Promise<"held" | "foreign-live"> {
     if (this.turnOwnerLocks.has(handleId)) return "held";
     try {
-      const release = await acquireCrossProcessLock({
+      const release = await this.historyService.locks.acquireCrossProcessLock({
         lockPath: workspaceTurnOwnerLockPath(this.config.rootDir, handleId),
         acquireTimeoutMs: 0,
         staleMs: WORKSPACE_TURN_OWNER_LOCK_STALE_MS,
@@ -1110,7 +1133,7 @@ export class WorkspaceTurnManager {
         params.runtime,
         params.workspacePath,
         parsedAgentId.data,
-        { projectPluginsTrusted: params.projectPluginsTrusted }
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       scope = definition.scope;
       source = definition.source;
@@ -1121,6 +1144,7 @@ export class WorkspaceTurnManager {
         agentDefinition: definition,
         workspaceId: params.workspaceId,
         projectPluginsTrusted: params.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       chain = resolvedChain.map((entry) => ({
         id: entry.id,
@@ -1145,7 +1169,7 @@ export class WorkspaceTurnManager {
         params.runtime,
         params.workspacePath,
         params.agentId,
-        { projectPluginsTrusted: params.projectPluginsTrusted }
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
     } catch (error) {
       if (isRuntimeTransportError(error)) {
@@ -1269,7 +1293,10 @@ export class WorkspaceTurnManager {
         parsedAgentId.data,
         // #6426: read in the owner, but the target streams it, so the target's trust decides
         // which candidate wins (owner and target share the agent host here).
-        { projectPluginsTrusted: params.target.projectPluginsTrusted }
+        {
+          projectPluginsTrusted: params.target.projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }
       );
       resolvedScope = definition.scope;
     } catch (error) {
@@ -1288,14 +1315,19 @@ export class WorkspaceTurnManager {
         `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so project-local agentId (${params.agentId}) cannot be verified there`
       );
     }
+    // #7216: the owner's checkout, but the target's trust (the target streams the agent).
+    const ownerCheckoutContext = {
+      ...params.owner,
+      projectPluginsTrusted: params.target.projectPluginsTrusted,
+    };
     const validation = await this.validateWorkspaceTurnAgentId({
       cfg: params.cfg,
       agentId: params.agentId,
       workspaceId: params.workspaceId,
-      ...params.owner,
+      ...ownerCheckoutContext,
     });
     return validation.success
-      ? Ok({ validatedContext: params.owner, ...validation.data })
+      ? Ok({ validatedContext: ownerCheckoutContext, ...validation.data })
       : validation;
   }
 
@@ -1370,18 +1402,14 @@ export class WorkspaceTurnManager {
       );
     }
 
-    const allWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns();
-    const ownerWorkspaceTurns = allWorkspaceTurns.filter(
-      (record) => record.ownerWorkspaceId === ownerWorkspaceId
-    );
-    const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
     // Closures in this function share one scope, and callbacks handed to sendMessage (onCanceled)
-    // can outlive the turn. Capturing allWorkspaceTurns pinned every owner's records, ~82 MB per
-    // copy in a long-lived server (F29). Capture only the records with an active status: the
-    // count skips every other record before its first await, so the result is the same.
-    const statusActiveWorkspaceTurns = allWorkspaceTurns.filter((record) =>
-      isActiveWorkspaceTurnTaskStatus(record.status)
-    );
+    // can outlive the turn. Capturing every owner's records pinned ~82 MB per copy in a long-lived
+    // server (F29). Read only the records with an active status: the count and the active-turn
+    // lookup skip every other record, and the scan reads only these files.
+    const statusActiveWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns({
+      statuses: COUNTED_WORKSPACE_TURN_STATUSES,
+    });
+    const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
     const ensureParallelSlot = async (): Promise<Result<void, string>> => {
       const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(
         statusActiveWorkspaceTurns
@@ -1474,14 +1502,14 @@ export class WorkspaceTurnManager {
 
       // The owner rule. The active-turn lookup reads only the owners it admits
       // (workspaceTurnOwners.ts), so changing it must update that module.
-      const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
-        (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
-      );
       const ownsDescendantAgentWorkspace =
         args.allowAgentWorkspace === true &&
         targetEntry?.workspace.parentWorkspaceId != null &&
         this.taskHost.isDescendantAgentTaskInConfig(cfg, ownerWorkspaceId, existingWorkspaceId);
-      if (!ownsExistingWorkspaceTurn && !ownsDescendantAgentWorkspace) {
+      if (
+        !ownsDescendantAgentWorkspace &&
+        !(await this.createdThroughWorkspaceTurn(ownerWorkspaceId, existingWorkspaceId))
+      ) {
         return Err("Task.createWorkspaceTurn: invalid_scope for existing workspace");
       }
       if (
@@ -1563,6 +1591,7 @@ export class WorkspaceTurnManager {
         agentDefinitionContext = {
           ...validation.data.validatedContext,
           workspaceId: targetWorkspaceId,
+          runtimeFactory: nodeRuntimeFactory,
         };
       }
       // Follow-up sends continue the target workspace's own last-used settings
@@ -1575,7 +1604,7 @@ export class WorkspaceTurnManager {
         : undefined;
       queuedForExistingWorkspace = this.workspaceService.isBusyForMessage(existingWorkspaceId);
       const activeWorkspaceTurn = await this.findActiveWorkspaceTurnForWorkspace(
-        allWorkspaceTurns,
+        statusActiveWorkspaceTurns,
         existingWorkspaceId
       );
       if (!queuedForExistingWorkspace || activeWorkspaceTurn == null) {
@@ -1692,7 +1721,11 @@ export class WorkspaceTurnManager {
             { agentId: requestedAgentId, error: validation.error }
           );
         } else {
-          agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+          agentDefinitionContext = {
+            ...ownerContext,
+            workspaceId: ownerWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
+          };
         }
       }
       const slot = await ensureParallelSlot();
@@ -1796,6 +1829,7 @@ export class WorkspaceTurnManager {
           agentDefinitionContext = {
             ...validation.data.validatedContext,
             workspaceId: targetWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
           };
         }
       }
@@ -4006,13 +4040,16 @@ export class WorkspaceTurnManager {
             targetRuntimeConfig.coder != null &&
             targetRuntimeConfig.coder.existingWorkspace !== true &&
             (targetRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
-          if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
+          const remoteDeletion = remoteBoxDeletionRefusal(
+            isDedicatedCoderWorkspace,
+            coderArchiveBehavior
+          );
+          if (remoteDeletion) {
             return Ok({
               status: "error",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error:
-                'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".',
+              error: remoteDeletion,
             });
           }
 
@@ -4184,7 +4221,7 @@ export class WorkspaceTurnManager {
                   .map((subagent) => `${subagent.title} (${subagent.workspaceId})`)
                   .join(", ")}, because the snapshot archive behavior cannot preserve them. ` +
                 "This tool cannot approve that loss, and you must not delete the files to get around it. " +
-                "Ask the user to archive those sub-agents manually first; the archive dialog lists the files and asks for confirmation.",
+                "Ask the user to archive this workspace manually; the archive dialog lists the sub-agents' files and asks for confirmation.",
             });
           }
           if (targetPaths.length > 0) {
@@ -4686,6 +4723,19 @@ export class WorkspaceTurnManager {
     return isActiveWorkspaceTurnTaskStatus(record.status);
   }
 
+  /** An unreadable handle directory reads as no records, as it does in the global scan. */
+  private async createdThroughWorkspaceTurn(
+    ownerWorkspaceId: string,
+    workspaceId: string
+  ): Promise<boolean> {
+    try {
+      return await this.taskHandleStore.isWorkspaceOwnedBy(ownerWorkspaceId, workspaceId);
+    } catch (error: unknown) {
+      log.warn("Skipping unreadable workspace-turn handle directory", { ownerWorkspaceId, error });
+      return false;
+    }
+  }
+
   private async findActiveWorkspaceTurnForWorkspace(
     records: readonly WorkspaceTurnTaskHandleRecord[],
     workspaceId: string
@@ -4860,7 +4910,7 @@ export class WorkspaceTurnManager {
    */
   private async keepIfOwnedElsewhere(handleId: string): Promise<"keep" | undefined> {
     if (this.turnOwnerLocks.has(handleId)) return undefined;
-    const lock = await inspectCrossProcessLock(
+    const lock = await this.historyService.locks.inspectCrossProcessLock(
       workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
     );
     return lock.state === "held" ? "keep" : undefined;

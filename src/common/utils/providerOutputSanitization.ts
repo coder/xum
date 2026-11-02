@@ -1,10 +1,7 @@
 import assert from "@/common/utils/assert";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 
-const DEFAULT_MAX_SAFE_STRING_CHARS = 12_000;
-const DEFAULT_MAX_ERROR_MESSAGE_CHARS = 2_000;
 const DEFAULT_PROVIDER_PREVIEW_CHARS = 64;
-const DEFAULT_ERROR_PREVIEW_CHARS = 240;
 const MAX_RECURSION_DEPTH = 8;
 
 interface TextSafetyStats {
@@ -12,11 +9,6 @@ interface TextSafetyStats {
   nulCount: number;
   controlCount: number;
   replacementCount: number;
-}
-
-interface SanitizeStringOptions {
-  maxChars?: number;
-  reason?: "provider-output" | "error-message";
 }
 
 // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -112,39 +104,9 @@ function formatCounts(stats: TextSafetyStats): string {
   return `length=${stats.length}, nul=${stats.nulCount}, control=${stats.controlCount}, replacement=${stats.replacementCount}`;
 }
 
-function formatBinaryRedaction(
-  value: string,
-  stats: TextSafetyStats,
-  reason: NonNullable<SanitizeStringOptions["reason"]>
-): string {
-  const previewChars =
-    reason === "error-message" ? DEFAULT_ERROR_PREVIEW_CHARS : DEFAULT_PROVIDER_PREVIEW_CHARS;
-  const preview = escapePreview(value, previewChars);
-  return `[redacted binary-like ${reason}; ${formatCounts(stats)}; preview="${preview}"]`;
-}
-
-/** Bound and redact provider-visible strings so binary response bodies cannot poison history. */
-export function sanitizeStringForProviderOutput(
-  value: string,
-  options: SanitizeStringOptions = {}
-): string {
-  const maxChars = options.maxChars ?? DEFAULT_MAX_SAFE_STRING_CHARS;
-  assert(Number.isInteger(maxChars) && maxChars > 0, "sanitize maxChars must be positive");
-
-  if (value.length <= maxChars && !hasUnsafeText(value)) {
-    return value;
-  }
-
-  const stats = getTextSafetyStats(value);
-  const reason = options.reason ?? "provider-output";
-  if (isBinaryLikeText(value, stats)) {
-    return formatBinaryRedaction(value, stats, reason);
-  }
-  if (value.length <= maxChars) {
-    return value;
-  }
-
-  return `${value.slice(0, maxChars)}\n[truncated ${reason}; ${formatCounts(stats)}]`;
+function formatBinaryRedaction(value: string, stats: TextSafetyStats): string {
+  const preview = escapePreview(value, DEFAULT_PROVIDER_PREVIEW_CHARS);
+  return `[redacted binary-like provider-output; ${formatCounts(stats)}; preview="${preview}"]`;
 }
 
 /** Redact a binary-like tool output string; any other string keeps its full length. */
@@ -153,16 +115,7 @@ function redactBinaryLikeString(value: string): string {
     return value;
   }
   const stats = getTextSafetyStats(value);
-  return isBinaryLikeText(value, stats)
-    ? formatBinaryRedaction(value, stats, "provider-output")
-    : value;
-}
-
-export function sanitizeErrorMessageForDisplay(message: string): string {
-  return sanitizeStringForProviderOutput(message, {
-    maxChars: DEFAULT_MAX_ERROR_MESSAGE_CHARS,
-    reason: "error-message",
-  });
+  return isBinaryLikeText(value, stats) ? formatBinaryRedaction(value, stats) : value;
 }
 
 /**

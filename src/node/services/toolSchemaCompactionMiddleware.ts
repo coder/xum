@@ -86,12 +86,9 @@ export function compactToolInputSchema(
 }
 
 // createAnthropic names its models "anthropic.messages" on every route (direct, Coder, custom
-// anthropic-messages providers), and the gateway forwards anthropic/* models to Anthropic.
-function sendsAnthropicMessages(model: Pick<LanguageModelV4, "provider" | "modelId">): boolean {
-  return (
-    model.provider === "anthropic.messages" ||
-    (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
-  );
+// anthropic-messages providers).
+function sendsAnthropicMessages(model: Pick<LanguageModelV4, "provider">): boolean {
+  return model.provider === "anthropic.messages";
 }
 
 export function createToolSchemaCompactionMiddleware(): LanguageModelV4Middleware {

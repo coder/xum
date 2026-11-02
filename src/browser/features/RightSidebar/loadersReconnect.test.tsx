@@ -13,11 +13,14 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import { createTestConfig, type TestApiOutput, type TestApiOverrides } from "@/browser/testUtils";
+import type { GoalBoardSnapshot, GoalRecordV1 } from "@/common/types/goal";
+import type { WorkspaceInstructions } from "@/common/types/instructions";
 import { GoalDefaultsSection } from "./GoalDefaultsSection";
 import { useGoalBoard, type UseGoalBoardResult } from "./useGoalBoard";
 
@@ -39,25 +42,53 @@ function deferred<T>(): Deferred<T> {
 }
 
 /** What each server procedure answers; a test swaps them (or holds them) before a connect. */
-let answerBoard: () => Promise<unknown>;
-let answerServers: () => Promise<unknown>;
-let answerInstructions: () => Promise<unknown>;
-let answerChatInstructions: () => Promise<unknown>;
-let answerOverride: () => Promise<unknown>;
-let savedOverrides: unknown[] = [];
+type Workspace = APIClient["workspace"];
+let answerBoard: () => Promise<TestApiOutput<Workspace["getGoalBoard"]>>;
+let answerServers: () => Promise<TestApiOutput<APIClient["mcp"]["list"]>>;
+let answerInstructions: () => Promise<TestApiOutput<Workspace["getInstructions"]>>;
+let answerChatInstructions: () => Promise<TestApiOutput<Workspace["getAdditionalSystemContext"]>>;
+let answerOverride: () => Promise<TestApiOutput<Workspace["goalDefaults"]["get"]>>;
+let savedOverrides: Array<Parameters<Workspace["goalDefaults"]["set"]>[0]> = [];
 let savedChatInstructions: Array<{ content: string; enabled: boolean }> = [];
 let failChatSave: Error | null = null;
 
-function board(goalId: string) {
-  return { entries: [{ section: "upcoming", goal: { goalId } }] };
+function board(goalId: string): GoalBoardSnapshot {
+  const goal: GoalRecordV1 = {
+    version: 1,
+    goalId,
+    objective: `Goal ${goalId}`,
+    status: "active",
+    budgetCents: null,
+    turnCap: null,
+    costCents: 0,
+    turnsUsed: 0,
+    attributedChildren: [],
+    budgetLimitInjectedForGoalId: null,
+    requireUserAcknowledgmentSinceMs: null,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  };
+  return { entries: [{ section: "upcoming", goal }] };
 }
 
-function servers(name: string) {
+function servers(name: string): TestApiOutput<APIClient["mcp"]["list"]> {
   return { [name]: { transport: "stdio", command: "run", disabled: false } };
 }
 
 function turnCapOverride(turnCap: number) {
   return { defaultBudgetCents: null, defaultTurnCap: turnCap, alwaysRequireExplicitBudget: null };
+}
+
+/** A workspace with no instruction files. */
+function noInstructions(): WorkspaceInstructions {
+  return {
+    workspaceId: "ws-instructions",
+    model: null,
+    additionalSystemContext: { content: "", enabled: true },
+    sources: { global: [], context: [] },
+    files: [],
+    totalTokens: 0,
+  };
 }
 
 function serverOverrides(): TestApiOverrides<APIClient> {
@@ -66,22 +97,22 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getGoalBoard: () => answerBoard(),
       getInstructions: () => answerInstructions(),
       getAdditionalSystemContext: () => answerChatInstructions(),
-      setAdditionalSystemContext: (input: { content: string; enabled: boolean }) => {
+      setAdditionalSystemContext: (input) => {
         if (failChatSave) return Promise.reject(failChatSave);
         savedChatInstructions.push({ content: input.content, enabled: input.enabled });
         return Promise.resolve({ content: input.content, enabled: input.enabled });
       },
       goalDefaults: {
         get: () => answerOverride(),
-        set: (input: unknown) => {
+        set: (input) => {
           savedOverrides.push(input);
-          return Promise.resolve();
+          return Promise.resolve({ success: true as const, data: undefined });
         },
       },
     },
     mcp: { list: () => answerServers() },
-    config: { getConfig: () => Promise.resolve({}) },
-  } as unknown as TestApiOverrides<APIClient>;
+    config: { getConfig: () => Promise.resolve(createTestConfig()) },
+  };
 }
 
 let harness: ConnectionHarness;
@@ -99,24 +130,18 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 /** Never answers: the read stays in flight until a drop cuts it off. */
-function pending(): Promise<unknown> {
+function pending<T>(): Promise<T> {
   return new Promise(() => undefined);
 }
 
@@ -183,7 +208,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
   });
 
   test("the Instructions tab keeps its empty state and an enabled editor while it reloads", async () => {
-    answerInstructions = () => Promise.resolve({ files: [], totalTokens: 0 });
+    answerInstructions = () => Promise.resolve(noInstructions());
     answerChatInstructions = () => Promise.resolve({ content: "be brief", enabled: true });
     const view = render(<InstructionsTab workspaceId="ws-instructions" />, { wrapper: Wrapper });
     const editor = (await view.findByLabelText("Chat Instructions editor")) as HTMLTextAreaElement;
@@ -192,8 +217,8 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     expect(editor.disabled).toBe(false);
 
     await drop();
-    const nextInstructions = deferred<unknown>();
-    const nextChatInstructions = deferred<unknown>();
+    const nextInstructions = deferred<WorkspaceInstructions>();
+    const nextChatInstructions = deferred<{ content: string; enabled: boolean }>();
     answerInstructions = () => nextInstructions.promise;
     answerChatInstructions = () => nextChatInstructions.promise;
     await reconnect();
@@ -201,7 +226,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     expect(editor.disabled).toBe(false);
     expect(view.queryByText("Loading…")).toBeNull();
 
-    nextInstructions.resolve({ files: [], totalTokens: 0 });
+    nextInstructions.resolve(noInstructions());
     nextChatInstructions.resolve({ content: "be precise", enabled: true });
     await waitFor(() => expect(editor.value).toBe("be precise"));
   });
@@ -216,7 +241,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     await waitFor(() => expect(turnCap().value).toBe("5"));
 
     await drop();
-    const next = deferred<unknown>();
+    const next = deferred<ReturnType<typeof turnCapOverride>>();
     answerOverride = () => next.promise;
     await reconnect();
     expect(turnCap().value).toBe("5");
@@ -228,7 +253,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     fireEvent.blur(turnCap());
     await waitFor(() => expect(savedOverrides).toHaveLength(1));
     next.resolve(turnCapOverride(7));
-    await flush();
+    await settle();
     expect(turnCap().value).toBe("9");
   });
 });
@@ -253,7 +278,7 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
 
   test("the chat-instructions editor is read-only while offline, and editable again after the reconnect", async () => {
     const workspaceId = `ws-offline-edit-${mode}`;
-    answerInstructions = () => Promise.resolve({ files: [], totalTokens: 0 });
+    answerInstructions = () => Promise.resolve(noInstructions());
     answerChatInstructions = () => Promise.resolve({ content: "be brief", enabled: true });
     const view = render(<InstructionsTab workspaceId={workspaceId} />, { wrapper: Wrapper });
     const editor = (await view.findByLabelText("Chat Instructions editor")) as HTMLTextAreaElement;
@@ -318,7 +343,7 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     // Project B's first list is still loading when the connection drops and cuts it off.
     answerServers = pending;
     view.rerender(<ProjectMCPOverview projectPath="/projects/b" />);
-    await flush();
+    await settle();
     expect(view.queryByText("alpha")).toBeNull();
     await drop();
     expect(view.queryByText("alpha")).toBeNull();

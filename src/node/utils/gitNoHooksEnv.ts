@@ -3,7 +3,8 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { providerSecretEnvVarNames } from "@/node/utils/providerRequirements";
-import { execFileAsync } from "@/node/utils/disposableExec";
+import type { HostProcesses } from "@/node/services/hostProcesses/hostProcesses";
+import { nodeHostProcesses } from "@/node/services/hostProcesses/nodeHostProcesses";
 import { getBashPath } from "@/node/utils/main/bashPath";
 
 /**
@@ -477,12 +478,14 @@ export function parseLocalRepoAutomationDiscovery(
 export async function gitNoRepoAutomationEnvForLocalRepo(
   repoPath: string,
   signal?: AbortSignal,
-  allowNonRepository = false
+  allowNonRepository = false,
+  // The host spawn. Tests pass the scripted layer (scriptedCommands.testHarness.ts).
+  processes: HostProcesses = nodeHostProcesses
 ): Promise<Record<string, string>> {
   const script = repoAutomationDiscoveryScript(shellQuote(repoPath));
   let output: { stdout: string; stderr: string };
   try {
-    using proc = execFileAsync(localDiscoveryShell(), ["-c", script], {
+    using proc = processes.execFile(localDiscoveryShell(), ["-c", script], {
       // Git Bash would source BASH_ENV; /bin/sh ignores it.
       env: { ...gitNoRepoAutomationEnv(), BASH_ENV: "" },
       signal,

@@ -7,13 +7,14 @@ import {
   type DescendantActivityHints,
   type ObservedWorkflowRunInfo,
 } from "xum/browser/components/SubAgentTasksDecoration/SubAgentTasksDecoration";
-import { usePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getSubAgentTasksExpandedKey } from "xum/common/constants/storage";
+import { useChatActivityPanel } from "xum/browser/components/ChatPane/chatActivityPanels";
 import type { UiWorkspace, UiWorkspaceActivity } from "./protocol";
 
 /**
- * The desktop sub-agent tasks strip in the webview dock (#5109), fed by the host's live workspace
+ * The sub-agents chip of the webview's live line (#5109, #7689), fed by the host's live workspace
  * list and the selected workspace's activity map instead of WorkspaceContext/WorkspaceStore.
+ * Its panel shares the line's one panel slot, as desktop's SubAgentTasksDecoration does, so
+ * opening it closes another chip's panel (and it is not persisted, as on desktop).
  */
 export function SubAgentTasksDock(props: {
   workspaces: readonly UiWorkspace[];
@@ -21,10 +22,7 @@ export function SubAgentTasksDock(props: {
   activity: Readonly<Record<string, UiWorkspaceActivity>>;
   onSelect: (workspaceId: string) => void;
 }) {
-  const [expanded, setExpanded] = usePersistedState(
-    getSubAgentTasksExpandedKey(props.workspaceId),
-    false
-  );
+  const [expanded, setExpanded] = useChatActivityPanel("sub-agents");
   const observedRef = useRef(new Map<string, ObservedWorkflowRunInfo>());
   const { subAgents, workflowGroups: liveGroups, descendantWorkspaceIds } =
     collectDescendantAgents(

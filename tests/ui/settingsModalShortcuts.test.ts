@@ -62,7 +62,7 @@ describeIntegration("Settings modal shortcuts", () => {
         if (dialog.isConnected && dialog.getAttribute("data-state") === "open") {
           await user.keyboard("{Escape}");
         }
-        expect(body.queryByRole("dialog", { name: "Settings" })).toBeNull();
+        expect(body.queryByRole("dialog", { name: "Settings" }) === null).toBe(true);
       });
       await waitFor(() => expect(focused()).toBe("opener"));
     } finally {

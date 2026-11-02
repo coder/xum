@@ -1102,6 +1102,58 @@ describe("WorkspaceTurnManager", () => {
     expect(childEntry?.agentId).toBeUndefined();
   });
 
+  test("createWorkspaceTurn admits a descendant agent workspace when the owner's handle directory has an unreadable entry", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["followhandle", "followturn"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const childWorkspaceId = "reported-child";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, childWorkspaceId),
+        id: childWorkspaceId,
+        name: "agent_explore_reported_child",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        parentWorkspaceId: parentId,
+        agentType: "explore",
+        taskStatus: "reported",
+        reportedAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+      return cfg;
+    });
+    // A directory where a handle file belongs fails the owner's listing with EISDIR, even as root.
+    await fsPromises.mkdir(
+      path.join(config.sessionsDir, parentId, "task-handles", "wst_unreadable.json"),
+      { recursive: true }
+    );
+
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, { workspaceService });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Follow up",
+      title: "Follow up",
+      allowAgentWorkspace: true,
+      attentionPolicy: "notify_on_terminal",
+      workspace: { mode: "existing", workspaceId: childWorkspaceId },
+    });
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    const outsider = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Follow up",
+      title: "Follow up",
+      workspace: { mode: "existing", workspaceId: childWorkspaceId },
+    });
+    expect(outsider).toEqual(Err("Task.createWorkspaceTurn: invalid_scope for existing workspace"));
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("createWorkspaceTurn existing-target agent override dispatches without persisting AI settings", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "firstturn", "followuphandle", "followupturn"]);

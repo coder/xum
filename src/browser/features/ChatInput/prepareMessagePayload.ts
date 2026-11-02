@@ -37,9 +37,6 @@ interface PrepareMessagePayloadInput {
   agentSkillRefs: AgentSkillReference[];
   mcpPromptRefs: MCPPromptReference[];
   sendMessageOptions: SendMessageOptions;
-  compactionOptions?: Partial<SendMessageOptions>;
-  compactionMessageText?: string;
-  appendStagedNotice?: boolean;
   modelOneShot?: ModelOneShot | null;
   /**
    * One-shot override composed with a skill invocation ("/haiku+0 /done").
@@ -84,36 +81,23 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ? fileParts
       : undefined;
   let metadata = input.baseMetadata;
-  // Refs on a compaction request would make the summarization turn materialize
-  // skill snapshots; the caller carries them on the compaction follow-up instead.
-  if (metadata?.type !== "compaction-request") {
-    if (input.agentSkillRefs.length > 0) {
-      metadata = withAgentSkillRefs(metadata, input.agentSkillRefs);
-    }
-    if (input.mcpPromptRefs.length > 0) {
-      metadata = withMcpPromptRefs(metadata, input.mcpPromptRefs);
-    }
+  if (input.agentSkillRefs.length > 0) {
+    metadata = withAgentSkillRefs(metadata, input.agentSkillRefs);
+  }
+  if (input.mcpPromptRefs.length > 0) {
+    metadata = withMcpPromptRefs(metadata, input.mcpPromptRefs);
   }
 
-  const actualMessageText = input.compactionMessageText ?? input.messageTextForSend;
-  const userMessageText =
-    input.appendStagedNotice === false
-      ? actualMessageText
-      : appendStagedAttachmentNotice(actualMessageText, input.attachments);
+  const userMessageText = appendStagedAttachmentNotice(input.messageTextForSend, input.attachments);
   const prepared = prepareUserMessageForSend(
     { text: userMessageText, reviews: input.reviews },
     metadata
   );
-  const compactionOptions = input.compactionOptions ?? {};
-  const additionalSystemInstructions =
-    compactionOptions.additionalSystemInstructions ??
-    input.sendMessageOptions.additionalSystemInstructions;
   // Model/thinking override from either a bare one-shot ("/haiku+0 msg") or
   // one composed with a skill invocation ("/haiku+0 /done args").
   const oneShotOverride = input.modelOneShot ?? input.skillOneShot ?? null;
   const oneShotModelOverride = oneShotOverride?.modelString;
-  const effectiveModel =
-    oneShotModelOverride ?? compactionOptions.model ?? input.sendMessageOptions.model;
+  const effectiveModel = oneShotModelOverride ?? input.sendMessageOptions.model;
   const trimmedMessageText = input.messageText.trim();
   const commandPrefix = input.modelOneShot
     ? trimmedMessageText
@@ -141,7 +125,6 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
     sentReviewIds: input.reviewIds,
     options: {
       ...input.sendMessageOptions,
-      ...compactionOptions,
       ...(input.transferredDraftProjectDiscovery && hasProjectScopedSkillRef(input.agentSkillRefs)
         ? { disableWorkspaceAgents: true }
         : {}),
@@ -175,7 +158,6 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
               : "",
           }
         : {}),
-      additionalSystemInstructions,
       editMessageId: input.editMessageId,
       ...(input.editMessageId && input.historyEditPrecondition
         ? { historyEditPrecondition: input.historyEditPrecondition }

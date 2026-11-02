@@ -41,6 +41,7 @@ import {
   type ArtifactBytesOutcome,
   type ArtifactReadOptions,
   type ArtifactReadOutcome,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 export type ArtifactsContext = Pick<
@@ -96,8 +97,6 @@ export async function resolveArtifactsLocation(
   metadata: ArtifactsWorkspaceMetadata,
   options?: {
     createRuntime?: (metadata: ArtifactsWorkspaceMetadata) => Runtime;
-    canBindMountHostPaths?: () => Promise<boolean>;
-    hostSupportsDescriptorPaths?: () => Promise<boolean>;
     abortSignal?: AbortSignal;
   }
 ): Promise<ArtifactsLocation> {
@@ -112,7 +111,6 @@ export async function resolveArtifactsLocation(
     sessionsDir,
     runtime: { getXumHome: () => getRuntime().getXumHome() },
     multiProject: (metadata.projects?.length ?? 0) > 1, // isMultiProject, on a narrower type
-    canBindMountHostPaths: options?.canBindMountHostPaths,
   });
   switch (spec.kind) {
     case "host":
@@ -134,10 +132,7 @@ export async function resolveArtifactsLocation(
       // can be raced from there. Hosts with descriptor paths (Linux) pin every folder; elsewhere
       // the dir is read inside the container, where a swap reaches nothing the container could
       // not already read.
-      const pinnable = await (
-        options?.hostSupportsDescriptorPaths ?? hostSupportsDescriptorPaths
-      )();
-      if (!pinnable) {
+      if (!(await hostSupportsDescriptorPaths())) {
         return { kind: "runtime", runtime: getRuntime(), dir: getArtifactsDir(spec.dir) };
       }
       return { kind: "host", dir: getArtifactsDir(spec.dir), containerWritable: true };
@@ -267,18 +262,25 @@ export async function readArtifact(
 /**
  * Write one host-maintained artifact (e.g. the goal status board) wherever the location lives,
  * with the same containment rules as reads. Throws on failure; callers decide whether to care.
+ * `createOnly` writes only a missing file, atomically: a file that exists, or appears while
+ * the write runs, is left as it is.
  */
 export async function writeArtifactAtLocation(
   location: Exclude<ArtifactsLocation, { kind: "unavailable" }>,
   relPath: string,
-  content: string
+  content: string,
+  options?: ArtifactWriteOptions & { abortSignal?: AbortSignal }
 ): Promise<void> {
   if (location.kind === "runtime") {
-    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content);
+    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content, {
+      abortSignal: options?.abortSignal,
+      createOnly: options?.createOnly,
+    });
     return;
   }
   await writeArtifactToDir(location.dir, relPath, content, {
     requireDescriptorPaths: location.containerWritable,
+    createOnly: options?.createOnly,
   });
 }
 

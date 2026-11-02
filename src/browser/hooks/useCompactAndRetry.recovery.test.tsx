@@ -131,6 +131,7 @@ describe("useCompactAndRetry trigger message", () => {
             })()
           ),
         getSessionUsage: () => Promise.resolve(undefined),
+        getSubagentUsage: () => Promise.resolve({ children: {} }),
         activity: {
           list: () => Promise.resolve({}),
           subscribe: (_input, options) => Promise.resolve(idle(options?.signal)),

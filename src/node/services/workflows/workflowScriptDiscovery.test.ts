@@ -6,6 +6,8 @@ import { describe, expect, test } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 async function writePluginWithWorkflow(workspacePath: string, pluginName: string): Promise<void> {
   const pluginDir = path.join(workspacePath, ".mux", "plugins", pluginName);
@@ -36,6 +38,7 @@ describe("discoverWorkflowScripts (agent plugins)", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     };
 
     const discovered = await discoverWorkflowScripts(input);
@@ -77,6 +80,7 @@ describe("discoverWorkflowScripts (agent plugins)", () => {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
         projectTrusted,
+        runtimeFactory,
       });
       const names = discovered.map((workflow) => workflow.scriptPath);
       expect(names.some((name) => name.includes("plugin-skill-flow"))).toBe(projectTrusted);

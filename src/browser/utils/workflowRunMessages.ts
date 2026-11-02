@@ -10,13 +10,12 @@ import {
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowRunCardMessage,
-  filterWorkflowDisplayOnlyMessages,
   isWorkflowRunEmittingToolName,
   type WorkflowRunCardInput,
   type WorkflowRunCardResult,
 } from "@/common/utils/workflowRunMessages";
 
-export { buildWorkflowRunCardMessage, filterWorkflowDisplayOnlyMessages };
+export { buildWorkflowRunCardMessage };
 
 function getLatestWorkflowResult(run: WorkflowRunRecord): unknown {
   return run.events.findLast((event) => event.type === "result")?.result ?? null;

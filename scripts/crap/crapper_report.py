@@ -1,21 +1,12 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   # Crapper is the scorer; this adapter only adds file paths and line ranges,
-#   # which Crapper's own `.metrics/crap.edn` omits. Pin the SHA and the exact
-#   # grammar versions together: cyclomatic complexity counts come from the
-#   # tree-sitter grammar, so a grammar bump can move every score.
-#   "crapper @ git+https://github.com/unclebob/crapper@9f1bead298b5a9d576bdd6319289fcf426e5b18a",
-#   "tree-sitter==0.26.0",
-#   "tree-sitter-language-pack==1.21.3",
-# ]
-# ///
 """Score functions with Crapper and print one JSON row per function.
 
-Usage (through uv, which reads the pins above):
+Crapper is the scorer; this adapter only adds file paths and line ranges,
+which Crapper's own `.metrics/crap.edn` omits.
 
-    uv run --script scripts/crap/crapper_report.py [--root DIR] [--lcov FILE]...
-        [--top N] [FILE ...]
+Usage (through uv, with the crap group of pyproject.toml):
+
+    uv run --locked --only-group crap python scripts/crap/crapper_report.py
+        [--root DIR] [--lcov FILE]... [--top N] [FILE ...]
 
 With no FILE, it scores every production file that git tracks under `src/`.
 Given FILEs (relative to --root), it keeps only the production files among

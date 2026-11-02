@@ -67,8 +67,8 @@ import {
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { ModelDisplay } from "../Messages/ModelDisplay";
-import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import { ModelDisplay, ThinkingLevelLabel } from "../Messages/ModelDisplay";
+import type { ThinkingLevel } from "@/common/types/thinking";
 
 /**
  * Clean SVG icon for task tools - represents spawning/branching work
@@ -529,6 +529,8 @@ interface TaskToolCallProps {
 
 interface TaskToolDisplayEntry {
   taskId: string;
+  /** The child's best-of slot: a partial group result skips the slots that failed to spawn. */
+  candidateIndex?: number;
   status: string;
   title?: string;
   reportMarkdown?: string;
@@ -563,7 +565,8 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
       )}
       {props.thinkingLevel != null && (
         <span className="rounded bg-[var(--color-bg-tertiary)] px-1 py-0.5 font-mono leading-none">
-          thinking: {getThinkingOptionLabel(props.thinkingLevel, props.modelString)}
+          thinking:{" "}
+          <ThinkingLevelLabel level={props.thinkingLevel} modelString={props.modelString} />
         </span>
       )}
     </span>
@@ -652,6 +655,12 @@ function getTaskToolWorkspaceTitle(
   metadata: FrontendWorkspaceMetadata | null | undefined
 ): string | undefined {
   return normalizeTaskTitle(metadata?.title) ?? normalizeTaskTitle(metadata?.name) ?? undefined;
+}
+
+function getTaskToolWorkspaceCandidateIndex(
+  metadata: FrontendWorkspaceMetadata | null | undefined
+): number | undefined {
+  return metadata?.bestOf?.index;
 }
 
 function mergeTaskIdsInDisplayOrder(taskIdLists: ReadonlyArray<readonly string[]>): string[] {
@@ -934,7 +943,7 @@ const TaskToolCandidateCard: React.FC<{
 }> = ({ entry, index, total, onOpenTranscript }) => {
   const canViewTranscript = entry.status === "completed";
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
-  const memberLabel = formatTaskGroupMemberLabel(index);
+  const memberLabel = formatTaskGroupMemberLabel(entry.candidateIndex ?? index);
 
   return (
     <div className="bg-code-bg rounded-sm p-2">
@@ -1050,6 +1059,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
     return {
       taskId,
+      candidateIndex: getTaskToolWorkspaceCandidateIndex(metadata),
       status:
         derivedStatus ?? (status === "executing" ? "running" : (successResult?.status ?? "queued")),
       title: reportTitle ?? getTaskToolWorkspaceTitle(metadata) ?? title,

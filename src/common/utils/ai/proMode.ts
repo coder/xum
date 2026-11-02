@@ -6,10 +6,7 @@
  * - model must be pro-capable (see openaiSupportsProMode);
  * - pro mode is a Responses API field, so `wireFormat: "chatCompletions"` disables it;
  * - direct OpenAI and Coder's OpenAI Responses instances deliver the mode.
- *   Other gateways hide it: non-passthrough ones use another provider schema, and mux-gateway currently
- *   drops `providerOptions.openai.reasoningMode` server-side (verified empirically —
- *   the Responses API echoed `mode: "standard"`), so it fails closed until the
- *   gateway forwards the field;
+ *   Other gateways hide it: they use another provider schema;
  * - Codex OAuth routes strip `reasoning.mode` before calling the stricter ChatGPT
  *   backend, so when OAuth is the effective auth path, pro mode is unavailable too.
  *
@@ -48,9 +45,9 @@ export function openaiProModeAvailable(
     if (isCustomProviderConfig(options?.providersConfig?.coder)) {
       return false;
     }
-    // Coder forwards native Responses bodies, unlike mux-gateway's SDK proxy.
-    // Resolve the actual instance type before name-based canonicalization; the
-    // direct OpenAI wire format and Codex credentials do not govern this route.
+    // Coder forwards native Responses bodies. Resolve the actual instance type
+    // before name-based canonicalization; the direct OpenAI wire format and
+    // Codex credentials do not govern this route.
     const gatewayModelId = resolveCoderRouteGatewayModelId(
       modelString,
       options?.providersConfig ?? null

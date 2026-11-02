@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { ClutterScanner, getClutterWatchRoots } from "@/node/runtime/homeClutterWatch";
+import { makeTestEffectRunner } from "@/node/services/di/testEffectRunner";
 import { HomeClutterReminderSource } from "./HomeClutterReminderSource";
 
 interface PollResult {
@@ -33,7 +34,7 @@ describe("HomeClutterReminderSource (real filesystem)", () => {
 
   test("reports the first tool call's clutter once per turn", async () => {
     const turn = new HomeClutterReminderSource({ homeDir: home, scanner });
-    await scanner.scan(); // the turn-start baseline scan has finished
+    await scanner.scan(Date.now()); // the turn-start baseline scan has finished
 
     await fs.mkdir(path.join(home, "perf-runs"));
     const first = await poll(turn);
@@ -46,7 +47,7 @@ describe("HomeClutterReminderSource (real filesystem)", () => {
 
     // The next turn gets a fresh source and reports only what is new since it started.
     const nextTurn = new HomeClutterReminderSource({ homeDir: home, scanner });
-    await scanner.scan();
+    await scanner.scan(Date.now());
     await fs.mkdir(path.join(home, "ws5-scripts"));
     const next = await poll(nextTurn);
     expect(next[0].content).toContain("~/ws5-scripts");
@@ -55,7 +56,7 @@ describe("HomeClutterReminderSource (real filesystem)", () => {
 
   test("keeps the reminder until a tool result can actually carry it", async () => {
     const turn = new HomeClutterReminderSource({ homeDir: home, scanner });
-    await scanner.scan();
+    await scanner.scan(Date.now());
 
     // Failed calls and string results (e.g. MCP tools) drop notifications, so nothing is spent.
     await fs.mkdir(path.join(home, "from-failed-call"));
@@ -118,11 +119,44 @@ describe("HomeClutterReminderSource (stalled or failing reads)", () => {
     // The first tool call returns without waiting for the stuck baseline scan.
     expect(await poll(turn)).toEqual([]);
     fake.unstall();
-    await scanner.scan(); // the late baseline lands
+    await scanner.scan(Date.now()); // the late baseline lands
 
     fake.dirs.get(home)!.push("made-by-first-call");
     const next = await poll(turn);
     expect(next[0].content).toContain("~/made-by-first-call");
+  });
+
+  test("a poll on a stuck scan gives up when the session clock passes the timeout", async () => {
+    const clock = makeTestEffectRunner();
+    try {
+      const fake = fakeHome(home);
+      const scanner = new ClutterScanner(getClutterWatchRoots(home), fake.readDir);
+      fake.stall();
+      const turn = new HomeClutterReminderSource({
+        homeDir: home,
+        scanner,
+        clock: clock.hostClock,
+      });
+
+      let settled = false;
+      const result = poll(turn).then((notifications) => {
+        settled = true;
+        return notifications;
+      });
+      // A macrotask turn: a real setTimeout of 250 ms cannot fire here, so only the TestClock
+      // can end the wait.
+      const macrotask = () => new Promise((resolve) => setImmediate(resolve));
+      await clock.adjust("249 millis");
+      await macrotask();
+      expect(settled).toBe(false);
+      await clock.adjust("1 millis");
+      await macrotask();
+      expect(settled).toBe(true);
+      expect(await result).toEqual([]);
+      fake.unstall();
+    } finally {
+      await clock.dispose();
+    }
   });
 
   test("shares one stuck scan across turns instead of piling up reads", async () => {
@@ -145,7 +179,7 @@ describe("HomeClutterReminderSource (stalled or failing reads)", () => {
     const fake = fakeHome(home);
     const scanner = new ClutterScanner(getClutterWatchRoots(home), fake.readDir);
     const turn = new HomeClutterReminderSource({ homeDir: home, scanner });
-    await scanner.scan();
+    await scanner.scan(Date.now());
 
     fake.failing.add(home);
     expect(await poll(turn)).toEqual([]);

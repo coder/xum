@@ -71,7 +71,7 @@ export function parseWebviewToExtensionMessage(raw: unknown): WebviewToExtension
       return {
         type,
         requestId: record.requestId,
-        path: path as string[],
+        path: path,
         input: record.input,
         lastEventId,
       };

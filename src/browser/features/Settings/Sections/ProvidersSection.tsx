@@ -41,10 +41,6 @@ import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import {
-  formatMuxGatewayBalance,
-  useMuxGatewayAccountStatus,
-} from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -96,7 +92,6 @@ import {
   resolveCoderCanonicalRouteInstance,
 } from "@/common/constants/coderOAuth";
 
-type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
 type CopilotLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 
@@ -129,13 +124,6 @@ interface CodexOauthDeviceFlow {
   flowId: string;
   userCode: string;
   verifyUrl: string;
-}
-
-interface OAuthMessage {
-  type?: unknown;
-  state?: unknown;
-  ok?: unknown;
-  error?: unknown;
 }
 
 function getServerAuthToken(): string | null {
@@ -318,10 +306,6 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
         optional: true,
       },
     ];
-  }
-
-  if (provider === "mux-gateway") {
-    return [];
   }
 
   if (provider === "github-copilot") {
@@ -627,12 +611,6 @@ export function ProvidersSection() {
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
-  const {
-    data: muxGatewayAccountStatus,
-    error: muxGatewayAccountError,
-    isLoading: muxGatewayAccountLoading,
-    refresh: refreshMuxGatewayAccountStatus,
-  } = useMuxGatewayAccountStatus();
 
   const [openaiServiceTierSelectOverride, setOpenaiServiceTierSelectOverride] =
     useState<OpenAIServiceTierSelectValue | null>(null);
@@ -702,13 +680,6 @@ export function ProvidersSection() {
   );
 
   const backendBaseUrl = getBrowserBackendBaseUrl();
-  const backendOrigin = (() => {
-    try {
-      return new URL(backendBaseUrl).origin;
-    } catch {
-      return window.location.origin;
-    }
-  })();
 
   const isDesktop = !!window.api;
 
@@ -976,7 +947,6 @@ export function ProvidersSection() {
     }
   };
 
-  const [muxGatewayLoginStatus, setMuxGatewayLoginStatus] = useState<MuxGatewayLoginStatus>("idle");
   const cancelCodexOauth = () => {
     codexOauthAttemptRef.current++;
 
@@ -995,218 +965,6 @@ export function ProvidersSection() {
     setCodexOauthStatus("idle");
     setCodexOauthError(null);
   };
-
-  const [muxGatewayLoginError, setMuxGatewayLoginError] = useState<string | null>(null);
-
-  const muxGatewayLoginAttemptRef = useRef(0);
-  const [muxGatewayDesktopFlowId, setMuxGatewayDesktopFlowId] = useState<string | null>(null);
-  const [muxGatewayServerState, setMuxGatewayServerState] = useState<string | null>(null);
-
-  const [muxGatewayAuthorizeUrl, setMuxGatewayAuthorizeUrl] = useState<string | null>(null);
-
-  const cancelMuxGatewayLogin = () => {
-    muxGatewayLoginAttemptRef.current++;
-
-    if (isDesktop && api && muxGatewayDesktopFlowId) {
-      void api.muxGatewayOauth.cancelDesktopFlow({ flowId: muxGatewayDesktopFlowId });
-    }
-
-    setMuxGatewayDesktopFlowId(null);
-    setMuxGatewayServerState(null);
-    setMuxGatewayAuthorizeUrl(null);
-    setMuxGatewayLoginStatus("idle");
-    setMuxGatewayLoginError(null);
-  };
-
-  const clearMuxGatewayCredentials = () => {
-    if (!api) {
-      return;
-    }
-
-    cancelMuxGatewayLogin();
-    updateOptimistically("mux-gateway", { couponCodeSet: false });
-
-    void api.providers.setProviderConfig({
-      provider: "mux-gateway",
-      keyPath: ["couponCode"],
-      value: "",
-    });
-    void api.providers.setProviderConfig({
-      provider: "mux-gateway",
-      keyPath: ["voucher"],
-      value: "",
-    });
-  };
-
-  const startMuxGatewayLogin = async () => {
-    const attempt = ++muxGatewayLoginAttemptRef.current;
-
-    try {
-      setMuxGatewayLoginError(null);
-      setMuxGatewayDesktopFlowId(null);
-      setMuxGatewayServerState(null);
-      setMuxGatewayAuthorizeUrl(null);
-
-      if (isDesktop) {
-        if (!liveApi) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError("Xum API not connected.");
-          return;
-        }
-
-        setMuxGatewayLoginStatus("starting");
-        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          if (startResult.success) {
-            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
-          }
-          return;
-        }
-
-        if (!startResult.success) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError(startResult.error);
-          return;
-        }
-
-        const { flowId, authorizeUrl } = startResult.data;
-        setMuxGatewayDesktopFlowId(flowId);
-        setMuxGatewayAuthorizeUrl(authorizeUrl);
-        setMuxGatewayLoginStatus("waiting");
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        if (waitResult.success) {
-          setMuxGatewayLoginStatus("success");
-          void refreshMuxGatewayAccountStatus();
-
-          return;
-        }
-
-        setMuxGatewayAuthorizeUrl(null);
-        setMuxGatewayLoginStatus("error");
-        setMuxGatewayLoginError(waitResult.error);
-        return;
-      }
-
-      // Browser/server mode: use unauthenticated bootstrap route.
-      setMuxGatewayLoginStatus("starting");
-
-      const startUrl = new URL(`${backendBaseUrl}/auth/mux-gateway/start`);
-      const authToken = getServerAuthToken();
-
-      const res = await fetch(startUrl, {
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-      });
-
-      const contentType = res.headers.get("content-type") ?? "";
-      if (!contentType.includes("application/json")) {
-        const body = await res.text();
-        const prefix = body.trim().slice(0, 80);
-        throw new Error(
-          `Unexpected response from ${startUrl.toString()} (expected JSON, got ${
-            contentType || "unknown"
-          }): ${prefix}`
-        );
-      }
-
-      const json = (await res.json()) as {
-        authorizeUrl?: unknown;
-        state?: unknown;
-        error?: unknown;
-      };
-
-      if (!res.ok) {
-        const message = typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
-        throw new Error(message);
-      }
-
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        return;
-      }
-
-      if (typeof json.authorizeUrl !== "string" || typeof json.state !== "string") {
-        throw new Error(`Invalid response from ${startUrl.pathname}`);
-      }
-
-      setMuxGatewayServerState(json.state);
-      setMuxGatewayAuthorizeUrl(json.authorizeUrl);
-      setMuxGatewayLoginStatus("waiting");
-    } catch (err) {
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        return;
-      }
-
-      const message = getErrorMessage(err);
-      setMuxGatewayAuthorizeUrl(null);
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(message);
-    }
-  };
-
-  useEffect(() => {
-    const attempt = muxGatewayLoginAttemptRef.current;
-
-    if (isDesktop || muxGatewayLoginStatus !== "waiting" || !muxGatewayServerState) {
-      return;
-    }
-
-    const handleMessage = (event: MessageEvent<OAuthMessage>) => {
-      if (event.origin !== backendOrigin) return;
-      if (muxGatewayLoginAttemptRef.current !== attempt) return;
-
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type !== "mux-gateway-oauth") return;
-      if (data.state !== muxGatewayServerState) return;
-
-      if (data.ok === true) {
-        setMuxGatewayAuthorizeUrl(null);
-        setMuxGatewayLoginStatus("success");
-        void refreshMuxGatewayAccountStatus();
-
-        return;
-      }
-
-      const msg = typeof data.error === "string" ? data.error : "Login failed";
-      setMuxGatewayAuthorizeUrl(null);
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(msg);
-    };
-
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [
-    isDesktop,
-    muxGatewayLoginStatus,
-    muxGatewayServerState,
-    backendOrigin,
-    refreshMuxGatewayAccountStatus,
-  ]);
-  const muxGatewayCouponCodeSet = config?.["mux-gateway"]?.couponCodeSet ?? false;
-  const muxGatewayLoginInProgress =
-    muxGatewayLoginStatus === "waiting" || muxGatewayLoginStatus === "starting";
-  const muxGatewayIsLoggedIn = muxGatewayCouponCodeSet || muxGatewayLoginStatus === "success";
-
-  const muxGatewayAuthStatusText = muxGatewayIsLoggedIn ? "Logged in" : "Not logged in";
-
-  const muxGatewayLoginButtonLabel =
-    muxGatewayLoginStatus === "error"
-      ? "Try again"
-      : muxGatewayLoginInProgress
-        ? "Waiting for login..."
-        : muxGatewayIsLoggedIn
-          ? "Re-login to Xum Gateway"
-          : "Login to Xum Gateway";
 
   // --- GitHub Copilot Device Code Flow ---
   const [copilotLoginStatus, setCopilotLoginStatus] = useState<CopilotLoginStatus>("idle");
@@ -1574,29 +1332,6 @@ export function ProvidersSection() {
     void startCoderLogin();
   }, [providersStartCoderLogin, setProvidersStartCoderLogin, configLoading, startCoderLogin]);
 
-  useEffect(() => {
-    if (expandedProvider !== "mux-gateway" || !muxGatewayIsLoggedIn) {
-      return;
-    }
-
-    // Fetch lazily when the user expands the Xum Gateway provider.
-    //
-    // Important: avoid auto-retrying after a failure. If the request fails,
-    // `muxGatewayAccountStatus` remains null and we'd otherwise trigger a refresh
-    // on every render while the provider stays expanded.
-    if (muxGatewayAccountStatus || muxGatewayAccountLoading || muxGatewayAccountError) {
-      return;
-    }
-
-    void refreshMuxGatewayAccountStatus();
-  }, [
-    expandedProvider,
-    muxGatewayAccountError,
-    muxGatewayAccountLoading,
-    muxGatewayAccountStatus,
-    muxGatewayIsLoggedIn,
-    refreshMuxGatewayAccountStatus,
-  ]);
   const [editingField, setEditingField] = useState<{
     provider: string;
     field: string;
@@ -1607,9 +1342,6 @@ export function ProvidersSection() {
   const handleToggleProvider = (provider: string) => {
     setExpandedProvider((prev) => {
       const next = prev === provider ? null : provider;
-      if (prev === "mux-gateway" && next !== "mux-gateway") {
-        cancelMuxGatewayLogin();
-      }
       if (prev === "github-copilot" && next !== "github-copilot") {
         cancelCopilotLogin();
       }
@@ -1768,7 +1500,7 @@ export function ProvidersSection() {
 
   const handleProviderEnabledChange = useCallback(
     (provider: string, nextEnabled: boolean) => {
-      if (!api || provider === "mux-gateway") {
+      if (!api) {
         return;
       }
 
@@ -2152,26 +1884,24 @@ export function ProvidersSection() {
                           using your custom configuration.
                         </div>
                       )}
-                      {provider !== "mux-gateway" && (
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <label className="text-foreground block text-xs font-medium">
-                              Enabled
-                            </label>
-                            <span className="text-muted text-xs">
-                              Disable this provider without deleting saved credentials.
-                            </span>
-                          </div>
-                          <Switch
-                            checked={enabled}
-                            onCheckedChange={(nextChecked) =>
-                              handleProviderEnabledChange(provider, nextChecked)
-                            }
-                            aria-label={`Toggle ${provider} provider`}
-                            disabled={!api}
-                          />
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <label className="text-foreground block text-xs font-medium">
+                            Enabled
+                          </label>
+                          <span className="text-muted text-xs">
+                            Disable this provider without deleting saved credentials.
+                          </span>
                         </div>
-                      )}
+                        <Switch
+                          checked={enabled}
+                          onCheckedChange={(nextChecked) =>
+                            handleProviderEnabledChange(provider, nextChecked)
+                          }
+                          aria-label={`Toggle ${provider} provider`}
+                          disabled={!api}
+                        />
+                      </div>
 
                       {/* Quick link to get API key */}
                       {providerKeyUrl && (
@@ -2211,124 +1941,6 @@ export function ProvidersSection() {
                               )
                               .join(", ")}
                           </span>
-                        </div>
-                      )}
-
-                      {provider === "mux-gateway" && (
-                        <div className="space-y-2">
-                          <div>
-                            <label className="text-foreground block text-xs font-medium">
-                              Authentication
-                            </label>
-                            <span className="text-muted text-xs">{muxGatewayAuthStatusText}</span>
-                          </div>
-
-                          <div className="space-y-2">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Button
-                                size="sm"
-                                onClick={() => {
-                                  void startMuxGatewayLogin();
-                                }}
-                                disabled={muxGatewayLoginInProgress}
-                              >
-                                {muxGatewayLoginButtonLabel}
-                              </Button>
-
-                              {muxGatewayLoginStatus === "waiting" && muxGatewayAuthorizeUrl && (
-                                <Button
-                                  size="sm"
-                                  aria-label="Copy and open Xum Gateway authorization page"
-                                  onClick={() => {
-                                    void navigator.clipboard.writeText(muxGatewayAuthorizeUrl);
-                                    window.open(muxGatewayAuthorizeUrl, "_blank", "noopener");
-                                  }}
-                                  className="h-8 px-3 text-xs"
-                                >
-                                  Copy & Open Xum Gateway
-                                </Button>
-                              )}
-
-                              {muxGatewayLoginInProgress && (
-                                <Button
-                                  variant="secondary"
-                                  size="sm"
-                                  onClick={cancelMuxGatewayLogin}
-                                >
-                                  Cancel
-                                </Button>
-                              )}
-
-                              {muxGatewayIsLoggedIn && (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  onClick={clearMuxGatewayCredentials}
-                                >
-                                  Log out
-                                </Button>
-                              )}
-                            </div>
-
-                            {muxGatewayLoginStatus === "waiting" && (
-                              <p className="text-muted inline-flex items-center gap-2 text-xs">
-                                <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" />
-                                Waiting for authorization...
-                              </p>
-                            )}
-
-                            {muxGatewayLoginStatus === "error" && muxGatewayLoginError && (
-                              <p className="text-destructive text-xs">
-                                Login failed: {muxGatewayLoginError}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      {provider === "mux-gateway" && muxGatewayIsLoggedIn && (
-                        <div className="border-border-light space-y-2 border-t pt-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div>
-                              <label className="text-foreground block text-xs font-medium">
-                                Account
-                              </label>
-                              <span className="text-muted text-xs">
-                                Balance and limits from Xum Gateway
-                              </span>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                void refreshMuxGatewayAccountStatus();
-                              }}
-                              disabled={muxGatewayAccountLoading}
-                            >
-                              {muxGatewayAccountLoading ? "Refreshing..." : "Refresh"}
-                            </Button>
-                          </div>
-
-                          <div className="flex items-center justify-between gap-4">
-                            <span className="text-muted text-xs">Balance</span>
-                            <span className="text-foreground font-mono text-xs">
-                              {formatMuxGatewayBalance(
-                                muxGatewayAccountStatus?.remaining_microdollars
-                              )}
-                            </span>
-                          </div>
-
-                          <div className="flex items-center justify-between gap-4">
-                            <span className="text-muted text-xs">Concurrent requests per user</span>
-                            <span className="text-foreground font-mono text-xs">
-                              {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ??
-                                "—"}
-                            </span>
-                          </div>
-
-                          {muxGatewayAccountError && (
-                            <p className="text-destructive text-xs">{muxGatewayAccountError}</p>
-                          )}
                         </div>
                       )}
 

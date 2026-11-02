@@ -93,10 +93,10 @@ function isOrpcStreamErrorMessage(raw: unknown): raw is OrpcStreamError {
 }
 
 class VscodeOrpcAsyncIterator<T> implements AsyncIterator<T>, AsyncIterable<T> {
-  private readonly pending: Array<{
+  private readonly pending: {
     resolve: (value: IteratorResult<T>) => void;
     reject: (error: unknown) => void;
-  }> = [];
+  }[] = [];
 
   private readonly buffered: T[] = [];
   private done = false;
@@ -219,6 +219,7 @@ class VscodeOrpcAsyncIterator<T> implements AsyncIterator<T>, AsyncIterable<T> {
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/require-await -- AsyncIterator.return() must return a Promise, and async turns a throw from cancel() into a rejection
   async return(): Promise<IteratorResult<T>> {
     this.cancel("Iterator return() called");
     return { value: undefined as unknown as T, done: true };
@@ -307,7 +308,8 @@ export function createVscodeOrpcLink(
   });
 
   const call = async (path: readonly string[], input: unknown, options: ClientOptions<ClientContext>) => {
-    assert(Array.isArray(path), "ORPC call requires path array");
+    // Check `path as unknown`: Array.isArray narrows a readonly string[] to any[].
+    assert(Array.isArray(path as unknown), "ORPC call requires path array");
 
     const requestId = createRequestId();
 

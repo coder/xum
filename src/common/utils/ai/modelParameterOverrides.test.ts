@@ -519,7 +519,7 @@ describe("resolveModelParameterOverrides", () => {
       providersConfig,
       "google",
       "google:gemini-3.8-flash",
-      "mux-gateway:google/gemini-3.8-flash"
+      "openrouter:google/gemini-3.8-flash"
     );
 
     expect(result).toEqual({ standard: {} });

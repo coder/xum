@@ -1,3 +1,5 @@
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+
 export type AbortAndTimeoutResult<T> =
   | { kind: "ok"; value: T }
   | { kind: "timeout" }
@@ -5,16 +7,16 @@ export type AbortAndTimeoutResult<T> =
 
 export async function raceWithAbortAndTimeout<T>(
   promise: Promise<T>,
-  options: { signal?: AbortSignal; timeoutMs?: number }
+  // clock: agent-loop callers pass their HostClock so tests can drive the
+  // timeout on a TestClock; every other caller keeps nodeClock (setTimeout).
+  options: { signal?: AbortSignal; timeoutMs?: number; clock?: HostClock }
 ): Promise<AbortAndTimeoutResult<T>> {
   return await new Promise<AbortAndTimeoutResult<T>>((resolve, reject) => {
     let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelTimer: (() => void) | undefined;
 
     const cleanup = () => {
-      if (timer != null) {
-        clearTimeout(timer);
-      }
+      cancelTimer?.();
       options.signal?.removeEventListener("abort", onAbort);
     };
     const settle = (result: AbortAndTimeoutResult<T>) => {
@@ -48,8 +50,11 @@ export async function raceWithAbortAndTimeout<T>(
     // Register settlement before arming the timer so an already-settled
     // promise wins over a simultaneous timeout.
     if (options.timeoutMs != null) {
-      timer = setTimeout(() => settle({ kind: "timeout" }), options.timeoutMs);
-      timer.unref?.();
+      cancelTimer = (options.clock ?? nodeClock).setTimer(
+        () => settle({ kind: "timeout" }),
+        options.timeoutMs,
+        { unref: true }
+      );
     }
   });
 }

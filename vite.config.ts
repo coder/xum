@@ -14,7 +14,6 @@ import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
 import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const disableMermaid = process.env.VITE_DISABLE_MERMAID === "1";
 
 const {
   host: devServerHost,
@@ -55,10 +54,6 @@ const alias: Record<string, string> = {
   // Node-only SDK; see the stub for why browser bundles never load it.
   "@ai-sdk/google-vertex": path.resolve(__dirname, "./src/common/mocks/googleVertexStub.ts"),
 };
-
-if (disableMermaid) {
-  alias["mermaid"] = path.resolve(__dirname, "./src/mocks/mermaidStub.ts");
-}
 
 // Babel plugins configuration (shared between dev and production)
 const babelPlugins = [["babel-plugin-react-compiler", reactCompilerConfig]];

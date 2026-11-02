@@ -10,6 +10,7 @@ import {
   readSubagentReportArtifactsFile,
   upsertSubagentReportArtifact,
 } from "@/node/services/subagentReportArtifacts";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("subagentReportArtifacts", () => {
   let testDir: string;
@@ -28,6 +29,7 @@ describe("subagentReportArtifacts", () => {
     const markdown = "A".repeat(400);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -51,6 +53,7 @@ describe("subagentReportArtifacts", () => {
     const planFilePath = path.join(testDir, "plans", "repo", "plan-child.md");
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -74,6 +77,7 @@ describe("subagentReportArtifacts", () => {
     const structuredOutput = { claims: ["durable"], confidence: 0.8 };
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId,
       workspaceSessionDir: testDir,
       childTaskId,
@@ -103,6 +107,7 @@ describe("subagentReportArtifacts", () => {
       ancestorWorkspaceIds: [workspaceId],
     };
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       ...base,
       reportMarkdown: "Report A.",
       taskAttemptId: "att_00000000000000a1",
@@ -112,6 +117,7 @@ describe("subagentReportArtifacts", () => {
       "utf-8"
     );
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       ...base,
       reportMarkdown: "Report B.",
       taskAttemptId: "att_00000000000000b2",
@@ -132,6 +138,7 @@ describe("subagentReportArtifacts", () => {
         kind: "absent",
       });
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: "parent-1",
         workspaceSessionDir: testDir,
         childTaskId,

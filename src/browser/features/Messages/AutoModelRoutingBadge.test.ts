@@ -1,9 +1,46 @@
-import { describe, expect, test } from "bun:test";
+import { cleanup, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createElement, Fragment, type ReactNode } from "react";
+import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as ActualTooltipModule from "@/browser/components/Tooltip/Tooltip";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+
+// Snapshot the real exports before the mocks below replace the live namespace bindings.
+const actualTooltipModule = { ...ActualTooltipModule };
+const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/Tooltip/Tooltip", actualTooltipModule],
+  ["@/browser/hooks/useProvidersConfig", actualProvidersConfigModule],
+]);
+
+// Radix portals tooltip content, which happy-dom cannot host; render it inline.
+const renderChildren = (props: { children?: ReactNode }) =>
+  createElement(Fragment, null, props.children);
+void mock.module("@/browser/components/Tooltip/Tooltip", () => ({
+  ...actualTooltipModule,
+  Tooltip: renderChildren,
+  TooltipTrigger: renderChildren,
+  TooltipContent: renderChildren,
+}));
+
+let providersConfig: ProvidersConfigMap | null = null;
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  ...actualProvidersConfigModule,
+  useProvidersConfig: () => ({
+    ...actualProvidersConfigModule.useProvidersConfig(),
+    config: providersConfig,
+  }),
+}));
+
 import {
+  AutoModelRoutingBadge,
   buildAutoModelRoutingBadgeLabel,
   buildAutoModelRoutingTooltipLines,
 } from "./AutoModelRoutingBadge";
-import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
 // Tooltip copy renders through a Radix portal that happy-dom can't observe, so
 // the branching (status, missing confidence, probability ordering) is tested
@@ -175,5 +212,47 @@ describe("buildAutoModelRoutingTooltipLines", () => {
     };
     expect(buildAutoModelRoutingBadgeLabel(openai)).toContain("XHIGH");
     expect(buildAutoModelRoutingBadgeLabel(anthropic)).toContain("MAX");
+  });
+});
+
+describe("AutoModelRoutingBadge", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+    providersConfig = null;
+  });
+
+  test("labels a mapped alias's thinking from its target model", () => {
+    providersConfig = createMappedAliasProvidersConfig();
+    const record: AutoModelRoutingRecord = {
+      ...routed,
+      model: MAPPED_ALIAS_MODEL,
+      thinkingLevel: "max",
+    };
+
+    const view = render(createElement(AutoModelRoutingBadge, { record }));
+
+    expect(view.container.textContent).toContain("Auto: Easy · MAX");
+    expect(view.container.textContent).toContain("at MAX thinking");
+
+    // A raise to max is labeled the same way; its own render keeps the run line at high.
+    cleanup();
+    const escalated = render(
+      createElement(AutoModelRoutingBadge, {
+        record: {
+          ...record,
+          thinkingLevel: "high",
+          escalations: [{ step: 3, from: "high", to: "max", reason: "stuck" }],
+        },
+      })
+    );
+    expect(escalated.container.textContent).toContain("Escalated to MAX thinking");
   });
 });

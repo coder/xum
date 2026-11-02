@@ -18,6 +18,9 @@ import { listRefinements } from "@/node/services/refinement/refinementRollback";
 import { createFileEditInsertTool } from "./tools/file_edit_insert";
 import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_string";
 import { getTestDeps } from "./tools/testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function executableTool(description: string): Tool {
   return {
@@ -31,6 +34,7 @@ describe("applyToolPolicyAndExperiments", () => {
   test("PTC keeps literal file edits direct without duplicating them in the sandbox", async () => {
     using tmp = new DisposableTempDir("ptc-direct-file-edits");
     const deps = {
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: tmp.path,
       runtime: new LocalRuntime(tmp.path),
@@ -156,8 +160,8 @@ describe("applyToolPolicyAndExperiments", () => {
   });
 
   test("context-coupled tools stay model-visible under PTC; media tools bridge", async () => {
-    // memory: AIService keys system-prompt context (memory index /
-    // hot set) off their top-level presence. attach_file /
+    // memory: AIService keys system-prompt context (memory index and
+    // guidance) off their top-level presence. attach_file /
     // desktop_screenshot are bridgeable instead: the ToolBridge strips their
     // base64 from sandbox-visible values and the code_execution attachments
     // carrier delivers the real bytes to request-time extraction, so nested
@@ -976,7 +980,8 @@ describe("token budget history policy", () => {
       const agent = await resolveAgentFrontmatter(
         new LocalRuntime(tempDir.path),
         tempDir.path,
-        agentId
+        agentId,
+        { runtimeFactory }
       );
       const policy = resolveToolPolicyForAgent({
         agents: [agent],
@@ -1074,7 +1079,8 @@ describe("models_list exposure", () => {
       const agent = await resolveAgentFrontmatter(
         new LocalRuntime(tempDir.path),
         tempDir.path,
-        agentId
+        agentId,
+        { runtimeFactory }
       );
       const policy = resolveToolPolicyForAgent({
         agents: [agent],

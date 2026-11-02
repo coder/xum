@@ -119,6 +119,34 @@ describe("openInEditor", () => {
     expect(url.endsWith(`${filePath}:1:1`)).toBe(true);
   });
 
+  // A deferred-access SSH runtime (Coder) persists the default srcBaseDir (~/mux) unresolved, so
+  // only the backend can resolve the checkout path once the host is reachable.
+  test("opens the path the backend resolved for an SSH checkout under ~", async () => {
+    const calls: OpenCall[] = [];
+    const recordEditorOpen = mock((_input: { workspaceId: string; remotePath?: string | null }) =>
+      Promise.resolve({
+        success: true as const,
+        data: { remotePath: "/home/dev/mux/project/feature" },
+      })
+    );
+    const api = createTestApiClient({ general: { recordEditorOpen } });
+
+    const result = await withWindow(createMockWindow(calls), () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: "~/mux/project/feature",
+        runtimeConfig: { type: "ssh", host: "dev-box", srcBaseDir: "~/mux" },
+      })
+    );
+
+    expect(result).toEqual({ success: true });
+    expect(recordEditorOpen.mock.calls[0]?.[0].remotePath).toBe("~/mux/project/feature");
+    expect(calls.map(([url]) => url)).toEqual([
+      "vscode://vscode-remote/ssh-remote+dev-box/home/dev/mux/project/feature",
+    ]);
+  });
+
   test("opens devcontainer deep links with mapped container path", async () => {
     const calls: OpenCall[] = [];
 

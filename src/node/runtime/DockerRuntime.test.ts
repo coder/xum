@@ -228,6 +228,18 @@ describe("DockerRuntime.postCreateSetup credentials", () => {
   });
 });
 
+describe("DockerRuntime.initWorkspace", () => {
+  it("gives the container a new agent host key once the checkout is ready (#6426)", async () => {
+    const runtime = new CredentialTestDockerRuntime(
+      { image: "ubuntu:22.04", containerName: "mux-test-init-key" },
+      { uid: "0", gid: "0", home: "/root" }
+    );
+    const before = runtime.getAgentHostKey();
+    await runtime.initWorkspace(buildPostCreateSetupParams());
+    expect(runtime.getAgentHostKey()).not.toBe(before);
+  });
+});
+
 describe("DockerRuntime.forkWorkspace", () => {
   it("stops before Docker commands when the fork is already aborted", async () => {
     const runtime = new DockerRuntime({ image: "ubuntu:22.04" });

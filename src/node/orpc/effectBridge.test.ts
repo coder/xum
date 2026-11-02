@@ -35,6 +35,7 @@ import { createOpenAPIGenerator } from "./server";
 import { MemoryMeta } from "@/node/services/di/tags";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 
 const t = orpcBase.$context<ORPCContext>();
 
@@ -141,9 +142,9 @@ let client: ReturnType<typeof createClient>;
 function makeContext(service: MemoryMetaService): ORPCContext {
   // Bridge probe procedures only consume Effect services; the remaining ~60 context
   // fields are irrelevant here (same partial-context pattern as router.test.ts).
-  return {
+  return orpcContextFromDoubles({
     "effect/context": Context.make(MemoryMeta, service),
-  } as unknown as ORPCContext;
+  });
 }
 
 function createClient(service: MemoryMetaService) {
@@ -260,7 +261,7 @@ describe("router-level middleware over Effect handlers", () => {
       .use(createAuthMiddleware("secret-token"))
       .router({ effectBridge });
     const unauthedClient = createRouterClient(authedRouter, {
-      context: { headers: {} } as unknown as ORPCContext,
+      context: orpcContextFromDoubles({ headers: {} }),
     });
 
     try {

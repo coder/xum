@@ -29,7 +29,7 @@ import {
   buildRequiredToolPatterns,
   type ToolPolicy,
 } from "@/common/utils/tools/toolPolicy";
-import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
   discoverAgentDefinitions,
@@ -41,6 +41,7 @@ import {
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
+import { resolveAgentAiSettingsChain } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { resolveToolPolicyForAgent } from "@/node/services/agentDefinitions/resolveToolPolicy";
 import { log } from "./log";
 import { getTaskDepthFromConfig } from "./taskUtils";
@@ -53,6 +54,8 @@ export interface ResolveAgentOptions {
   metadata: WorkspaceMetadata;
   runtime: Runtime;
   workspacePath: string;
+  /** Builds the parent workspace's runtime for agent discovery (the session's RuntimeFactory). */
+  runtimeFactory: RuntimeFactory;
   /** Requested agent ID from the frontend (may be undefined → defaults to exec). */
   requestedAgentId: string | undefined;
   /** When true, skip workspace-specific agents (for "unbricking" broken agent files). */
@@ -99,6 +102,8 @@ export interface AgentResolutionResult {
   isSubagentWorkspace: boolean;
   /** Resolved inheritance chain in child → base order for capability checks. */
   agentInheritanceChain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>>;
+  /** The chain the agent's AI settings resolve over (ai.settingsBase applied); see resolveAgentAiSettingsChain. */
+  agentAiSettingsChain: Awaited<ReturnType<typeof resolveAgentInheritanceChain>>;
   /** Whether the resolved agent inherits plan-like behavior (has propose_plan in tool chain). */
   agentIsPlanLike: boolean;
   effectiveMode: "plan" | "exec" | "compact";
@@ -185,6 +190,7 @@ function getAgentDiscoveryCandidates(params: {
   metadata: WorkspaceMetadata;
   runtime: Runtime;
   workspacePath: string;
+  runtimeFactory: RuntimeFactory;
   disableWorkspaceAgents: boolean;
   cfg: ProjectsConfig;
 }): AgentDiscoveryCandidate[] {
@@ -205,7 +211,7 @@ function getAgentDiscoveryCandidates(params: {
   if (parentWorkspace != null && parentWorkspaceName != null) {
     try {
       candidates.push(
-        createRuntimeContextForWorkspace({
+        params.runtimeFactory.createRuntimeContextForWorkspace({
           runtimeConfig: parentWorkspace.workspace.runtimeConfig ?? params.metadata.runtimeConfig,
           projectPath: parentWorkspace.projectPath,
           name: parentWorkspaceName,
@@ -269,6 +275,7 @@ export async function resolveAgentForStream(
     cfg,
     emitError,
     agentDefinitionCache: cache,
+    runtimeFactory,
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
@@ -298,6 +305,7 @@ export async function resolveAgentForStream(
     metadata,
     runtime,
     workspacePath,
+    runtimeFactory,
     disableWorkspaceAgents,
     cfg,
   });
@@ -347,7 +355,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { cache, projectPluginsTrusted }
+          { cache, projectPluginsTrusted, runtimeFactory }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -391,6 +399,7 @@ export async function resolveAgentForStream(
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       cache,
       projectPluginsTrusted,
+      runtimeFactory,
     });
   }
 
@@ -438,6 +447,7 @@ export async function resolveAgentForStream(
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           cache,
           projectPluginsTrusted,
+          runtimeFactory,
         }
       );
 
@@ -490,7 +500,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { cache, projectPluginsTrusted }
+          { cache, projectPluginsTrusted, runtimeFactory }
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -524,6 +534,7 @@ export async function resolveAgentForStream(
     workspaceId,
     cache,
     projectPluginsTrusted,
+    runtimeFactory,
   });
 
   // Strict chain pin: inheritance resolution reloads every base independently, so a
@@ -565,6 +576,19 @@ export async function resolveAgentForStream(
     }
   }
 
+  const agentAiSettingsChain = await resolveAgentAiSettingsChain(
+    agentDefinition.id,
+    agentsForInheritance,
+    {
+      runtime: agentDiscoveryRuntime,
+      workspacePath: agentDiscoveryPath,
+      workspaceId,
+      cache,
+      projectPluginsTrusted,
+      runtimeFactory,
+    }
+  );
+
   const agentIsPlanLike = isPlanLikeInResolvedChain(agentsForInheritance);
   const effectiveMode =
     agentDefinition.id === "compact" ? "compact" : agentIsPlanLike ? "plan" : "exec";
@@ -602,6 +626,7 @@ export async function resolveAgentForStream(
           {
             cache,
             projectPluginsTrusted,
+            runtimeFactory,
             skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           }
         ).catch(() => undefined)
@@ -610,6 +635,7 @@ export async function resolveAgentForStream(
   if (activeSelectable && effectiveToolPolicy !== undefined) {
     const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
       projectPluginsTrusted,
+      runtimeFactory,
     }).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
@@ -619,6 +645,7 @@ export async function resolveAgentForStream(
           const readOptions = {
             cache,
             projectPluginsTrusted,
+            runtimeFactory,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           };
           const frontmatter = await resolveAgentFrontmatter(
@@ -652,6 +679,7 @@ export async function resolveAgentForStream(
             workspaceId,
             cache,
             projectPluginsTrusted,
+            runtimeFactory,
           });
           const toolPolicy = composeForUnion(
             resolveToolPolicyForAgent({
@@ -693,6 +721,7 @@ export async function resolveAgentForStream(
     agentDiscoveryPath,
     isSubagentWorkspace,
     agentInheritanceChain: agentsForInheritance,
+    agentAiSettingsChain,
     agentIsPlanLike,
     effectiveMode,
     taskSettings,

@@ -72,10 +72,10 @@ describe("aggregateProviderCacheHitRows", () => {
     ]);
   });
 
-  test("normalizes mux-gateway model prefixes before provider grouping", () => {
+  test("normalizes gateway model prefixes before provider grouping", () => {
     const rows: ProviderCacheHitModelRow[] = [
       {
-        model: "mux-gateway:openai/gpt-4.1",
+        model: "openrouter:openai/gpt-4.1",
         cached_tokens: 12,
         total_prompt_tokens: 30,
         response_count: 2,

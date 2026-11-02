@@ -5,17 +5,18 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { parseClaudeMarketplace } from "./claudeMarketplace";
 import { discoverAgentPluginAt } from "./discovery";
 import {
   chooseInstallMethod,
   detectInstallMethods,
+  entryInstallMethods,
   findSkillsPackageRoots,
   generatedPluginName,
-  INERT_COMPONENT_PATH,
   toPluginName,
   writeGeneratedManifest,
 } from "./installMethods";
-import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, MAX_SKILLS_ROOTS } from "./manifest";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, INERT_COMPONENT_PATH, MAX_SKILLS_ROOTS } from "./manifest";
 
 const SKILL = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
 
@@ -171,6 +172,127 @@ describe("detectInstallMethods", () => {
     );
     expect(await fs.lstat(path.join(tmp.path, "target.json")).catch(() => null)).toBeNull();
   });
+
+  test("a root plugin.json with no $schema yields to a Claude manifest, as in discovery", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    const schemaLess = JSON.stringify({ name: "ponytail" });
+    const claudeManifest = JSON.stringify({ name: "ponytail" });
+
+    const claude = path.join(tmp.path, "claude");
+    await writeTree(claude, ["skills/a"], {
+      "plugin.json": schemaLess,
+      ".claude-plugin/plugin.json": claudeManifest,
+    });
+    // No skills: the root entry still blocks a generated plugin.json.
+    expect((await detectInstallMethods(claude)).methods).toEqual([{ kind: "claude-plugin" }]);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: claude, scope: "global" });
+    expect(plugin?.claudeFallback).toBe(true);
+
+    const codex = path.join(tmp.path, "codex");
+    await writeTree(codex, [], {
+      "plugin.json": schemaLess,
+      ".codex-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
+      ".claude-plugin/plugin.json": claudeManifest,
+    });
+    expect((await detectInstallMethods(codex)).methods).toEqual([{ kind: "agent-plugin" }]);
+
+    // Alone, discovery validates the root file and reports its error.
+    const alone = path.join(tmp.path, "alone");
+    await writeTree(alone, ["skills/a"], { "plugin.json": schemaLess });
+    expect((await detectInstallMethods(alone)).methods).toEqual([{ kind: "agent-plugin" }]);
+
+    const withSchema = path.join(tmp.path, "with-schema");
+    await writeTree(withSchema, [], {
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "ponytail" }),
+      ".claude-plugin/plugin.json": claudeManifest,
+    });
+    expect((await detectInstallMethods(withSchema)).methods).toEqual([{ kind: "agent-plugin" }]);
+  });
+
+  test("a root plugin.json is read the way discovery reads it", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    // A symlink inside the tree to a schema-less file: discovery follows it and loads the Claude
+    // manifest, so the method is claude-plugin (Codex review, #7422).
+    const linked = path.join(tmp.path, "linked");
+    await writeTree(linked, [], {
+      "other.json": JSON.stringify({ name: "ponytail" }),
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
+    });
+    await fs.symlink(path.join(linked, "other.json"), path.join(linked, "plugin.json"));
+    expect((await detectInstallMethods(linked)).methods).toEqual([{ kind: "claude-plugin" }]);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: linked, scope: "global" });
+    expect(plugin?.claudeFallback).toBe(true);
+
+    // A symlink that leaves the tree: discovery refuses it, so it stays the own manifest.
+    const escaping = path.join(tmp.path, "escaping");
+    await writeTree(escaping, [], {
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
+    });
+    await fs.writeFile(path.join(tmp.path, "outside.json"), JSON.stringify({ name: "ponytail" }));
+    await fs.symlink(path.join(tmp.path, "outside.json"), path.join(escaping, "plugin.json"));
+    expect((await detectInstallMethods(escaping)).methods).toEqual([{ kind: "agent-plugin" }]);
+    const refused = await discoverAgentPluginAt({ pluginDir: escaping, scope: "global" });
+    expect(refused.plugin).toBeNull();
+
+    const invalid = path.join(tmp.path, "invalid");
+    await writeTree(invalid, [], {
+      "plugin.json": "{ not json",
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
+    });
+    expect((await detectInstallMethods(invalid)).methods).toEqual([{ kind: "agent-plugin" }]);
+  });
+
+  test("a Cursor manifest is cursor-plugin, after a Claude one, as discovery loads them", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    const cursorManifest = JSON.stringify({ name: "pstack" });
+
+    const cursor = path.join(tmp.path, "cursor");
+    await writeTree(cursor, [], { ".cursor-plugin/plugin.json": cursorManifest });
+    expect((await detectInstallMethods(cursor)).methods).toEqual([{ kind: "cursor-plugin" }]);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: cursor, scope: "global" });
+    expect(plugin?.cursorFallback).toBe(true);
+
+    const both = path.join(tmp.path, "both");
+    await writeTree(both, [], {
+      ".claude-plugin/plugin.json": cursorManifest,
+      ".cursor-plugin/plugin.json": cursorManifest,
+    });
+    expect((await detectInstallMethods(both)).methods).toEqual([{ kind: "claude-plugin" }]);
+
+    // A schema-less root plugin.json yields to the Cursor manifest, as it does to a Claude one.
+    const schemaLess = path.join(tmp.path, "schema-less");
+    await writeTree(schemaLess, [], {
+      "plugin.json": JSON.stringify({ name: "pstack" }),
+      ".cursor-plugin/plugin.json": cursorManifest,
+    });
+    expect((await detectInstallMethods(schemaLess)).methods).toEqual([{ kind: "cursor-plugin" }]);
+    const loaded = await discoverAgentPluginAt({ pluginDir: schemaLess, scope: "global" });
+    expect(loaded.plugin?.cursorFallback).toBe(true);
+  });
+});
+
+describe("entryInstallMethods", () => {
+  const cursorEntry = parseClaudeMarketplace(
+    JSON.stringify({ name: "cursor-plugins", plugins: [{ name: "kit", source: "kit" }] }),
+    "cursor"
+  ).entries[0];
+
+  test("a Cursor entry installs only through its folder's own manifest", () => {
+    const ctx = { file: "cursor" as const, entry: cursorEntry, rootSource: false };
+    expect(entryInstallMethods([{ kind: "cursor-plugin" }], { ...ctx, relative: true })).toEqual({
+      methods: [{ kind: "cursor-plugin" }],
+      warnings: [],
+    });
+    const refusal =
+      "The Cursor marketplace entry 'kit' has no plugin manifest in its folder. Xum does not install it.";
+    // No generated manifest for a folder of the repository, no Skills for another repository.
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: true })).toThrow(
+      refusal
+    );
+    expect(() => entryInstallMethods([{ kind: "skills" }], { ...ctx, relative: false })).toThrow(
+      refusal
+    );
+  });
 });
 
 describe("chooseInstallMethod", () => {
@@ -189,6 +311,24 @@ describe("chooseInstallMethod", () => {
     ).toThrow("cannot be installed as Agent Plugin; it fits: Claude Code plugin, Skills");
   });
 
+  test("a Cursor marketplace entry matches only the same entry", () => {
+    const pstack = { kind: "cursor-marketplace" as const, entry: "pstack" };
+    expect(chooseInstallMethod([pstack], { mode: "exact", method: { ...pstack } })).toEqual(pstack);
+    expect(() =>
+      chooseInstallMethod([pstack], {
+        mode: "exact",
+        method: { kind: "cursor-marketplace", entry: "origin-apps" },
+      })
+    ).toThrow("cannot be installed as Cursor marketplace entry");
+    // The Claude entry of the same name is another method.
+    expect(() =>
+      chooseInstallMethod([pstack], {
+        mode: "exact",
+        method: { kind: "claude-marketplace", entry: "pstack" },
+      })
+    ).toThrow("cannot be installed as Claude Code marketplace entry");
+  });
+
   test("update keeps a generated install on skills unless the repository has its own manifest", () => {
     const generatedFrom = { kind: "skills" as const };
     expect(chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom })).toEqual({
@@ -204,6 +344,24 @@ describe("chooseInstallMethod", () => {
     expect(
       chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom: undefined })
     ).toEqual({ kind: "claude-plugin" });
+  });
+
+  test("update reads a Cursor manifest, also for an entry Xum generated from the Claude file", () => {
+    const cursorAndSkills = [{ kind: "cursor-plugin" as const }, { kind: "skills" as const }];
+    expect(
+      chooseInstallMethod([{ kind: "cursor-plugin" }], { mode: "update", generatedFrom: undefined })
+    ).toEqual({ kind: "cursor-plugin" });
+    // A Claude marketplace entry whose folder gained a Cursor manifest switches to it.
+    expect(
+      chooseInstallMethod(cursorAndSkills, {
+        mode: "update",
+        generatedFrom: { kind: "claude-marketplace", entry: "kit" },
+      })
+    ).toEqual({ kind: "cursor-plugin" });
+    // A generated skills install keeps its generator.
+    expect(
+      chooseInstallMethod(cursorAndSkills, { mode: "update", generatedFrom: { kind: "skills" } })
+    ).toEqual({ kind: "skills" });
   });
 });
 

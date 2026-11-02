@@ -19,7 +19,7 @@ for (const [alias, modelId] of Object.entries(MODEL_ABBREVIATIONS)) {
 export function modelMatchesQuery(model: string, lowerQuery: string): boolean {
   if (model.toLowerCase().includes(lowerQuery)) return true;
   // Aliases map to canonical provider:model ids; normalize so gateway-prefixed
-  // entries (mux-gateway:google/...) match their aliases too.
+  // entries (openrouter:google/...) match their aliases too.
   const aliases = ALIASES_BY_MODEL.get(normalizeToCanonical(model));
   return aliases?.some((alias) => alias.includes(lowerQuery)) ?? false;
 }

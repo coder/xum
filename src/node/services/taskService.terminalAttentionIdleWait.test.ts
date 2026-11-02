@@ -97,10 +97,11 @@ describe("TaskService terminal attention idle waits", () => {
     const chatListeners = () => emitter.listenerCount("chat-event");
     const baseline = chatListeners();
 
-    const drainChains = Reflect.get(taskService, "pendingTerminalAttentionDrainsByOwner") as Map<
-      string,
-      Promise<void>
-    >;
+    const drainChains = (
+      taskService as unknown as {
+        terminalAttention: { pendingTerminalAttentionDrainsByOwner: Map<string, Promise<void>> };
+      }
+    ).terminalAttention.pendingTerminalAttentionDrainsByOwner;
 
     for (const [index, childId] of childIds.entries()) {
       const reportMarkdown = `Report ${index} from ${childId}`;

@@ -12,7 +12,6 @@ import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBann
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
-import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
@@ -21,7 +20,13 @@ import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
-import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
+import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { WaitingOnYouCard, WaitingOnYouProvider, WaitingOnYouSlot } from "./WaitingOnYou";
+import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
+import {
+  AskUserQuestionPlacementProvider,
+  getTranscriptAskUserQuestionPlacement,
+} from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
 import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
 import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
@@ -63,20 +68,24 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import { useMainPaneAgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import type { AgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
+import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
-import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
-import { HeldInput } from "@/browser/features/Messages/HeldInput";
+import { QueuedMessage, queuedMessageEntry } from "@/browser/features/Messages/QueuedMessage";
+import { HeldInput, heldInputsEntry } from "@/browser/features/Messages/HeldInput";
 import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
 import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
-import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
-import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
+import {
+  ContextSwitchWarning as ContextSwitchWarningBanner,
+  contextSwitchEntry,
+} from "../ContextSwitchWarning/ContextSwitchWarning";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
@@ -103,9 +112,9 @@ import {
   ChatDockSurface,
   useChatDockColumnWidthClass,
 } from "./chatDockColumn";
+import { ChatActivityLine } from "./ChatActivityLine";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useReviews } from "@/browser/hooks/useReviews";
-import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -175,6 +184,11 @@ export type ChatPaneContentProps = Omit<
   embedded?: boolean;
   /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
   onChatInputReady?: (api: ChatInputAPI) => void;
+  /**
+   * Agent interface view: which view the main pane shows, or null/absent when the workspace has
+   * no status page to show (or the experiment is off), which leaves the transcript as is.
+   */
+  agentInterfaceView?: AgentInterfaceView | null;
 };
 
 type ReviewsState = ReturnType<typeof useReviews>;
@@ -204,7 +218,11 @@ function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): read
 const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
 
 /** Off the bottom, or detached: the bottom of the slice is not the live tail. */
-const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean) => !autoScroll || isDetached;
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
+  !statusShown && (!autoScroll || isDetached);
+
+/** Tab skips the transcript under the status page; the composer dock it holds stays reachable. */
+const transcriptTabIndex = (statusShown: boolean) => (statusShown ? -1 : 0);
 
 /** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
 function lastRowAnchor(scrollport: HTMLDivElement | null) {
@@ -342,6 +360,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
+  const agentInterfaceView = useMainPaneAgentInterfaceView(workspaceId);
+
   return (
     <PerfRenderMarker id="chat-pane">
       <div
@@ -393,6 +413,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
+            agentInterfaceView={agentInterfaceView}
           />
         </main>
 
@@ -444,6 +465,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
+
+  // Agent interface view: the transcript stays mounted (hidden) under the status page, so its
+  // scroll position survives a round trip; the status page unmounts while the transcript shows.
+  const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -737,6 +762,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     setTranscriptDetached(isTranscriptDetached);
   }, [isTranscriptDetached, setTranscriptDetached]);
   const revealedMessages = mountedSlice(deferredMessages, revealFromIndex, revealToIndex);
+  // An accepted non-blocking answer closes its question without any transcript change.
+  useAcceptedAnswersVersion();
+  // Open ask_user_question forms live in the composer dock (sticky to the bottom of the chat) and
+  // their transcript rows render as stubs.
+  const askUserQuestionPlacement = getTranscriptAskUserQuestionPlacement({
+    workspaceId,
+    transcriptOnly,
+    transcripts: [transformedMessages, deferredMessages],
+  });
   const hasCommittedTranscriptRow =
     !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
   // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
@@ -1335,8 +1369,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Live status belongs beside the input, below async decorations: neither history
-  // reveal nor banners arriving should bump the label and Stop across the screen.
+  // Transcript-only workspaces have no composer, so their live status stands alone; the
+  // composer's live line (ChatActivityLine) renders its own.
   const turnStatus = shouldMountStreamingBarrier ? (
     <ChatDockSurface>
       <StreamingBarrier
@@ -1621,6 +1655,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             props.embedded !== true && "mobile-header-spacer"
           )}
         >
+          {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
+              before the composer below it. */}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1631,7 +1674,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onKeyDown={handleTranscriptKeyDown}
             onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            tabIndex={0}
+            tabIndex={transcriptTabIndex(showStatusView)}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
             // decoration data readiness AND the tail-first reveal having settled
@@ -1685,7 +1728,9 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
                 // where real messages will, avoiding a jump when hydration completes.
-                showEmptyTranscriptPlaceholder && "flex flex-col"
+                showEmptyTranscriptPlaceholder && "flex flex-col",
+                // Under the status page: hidden but laid out, so its scroll position survives.
+                { invisible: showStatusView }
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
@@ -1732,13 +1777,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         </TooltipIfPresent>
                       </div>
                     )}
-                    <TranscriptBundleRows
-                      workspaceId={workspaceId}
-                      messages={revealedMessages}
-                      indexOffset={revealFromIndex}
-                      bundles={transcriptBundles}
-                      renderMessageAtIndex={renderMessageAtIndex}
-                    />
+                    <AskUserQuestionPlacementProvider value={askUserQuestionPlacement}>
+                      <TranscriptBundleRows
+                        workspaceId={workspaceId}
+                        messages={revealedMessages}
+                        indexOffset={revealFromIndex}
+                        bundles={transcriptBundles}
+                        renderMessageAtIndex={renderMessageAtIndex}
+                      />
+                    </AskUserQuestionPlacementProvider>
                     <ShowNewerMessagesButton
                       visible={isTranscriptDetached}
                       onClick={handleShowNewerMessages}
@@ -1798,7 +1845,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {offersJumpToBottom(autoScroll, isTranscriptDetached) && (
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached, showStatusView) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
@@ -1832,7 +1879,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     </>
                   ) : (
                     <ChatInputPane
-                      turnStatus={turnStatus}
+                      vimEnabled={vimEnabled}
+                      onCancelCompaction={handleCancelCompactionFromBarrier}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1926,7 +1974,8 @@ const TranscriptOnlyNoticePane: React.FC<{
 };
 
 interface ChatInputPaneProps {
-  turnStatus: React.ReactNode;
+  vimEnabled: boolean;
+  onCancelCompaction: () => void;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
@@ -2001,34 +2050,42 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         // while compaction/reconnect bypasses the hydration skeleton but other data is still loading.
         revealBeforeReady: true,
         node: (
-          <QueuedMessage
-            message={props.queuedMessage}
-            onEdit={() => void props.onEditQueuedMessage()}
-            editBlocked={props.editingMessage !== undefined}
-            onChangeDispatchMode={props.onQueuedDispatchModeChange}
-            onActionError={props.onQueuedActionError}
-            actionError={props.queuedActionError}
-            onActionStart={props.onClearQueuedActionError}
-            onSendImmediately={props.onSendQueuedImmediately}
-          />
+          <WaitingOnYouSlot id="queued" entry={queuedMessageEntry(props.queuedMessage)}>
+            <QueuedMessage
+              message={props.queuedMessage}
+              onEdit={() => void props.onEditQueuedMessage()}
+              editBlocked={props.editingMessage !== undefined}
+              onChangeDispatchMode={props.onQueuedDispatchModeChange}
+              onActionError={props.onQueuedActionError}
+              actionError={props.queuedActionError}
+              onActionStart={props.onClearQueuedActionError}
+              onSendImmediately={props.onSendQueuedImmediately}
+            />
+          </WaitingOnYouSlot>
         ),
       })
     );
   }
   // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
   // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
-  for (const [index, heldInput] of props.heldInputs.entries()) {
+  // One slot for all of them: the "Waiting on you" card gives them one tab ("2 unsent").
+  if (props.heldInputs.length > 0) {
     decorationEntries.push(
       createChatInputDecorationStackItem({
-        key: `held-input-${heldInput.id}`,
+        key: "held-inputs",
         revealBeforeReady: true,
         node: (
-          <HeldInput
-            workspaceId={props.workspaceId}
-            heldInput={heldInput}
-            // The composer's held-input shortcuts act on the oldest one (see ChatInput).
-            isShortcutTarget={index === 0}
-          />
+          <WaitingOnYouSlot id="held-inputs" entry={heldInputsEntry(props.heldInputs.length)}>
+            {props.heldInputs.map((heldInput, index) => (
+              <HeldInput
+                key={heldInput.id}
+                workspaceId={props.workspaceId}
+                heldInput={heldInput}
+                // The composer's held-input shortcuts act on the oldest one (see ChatInput).
+                isShortcutTarget={index === 0}
+              />
+            ))}
+          </WaitingOnYouSlot>
         ),
       })
     );
@@ -2070,68 +2127,46 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     addDecorationEntry({
       key: "context-switch-warning",
       node: (
-        <ChatDockSurface>
-          <ContextSwitchWarningBanner
-            warning={props.contextSwitchWarning}
-            onCompact={props.onContextSwitchCompact}
-            onDismiss={props.onContextSwitchDismiss}
-          />
-        </ChatDockSurface>
+        <WaitingOnYouSlot
+          id="context-switch"
+          entry={contextSwitchEntry(props.contextSwitchWarning)}
+        >
+          <ChatDockSurface>
+            <ContextSwitchWarningBanner
+              warning={props.contextSwitchWarning}
+              onCompact={props.onContextSwitchCompact}
+              onDismiss={props.onContextSwitchDismiss}
+            />
+          </ChatDockSurface>
+        </WaitingOnYouSlot>
       ),
     });
   }
   // Match Codex’s behavior: shared local checkouts intentionally have no concurrency warning.
 
-  if (props.shouldShowPinnedTodoList) {
-    addDecorationEntry({
-      key: "pinned-todo-list",
-      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
-      // scroll position (set to the current item on open) must not carry over to another chat.
-      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
-    });
-  }
-  addDecorationEntry({
-    key: "sub-agent-tasks",
-    // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
-    // The decoration is collapsed by default, so inactive task history is available without noise.
-    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
-    // retains observed workflow-run refs that must never leak into another chat's tray.
-    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
-  });
-  addDecorationEntry({
-    key: "background-processes",
-    node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
-  });
   // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
   // workspace so one workspace's offer, error or pending import never carries over to another.
   addDecorationEntry({
     key: "legacy-plan-import",
-    node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
+    node: (
+      <WaitingOnYouSlot id="legacy-plan">
+        <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />
+      </WaitingOnYouSlot>
+    ),
   });
-  // The Chat Instructions decoration is intentionally self-gating: it renders
-  // nothing when the scratchpad is empty or disabled, so it can always be in
-  // the decoration lane without affecting layout for users who don't use it.
-  addDecorationEntry({
-    key: "chat-instructions",
-    node: <ChatInstructionsChatDecoration workspaceId={props.workspaceId} />,
-  });
-  if (props.shouldShowReviewsBanner) {
-    addDecorationEntry({
-      key: "reviews-banner",
-      node: <ReviewsBanner workspaceId={props.workspaceId} />,
-    });
-  }
   if (props.delegatedCreationInterrupted) {
     addDecorationEntry({
       key: "delegated-creation-interrupted",
       node: (
-        <DelegatedCreationInterruptedBanner
-          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
-          // pending Remove/Keep or its error must not carry over to another's banner.
-          key={props.workspaceId}
-          workspaceId={props.workspaceId}
-          workspaceName={props.workspaceName}
-        />
+        <WaitingOnYouSlot id="delegated-creation">
+          <DelegatedCreationInterruptedBanner
+            // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+            // pending Remove/Keep or its error must not carry over to another's banner.
+            key={props.workspaceId}
+            workspaceId={props.workspaceId}
+            workspaceName={props.workspaceName}
+          />
+        </WaitingOnYouSlot>
       ),
     });
   }
@@ -2149,15 +2184,54 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
+  // Open questions sit closest to the composer: they wait on the user, like the next message.
+  // Self-gating (renders nothing without an open question) and keyed by workspace, since the
+  // dock retains closed cards for the visit (see AskUserQuestionDock). Like the queued message it
+  // is synchronous chat state, and it must not wait for the reveal: the transcript stubs these
+  // rows from the first render, so the form never moves between instances mid-answer.
+  decorationEntries.push(
+    createChatInputDecorationStackItem({
+      key: "ask-user-question",
+      revealBeforeReady: true,
+      node: (
+        <WaitingOnYouSlot id="question">
+          <AskUserQuestionDock key={props.workspaceId} workspaceId={props.workspaceId} />
+        </WaitingOnYouSlot>
+      ),
+    })
+  );
+  // Two or more of the items above at once fold into this card, under them in the stack (the
+  // items move into it, see WaitingOnYouSlot). Renders nothing otherwise.
+  decorationEntries.push(
+    createChatInputDecorationStackItem({
+      key: "waiting-on-you",
+      revealBeforeReady: true,
+      node: <WaitingOnYouCard />,
+    })
+  );
   // Keep decorations in the in-flow composer dock so height changes reserve
   // transcript clearance in the same layout pass.
 
   return (
     <>
-      <ChatInputDecorationStackLane
-        items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
+      {/* Remount per workspace, but keep this key distinct from the sibling ChatInput's: React
+          cannot reconcile same-keyed siblings, and on a workspace switch it left the previous
+          workspace's decoration stack (queued message, questions) in the dock. */}
+      <WaitingOnYouProvider key={`waiting-on-you:${props.workspaceId}`}>
+        <ChatInputDecorationStackLane
+          items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
+        />
+      </WaitingOnYouProvider>
+      {/* Live status sits beside the input, below async decorations: neither history reveal nor
+          banners arriving should bump the label and Stop across the screen. */}
+      <ChatActivityLine
+        workspaceId={props.workspaceId}
+        vimEnabled={props.vimEnabled}
+        onCancelCompaction={props.onCancelCompaction}
+        revealChips={props.revealDecorations}
+        showTodo={props.shouldShowPinnedTodoList}
+        showReviews={props.shouldShowReviewsBanner}
       />
-      {props.turnStatus}
       <ChatInput
         key={props.workspaceId}
         variant="workspace"

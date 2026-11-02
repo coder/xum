@@ -143,8 +143,8 @@ describe("Completing an edit of an older message", () => {
       await waitFor(
         () =>
           expect(
-            app.view.container.querySelector('textarea[aria-label="Edit message"]')
-          ).toBeNull(),
+            app.view.container.querySelector('textarea[aria-label="Edit message"]') === null
+          ).toBe(true),
         LOAD_TOLERANT_WAIT
       );
       await app.chat.expectStreamComplete(60_000);
@@ -169,8 +169,8 @@ describe("Completing an edit of an older message", () => {
       await waitFor(
         () =>
           expect(
-            app.view.container.querySelector('textarea[aria-label="Edit message"]')
-          ).toBeNull(),
+            app.view.container.querySelector('textarea[aria-label="Edit message"]') === null
+          ).toBe(true),
         LOAD_TOLERANT_WAIT
       );
       await expectUnsentDraftKept(app, scope);

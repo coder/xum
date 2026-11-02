@@ -9,6 +9,7 @@ import {
 } from "@/constants/serverUpdate";
 import { isExactVersion, type InstallLayout } from "./installLayout";
 import { fetchPublishedDigests, type RegistryRequest } from "./registry";
+import { installedName } from "./shrinkwrap";
 
 /**
  * One package a manager's lockfile records, before any trust decision. `name` is the name the
@@ -42,8 +43,9 @@ const bunLock = z.object({
       z
         .tuple([z.string(), z.string(), bunMeta, z.string().optional()])
         .transform(([spec, registry, , integrity]) => ({ spec, registry, integrity })),
-      // Every other resolution kind names its location in the spec.
-      z.tuple([z.string(), bunMeta]).transform(([spec]) => ({ spec })),
+      // Every other resolution kind names its location in the spec. bun 1.4, unlike 1.2, ends a
+      // tarball entry (the staged release's included) with the tarball's digest.
+      z.tuple([z.string(), bunMeta, z.string().optional()]).transform(([spec]) => ({ spec })),
     ])
   ),
 });
@@ -96,7 +98,7 @@ const lockfileParsers: Record<InstallLayout["packageManager"], (raw: string) => 
   npm: (raw) =>
     Object.entries(npmLock.parse(JSON.parse(raw)).packages).flatMap(([key, pkg]) => {
       if (key === "") return [];
-      const name = key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length);
+      const name = installedName(key);
       if (pkg.name !== undefined && pkg.name !== name)
         throw new Error(`Dependency ${name} was installed under another package's name`);
       return [
@@ -139,31 +141,52 @@ const isLocal = (resolved: string) =>
   /^(file:|\.\.?\/)/.test(resolved) || path.isAbsolute(resolved);
 
 /**
- * Anchors the staged dependency tree to the configured registry. Managers follow redirects (also
- * to plaintext) while resolving dependencies and record whatever digest they were served, so the
- * lockfile alone proves nothing; every recorded digest must be one the registry publishes over
- * verified HTTPS without redirects. Managers do verify every tarball against its recorded digest,
- * which makes that digest the only link that needs anchoring. Returns the verified count.
+ * The digests a staged lockfile entry records for a registry release; undefined for the staged
+ * release itself. Throws for any other kind of entry.
+ */
+function recordedDigests(pkg: LockedPackage): string[] | undefined {
+  if (pkg.resolved !== undefined && isLocal(pkg.resolved)) {
+    // The release tarball itself was digest-checked before the install.
+    if (pkg.root) return undefined;
+    throw new Error(`Dependency ${pkg.name} was installed from a local path`);
+  }
+  if (pkg.resolved !== undefined && !pkg.resolved.startsWith("https://"))
+    throw new Error(`Dependency ${pkg.name} was not resolved over HTTPS`);
+  if (!isExactVersion(pkg.version) || !pkg.integrity)
+    throw new Error(`Dependency ${pkg.name} is not a digest-pinned registry release`);
+  return pkg.integrity.trim().split(/\s+/);
+}
+
+/**
+ * Holds the staged dependency tree to the release's pins (`name@version` to digests, from its
+ * npm-shrinkwrap.json) and anchors it to the configured registry. Managers follow redirects
+ * (also to plaintext) while fetching and record whatever digest they were served, so the
+ * lockfile alone proves nothing; every recorded digest must also be one the registry publishes
+ * over verified HTTPS without redirects. Managers do verify every tarball against its recorded
+ * digest, which makes that digest the only link that needs anchoring. Returns the verified count.
  */
 export async function verifyStagedDependencies(
   layout: InstallLayout,
   dir: string,
+  pins: ReadonlyMap<string, readonly string[]>,
   request: RegistryRequest = fetch,
   signal?: AbortSignal
 ): Promise<number> {
   const lockfile = path.join(dir, SERVER_UPDATE_LOCKFILES[layout.packageManager]);
-  const queue: Array<{ name: string; version: string; integrity: string }> = [];
+  const queue: Array<{ name: string; version: string; recorded: string[] }> = [];
   for (const pkg of lockfileParsers[layout.packageManager](await fs.readFile(lockfile, "utf8"))) {
-    if (pkg.resolved !== undefined && isLocal(pkg.resolved)) {
-      // The release tarball itself was digest-checked before the install.
-      if (pkg.root) continue;
-      throw new Error(`Dependency ${pkg.name} was installed from a local path`);
-    }
-    if (pkg.resolved !== undefined && !pkg.resolved.startsWith("https://"))
-      throw new Error(`Dependency ${pkg.name} was not resolved over HTTPS`);
-    if (!isExactVersion(pkg.version) || !pkg.integrity)
-      throw new Error(`Dependency ${pkg.name} is not a digest-pinned registry release`);
-    queue.push({ name: pkg.name, version: pkg.version, integrity: pkg.integrity });
+    const recorded = recordedDigests(pkg);
+    if (!recorded) continue;
+    // A version the release does not pin is one the manager resolved at update time, as a
+    // release compromised an hour earlier would be. A manager accepts a tarball matching any
+    // recorded digest of its strongest algorithm, so one trusted digest cannot vouch for a
+    // foreign one listed beside it.
+    const pinned = pins.get(`${pkg.name}@${pkg.version}`);
+    if (!pinned || !recorded.every((sri) => pinned.includes(sri)))
+      throw new Error(
+        `Dependency ${pkg.name}@${pkg.version} is not pinned by the release's npm-shrinkwrap.json`
+      );
+    queue.push({ name: pkg.name, version: pkg.version, recorded });
   }
   const total = queue.length;
   const worker = async () => {
@@ -176,9 +199,7 @@ export async function verifyStagedDependencies(
           request,
           signal
         );
-        // A manager accepts a tarball matching any recorded digest of its strongest algorithm, so
-        // one published digest cannot vouch for a foreign one listed beside it.
-        const recorded = pkg.integrity.trim().split(/\s+/);
+        const { recorded } = pkg;
         if (!recorded.every((sri) => published.includes(sri)))
           throw new Error(
             `Registry digest for ${pkg.name}@${pkg.version} differs from the staged lockfile`

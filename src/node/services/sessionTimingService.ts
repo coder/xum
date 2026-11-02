@@ -4,7 +4,8 @@ import * as fs from "fs/promises";
 import { EventEmitter } from "events";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Config } from "@/node/config";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import type { AgentMode } from "@/common/types/mode";
 import {
@@ -163,7 +164,8 @@ function validateTiming(params: {
 export class SessionTimingService {
   private readonly config: Config;
   private readonly telemetryService: TelemetryService;
-  private readonly fileLocks = workspaceFileLocks;
+  /** The one workspace FIFO (phase 4: from SessionLocks; desktop.ts keeps the Node default). */
+  private readonly fileLocks: SessionLocks["workspaceFiles"];
 
   private readonly activeStreams = new Map<string, ActiveStreamState>();
   private readonly timingFileCache = new Map<string, SessionTimingFile>();
@@ -181,9 +183,14 @@ export class SessionTimingService {
     { lastEmitTimeMs: number; timer?: ReturnType<typeof setTimeout> }
   >();
 
-  constructor(config: Config, telemetryService: TelemetryService) {
+  constructor(
+    config: Config,
+    telemetryService: TelemetryService,
+    locks: SessionLocks = nodeSessionLocks
+  ) {
     this.config = config;
     this.telemetryService = telemetryService;
+    this.fileLocks = locks.workspaceFiles;
   }
 
   addSubscriber(workspaceId: string): void {

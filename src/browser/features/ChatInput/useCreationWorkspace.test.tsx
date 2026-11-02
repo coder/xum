@@ -1,5 +1,8 @@
 import { getDraftStore } from "@/browser/stores/DraftStore";
-import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import {
+  createBlankCreationDraft,
+  getCreationDraftStore,
+} from "@/browser/stores/CreationDraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
@@ -27,7 +30,11 @@ import {
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
-import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
+import {
+  creationDraftMetadata,
+  summarizeCreationDraft,
+  toDraftAttachmentMetadata,
+} from "@/common/utils/drafts";
 
 import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
@@ -87,14 +94,13 @@ const draftBackend = createTestApiClient({
     updateCreation: async (input) => {
       await creationSaveGate;
       if (failCreationSaves) throw new Error("draft save refused");
-      return {
-        draftId: input.scope.draftId,
-        projectPath: input.projectPath ?? TEST_PROJECT_PATH,
-        subProjectPath: null,
+      const { scope, ...patch } = input;
+      const record = {
+        ...createBlankCreationDraft(scope.draftId, TEST_PROJECT_PATH, null),
+        ...patch,
         createdAt: 0,
-        manualName: input.manualName ?? "",
-        preview: "",
       };
+      return { ...summarizeCreationDraft(record), record: creationDraftMetadata(record) };
     },
     deleteCreation: () => Promise.resolve(),
   },
@@ -567,6 +573,9 @@ const setupWindow = ({
 
   const windowInstance = new GlobalWindow();
   globalThis.window = windowInstance as unknown as WindowWithApi;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  // saveDomGlobals() in beforeEach puts the previous CustomEvent back.
+  globalThis.CustomEvent = windowInstance.CustomEvent as unknown as typeof CustomEvent;
   const windowWithApi = globalThis.window as WindowWithApi;
 
   const apiMock: WindowApi = {

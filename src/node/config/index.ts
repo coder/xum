@@ -554,11 +554,6 @@ function normalizeOptionalModelString(value: unknown): string | undefined {
     return undefined;
   }
 
-  // Reject malformed mux-gateway strings ("mux-gateway:provider" without "/model").
-  if (trimmed.startsWith("mux-gateway:") && !trimmed.includes("/")) {
-    return undefined;
-  }
-
   const normalized = normalizeSelectedModel(trimmed);
   if (!isValidModelFormat(normalized)) {
     return undefined;
@@ -2799,58 +2794,6 @@ export class Config {
       return modified;
     };
 
-    const normalizeLegacyGatewayModel = (value: string): string | undefined => {
-      const trimmed = value.trim();
-      if (!trimmed) {
-        return undefined;
-      }
-
-      const legacyModelString = trimmed.includes(":") ? trimmed : trimmed.replace("/", ":");
-      const canonicalModel = normalizeToCanonical(legacyModelString);
-      return isValidModelFormat(canonicalModel) ? canonicalModel : undefined;
-    };
-
-    // Migrate legacy gateway settings to the new route-based system.
-    // Legacy keys are intentionally preserved on disk for downgrade compatibility —
-    // older versions still read muxGatewayEnabled / muxGatewayModels directly.
-    if (
-      (parsed.muxGatewayModels != null || parsed.muxGatewayEnabled != null) &&
-      !Array.isArray(parsed.routePriority)
-    ) {
-      let nextPriority = this.seedRoutePriorityFromProviders() ?? ["direct"];
-      if (parsed.muxGatewayEnabled === false) {
-        nextPriority = nextPriority.filter((route) => route !== "mux-gateway");
-        if (nextPriority.length === 0) {
-          nextPriority = ["direct"];
-        }
-      }
-      parsed.routePriority = nextPriority;
-      configModified = true;
-
-      if (parsed.muxGatewayEnabled !== false) {
-        const legacyModels = parseOptionalStringArray(parsed.muxGatewayModels) ?? [];
-        if (legacyModels.length > 0) {
-          const mergedRouteOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides) ?? {};
-          let routeOverridesModified = false;
-
-          for (const legacyModel of legacyModels) {
-            const canonicalModel = normalizeLegacyGatewayModel(legacyModel);
-            if (!canonicalModel || Object.hasOwn(mergedRouteOverrides, canonicalModel)) {
-              continue;
-            }
-
-            mergedRouteOverrides[canonicalModel] = "mux-gateway";
-            routeOverridesModified = true;
-          }
-
-          if (routeOverridesModified) {
-            parsed.routeOverrides = mergedRouteOverrides;
-            shouldInvalidateSessionUsageCaches = true;
-          }
-        }
-      }
-    }
-
     // Seed routePriority only when the field does not exist yet.
     // Once routePriority is an array, it becomes user-owned state, so
     // read-time backfill is intentionally skipped here. Credential-driven
@@ -2862,17 +2805,6 @@ export class Config {
         parsed.routePriority = seeded;
         configModified = true;
       }
-    }
-
-    if (
-      Array.isArray(parsed.routePriority) &&
-      parsed.routePriority.includes("mux-gateway") &&
-      parsed.muxGatewayEnabled === false
-    ) {
-      // Once routePriority exists, it is the authoritative routing signal. Clear a stale
-      // legacy disable flag so downgrade-compat data cannot veto an explicitly enabled gateway.
-      delete parsed.muxGatewayEnabled;
-      configModified = true;
     }
 
     // Normalize persisted model preferences while preserving explicit gateway selections.
@@ -2980,13 +2912,11 @@ export class Config {
     configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
-    const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
     // Lenient on read: malformed entries never break config load. Values
     // are judged at send time by resolveSkillModelClassBinding — a bound
     // class with a bad value fails that send with an actionable error.
     const modelClasses = parseOptionalStringRecord(parsed.modelClasses);
     const skillModelClasses = parseOptionalStringRecord(parsed.skillModelClasses);
-    const muxGatewayModels = parseOptionalStringArray(parsed.muxGatewayModels);
     const routePriority = parseOptionalStringArray(parsed.routePriority);
     const routeOverrides = normalizeRouteOverridesRecord(parsed.routeOverrides);
     const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
@@ -3156,7 +3086,6 @@ export class Config {
       userPreferences,
       taskSettings,
       chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
-      muxGatewayEnabled,
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       modelClasses,
       skillModelClasses,
@@ -3172,7 +3101,6 @@ export class Config {
       agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
-      muxGatewayModels,
       routePriority,
       routeOverrides,
       minThinkingLevelByModel,
@@ -3293,11 +3221,6 @@ export class Config {
       };
       deriveSharedTaskCheckouts(new Map(data.projects));
 
-      const muxGatewayEnabled = parseOptionalBoolean(config.muxGatewayEnabled);
-      if (muxGatewayEnabled !== undefined) {
-        data.muxGatewayEnabled = muxGatewayEnabled;
-      }
-
       const chatTranscriptFullWidth = parseOptionalBoolean(config.chatTranscriptFullWidth);
       if (chatTranscriptFullWidth === true) {
         data.chatTranscriptFullWidth = true;
@@ -3350,11 +3273,6 @@ export class Config {
       const evaluationDefaults = normalizeEvaluationDefaults(config.evaluationDefaults);
       if (evaluationDefaults !== undefined) {
         data.evaluationDefaults = evaluationDefaults;
-      }
-
-      const muxGatewayModels = parseOptionalStringArray(config.muxGatewayModels);
-      if (muxGatewayModels !== undefined) {
-        data.muxGatewayModels = muxGatewayModels;
       }
 
       const defaultModel = normalizeOptionalModelString(config.defaultModel);
@@ -3719,8 +3637,6 @@ export class Config {
     return {
       userPreferences: config.userPreferences,
       taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
-      muxGatewayEnabled: config.muxGatewayEnabled,
-      muxGatewayModels: config.muxGatewayModels,
       routePriority: config.routePriority,
       routeOverrides: config.routeOverrides,
       minThinkingLevelByModel: config.minThinkingLevelByModel,
@@ -3748,17 +3664,6 @@ export class Config {
       goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       evaluationDefaults: normalizeEvaluationDefaults(config.evaluationDefaults),
     };
-  }
-
-  async updateMuxGatewayPrefs(input: {
-    muxGatewayEnabled: boolean;
-    muxGatewayModels: string[];
-  }): Promise<void> {
-    await this.editConfig((config) => ({
-      ...config,
-      muxGatewayEnabled: input.muxGatewayEnabled ? undefined : false,
-      muxGatewayModels: [...new Set(input.muxGatewayModels)].sort(),
-    }));
   }
 
   async updateCoderPrefs(input: {
@@ -4208,7 +4113,7 @@ export class Config {
         try: () => self.saveConfig(newConfig, expectedStatKey),
         catch: (error) => error,
       });
-      // Backend-initiated config edits (for example gateway auth changes) use this signal
+      // Backend-initiated config edits (for example provider auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();
     });

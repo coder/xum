@@ -20,6 +20,7 @@ import {
   resolveJsonPointer,
 } from "./canvasSpec";
 import type { JsonValue } from "./jsonData";
+import type { ArtifactSendOrigin } from "./artifactInteractions";
 
 function ok(path: string, content: string): ArtifactReadResult {
   return {
@@ -140,7 +141,7 @@ describe("CanvasArtifact", () => {
 
   function renderCanvas(
     content: string,
-    interactions?: { requestSend: (t: string, d?: unknown) => void }
+    interactions?: { requestSend: (t: string, d: unknown, origin: ArtifactSendOrigin) => void }
   ) {
     return render(
       <CanvasArtifact
@@ -361,11 +362,14 @@ describe("CanvasArtifact", () => {
     expect(readOnly.queryByRole("button", { name: "Rerun" })).toBeNull();
     cleanup();
 
-    const requestSend = mock((_text: string, _data?: unknown) => undefined);
+    const requestSend = mock(
+      (_text: string, _data: unknown, _origin: ArtifactSendOrigin) => undefined
+    );
     const view = renderCanvas(content, { requestSend });
     const button = view.getByRole("button", { name: "Rerun" });
     expect(requestSend).not.toHaveBeenCalled();
     fireEvent.click(button);
-    expect(requestSend.mock.calls).toEqual([["rerun the report", { quarter: "Q3" }]]);
+    // Xum draws the button, so its click is the user's own: it sends without the strip.
+    expect(requestSend.mock.calls).toEqual([["rerun the report", { quarter: "Q3" }, "click"]]);
   });
 });

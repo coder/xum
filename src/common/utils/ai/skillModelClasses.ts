@@ -133,7 +133,8 @@ export type SkillModelClassBinding =
  */
 export function resolveSkillModelClassBinding(args: {
   skillName: string;
-  frontmatterMetadata?: Record<string, string>;
+  // Frontmatter metadata holds any JSON value; only a string names a class.
+  frontmatterMetadata?: Readonly<Record<string, unknown>>;
   modelClasses?: Record<string, string>;
   skillModelClasses?: Record<string, string>;
   providersConfig?: ProvidersConfigMap | null;

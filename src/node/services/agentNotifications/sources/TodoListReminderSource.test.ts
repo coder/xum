@@ -6,6 +6,8 @@ import * as path from "path";
 import { setTodosForSessionDir } from "@/node/services/tools/todo";
 
 import { TodoListReminderSource } from "./TodoListReminderSource";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TodoListReminderSource", () => {
   const workspaceId = "ws-test";
@@ -13,11 +15,17 @@ describe("TodoListReminderSource", () => {
 
   beforeEach(async () => {
     workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-todos-"));
-    await setTodosForSessionDir(workspaceId, workspaceSessionDir, [
-      { content: "Completed", status: "completed" },
-      { content: "In progress", status: "in_progress" },
-      { content: "Pending", status: "pending" },
-    ]);
+    await setTodosForSessionDir(
+      workspaceId,
+      workspaceSessionDir,
+      [
+        { content: "Completed", status: "completed" },
+        { content: "In progress", status: "in_progress" },
+        { content: "Pending", status: "pending" },
+      ],
+      nodeSessionLocks,
+      nodeSessionFiles
+    );
   });
 
   afterEach(async () => {
@@ -25,7 +33,10 @@ describe("TodoListReminderSource", () => {
   });
 
   test("reminds after 5 tool calls, then every 10", async () => {
-    const source = new TodoListReminderSource({ workspaceSessionDir });
+    const source = new TodoListReminderSource({
+      sessionFiles: nodeSessionFiles,
+      workspaceSessionDir,
+    });
 
     for (let i = 0; i < 4; i += 1) {
       const notifications = await source.poll({ toolName: "bash", toolSucceeded: true, now: i });
@@ -52,7 +63,10 @@ describe("TodoListReminderSource", () => {
   });
 
   test("resets after successful todo_write", async () => {
-    const source = new TodoListReminderSource({ workspaceSessionDir });
+    const source = new TodoListReminderSource({
+      sessionFiles: nodeSessionFiles,
+      workspaceSessionDir,
+    });
 
     for (let i = 0; i < 4; i += 1) {
       await source.poll({ toolName: "bash", toolSucceeded: true, now: i });
@@ -77,7 +91,10 @@ describe("TodoListReminderSource", () => {
 
   test("suppresses reminder when todo list is empty", async () => {
     const emptyDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-todos-empty-"));
-    const source = new TodoListReminderSource({ workspaceSessionDir: emptyDir });
+    const source = new TodoListReminderSource({
+      sessionFiles: nodeSessionFiles,
+      workspaceSessionDir: emptyDir,
+    });
 
     try {
       for (let i = 0; i < 5; i += 1) {
@@ -90,12 +107,21 @@ describe("TodoListReminderSource", () => {
   });
 
   test("suppresses reminder when all todos are completed", async () => {
-    await setTodosForSessionDir(workspaceId, workspaceSessionDir, [
-      { content: "Done 1", status: "completed" },
-      { content: "Done 2", status: "completed" },
-    ]);
+    await setTodosForSessionDir(
+      workspaceId,
+      workspaceSessionDir,
+      [
+        { content: "Done 1", status: "completed" },
+        { content: "Done 2", status: "completed" },
+      ],
+      nodeSessionLocks,
+      nodeSessionFiles
+    );
 
-    const source = new TodoListReminderSource({ workspaceSessionDir });
+    const source = new TodoListReminderSource({
+      sessionFiles: nodeSessionFiles,
+      workspaceSessionDir,
+    });
 
     for (let i = 0; i < 5; i += 1) {
       const notifications = await source.poll({ toolName: "bash", toolSucceeded: true, now: i });

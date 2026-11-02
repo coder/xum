@@ -11,6 +11,7 @@ import {
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 
 const model: LanguageModel = {
   specificationVersion: "v3",
@@ -26,7 +27,9 @@ describe("StreamManager - model-only tool notifications", () => {
   let historyCleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+    ({ historyService, cleanup: historyCleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    }));
   });
 
   afterEach(async () => {

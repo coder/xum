@@ -83,7 +83,6 @@ async function setup(
         canonicalProviderName: "openai",
         canonicalModelId: requestedModel.slice("openai:".length),
         wireProviderName: "openai",
-        routedThroughGateway: false,
       })
     );
   });
@@ -172,7 +171,11 @@ async function setup(
   });
   const registration = eventSpine.useRequestContext(assembly, { workspaceId });
   const oldCache = Reflect.get(h.session, "memoryContextByModelString") as Map<string, unknown>;
-  oldCache.set("preserved-model", { context: { hotMemoriesBlock: "Preserved old notes" } });
+  oldCache.set("preserved-model", {
+    context: {
+      indexEntries: [{ path: "/memories/global/old.md", description: "Preserved old notes" }],
+    },
+  });
   expect(
     (
       await historyService.appendManyToHistory(workspaceId, [
@@ -279,7 +282,11 @@ describe("pinned full-payload rollover admission", () => {
             ).toBe(false);
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get("preserved-model")).toEqual({
-            context: { hotMemoriesBlock: "Preserved old notes" },
+            context: {
+              indexEntries: [
+                { path: "/memories/global/old.md", description: "Preserved old notes" },
+              ],
+            },
           });
         }
         if (fits) {
@@ -425,27 +432,27 @@ describe("pinned full-payload rollover admission", () => {
         new MemoryMetaService(config.rootDir)
       );
       spyOn(fixture.experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) =>
-          id === EXPERIMENT_IDS.MEMORY ||
-          id === EXPERIMENT_IDS.MEMORY_HOT_SET ||
-          id === EXPERIMENT_IDS.TOKEN_BUDGET
+        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.TOKEN_BUDGET
       );
-      const previous = {
-        context: { indexEntries: [], hotMemoriesBlock: "Obsolete notes" },
-        includesHotMemories: true,
-        memoryEnabled: true,
-        hotSetEnabled: true,
-      };
+      const notes = (description: string) => [{ path: "/memories/global/notes.md", description }];
+      const previous = { context: { indexEntries: notes("Obsolete notes") }, memoryEnabled: true };
       oldCache.set(model, previous);
       const fresh = overflow ? "漢".repeat(70000) : "Fresh retained notes";
-      const readMemory = spyOn(service, "buildMemorySessionContext").mockImplementation(
-        (_workspace, _model, options) =>
-          Promise.resolve({
-            indexEntries: [],
-            hotMemoriesBlock: options?.includeHotMemories === false ? null : fresh,
-          })
+      const readMemory = spyOn(service, "buildMemorySessionContext").mockResolvedValue({
+        indexEntries: notes(fresh),
+      });
+      // The index reaches the request through the memory tool description.
+      assembleTools.mockImplementation((_model, options) =>
+        Promise.resolve({
+          session_history: smallTool,
+          memory: tool({
+            description: (options.memoryIndexEntries ?? [])
+              .map((entry) => entry.description)
+              .join(),
+            inputSchema: jsonSchema({ type: "object", properties: {} }),
+          }),
+        })
       );
-      assembleTools.mockResolvedValue({ session_history: smallTool, memory: smallTool });
       try {
         expect(
           (
@@ -455,21 +462,22 @@ describe("pinned full-payload rollover admission", () => {
             })
           ).success
         ).toBe(!overflow);
-        expect(readMemory).toHaveBeenCalledTimes(2);
+        expect(readMemory).toHaveBeenCalledTimes(1);
         expect(applyReset).toHaveBeenCalledTimes(overflow ? 0 : 1);
         if (overflow) {
           expect(Reflect.get(h.session, "memoryContextByModelString")).toBe(oldCache);
           expect(oldCache.get(model)).toBe(previous);
         } else {
-          expect(start.mock.calls[0][0].system).toContain(fresh);
-          expect(start.mock.calls[0][0].system).not.toContain("Obsolete notes");
+          const sentIndex = start.mock.calls[0][0].tools?.memory?.description;
+          expect(sentIndex).toContain(fresh);
+          expect(sentIndex).not.toContain("Obsolete notes");
           const cache = Reflect.get(h.session, "memoryContextByModelString") as Map<
             string,
             unknown
           >;
-          expect(cache.get(model)).toMatchObject({
-            context: { hotMemoriesBlock: fresh },
-            includesHotMemories: true,
+          expect(cache.get(model)).toEqual({
+            context: { indexEntries: notes(fresh) },
+            memoryEnabled: true,
           });
           // The new window's context is saved before its first stream, so a server restart
           // during that turn restores these bytes instead of rebuilding them.

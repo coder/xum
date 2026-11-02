@@ -30,15 +30,23 @@ import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { coerceNonEmptyString, findWorkspaceEntry } from "@/node/services/taskUtils";
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 import { streamToString } from "@/node/runtime/streamUtils";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 export type TaskApplyGitPatchArgs = z.infer<typeof TaskApplyGitPatchToolArgsSchema>;
 export type TaskApplyGitPatchResult = z.infer<typeof TaskApplyGitPatchToolResultSchema>;
 
 export type TaskGitPatchApplyConfig = Pick<
   ToolConfiguration,
-  "workspaceId" | "cwd" | "runtime" | "runtimeTempDir" | "workspaceSessionDir" | "trusted"
+  | "workspaceId"
+  | "cwd"
+  | "runtime"
+  | "runtimeTempDir"
+  | "workspaceSessionDir"
+  | "trusted"
+  | "sessionLocks"
 >;
 
 export interface GitPatchArtifactLookup {
@@ -652,6 +660,8 @@ function resolveCurrentWorkspaceRepoTargets(params: {
   }
 
   const projectRepos = getWorkspaceProjectRepos({
+    // Outside the agent loop: the host's runtimes.
+    runtimeFactory: nodeRuntimeFactory,
     workspaceId: params.workspaceId,
     workspaceName,
     workspacePath,
@@ -1245,6 +1255,8 @@ async function applyProjectPatch(params: {
   expectedHeadSha?: string;
   isReplay: boolean;
   abortSignal?: AbortSignal;
+  /** The artifact workspace's FIFO for the applied watermark write. */
+  locks: SessionLocks;
 }): Promise<{ success: boolean; projectResult: TaskApplyGitPatchProjectResult }> {
   const taskIdError = validatePatchRuntimePathComponent(params.taskId, "task_id");
   const storageKeyError = validatePatchRuntimePathComponent(
@@ -1665,6 +1677,7 @@ async function applyProjectPatch(params: {
         childTaskId: params.taskId,
         projectPath: params.projectArtifact.projectPath,
         appliedAtMs: Date.now(),
+        locks: params.locks,
       });
     }
 
@@ -1985,6 +1998,7 @@ async function applyPatch(
       expectedHeadSha,
       isReplay,
       abortSignal: options.abortSignal,
+      locks: config.sessionLocks,
     });
     projectResults.push(applyResult.projectResult);
     if (!applyResult.success) {

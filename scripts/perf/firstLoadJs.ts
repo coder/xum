@@ -19,7 +19,7 @@ import { FIRST_RUN_MODULES_ID } from "@/node/orpc/firstRunView";
 export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "node_modules/lottie-web/",
   "node_modules/ghostty-web/",
-  "node_modules/mermaid/",
+  "node_modules/pele/",
   "features/Settings/Sections/ProvidersSection",
   "node_modules/@shikijs/langs/",
   "node_modules/recharts/",

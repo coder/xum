@@ -8,8 +8,11 @@ import { UserMessage, type UserMessageNavigation } from "./UserMessage";
 import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
-import { AlertTriangle, ListTodo, MessageSquare } from "lucide-react";
-import { classifyTodoTurnEndNudgePrompt } from "@/common/utils/machineTurnPrompts";
+import { AlertTriangle, LayoutDashboard, ListTodo, MessageSquare } from "lucide-react";
+import {
+  classifyStatusPageTurnEndNudgePrompt,
+  classifyTodoTurnEndNudgePrompt,
+} from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -113,6 +116,10 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
         const todoNudgeKind =
           message.isSynthetic === true ? classifyTodoTurnEndNudgePrompt(message.content) : null;
+        const statusPageNudgeKind =
+          message.isSynthetic === true
+            ? classifyStatusPageTurnEndNudgePrompt(message.content)
+            : null;
         renderedMessage =
           message.contextBudgetWarning != null ? (
             <CollapsibleMachineMessage
@@ -155,6 +162,20 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               }
               icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
               marker="todo-turn-end-nudge"
+              className={className}
+            />
+          ) : statusPageNudgeKind != null ? (
+            // The Agent interface view's turn-end status page nudge, alone or after the TODO nudge
+            // in one continuation: constant control text, so the same compact row.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                statusPageNudgeKind === "todo-and-status-page"
+                  ? "Asked the agent to update its TODO list and status page"
+                  : "Asked the agent to update its status page"
+              }
+              icon={<LayoutDashboard aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="status-page-turn-end-nudge"
               className={className}
             />
           ) : backgroundWorkWakeSummary != null ? (

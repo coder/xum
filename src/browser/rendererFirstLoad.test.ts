@@ -76,6 +76,17 @@ describe("renderer first load", () => {
     expect(closure.has("src/browser/components/CommandPalette/CommandPalette.tsx")).toBe(false);
   }, 60_000);
 
+  // #7471: App.tsx and the palette's command sources read the Agent interface view's flags and
+  // status-page entry. Through agentInterfaceView.ts they pulled the artifact document parser and
+  // its helpers (~4 KB brotli) into main-*.js; only the main pane's status view needs those.
+  test("the entry's static imports do not reach the artifact document parser", async () => {
+    const closure = await staticImportClosure("src/browser/main.tsx");
+    expect(closure.has("src/browser/App.tsx")).toBe(true);
+    expect(closure.has("src/browser/features/RightSidebar/ArtifactsTab/artifactDocument.ts")).toBe(
+      false
+    );
+  }, 60_000);
+
   test("the workspace page's static imports do not reach the workspace-menu modals", async () => {
     // App.tsx starts the workspace page chunk (loadAIView() -> AIView) while the entry boots, so a
     // phone downloads both closures before the composer works. WorkspaceMenuBar mounted these

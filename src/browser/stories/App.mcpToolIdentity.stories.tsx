@@ -7,7 +7,7 @@ import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar, expandProjects } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { blurActiveElement, waitForScrollStabilization } from "./storyPlayHelpers";
+import { blurActiveElement, closeWithEscape, waitForScrollStabilization } from "./storyPlayHelpers";
 import notionIcon from "./assets/notion-mcp.png?inline";
 
 export default {
@@ -245,8 +245,7 @@ export const ServerDetails: AppStory = {
     await expect(dialog.querySelector("img")).toHaveAttribute("src", NOTION_ICON);
     // Server details never toggle the tool; the header still does.
     await expect(search.card).not.toHaveTextContent("Arguments");
-    await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await closeWithEscape(dialog);
     await userEvent.click(search.name);
     await expect(search.card).toHaveTextContent("Arguments");
     await userEvent.click(search.name);
@@ -544,8 +543,7 @@ export const PluginServerDetails: AppStory = {
     ).toBeVisible();
     await expect(dialog).toHaveTextContent("stdio");
     await expect(create.card).not.toHaveTextContent("Arguments");
-    await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await closeWithEscape(dialog);
     // The sibling installation resolves to its own connection and version.
     await userEvent.click(within(list.header).getByRole("button", { name: CODER_B_INFO }));
     const sibling = await within(document.body).findByRole("dialog", {
@@ -553,8 +551,7 @@ export const PluginServerDetails: AppStory = {
     });
     await expect(sibling).toHaveTextContent(CODER_B_KEY);
     await expect(sibling).toHaveTextContent("v1.9.0");
-    await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(sibling).not.toBeInTheDocument());
+    await closeWithEscape(sibling);
     // Expanding still works from the short label and shows the untouched call.
     await userEvent.click(create.name);
     await expect(create.card).toHaveTextContent("Arguments");

@@ -43,7 +43,7 @@ import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { createTestHistoryService } from "./testHistoryService";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
-import { assemblePromptPayload } from "./turnContextAssembler";
+import { assemblePromptPayload, formatMcpWarningSection } from "./turnContextAssembler";
 
 const WORKSPACE_ID = "prefix-ws";
 const MODEL_STRING = "anthropic:claude-opus-5-5";
@@ -275,11 +275,18 @@ async function readHistory(): Promise<MuxMessage[]> {
  * stream it through StreamManager (which persists the assistant row), and
  * return the wire body of every provider step this turn sent.
  */
+/** The volatile tail of a request whose MCP server `name` failed to start. */
+function mcpWarningTail(name: string): string {
+  const section = formatMcpWarningSection(1, [name]);
+  if (section == null) throw new Error("expected an MCP warning section");
+  return section;
+}
+
 async function runTurn(
   anthropic: ReturnType<typeof createScriptedAnthropic>,
   tools: Record<string, Tool>,
   steps: Array<ScriptedStep | ScriptedError>,
-  /** Volatile system tail (hot memories, MCP warning, context-window ids) after SYSTEM. */
+  /** Volatile system tail (MCP warning, context-window ids) after SYSTEM. */
   volatileTail = "",
   /** Tool search: the advertised tool set changes when a step activates a deferred tool. */
   toolSearchState?: ToolSearchStreamState,
@@ -844,8 +851,7 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
   test("volatile-tail rows in the segment keep the receipt's point", async () => {
     // Mechanism 10 rows are request messages, not parts of an assistant row, so they move no
     // part or step index the receipt points at. The strip turn and the last turn each change
-    // the hot memories, so each sends a system row after its trigger.
-    const hot = (text: string) => `\n\n<hot_memories>\n${text}\n</hot_memories>`;
+    // the failed MCP server, so each sends a system row after its trigger.
     const { receipt, stripBodies, laterFirst } = await expectStripTurnKeepsPrefix({
       stripTurn: [
         thinkThenCall("call-1", "activate_send"),
@@ -853,16 +859,21 @@ describe("prompt-cache prefix: thinking-replay receipt", () => {
         thinkThenAnswer("1"),
       ],
       keptThinking: "plan-call-2",
-      tails: [hot("A"), hot("B"), hot("B"), hot("C")],
+      tails: [
+        mcpWarningTail("server-a"),
+        mcpWarningTail("server-b"),
+        mcpWarningTail("server-b"),
+        mcpWarningTail("server-c"),
+      ],
     });
     const systemRows = (body: WireBody) =>
       body.messages.filter((message) => (message as { role?: unknown }).role === "system");
     // The strip turn's row stays in place, before the steps, in its later requests.
     const stripLast = stripBodies[stripBodies.length - 1];
-    expect(JSON.stringify(systemRows(stripLast))).toContain("B\\n</hot_memories>");
+    expect(JSON.stringify(systemRows(stripLast))).toContain("server-b");
     expect((stripLast.messages.at(-1) as { role?: unknown }).role).not.toBe("system");
     expect(systemRows(laterFirst)).toHaveLength(2);
-    expect(JSON.stringify(laterFirst.messages.at(-1))).toContain("C\\n</hot_memories>");
+    expect(JSON.stringify(laterFirst.messages.at(-1))).toContain("server-c");
     expect(receipt?.anthropicThinkingReplayFromStep).toBe(1);
   });
 
@@ -911,33 +922,23 @@ function wireBlocks(body: WireBody): string[] {
 describe("prompt-cache prefix: volatile system tail", () => {
   // turnContextAssembler.ts assemblePromptPayload sends
   // [cachedSystemMessage, ...volatileRows, ...messages]: the uncached volatile tail
-  // (hot memories, MCP failure warning, <context_window>) is a system block, and Anthropic
+  // (MCP failure warning, <context_window>) is a system block, and Anthropic
   // puts all system blocks before the conversation. #5260 keeps the STABLE block cached
   // when the tail changes, but every message after the tail still misses, so a tail
   // change re-writes the whole conversation.
-  test("a hot-memory change in the volatile tail costs only the tail", async () => {
-    await hotMemoryChangeKeepsHistoryCached();
+  test("an MCP warning change in the volatile tail costs only the tail", async () => {
+    await mcpWarningChangeKeepsHistoryCached();
   });
 });
 
-async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
+async function mcpWarningChangeKeepsHistoryCached(): Promise<void> {
   const anthropic = createScriptedAnthropic();
   const tools = { bash: plainTool("bash") };
   const endTurn: ScriptedStep[] = [[messageStart(), ...textBlock(0, "Ok."), ...finish("end_turn")]];
   await appendUser("First request.");
-  const [first] = await runTurn(
-    anthropic,
-    tools,
-    endTurn,
-    "\n\n<hot_memories>\nA\n</hot_memories>"
-  );
+  const [first] = await runTurn(anthropic, tools, endTurn, mcpWarningTail("server-a"));
   await appendUser(MONITOR_WAKE);
-  const [second] = await runTurn(
-    anthropic,
-    tools,
-    endTurn,
-    "\n\n<hot_memories>\nB\n</hot_memories>"
-  );
+  const [second] = await runTurn(anthropic, tools, endTurn, mcpWarningTail("server-b"));
 
   // A fix may send the new tail as a system row after the trigger: check the conversation
   // without it.
@@ -946,10 +947,10 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
   // The first turn's answer must precede the trigger: a fix that rebuilt the history without
   // it would still keep the tail-only change below and pass the target assertion.
   expect(endsWithAnswerThenTrigger(conversation)).toBe(true);
-  // Each request must send its own hot memories: a fix that dropped the tail or kept "A"
+  // Each request must send its own warning: a fix that dropped the tail or kept "server-a"
   // would otherwise pass the prefix check below.
-  expect(JSON.stringify(first)).toContain("<hot_memories>\\nA\\n</hot_memories>");
-  expect(JSON.stringify(second)).toContain("<hot_memories>\\nB\\n</hot_memories>");
+  expect(JSON.stringify(first)).toContain("server-a");
+  expect(JSON.stringify(second)).toContain("server-b");
   const previous = wireBlocks(first);
   const next = wireBlocks(second);
   const firstChanged = previous.findIndex((block, index) => block !== next[index]);
@@ -959,7 +960,7 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
   const cachedBlocks = firstChanged < 0 ? previous.length : firstChanged;
   const uncachedNonTailBlocks = previous
     .slice(cachedBlocks)
-    .filter((block) => !block.includes("<hot_memories>")).length;
+    .filter((block) => !block.includes("MCP server(s) failed to start")).length;
   // Target assertion: today the tail sits before the history, so the user message misses.
   expect(uncachedNonTailBlocks).toBe(0);
 }

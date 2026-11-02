@@ -39,6 +39,14 @@ class Comments:
         self.text: dict[int, list[str]] = {}
         spans: dict[int, list[tuple[int, int]]] = {}
         for node in descendants(tree.root_node):
+            # The braces of a JSX expression that holds only comments
+            # (`{/* ... */}`, on one line or many) are part of the comment.
+            if node.type == "jsx_expression" and node.named_children and all(
+                c.type == "comment" for c in node.named_children
+            ):
+                for brace in (node.children[0], node.children[-1]):
+                    spans.setdefault(brace.start_point[0] + 1, []).append((brace.start_point[1], brace.end_point[1]))
+                continue
             if node.type != "comment":
                 continue
             rows = data[node.start_byte : node.end_byte].decode("utf-8").split("\n")
@@ -53,8 +61,7 @@ class Comments:
             raw = bytearray(self.lines[line - 1].encode("utf-8"))
             for start, end in ranges:
                 raw[start:end] = b" " * (end - start)
-            # `{/* marker: reason */}` is how TSX writes a comment between elements.
-            if bytes(raw).translate(None, b" \t\r") in (b"", b"{}"):
+            if not bytes(raw).translate(None, b" \t\r"):
                 self.comment_only.add(line)
 
     def reason(self, first: int, last: int, marker: str) -> str | None:

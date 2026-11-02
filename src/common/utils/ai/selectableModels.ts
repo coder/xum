@@ -46,8 +46,6 @@ export function getCustomModels(config: ProvidersConfigMap | null): string[] {
   if (!config) return [];
   const models: string[] = [];
   for (const [provider, info] of Object.entries(config)) {
-    // Skip mux-gateway - those models are accessed via the cloud toggle, not listed separately
-    if (provider === "mux-gateway") continue;
     // Keep github-copilot's persisted catalog for authoritative model gating, not direct selector entries.
     if (provider === "github-copilot") continue;
     // Only surface custom models from enabled providers
@@ -123,7 +121,7 @@ export function isAuthoritativeProviderModelAccessible(
 
 /**
  * The OpenAI auth gates in this pipeline apply to the direct route only. A gateway
- * route (mux-gateway, openrouter, ...) supplies its own credentials, so the
+ * route (openrouter, coder, ...) supplies its own credentials, so the
  * user's OpenAI auth state must not hide, or warn about, models the gateway
  * serves. For a model with no active route, resolveRoute falls back to direct,
  * which keeps the gate in place.

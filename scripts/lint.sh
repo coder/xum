@@ -65,6 +65,8 @@ ESLINT_PATTERNS=(
   'src/node/builtinSkills/**/*.js'
   'src/node/workflowRuntime/*.js'
   'scripts/lib/*.js'
+  'scripts/**/*.test.ts'
+  'vscode/src/**/*.{ts,tsx}'
 )
 
 get_default_eslint_concurrency() {

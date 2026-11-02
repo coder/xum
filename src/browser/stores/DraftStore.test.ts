@@ -46,6 +46,8 @@ function createClient(service: DraftService) {
     updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
+    /** Subscriptions that reached subscribeGate (the store waits for this client's snapshot). */
+    subscribes: 0,
     /** Holds the legacy import that follows a snapshot. */
     importGate: null as Promise<void> | null,
     imports: 0,
@@ -93,6 +95,7 @@ function createClient(service: DraftService) {
       return service.importLegacy(input);
     },
     subscribe: async (_input: void, opts?: { signal?: AbortSignal }) => {
+      control.subscribes++;
       await control.subscribeGate;
       const queue: DraftEvent[] = [];
       let wake: (() => void) | null = null;
@@ -153,6 +156,9 @@ async function waitFor(
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Runs every queued promise continuation (one macrotask turn). */
+const drainMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
 /** The message `flush` rejects with, or "" when it resolves. */
 function flushError(store: DraftStore): Promise<string> {
@@ -689,7 +695,9 @@ describe("DraftStore", () => {
     const readiness = store.whenReady().then(() => (ready = true));
     store.setText(WS_SCOPE, "typed after the switch");
     const saving = flushError(store);
-    await sleep(50);
+    // Positive barrier: the store subscribed to the new backend and waits for its snapshot.
+    await waitFor(() => next.control.subscribes === 1);
+    await drainMicrotasks();
     expect(ready).toBe(false);
     expect(next.control.updates).toBe(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
@@ -702,7 +710,10 @@ describe("DraftStore", () => {
     expect(next.control.updates).toBe(1);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
     expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
-    // Saved once: the snapshot's own save of unsaved edits finds nothing left to write.
+    // Saved once: the snapshot's own save of unsaved edits finds nothing left to write. The
+    // snapshot is handled, then the wait outlasts the store's 300 ms flush debounce (a timer the
+    // store does not expose).
+    await waitFor(() => next.control.snapshotsHandled >= 1);
     await sleep(400);
     expect(next.control.updates).toBe(1);
     store.setText(WS_SCOPE, "typed later");
@@ -741,7 +752,9 @@ describe("DraftStore", () => {
     // draft); it must not open writes for the new client.
     await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
     const saving = flushError(store);
-    await sleep(50);
+    // Positive barrier: the store subscribed to the new backend and waits for its snapshot.
+    await waitFor(() => next.control.subscribes === 1);
+    await drainMicrotasks();
     expect(next.control.updates).toBe(0);
 
     releaseSnapshot();
@@ -779,7 +792,10 @@ describe("DraftStore", () => {
     // the draft; it must not open writes for the run after it.
     await waitFor(() => listPersistedKeys(getInputKey(WS)).length === 0);
     const saving = flushError(store);
-    await sleep(50);
+    // Positive barrier: the replacing run subscribed (the third subscribe) and waits for its
+    // snapshot.
+    await waitFor(() => control.subscribes === 3);
+    await drainMicrotasks();
     expect(control.updates).toBe(updatesBefore);
 
     releaseSnapshot();

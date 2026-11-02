@@ -9,12 +9,15 @@ import { createTestToolConfig } from "./tools/testHelpers";
 import { describe, expect, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
-import { tool } from "ai";
+import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
-import { evaluateStepBudget } from "@/common/utils/compaction/contextBudget";
+import {
+  evaluateStepBudget,
+  getContextBudgetHardCeiling,
+} from "@/common/utils/compaction/contextBudget";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { StreamManager, type SettledStepBudget } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
@@ -217,6 +220,101 @@ describe("settled context hard ceiling", () => {
         expect(sentToolCounts).toEqual(toolsDisabled ? [0] : []);
       } finally {
         delete process.env.XUM_DISABLE_AGENT_TOOLS;
+        await manager.stopStream(workspaceId);
+        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await h.cleanup();
+      }
+    }
+  );
+
+  // #7662: step zero has no settled step, so it counts against the turn anchor, as the
+  // turn-start check did; a full estimate here could refuse what turn start accepted. A
+  // thinking change that races stream setup rebuilds step zero at a level the anchor's
+  // provider count does not hold, so that step uses the full estimate.
+  test.each(["none", "anchored", "rethought"] as const)(
+    "step zero counts against the turn anchor (%s)",
+    async (mode) => {
+      const anchored = mode === "anchored";
+      const h = await createTestHistoryService();
+      const workspaceId = "turn-anchor-budget";
+      const messageId = "turn-anchor-assistant";
+      let providerCalls = 0;
+      const model = new MockLanguageModelV3({
+        doStream: () => {
+          providerCalls++;
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                { type: "text-start", id: "answer" },
+                { type: "text-delta", id: "answer", delta: "Done" },
+                { type: "text-end", id: "answer" },
+                {
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 10, text: 10, reasoning: 0 },
+                  },
+                },
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = await fs.mkdtemp(path.join(tmpdir(), "turn-anchor-budget-"));
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Hello"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const messages: ModelMessage[] = [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi" },
+          { role: "user", content: "Again" },
+        ];
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages,
+          system: "Answer briefly",
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          contextBudgetLimit: 10000,
+          // The previous reply's provider count alone is at the ceiling.
+          ...(mode === "none"
+            ? {}
+            : {
+                contextBudgetTurnAnchor: {
+                  model: "openai:gpt-4o",
+                  metadataModel: "openai:gpt-4o",
+                  providerTokens: getContextBudgetHardCeiling(10000),
+                },
+              }),
+          ...(mode === "rethought"
+            ? {
+                thinkingOverrideState: { pending: "off" as const },
+                rebuildProviderOptionsForThinkingLevel: () => ({
+                  providerOptions: {},
+                  effectiveLevel: "off" as const,
+                }),
+                rebuildFirstStepForThinkingLevel: () => Promise.resolve({ messages }),
+              }
+            : {}),
+        });
+        if (!started.success) throw new Error("Expected stream construction");
+        const completion = await started.data.completion;
+        expect(completion.status).toBe(anchored ? "failed" : "completed");
+        expect(providerCalls).toBe(anchored ? 0 : 1);
+      } finally {
         await manager.stopStream(workspaceId);
         await fs.rm(runtimeDir, { recursive: true, force: true });
         await h.cleanup();

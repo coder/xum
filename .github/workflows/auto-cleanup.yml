@@ -1,12 +1,11 @@
-# Periodically cleans up the codebase and maintains a refactor PR.
+# Cleans up the codebase and maintains a refactor PR. Runs only on manual dispatch.
 # SETUP: Add AUTO_CLEANUP_ANTHROPIC_API_KEY, XUM_APP_PRIVATE_KEY, and XUM_APP_ID
 # to repository secrets so auto-cleanup spend stays isolated from terminal-bench.
 
 name: Auto-Cleanup
 
 on:
-  schedule:
-    - cron: "0 */4 * * *" # Every 4 hours
+  # Schedule off: the API key secret is invalid (#7373); re-add it after a maintainer replaces AUTO_CLEANUP_ANTHROPIC_API_KEY.
   workflow_dispatch:
 
 permissions:
@@ -70,7 +69,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.AUTO_CLEANUP_ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          bunx @coder/xum@next run \
+          # npm installs the published package with its npm-shrinkwrap.json, the dependency tree
+          # that CI tested; bunx would resolve every dependency afresh and run it with these keys.
+          npm install --prefix "$RUNNER_TEMP/xum" --ignore-scripts --no-audit --no-fund @coder/xum@next
+          "$RUNNER_TEMP/xum/node_modules/.bin/xum" run \
             --model anthropic:claude-opus-5-5 \
             --thinking xhigh \
             < .github/prompts/auto-cleanup.md

@@ -12,4 +12,6 @@ export const SERVER_UPDATE_LOCKFILES = {
 export const SERVER_UPDATE_CLI_INTERPRETER = "node";
 export const SERVER_UPDATE_CLI_SHEBANG = `#!/usr/bin/env ${SERVER_UPDATE_CLI_INTERPRETER}`;
 export const SERVER_UPDATE_VERIFY_CONCURRENCY = 16;
+/** The registry whose tarball URLs a published shrinkwrap records. */
+export const NPM_PUBLIC_REGISTRY = "https://registry.npmjs.org";
 export const SERVER_VERSION_CHECK_TIMEOUT_MS = 5_000;

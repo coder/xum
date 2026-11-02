@@ -64,9 +64,11 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
   // report files production never loads.
   const metadataWithPath = { ...metadata, namedWorkspacePath: workspace.workspacePath };
   const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadataWithPath);
+  // Single-project only (multi-project returned above), like the endpoint's projectCheckoutRoot.
+  const projectCheckoutRoot = resolveWorkspaceRootPath(metadataWithPath, runtime);
   const hostCheckoutRoot =
     metadata.runtimeConfig.type !== "ssh" && metadata.runtimeConfig.type !== "docker"
-      ? resolveWorkspaceRootPath(metadataWithPath, runtime)
+      ? projectCheckoutRoot
       : null;
 
   const projectTrusted = isWorkspaceProjectTrusted(defaultConfig, metadata);
@@ -92,6 +94,7 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
     // never loads them off-host, so discovery must not scan the remote
     // workspacePath as if it were a host project root.
     hostCheckoutRoot,
+    projectCheckoutRoot,
     xumHome: defaultConfig.rootDir,
     projectTrusted,
     listMcpServerLayers: () =>

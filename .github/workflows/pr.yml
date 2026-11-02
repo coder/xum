@@ -37,11 +37,23 @@ jobs:
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
       docker: ${{ steps.filter.outputs.docker }}
+      e2e_tests: ${{ steps.filter.outputs.e2e_tests }}
+      vscode: ${{ steps.filter.outputs.vscode }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
       # push to main (the merge_group run already validated that exact commit).
       tests: ${{ (steps.filter.outputs.src == 'true' || steps.filter.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-      linux-runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+      # Depot runner sizes. Depot bills 2x, 4x and 8x the elapsed minutes on 4, 8 and 16 vCPU, so
+      # each job takes the smallest size that keeps its time. Measured on 2026-10-23 with dispatch
+      # runs 39935678316, 39935681840, 39937158652 and 39937162755: Unit, E2E, the bug-bash
+      # sandbox, Storybook, Smoke / Server and the builds ran as fast on 4 vCPU as on 16.
+      # Integration ran 1.7x longer on 4 vCPU (jest.config.js caps it at 4 workers, which 8 vCPU
+      # fits). On 2 vCPU, E2E and the sandbox ran out of heap and unit test hooks timed out.
+      # Static Checks keeps 16: 4 cold ESLint workers need 8 GiB each. Labels go through these
+      # outputs, not literals, because actionlint refuses unknown runner labels.
+      runner-4: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-4' || 'ubuntu-latest' }}
+      runner-8: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-8' || 'ubuntu-latest' }}
+      runner-16: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -79,6 +91,9 @@ jobs:
               - 'scripts/**'
               - 'packages/mux-compat/**'
               - 'jest.config.js'
+              # e2e_tests below lists it too: without it here, `tests` stays false on a
+              # Playwright-config-only change and test-e2e never runs.
+              - 'playwright.config.ts'
               - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
@@ -91,6 +106,19 @@ jobs:
               # so the snapshot-budget step (Test / Storybook) must run when they change.
               - 'pixel.jsonc'
               - '.storybook/**'
+            # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
+            # changes their own tests or sources. This workflow holds their steps, the Makefile
+            # their targets, and bun.lock the playwright-core version that keys the sandbox image.
+            e2e_tests:
+              - 'tests/e2e/**'
+              - 'tests/bugbash/**'
+              - 'playwright.config.ts'
+              - '.github/workflows/pr.yml'
+              - 'Makefile'
+              - 'package.json'
+              - 'bun.lock'
+            vscode:
+              - 'vscode/**'
             nix_deps:
               - 'package.json'
               - 'bun.lock'
@@ -98,9 +126,11 @@ jobs:
               - 'flake.nix'
               - 'nix/**'
               - 'flake.lock'
-            # Server image inputs: everything the Dockerfile copies into the build stage
-            # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
-            # PRs that touch them (#5605), not only in the merge queue.
+            # Server image build setup: the Dockerfile and every input it copies except the app
+            # sources, plus this workflow. Smoke / Docker runs on PRs that touch them (#5605), and in the merge
+            # queue for every change. App sources (src/**, docs/**, public/**, static/**, the
+            # HTML entries) are not here: they matched 272 of 301 PR runs (2026-10-23), so the
+            # 16-vCPU image build ran on almost every PR push for 2 failures.
             docker:
               - 'Dockerfile'
               - '.dockerignore'
@@ -110,7 +140,6 @@ jobs:
               - 'patches/**'
               - 'Makefile'
               - 'fmt.mk'
-              - 'src/**'
               - 'tsconfig.json'
               - 'tsconfig.main.json'
               - 'scripts/generate-version.sh'
@@ -123,20 +152,14 @@ jobs:
               - 'scripts/perf/firstLoadJs.ts'
               - 'scripts/build-row-tree-worker.ts'
               - 'scripts/check-analytics-worker.cjs'
-              - 'docs/**'
-              - 'index.html'
-              - 'terminal.html'
-              - 'desktop.html'
               - 'vite.config.ts'
-              - 'public/**'
-              - 'static/**'
               - '.github/workflows/pr.yml'
 
   static-check:
     name: Static Checks
     needs: [changes]
     if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -144,46 +167,63 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.local/bin/shfmt
-          key: ${{ runner.os }}-shfmt-latest
-      - name: Install shfmt
+      # Release binaries pinned by checksum. A version bump needs new checksums for every asset
+      # below. Never copy them from the release page: download each asset yourself, run
+      # `sha256sum` on it, and check that the result equals the digest GitHub computed at upload
+      # (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " +
+      # .digest'`). hadolint v2.12.0 predates those digests: compare with its .sha256 assets.
+      - name: Install shfmt and hadolint
+        env:
+          SHFMT_VERSION: v3.14.1
+          SHFMT_SHA256_X86_64: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
+          SHFMT_SHA256_AARCH64: 5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489
+          HADOLINT_VERSION: v2.12.0
+          HADOLINT_SHA256_X86_64: 56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010
+          HADOLINT_SHA256_AARCH64: 5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6
         run: |
           set -euo pipefail
-          if [[ ! -f "$HOME/.local/bin/shfmt" ]] || ! "$HOME/.local/bin/shfmt" --version >/dev/null 2>&1; then
-            # webinstall.dev can be flaky; retry and force HTTP/1.1 to avoid HTTP/2 stream errors.
-            curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf --http1.1 https://webinstall.dev/shfmt | bash
-          fi
-
-          if ! "$HOME/.local/bin/shfmt" --version >/dev/null 2>&1; then
-            echo "Error: shfmt install failed"
-            exit 1
-          fi
-
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          case "$(uname -m)" in
+            x86_64)
+              shfmt_arch=amd64 shfmt_sha256="$SHFMT_SHA256_X86_64"
+              hadolint_arch=x86_64 hadolint_sha256="$HADOLINT_SHA256_X86_64"
+              ;;
+            aarch64 | arm64)
+              shfmt_arch=arm64 shfmt_sha256="$SHFMT_SHA256_AARCH64"
+              hadolint_arch=arm64 hadolint_sha256="$HADOLINT_SHA256_AARCH64"
+              ;;
+            *)
+              echo "::error::no pinned shfmt or hadolint for $(uname -m); add its assets and checksums"
+              exit 1
+              ;;
+          esac
+          bin="$HOME/.local/bin"
+          mkdir -p "$bin"
+          curl -fsSL --retry 5 --retry-all-errors -o "$bin/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_${shfmt_arch}"
+          curl -fsSL --retry 5 --retry-all-errors -o "$bin/hadolint" \
+            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}"
+          echo "${shfmt_sha256}  $bin/shfmt" | sha256sum -c -
+          echo "${hadolint_sha256}  $bin/hadolint" | sha256sum -c -
+          chmod +x "$bin/shfmt" "$bin/hadolint"
+          "$bin/shfmt" --version
+          "$bin/hadolint" --version
+          echo "$bin" >> "$GITHUB_PATH"
       - name: Install shellcheck
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y shellcheck
-      - name: Install hadolint
-        run: |
-          set -euo pipefail
-          HADOLINT_VERSION="v2.12.0"
-          curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf \
-            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-x86_64" \
-            -o "$HOME/.local/bin/hadolint"
-          chmod +x "$HOME/.local/bin/hadolint"
-          hadolint --version
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - run: |
-          set -euo pipefail
-          curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf https://astral.sh/uv/install.sh | sh
-      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # uv runs the Python tools of pyproject.toml. setup-uv checks its download against the
+      # checksums it ships, which cover the uv releases before its own: keep `version` at one of
+      # them (setup-uv v10.2.0 knows uv up to 0.12.17).
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: false
       # ESLint's result cache hashes the Node version, and setup-xum takes the runner's Node 22.x,
       # so a runner with a newer Node misses every entry (#7191). Key the cache by Node version so
       # each version restores a cache it can use.
@@ -241,7 +281,7 @@ jobs:
     if: needs.changes.outputs.tests == 'true'
     # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     strategy:
       fail-fast: false
       matrix:
@@ -302,6 +342,12 @@ jobs:
           PATH="$dir:$PATH"
           curl -q --version
           bun test src/node/services/tools/web_fetch.pinning.test.ts
+      # The host trap and the in-memory agent-loop proof run in their own bun process, with
+      # the trap loaded before tests/setup.ts (make test-host-proof). The normal suite above
+      # never loads the trap. Required needs test-unit, so it covers this step.
+      - name: Host proof (own process)
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        run: make test-host-proof
       # A shard writes one report per process: coverage/lcov.info for the shared
       # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
       # scripts/test-unit-ci.sh). Upload them all.
@@ -342,7 +388,7 @@ jobs:
     # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
     # diagnostics and still bounds a wedged runner.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-8 }}
     strategy:
       fail-fast: false
       matrix:
@@ -474,6 +520,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
@@ -565,6 +612,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       # ci.ts writes verdict=violations only for a finished report with
       # unaccepted duplicates in block mode. A crash or a timeout leaves none.
@@ -637,6 +685,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
@@ -676,7 +725,7 @@ jobs:
     name: Test / Storybook
     needs: [changes]
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -702,10 +751,18 @@ jobs:
       - run: make test-storybook
 
   test-e2e:
-    # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
-    name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
+    # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
+    # "macos") to expanded jobs, and a job skipped before matrix expansion shows plain
+    # "Test / E2E" instead of the unexpanded expression (#7340).
+    name: Test / E2E
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    # Queue only on PR pushes: in 330 sampled PR runs (2026-10-16..23) the jobs moved here (E2E,
+    # bug-bash sandbox, Smoke / Server, Build / Linux, Build / VS Code) failed 8 times but were
+    # a third of the PR cost. The merge queue still runs them for every merge, and a dispatch of
+    # this workflow on a branch runs them before the queue.
+    if: >-
+      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -717,7 +774,7 @@ jobs:
           - { os: linux, shard: 3/4 }
           - { os: linux, shard: 4/4 }
           - { os: macos }
-    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.linux-runner }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -786,30 +843,35 @@ jobs:
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
     # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
-    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
-    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # AI. No secrets and no model. The launcher pulls main's attested image by digest without
+    # registry credentials (or builds one from this checkout), and exits nonzero on a refusal, a
+    # failed check or a container left `unknown`.
     # E2E shard 1 still runs the same repros on the host until this job proves stable.
     name: Test / Bug-bash sandbox
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
+    # Queue only on PR pushes, unless the PR changes tests/bugbash (see test-e2e).
+    if: >-
+      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
+    # 45, not 30: a PR that changes the image inputs has no published image yet (main publishes
+    # it after the merge), so the launcher builds one locally, for up to 25 minutes.
     timeout-minutes: 45
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
-    # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
-    # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
-    # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
-    # (make bug-bash, make mcp-apps-e2e) ignore it and keep the pinned digest.
-    env:
-      BUGBASH_SANDBOX_BUILD_STALE: "1"
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+      # GH_TOKEN: the launcher's gh verifies the published image's attestation on the host. It
+      # never reaches Docker or a job container (the container env drops it).
       - name: Sandbox self-check
         run: make bug-bash-sandbox-check
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Repros in the sandbox
         run: make test-bugbash-repros-sandbox
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   test-windows:
     name: Test / Windows
@@ -834,6 +896,9 @@ jobs:
         shell: pwsh
         run: |
           bun test src/node/utils/paths.test.ts src/node/utils/findExecutableOnPath.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
+      - name: Verify Report slowness script-path placeholders on Windows paths
+        shell: pwsh
+        run: bun test src/node/services/perf/perfReportService.test.ts -t "script paths"
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
@@ -862,15 +927,16 @@ jobs:
   smoke-server:
     name: Smoke / Server
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes (see test-e2e).
+    if: needs.changes.outputs.tests == 'true' && github.event_name != 'pull_request'
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
-      - run: ./scripts/generate-npm-shrinkwrap.sh
+      - run: bun scripts/generate-npm-shrinkwrap.ts
       - run: make build
       - run: make check-startup-imports-runtime
       - name: Pack npm package
@@ -903,7 +969,7 @@ jobs:
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
       (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     permissions:
       contents: read
       id-token: write # Depot OIDC authentication
@@ -1082,8 +1148,9 @@ jobs:
   build-linux:
     name: Build / Linux
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes (see test-e2e).
+    if: needs.changes.outputs.tests == 'true' && github.event_name != 'pull_request'
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1198,8 +1265,11 @@ jobs:
   build-vscode:
     name: Build / VS Code
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes, unless the PR changes vscode/ (see test-e2e).
+    if: >-
+      needs.changes.outputs.tests == 'true' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.vscode == 'true')
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1218,14 +1288,16 @@ jobs:
     name: Codex Comments
     needs: [changes]
     if: github.event_name == 'pull_request'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # A waiter (it polls Codex for up to 900 s) needs no CPU, and GitHub-hosted standard runners
+    # are free for this public repo, so it does not take a Depot runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Test PR readiness gates
-        run: make test-codex-comments test-pr-checks test-required-superseded
+        run: make test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it

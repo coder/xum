@@ -12,7 +12,6 @@ import {
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
-import { findLatestCompactionBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
 
 /**
@@ -214,35 +213,24 @@ ${planContent}
 // turn start (see createFileChangeNotificationMessage in fileChangeTracker.ts),
 // keeping the provider request a pure function of the session log.
 
-function findLatestLegacyCompactionSummaryIndex(messages: MuxMessage[]): number {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message.role !== "assistant") {
-      continue;
-    }
-
-    const compacted = message.metadata?.compacted;
-    if (compacted === undefined || compacted === false) {
-      continue;
-    }
-
-    return i;
-  }
-
-  return -1;
-}
-
 /**
  * Inject post-compaction attachments as a synthetic user message.
  * When compaction occurs, this injects a message containing plan file content
  * and/or edited files to preserve context that would otherwise be lost.
  *
- * The message is inserted AFTER the compaction summary message to ensure
- * the model receives this context for the next turn.
+ * The message goes right before the newest user message (Token Budget warning rows
+ * excepted, as in injectAgentTransition), or last without one. It is request-only and comes
+ * back every TURNS_BETWEEN_ATTACHMENTS turns for the whole segment, so it must not sit
+ * early in the history: placed after the compaction summary, it rewrote the cached history
+ * after the summary on the turn it appeared and again on the next turn, when it was gone.
+ * Here every row before the current turn's request stays byte-identical, and every step of
+ * the turn rebuilds the same position (the tool loop appends after the request). The model
+ * sees the same shape as before: the attachments, then the user's request (provider
+ * transforms merge the two user messages, attachments first).
  *
  * @param messages The conversation history
  * @param attachments Post-compaction attachments (plan file, loaded skills, edited files)
- * @returns Messages with attachments injected after compaction summary
+ * @returns Messages with the attachments injected before the newest user message
  */
 export function injectPostCompactionAttachments(
   messages: MuxMessage[],
@@ -252,37 +240,10 @@ export function injectPostCompactionAttachments(
     return messages;
   }
 
-  const durableCompactionIndex = findLatestCompactionBoundaryIndex(messages);
-  // Durable boundaries are authoritative for current histories. Legacy histories
-  // only have metadata.compacted, so fall back to that marker when needed.
-  const compactionIndex =
-    durableCompactionIndex !== -1
-      ? durableCompactionIndex
-      : findLatestLegacyCompactionSummaryIndex(messages);
-
-  if (compactionIndex === -1) {
-    // No compaction message found - this shouldn't happen if attachments are provided,
-    // but append at end as a fallback
-    const syntheticMessage: MuxMessage = {
-      id: `post-compaction-${Date.now()}`,
-      role: "user",
-      parts: [
-        {
-          type: "text",
-          text: renderAttachmentsToContentWithBudget(attachments, {
-            maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
-          }),
-        },
-      ],
-      metadata: {
-        timestamp: Date.now(),
-        synthetic: true,
-      },
-    };
-    return [...messages, syntheticMessage];
-  }
-
-  // Insert the synthetic message immediately after the compaction summary
+  const newestUserIndex = messages.findLastIndex(
+    (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
+  );
+  const index = newestUserIndex === -1 ? messages.length : newestUserIndex;
   const syntheticMessage: MuxMessage = {
     id: `post-compaction-${Date.now()}`,
     role: "user",
@@ -295,14 +256,11 @@ export function injectPostCompactionAttachments(
       },
     ],
     metadata: {
-      timestamp: messages[compactionIndex].metadata?.timestamp ?? Date.now(),
+      timestamp: messages[index]?.metadata?.timestamp ?? Date.now(),
       synthetic: true,
     },
   };
-
-  const result = [...messages];
-  result.splice(compactionIndex + 1, 0, syntheticMessage);
-  return result;
+  return [...messages.slice(0, index), syntheticMessage, ...messages.slice(index)];
 }
 
 /**

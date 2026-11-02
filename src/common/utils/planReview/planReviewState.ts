@@ -56,7 +56,6 @@ export const PlanReviewStateSchema = z.object({
 
 export type PlanReviewSnapshot = z.infer<typeof PlanReviewSnapshotSchema>;
 export type PlanReviewThread = z.infer<typeof PlanReviewThreadSchema>;
-export type PlanReviewThreadReply = z.infer<typeof PlanReviewThreadReplySchema>;
 export type PlanReviewFeedback = z.infer<typeof PlanReviewFeedbackSchema>;
 export type PlanReviewState = z.infer<typeof PlanReviewStateSchema>;
 

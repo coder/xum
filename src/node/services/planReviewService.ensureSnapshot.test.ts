@@ -15,6 +15,7 @@ import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { createTestHistoryService } from "./testHistoryService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // Plan files live under the runtime's xum home, like the AgentSession snapshot suite; unique
 // names keep parallel runs apart and afterEach removes them.
@@ -116,6 +117,7 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
           emitChatEvent: (_id, message) => emitted.push(message),
         },
         {
+          runtimeFactory: nodeRuntimeFactory,
           workspaceId,
           metadata,
           planStorage: createTestPlanStorage(),
@@ -286,6 +288,7 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
           emitChatEvent: (_id, message) => emitted.push(message),
         },
         {
+          runtimeFactory: nodeRuntimeFactory,
           workspaceId,
           metadata: remoteMetadata,
           planStorage,

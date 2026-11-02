@@ -219,6 +219,7 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
     const unregister = registerCodexPluginHooks(eventSpine, {
       workspaceId: "kernel-rewrite-ws",
       pluginName: "guard",
+      pluginInstanceId: "guard",
       order: 0,
       hooks: [
         {
@@ -273,6 +274,7 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
     const unregister = registerCodexPluginHooks(eventSpine, {
       workspaceId: "kernel-range-ws",
       pluginName: "guard",
+      pluginInstanceId: "guard",
       order: 0,
       hooks: [
         {
@@ -329,6 +331,7 @@ describe("createKernelFileLoader Codex PostToolUse block", () => {
     const unregister = registerCodexPluginHooks(eventSpine, {
       workspaceId: "kernel-post-block-ws",
       pluginName: "guard",
+      pluginInstanceId: "guard",
       order: 0,
       hooks: [
         {

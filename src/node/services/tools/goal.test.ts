@@ -15,6 +15,7 @@ import { createCompleteGoalTool } from "./complete_goal";
 import { createGetGoalTool } from "./get_goal";
 import { createSetGoalTool } from "./set_goal";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Goal tools do not touch runtime; ToolFactory config still requires one.
 // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -114,6 +115,7 @@ describe("goal tools", () => {
   test("get_goal returns the current goal", async () => {
     const created = await setGoalOk(goalService, { workspaceId, objective: "Read the goal" });
     const tool = createGetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -129,6 +131,7 @@ describe("goal tools", () => {
 
   test("set_goal creates an active goal using effective defaults", async () => {
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -169,6 +172,7 @@ describe("goal tools", () => {
 
   test("set_goal treats null budget and turn cap as defaults", async () => {
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -194,6 +198,7 @@ describe("goal tools", () => {
 
   test("set_goal uses positive default budget even when omitted user budgets are allowed", async () => {
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -216,6 +221,7 @@ describe("goal tools", () => {
 
   test("set_goal accepts explicit positive budget and turn cap", async () => {
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -241,6 +247,7 @@ describe("goal tools", () => {
 
   test("set_goal rejects model-created goals that resolve without budget or turn cap", async () => {
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -264,6 +271,7 @@ describe("goal tools", () => {
   test("set_goal blocks replacing an active goal without explicit replacement intent", async () => {
     await setGoalOk(goalService, { workspaceId, objective: "Existing" });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -282,6 +290,7 @@ describe("goal tools", () => {
   test("set_goal blocks replacing an active goal without matching expectedGoalId", async () => {
     const existing = await setGoalOk(goalService, { workspaceId, objective: "Existing" });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -309,6 +318,7 @@ describe("goal tools", () => {
   test("set_goal blocks replacing an active goal without expectedGoalId", async () => {
     await setGoalOk(goalService, { workspaceId, objective: "Existing" });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -336,6 +346,7 @@ describe("goal tools", () => {
     const staleGetGoal = mock(() => Promise.resolve(null));
     serviceAccess.getGoal = staleGetGoal;
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -360,6 +371,7 @@ describe("goal tools", () => {
   test("set_goal replaces an active goal with matching expectedGoalId", async () => {
     const existing = await setGoalOk(goalService, { workspaceId, objective: "Existing" });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -388,6 +400,7 @@ describe("goal tools", () => {
   test("set_goal replaces an active goal when the replacement objective is unchanged", async () => {
     const existing = await setGoalOk(goalService, { workspaceId, objective: "Repeatable" });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -423,6 +436,7 @@ describe("goal tools", () => {
       expectedGoalId: existing.goalId,
     });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -450,6 +464,7 @@ describe("goal tools", () => {
       expectedGoalId: existing.goalId,
     });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -477,6 +492,7 @@ describe("goal tools", () => {
       parentWorkspaceId: workspaceId,
     });
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -513,6 +529,7 @@ describe("goal tools", () => {
         agentId: "exec",
       });
       const tool = createSetGoalTool({
+        sessionLocks: nodeSessionLocks,
         cwd: "/tmp",
         runtimeTempDir: "/tmp",
         runtime: inertRuntime,
@@ -549,6 +566,7 @@ describe("goal tools", () => {
     const original = serviceAccess.isWorkspaceStreaming;
     serviceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -577,6 +595,7 @@ describe("goal tools", () => {
     const drained = await goalService.applyPendingAfterStreamEnd(workspaceId);
     const durable = await goalService.getGoal(workspaceId);
     const completeTool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -607,6 +626,7 @@ describe("goal tools", () => {
     const original = serviceAccess.isWorkspaceStreaming;
     serviceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -653,6 +673,7 @@ describe("goal tools", () => {
       return Promise.resolve(streamingChecks < 3);
     };
     const tool = createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -686,6 +707,7 @@ describe("goal tools", () => {
   test("complete_goal completes the goal, persists the summary, and emits model telemetry", async () => {
     const created = await setGoalOk(goalService, { workspaceId, objective: "Finish the goal" });
     const tool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -749,6 +771,7 @@ describe("goal tools", () => {
     await arrange();
     const before = await goalService.getGoal(workspaceId);
     const tool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -771,6 +794,7 @@ describe("goal tools", () => {
     const created = await setGoalOk(goalService, { workspaceId, objective: "Paused but done" });
     await setGoalOk(goalService, { workspaceId, status: "paused" });
     const tool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -796,6 +820,7 @@ describe("goal tools", () => {
   test("complete_goal surfaces goal_conflict when expected goalId is stale", async () => {
     await setGoalOk(goalService, { workspaceId, objective: "Compete with a stale goalId" });
     const tool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -827,6 +852,7 @@ describe("goal tools", () => {
   describe("execution-time gates", () => {
     function toolConfig(goalToolContext: GoalToolContext): ToolConfiguration {
       return {
+        sessionLocks: nodeSessionLocks,
         cwd: "/tmp",
         runtimeTempDir: "/tmp",
         runtime: inertRuntime,
@@ -1025,6 +1051,7 @@ describe("set_goal workspace agent selection gate", () => {
 
   function setGoalTool(goalToolContext: GoalToolContext) {
     return createSetGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,
@@ -1105,6 +1132,7 @@ describe("set_goal workspace agent selection gate", () => {
     await selectAgent("exec");
     await setGoalOk(goalService, { workspaceId, objective: "Exec goal", budgetCents: 500 });
     const tool = createCompleteGoalTool({
+      sessionLocks: nodeSessionLocks,
       cwd: "/tmp",
       runtimeTempDir: "/tmp",
       runtime: inertRuntime,

@@ -14,7 +14,8 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { readArtifactBytesOnRuntime } from "./artifactRuntimeStore";
 import {
@@ -153,13 +154,14 @@ export async function readPinnedPaths(sessionDir: string): Promise<string[]> {
 
 async function updatePinnedPaths(
   sessionDir: string,
-  update: (paths: string[]) => string[]
+  update: (paths: string[]) => string[],
+  locks: SessionLocks
 ): Promise<void> {
   await storeLocks.withLock(sessionDir, async () => {
     await fs.mkdir(sessionDir, { recursive: true });
     // The in-process queue orders this backend's writers; the file lock excludes another backend
     // sharing the Xum home (a desktop app alongside `xum server`), whose update could be lost.
-    const release = await acquireCrossProcessLock({
+    const release = await locks.acquireCrossProcessLock({
       lockPath: `${storePath(sessionDir)}.lock`,
       acquireTimeoutMs: 30_000,
       staleMs: 60_000,
@@ -171,14 +173,24 @@ async function updatePinnedPaths(
   });
 }
 
-export async function addPinnedPath(sessionDir: string, relPath: string): Promise<void> {
-  await updatePinnedPaths(sessionDir, (paths) =>
-    paths.includes(relPath) ? paths : [...paths, relPath]
+export async function addPinnedPath(
+  sessionDir: string,
+  relPath: string,
+  locks: SessionLocks = nodeSessionLocks
+): Promise<void> {
+  await updatePinnedPaths(
+    sessionDir,
+    (paths) => (paths.includes(relPath) ? paths : [...paths, relPath]),
+    locks
   );
 }
 
-export async function removePinnedPath(sessionDir: string, relPath: string): Promise<void> {
-  await updatePinnedPaths(sessionDir, (paths) => paths.filter((p) => p !== relPath));
+export async function removePinnedPath(
+  sessionDir: string,
+  relPath: string,
+  locks: SessionLocks = nodeSessionLocks
+): Promise<void> {
+  await updatePinnedPaths(sessionDir, (paths) => paths.filter((p) => p !== relPath), locks);
 }
 
 async function statPinned(

@@ -17,6 +17,7 @@ export interface WorkspaceActivityPumpClient {
       ): Promise<
         AsyncIterable<
           | { type: "activity"; workspaceId: string; activity: ActivityFields | null }
+          | { type: "usage-changed"; workspaceId: string }
           | { type: "heartbeat" }
         >
       >;

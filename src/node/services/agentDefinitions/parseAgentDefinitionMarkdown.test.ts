@@ -70,6 +70,17 @@ Body
     expect(result.frontmatter.subagent?.skip_init_hook).toBe(true);
   });
 
+  test("keeps ai.cacheTtl and rejects an unknown TTL like an unknown thinkingLevel", () => {
+    const parse = (ai: string) => {
+      const content = `---\nname: Cached\nai:\n${ai}\n---\nBody\n`;
+      return parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content) });
+    };
+
+    expect(parse("  cacheTtl: 1h").frontmatter.ai).toEqual({ cacheTtl: "1h" });
+    expect(() => parse("  cacheTtl: 2h")).toThrow(AgentDefinitionParseError);
+    expect(() => parse("  thinkingLevel: turbo")).toThrow(AgentDefinitionParseError);
+  });
+
   test("throws on missing frontmatter", () => {
     expect(() =>
       parseAgentDefinitionMarkdown({
@@ -128,7 +139,7 @@ Body
         description: "Delegate",
         base: "exec",
         ui: { hidden: true },
-        subagent: { runnable: true },
+        subagent: { runnable: true, background_hint: true },
         prompt: { append: false },
       });
     });

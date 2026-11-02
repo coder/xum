@@ -17,6 +17,8 @@ import type { TaskService } from "@/node/services/taskService";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 type BackgroundStartInput = Parameters<
   NonNullable<NonNullable<ToolConfiguration["workflowService"]>["startWorkflowInBackground"]>
@@ -1004,6 +1006,7 @@ describe("workflow_run duplicate guard", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
     const inlineRun = createWorkflowRunRecord({
       id: "wfr_inline",
@@ -1238,6 +1241,7 @@ describe("workflow_run duplicate guard", () => {
       runtime: new LocalRuntime(tempDir.path),
       workspacePath: tempDir.path,
       projectTrusted: true,
+      runtimeFactory,
     });
     // Legacy descriptor shape: no sourceKind/sourceHash/canonicalScriptPath on the workflow;
     // only the run-level sourceHash identifies the source.

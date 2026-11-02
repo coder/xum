@@ -104,7 +104,7 @@ function sdkProviderOptionsNamespace(provider: string): string {
 
 /**
  * Resolve which providerOptions namespace a request will use for a given
- * canonical origin and route provider. Passthrough gateways (mux-gateway)
+ * canonical origin and route provider. Passthrough gateways (coder)
  * keep the origin namespace; transforming gateways (openrouter,
  * github-copilot, bedrock) use their own.
  */
@@ -130,12 +130,11 @@ export function resolveProviderOptionsNamespaceKey(
  * Equality key for UI selection tracking (explicit-change origin recording,
  * same-model warning suppression).
  *
- * Collapses passthrough gateway aliases to canonical identity — a persisted
- * rewrite like mux-gateway:openai/x must still match an explicit openai:x
- * switch — but keeps raw coder:<instance>/<model> identities distinct: the
- * instance's TYPE (not its name) decides the upstream, so name-only
- * canonicalization would equate a cross-typed gateway selection with an
- * unrelated direct model and drop the switch/warning.
+ * Collapses passthrough gateway aliases to canonical identity, but keeps raw
+ * coder:<instance>/<model> identities distinct: the instance's TYPE (not its
+ * name) decides the upstream, so name-only canonicalization would equate a
+ * cross-typed gateway selection with an unrelated direct model and drop the
+ * switch/warning.
  */
 export function modelSelectionEqualityKey(modelString: string): string {
   const trimmed = modelString.trim();

@@ -7,7 +7,7 @@ import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/uti
 /**
  * Shared loopback OAuth callback server.
  *
- * Three OAuth services (Gateway, Codex, MCP) spin up a local HTTP
+ * Three OAuth services (Codex, Coder, MCP) spin up a local HTTP
  * server to receive the authorization code redirect. The pattern is identical
  * across all three — this module extracts that into a single reusable utility.
  */

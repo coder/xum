@@ -206,7 +206,7 @@ describe("QueuedMessage banner", () => {
     fireEvent.click(view.getByRole("menuitem", { name: "Send now" }));
     await waitFor(() => {
       expect(onSendImmediately).toHaveBeenCalledTimes(2);
-      expect(view.queryByRole("alert")).toBeNull();
+      expect(view.queryByRole("alert") === null).toBe(true);
     });
   });
 

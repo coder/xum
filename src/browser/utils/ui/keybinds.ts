@@ -571,9 +571,17 @@ export const KEYBINDS = {
    */
   STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
 
-  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
-  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
-  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Open the live line's background bashes, TODO, sub-agents or reviews panel and focus it; again
+  // (or Esc) closes it. All four share one modifier pair so the chips' chords read as one family.
+  // Ctrl/Cmd+Alt, like NEW_SIDEBAR_TAB: Ctrl/Cmd+Shift has no free letters left for them, and
+  // Ctrl+Alt+T is GNOME's terminal. Matched by `code`: Option+letter is a dead key on macOS.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords
+  // (its secondary side bar toggle takes the "bash" mnemonic letter).
+  // The settings backup chords reuse these keys only inside the Settings dialog.
+  FOCUS_BACKGROUND_PROCESSES: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  OPEN_TODO_PANEL: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  OPEN_SUB_AGENTS_PANEL: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  OPEN_REVIEWS_PANEL: { key: "r", code: "KeyR", ctrl: true, alt: true },
   // Scoped to a focused row of the background processes strip.
   BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
   BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
@@ -606,8 +614,17 @@ export const KEYBINDS = {
   /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_STATS_DIALOG: { key: "s", shift: true },
 
-  /** Open (or focus) the Artifacts tab in the right sidebar, or collapse the sidebar when it shows it */
+  /** Open or focus the Artifacts tab in the right sidebar, or collapse the sidebar when focus is in it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
+
+  /** Agent interface view: switch the main pane between the agent's status page and the chat */
+  TOGGLE_AGENT_INTERFACE_VIEW: { key: "S", ctrl: true, shift: true },
+
+  /** Agent interface view: show or hide the transcript peek under the status page's bar */
+  TOGGLE_STATUS_TRANSCRIPT_PEEK: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
+
+  /** Agent interface view: open Start Here from the agent's last reply, from the status page's bar */
+  STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.

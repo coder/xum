@@ -30,6 +30,7 @@ import type {
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
@@ -125,8 +126,14 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * kernelFileLoader backs mux.load (r12 bulk ingestion) — built by the
    * caller from the workspace cwd/runtime pair the file tools use; only
    * honored in kernel mode with file_read bridged.
+   * locks take refinement_rollback's rollback and target locks (phase 4: SessionLocks).
    */
-  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
+  sandbox?: {
+    workspaceId: string;
+    sessionDir: string;
+    kernelFileLoader?: KernelFileLoader;
+    locks?: SessionLocks;
+  };
   /**
    * Whether the turn must leave project skill content out of what
    * code_execution returns (toolExcludesProjectSkillContent over the turn's
@@ -173,7 +180,7 @@ function refuseToolForAgent(
  * - Provider-executed tools (native web_search) and tools without a local
  *   execute never run the refusal.
  * - Memory's description carries the memory index, so an agent denied memory
- *   must not see it (intuition, which reads memory directly, follows memory).
+ *   must not see it.
  * - A refused tool_catalog_search would still make tool search defer the MCP
  *   tools (prepareToolSearch reads presence), and every search would then be
  *   refused, leaving those allowed tools unreachable.

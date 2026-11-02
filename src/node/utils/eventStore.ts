@@ -1,5 +1,6 @@
 import { SessionFileManager, type SessionFileWriteOptions } from "@/node/utils/sessionFile";
 import type { Config } from "@/node/config";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { log } from "@/node/services/log";
 
 /**
@@ -48,6 +49,7 @@ export class EventStore<TState, TEvent> {
    * @param filename - Filename for persisted state (e.g., "init-status.json")
    * @param serializeState - Function to convert state into array of events for replay
    * @param emitEvent - Function to emit a single event (typically wraps EventEmitter.emit)
+   * @param locks - The owner's SessionLocks: the SessionFileManager takes its workspace FIFO
    * @param storeName - Name for logging (e.g., "InitStateManager")
    */
   constructor(
@@ -55,9 +57,10 @@ export class EventStore<TState, TEvent> {
     filename: string,
     serializeState: (state: TState) => TEvent[],
     emitEvent: (event: TEvent) => void,
+    locks: SessionLocks,
     storeName = "EventStore"
   ) {
-    this.fileManager = new SessionFileManager<TState>(config, filename);
+    this.fileManager = new SessionFileManager<TState>(config, filename, locks);
     this.serializeState = serializeState;
     this.emitEvent = emitEvent;
     this.storeName = storeName;

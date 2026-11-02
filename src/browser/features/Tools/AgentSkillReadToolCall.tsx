@@ -33,7 +33,7 @@ interface AgentSkillFrontmatter {
   description: string;
   license?: string;
   compatibility?: string;
-  metadata?: Record<string, string>;
+  metadata?: Record<string, unknown>;
 }
 
 interface AgentSkillPackage {

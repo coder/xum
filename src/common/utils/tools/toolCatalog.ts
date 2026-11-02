@@ -402,6 +402,13 @@ function groupCatalogByServer(catalog: readonly ToolCatalogEntry[]): Array<[stri
   return [...byServer.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
 
+/**
+ * Build a compact, deterministic index of the deferred catalog grouped by MCP
+ * server, e.g. `- github: github_create_issue, …, and more`.
+ * Only names are listed — descriptions and parameter schemas stay deferred
+ * until activation, so the overview solves the "unknown unknowns" discovery
+ * problem without reintroducing schema token bloat.
+ */
 function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOverview {
   const servers = groupCatalogByServer(catalog);
   const lines: string[] = [];
@@ -438,18 +445,6 @@ function buildOverview(catalog: readonly ToolCatalogEntry[]): ToolCatalogOvervie
     servers: servers.map(([server]) => server),
     lines: claims,
   };
-}
-
-/**
- * Build a compact, deterministic index of the deferred catalog grouped by MCP
- * server, e.g. `- github: github_create_issue, …, and more`.
- * Only names are listed — descriptions and parameter schemas stay deferred
- * until activation, so the overview solves the "unknown unknowns" discovery
- * problem without reintroducing schema token bloat. Returns "" for an empty
- * catalog.
- */
-export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): string {
-  return catalog.length === 0 ? "" : buildOverview(catalog).text;
 }
 
 /**

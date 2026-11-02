@@ -183,11 +183,11 @@ describe("PRStackBadge", () => {
       trigger.getBoundingClientRect(),
     ] as unknown as DOMRectList);
 
-    fireEvent(window, new Event("resize"));
+    fireEvent(window, new window.Event("resize"));
     expect(view.queryByRole("menu")).not.toBeNull();
 
     rects.mockReturnValue([] as unknown as DOMRectList);
-    fireEvent(window, new Event("resize"));
+    fireEvent(window, new window.Event("resize"));
     expect(view.queryByRole("menu")).toBeNull();
   });
 });

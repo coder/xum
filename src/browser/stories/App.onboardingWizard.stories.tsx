@@ -1,8 +1,8 @@
 /**
  * First-run onboarding wizard (#5944): the step indicator has an accessible name, and the
  * wizard's text meets WCAG AA contrast in every theme. Lighthouse scored the light theme's
- * muted text at 3.6-3.8:1 before the fix. Every theme also checks the step's accent links,
- * which use the text-only accent token (#5946, #6449).
+ * muted text at 3.6-3.8:1 before the fix. Every theme also checks the step's accent link,
+ * which uses the text-only accent token (#5946, #6449).
  */
 
 import { expect, waitFor, within } from "storybook/test";
@@ -18,7 +18,7 @@ export default {
   title: "App/OnboardingWizard",
 };
 
-/** A first run: no splash seen and no provider configured, so the wizard opens on its Gateway step. */
+/** A first run: no splash seen and no provider configured, so the wizard opens on providers. */
 const renderFirstRun = () => (
   <AppWithMocks
     setup={() => createMockORPCClient({ viewedSplashScreens: [], providersConfig: {} })}
@@ -35,8 +35,8 @@ async function expectAccessibleWizard(canvasElement: HTMLElement) {
 
   const texts = [
     await dialog.findByText(/^1 \/ \d+$/),
-    await dialog.findByText(/^OSS contributors with GitHub accounts/),
-    await dialog.findByText(/^vouchers which you can/),
+    await dialog.findByText(/^Xum is provider-agnostic/),
+    await dialog.findByText("No providers configured yet."),
   ];
   await waitFor(async () => {
     for (const text of texts) {
@@ -46,15 +46,12 @@ async function expectAccessibleWizard(canvasElement: HTMLElement) {
 }
 
 /**
- * The step's accent links reach 4.5:1 on the dialog in every theme. Dark #0070cc was 3.36:1 here
+ * The step's accent link reaches 4.5:1 on the dialog in every theme. Dark #0070cc was 3.36:1 here
  * (#5946). The light themes pass on this dialog; the check guards their accent text token (#6449).
  */
 async function expectReadableWizardLinks(canvasElement: HTMLElement) {
   const dialog = within(await within(canvasElement.ownerDocument.body).findByRole("dialog"));
-  const links = [
-    ...["Coder", "Discord", "claim here"].map((name) => dialog.getByRole("link", { name })),
-    dialog.getByRole("button", { name: "Settings → Providers" }),
-  ];
+  const links = [dialog.getByRole("button", { name: "Settings → Providers" })];
   const failing = links
     .map((link) => ({ name: link.textContent ?? "", ratio: textContrast(link) }))
     .filter((link) => link.ratio < 4.5)

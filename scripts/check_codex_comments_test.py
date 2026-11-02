@@ -40,10 +40,11 @@ def board_for(body, head):
     return body.replace(board_head(body), head)
 
 
-def comment(body, author=BOT, created_at=AFTER, minimized=False):
+def comment(body, author=BOT, created_at=AFTER, minimized=False, association="MEMBER"):
     return {
         "id": "comment",
         "author": {"login": author},
+        "authorAssociation": association,
         "body": body,
         "createdAt": created_at,
         "isMinimized": minimized,
@@ -103,6 +104,11 @@ class CodexGateTest(unittest.TestCase):
         gh.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if args[:2] == ['pr', 'comment']:
+    # The only write the scripts may make: a Codex review request (wait_pr_codex.sh).
+    with open(os.environ['CODEX_GATE_POSTS'], 'a') as posts:
+        posts.write(args[args.index('--body') + 1] + '\\0')
+    sys.exit(0)
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
 cursor = next((arg[7:] for arg in args if arg.startswith('cursor=')), 'null')
@@ -151,6 +157,8 @@ else:
             round_marker.unlink()
         calls = self.directory / "calls"
         calls.write_text("")
+        self.posts = self.directory / "posts"
+        self.posts.write_text("")
         cache_file = self.directory / "cache.json"
         if cache is not None:
             cache_file.write_text(json.dumps(cache))
@@ -164,6 +172,7 @@ else:
                 "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
                 "CODEX_GATE_FIXTURE": str(fixture),
                 "CODEX_GATE_CALLS": str(calls),
+                "CODEX_GATE_POSTS": str(self.posts),
                 "MUX_GH_OWNER": "fixture",
                 "MUX_GH_REPO": "fixture",
                 "MUX_SKIP_FETCH_SYNC": "1",
@@ -235,6 +244,40 @@ else:
             with self.subTest(body=body):
                 self.assert_gate(expected, snapshot([comment(body)]))
 
+    def test_receipt_without_reviewed_commit_does_not_hide_findings(self):
+        # Codex sometimes omits the Reviewed commit line (coder/xum#7302). That
+        # line is optional, but text in its place or around the receipt blocks.
+        clean = FIXTURES["receipt_security_no_findings_without_commit"]["body"]
+        report = "\n\n[View security finding report]"
+        for body, expected in (
+            (clean, 0),
+            (clean.replace(report, "\n\n[P1] Found an issue." + report), 1),
+            (clean.replace(report, "\n\n**Reviewed commit:** `zzz`" + report), 1),
+            (clean.replace("No security issues were found", "Found a P1 issue"), 1),
+            (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
+    def test_clean_code_review_receipt_does_not_hide_findings(self):
+        # The clean verdict is one sentence, a one-line flourish and an optional
+        # Reviewed commit line (coder/xum#7504). Text after it, a flourish that
+        # carries a finding badge, or text before it blocks.
+        clean = FIXTURES["code_review_no_findings"]["body"]
+        flourish = "More of your lovely PRs please."
+        help_start = "\n\n<details>"
+        account = FIXTURES["account_setup_notice"]["body"]
+        for body, expected in (
+            (clean, 0),
+            (clean.replace(help_start, "\n\n[P1] Fix authorization." + help_start, 1), 1),
+            (clean.replace(flourish, "[P1] Fix authorization."), 1),
+            (clean.replace(flourish, "![P1 Badge](https://img.shields.io/badge/P1-orange)"), 1),
+            (clean.replace("Codex Review:", "[P1] Fix authorization.\n\nCodex Review:"), 1),
+            (account + "\n\n[P1] Fix authorization.", 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
     def test_review_state_line_is_fail_closed(self):
         # Codex added a review-state line to its board on 2026-10-15. Only the
         # observed keys and statuses count; has_any_findings stays true after
@@ -246,8 +289,9 @@ else:
         unresolved = '"has_unresolved_findings":false'
         for case, changed, expected in (
             ("observed", body, 0),
-            # Codex sends null while a review runs; a completed review must say false.
-            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            # A finished code review of this head may say null (coder/xum#7734): its findings are
+            # threads and finding comments, which block on their own.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 0),
             ("running, null findings", body.replace(
                 unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
             ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
@@ -268,6 +312,184 @@ else:
             for cached in (False, True):
                 with self.subTest(case=case, cached=cached):
                     data = snapshot([comment(changed)], head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_null_security_flags_pass_only_with_a_clean_receipt_for_this_head(self):
+        # Since 2026-10-28 Codex can finish a security review with null findings flags
+        # (coder/xum#7727, observed on #7722). That is clean only beside a clean receipt
+        # for the current head and with no open Codex thread; every other null blocks.
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        older_receipt = receipt.replace("`" + head[:10] + "`", "`" + "c" * 10 + "`")
+        self.assertNotEqual(older_receipt, receipt)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        open_thread = thread("[P2] Open" + code_marker, commit=head)
+        advisory = board.replace(
+            "\n\n\n\n<details>",
+            "\n\n### Security findings\n\n#### Advisory findings (1)\n\n"
+            "- 🟡 [Leak](https://github.com/coder/xum/pull/7722#discussion_r1) · **Medium**"
+            "\n\n\n\n<details>",
+            1,
+        )
+        self.assertNotEqual(advisory, board)
+        running = board.replace(
+            '"has_unresolved_findings":null,"status":"completed"}}',
+            '"has_unresolved_findings":null,"status":"running"}}',
+        ).replace('"status":"completed"} -->', '"status":"running"} -->')
+        self.assertNotEqual(running, board)
+        for case, comments, threads, pr_head, expected in (
+            ("clean receipt for this head", [board, receipt], [], head, 0),
+            # Pending, not failed: a push-triggered run posts no receipt (coder/xum#7731).
+            ("no receipt", [board], [], head, 10),
+            ("open Codex thread", [board, receipt], [open_thread], head, 1),
+            ("receipt for an older head", [board, older_receipt], [], head, 10),
+            # Unknown, not "older review in progress": null flags are clean only for this head.
+            ("board and receipt for an older head", [board, receipt], [], NEWER_HEAD, 1),
+            ("advisory section", [advisory, receipt], [], head, 1),
+            ("merge gate on", [board.replace('"mergeGateEnabled":false', '"mergeGateEnabled":true'), receipt],
+             [], head, 1),
+            ("running, null findings", [running, receipt], [], head, 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+        with self.subTest("a minimized receipt does not count"):
+            data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
+            self.assert_gate(10, data)
+        with self.subTest("the CI wait ends once the receipt lands"):
+            pending = snapshot([comment(board)], head=head)
+            self.assert_gate(0, [pending, snapshot([comment(board), comment(receipt)], head=head)], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("a finding still fails while the receipt is pending"):
+            data = snapshot([comment(board)], [open_thread], head=head)
+            self.assert_gate(1, data, wait=60)
+
+    def test_null_security_flags_pass_beside_cleared_advisories(self):
+        # Codex keeps listing an advisory after its thread is resolved, beside null
+        # security flags (observed on #7859). A cleared bullet must not block that board.
+        board = FIXTURES["review_state_null_security_advisory_summary"]["body"]
+        head = board_head(board)
+        clean = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        receipt = re.sub(r"\*\*Reviewed commit:\*\* `[0-9a-f]+`", f"**Reviewed commit:** `{head[:10]}`", clean)
+        self.assertNotEqual(receipt, clean)
+        discussion = "4433878221"
+        link = f"(https://github.com/coder/xum/pull/7859#discussion_r{discussion})"
+        unlinked = board.replace("[Let Stop preempt grouped task creation]" + link, "Let Stop preempt grouped task creation")
+        self.assertNotEqual(unlinked, board)
+        undercounted = board.replace("#### Advisory findings (1)", "#### Advisory findings (2)")
+        self.assertNotEqual(undercounted, board)
+        bulletless = re.sub(r"\n- 🟡 [^\n]*", "", board)
+        self.assertNotEqual(bulletless, board)
+        bullet = re.search(r"\n- 🟡 [^\n]*", board).group(0)
+        outside = bulletless.replace("\n### Security findings", bullet + "\n\n### Security findings")
+        self.assertNotEqual(outside, bulletless)
+        borrowed = board.replace("#### Advisory findings (1)", "#### Advisory findings (1)\n\n#### Advisory findings (0)")
+        self.assertNotEqual(borrowed, board)
+        headless = re.sub(r"\n#### Advisory findings \(1\)\n", "", bulletless)
+        self.assertNotEqual(headless, bulletless)
+        # Round 4 on #7860: the findings heading must open the inventory, not follow it.
+        misplaced = board.replace("### Security findings\n\n", "").replace(bullet, bullet + "\n\n### Security findings")
+        self.assertNotEqual(misplaced, board)
+        loading = re.sub(
+            r"#### Advisory findings \(1\)\n\n- 🟡 [^\n]*",
+            "Finding details are still loading. Check the individual review comments.",
+            board,
+        )
+        self.assertNotEqual(loading, board)
+        marked = board.replace(bullet, bullet + " · **Resolved**")
+        self.assertNotEqual(marked, board)
+
+        def advisory(resolved, marker="<!-- codex-security-review-finding:v1 -->\n"):
+            return thread(
+                marker + "[P2] Let Stop preempt grouped task creation",
+                resolved=resolved,
+                discussion=discussion,
+                commit=head,
+            )
+
+        code_thread = thread(
+            "[P2] Let Stop preempt grouped task creation\n\n<!-- codex-code-review-finding:v1 -->",
+            resolved=True,
+            discussion=discussion,
+            commit=head,
+        )
+
+        for case, comments, threads, pr_head, expected in (
+            ("resolved advisory", [board, receipt], [advisory(True)], head, 0),
+            ("unresolved advisory", [board, receipt], [advisory(False)], head, 1),
+            ("bullet without a thread link", [unlinked, receipt], [advisory(True)], head, 1),
+            ("fewer bullets than the declared count", [undercounted, receipt], [advisory(True)], head, 1),
+            ("declared advisory without a bullet", [bulletless, receipt], [advisory(True)], head, 1),
+            ("bullet outside the advisory section", [outside, receipt], [advisory(True)], head, 1),
+            ("bullet under another advisory header", [borrowed, receipt], [advisory(True)], head, 1),
+            ("findings heading without an advisory header", [headless, receipt], [advisory(True)], head, 1),
+            ("findings heading after the inventory", [misplaced, receipt], [advisory(True)], head, 1),
+            ("finding details still loading", [loading, receipt], [advisory(True)], head, 1),
+            ("bullet linking a resolved code-review thread", [board, receipt], [code_thread], head, 1),
+            ("bullet linking a resolved thread without a marker", [board, receipt], [advisory(True, "")], head, 1),
+            ("Resolved marker without a thread", [marked, receipt], [], head, 0),
+            ("no receipt", [board], [advisory(True)], head, 10),
+            ("board for another head", [board, receipt], [advisory(True)], NEWER_HEAD, 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=pr_head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_missing_security_receipt_is_requested_once_per_head(self):
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        review = comment("@codex review", "maintainer", BEFORE)
+        posted = "@codex security review\n\nHead: " + head
+        approval = comment("Codex Review: Didn't find any major issues. Nice work!", created_at=AFTER)
+        for case, comments, posts, expected in (
+            ("no request names the head", [review, comment(board)], 1, 10),
+            # A request that names another head (an earlier push) does not count.
+            ("request for an older head", [review, comment(posted.replace(head, "c" * 40), "maintainer"),
+                                           comment(board)], 1, 10),
+            ("request names the head", [review, comment(posted, "maintainer"), comment(board)], 0, 10),
+            # Anyone can comment on a public PR: only a member's request counts.
+            ("outsider's request names the head",
+             [review, comment(posted, "outsider", association="NONE"), comment(board)], 1, 10),
+            ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
+            ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
+            # No receipt will come after a usage-limit notice: fail, never pass the security half.
+            ("usage limits after the head's request",
+             [review, comment(posted, "maintainer", REQUEST), comment(board), comment(USAGE_LIMIT_NOTICES[0])], 0, 1),
+            ("usage limits before the head's request",
+             [review, comment(USAGE_LIMIT_NOTICES[0], created_at=BEFORE), comment(posted, "maintainer", REQUEST),
+              comment(board)], 0, 10),
+        ):
+            with self.subTest(case=case):
+                result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(self.posts.read_text().split("\0")[:-1], [posted] * posts)
+
+    def test_null_code_review_flags_pass_only_for_this_head(self):
+        # Since 2026-10-29 Codex can finish a code review with null flags (coder/xum#7734,
+        # observed on #7732). Its findings are threads and finding comments, which block alone.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code_flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
+        self.assertIn(code_flags, clean)
+        null_flags = code_flags.replace('"has_unresolved_findings":false', '"has_unresolved_findings":null')
+        null_code = clean.replace(code_flags, null_flags, 1)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        self.assertNotEqual(null_code, clean)
+        for case, comments, threads, expected in (
+            ("clean", [null_code], [], 0),
+            ("open Codex thread", [null_code], [thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("Codex finding comment", [null_code, "**P1** Validate the caller" + code_marker], [], 1),
+            ("older commit", [null_code.replace('"code_review":{"commit_sha":"' + head, '"code_review":{"commit_sha":"' + "c" * 40, 1)],
+             [], 1),
+            ("running", [null_code.replace(null_flags, null_flags.replace("completed", "running"), 1)], [], 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=head)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
@@ -637,7 +859,11 @@ else:
                 )
                 # Completed informational envelopes and in-progress summaries keep
                 # polling for approval; unknown reports remain failures under the CI policy.
-                expected = 10 if fixture["expected_exit_code"] in (0, 10) else 1
+                # A fixture can name its own readiness result: the clean code-review
+                # receipt is approval, and the account notice is a failed review.
+                expected = fixture.get(
+                    "wait_exit_code", 10 if fixture["expected_exit_code"] in (0, 10) else 1
+                )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_in_progress_review_fails_fast_on_older_blockers(self):

@@ -106,7 +106,7 @@ describe("CommandPalette inline goal prompts", () => {
     expect(view.getByRole("combobox")).toBe(input);
 
     fireEvent.keyDown(input, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("combobox") === null).toBe(true));
   });
 
   test("Goal: Set objective traps focus and restores it on dismissal", async () => {
@@ -143,7 +143,7 @@ describe("CommandPalette inline goal prompts", () => {
     expect(objectiveInput.closest('[cmdk-root=""]')?.contains(document.activeElement)).toBe(true);
 
     fireEvent.keyDown(objectiveInput, { key: "Escape" });
-    await waitFor(() => expect(view.queryByText("Goal: Set objective")).toBeNull());
+    await waitFor(() => expect(view.queryByText("Goal: Set objective") === null).toBe(true));
     expect(document.activeElement).toBe(opener);
   });
 
@@ -180,7 +180,7 @@ describe("CommandPalette inline goal prompts", () => {
     expect(summaryInput.closest('[cmdk-root=""]')?.contains(document.activeElement)).toBe(true);
 
     fireEvent.keyDown(summaryInput, { key: "Escape" });
-    await waitFor(() => expect(view.queryByText("Goal: Mark complete")).toBeNull());
+    await waitFor(() => expect(view.queryByText("Goal: Mark complete") === null).toBe(true));
     expect(document.activeElement).toBe(opener);
   });
 });

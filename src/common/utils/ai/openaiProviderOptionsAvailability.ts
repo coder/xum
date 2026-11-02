@@ -89,7 +89,7 @@ export function openaiModelSupportsServiceTier(
 /**
  * Whether the wire this route actually speaks accepts Ultrafast. An allowlist that fails
  * closed: only routes that send OpenAI's own Responses API keep the 6x tier. Gateways with
- * their own adapters (OpenRouter's chat API, Xum Gateway, Copilot's Chat Completions) do not
+ * their own adapters (OpenRouter's chat API, Copilot's Chat Completions) do not
  * accept "ultrafast", and each route pins its own wire, so the direct OpenAI wireFormat
  * setting must not decide for them.
  */
@@ -162,7 +162,7 @@ export function openaiServiceTierAvailable(
     return /^(?:gpt-\d|o[1-9](?:-|$))/.test(modelId);
   }
   if (origin !== "openai") return false;
-  if (route === "openrouter" || route === "mux-gateway" || route === "github-copilot") {
+  if (route === "openrouter" || route === "github-copilot") {
     return true;
   }
   return openaiDirectProviderOptionsAvailable(normalized, {

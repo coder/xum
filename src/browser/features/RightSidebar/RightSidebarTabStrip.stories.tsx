@@ -382,6 +382,53 @@ export const Cramped: Story = {
   },
 };
 
+/**
+ * Arrow keys, Home and End move focus between the tabs (WAI-ARIA tabs pattern, #7102). Only Enter
+ * or Space selects, and only the selected tab is in the Tab order.
+ */
+export const ArrowKeys: Story = {
+  // Narrow enough that the tabs overflow: a tab reached by a key scrolls into view.
+  args: { width: 330, reservesToggle: false },
+  play: async ({ canvasElement }) => {
+    const row = within(canvasElement).getByRole("tablist");
+    const tabs = within(row).getAllByRole("tab");
+    const [first, second] = tabs;
+    const last = tabs[tabs.length - 1];
+    await expect(first).toHaveAttribute("aria-selected", "true");
+
+    first.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    await expect(second).toHaveFocus();
+    // Focus moves; the selection stays until Enter or Space.
+    await expect(first).toHaveAttribute("aria-selected", "true");
+    await userEvent.keyboard("{End}");
+    await expect(last).toHaveFocus();
+    await expectFullyInRow(row, last);
+    // A size change in the row (a badge loads, a font swaps) must not scroll it back to the
+    // selected tab, away from the focused one. The row's ResizeObserver runs within a frame.
+    first.style.paddingLeft = "32px";
+    await frame();
+    await frame();
+    await expectFullyInRow(row, last);
+    // The same while focus is on a button inside that tab (the terminal's close button).
+    last.querySelector<HTMLButtonElement>('button[aria-label="Close terminal"]')!.focus();
+    first.style.paddingLeft = "";
+    await frame();
+    await frame();
+    await expectFullyInRow(row, last);
+    last.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    await expect(first).toHaveFocus();
+    await userEvent.keyboard("{ArrowLeft}");
+    await expect(last).toHaveFocus();
+    await userEvent.keyboard("{Home}");
+    await expect(first).toHaveFocus();
+
+    await userEvent.keyboard("{ArrowRight}{Enter}");
+    await expect(second).toHaveAttribute("aria-selected", "true");
+  },
+};
+
 function center(rect: DOMRect) {
   return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 }

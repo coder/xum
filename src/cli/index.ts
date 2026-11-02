@@ -44,7 +44,8 @@ void bootstrapCli();
 
 async function bootstrapCli(): Promise<void> {
   try {
-    // One stderr line on a Node older than xum server supports (#6968). It never exits.
+    // One stderr line on a Node older than xum server supports (#6968) or affected by
+    // CVE-2026-111497. It never exits.
     warnIfUnsupportedNode();
     const transition = await initializeXumHomeTransition();
     cleanupObsoleteXumBinArtifacts(transition.activePath);

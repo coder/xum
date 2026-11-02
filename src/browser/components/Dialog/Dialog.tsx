@@ -67,6 +67,10 @@ const DialogOverlay = React.forwardRef<
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
 const NO_ANIMATION: React.CSSProperties = { animation: "none" };
+// A caller's width class replaces the safe-area width in `cn` while `left` stays at the safe area's
+// center, and those callers pass `maxWidth`: capping it keeps such a dialog between the safe areas.
+const SAFE_AREA_WIDTH =
+  "calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px))";
 
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
@@ -150,14 +154,16 @@ const DialogContent = React.forwardRef<
             e.stopPropagation();
             if (!e.nativeEvent.defaultPrevented) onOpenChange(false);
           }}
+          // Centered between the side safe areas, not in the window: the iPhone Duo's cover
+          // display keeps an 84px status column on the right, and dialogs ran under it.
           className={cn(
-            "bg-dark border-border fixed top-[50%] left-[50%] z-[1500] grid w-[90%] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]",
+            "bg-dark border-border fixed top-[50%] left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))/2)] z-[1500] grid w-[calc((100%_-_env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))*0.9)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]",
             !maxWidth && "max-w-lg",
             maxHeight && "overflow-y-auto",
             className
           )}
           style={{
-            ...(maxWidth && { maxWidth }),
+            ...(maxWidth && { maxWidth: `min(${maxWidth}, ${SAFE_AREA_WIDTH})` }),
             ...(maxHeight && { maxHeight }),
             ...(skipEntryAnimation && NO_ANIMATION),
             ...style,

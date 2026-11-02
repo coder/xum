@@ -40,9 +40,9 @@ describe("getModelStats", () => {
 
   test.each([
     ["openai:gpt-5.5-2026-04-23", "openai:gpt-5.5"],
-    ["mux-gateway:openai/gpt-5.5-pro-2026-04-23", "openai:gpt-5.5-pro"],
-    ["mux-gateway:openai/gpt-5.4-mini-2026-03-11", "openai:gpt-5.4-mini"],
-    ["mux-gateway:openai/gpt-5.4-nano-2026-03-17", "openai:gpt-5.4-nano"],
+    ["coder:openai/gpt-5.5-pro-2026-04-23", "openai:gpt-5.5-pro"],
+    ["coder:openai/gpt-5.4-mini-2026-03-11", "openai:gpt-5.4-mini"],
+    ["coder:openai/gpt-5.4-nano-2026-03-17", "openai:gpt-5.4-nano"],
     ["openai:gpt-5.6-sol-2026-07-09", "openai:gpt-5.6-sol"],
   ])("falls back from %s to the published %s family entry", (datedModel, canonicalModel) => {
     expect(expectStats(datedModel)).toEqual(expectStats(canonicalModel));
@@ -116,7 +116,7 @@ describe("getModelStats", () => {
   test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
     const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
     expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
-    expect(expectStats("mux-gateway:openai/gpt-6-astra")).toEqual(astra);
+    expect(expectStats("coder:openai/gpt-6-astra")).toEqual(astra);
     // OpenAI has published no Astra variants; do not resolve unknown ids to it.
     expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
   });
@@ -139,6 +139,23 @@ describe("getModelStats", () => {
     expect(stats.cache_read_input_token_cost).toBe(0.000000075);
   });
 
+  test.each([
+    // [model, input, output, cacheRead]: the base models' introductory rates do not apply.
+    ["google-vertex:gemini-3.8-flash-cyber", 0.0000015, 0.0000075, 0.00000015],
+    ["google-vertex:gemini-4-argon-cyber-permissive", 0.000004, 0.00002, 0.0000002],
+  ] as const)(
+    "resolves the Vertex-only %s custom model with its list pricing and limits",
+    (model, input, output, cacheRead) => {
+      expect(expectStats(model)).toMatchObject({
+        max_input_tokens: 1048576,
+        max_output_tokens: 65536,
+        input_cost_per_token: input,
+        output_cost_per_token: output,
+        cache_read_input_token_cost: cacheRead,
+      });
+    }
+  );
+
   test("reads the long-context threshold from LiteLLM's *_above_200k_tokens rate names", () => {
     const stats = expectStats("google:gemini-3.1-pro-preview");
     expect(stats.tiered_pricing_threshold_tokens).toBe(200000);
@@ -146,10 +163,10 @@ describe("getModelStats", () => {
     expect(stats.output_cost_per_token_above_threshold).toBe(0.000018);
   });
 
-  test("normalizes mux-gateway provider/model ids before lookup", () => {
-    expect(expectStats("mux-gateway:anthropic/claude-sonnet-4-5")).toEqual(
-      expectStats("anthropic:claude-sonnet-4-5")
-    );
+  test("normalizes gateway provider/model ids before lookup", () => {
+    const sonnet = expectStats("anthropic:claude-sonnet-4-5");
+    expect(expectStats("openrouter:anthropic/claude-sonnet-4-5")).toEqual(sonnet);
+    expect(expectStats("bedrock:anthropic.claude-sonnet-4-5")).toEqual(sonnet);
   });
 
   test("supports bare model ids without a provider prefix", () => {
@@ -241,7 +258,7 @@ describe("getModelStats", () => {
   test("returns null for unknown models across direct and gateway forms", () => {
     expect(getModelStats("unknown:fake-model-9000")).toBeNull();
     expect(getModelStats("ollama:this-model-does-not-exist")).toBeNull();
-    expect(getModelStats("mux-gateway:anthropic/unknown-model-xyz")).toBeNull();
+    expect(getModelStats("openrouter:anthropic/unknown-model-xyz")).toBeNull();
   });
 });
 

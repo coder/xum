@@ -91,7 +91,11 @@ describe("inactive real cancellation storage", () => {
     mutationCommitted.mockClear();
     h = await createTestHistoryService();
     foreign = new HistoryService(h.config);
-    storage = new FileCompactionCancellationStorage(h.historyService, workspaceId);
+    storage = new FileCompactionCancellationStorage(
+      h.historyService,
+      workspaceId,
+      h.historyService.files
+    );
     state = new CompactionCancellation(storage);
     sessionDir = path.dirname(storage.path);
     expect(
@@ -397,8 +401,8 @@ describe("inactive real cancellation storage", () => {
     ).toBe(true);
     const committed = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const remove = nodeFs.promises.rm;
-    spyOn(nodeFs.promises, "rm").mockImplementation(async (file, options) => {
+    const remove = fs.rm;
+    const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
       if (String(file).startsWith(`${storage.path}.continuous-`)) {
         committed.resolve();
         await release.promise;
@@ -408,6 +412,7 @@ describe("inactive real cancellation storage", () => {
     const stopping = state.cancel();
     try {
       await committed.promise;
+      expect(removing).toHaveBeenCalled();
       expect(await storage.read()).not.toBeNull();
       // Simulate downgrade's lock-free read after a crash at this publication boundary.
       const rows = (await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8"))
@@ -508,14 +513,18 @@ describe("inactive real cancellation storage", () => {
         expect(initial.version).toBe(1);
         if (kind === "scoped") {
           const other = new CompactionCancellation(
-            new FileCompactionCancellationStorage(foreign, workspaceId)
+            new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
           );
           await other.read();
           await other.narrow(initial.nonce, summary);
         }
         settled.resolve(kind !== "failed");
         expect(await stopping).toBe("applied");
-        const persisted = await new FileCompactionCancellationStorage(foreign, workspaceId).read();
+        const persisted = await new FileCompactionCancellationStorage(
+          foreign,
+          workspaceId,
+          foreign.files
+        ).read();
         expect(persisted?.nonce).toBe(initial.nonce);
         expect(persisted?.version).toBe(kind === "joined" ? 2 : 1);
         if (kind === "joined") {
@@ -524,7 +533,7 @@ describe("inactive real cancellation storage", () => {
           );
           expect(
             await new CompactionCancellation(
-              new FileCompactionCancellationStorage(foreign, workspaceId)
+              new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
             ).read()
           ).toEqual(persisted);
         } else expect(persisted?.settledGeneration).toBeUndefined();
@@ -655,7 +664,7 @@ describe("inactive real cancellation storage", () => {
         // These real writes acquire the same locks: waiting for physical settlement must release them.
         if (successorKind === "nonce") {
           await new CompactionCancellation(
-            new FileCompactionCancellationStorage(foreign, workspaceId)
+            new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
           ).cancel({ retainUntilReplacement: true });
         } else {
           await foreign.withCompactionStorageLock(workspaceId, async (_dir, checkLock) => {
@@ -754,7 +763,7 @@ describe("inactive real cancellation storage", () => {
     expect(await storage.read()).toBeNull();
     failure.mockRestore();
     const successor = new CompactionCancellation(
-      new FileCompactionCancellationStorage(foreign, workspaceId)
+      new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
     );
     expect(await successor.cancel({ retainUntilReplacement: true })).toBe("applied");
     const successorBytes = await fs.readFile(storage.path);
@@ -810,13 +819,15 @@ describe("inactive real cancellation storage", () => {
         cleanup.resolve();
         await release.promise;
       };
-      if (phase === "publish" || phase === "narrow") {
-        const remove = nodeFs.promises.rm;
-        spyOn(nodeFs.promises, "rm").mockImplementation(async (file, options) => {
-          if (String(file).startsWith(`${storage.path}.continuous-`)) await pauseCleanup();
-          await remove(file, options);
-        });
-      } else {
+      const remove = fs.rm;
+      const removing =
+        phase === "publish" || phase === "narrow"
+          ? spyOn(fs, "rm").mockImplementation(async (file, options) => {
+              if (String(file).startsWith(`${storage.path}.continuous-`)) await pauseCleanup();
+              await remove(file, options);
+            })
+          : undefined;
+      if (removing === undefined) {
         const unlink = fs.unlink;
         spyOn(fs, "unlink").mockImplementation(async (file) => {
           if (file === lockPath) await pauseCleanup();
@@ -826,6 +837,7 @@ describe("inactive real cancellation storage", () => {
       const writing = storage.mutate(mutation, () => true, mutationCommitted);
       try {
         await cleanup.promise;
+        if (removing) expect(removing).toHaveBeenCalled();
         expect(mutationCommitted).toHaveBeenCalledTimes(1);
         assert.deepEqual(mutationCommitted.mock.calls[0]?.[0], expected);
         expect(await storage.read()).toEqual(expected);
@@ -910,20 +922,18 @@ describe("inactive real cancellation storage", () => {
         nodeFs.writeFileSync(generationPath, "foreign-generation");
       };
       if (phase === "retirement") {
-        const open = nodeFs.promises.open;
-        spyOn(nodeFs.promises, "open").mockImplementation(
-          async (...args: Parameters<typeof open>) => {
-            const handle = await open(...args);
-            if (args[0] === storage.path) {
-              const close = handle.close.bind(handle);
-              spyOn(handle, "close").mockImplementation(async () => {
-                await close();
-                if (!displaced) displace();
-              });
-            }
-            return handle;
+        const open = fs.open;
+        spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+          const handle = await open(...args);
+          if (args[0] === storage.path) {
+            const close = handle.close.bind(handle);
+            spyOn(handle, "close").mockImplementation(async () => {
+              await close();
+              if (!displaced) displace();
+            });
           }
-        );
+          return handle;
+        });
       } else {
         const target = phase === "generation" ? generationPath : storage.path;
         afterCompactionStaging(target, () => {
@@ -1130,40 +1140,38 @@ describe("inactive real cancellation storage", () => {
       let totalRead = 0;
       let largestBuffer = 0;
       let closed = false;
-      const open = nodeFs.promises.open;
-      spyOn(nodeFs.promises, "open").mockImplementation(
-        async (...args: Parameters<typeof open>) => {
-          const handle = await open(...args);
-          if (args[0] === storage.path) {
-            const close = handle.close.bind(handle);
-            spyOn(handle, "close").mockImplementation(async () => {
-              await close();
-              closed = true;
-            });
-            const read = handle.read.bind(handle);
-            spyOn(handle, "read").mockImplementation((async (
-              buffer: Buffer,
-              offset: number,
-              length: number,
-              position: number
-            ) => {
-              reads++;
-              largestBuffer = Math.max(largestBuffer, buffer.byteLength);
-              if (kind === "read error") throw new Error("descriptor read failed");
-              // Exercise legal short reads; a single read must not mistake them for EOF.
-              const result = await read(
-                buffer,
-                offset,
-                Math.min(length, SESSION_HISTORY_MAX_LINE_BYTES / 16),
-                position
-              );
-              totalRead += result.bytesRead;
-              return result;
-            }) as typeof handle.read);
-          }
-          return handle;
+      const open = fs.open;
+      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args);
+        if (args[0] === storage.path) {
+          const close = handle.close.bind(handle);
+          spyOn(handle, "close").mockImplementation(async () => {
+            await close();
+            closed = true;
+          });
+          const read = handle.read.bind(handle);
+          spyOn(handle, "read").mockImplementation((async (
+            buffer: Buffer,
+            offset: number,
+            length: number,
+            position: number
+          ) => {
+            reads++;
+            largestBuffer = Math.max(largestBuffer, buffer.byteLength);
+            if (kind === "read error") throw new Error("descriptor read failed");
+            // Exercise legal short reads; a single read must not mistake them for EOF.
+            const result = await read(
+              buffer,
+              offset,
+              Math.min(length, SESSION_HISTORY_MAX_LINE_BYTES / 16),
+              position
+            );
+            totalRead += result.bytesRead;
+            return result;
+          }) as typeof handle.read);
         }
-      );
+        return handle;
+      });
       if (kind === "limit") expect(await storage.read()).toEqual(record("bounded"));
       else
         await assert.rejects(
@@ -1186,7 +1194,7 @@ describe("inactive real cancellation storage", () => {
     expect(await storage.read()).toBeNull();
     await state.cancel();
     const first = (await state.read())!;
-    const other = new FileCompactionCancellationStorage(foreign, workspaceId);
+    const other = new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files);
     expect(await other.read()).toEqual(first);
     const loaded = (await other.read())!;
     loaded.nonce = "changed locally";
@@ -1264,7 +1272,7 @@ describe("inactive real cancellation storage", () => {
     await state.cancel();
     const old = (await state.read())!;
     const successor = new CompactionCancellation(
-      new FileCompactionCancellationStorage(foreign, workspaceId)
+      new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
     );
     await successor.cancel({ retainUntilReplacement: true });
     const expected = await successor.read();
@@ -1406,8 +1414,11 @@ describe("inactive real cancellation storage", () => {
       storage.mutate(mutation, () => true, mutationCommitted),
       /not configured/
     );
-    const refusing = new FileCompactionCancellationStorage(foreign, workspaceId, () =>
-      Promise.resolve(() => Promise.resolve(false))
+    const refusing = new FileCompactionCancellationStorage(
+      foreign,
+      workspaceId,
+      foreign.files,
+      () => Promise.resolve(() => Promise.resolve(false))
     );
     await assert.rejects(
       refusing.mutate(mutation, () => true, mutationCommitted),
@@ -1415,17 +1426,22 @@ describe("inactive real cancellation storage", () => {
     );
     expect(await storage.read()).toEqual(retained);
     let current = true;
-    const verifying = new FileCompactionCancellationStorage(foreign, workspaceId, (witness) => {
-      expect(witness.nonce).toBe(retained.nonce);
-      expect(nodeFs.existsSync(historyWriteLockPath(h.config.rootDir, workspaceId))).toBe(false);
-      return Promise.resolve(async () => {
-        expect(
-          await fs.readFile(historyWriteLockPath(h.config.rootDir, workspaceId), "utf8")
-        ).not.toBe("");
-        current = false;
-        return true;
-      });
-    });
+    const verifying = new FileCompactionCancellationStorage(
+      foreign,
+      workspaceId,
+      foreign.files,
+      (witness) => {
+        expect(witness.nonce).toBe(retained.nonce);
+        expect(nodeFs.existsSync(historyWriteLockPath(h.config.rootDir, workspaceId))).toBe(false);
+        return Promise.resolve(async () => {
+          expect(
+            await fs.readFile(historyWriteLockPath(h.config.rootDir, workspaceId), "utf8")
+          ).not.toBe("");
+          current = false;
+          return true;
+        });
+      }
+    );
     expect(await verifying.mutate(mutation, () => current, mutationCommitted)).toBe("superseded");
     expect(await storage.read()).toEqual(retained);
     // This injected authority exercises the seam only; real accepted-row proof belongs to H2b.
@@ -1541,7 +1557,7 @@ describe("inactive real cancellation storage", () => {
     expect(state.blocksRecovery).toBe(true);
     expect(await storage.read()).toEqual(old);
     const successor = new CompactionCancellation(
-      new FileCompactionCancellationStorage(foreign, workspaceId)
+      new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
     );
     await successor.cancel();
     expect(await state.retry()).toBe("superseded");
@@ -1597,7 +1613,7 @@ describe("inactive real cancellation storage", () => {
       failingRename.mockRestore();
       if (change === "Stop") {
         await new CompactionCancellation(
-          new FileCompactionCancellationStorage(foreign, workspaceId)
+          new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
         ).cancel();
       } else {
         await foreign.getContinuousCompactionJournal(workspaceId).advanceGeneration();
@@ -1872,7 +1888,7 @@ describe("inactive real cancellation storage", () => {
     await fs.writeFile(storage.path, "{bad");
     await assert.rejects(storage.read(), MalformedCompactionCancellationError);
     const successor = new CompactionCancellation(
-      new FileCompactionCancellationStorage(foreign, workspaceId)
+      new FileCompactionCancellationStorage(foreign, workspaceId, foreign.files)
     );
     await successor.cancel({ retainUntilReplacement: true });
     const committed = mock(() => undefined);

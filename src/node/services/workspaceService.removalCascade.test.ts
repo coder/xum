@@ -172,8 +172,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
   // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and
   // has no reader once the row is gone. White-box: the leak is its only observable effect.
   test("removing tasks drops their unpersisted-end marks", async () => {
-    const marks = (a.taskService as unknown as { unpersistedLaunchFailureTaskIds: Set<string> })
-      .unpersistedLaunchFailureTaskIds;
+    const marks = (
+      a.taskService as unknown as { waiters: { unpersistedLaunchFailureTaskIds: Set<string> } }
+    ).waiters.unpersistedLaunchFailureTaskIds;
     marks.add(childId);
     marks.add(grandchildId);
 
@@ -190,8 +191,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     const userStopEpochs = (
       a.taskService as unknown as { workspaceUserStopEpochs: Map<string, number> }
     ).workspaceUserStopEpochs;
-    const stopEpochs = (a.taskService as unknown as { workspaceStopEpochs: Map<string, number> })
-      .workspaceStopEpochs;
+    const stopEpochs = (
+      a.taskService as unknown as { taskStopLatch: { workspaceStopEpochs: Map<string, number> } }
+    ).taskStopLatch.workspaceStopEpochs;
     expect([...userStopEpochs.keys()].sort()).toEqual([...allIds].sort());
     expect([...stopEpochs.keys()].sort()).toEqual([...allIds].sort());
 

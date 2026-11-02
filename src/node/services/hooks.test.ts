@@ -374,7 +374,7 @@ describe("hooks", () => {
         };
         const logError = spyOn(log, "error").mockImplementation(() => undefined);
         try {
-          // Cancelled tool call (user interrupt, memory intuition deadline): skipped hook.
+          // Cancelled tool call (user interrupt): skipped hook.
           expect(await run(runtime, hookPath, context)).toContain("aborted");
           expect(logError).not.toHaveBeenCalled();
 

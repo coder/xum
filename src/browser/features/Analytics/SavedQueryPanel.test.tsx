@@ -196,7 +196,7 @@ describe("SavedQueryPanel", () => {
       expect(onUpdate).toHaveBeenCalledWith({ id: view.query.id, sql: "SELECT 1;" })
     );
     await waitFor(() =>
-      expect(view.queryByRole("textbox", { name: "Saved query SQL" })).toBeNull()
+      expect(view.queryByRole("textbox", { name: "Saved query SQL" }) === null).toBe(true)
     );
   });
 

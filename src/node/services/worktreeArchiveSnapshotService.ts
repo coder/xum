@@ -25,6 +25,7 @@ import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { STAGED_ATTACHMENT_DIRS } from "@/common/constants/stagedAttachments";
 import { stagedAttachmentMirrorMatchesCheckout } from "@/node/utils/attachments/stageWorkspaceAttachment";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_DIR_NAME = "archive-state";
@@ -175,6 +176,8 @@ export class WorktreeArchiveSnapshotService {
     }
 
     const projectRepos = getWorkspaceProjectRepos({
+      // Outside the agent loop: the host's runtimes.
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: args.workspaceId,
       workspaceName,
       workspacePath: workspaceEntry.workspace.path,
@@ -238,6 +241,8 @@ export class WorktreeArchiveSnapshotService {
     }
 
     const projectRepos = getWorkspaceProjectRepos({
+      // Outside the agent loop: the host's runtimes.
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: args.workspaceId,
       workspaceName,
       workspacePath: workspaceEntry.workspace.path,
@@ -327,6 +332,8 @@ export class WorktreeArchiveSnapshotService {
 
     try {
       const projectRepos = getWorkspaceProjectRepos({
+        // Outside the agent loop: the host's runtimes.
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: args.workspaceId,
         workspaceName,
         workspacePath: workspaceEntry.workspace.path,

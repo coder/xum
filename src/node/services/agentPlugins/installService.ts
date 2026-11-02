@@ -17,9 +17,15 @@ import {
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import { getOwn } from "@/common/utils/getOwn";
+import { AgentPluginRuleTypeSchema } from "@/common/orpc/schemas/agentPlugins";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceBuild,
+  AgentPluginMarketplaceListing,
+  AgentPluginNotApplied,
+  AgentPluginRuleType,
+  AgentPluginSourcePreview,
   AgentPluginComponents,
   AgentPluginHooks,
   AgentPluginInterfaceSummary,
@@ -38,6 +44,7 @@ import type {
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import type { Config } from "@/node/config";
 import {
@@ -67,6 +74,7 @@ import {
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -86,17 +94,32 @@ import {
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import {
-  chooseInstallMethod,
+  chooseStagedMethod,
   detectInstallMethods,
+  generatesManifest,
+  isOwnManifestMethod,
   methodLabel,
   installMethodRequest,
-  noInstallMethodMessage,
+  marketplaceManifest,
   readInstalledGeneratedFrom,
-  skillsCliSkillNames,
+  relativeEntryContext,
   writeGeneratedManifest,
   type InstallMethodRequest,
+  type MarketplaceEntryContext,
   type SkillsPackageRoot,
 } from "./installMethods";
+import {
+  MARKETPLACE_RELATIVE_PATHS,
+  MAX_CLAUDE_MARKETPLACE_BYTES,
+  findMarketplaceEntry,
+  marketplaceListing,
+  parseClaudeMarketplace,
+  parseMarketplaces,
+  resolveEntrySource,
+  type ClaudeMarketplace,
+  type MarketplaceEntryRef,
+  type MarketplaceFile,
+} from "./claudeMarketplace";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
@@ -139,7 +162,13 @@ import {
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
-import { hashPluginTree } from "./treeHash";
+import {
+  hashPluginTree,
+  KeptBytesLimitError,
+  listPluginTreeRecords,
+  pluginTreeRecordContent,
+  type PluginTreeRecord,
+} from "./treeHash";
 import {
   buildPluginServerKey,
   computePluginInstanceId,
@@ -147,12 +176,14 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
-import { loadPluginCodexHooks } from "./codexHooks";
+import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   readPluginHookTrust,
+  rebindPluginHookTrust,
   removePluginHookTrust,
   reviewStateOf,
   setPluginHookTrust,
+  type PluginHookTrustRecord,
   type PluginHookTrustState,
 } from "./pluginHookTrust";
 import {
@@ -232,6 +263,9 @@ import {
  */
 const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
 
+/** Marketplace entries whose skills a listing scans at once (each scan reads SKILL.md files). */
+const MARKETPLACE_SCAN_CONCURRENCY = 8;
+
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 
@@ -294,6 +328,22 @@ async function signOutFailure(
   if (settled.kind === "ok") return settled.value.success ? undefined : settled.value.error;
   log.warn("A pending plugin MCP sign-out timed out", { timeoutMs });
   return `The sign-out did not finish within ${Math.round(timeoutMs / 1000)} s.`;
+}
+
+/**
+ * Workspace IDs an install-time MCP override error lists. Large configs fail
+ * the sweep for hundreds of workspaces at once, and a wall of IDs hid the
+ * actual advice; the log keeps one warning per workspace.
+ */
+const MAX_LISTED_FAILED_WORKSPACES = 5;
+
+/** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
+function describeFailedWorkspaces(ids: readonly string[]): string {
+  assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
+  const shown = ids.slice(0, MAX_LISTED_FAILED_WORKSPACES);
+  const rest = ids.length - shown.length;
+  const noun = ids.length === 1 ? "workspace" : "workspaces";
+  return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
 }
 
 /**
@@ -508,30 +558,6 @@ function reviewText(item: ReviewTextSource): string {
 }
 
 /**
- * Characters that render invisibly, reorder text or break lines unseen (#6629): every Unicode
- * default-ignorable code point (zero-width and joiner characters, variation selectors such as
- * U+FE0F, U+034F, tags), the bidi controls, every control character except tab and LF, a CR not
- * followed by LF, and U+2028/U+2029. Several are valid in JavaScript identifiers, so without a
- * mark `safe` and `safe` + U+FE0F look the same. A lone CR, U+2028 and U+2029 end a `//` comment
- * in JavaScript, but the browser draws them as nothing or a space, so code after one would read
- * as comment text in the review while the fingerprint approves it.
- */
-const REVIEW_TEXT_CONTROLS =
-  /[\p{Default_Ignorable_Code_Point}\u061c\u202a-\u202e\u2066-\u2069\u2028\u2029]|\r(?!\n)|(?![\t\n\r])\p{Cc}/gu;
-
-/**
- * Review text as the user reads it: each such character becomes a visible `<U+XXXX>` mark. The
- * mark is not a JavaScript escape, so a literal `\u202e` in the source still reads differently
- * from the character itself.
- */
-function showInvisibleControls(text: string): string {
-  return text.replace(
-    REVIEW_TEXT_CONTROLS,
-    (char) => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}>`
-  );
-}
-
-/**
  * Upper bound on the text of one review. Frontmatter fields have no size limit, so a crafted
  * package could make a review too large to send and render. Over the bound, Xum refuses the review
  * (fails closed) instead of truncating text the user would approve.
@@ -555,11 +581,161 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
       total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
     0
   );
-  if (size > MAX_REVIEW_TEXT_CHARS) {
-    throw new Error(
-      "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
+  if (size > MAX_REVIEW_TEXT_CHARS) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+}
+
+const REVIEW_TOO_LARGE_MESSAGE =
+  "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher.";
+
+/** A file larger than this shows only its row in the file review, like a binary file. */
+const FILE_REVIEW_TEXT_MAX_BYTES = 64 * 1024;
+
+/**
+ * A Cursor command hook can run or source any file of its plugin, so a plugin with one gets a
+ * review of its files (Cursor plugin RFC D1).
+ */
+function runsCursorCommands(hooks: readonly PluginHookDefinition[]): boolean {
+  return hooks.some((hook) => hook.status === "runnable" && hook.handler.type === "cursor-command");
+}
+
+/**
+ * Whether the user trusted a current Cursor hook of the plugin, at any hash, for the installed
+ * commit. Trusting the first one took the full file review (firstTrustFileReview), and every
+ * update this build applied since reviewed its changed files and moved the binding along
+ * (rebindPluginHookTrust). Trust of a hook the plugin no longer has does not count, and neither
+ * does trust bound to another commit (the read drops that binding).
+ */
+function trustsCursorHook(
+  hooks: readonly PluginHookDefinition[],
+  trust: PluginHookTrustRecord
+): boolean {
+  return hooks.some((hook) => {
+    const entry = getOwn(trust, hook.key);
+    return (
+      hook.handler.type === "cursor-command" &&
+      entry?.state === "trusted" &&
+      entry.reviewedSha !== undefined
     );
+  });
+}
+
+/**
+ * The rows as shown, plus each entry's kind, mode and content hash (Codex review): a binary or
+ * large file's row shows no bytes, so the rows alone would not change when such a file does.
+ */
+function fileReviewDigest(
+  changes: readonly AgentPluginCapabilityChange[],
+  records: readonly PluginTreeRecord[]
+): string {
+  // The rows leave directories out, so a directory's mode change must not void the review either.
+  const entries = records
+    .filter((record) => record.kind !== "directory")
+    .map((record) => [record.path, record.kind, record.mode, pluginTreeRecordContent(record)]);
+  return createHash("sha256")
+    .update(JSON.stringify([changes, entries]))
+    .digest("hex");
+}
+
+function fileReviewText(record: PluginTreeRecord | undefined): string | undefined {
+  if (record?.kind === "symlink") return showOneLineControls(record.target);
+  if (record?.kind !== "file" || record.bytes === undefined) return undefined;
+  try {
+    // ignoreBOM keeps a leading BOM in the text, so the review marks it instead of dropping it.
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(record.bytes);
+    return showInvisibleControls(text);
+  } catch {
+    return undefined;
   }
+}
+
+function sameTreeEntry(a: PluginTreeRecord, b: PluginTreeRecord): boolean {
+  return (
+    a.kind === b.kind &&
+    a.mode === b.mode &&
+    pluginTreeRecordContent(a) === pluginTreeRecordContent(b)
+  );
+}
+
+function fileReviewRow(
+  filePath: string,
+  was: PluginTreeRecord | undefined,
+  now: PluginTreeRecord | undefined
+): AgentPluginCapabilityChange {
+  const verb = was === undefined ? "added" : now === undefined ? "removed" : "changed";
+  const before = fileReviewText(was);
+  const after = fileReviewText(now);
+  // A row without the text of a side must say so: an empty row reads as a harmless change.
+  const hidden = textHidden(was, before) || textHidden(now, after);
+  return {
+    summary: `${treeEntryNoun(was, now)} ${showOneLineControls(filePath)} ${verb}${modeNote(was, now)}${hidden ? FILE_REVIEW_HIDDEN_NOTE : ""}`,
+    ...(before !== undefined ? { before } : {}),
+    ...(after !== undefined ? { after } : {}),
+  };
+}
+
+const FILE_REVIEW_HIDDEN_NOTE = " (contents not shown: binary or larger than 64 KiB)";
+
+/**
+ * "file" or "symlink" (Codex review): a symlink's text is its target, so an added symlink must not
+ * read as a file holding that text. A row whose entry changes kind names both.
+ */
+function treeEntryNoun(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined) {
+  const noun = (record: PluginTreeRecord) => (record.kind === "symlink" ? "symlink" : "file");
+  const newest = now ?? was;
+  assert(newest !== undefined, "a review row has a side");
+  if (was === undefined || now === undefined) return noun(newest);
+  return noun(was) === noun(now) ? noun(now) : `${noun(was)} → ${noun(now)}`;
+}
+
+/** A permission change is consent-relevant (sameTreeEntry), and a chmod alone shows no text change. */
+function modeNote(was: PluginTreeRecord | undefined, now: PluginTreeRecord | undefined): string {
+  const bits = (record: PluginTreeRecord) => (record.mode & 0o7777).toString(8);
+  // A symlink's own mode means nothing on most systems: only a file's bits are shown.
+  if (was?.kind !== "file" || now?.kind !== "file" || bits(was) === bits(now)) return "";
+  return ` (mode ${bits(was)} → ${bits(now)})`;
+}
+
+function textHidden(record: PluginTreeRecord | undefined, text: string | undefined): boolean {
+  return record?.kind === "file" && text === undefined;
+}
+
+/**
+ * The file review (D1, D30): one row per file or symlink that differs between two plugin trees.
+ * `before: null` is the empty tree, so every file is an added row. A directory gets no row; the
+ * files under it do.
+ */
+function fileReviewRows(
+  before: readonly PluginTreeRecord[] | null,
+  after: readonly PluginTreeRecord[]
+): AgentPluginCapabilityChange[] {
+  const entries = (records: readonly PluginTreeRecord[]) =>
+    new Map(
+      records.filter((record) => record.kind !== "directory").map((record) => [record.path, record])
+    );
+  const old = entries(before ?? []);
+  const next = entries(after);
+  return [...new Set([...old.keys(), ...next.keys()])].sort().flatMap((filePath) => {
+    const was = old.get(filePath);
+    const now = next.get(filePath);
+    return was !== undefined && now !== undefined && sameTreeEntry(was, now)
+      ? []
+      : [fileReviewRow(filePath, was, now)];
+  });
+}
+
+/** Display form: names come from the plugin's files, so they get the agent names' marks (#6629). */
+function shownNotApplied(plugin: Pick<AgentPluginInfo, "notApplied">): AgentPluginNotApplied[] {
+  return plugin.notApplied.map((item) => ({
+    ...item,
+    name: showInvisibleControls(item.name),
+    reason: showInvisibleControls(item.reason),
+  }));
+}
+
+function notAppliedField(plugin: Pick<AgentPluginInfo, "notApplied">): {
+  notApplied?: AgentPluginNotApplied[];
+} {
+  return plugin.notApplied.length > 0 ? { notApplied: shownNotApplied(plugin) } : {};
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -1085,6 +1261,51 @@ function resolvePreviewSubpath(
   return parsedSubpath ?? explicit;
 }
 
+/**
+ * Ref for preview(): from the `@ref` shorthand or the separate field, refusing two different
+ * ones. An empty field is no ref.
+ */
+function resolvePreviewRef(
+  parsedRef: string | undefined,
+  rawExplicit: string | undefined
+): string | undefined {
+  const explicit = rawExplicit?.trim() ?? "";
+  if (explicit.length > 0 && parsedRef !== undefined && parsedRef !== explicit) {
+    throw new Error(
+      `Conflicting refs: '@${parsedRef}' in the source and '${explicit}' in the ref field.`
+    );
+  }
+  return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
+}
+
+function marketplaceEntryOf(
+  method: AgentPluginInstallMethod | null | undefined
+): MarketplaceEntryRef | undefined {
+  switch (method?.kind) {
+    case "claude-marketplace":
+      return { file: "claude", entry: method.entry };
+    case "cursor-marketplace":
+      return { file: "cursor", entry: method.entry };
+    default:
+      return undefined;
+  }
+}
+
+/** The git source that preview returns and install persists. */
+function resolvedGitSource(
+  url: string,
+  resolved: Pick<ResolvedRemoteRef, "ref" | "refType">,
+  subpath: string | undefined
+): AgentPluginGitSource {
+  return {
+    type: "git",
+    url,
+    ref: resolved.ref,
+    refType: resolved.refType,
+    ...(subpath !== undefined ? { subpath } : {}),
+  };
+}
+
 /** Throws unless `subpath` is absent or already in normalizeAgentPluginSubpath form. */
 function assertNormalizedSubpath(subpath: string | undefined): void {
   if (subpath !== undefined && normalizeAgentPluginSubpath(subpath) !== subpath) {
@@ -1200,12 +1421,36 @@ function displayNameWarnings(
   ];
 }
 
+/**
+ * The rule type of a skill that Xum made from a Cursor rule (cursorRules.ts writes it into the
+ * metadata). Only a rule root gets one, so an ordinary skill with that metadata key gets no rule
+ * label.
+ */
+function ruleTypeField(
+  skillsRoot: PluginSkillsRoot,
+  metadata: Record<string, unknown> | undefined
+): { ruleType?: AgentPluginRuleType } {
+  if (skillsRoot.rule === undefined) return {};
+  const parsed = AgentPluginRuleTypeSchema.safeParse(metadata?.["cursor-rule-type"]);
+  return parsed.success ? { ruleType: parsed.data } : {};
+}
+
 /** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
+/** The `contributes.skills` value of a generated manifest (undefined: the default skills/). */
+function declaredSkills(manifest: Record<string, unknown>): string | string[] | undefined {
+  const skills = isPlainObject(manifest.contributes) ? manifest.contributes.skills : undefined;
+  if (typeof skills === "string") return skills;
+  return Array.isArray(skills)
+    ? skills.filter((item): item is string => typeof item === "string")
+    : undefined;
+}
+
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
-  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // A command or a rule is its file; a single skill folder is the skill itself, and at the plugin root it
   // has no relative path.
   if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
+  if (skillsRoot.rule !== undefined) return path.join(relativeRoot, skillsRoot.rule);
   if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
   return `${relativeRoot}/${name}`;
 }
@@ -1616,6 +1861,19 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
     ...(manifest.repository !== undefined ? { repository: manifest.repository } : {}),
     ...(manifest.license !== undefined ? { license: manifest.license } : {}),
   };
+}
+
+/**
+ * The repository path of a staged plugin root, for manifest errors (discoverAgentPluginAt
+ * `shownRoot`). The staged tree is the "Plugin folder", so errors name e.g.
+ * `.codex-plugin/plugin.json`. A marketplace entry's folder sits below it, so its errors keep
+ * entry-relative paths.
+ */
+function shownStagedRoot(
+  source: Pick<AgentPluginGitSource, "subpath">,
+  marketplace: MarketplaceEntryContext | undefined
+): string | undefined {
+  return marketplace === undefined ? source.subpath : undefined;
 }
 
 export class AgentPluginInstallService {
@@ -2160,6 +2418,40 @@ export class AgentPluginInstallService {
     );
   }
 
+  private async fileReviewRecords(dir: string): Promise<PluginTreeRecord[]> {
+    try {
+      return await listPluginTreeRecords(dir, this.stagingQuota(), {
+        keepBytesUpTo: FILE_REVIEW_TEXT_MAX_BYTES,
+        // A UTF-16 unit takes at least one byte and at most three in UTF-8 (a 4-byte character is
+        // two units), so more kept bytes than this always render past the review's size cap.
+        // The walk then stops before it holds the whole staged-tree quota in memory.
+        maxKeptBytes: 3 * MAX_REVIEW_TEXT_CHARS,
+        skipRootGit: true,
+      });
+    } catch (error) {
+      if (error instanceof KeptBytesLimitError) throw new Error(REVIEW_TOO_LARGE_MESSAGE);
+      throw error;
+    }
+  }
+
+  /**
+   * The file review rows of a staged plugin with a runnable Cursor command hook; none for any
+   * other plugin. D30: an installed tree (or none) without such a hook never had a file review,
+   * so the staged tree is compared with the empty tree and every file is listed.
+   */
+  private async fileReviewChanges(
+    staged: AgentPluginInfo,
+    installed: AgentPluginInfo | null
+  ): Promise<AgentPluginCapabilityChange[]> {
+    if (!runsCursorCommands((await loadPluginHooks(staged)).hooks)) return [];
+    const reviewed =
+      installed !== null && runsCursorCommands((await loadPluginHooks(installed)).hooks);
+    return fileReviewRows(
+      reviewed ? await this.fileReviewRecords(installed.rootPath) : null,
+      await this.fileReviewRecords(staged.rootPath)
+    );
+  }
+
   /**
    * During-clone disk bound for a staging dir: checkout + pack live in it, so
    * allow twice the checkout quota (bytes AND file count — loose objects can
@@ -2303,7 +2595,11 @@ export class AgentPluginInstallService {
    * install fails loudly instead of installing unreviewed content. A
    * `source.subpath` stages only that folder (see extractSubpath).
    */
-  private async cloneExactSha(source: AgentPluginGitSource, sha: string): Promise<string> {
+  private async cloneExactSha(
+    source: AgentPluginGitSource,
+    sha: string,
+    options?: { readMarketplace: MarketplaceFile }
+  ): Promise<{ dir: string; marketplaceJson: string | undefined }> {
     const subpath = source.subpath;
     const dir = await this.createStagingDir();
     try {
@@ -2331,10 +2627,83 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
-      return await this.stagedPluginRoot(dir, subpath, source.url, sha);
+      // Before stagedPluginRoot: a subpath clone keeps only the plugin folder, and the
+      // marketplace file sits at the repository root.
+      const marketplaceJson =
+        options !== undefined
+          ? await this.readMarketplaceAtCommit(dir, sha, options.readMarketplace)
+          : undefined;
+      return { dir: await this.stagedPluginRoot(dir, subpath, source.url, sha), marketplaceJson };
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
+    }
+  }
+
+  /**
+   * The marketplace file `file` at `sha` in a staging clone (which may be partial and sparse),
+   * or undefined when the commit has none. Only a regular file counts: a symlink blob would name
+   * another path. The blob size is checked before its content is read, and a lazy fetch of the
+   * blob runs under the clone's disk quota.
+   */
+  private async readMarketplaceAtCommit(
+    dir: string,
+    sha: string,
+    file: MarketplaceFile
+  ): Promise<string | undefined> {
+    const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
+    const listing = await runGit([
+      "--literal-pathspecs",
+      "-C",
+      dir,
+      "ls-tree",
+      "-z",
+      sha,
+      "--",
+      relativePath,
+    ]);
+    const record = listing
+      .split("\0")
+      .map((line) => /^(\d{6}) blob ([0-9a-f]+)\t([\s\S]*)$/.exec(line))
+      .find((match) => match?.[3] === relativePath);
+    if (record == null) return undefined;
+    const [, mode, oid] = record;
+    if (mode !== "100644" && mode !== "100755") {
+      throw new Error(`${relativePath} is not a regular file.`);
+    }
+    const diskQuota = this.cloneDiskQuota(dir);
+    const size = Number((await runGit(["-C", dir, "cat-file", "-s", oid], { diskQuota })).trim());
+    if (!Number.isSafeInteger(size) || size > MAX_CLAUDE_MARKETPLACE_BYTES) {
+      throw new Error(
+        `${relativePath} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / (1024 * 1024)} MiB.`
+      );
+    }
+    return runGit(["-C", dir, "cat-file", "blob", oid], { diskQuota });
+  }
+
+  /**
+   * cloneExactSha for an install or update, plus the context of marketplace entry `ref` (a
+   * relative entry whose plugin.json Xum writes), read from its marketplace file at `sha`.
+   */
+  private async cloneWithEntry(
+    source: AgentPluginGitSource,
+    sha: string,
+    ref: MarketplaceEntryRef | undefined
+  ): Promise<{ stagedDir: string; marketplace: MarketplaceEntryContext | undefined }> {
+    if (ref === undefined) {
+      return { stagedDir: (await this.cloneExactSha(source, sha)).dir, marketplace: undefined };
+    }
+    const { dir, marketplaceJson } = await this.cloneExactSha(source, sha, {
+      readMarketplace: ref.file,
+    });
+    try {
+      return {
+        stagedDir: dir,
+        marketplace: relativeEntryContext(marketplaceJson, ref.entry, source, ref.file),
+      };
+    } catch (error) {
+      await this.removeDir(dir);
+      throw error;
     }
   }
 
@@ -2530,14 +2899,15 @@ export class AgentPluginInstallService {
 
   /**
    * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
-   * install, then run the exact runtime validation (manifest + component discovery) against the
-   * staged clone. Throws user-facing errors for non-plugins, including a clear message for a
-   * Claude Code marketplace repo (not installable yet).
+   * or marketplace-entry install, then run the exact runtime validation (manifest + component
+   * discovery) against the staged clone. Throws user-facing errors for non-plugins. `marketplace`:
+   * the staged tree is the folder of that marketplace entry (entryInstallMethods).
    */
   private async validateStagedClone(
     stagedDir: string,
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
-    request: InstallMethodRequest
+    request: InstallMethodRequest,
+    marketplace?: MarketplaceEntryContext
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
@@ -2548,22 +2918,8 @@ export class AgentPluginInstallService {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
     // consent receipt hashes.
     const detected = await detectInstallMethods(stagedDir);
-    const method = chooseInstallMethod(detected.methods, request);
-    if (method === undefined) {
-      if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
-        throw new Error(
-          "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
-        );
-      }
-      if (request.mode === "update" && detected.methods.length > 0) {
-        // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn
-        // it into a generated skills install on update (installMethods.ts, InstallMethodRequest).
-        throw new Error(
-          `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
-        );
-      }
-      throw new Error(noInstallMethodMessage(source.subpath));
-    }
+    const choice = await chooseStagedMethod(stagedDir, detected, request, source, marketplace);
+    const method = choice.method;
 
     // The crash-recovery marker name is RESERVED: install/update write a
     // nonce file at this path just before their promote rename, which would
@@ -2589,11 +2945,13 @@ export class AgentPluginInstallService {
     }
 
     // After the marker check, so a refused tree never gets a generated file.
-    const generatedWarnings =
-      method.kind === "skills" ? await writeGeneratedManifest(stagedDir, method, source) : [];
+    const generatedWarnings = generatesManifest(method)
+      ? await writeGeneratedManifest(stagedDir, method, source, marketplace)
+      : [];
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
+      shownRoot: shownStagedRoot(source, marketplace),
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
@@ -2601,11 +2959,13 @@ export class AgentPluginInstallService {
         reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
       // A preview without a method must still reach the "Install as" choice: when the first
       // method's manifest is invalid (a broken .claude-plugin/plugin.json next to valid skill
-      // folders), preview the next method and name the problem. No file was written: only
-      // `skills` generates one, and it is always the last method.
-      const next = detected.methods[detected.methods.indexOf(method) + 1];
+      // folders), preview the next method and name the problem. No file was written: of a
+      // repository's methods only `skills` generates one, and it is always the last method.
+      // A marketplace entry has its own methods (entryInstallMethods) and gets no fallback.
+      const next =
+        marketplace === undefined ? choice.methods[choice.methods.indexOf(method) + 1] : undefined;
       if (request.mode === "first" && next !== undefined) {
-        assert(method.kind !== "skills", "validateStagedClone: skills must be the last method");
+        assert(!generatesManifest(method), "validateStagedClone: a generated manifest is last");
         const fallback = await this.validateStagedClone(stagedDir, source, {
           mode: "exact",
           method: next,
@@ -2617,16 +2977,15 @@ export class AgentPluginInstallService {
       }
       throw new Error(problem);
     }
-    const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
     return {
       plugin,
-      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message), ...cli.warnings],
+      warnings: [...choice.warnings, ...generatedWarnings, ...diagnostics.map((d) => d.message)],
       method,
-      methods: detected.methods,
+      methods: choice.methods,
       skillsCliSkills: await this.acceptedSkillsCliNames(
         stagedDir,
         detected.skillsRoots,
-        cli.names
+        choice.skillsCliSkills
       ),
     };
   }
@@ -2951,6 +3310,7 @@ export class AgentPluginInstallService {
     changes.push(
       ...wholeComponentChanges("slashCommands", staged.slashCommands, current?.slashCommands)
     );
+    changes.push(...(await this.fileReviewChanges(stagedPlugin, currentPlugin)));
     assertReviewFits(changes);
     return changes;
   }
@@ -3006,12 +3366,16 @@ export class AgentPluginInstallService {
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
     for (const skillsRoot of plugin.skillsDirs ?? []) {
-      for (const skill of await this.collectSkills(plugin.rootPath, skillsRoot, warnings)) {
+      for (const { skill, label } of await this.collectSkills(
+        plugin.rootPath,
+        skillsRoot,
+        warnings
+      )) {
         // Runtime discovery keeps the first skill of a name (roots in declared order), so the
         // preview must not promise the later one (#6121).
         if (skills.some((earlier) => earlier.name === skill.name)) {
           warnings.push(
-            `${skillReviewLabel(plugin.rootPath, skillsRoot, skill.name)}: an earlier skills root has a skill with this name; it will not load`
+            `${label}: an earlier skills root has a skill with this name; it will not load`
           );
           continue;
         }
@@ -3021,19 +3385,25 @@ export class AgentPluginInstallService {
     return skills;
   }
 
-  /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
+  /**
+   * One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path;
+   * `label` names each skill's real folder (a snake_case folder has a kebab-case skill name).
+   */
   private async collectSkills(
     pluginRoot: string,
     skillsRoot: PluginSkillsRoot,
     warnings: string[]
-  ): Promise<CollectedPluginSkill[]> {
-    const skills: CollectedPluginSkill[] = [];
+  ): Promise<Array<{ skill: CollectedPluginSkill; label: string }>> {
+    const skills: Array<{ skill: CollectedPluginSkill; label: string }> = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
-    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
-      skillsRoot
-    )) {
-      const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
+    for (const {
+      name: skillName,
+      folder,
+      dir: skillDir,
+      file: skillPath,
+    } of await listPluginSkillFolders(skillsRoot)) {
+      const label = skillReviewLabel(pluginRoot, skillsRoot, folder);
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -3067,8 +3437,8 @@ export class AgentPluginInstallService {
       // preview (and the update capability surface built from it) would
       // promise a skill that disappears after installation — or classify a
       // never-loading skill as a capability addition.
-      const dirNameParsed = SkillNameSchema.safeParse(dirName);
-      if (!dirNameParsed.success) {
+      const skillNameParsed = SkillNameSchema.safeParse(skillName);
+      if (!skillNameParsed.success) {
         warnings.push(`${label}: invalid skill directory name; it will not load`);
         continue;
       }
@@ -3082,44 +3452,48 @@ export class AgentPluginInstallService {
         continue;
       }
       try {
-        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // A Claude command or a Cursor rule becomes SKILL.md text first, so its review, fingerprint and approved
         // copy are a skill's (the copy is that text, which the runtime check parses as is).
         const content = pluginSkillMarkdown(
-          dirName,
+          skillName,
           await fsPromises.readFile(containedSkillPath, "utf8"),
-          skillsRoot.command
+          skillsRoot
         );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,
-          directoryName: dirNameParsed.data,
+          directoryName: skillNameParsed.data,
           // Mirror runtime discovery: a display name loads under the dir name.
           allowDisplayName: true,
         });
-        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
+        warnings.push(...displayNameWarnings(label, skillName, parsed.displayName));
         const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
-          name: parsed.frontmatter.name,
-          ...skillConsentFields({
-            relativeDir,
-            frontmatter: skillConsentFrontmatter(parsed),
-            body: parsed.body,
-          }),
-          approvedCopy: { relativeDir, content },
-          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
-          ...directivesField(skillReviewDirectives(parsed.body)),
-          ...(parsed.frontmatter.description !== undefined
-            ? { description: parsed.frontmatter.description }
-            : {}),
-          // Model-visible beyond name/description: whenToUse interpolates
-          // into the agent_skill_read tool description, and advertise
-          // controls whether the skill appears there at all. Both feed the
-          // update capability fingerprint (capabilitySurface), resolved with
-          // the same helpers the runtime uses.
-          whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
-          advertise: resolveSkillAdvertise(parsed.frontmatter),
-          // paths moves the skill from the static index to file-tool pointers.
-          paths: resolveSkillPaths(parsed.frontmatter),
+          label,
+          skill: {
+            name: parsed.frontmatter.name,
+            ...skillConsentFields({
+              relativeDir,
+              frontmatter: skillConsentFrontmatter(parsed),
+              body: parsed.body,
+            }),
+            approvedCopy: { relativeDir, content },
+            // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+            ...directivesField(skillReviewDirectives(parsed.body)),
+            ...(parsed.frontmatter.description !== undefined
+              ? { description: parsed.frontmatter.description }
+              : {}),
+            ...ruleTypeField(skillsRoot, parsed.frontmatter.metadata),
+            // Model-visible beyond name/description: whenToUse interpolates
+            // into the agent_skill_read tool description, and advertise
+            // controls whether the skill appears there at all. Both feed the
+            // update capability fingerprint (capabilitySurface), resolved with
+            // the same helpers the runtime uses.
+            whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+            advertise: resolveSkillAdvertise(parsed.frontmatter),
+            // paths moves the skill from the static index to file-tool pointers.
+            paths: resolveSkillPaths(parsed.frontmatter),
+          },
         });
       } catch (error) {
         warnings.push(`${label}: ${getErrorMessage(error)}`);
@@ -3240,8 +3614,8 @@ export class AgentPluginInstallService {
     }
   }
 
-  previewResult(args: Parameters<AgentPluginInstallService["preview"]>[0]) {
-    return this.captureResult(() => this.preview(args));
+  previewResult(args: Parameters<AgentPluginInstallService["previewSource"]>[0]) {
+    return this.captureResult(() => this.previewSource(args));
   }
 
   installResult(args: Parameters<AgentPluginInstallService["install"]>[0]) {
@@ -3301,117 +3675,346 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.confirmComponentReview(args));
   }
 
-  async preview(args: {
+  /** The plugin preview of a source; a marketplace repository is refused (see previewSource). */
+  async preview(
+    args: Parameters<AgentPluginInstallService["previewSource"]>[0]
+  ): Promise<AgentPluginInstallPreview> {
+    const result = await this.previewSource(args);
+    if (result.kind === "marketplace") {
+      throw new Error(
+        `This repository is the plugin marketplace '${result.marketplace.name}'. Preview one of its plugins.`
+      );
+    }
+    return result.preview;
+  }
+
+  /**
+   * Preview a source: a plugin to review, or the entries of a marketplace. A root clone without
+   * a plugin manifest but with `.cursor-plugin/marketplace.json` or
+   * `.claude-plugin/marketplace.json` lists the marketplace, unless a method was asked for
+   * (Skills installs the whole repository). Xum never looks for a marketplace under a subpath.
+   * With a `claude-marketplace` or `cursor-marketplace` method, the preview resolves that
+   * entry's source and previews its plugin.
+   */
+  async previewSource(args: {
     input: string;
     ref?: string | undefined;
     subpath?: string | undefined;
     /** Absent: the first method that fits. */
     method?: AgentPluginInstallMethod | null | undefined;
-  }): Promise<AgentPluginInstallPreview> {
+  }): Promise<AgentPluginSourcePreview> {
     const parsed = parseAgentPluginSourceInput(args.input);
-    const explicitRef = args.ref?.trim() ?? "";
-    if (explicitRef.length > 0 && parsed.ref !== undefined && parsed.ref !== explicitRef) {
-      throw new Error(
-        `Conflicting refs: '@${parsed.ref}' in the source and '${explicitRef}' in the ref field.`
-      );
-    }
-    const ref = parsed.ref ?? (explicitRef.length > 0 ? explicitRef : undefined);
+    const ref = resolvePreviewRef(parsed.ref, args.ref);
     const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
+    const entryRef = marketplaceEntryOf(args.method);
+    if (entryRef !== undefined && subpath !== undefined) {
+      throw new Error("A marketplace entry is picked at the repository root. Remove the folder.");
+    }
 
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
-    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
+    const staged = await this.cloneResolved(parsed.url, resolved, subpath);
+    const source = resolvedGitSource(parsed.url, resolved, subpath);
+    let stagedDir = staged.dir;
     try {
-      const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
-        stagedDir,
-        { url: parsed.url, subpath },
-        installMethodRequest(args.method)
-      );
-      const targetPath = this.targetPathFor(plugin.name);
-      // A name collision blocks only the managed install of this method: the preview still lists
-      // the other methods and the Skills CLI choice, which creates no managed plugin.
-      const installBlockedReason = await this.collisionReason(plugin.name);
-
-      const skills = await this.collectSkillsFromRoots(plugin, warnings);
-      assertDirectivesFit(skills);
-      const { previews: mcpServers, fingerprints: mcpFingerprints } = await this.collectMcpServers(
-        plugin,
-        targetPath,
-        this.instanceIdFor(plugin.name),
-        warnings
-      );
-      const hook = this.collectHook(plugin);
-      const codexHooks = await loadPluginCodexHooks(plugin);
-      warnings.push(...codexHooks.warnings);
-      const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-      // Display only: the names a user reads before Install show invisible controls (#6629).
-      const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
-        showInvisibleControls
-      );
-      const workflowScripts = await this.collectWorkflowScripts(plugin, warnings);
-      const slashSurface = [...slashCommandSurface(plugin)];
-      const reviewedComponents = reviewedComponentRows([
-        ["workflows", workflowScripts.map((w) => [w.file, w])],
-        ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
-        ["slashCommands", slashSurface],
-      ]);
-      // Built from the rows above, never a second read, so it covers exactly what was shown.
-      const consentDigest = componentConsentDigest(
-        inventoryFingerprints({
-          skills,
-          mcpServers: mcpFingerprints,
-          workflows: workflowScripts,
-          agents: agentFiles,
-          slashCommands: slashSurface,
-        }),
-        hook
-      );
-      const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
-        name: command.name,
-        ...(command.description !== undefined ? { description: command.description } : {}),
-      }));
-
-      if (resolved.refType === "tag" && sha !== resolved.sha) {
-        warnings.push(
-          `Tag '${resolved.ref}' moved between resolution and clone — installing ${sha.slice(0, 12)}.`
-        );
+      if (entryRef !== undefined) {
+        const entry = await this.stageMarketplaceEntry(staged, source, entryRef);
+        stagedDir = entry.staged.dir;
+        return {
+          kind: "plugin",
+          preview: await this.previewStaged({ ...entry, request: { mode: "first" } }),
+        };
       }
-
-      const source: AgentPluginGitSource = {
-        type: "git",
-        url: parsed.url,
-        ref: resolved.ref,
-        refType: resolved.refType,
-        ...(subpath !== undefined ? { subpath } : {}),
-      };
+      const listing = await this.marketplaceListingAt(staged, source, args.method);
+      if (listing !== undefined) return { kind: "marketplace", marketplace: listing };
       return {
-        source,
-        method,
-        methods,
-        skillsCliSkills,
-        installBlockedReason,
-        lockedSha: sha,
-        manifest: {
-          ...manifestSummary(plugin.manifest),
-          ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
-        },
-        // Fingerprints stay in the backend: the preview shows what the components do.
-        skills: skills.map((skill) => omitConsentFingerprint(skill)),
-        mcpServers,
-        ...(hook !== undefined ? { hook } : {}),
-        codexHooks: codexHooks.hooks,
-        agents,
-        workflows,
-        slashCommands,
-        reviewedComponents,
-        warnings,
-        targetPath: shortenHome(targetPath),
-        consentDigest,
+        kind: "plugin",
+        preview: await this.previewStaged({
+          staged,
+          source,
+          resolved,
+          request: installMethodRequest(args.method),
+        }),
       };
     } finally {
       await this.removeDir(stagedDir);
     }
+  }
+
+  /**
+   * The listing when a root clone has a marketplace file and no plugin manifest. Xum looks only
+   * at the root, and only when no method was asked for (Skills installs the whole repository).
+   * With both marketplace files, the rows are their merged entries (mergeMarketplaces).
+   */
+  private async marketplaceListingAt(
+    staged: { dir: string; sha: string },
+    source: AgentPluginGitSource,
+    method: AgentPluginInstallMethod | null | undefined
+  ): Promise<AgentPluginMarketplaceListing | undefined> {
+    if (method != null || source.subpath !== undefined) return undefined;
+    // A read error waits for the manifest guard: a root plugin still previews beside a marketplace
+    // file that is not a regular file or is too large.
+    const read = (file: MarketplaceFile) =>
+      this.readMarketplaceAtCommit(staged.dir, staged.sha, file).catch((error: unknown) =>
+        error instanceof Error ? error : new Error(getErrorMessage(error))
+      );
+    const contents = { cursor: await read("cursor"), claude: await read("claude") };
+    if (contents.cursor === undefined && contents.claude === undefined) return undefined;
+    const { methods } = await detectInstallMethods(staged.dir);
+    if (methods.some(isOwnManifestMethod)) return undefined;
+    const marketplaces = parseMarketplaces(contents);
+    const listing = marketplaceListing({ marketplaces, source, lockedSha: staged.sha, methods });
+    // A catalog can list hundreds of entries that share one folder: scan at most
+    // MARKETPLACE_SCAN_CONCURRENCY at once, and each distinct folder + skills list once.
+    const semaphore = new AsyncSemaphore(MARKETPLACE_SCAN_CONCURRENCY);
+    const scans = new Map<string, Promise<Set<string>>>();
+    const entries = await Promise.all(
+      listing.entries.map(async (row) => ({
+        ...row,
+        builds: await Promise.all(
+          row.builds.map(async (build) => {
+            const marketplace = marketplaces.files[build.file];
+            assert(marketplace !== null, "marketplaceListingAt: a build's file parsed");
+            const slot = await semaphore.acquire();
+            try {
+              return await this.withAcceptedSkillCount(
+                staged.dir,
+                marketplace,
+                source,
+                row.name,
+                build,
+                scans
+              );
+            } finally {
+              slot.release();
+            }
+          })
+        ),
+      }))
+    );
+    return { ...listing, entries };
+  }
+
+  /**
+   * A relative build's skill count: the skills its preview accepts (collectSkills), not the
+   * paths its entry lists. An entry in another repository keeps the count of paths: Xum has not
+   * cloned it. Each build reads its own file's entry.
+   */
+  private async withAcceptedSkillCount(
+    stagedDir: string,
+    marketplace: ClaudeMarketplace,
+    source: AgentPluginGitSource,
+    /** The entry name in the build's file (the row name). */
+    name: string,
+    build: AgentPluginMarketplaceBuild,
+    /** Scans of this listing by folder, skills list and plugin name. */
+    scans: Map<string, Promise<Set<string>>>
+  ): Promise<AgentPluginMarketplaceBuild> {
+    if (build.skillCount === undefined || !build.installable || build.sourceKind !== "relative") {
+      return build;
+    }
+    const entry = findMarketplaceEntry(marketplace, name);
+    const resolved = resolveEntrySource(marketplace, source.url, entry);
+    assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
+    const folder = path.join(stagedDir, resolved.subpath ?? "");
+    let entryDir: string;
+    try {
+      entryDir = await ensurePluginPathContained(stagedDir, folder);
+    } catch (error) {
+      // A missing or escaping folder would fail the entry's preview, so the listing does not
+      // offer it. The reason names the folder, not the staging path.
+      const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
+      return {
+        ...build,
+        installable: false,
+        reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
+      };
+    }
+    let manifest: Record<string, unknown>;
+    try {
+      ({ manifest } = marketplaceManifest({
+        file: build.file,
+        entry,
+        relative: true,
+        rootSource: resolved.subpath === undefined,
+      }));
+    } catch {
+      // No plugin name fits the entry name: its own preview fails with the reason.
+      return build;
+    }
+    const declared = declaredSkills(manifest);
+    const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
+    // The plugin name names only a skill at the plugin root itself (a declared "."), so
+    // entries that share a folder and skills list share one scan otherwise.
+    const namesRootSkill =
+      declared === undefined ||
+      [declared].flat().some((root) => path.posix.normalize(`${root}/`) === "./");
+    const key = JSON.stringify([entryDir, declared, namesRootSkill ? pluginName : null]);
+    let scan = scans.get(key);
+    if (scan === undefined) {
+      scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
+      scans.set(key, scan);
+    }
+    return { ...build, skillCount: (await scan).size };
+  }
+
+  /**
+   * Stage the plugin of marketplace entry `ref` from a root clone of the marketplace. A
+   * root-source entry is that clone. A folder of the same repository is cloned at the same commit
+   * (so the entry and its folder match), and another repository is resolved like a typed source.
+   * Consumes `marketplace` when it returns a different folder.
+   */
+  private async stageMarketplaceEntry(
+    marketplace: { dir: string; sha: string },
+    marketplaceSource: AgentPluginGitSource,
+    ref: MarketplaceEntryRef
+  ): Promise<{
+    staged: { dir: string; sha: string };
+    source: AgentPluginGitSource;
+    resolved: ResolvedRemoteRef;
+    marketplace: MarketplaceEntryContext;
+  }> {
+    const relativePath = MARKETPLACE_RELATIVE_PATHS[ref.file];
+    const content = await this.readMarketplaceAtCommit(marketplace.dir, marketplace.sha, ref.file);
+    if (content === undefined) {
+      throw new Error(`This repository has no ${relativePath}.`);
+    }
+    const parsed = parseClaudeMarketplace(content, ref.file);
+    const entry = findMarketplaceEntry(parsed, ref.entry);
+    const target = resolveEntrySource(parsed, marketplaceSource.url, entry);
+    const marketplaceResolved: ResolvedRemoteRef = {
+      ref: marketplaceSource.ref,
+      refType: marketplaceSource.refType,
+      sha: marketplace.sha,
+    };
+    if (target.kind === "relative" && target.subpath === undefined) {
+      return {
+        staged: marketplace,
+        source: marketplaceSource,
+        resolved: marketplaceResolved,
+        marketplace: { file: ref.file, entry, relative: true, rootSource: true },
+      };
+    }
+    await this.removeDir(marketplace.dir);
+    if (target.kind === "relative") {
+      const source = { ...marketplaceSource, subpath: target.subpath };
+      const { dir } = await this.cloneExactSha(source, marketplace.sha);
+      return {
+        staged: { dir, sha: marketplace.sha },
+        source,
+        resolved: marketplaceResolved,
+        marketplace: { file: ref.file, entry, relative: true, rootSource: false },
+      };
+    }
+    const resolved = await this.resolveRemoteRef(target.url, target.ref);
+    const staged = await this.cloneResolved(target.url, resolved, target.subpath);
+    return {
+      staged,
+      source: resolvedGitSource(target.url, resolved, target.subpath),
+      resolved,
+      marketplace: { file: ref.file, entry, relative: false, rootSource: false },
+    };
+  }
+
+  /** The consent preview of a staged clone (removed by the caller). */
+  private async previewStaged(args: {
+    staged: { dir: string; sha: string };
+    source: AgentPluginGitSource;
+    resolved: ResolvedRemoteRef;
+    request: InstallMethodRequest;
+    marketplace?: MarketplaceEntryContext;
+  }): Promise<AgentPluginInstallPreview> {
+    const { source, resolved } = args;
+    const { dir: stagedDir, sha } = args.staged;
+    const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
+      stagedDir,
+      source,
+      args.request,
+      args.marketplace
+    );
+    const targetPath = this.targetPathFor(plugin.name);
+    // A name collision blocks only the managed install of this method: the preview still lists
+    // the other methods and the Skills CLI choice, which creates no managed plugin.
+    const installBlockedReason = await this.collisionReason(plugin.name);
+
+    const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    assertDirectivesFit(skills);
+    const { previews: mcpServers, fingerprints: mcpFingerprints } = await this.collectMcpServers(
+      plugin,
+      targetPath,
+      this.instanceIdFor(plugin.name),
+      warnings
+    );
+    const hook = this.collectHook(plugin);
+    const codexHooks = await loadPluginHooks(plugin);
+    warnings.push(...codexHooks.warnings);
+    const fileChanges = await this.fileReviewChanges(plugin, null);
+    assertReviewFits(fileChanges);
+    const openaiInterface = await interfaceSummary(plugin, warnings);
+    const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
+    // Display only: the names a user reads before Install show invisible controls (#6629).
+    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
+    const readonlyAgents = agentFiles.flatMap((agent) =>
+      agent.readonly ? [showInvisibleControls(agent.file)] : []
+    );
+    const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+      showInvisibleControls
+    );
+    const workflowScripts = await this.collectWorkflowScripts(plugin, warnings);
+    const slashSurface = [...slashCommandSurface(plugin)];
+    const reviewedComponents = reviewedComponentRows([
+      ["workflows", workflowScripts.map((w) => [w.file, w])],
+      ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
+      ["slashCommands", slashSurface],
+    ]);
+    // Built from the rows above, never a second read, so it covers exactly what was shown.
+    const consentDigest = componentConsentDigest(
+      inventoryFingerprints({
+        skills,
+        mcpServers: mcpFingerprints,
+        workflows: workflowScripts,
+        agents: agentFiles,
+        slashCommands: slashSurface,
+      }),
+      hook
+    );
+    const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
+      name: command.name,
+      ...(command.description !== undefined ? { description: command.description } : {}),
+    }));
+
+    if (resolved.refType === "tag" && sha !== resolved.sha) {
+      warnings.push(
+        `Tag '${resolved.ref}' moved between resolution and clone — installing ${sha.slice(0, 12)}.`
+      );
+    }
+
+    return {
+      source,
+      method,
+      methods,
+      skillsCliSkills,
+      installBlockedReason,
+      lockedSha: sha,
+      manifest: {
+        ...manifestSummary(plugin.manifest),
+        ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
+      },
+      // Fingerprints stay in the backend: the preview shows what the components do.
+      skills: skills.map((skill) => omitConsentFingerprint(skill)),
+      mcpServers,
+      ...(hook !== undefined ? { hook } : {}),
+      codexHooks: codexHooks.hooks,
+      fileChanges,
+      agents,
+      readonlyAgents,
+      workflows,
+      slashCommands,
+      reviewedComponents,
+      warnings,
+      notApplied: shownNotApplied(plugin),
+      targetPath: shortenHome(targetPath),
+      consentDigest,
+    };
   }
 
   private async assertNoCollision(name: string): Promise<void> {
@@ -3462,12 +4065,20 @@ export class AgentPluginInstallService {
     assertNormalizedSubpath(args.source.subpath);
 
     return this.runExclusive(async () => {
-      const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
+      // A marketplace entry without its own plugin.json is read again from the marketplace file
+      // of the consented commit, so install writes the plugin.json that the preview showed. A
+      // `cursor-marketplace` method fails here: its entry installs through its own manifest.
+      const { stagedDir, marketplace } = await this.cloneWithEntry(
+        args.source,
+        args.expectedSha,
+        marketplaceEntryOf(args.method)
+      );
       try {
         const { plugin } = await this.validateStagedClone(
           stagedDir,
           args.source,
-          installMethodRequest(args.method)
+          installMethodRequest(args.method),
+          marketplace
         );
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
@@ -4225,10 +4836,11 @@ export class AgentPluginInstallService {
       warnings
     );
     return {
-      skills: skills.map(({ name, description, directives }) => ({
+      skills: skills.map(({ name, description, directives, ruleType }) => ({
         name,
         ...(description !== undefined ? { description } : {}),
         ...directivesField(directives),
+        ...(ruleType !== undefined ? { ruleType } : {}),
       })),
       mcpServers,
       /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
@@ -4303,17 +4915,42 @@ export class AgentPluginInstallService {
     // The hook load and the trust read are two reads: an update from another process between
     // them could show the old hook as trusted. Bracket both with discovery's journal/epoch gate,
     // as getComponents does (Codex PRRT_kwDOPxxmWM6rb4Tz).
-    const { hooks, warnings, trust } = await this.readInsideDiscoveryGate(
+    const { hooks, warnings, trust, fileReview } = await this.readInsideDiscoveryGate(
       "Plugin files changed during hook review. Refresh the hook review.",
-      async () => ({
-        ...(await this.loadManagedPluginHooks(args.name)),
-        trust: await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name)),
-      })
+      async () => {
+        const { plugin, ...loaded } = await this.loadManagedPluginHooks(args.name);
+        const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+        return {
+          ...loaded,
+          trust,
+          fileReview: await this.firstTrustFileReview(plugin, loaded.hooks, trust),
+        };
+      }
     );
     return {
       hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
       warnings,
+      ...(fileReview !== undefined ? { fileReview } : {}),
     };
+  }
+
+  /**
+   * D30 at the first trust (Codex review of the RFC, P1): a plugin installed by a build without
+   * the file review never showed its files, and later updates show only changed ones. So while
+   * no Cursor hook of the plugin is trusted, trusting one needs the install preview's review of
+   * every file. Xum keeps no record of which install showed the files, so a plugin installed with
+   * the review shows it once more here.
+   */
+  private async firstTrustFileReview(
+    plugin: AgentPluginInfo,
+    hooks: readonly PluginHookDefinition[],
+    trust: PluginHookTrustRecord
+  ): Promise<AgentPluginHooks["fileReview"]> {
+    if (!runsCursorCommands(hooks) || trustsCursorHook(hooks, trust)) return undefined;
+    const records = await this.fileReviewRecords(plugin.rootPath);
+    const changes = fileReviewRows(null, records);
+    assertReviewFits(changes);
+    return { changes, digest: fileReviewDigest(changes, records) };
   }
 
   /**
@@ -4326,11 +4963,13 @@ export class AgentPluginInstallService {
     key: string;
     hash: string;
     state: PluginHookTrustState | null;
+    /** getHooks' `fileReview.digest`, when it showed one. */
+    fileReviewDigest?: string;
   }): Promise<void> {
     // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
     // the trust file between this check and the write, which would recreate it.
     return this.runExclusive(async () => {
-      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const { entry, plugin, hooks } = await this.loadManagedPluginHooks(args.name);
       const hook = hooks.find((candidate) => candidate.key === args.key);
       if (hook?.hash !== args.hash) {
         throw new Error("This hook changed since you reviewed it. Review it again.");
@@ -4338,8 +4977,43 @@ export class AgentPluginInstallService {
       if (args.state === "trusted" && hook.status !== "runnable") {
         throw new Error("Xum does not run this hook, so it cannot be trusted.");
       }
-      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+      const instanceId = this.instanceIdFor(args.name);
+      if (args.state === "trusted") {
+        await this.assertFilesReviewed({ plugin, hooks, hook, instanceId }, args.fileReviewDigest);
+      }
+      await setPluginHookTrust(this.config.rootDir, instanceId, {
+        key: args.key,
+        hash: args.hash,
+        state: args.state,
+        // The files of this commit are the ones reviewed: at install, an update, or just above.
+        ...(hook.handler.type === "cursor-command" ? { reviewedSha: entry.lockedSha } : {}),
+      });
     });
+  }
+
+  /**
+   * Before a Cursor command hook's trust: while getHooks shows the first-trust file review, the
+   * trust needs the digest of that review, read again here, not taken from the caller: the trust
+   * covers the files as they are now.
+   */
+  private async assertFilesReviewed(
+    target: {
+      plugin: AgentPluginInfo;
+      hooks: readonly PluginHookDefinition[];
+      hook: PluginHookDefinition;
+      instanceId: string;
+    },
+    fileReviewDigest: string | undefined
+  ): Promise<void> {
+    if (target.hook.handler.type !== "cursor-command") return;
+    const trust = await readPluginHookTrust(this.config.rootDir, target.instanceId);
+    const review = await this.firstTrustFileReview(target.plugin, target.hooks, trust);
+    if (review === undefined || review.digest === fileReviewDigest) return;
+    throw new Error(
+      fileReviewDigest === undefined
+        ? "Review this plugin's files before you trust its first hook."
+        : "This plugin's files changed since you reviewed them. Review them again."
+    );
   }
 
   /**
@@ -4375,13 +5049,13 @@ export class AgentPluginInstallService {
   }
 
   private async loadManagedPluginHooks(name: string) {
-    await this.findOwnRegistryEntry(name);
+    const entry = await this.findOwnRegistryEntry(name);
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
-    return loadPluginCodexHooks(plugin);
+    return { entry, plugin, ...(await loadPluginHooks(plugin)) };
   }
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
@@ -5010,6 +5684,7 @@ export class AgentPluginInstallService {
           (server) => selection === undefined || selection.mcpServers.includes(server.serverName)
         ).length,
         ...reviewRequiredField(entry, inventory.fingerprints, await countAmbiguousAgents(plugin)),
+        ...notAppliedField(plugin),
       });
     }
 
@@ -5526,6 +6201,8 @@ export class AgentPluginInstallService {
                         : mcpServerManager.forgetWorkspaceOverrides(target)
                     )
                   : mcpServerManager.applyWorkspaceOverrides(target, persisted),
+              hasSnapshot: (workspaceId) =>
+                mcpServerManager.hasWorkspaceOverridesSnapshot(workspaceId),
             }
           : undefined
       );
@@ -5775,7 +6452,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}). The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
@@ -5807,7 +6484,7 @@ export class AgentPluginInstallService {
     }
     if (failed.length > 0) {
       throw new Error(
-        `Stale workspace MCP overrides for '${name}' could not be cleaned up (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
@@ -5995,15 +6672,25 @@ export class AgentPluginInstallService {
   ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
     // A subpath install tracks the same folder at the new commit; a folder
     // that disappeared upstream fails here, before any swap.
-    const stagedDir = await this.cloneExactSha(entry.source, sha);
+    // A plugin.json that Xum generated is regenerated from the new commit, unless the
+    // repository now has its own manifest. The update review covers every component as usual. A
+    // marketplace entry is read again from the marketplace file at the new commit: the staged
+    // folder holds only the entry.
+    const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
+    const { stagedDir, marketplace } = await this.cloneWithEntry(
+      entry.source,
+      sha,
+      generatedFrom?.kind === "claude-marketplace"
+        ? { file: "claude", entry: generatedFrom.entry }
+        : undefined
+    );
     try {
-      // A plugin.json that Xum generated is regenerated from the new commit, unless the
-      // repository now has its own manifest. The update review covers every component as usual.
-      const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source, {
-        mode: "update",
-        generatedFrom,
-      });
+      const { plugin, warnings } = await this.validateStagedClone(
+        stagedDir,
+        entry.source,
+        { mode: "update", generatedFrom },
+        marketplace
+      );
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.
@@ -6239,6 +6926,7 @@ export class AgentPluginInstallService {
           ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
           changes,
           warnings,
+          ...notAppliedField(plugin),
         };
       } finally {
         await this.removeDir(stagedDir);
@@ -6521,6 +7209,18 @@ export class AgentPluginInstallService {
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
+        // This update reviewed every changed file a Cursor hook can run: trust bound to the old
+        // commit moves to the new one. A failure only asks the user to review again.
+        await rebindPluginHookTrust(
+          this.config.rootDir,
+          this.instanceIdFor(entry.name),
+          entry.lockedSha
+        ).catch((error: unknown) => {
+          log.warn("Failed to move hook trust to the updated plugin commit", {
+            name: entry.name,
+            error: getErrorMessage(error),
+          });
+        });
         await this.sweepApprovedCopies(updated);
         log.info(
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`

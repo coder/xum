@@ -1,12 +1,14 @@
 import assert from "@/common/utils/assert";
 import { createHash } from "node:crypto";
-import * as fsPromises from "fs/promises";
+import type * as fsPromises from "fs/promises";
 import type { FilePart } from "@/common/orpc/types";
 import {
   ACP_DELEGATED_TOOLS_METADATA_KEY,
   ACP_PROMPT_ID_METADATA_KEY,
 } from "@/constants/acpMetadata";
 import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isReadableHistoryMessage } from "./historyScanner";
 
@@ -239,11 +241,12 @@ async function scanFile(
   filePath: string,
   ids: readonly string[],
   out: Map<string, SendIdEvidence[]>,
-  maxLineBytes: number
+  maxLineBytes: number,
+  files: SessionFiles
 ): Promise<void> {
   let handle: fsPromises.FileHandle;
   try {
-    handle = await fsPromises.open(filePath, "r");
+    handle = await files.promises.open(filePath, "r");
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) return;
     throw error;
@@ -350,13 +353,14 @@ export function provesAccepted(evidence: readonly SendIdEvidence[] | undefined):
  */
 export async function readSendIdEvidence(
   filePaths: readonly string[],
-  ids: readonly string[]
+  ids: readonly string[],
+  files: SessionFiles
 ): Promise<Map<string, SendIdEvidence[]>> {
   const evidence = new Map<string, SendIdEvidence[]>();
   const unique = [...new Set(ids)];
   if (unique.length === 0) return evidence;
   for (const filePath of filePaths)
-    await scanFile(filePath, unique, evidence, MAX_SEND_ID_LINE_BYTES);
+    await scanFile(filePath, unique, evidence, MAX_SEND_ID_LINE_BYTES, files);
   return evidence;
 }
 
@@ -369,7 +373,8 @@ export async function readSendIdEvidence(
 export async function decideSendIdsFromHistory(
   filePaths: readonly string[],
   identities: readonly SendIdentity[],
-  maxLineBytes = MAX_SEND_ID_LINE_BYTES
+  maxLineBytes = MAX_SEND_ID_LINE_BYTES,
+  files: SessionFiles = nodeSessionFiles
 ): Promise<SendIdDecision> {
   assert(identities.length > 0, "a send id lookup needs at least one id");
   // Every id was minted for this send and never offered before: no row can hold one. Reading a
@@ -383,6 +388,6 @@ export async function decideSendIdsFromHistory(
   }
   const evidence = new Map<string, SendIdEvidence[]>();
   const ids = [...new Set(identities.map((identity) => identity.id))];
-  for (const filePath of filePaths) await scanFile(filePath, ids, evidence, maxLineBytes);
+  for (const filePath of filePaths) await scanFile(filePath, ids, evidence, maxLineBytes, files);
   return decideSendIds(identities, evidence);
 }

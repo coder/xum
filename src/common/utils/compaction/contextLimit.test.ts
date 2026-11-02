@@ -19,7 +19,7 @@ function providersWithOpenAI(overrides: Partial<ProviderConfigInfo>): ProvidersC
 
 describe("getEffectiveContextLimit", () => {
   test.each(["gpt-6.1-sol", "gpt-6-luna"])("reserves output capacity for %s", (model) => {
-    for (const id of [`openai:${model}`, `mux-gateway:openai/${model}`]) {
+    for (const id of [`openai:${model}`, `coder:openai/${model}`]) {
       expect(getEffectiveContextLimit(id, false, null)).toBe(922000);
       expect(getEffectiveContextLimit(id, true, null)).toBe(922000);
       expect(getModelStats(id)?.max_output_tokens).toBe(128000);

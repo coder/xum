@@ -9,6 +9,7 @@
  */
 
 import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import type { AgentAiDefaults } from "./agentAiDefaults";
@@ -33,12 +34,15 @@ export interface AgentAiSettingsLayerValues {
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
   serviceTier?: ServiceTier;
+  /** Only config and definition layers carry it (see resolveAgentCacheTtl). */
+  cacheTtl?: AnthropicCacheTtl;
 }
 
 /** Agent-definition frontmatter `ai` block defaults. */
 export interface AgentAiDefinitionDefaults {
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  cacheTtl?: AnthropicCacheTtl;
 }
 
 /**

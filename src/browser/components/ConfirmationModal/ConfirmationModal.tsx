@@ -108,7 +108,9 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = (props) => {
           </WarningBox>
         )}
 
-        <DialogFooter className="justify-center">
+        {/* Wrap at phone widths: two no-wrap buttons with a long confirm label are wider than the
+            dialog, and the grid column would grow past its edge. */}
+        <DialogFooter className="flex-wrap justify-center">
           <Button variant="secondary" onClick={onCancel} disabled={isConfirming}>
             {props.cancelLabel ?? "Cancel"}
             <span

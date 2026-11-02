@@ -2,6 +2,7 @@ import type { AgentSkillDescriptor, SkillName } from "@/common/types/agentSkill"
 import type { AvailableWorkflow } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import type { ApprovedCopiesReads } from "@/node/services/agentPlugins/approvedCopies";
 import {
@@ -27,6 +28,8 @@ export interface DiscoverWorkflowScriptsInput {
   projectSearchRoot?: string;
   projectTrusted: boolean;
   skillStorageContext?: SkillStorageContext;
+  /** Builds the host-local runtimes of skill discovery. */
+  runtimeFactory: RuntimeFactory;
 }
 
 /**
@@ -67,8 +70,13 @@ export async function discoverWorkflowScripts(
         skillCtx?.runtime ?? input.runtime,
         skillCtx?.workspacePath ?? input.workspacePath,
         skillCtx != null
-          ? { roots: skillCtx.roots, containment: skillCtx.containment }
+          ? {
+              roots: skillCtx.roots,
+              containment: skillCtx.containment,
+              runtimeFactory: input.runtimeFactory,
+            }
           : {
+              runtimeFactory: input.runtimeFactory,
               projectSearchRoot: input.projectSearchRoot,
               // #6426: default roots include project plugin skills only in a trusted project.
               projectPluginsTrusted: input.projectTrusted,
@@ -94,6 +102,7 @@ export async function discoverWorkflowScripts(
         projectTrusted: input.projectTrusted,
         skillStorageContext: input.skillStorageContext,
         approvedCopiesReads,
+        runtimeFactory: input.runtimeFactory,
       });
       const descriptor = buildWorkflowScriptDescriptor(resolved);
       // Pre-run phase preview. An invalid meta.phases declaration must not hide

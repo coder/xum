@@ -118,6 +118,7 @@ describe("pinned workspace files", () => {
     expect(await readPinnedFile(context, { workspaceId: "ws", path: "README.md" })).toEqual({
       success: false,
       error: "Artifact not found: README.md",
+      missing: true,
     });
   });
 

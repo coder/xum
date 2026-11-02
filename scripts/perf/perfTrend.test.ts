@@ -120,7 +120,7 @@ describe("perfTrend CLI", () => {
   const broken = (overrides: Record<string, unknown>) => ({
     out: { total_count: 2, workflow_runs: [apiRun(1), apiRun(2, overrides)] },
   });
-  const failures: Array<[string, string, Replies[string]]> = [
+  const failures: [string, string, Replies[string]][] = [
     ["a runs listing that exits 1", RUNS, { err: HOSTILE, code: 1 }],
     ["a failed current-run fetch", "repos/o/r/actions/runs/100", { err: HOSTILE, code: 1 }],
     ["a failed artifact listing", "repos/o/r/actions/runs/99/artifacts", { err: HOSTILE, code: 1 }],
@@ -157,6 +157,7 @@ describe("perfTrend CLI", () => {
     }
     const markdown = readFileSync(summary, "utf8");
     expect(markdown).toContain("- history fetch failed: `HTTP 401: ::error::bad tickb`\n");
+    // eslint-disable-next-line no-control-regex -- the test asserts that no ESC (ANSI escape) reaches the summary
     expect(markdown).not.toMatch(/[\u001b<>]|second line/);
   });
 

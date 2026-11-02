@@ -8,6 +8,12 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+# A new push to a PR cancels its older Pixel run, as pr.yml does. Main pushes group by SHA, so
+# every main run finishes and sets its baseline.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pixel:
     name: Visual Regression Testing

@@ -13,6 +13,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { changesSince, writeBaseTree } from "../crap/changes";
+import { uvRunArgs } from "../crap/uv";
 
 const ADAPTER = join(import.meta.dir, "dryer_report.py");
 
@@ -84,18 +85,7 @@ export function runCheck(cwd: string, baseRef: string): DryReport {
     );
     const out = execFileSync(
       "uv",
-      [
-        "run",
-        "--quiet",
-        "--script",
-        ADAPTER,
-        "--root",
-        root,
-        "--base-root",
-        tree,
-        "--changes",
-        changes,
-      ],
+      [...uvRunArgs("dry", ADAPTER), "--root", root, "--base-root", tree, "--changes", changes],
       { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }
     );
     return { base, ...(JSON.parse(out) as Omit<DryReport, "base">) };

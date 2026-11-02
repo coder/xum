@@ -24,8 +24,8 @@ interface ExplicitModelChange {
 const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 
 // Coder identities stay raw so switches between coder:<instance>/<model> and the
-// direct <provider>:<model> are tracked as explicit actions; passthrough gateway
-// aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
+// direct <provider>:<model> are tracked as explicit actions; other gateway
+// aliases (openrouter:openai/x) still collapse so persisted rewrites keep matching.
 const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
 const isWorkspaceScope = (scopeId: string): boolean => !isNonWorkspaceScopeId(scopeId);

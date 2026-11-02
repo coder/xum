@@ -1,5 +1,6 @@
 import React from "react";
-import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
+import assert from "@/common/utils/assert";
+import { sumSessionCostUsage, useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
 import {
   sumUsageHistory,
   formatCostWithDollar,
@@ -23,6 +24,34 @@ const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "last-request", label: "Last Request" },
 ];
 
+export function mergeUsageByModel(
+  a: Record<string, ChatUsageDisplay> | undefined,
+  b: Record<string, ChatUsageDisplay> | undefined
+): Map<string, ChatUsageDisplay> {
+  const merged = new Map<string, ChatUsageDisplay>(Object.entries(a ?? {}));
+  for (const [model, entry] of Object.entries(b ?? {})) {
+    const existing = merged.get(model);
+    const sum = existing ? sumUsageHistory([existing, entry]) : entry;
+    assert(sum, "mergeUsageByModel: sum of two usages must exist");
+    merged.set(model, sum);
+  }
+  return merged;
+}
+
+/** The session cost already includes this spend: the note only says how much came from it. */
+export function SubagentCostNote(props: { total?: ChatUsageDisplay; count?: number }) {
+  const cost = props.total ? getTotalCost(props.total) : undefined;
+  if (cost === undefined || cost <= 0 || props.count === undefined) {
+    return null;
+  }
+  return (
+    <div data-testid="cost-subagents" className="text-muted counter-nums -mt-2 mb-1 text-[11px]">
+      Includes {formatCostWithDollar(cost)} from {props.count} open sub-agent
+      {props.count === 1 ? "" : "s"}
+    </div>
+  );
+}
+
 interface CostsTabProps {
   workspaceId: string;
 }
@@ -33,20 +62,15 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const viewMode =
     useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
-  // Session usage for cost calculation
-  // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
-  const sessionUsage = React.useMemo(() => {
-    const parts: ChatUsageDisplay[] = [];
-    if (usage.sessionTotal) parts.push(usage.sessionTotal);
-    if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
-    return parts.length > 0 ? sumUsageHistory(parts) : undefined;
-  }, [usage.sessionTotal, usage.liveCostUsage]);
+  const sessionUsage = sumSessionCostUsage(usage);
+  const sessionCacheHealth = getSessionCacheHealth(usage);
 
   // Per-model session costs. Live streaming usage is not yet folded into the
   // persisted byModel record, so merge it into the active model's bucket to
   // keep rows consistent with the session total above.
   const sessionModelRows = (() => {
-    const merged = new Map<string, ChatUsageDisplay>(Object.entries(usage.sessionByModel ?? {}));
+    // Open sub-agents count toward the session total above, so their models do too.
+    const merged = mergeUsageByModel(usage.sessionByModel, usage.subagentByModel);
     const liveModel = usage.liveCostUsage?.model;
     if (usage.liveCostUsage && liveModel) {
       // Same ledger key as the backend and WorkspaceStore deltas: live Coder
@@ -208,6 +232,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   )}
                 </span>
               </div>
+              {viewMode === "session" && (
+                <SubagentCostNote total={usage.subagentTotal} count={usage.subagentCount} />
+              )}
               <div className="relative w-full">
                 <div className="bg-border-light flex h-1.5 w-full overflow-hidden rounded-[3px]">
                   {cachedCostPercentage > 0 && (
@@ -333,15 +360,13 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
               </tbody>
             </table>
           )}
-          {/* Hidden for sessions that never touched a prompt cache (e.g. most non-Anthropic
-              providers report no cache tokens), where a 0% read share is noise. */}
-          {sessionUsage !== undefined &&
-            sessionUsage.cached.tokens + sessionUsage.cacheCreate.tokens > 0 && (
-              <PromptCacheHealth
-                session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
-                turns={usage.recentTurnCacheHealth ?? []}
-              />
-            )}
+          {sessionCacheHealth && (
+            // The session row counts the whole tree. The turn rows are this workspace's own turns.
+            <PromptCacheHealth
+              session={sessionCacheHealth}
+              turns={usage.recentTurnCacheHealth ?? []}
+            />
+          )}
         </div>
       </div>
     </div>

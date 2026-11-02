@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
+import { cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { APIClient } from "@/browser/contexts/API";
@@ -10,8 +10,9 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import { snapshotStream, type TestApiOverrides } from "@/browser/testUtils";
 import type { DevToolsRunSummary } from "@/common/types/devtools";
 import type { AvailableWorkflow, WorkflowRunRecord } from "@/common/types/workflow";
 import { useDevToolsSubscription } from "./DevToolsTab/useDevToolsSubscription";
@@ -38,16 +39,6 @@ function deferred<T>(): Deferred<T> {
 let devToolsSnapshot: () => Promise<string[]>;
 let workflowSnapshot: () => Promise<string[]>;
 let scriptNames: () => Promise<string[]>;
-
-/** A stream that sends one snapshot, then stays open until the connection drops. */
-function snapshotStream<T>(snapshot: Promise<T>) {
-  return Promise.resolve(
-    (async function* () {
-      yield await snapshot;
-      await new Promise(() => undefined);
-    })()
-  );
-}
 
 function devToolsRun(id: string): DevToolsRunSummary {
   return { id } as unknown as DevToolsRunSummary;
@@ -81,7 +72,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
         ),
       listScripts: () => scriptNames().then((names) => names.map(script)),
     },
-  } as unknown as TestApiOverrides<APIClient>;
+  };
 }
 
 let harness: ConnectionHarness;
@@ -91,20 +82,14 @@ function Wrapper(props: { children: ReactNode }) {
   return <Connection>{props.children}</Connection>;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 function ids(runs: Array<{ id: string }>): string[] {
@@ -204,7 +189,7 @@ describe.each([...GAP_MODES])("the Workflows tab opened while reconnecting (%s)"
   test("shows its loading state, not the empty state, until the first snapshot lands", async () => {
     workflowSnapshot = () => Promise.resolve([]);
     const view = render(<WorkflowsTab workspaceId="ws-1" />, { wrapper: Wrapper });
-    await flush();
+    await settle();
 
     const next = deferred<string[]>();
     workflowSnapshot = () => next.promise;
@@ -256,7 +241,7 @@ describe("live feeds of another workspace", () => {
     workflowSnapshot = () => new Promise(() => undefined);
     devTools.rerender({ workspaceId: "ws-2" });
     workflows.rerender({ workspaceId: "ws-2" });
-    await flush();
+    await settle();
     expect(ids(devTools.result.current.runs)).toEqual([]);
     expect(ids(workflows.result.current.runs)).toEqual([]);
     expect(workflows.result.current.loading).toBe(true);

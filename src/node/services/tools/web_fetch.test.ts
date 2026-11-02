@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
-import { createWebFetchTool } from "./web_fetch";
+import { createWebFetchTool, parseHtmlDocument, stripHeavyTags } from "./web_fetch";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
@@ -13,9 +14,10 @@ const toolCallOptions: ToolExecutionOptions<unknown> = {
   context: undefined,
 };
 
-function createTestWebFetchTool() {
+function createTestWebFetchTool(clock?: HostClock) {
   const tempDir = new TestTempDir("test-web-fetch");
   const config = createTestToolConfig(tempDir.path);
+  config.clock = clock;
   const tool = createWebFetchTool(config);
 
   return {
@@ -80,12 +82,9 @@ function getCurlMaxTime(command: string): number {
 }
 
 afterEach(() => {
-  // Restore all spies (including the Date.now spy in the shared-timeout-budget
-  // test) so they never leak across test files: a frozen Date.now leaks
-  // process-wide and breaks downstream suites in the same `bun test` run, e.g.
-  // WorkflowService's crash-recovery retry test, whose retry delay never
-  // reaches 0 when time stands still. Do not remove this without restoring
-  // each global spy individually.
+  // Restore all spies so they never leak across test files: a global spy leaks
+  // process-wide and breaks downstream suites in the same `bun test` run. Do not
+  // remove this without restoring each global spy individually.
   mock.restore();
 });
 
@@ -387,6 +386,35 @@ describe("web_fetch tool", () => {
     }
   });
 
+  it("keeps content that follows tag-like text inside a quoted attribute", async () => {
+    using testEnv = createTestWebFetchTool();
+    const articleHtml = `<!DOCTYPE html><html><head><title>Quoted Markup</title></head><body>
+      <article>
+        <h1>Quoted markup</h1>
+        <p><img alt="literal <link rel=preload">First paragraph.</p>
+        <p>Second paragraph after the image.</p>
+      </article></body></html>`;
+    mockRuntimeExec(() =>
+      Promise.resolve(
+        createExecResult({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
+        })
+      )
+    );
+
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/quoted" },
+      toolCallOptions
+    )) as WebFetchToolResult;
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.content).toContain("First paragraph.");
+      expect(result.content).toContain("Second paragraph after the image.");
+    }
+  });
+
   it("follows validated public redirects and returns the final content", async () => {
     using testEnv = createTestWebFetchTool();
 
@@ -426,10 +454,9 @@ describe("web_fetch tool", () => {
   });
 
   it("shares one overall timeout budget across redirect validation and fetch hops", async () => {
-    using testEnv = createTestWebFetchTool();
-
     let now = 1_000;
-    spyOn(Date, "now").mockImplementation(() => now);
+    // The tool reads the config's clock, so the test moves time without patching Date.now.
+    using testEnv = createTestWebFetchTool({ ...nodeClock, nowMs: () => now });
 
     const execSpy = mockRuntimeExec((_runtime, command, options) => {
       if (isRuntimeResolveCommand(command) && command.includes("public.example")) {
@@ -531,5 +558,56 @@ describe("web_fetch tool", () => {
       success: false,
       error: "HTTP 403: Cloudflare security challenge (page requires JavaScript)",
     });
+  });
+});
+
+describe("stripHeavyTags", () => {
+  // The regexes that stripHeavyTags replaced: they define the expected matches.
+  const referenceStrip = (html: string) =>
+    html
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+
+  it("removes the same blocks as the reference regexes", () => {
+    const inputs = [
+      "<p>keep</p>",
+      "<style>a{}</style><p>keep</p><SCRIPT type=x>b()</script >",
+      "<style>one</style>mid<style media=print>two</style>end",
+      "<script>if (a < b) {}</script><stylesheet>keep</stylesheet>",
+      "<style>no closer<p>keep</p>",
+      "<style no opener end",
+      "<script>a</script><script>unclosed<style>x</style>tail",
+      "<style><script>x</style></script>after",
+      "</style><style>a</style   ><style>b</STYLE>",
+      "a</style>b<style c",
+    ];
+    for (const input of inputs) {
+      expect(stripHeavyTags(input)).toBe(referenceStrip(input));
+    }
+  });
+
+  it("strips 200 KB of unclosed openers in linear time", () => {
+    // The reference regexes took 1 to 4 seconds on each of these inputs.
+    const size = 200 * 1024;
+    const started = performance.now();
+    for (const opener of ["<style ", "<style>", "<script ", "<script>"]) {
+      const html = opener.repeat(Math.ceil(size / opener.length));
+      expect(stripHeavyTags(html)).toBe(html);
+    }
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("parseHtmlDocument", () => {
+  it("does not run inline scripts or event handler attributes", () => {
+    // happy-dom's WebSocket connects outside the fetch interceptor, and only
+    // script can open one, so parsing must never evaluate script.
+    const document = parseHtmlDocument(
+      '<body onload="document.title = \'handler ran\'"><p id="target">original</p>' +
+        "<script>document.getElementById('target').textContent = 'script ran';</script></body>",
+      "http://127.0.0.1/page"
+    );
+    expect(document.getElementById("target")?.textContent).toBe("original");
+    expect(document.title).not.toBe("handler ran");
   });
 });

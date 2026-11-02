@@ -19,6 +19,7 @@ import { waitForCondition } from "./testDispatchHelpers";
 import { Effect, Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
@@ -89,7 +90,10 @@ describe("WorkspaceService metadata listeners", () => {
       await waitForCondition(() => setTodoStatus.mock.calls.length > 0);
       await setTodoStatus.mock.results[0]?.value;
 
-      expect(readTodosSpy).toHaveBeenCalledWith(path.join(harness.config.sessionsDir, workspaceId));
+      expect(readTodosSpy).toHaveBeenCalledWith(
+        path.join(harness.config.sessionsDir, workspaceId),
+        nodeSessionFiles
+      );
       expect(setTodoStatus).toHaveBeenCalledWith(
         workspaceId,
         { emoji: "🔄", message: "Run typecheck" },

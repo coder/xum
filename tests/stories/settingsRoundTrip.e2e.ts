@@ -10,7 +10,7 @@
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { disableTutorials, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
+import { disableTutorials, sendMessage, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
 import { openPlayground } from "./helpers";
 
 const MESSAGE = "water the herbs";
@@ -29,7 +29,8 @@ test(
     await app.open();
     // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
     await openPlayground(screen);
-    await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
+    // exact step: an agent step that types here stops replaying when the placeholder tip rotates.
+    await sendMessage(screen, MESSAGE);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
 
     // One agent step, ending on a screen it can see (Settings open). As one step with the close,

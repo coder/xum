@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
+import type { ExecOptions, ExecStream } from "./Runtime";
 
 /**
  * Minimal concrete RemoteRuntime for tests: identity path resolution, throwing
@@ -85,6 +86,40 @@ export class ShellRemoteRuntime extends TestRemoteRuntime {
         stdio: ["pipe", "pipe", "pipe"],
       }),
     });
+  }
+}
+
+/**
+ * #6426: a ShellRemoteRuntime with an agent host key (so remote project plugins load) that
+ * records every command it runs.
+ */
+export class HostKeyShellRemoteRuntime extends ShellRemoteRuntime {
+  readonly commands: string[] = [];
+
+  constructor(
+    private readonly loginPath: string,
+    private readonly hostKey: string
+  ) {
+    super(loginPath);
+  }
+
+  /** File commands (stat, read) run in the login directory, which exists on this host. */
+  protected override getBasePath(): string {
+    return this.loginPath;
+  }
+
+  override getAgentHostKey(): string {
+    return this.hostKey;
+  }
+
+  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+    this.commands.push(command);
+    return super.exec(command, options);
+  }
+
+  /** How many remote plugin listings ran (the listing script archives with tar). */
+  get pluginListings(): number {
+    return this.commands.filter((command) => command.includes("tar -cf - -T -")).length;
   }
 }
 

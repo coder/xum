@@ -47,6 +47,10 @@ import {
 } from "./hookService";
 import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 
 const WORKSPACE_ID = "plugin-hooks-test";
@@ -1203,5 +1207,49 @@ describe("epoch-based hook retirement", () => {
     const reensured = makeToolCtx("dangerous_tool", { a: 3 });
     await runTool(harness.spine, reensured);
     expect(blockedError(reensured)).toContain("blocked by hook");
+  });
+});
+
+describe("AgentPluginHookService host layers", () => {
+  test("discovers and reads hooks.js on the host files and paths it is given", async () => {
+    // Phase 5: the turn passes the loop's HostFiles and HostPaths. This plugin exists only in the
+    // memory home's ~/.agents/plugins, so the Node home and filesystem find no hook.
+    const harness = await createHarness();
+    const host = createMemoryHost();
+    const plugin = path.join(MEMORY_USER_HOME, ".agents", "plugins", "memory-denier");
+    await host.files.promises.mkdir(plugin, { recursive: true });
+    await host.files.promises.writeFile(
+      path.join(plugin, "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "memory-denier",
+        extensions: { mux: { hooks: { tools: ["file_read"] } } },
+      })
+    );
+    await host.files.promises.writeFile(
+      path.join(plugin, "hooks.js"),
+      `({ "tool.execute.before": () => ({ deny: "Denied from the memory home" }) })`
+    );
+    const service = new AgentPluginHookService({
+      spine: harness.spine,
+      sandboxHost: harness.sandboxHost,
+    });
+    try {
+      await service.ensureWorkspaceHooks({
+        workspaceId: WORKSPACE_ID,
+        sessionDir: harness.sessionDir,
+        journal: harness.journal,
+        xumHome: harness.tmp.path,
+        projectTrusted: false,
+        hostFiles: host.files,
+        hostPaths: host.paths,
+      });
+      const ctx = makeToolCtx("file_read", { path: "/repo/secret.txt" });
+      await runTool(harness.spine, ctx);
+      expect(ctx.executed).toBe(false);
+      expect(blockedError(ctx)).toContain("Denied from the memory home");
+    } finally {
+      await service.disposeWorkspace(WORKSPACE_ID);
+    }
   });
 });

@@ -27,6 +27,8 @@ import {
   REFUSAL_FINISH,
 } from "./streamManager.suite.testHarness";
 import { Ok } from "@/common/types/result";
+import { clampErrorMessage } from "@/common/utils/errors";
+import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
 
 installStreamManagerTestHistory();
 
@@ -895,29 +897,6 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
     });
   }
-
-  for (const [modelId, repaired] of [
-    ["openai/gpt-5.2-codex", true],
-    ["anthropic/claude-opus-4-5", false],
-  ] as const) {
-    test(`Xum gateway ${modelId} ${repaired ? "is" : "is not"} eligible for the repair`, async () => {
-      const harness = createRecoveryHarness();
-
-      const { calls } = await runReplayTurn(harness, {
-        workspaceId: "replay-gateway",
-        model: createTestLanguageModel(modelId, "gateway"),
-        modelString: `mux-gateway:${modelId}`,
-        attempts: repaired
-          ? [failingAttempt(openAIReasoningReplayRejections[0].error), successfulAttempt]
-          : [failingAttempt(openAIReasoningReplayRejections[0].error)],
-      });
-
-      expect(calls).toHaveLength(repaired ? 2 : 1);
-      expect(harness.streamEnds()).toHaveLength(repaired ? 1 : 0);
-      expect(harness.errors()).toHaveLength(repaired ? 0 : 1);
-      expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
-    });
-  }
 });
 
 describe("StreamManager - error partial ordering", () => {
@@ -978,6 +957,20 @@ describe("StreamManager - stream error classification", () => {
     expect(partial?.metadata?.errorType).toBe(harness.errors()[0]?.errorType);
     return harness.errors()[0]?.errorType;
   }
+
+  test("clamps a huge provider error message before it is persisted and emitted", async () => {
+    const harness = createRecoveryHarness();
+    const huge = `head ${"x".repeat(ERROR_MESSAGE_CLAMP_MAX_CHARS * 2)} tail`;
+    await harness.run({
+      workspaceId: "clamp-error",
+      attempts: [failingAttempt(new Error(huge))],
+    });
+    const emitted = harness.errors()[0]?.error ?? "";
+    expect(emitted).toBe(clampErrorMessage(huge));
+    expect(emitted.length).toBeLessThan(huge.length);
+    const partial = await historyService.readPartial("clamp-error");
+    expect(partial?.metadata?.error).toBe(emitted);
+  });
 
   test("unwraps RetryError.lastError to classify model_not_found", async () => {
     const apiError = createApiCallErrorForTests({
@@ -1117,13 +1110,12 @@ describe("StreamManager - stream error classification", () => {
     {
       name: "classifies 402 payment required as quota (avoid auto-retry)",
       error: createApiCallErrorForTests({
-        message: "Insufficient balance. Please add credits to continue.",
-        url: "https://gateway.xum.cdr.dev/api/v1/ai-gateway/v1/ai/language-model",
+        message: "Payment required",
+        url: "https://openrouter.ai/api/v1/chat/completions",
         statusCode: 402,
-        responseBody:
-          '{"error":{"message":"Insufficient balance. Please add credits to continue.","type":"invalid_request_error"}}',
+        responseBody: '{"error":{"message":"Payment required","code":402}}',
         isRetryable: false,
-        data: { error: { message: "Insufficient balance. Please add credits to continue." } },
+        data: { error: { message: "Payment required", code: 402 } },
       }),
       expected: "quota",
     },
@@ -1160,6 +1152,17 @@ describe("StreamManager - stream error classification", () => {
         isRetryable: true,
       }),
       expected: "rate_limit",
+    },
+    {
+      // 500 is the lowest status that counts as a provider outage.
+      name: "classifies HTTP 500 as server_error",
+      error: createApiCallErrorForTests({
+        message: "Internal server error",
+        statusCode: 500,
+        responseBody: '{"error":{"message":"Internal server error"}}',
+        isRetryable: true,
+      }),
+      expected: "server_error",
     },
   ];
 
@@ -1667,7 +1670,8 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
 
   test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
     // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
-    const rebuiltTail = { text: "\n\n<hot_memories>B</hot_memories>", placement: "row" as const };
+    const rebuiltTail = { text: "\n\n[Warning: B]", placement: "row" as const };
+    const rebuiltInstructions = { text: "\n<custom-instructions>\nB\n</custom-instructions>" };
     const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
       applied: "medium",
     };
@@ -1706,7 +1710,10 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
         rebuildFirstStepForThinkingLevel: () =>
           Promise.resolve({
             messages: messages(),
-            volatileSystemTail: rebuiltTail,
+            systemRecords: {
+              volatileSystemTail: rebuiltTail,
+              customInstructions: { ...rebuiltInstructions, placement: "row" },
+            },
             systemMessageTokens: 4321,
           }),
       },
@@ -1716,6 +1723,10 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     const history = await historyService.getHistoryFromLatestBoundary("anthropic-receipt-rebuild");
     if (!history.success) throw new Error(history.error);
     expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+    expect(history.data.at(-1)?.metadata?.customInstructions).toEqual({
+      ...rebuiltInstructions,
+      placement: "row",
+    });
     expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(4321);
     expect(thinkingOverrideState.applied).toBe("high");
     expect(requestBlockTypes).toHaveLength(2);

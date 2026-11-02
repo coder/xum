@@ -118,6 +118,8 @@ runs/
 __pycache__
 # ruff format (fmt.mk) drops its cache at the repo root
 .ruff_cache/
+# uv run installs pyproject.toml's dependency groups here
+/.venv/
 
 tmpfork
 .mux-agent-cli
@@ -162,3 +164,6 @@ ds-bundle/
 
 # CRAP score snapshots (make crap)
 .metrics/
+
+# Written from bun.lock at pack time (scripts/generate-npm-shrinkwrap.ts)
+/npm-shrinkwrap.json

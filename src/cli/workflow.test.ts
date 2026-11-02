@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { nodeVersionWarning } from "./nodeVersion";
 import { parseWorkflowArgs } from "./workflow";
 
 const BUN_EXECUTABLE = process.execPath;
@@ -272,7 +273,7 @@ AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup fa
     await seedEvaluationDefault(muxRoot, "nope:settings-model");
     expect((await probe()).stdout).toContain("evaluation failed: unsupported/unsupported-provider");
 
-    expect((await probe("--evaluation-model", "mux-gateway:openai:gpt-5")).stdout).toContain(
+    expect((await probe("--evaluation-model", "openrouter:openai/gpt-5")).stdout).toContain(
       "evaluation failed: unsupported/unsupported-route"
     );
 
@@ -280,7 +281,7 @@ AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup fa
       (
         await probe(
           "--evaluation-model",
-          "mux-gateway:openai:gpt-5",
+          "openrouter:openai/gpt-5",
           "--args-json",
           '{"model":"nope:per-call"}'
         )
@@ -456,7 +457,13 @@ AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup fa
       stdinProc.exited,
     ]);
     expect(stdinExitCode).toBe(0);
-    expect(stdinStderr).toBe("");
+    // The CLI warns on stderr when the host Node is a release affected by CVE-2026-111497, so the
+    // only stderr this run may print is the warning for the Node this test spawned.
+    const hostNodeVersions = JSON.parse(
+      await Bun.$`node -p ${"JSON.stringify(process.versions)"}`.text()
+    ) as Record<string, string | undefined>;
+    const hostNodeWarning = nodeVersionWarning(hostNodeVersions);
+    expect(stdinStderr).toBe(hostNodeWarning === undefined ? "" : `${hostNodeWarning}\n`);
     const stdinEvent = JSON.parse(stdinStdout.trim()) as unknown;
     expect(stdinEvent).toMatchObject({
       type: "result",

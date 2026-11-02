@@ -1,5 +1,3 @@
-import * as fsPromises from "fs/promises";
-import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -20,11 +18,17 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
-import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
+import {
+  discoverAgentPlugins,
+  isPluginSkillDirectory,
+  pluginSkillFolderNames,
+} from "@/node/services/agentPlugins/discovery";
 import {
   pluginSkillFileName,
   pluginSkillMarkdown,
+  type PluginSkillFileKind,
 } from "@/node/services/agentPlugins/claudeCommands";
 import type { PluginSkillConsentGate } from "@/node/services/agentPlugins/componentConsent";
 import {
@@ -34,7 +38,6 @@ import {
 import {
   discoverAgentSkills,
   requireReachableSkills,
-  getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
@@ -42,6 +45,7 @@ import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillSto
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode, isSameHostDirectory } from "./skillFileUtils";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
@@ -49,7 +53,7 @@ interface AgentSkillListToolArgs {
 
 async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   try {
-    const entries = await fsPromises.readdir(skillsRoot, { withFileTypes: true });
+    const entries = await nodeHostFiles.promises.readdir(skillsRoot, { withFileTypes: true });
     // Include symlinked entries: skill package managers install skills by
     // symlinking directories into skills roots. readSkillDescriptor enforces
     // realpath containment per skill, so escaping symlinks stay rejected.
@@ -74,6 +78,9 @@ interface ListedSkillsRoot {
   singleSkillName?: string;
   /** Plugin roots only: that skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  ruleFile?: string | undefined;
+  /** Plugin roots only: snake_case folders load under kebab-case names (pluginSkillNameOfFolder). */
+  plugin?: true;
 }
 
 /**
@@ -110,13 +117,18 @@ async function getHostGlobalSkillsRoots(
 /** The skill folders of a skills root: the root itself for a single-skill plugin root. */
 async function listSkillFolders(
   skillsRoot: string,
-  singleSkillName: string | undefined
+  singleSkillName: string | undefined,
+  plugin: true | undefined
 ): Promise<Array<{ name: string; dir: string }>> {
   if (singleSkillName != null) return [{ name: singleSkillName, dir: skillsRoot }];
-  return (await listSkillDirectories(skillsRoot)).map((name) => ({
-    name,
-    dir: path.join(skillsRoot, name),
-  }));
+  const folders = await listSkillDirectories(skillsRoot);
+  const entries =
+    plugin === true
+      ? await pluginSkillFolderNames(folders, (folder) =>
+          isPluginSkillDirectory(nodeHostFiles.promises.stat(path.join(skillsRoot, folder)))
+        )
+      : folders.map((folder) => ({ folder, name: folder }));
+  return entries.map(({ folder, name }) => ({ name, dir: path.join(skillsRoot, folder) }));
 }
 
 /**
@@ -154,9 +166,9 @@ async function readContainedSkillFile(
     return null;
   }
 
-  let stat: Awaited<ReturnType<typeof fsPromises.stat>>;
+  let stat: Awaited<ReturnType<typeof nodeHostFiles.promises.stat>>;
   try {
-    stat = await fsPromises.stat(containedPath);
+    stat = await nodeHostFiles.promises.stat(containedPath);
   } catch {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md is missing: ${skillFilePath}`
@@ -177,7 +189,10 @@ async function readContainedSkillFile(
   }
 
   try {
-    return { content: await fsPromises.readFile(containedPath, "utf-8"), byteSize: stat.size };
+    return {
+      content: await nodeHostFiles.promises.readFile(containedPath, "utf-8"),
+      byteSize: stat.size,
+    };
   } catch (error) {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md could not be read: ${getErrorMessage(error)}`
@@ -192,7 +207,7 @@ async function readSkillDescriptor(
   scope: "global" | "project",
   containmentRoot: string,
   skillConsent?: PluginSkillConsentGate,
-  commandSkill?: true
+  fileKind: PluginSkillFileKind = {}
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
@@ -206,7 +221,7 @@ async function readSkillDescriptor(
     directoryName,
     scope,
     containmentRoot,
-    pluginSkillFileName(directoryName, commandSkill)
+    pluginSkillFileName(directoryName, fileKind)
   );
   if (file === null) return null;
 
@@ -216,7 +231,7 @@ async function readSkillDescriptor(
       skillConsent,
       skillDir,
       parseSkillMarkdown({
-        content: pluginSkillMarkdown(directoryName, file.content, commandSkill),
+        content: pluginSkillMarkdown(directoryName, file.content, fileKind),
         byteSize: file.byteSize,
         directoryName,
         // Agree with discovery; the display name stays out of this model-facing output.
@@ -275,6 +290,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
       try {
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
@@ -283,16 +299,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         if (skillCtx.kind === "project-runtime") {
           // Runtime discovery mirrors the shared default roots contract so project-runtime
           // listings include .xum/skills and .agents/skills plus ~/.xum/skills and ~/.agents/skills.
-          const roots =
-            skillCtx.roots ??
-            getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
-              includeClaudeSkills,
-            });
-
           const discovered = requireReachableSkills(
             await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-              roots,
+              roots: skillCtx.roots,
               containment: skillCtx.containment,
+              runtimeFactory: toolRuntimeFactory(config),
               dedupeByName: false,
             })
           );
@@ -324,7 +335,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           throw new Error("agent_skill_list requires xumScope");
         }
 
-        const userHome = os.homedir();
+        const userHome = nodeHostPaths.userHome();
 
         // Always list global skills; also list project skills when in a project workspace.
         const roots: ListedSkillsRoot[] = await getHostGlobalSkillsRoots(
@@ -403,6 +414,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillConsent,
               singleSkillName: skillsRoot.name,
               commandSkill: skillsRoot.command,
+              ruleFile: skillsRoot.rule,
+              plugin: true as const,
             }))
           );
         }
@@ -417,10 +430,12 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillConsent,
           singleSkillName,
           commandSkill,
+          ruleFile,
+          plugin,
         } of roots) {
           let skillsRootReal: string;
           try {
-            skillsRootReal = await fsPromises.realpath(skillsRoot);
+            skillsRootReal = await nodeHostFiles.promises.realpath(skillsRoot);
           } catch (error) {
             log.warn(
               `Skipping ${scope} skills root '${skillsRoot}' because path could not be resolved: ${getErrorMessage(error)}`
@@ -439,7 +454,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
           for (const { name: directoryName, dir: skillDir } of await listSkillFolders(
             skillsRootReal,
-            singleSkillName
+            singleSkillName,
+            plugin
           )) {
             // Skipped plugin skills must not claim a same-named fallback in this manual scan.
             if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
@@ -453,7 +469,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               scope,
               containmentRoot,
               skillConsent,
-              commandSkill
+              { command: commandSkill, rule: ruleFile }
             );
             if (!descriptor) {
               continue;

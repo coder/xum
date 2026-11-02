@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, waitFor } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { UserMessageContent } from "./UserMessageContent";
@@ -120,4 +121,77 @@ export const Blockquotes: Story = {
 /** Long-line rendering in user message markdown content */
 export const LongLines: Story = {
   render: () => <UserMarkdownCanvas content={LONG_LINE_CONTENT} />,
+};
+
+const WIDE_FLOWCHART_CONTENT = `\`\`\`mermaid
+flowchart LR
+A[Request]-->B[Parse]-->C[Plan]-->D[Build]-->E[Test]-->F[Ship]
+\`\`\``;
+
+// Mirror Pixel's named viewports so each story's globals pin the width that CI snapshots.
+const MERMAID_VIEWPORTS = {
+  options: {
+    phone390: { name: "Phone 390", styles: { width: "390px", height: "844px" }, type: "mobile" },
+    laptop1200: {
+      name: "Laptop 1200",
+      styles: { width: "1200px", height: "900px" },
+      type: "desktop",
+    },
+  },
+};
+
+// The column has a fixed width because the test runner plays every story at desktop width.
+function MermaidColumn(props: { width: number }) {
+  return (
+    <div className="bg-background min-h-screen p-4">
+      <div style={{ width: props.width }}>
+        <MarkdownRenderer content={WIDE_FLOWCHART_CONTENT} />
+      </div>
+    </div>
+  );
+}
+
+/** Waits until the diagram has rendered at the column's width with the expected shape. */
+async function waitForDiagram(canvasElement: HTMLElement, shape: "tall" | "wide") {
+  return waitFor(
+    () => {
+      const svg = canvasElement.querySelector<SVGSVGElement>(".mermaid-container > svg.pele");
+      if (!svg) throw new Error("The diagram has not rendered yet");
+      const box = svg.getBoundingClientRect();
+      const isTall = box.height > box.width;
+      if (isTall !== (shape === "tall")) {
+        throw new Error(`Expected a ${shape} diagram, got ${box.width}x${box.height}`);
+      }
+      return svg;
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/** Below 640 px a left-to-right flowchart turns top-to-bottom and drops the height cap. */
+export const MermaidPhone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: { matrix: { viewports: ["phone"] } } },
+  render: () => <MermaidColumn width={358} />,
+  play: async ({ canvasElement, parameters, globals }) => {
+    // The pinned Pixel variant and the local viewport must stay paired, or this story
+    // snapshots the wide layout.
+    await expect(parameters).toMatchObject({ pixel: { matrix: { viewports: ["phone"] } } });
+    await expect(globals).toMatchObject({ viewport: { value: "phone390" } });
+
+    const svg = await waitForDiagram(canvasElement, "tall");
+    const container = svg.parentElement!;
+    await expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth + 2);
+    await expect(getComputedStyle(svg).maxHeight).toBe("none");
+  },
+};
+
+/** At 640 px and wider the same flowchart keeps its left-to-right layout. */
+export const MermaidLaptop: Story = {
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: { matrix: { viewports: ["laptop"] } } },
+  render: () => <MermaidColumn width={768} />,
+  play: async ({ canvasElement }) => {
+    await waitForDiagram(canvasElement, "wide");
+  },
 };

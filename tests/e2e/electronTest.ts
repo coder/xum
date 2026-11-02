@@ -228,7 +228,6 @@ export const electronTest = base.extend<ElectronFixtures>({
         env: {
           ...process.env,
           NODE_ENV: "development",
-          VITE_DISABLE_MERMAID: "1",
           XUM_VITE_PORT: String(devServerPort),
           MUX_VITE_PORT: String(devServerPort),
         },
@@ -298,7 +297,6 @@ export const electronTest = base.extend<ElectronFixtures>({
       // Tutorials stay off in every scenario, including ones that rewrite config.json: their
       // delayed backdrops race with Playwright clicks.
       setXumE2EEnv(electronEnv, "ENABLE_TUTORIALS_IN_SANDBOX", "0");
-      electronEnv.VITE_DISABLE_MERMAID = "1";
 
       if (shouldStartDevServer) {
         setXumE2EEnv(electronEnv, "DEVSERVER_PORT", String(devServerPort));

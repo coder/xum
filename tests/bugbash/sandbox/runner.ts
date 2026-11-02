@@ -1,13 +1,12 @@
 /**
  * The runner library of the bug-bash sandbox (#5714). It finds a local Docker daemon, gets the
- * pinned image, runs commands as tracked async children, runs the job container, and cleans up
- * after a job. launch.ts is its entry point.
+ * image, runs commands as tracked async children, runs the job container, and cleans up after a
+ * job. launch.ts is its entry point.
  *
- * The trust anchor is the digest in image.json, which a reviewed pull request sets. The runner
- * pulls only `name@digest`. It refuses when the inputs key of this checkout (`build.sh --key`)
- * differs from image.json: that image was built for other inputs, and a person must publish a
- * new one (workflow "Bug-bash sandbox image") and update image.json. The one exception is a
- * local build for the jobs that the launcher allows (ensureImage's `localBuild`).
+ * The image: main's publish workflow ("Bug-bash sandbox image") pushes one stable tag per inputs
+ * key (`build.sh --key`) and attests it. ensureImage() looks up the tag of this checkout's key,
+ * verifies the attestation with gh, and pulls only `name@digest`. Without a verified image it
+ * builds one from this checkout with build.sh (or reuses that local build).
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
@@ -17,6 +16,11 @@ import * as path from "node:path";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
+/** The only workflow whose attestation ensureImage() accepts, and only from main. */
+const PUBLISH_WORKFLOW = "coder/xum/.github/workflows/bugbash-sandbox-image.yml";
+/** The host env names, besides PATH and HOME, that gh needs to find the user's login. */
+const GH_LOGIN_ENV = ["GH_TOKEN", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR"]; // prettier-ignore
 /** How long build.sh gets for a local image: a fresh build with no cache. */
 const BUILD_MS = 25 * 60_000;
 /** How long a child gets after SIGTERM before SIGKILL. */
@@ -39,27 +43,6 @@ export class Stopped extends Error {
   constructor(readonly reason: string) {
     super(`stopped: ${reason}`);
   }
-}
-
-export interface ImageLock {
-  image: string;
-  digest: string;
-  inputsKey: string;
-  playwrightCore: string;
-  publishedFrom: string;
-}
-
-export function readImageLock(root = ROOT): ImageLock {
-  const file = path.join(root, "tests/bugbash/sandbox/image.json");
-  const lock = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<ImageLock>;
-  const valid =
-    lock.image === IMAGE &&
-    /^sha256:[0-9a-f]{64}$/.test(lock.digest ?? "") &&
-    /^[0-9a-f]{64}$/.test(lock.inputsKey ?? "") &&
-    /^\d+\.\d+\.\d+$/.test(lock.playwrightCore ?? "") &&
-    /^[0-9a-f]{40}$/.test(lock.publishedFrom ?? "");
-  if (!valid) throw new Refusal("tests/bugbash/sandbox/image.json is not a valid image lock");
-  return lock as ImageLock;
 }
 
 interface Result {
@@ -138,27 +121,31 @@ export class Session {
   }
 
   /**
-   * The pinned image, pulled when missing, as `name@digest`. With `localBuild` and a stale key
-   * only, a local image of this checkout instead, as its image ID. A matching key always
-   * takes the pinned image.
+   * The image of this checkout's inputs key. `local` is null for the image that main's publish
+   * workflow built and attested, pulled when missing, as `name@digest`. Otherwise `local` is the
+   * reason it is not that image, and the image is a local build of this checkout, as its ID.
+   *
+   * A local build adds no power over the published image: each job already stages the
+   * checkout's git-listed files and mounts its dist/ and node_modules/ (launch.ts). So a job runs
+   * either an image that main's publish workflow built and attested, or one built from its own
+   * checkout, never one that a registry, a tag or another branch chose.
    */
-  async ensureImage(options: { localBuild?: boolean } = {}): Promise<string> {
-    const lock = readImageLock(this.#root);
+  async ensureImage(): Promise<{ ref: string; local: string | null }> {
     const key = await this.#checkoutKey();
-    const stale = key !== lock.inputsKey;
-    if (stale && options.localBuild !== true)
-      throw new Refusal(
-        `stale image: image.json has inputs key ${lock.inputsKey.slice(0, 16)}, this checkout ` +
-          `${key.slice(0, 16)}. Publish a new image, then update tests/bugbash/sandbox/image.json.`
-      );
     await this.#connect();
     this.#checkArchitecture();
-    let ref = `${lock.image}@${lock.digest}`;
-    if (stale) ref = await this.#localImage(key);
-    else {
+    const published = await this.#publishedImage(key);
+    let ref: string;
+    if (published.ok) {
+      ref = published.ref;
       // An empty list with exit 0 means absent. Any failure refuses: it is not "absent".
       const listed = await this.#must(["images", "--no-trunc", "--quiet", ref], 15_000);
       if (listed.stdout === "") await this.#must(["pull", "--quiet", ref], 10 * 60_000);
+      // Names the image in the job log, as the fallback below names its reason.
+      this.#log(`verified image for inputs key ${key.slice(0, 16)}: ${ref}`);
+    } else {
+      this.#log(`no verified image for inputs key ${key.slice(0, 16)}: ${published.why}`);
+      ref = await this.#localImage(key);
     }
     // The same label check for both: the image must carry the key of this checkout.
     const inspect = ["image", "inspect", "--format", "{{json .Config.Labels}}", ref];
@@ -169,7 +156,56 @@ export class Session {
     const label = labels?.["org.xum.bugbash.inputs"];
     if (label !== key)
       throw new Refusal(`${ref}: label org.xum.bugbash.inputs is ${label}, not ${key}`);
-    return ref;
+    return { ref, local: published.ok ? null : published.why };
+  }
+
+  /**
+   * The stable tag of `key`, looked up anonymously (the private client config), and its
+   * attestation, verified by gh on the host. Any outcome but a verified digest gives the reason.
+   * A stop still throws Stopped: it is no reason to build.
+   */
+  async #publishedImage(
+    key: string
+  ): Promise<{ ok: true; ref: string } | { ok: false; why: string }> {
+    const tag = `${IMAGE}:inputs-${key}`;
+    const format = "{{json .Manifest.Digest}}";
+    const args = ["buildx", "imagetools", "inspect", "--format", format, tag];
+    const look = await this.#job("docker", args, this.#client!, 60_000);
+    // A missing tag fails with stderr `ERROR: <tag>: not found`.
+    if (!look.ok && look.error.endsWith(": not found"))
+      return { ok: false, why: `${tag} is not published` };
+    if (!look.ok) return { ok: false, why: `the lookup of ${tag} failed: ${lastLine(look.error)}` };
+    const digest = /^"(sha256:[0-9a-f]{64})"$/.exec(look.stdout)?.[1];
+    if (digest == null)
+      return { ok: false, why: `the lookup of ${tag} gave ${JSON.stringify(look.stdout)}` };
+    const ref = `${IMAGE}@${digest}`;
+    // gh gets the user's login and nothing else of this env: GH_TOKEN, or its config folder
+    // (GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh, else HOME/.config/gh) with the token in it or in
+    // the desktop keyring, which gh reaches over the session bus (DBUS_SESSION_BUS_ADDRESS, else
+    // XDG_RUNTIME_DIR/bus). None of them reaches Docker or the container (containerEnv drops
+    // the token, and its allowlist has none of the others).
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+    };
+    for (const name of GH_LOGIN_ENV) if (process.env[name] != null) env[name] = process.env[name];
+    // prettier-ignore
+    const verify = await this.#job("gh", ["attestation", "verify", `oci://${ref}`, "--repo", "coder/xum",
+      "--bundle-from-oci", "--source-ref", "refs/heads/main", "--signer-workflow", PUBLISH_WORKFLOW], env, 120_000);
+    if (verify.ok) return { ok: true, ref };
+    // Node says `spawn gh ENOENT`, Bun `Executable not found in $PATH: "gh"`.
+    if (/ENOENT|Executable not found/.test(verify.error))
+      return { ok: false, why: "gh is not installed" };
+    // gh exits 4 when it has no login: CI sets GH_TOKEN for the launcher steps.
+    if (verify.code === 4)
+      return {
+        ok: false,
+        why: `${ref} is not verified: no gh token (set GH_TOKEN or run gh auth login)`,
+      };
+    return {
+      ok: false,
+      why: `${ref} is not verified (gh exit ${verify.code}): ${lastLine(verify.error)}`,
+    };
   }
 
   /**
@@ -433,16 +469,16 @@ export class Session {
   }
 
   /**
-   * A pull request that changes the image inputs has no published image yet (only main
-   * publishes), so build.sh builds one from its committed source into the local Docker. It runs
-   * with the private client config: no registry login, and nothing is pushed. A present image
+   * A pull request that changes the image inputs has no published image yet (main publishes it
+   * after the merge), so build.sh builds one from its committed source into the local Docker. It
+   * runs with the private client config: no registry login, and nothing is pushed. A present image
    * under build.sh's local tag is reused: the self-check runs three jobs, then CI runs the repros.
    */
   async #localImage(key: string): Promise<string> {
     const tag = `xum-bugbash-sandbox:inputs-${key}`; // build.sh's local tag
     let id = (await this.#must(["images", "--no-trunc", "--quiet", tag], 15_000)).stdout;
     if (id === "") {
-      this.#log(`stale image key: building ${tag} with build.sh (up to 25 minutes)`);
+      this.#log(`building ${tag} with build.sh (up to 25 minutes)`);
       const script = path.join(this.#root, "tests/bugbash/sandbox/build.sh");
       const built = await this.#job(script, [], this.#client!, BUILD_MS);
       // The tail only: the error holds the whole build log.
@@ -589,6 +625,9 @@ export class Session {
     return result;
   }
 }
+
+/** The last line of a command's stderr: a reason line, not the whole log. */
+const lastLine = (error: string) => error.split("\n").at(-1) ?? "";
 
 // ESRCH: the group is empty. EPERM: its members belong to another user, so it is not a group
 // that this session started (every command runs as this user). Neither is an error here: these

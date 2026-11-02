@@ -10,6 +10,8 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 
 import { resolveSkillStorageContext } from "./skillStorageContext";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // Host-local contexts read the real ~/.mux/skills (the skills CLI's `--agent mux` dir).
 const HOST_LEGACY_MUX_SKILLS_ROOT = path.join(os.homedir(), ".mux", "skills");
@@ -26,6 +28,7 @@ describe("resolveSkillStorageContext", () => {
         type: "global",
         xumHome: tempDir.path,
       },
+      runtimeFactory,
     });
 
     expect(context.kind).toBe("global-local");
@@ -52,6 +55,7 @@ describe("resolveSkillStorageContext", () => {
     const context = resolveSkillStorageContext({
       runtime: new MuxHomeRuntime(tempDir.path),
       workspacePath: tempDir.path,
+      runtimeFactory,
     });
 
     expect(context.kind).toBe("global-local");
@@ -82,6 +86,7 @@ describe("resolveSkillStorageContext", () => {
       runtime,
       workspacePath: "/remote/workspace",
       xumScope,
+      runtimeFactory,
     });
 
     expect(context.kind).toBe("project-local");
@@ -127,6 +132,7 @@ describe("resolveSkillStorageContext", () => {
       workspacePath: "/remote/workspace",
       xumScope,
       includeClaudeSkills: true,
+      runtimeFactory,
     });
 
     expect(projectContext.roots).toEqual({
@@ -158,6 +164,7 @@ describe("resolveSkillStorageContext", () => {
         xumHome: tempDir.path,
       },
       includeClaudeSkills: true,
+      runtimeFactory,
     });
 
     expect(globalContext.roots).toEqual({
@@ -187,6 +194,7 @@ describe("resolveSkillStorageContext", () => {
       runtime,
       workspacePath: "/remote/workspace",
       xumScope,
+      runtimeFactory,
     });
     expect(projectContext.roots?.projectPluginRoots).toEqual([
       path.join(projectRoot, ".xum", "plugins"),
@@ -205,6 +213,7 @@ describe("resolveSkillStorageContext", () => {
         type: "global",
         xumHome: tempDir.path,
       },
+      runtimeFactory,
     });
     expect(globalContext.roots?.projectPluginRoots).toBeUndefined();
     expect(globalContext.roots?.globalPluginRoots).toEqual([
@@ -235,6 +244,7 @@ describe("resolveSkillStorageContext", () => {
         projectStorageAuthority: "host-local",
         projectPluginsTrusted: true,
       },
+      runtimeFactory,
     });
 
     expect(context.kind).toBe("project-local");
@@ -283,6 +293,7 @@ describe("resolveSkillStorageContext", () => {
         projectStorageAuthority: "runtime",
         checkoutRoot,
       },
+      runtimeFactory,
     });
 
     expect(context.kind).toBe("project-runtime");

@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { DryReport } from "./check";
 
 const CHECK = join(import.meta.dir, "check.ts");
 // Hermetic git: CI has no identity, and host config (hooks, signing) must not leak in.
@@ -27,13 +28,15 @@ function write(path: string, text: string): void {
   writeFileSync(join(repo, path), text);
 }
 
-function check() {
+function check(): { status: number | null; report: DryReport } {
   const result = spawnSync(process.execPath, [CHECK, "--base", "HEAD", "--json"], {
     cwd: repo,
     env: GIT_ENV,
     encoding: "utf8",
   });
-  return { status: result.status, report: result.status === 2 ? null : JSON.parse(result.stdout) };
+  // Exit 2 is a usage or tool error with no JSON report; no test expects it.
+  if (result.status === 2) throw new Error(`check.ts exited 2: ${result.stderr}`);
+  return { status: result.status, report: JSON.parse(result.stdout) as DryReport };
 }
 
 const bucket = (name: string) => `export function ${name}(n: number): string {
@@ -63,9 +66,7 @@ test("a new copy of existing code is a finding", () => {
   const { status, report } = check();
 
   expect(status).toBe(1);
-  const pairs = (report.pairs as Array<{ left: { name: string }; right: { name: string } }>).map(
-    (pair) => `${pair.left.name}~${pair.right.name}`
-  );
+  const pairs = report.pairs.map((pair) => `${pair.left.name}~${pair.right.name}`);
   expect(pairs.sort()).toEqual(["fee~cents", "fee~count"]);
 });
 
@@ -113,8 +114,7 @@ test("a new copy that shares a name with an old match is a finding", () => {
   const { status, report } = check();
 
   expect(status).toBe(1);
-  type Side = { path: string; name: string; startLine: number };
-  const pairs = (report.pairs as Array<{ left: Side; right: Side }>)
+  const pairs = report.pairs
     .filter((p) => p.left.path === "src/r.ts" && p.left.startLine === 2)
     .filter((p) => p.right.path === "src/r.ts")
     .map((p) => p.right.name);
@@ -134,7 +134,7 @@ test("a dry-duplicate-ok marker in the changed function accepts the pair", () =>
   const { status, report } = check();
 
   expect(status).toBe(0);
-  const reasons = (report.pairs as Array<{ accepted?: string }>).map((p) => p.accepted);
+  const reasons = report.pairs.map((p) => p.accepted);
   expect(reasons).toEqual(["fees and cents must change apart", "fees and cents must change apart"]);
 });
 
@@ -148,7 +148,7 @@ test("a marker on the old side does not excuse a new copy", () => {
   const { status, report } = check();
 
   expect(status).toBe(1);
-  expect((report.pairs as Array<{ accepted?: string }>).some((p) => p.accepted)).toBe(false);
+  expect(report.pairs.some((p) => p.accepted)).toBe(false);
 });
 
 test("a function moved to another file is reported again (moves are not tracked)", () => {
@@ -172,9 +172,6 @@ test("a function moved to another file is reported again (moves are not tracked)
 
   // cents~count matched before the move. See new_pairs in dryer_report.py.
   expect(status).toBe(1);
-  type Side = { name: string };
-  const pairs = (report.pairs as Array<{ left: Side; right: Side }>).map(
-    (pair) => `${pair.left.name}~${pair.right.name}`
-  );
+  const pairs = report.pairs.map((pair) => `${pair.left.name}~${pair.right.name}`);
   expect(pairs).toEqual(["cents~count"]);
 });

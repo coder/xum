@@ -63,6 +63,17 @@ export const ArtifactReadResultSchema = z.discriminatedUnion("status", [
 ]);
 export type ArtifactReadResult = z.infer<typeof ArtifactReadResultSchema>;
 
+/**
+ * What a read returns. `missing` marks a file the folder does not have as a regular file (a
+ * listing leaves it out too), as against a read that failed, such as one that could not reach
+ * the runtime.
+ */
+export const ArtifactReadOutcomeSchema = z.discriminatedUnion("success", [
+  z.object({ success: z.literal(true), data: ArtifactReadResultSchema }),
+  z.object({ success: z.literal(false), error: z.string(), missing: z.literal(true).optional() }),
+]);
+export type ArtifactReadOutcome = z.infer<typeof ArtifactReadOutcomeSchema>;
+
 export const ArtifactCapabilitiesSchema = z.object({
   /**
    * Whether `agent-browser` is on the runtime's PATH, so the agent can look at its own HTML
@@ -82,7 +93,6 @@ export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;
  * indexes as corrupt and move their history aside.
  */
 export const ArtifactVersionSourceSchema = z.enum(["publish", "turn-end", "attach_file"]);
-export type ArtifactVersionSource = z.infer<typeof ArtifactVersionSourceSchema>;
 
 /** Shelf pin requested by the agent's `artifact` tool; M5 copies pinned versions to the shelf. */
 export const ArtifactPinSchema = z.enum(["project", "global"]);

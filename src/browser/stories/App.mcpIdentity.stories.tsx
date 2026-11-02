@@ -194,11 +194,16 @@ export const WorkspaceModalAfterFetch: AppStory = {
     // (T3 #5971), after the settings button.
     await canvas.findByTestId("workspace-more-actions", {}, { timeout: 10000 });
     await userEvent.keyboard("{Control>}{Shift>}m{/Shift}{/Control}");
-    const dialog = await within(document.body).findByRole("dialog");
-    const row = rowContaining(
-      await within(dialog).findByRole("switch", { name: `Toggle ${NOTION} MCP server` }),
-      "Fetch Tools"
+    // The modal loads lazily (#5971): a "Loading…" dialog shows first, and the loaded modal
+    // replaces it with a new dialog element. A handle to the first dialog goes stale (#7310), so
+    // wait for the loaded modal's own switch.
+    const toggle = await within(document.body).findByRole(
+      "switch",
+      { name: `Toggle ${NOTION} MCP server` },
+      { timeout: 10000 }
     );
+    await expect(toggle.closest('[role="dialog"]')).not.toHaveAttribute("aria-busy");
+    const row = rowContaining(toggle, "Fetch Tools");
     await expect(within(row).queryByRole("button", { name: INFO_BUTTON })).not.toBeInTheDocument();
     await userEvent.click(within(row).getByRole("button", { name: "Fetch Tools" }));
     const badge = await within(row).findByRole("button", { name: INFO_BUTTON });

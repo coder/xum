@@ -241,7 +241,7 @@ describe("WorkspaceStatusIndicator", () => {
     await waitFor(() => {
       expect(getModelDisplay()?.textContent ?? "").toContain(pendingDisplayName);
       expect(getModelDisplay()?.textContent ?? "").not.toContain(fallbackDisplayName);
-      expect(view.container.querySelector("[data-phase-slot]")).toBeNull();
+      expect(view.container.querySelector("[data-phase-slot]") === null).toBe(true);
       expect(view.container.textContent?.toLowerCase()).toContain("streaming");
       expect(view.container.textContent?.toLowerCase()).not.toContain("starting");
     });

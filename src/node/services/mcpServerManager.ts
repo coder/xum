@@ -4722,6 +4722,20 @@ export class MCPServerManager {
     }
   }
 
+  /**
+   * True when this manager holds an override snapshot it could serve: a
+   * latest snapshot or recorded request options. False means the next serve
+   * of any kind reads overrides from disk — an invalidation marker alone
+   * forces that re-read too — so a plugin-key sweep can skip the
+   * workspace's publication (see PluginSweepOptions.hasSnapshot).
+   */
+  hasWorkspaceOverridesSnapshot(workspaceId: string): boolean {
+    return (
+      this.latestWorkspaceOverrides.has(workspaceId) ||
+      this.lastWorkspaceRequestOptions.has(workspaceId)
+    );
+  }
+
   /** Keeps prompt invocation from using stale enablement before the next stream refresh. */
   async applyWorkspaceOverrides(
     workspaceId: string,

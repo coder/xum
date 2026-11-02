@@ -22,7 +22,7 @@ async function mismatches(
       files,
       oxlintConfig,
       eslintOptions: { overrideConfigFile: true, overrideConfig: eslintConfig },
-    })) as Map<string, string[]>;
+    }));
     return Object.fromEntries(found);
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });

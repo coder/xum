@@ -22,6 +22,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { ShellOverlayToolbarSpacerContext } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { SelectableDiffRenderer } from "../../Shared/DiffRenderer";
 import { ImmersiveDiffRevealLoadingState } from "./ImmersiveDiffRevealLoadingState";
 import { ImmersiveMinimap } from "./ImmersiveMinimap";
@@ -374,6 +375,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     selectedHunkId !== null && (assistedHunkIds?.has(selectedHunkId) ?? false);
   const selectedAssistedLabel = selectedAssistedComment ?? "Flagged by agent for review";
   const isTouchExperience = isTouchImmersive === true;
+  const ToolbarSpacer = React.useContext(ShellOverlayToolbarSpacerContext);
 
   // Flatten file tree into ordered file list
   const fileList = useMemo(() => flattenFileTreeLeaves(fileTree), [fileTree]);
@@ -2092,6 +2094,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     >
       {/* Header */}
       <div className="border-border-light bg-dark flex flex-wrap items-center gap-2 border-b px-3 py-2">
+        <ToolbarSpacer />
         {/* Back button */}
         <button
           onClick={onExit}
@@ -2376,7 +2379,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           <div className="relative min-h-0 min-w-0 flex-1">
             <div
               ref={scrollContainerRef}
-              className="scrollbar-none h-full min-h-0 min-w-0 overflow-y-auto pb-3 [overflow-anchor:none]"
+              className="h-full min-h-0 min-w-0 scrollbar-none overflow-y-auto pb-3 [overflow-anchor:none]"
             >
               {props.isLoading && currentFileHunks.length === 0 ? (
                 <div className="text-muted flex items-center justify-center py-12 text-sm">

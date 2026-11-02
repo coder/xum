@@ -3,12 +3,18 @@
  *
  * - `agent-plugin`: the repository's plugin.json (or .codex-plugin/plugin.json).
  * - `claude-plugin`: its .claude-plugin/plugin.json.
+ * - `cursor-plugin`: its .cursor-plugin/plugin.json.
  * - `skills`: SKILL.md folders only. Xum writes a plugin.json into the staged tree before the
  *   review, so the consent preview, receipts and updates treat it like any plugin.
+ * - `claude-marketplace`: one entry of a Claude Code marketplace whose folder has no manifest.
+ *   Xum writes a plugin.json from the entry (the Claude rule: the entry is the manifest).
+ * - `cursor-marketplace`: one entry of a Cursor marketplace, for a preview only. The entry
+ *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
+ *   whose folder has none.
  *
  * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
- * Claude manifest does not block `skills`: the generated root plugin.json wins by discovery order,
- * which is the user's explicit choice.
+ * Claude or Cursor manifest does not block `skills`: the generated root plugin.json wins by
+ * discovery order, which is the user's explicit choice.
  */
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -30,14 +36,28 @@ import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import {
   CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
   MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_MANIFEST_RELATIVE_PATH,
   ensurePluginPathContained,
+  isSchemaLessRootManifest,
   readPluginFileWithinRootCapped,
 } from "./discovery";
+import { normalizeClaudeManifest } from "./claudeManifest";
+import {
+  MARKETPLACE_RELATIVE_PATHS,
+  entryAsManifest,
+  entryDeclaresComponents,
+  findMarketplaceEntry,
+  parseClaudeMarketplace,
+  resolveEntrySource,
+  type ClaudeMarketplaceEntry,
+  type MarketplaceFile,
+} from "./claudeMarketplace";
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   MAX_SKILLS_ROOTS,
+  inertGeneratedComponents,
   isPlainObject,
   readGeneratedFrom,
   type GeneratedFrom,
@@ -265,25 +285,42 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 }
 
 export interface DetectedInstallMethods {
-  /** Every method that fits, in order: agent-plugin, claude-plugin, skills. */
+  /** Every method that fits, in order: agent-plugin, claude-plugin or cursor-plugin, skills. */
   methods: AgentPluginInstallMethod[];
   /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
   skillsRoots: SkillsPackageRoot[];
 }
 
+/**
+ * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude or a
+ * Cursor manifest. It uses discovery's own reader, which follows a symlink inside the tree and
+ * refuses one that leaves it, so the method always names the manifest discovery loads. A refused
+ * or unreadable file stays the own manifest: discovery then reports its error.
+ */
+async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
+  return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
+}
+
 /** The install methods that fit a staged tree (see the module comment for the rules). */
 export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
   // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
+  const rootEntry = await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH);
+  const claudeManifest = await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH);
+  const cursorManifest = await entryExists(stagedDir, CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH);
+  // Discovery loads a Claude or Cursor manifest over a schema-less root plugin.json
+  // (selectManifest), so the method must be claude-plugin or cursor-plugin there, not agent-plugin.
   const ownManifest =
-    (await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH)) ||
-    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH));
+    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)) ||
+    (rootEntry &&
+      !((claudeManifest || cursorManifest) && (await rootManifestIsSchemaLess(stagedDir))));
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
   if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
   const methods: AgentPluginInstallMethod[] = [];
-  if (await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH)) {
-    methods.push({ kind: "claude-plugin" });
-  }
-  if (skillsRoots.length > 0) methods.push({ kind: "skills" });
+  if (claudeManifest) methods.push({ kind: "claude-plugin" });
+  // Discovery loads a Claude manifest before a Cursor one.
+  else if (cursorManifest) methods.push({ kind: "cursor-plugin" });
+  // A root entry that yields to the Claude or Cursor manifest still blocks the generated plugin.json.
+  if (!rootEntry && skillsRoots.length > 0) methods.push({ kind: "skills" });
   return { methods, skillsRoots };
 }
 
@@ -312,8 +349,12 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
   switch (a.kind) {
     case "agent-plugin":
     case "claude-plugin":
+    case "cursor-plugin":
     case "skills":
       return b.kind === a.kind;
+    case "claude-marketplace":
+    case "cursor-marketplace":
+      return b.kind === a.kind && b.entry === a.entry;
   }
 }
 
@@ -338,20 +379,33 @@ export function chooseInstallMethod(
         `This repository cannot be installed as ${methodLabel(request.method)}${fits.length > 0 ? `; it fits: ${fits}` : ""}. Preview it again.`
       );
     }
-    case "update": {
-      const own = methods.find((method) => method.kind === "agent-plugin");
-      if (own !== undefined) return own;
-      const generated = request.generatedFrom;
-      if (generated !== undefined) return methods.find((method) => method.kind === generated.kind);
-      return methods.find((method) => method.kind === "claude-plugin");
-    }
+    case "update":
+      return chooseUpdateMethod(methods, request.generatedFrom);
   }
+}
+
+/** See InstallMethodRequest's `update` mode. */
+function chooseUpdateMethod(
+  methods: AgentPluginInstallMethod[],
+  generated: GeneratedFrom | undefined
+): AgentPluginInstallMethod | undefined {
+  const own = methods.find((method) => method.kind === "agent-plugin");
+  if (own !== undefined) return own;
+  // A marketplace entry that now ships a Claude or Cursor manifest switches to it (the update
+  // review covers every component); a generated skills install keeps its generator.
+  const kinds: Array<AgentPluginInstallMethod["kind"]> =
+    generated === undefined
+      ? ["claude-plugin", "cursor-plugin"]
+      : generated.kind === "claude-marketplace"
+        ? ["claude-plugin", "cursor-plugin", generated.kind]
+        : [generated.kind];
+  return methods.find((method) => kinds.includes(method.kind));
 }
 
 /** The error when no method fits: it names every format Xum looked for. */
 export function noInstallMethodMessage(subpath: string | undefined): string {
   const formats =
-    "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) and no SKILL.md files";
+    "No plugin.json (or .codex-plugin/plugin.json, .claude-plugin/plugin.json or .cursor-plugin/plugin.json) and no SKILL.md files";
   return subpath === undefined
     ? `${formats} found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin.`
     : `${formats} found in '${subpath}'. The folder is not a plugin.`;
@@ -435,46 +489,170 @@ export async function skillsCliSkillNames(
   };
 }
 
-/**
- * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
- * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
- * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
- * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
- * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
- * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
- * file off. Those builds then load only the skills roots the manifest lists. Builds before
- * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
- */
-export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+/** A marketplace entry being previewed, installed or updated (claudeMarketplace.ts). */
+export interface MarketplaceEntryContext {
+  /** The marketplace file that lists the entry. */
+  file: MarketplaceFile;
+  entry: ClaudeMarketplaceEntry;
+  /** The entry is a folder of the marketplace repository, so Xum can write its plugin.json. */
+  relative: boolean;
+  /** The entry source is the marketplace root: entry `skills` replace the default skills/. */
+  rootSource: boolean;
+}
 
-/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
-export function inertGeneratedComponents(): {
-  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
-  openai: { hooks: [] };
-} {
-  return {
-    contributes: {
-      hooks: INERT_COMPONENT_PATH,
-      agents: INERT_COMPONENT_PATH,
-      workflows: INERT_COMPONENT_PATH,
-      mcp: INERT_COMPONENT_PATH,
-    },
-    openai: { hooks: [] },
-  };
+/** The methods that read a folder's own manifest, so Xum writes no plugin.json for them. */
+const OWN_MANIFEST_METHOD_KINDS: ReadonlyArray<AgentPluginInstallMethod["kind"]> = [
+  "agent-plugin",
+  "claude-plugin",
+  "cursor-plugin",
+];
+
+export function isOwnManifestMethod(method: AgentPluginInstallMethod): boolean {
+  return OWN_MANIFEST_METHOD_KINDS.includes(method.kind);
 }
 
 /**
- * Write the plugin.json of a `skills` install into the staged tree and return preview warnings.
- * The file is part of the tree that the receipts hash and that install promotes, and preview and
- * install generate it from the same commit, so their consent digests match. Callers run it only
- * when `skills` fits (no root or Codex manifest).
+ * The methods of a marketplace entry's folder: its own manifest when it has one; else the entry
+ * as the manifest, for a relative source only (an update must find the entry again in the same
+ * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
+ * components is the Claude conflict for `strict: false`; with `strict` Xum uses only the
+ * manifest and warns (Claude would merge them). A Cursor entry installs only through its own
+ * manifest (Cursor plugin RFC, D23).
  */
-export async function writeGeneratedManifest(
-  stagedDir: string,
-  method: Extract<AgentPluginInstallMethod, { kind: "skills" }>,
+export function entryInstallMethods(
+  detected: AgentPluginInstallMethod[],
+  ctx: MarketplaceEntryContext
+): { methods: AgentPluginInstallMethod[]; warnings: string[] } {
+  const name = ctx.entry.name;
+  const own = detected.find(isOwnManifestMethod);
+  if (own === undefined && ctx.file === "cursor") {
+    throw new Error(
+      `The Cursor marketplace entry '${name}' has no plugin manifest in its folder. Xum does not install it.`
+    );
+  }
+  if (own !== undefined) {
+    if (!entryDeclaresComponents(ctx.entry)) return { methods: [own], warnings: [] };
+    if (!ctx.entry.strict) {
+      throw new Error(
+        `The marketplace entry '${name}' sets strict: false and declares components, and its folder has a plugin manifest too. Claude Code refuses these conflicting manifests, and so does Xum.`
+      );
+    }
+    return {
+      methods: [own],
+      warnings: [
+        `Xum reads only the plugin manifest of '${name}'; the components its marketplace entry adds do not load`,
+      ],
+    };
+  }
+  if (ctx.relative) {
+    return { methods: [{ kind: "claude-marketplace", entry: name }], warnings: [] };
+  }
+  // In Claude Code the entry is this plugin's manifest. Xum does not generate one for another
+  // repository (an update must find the entry again), so an entry that names components would
+  // install a different component set as Skills: refuse it instead.
+  if (entryDeclaresComponents(ctx.entry)) {
+    throw new Error(
+      `The marketplace entry '${name}' lists its own components, and the repository it points to has no plugin manifest. Xum does not install such an entry; install the repository as Skills instead.`
+    );
+  }
+  const skills = detected.find((method) => method.kind === "skills");
+  return { methods: skills !== undefined ? [skills] : [], warnings: [] };
+}
+
+/**
+ * The context of a relative entry at an install or update commit: the entry named `entryName` in
+ * the marketplace file `file` of that commit. Its source must still resolve to the folder of
+ * `source` (a direct API install cannot pair one entry with another folder, and an update does
+ * not follow an entry that moved).
+ */
+export function relativeEntryContext(
+  marketplaceJson: string | undefined,
+  entryName: string,
+  source: Pick<AgentPluginGitSource, "url" | "subpath">,
+  file: MarketplaceFile
+): MarketplaceEntryContext {
+  const relativePath = MARKETPLACE_RELATIVE_PATHS[file];
+  if (marketplaceJson === undefined) {
+    throw new Error(
+      `The repository has no ${relativePath} at this commit, so Xum cannot read the entry '${entryName}'.`
+    );
+  }
+  const marketplace = parseClaudeMarketplace(marketplaceJson, file);
+  const entry = findMarketplaceEntry(marketplace, entryName);
+  const resolved = resolveEntrySource(marketplace, source.url, entry);
+  if (resolved.kind !== "relative" || resolved.subpath !== source.subpath) {
+    throw new Error(
+      `The marketplace entry '${entryName}' now points to another location. Uninstall it and install it again.`
+    );
+  }
+  return { file, entry, relative: true, rootSource: resolved.subpath === undefined };
+}
+
+/** The error when a marketplace entry's folder fits no method. */
+export function noEntryMethodMessage(
+  entry: string,
   source: Pick<AgentPluginGitSource, "url" | "subpath">
-): Promise<string[]> {
-  assert(method.kind === "skills", "writeGeneratedManifest: only skills generate a manifest");
+): string {
+  const where = `${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`;
+  return `The marketplace entry '${entry}' points to ${where}, which has no plugin.json (or .codex-plugin/plugin.json, .claude-plugin/plugin.json or .cursor-plugin/plugin.json) and no SKILL.md files.`;
+}
+
+/** The methods that fit a staged tree, the one to use, and what the preview shows about them. */
+export interface StagedMethodChoice {
+  method: AgentPluginInstallMethod;
+  methods: AgentPluginInstallMethod[];
+  warnings: string[];
+  skillsCliSkills: string[];
+}
+
+/**
+ * Choose the method of a staged tree (`marketplace`: the tree is that entry's folder). Throws
+ * the message that names every format Xum looked for when none fits.
+ */
+export async function chooseStagedMethod(
+  stagedDir: string,
+  detected: DetectedInstallMethods,
+  request: InstallMethodRequest,
+  source: Pick<AgentPluginGitSource, "url" | "subpath">,
+  marketplace: MarketplaceEntryContext | undefined
+): Promise<StagedMethodChoice> {
+  if (marketplace !== undefined) {
+    const { methods, warnings } = entryInstallMethods(detected.methods, marketplace);
+    const method = chooseInstallMethod(methods, request);
+    if (method === undefined) throw new Error(noEntryMethodMessage(marketplace.entry.name, source));
+    // A marketplace entry is one plugin: the Skills CLI choice is for a whole repository.
+    return { method, methods, warnings, skillsCliSkills: [] };
+  }
+  const method = chooseInstallMethod(detected.methods, request);
+  if (method === undefined && request.mode === "update" && detected.methods.length > 0) {
+    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
+    // into a generated skills install on update (InstallMethodRequest).
+    throw new Error(
+      `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
+    );
+  }
+  if (method === undefined) throw new Error(noInstallMethodMessage(source.subpath));
+  const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
+  return {
+    method,
+    methods: detected.methods,
+    warnings: cli.warnings,
+    skillsCliSkills: cli.names,
+  };
+}
+
+/** The methods for which Xum writes the plugin.json (writeGeneratedManifest). */
+export function generatesManifest(
+  method: AgentPluginInstallMethod
+): method is Extract<AgentPluginInstallMethod, { kind: "skills" | "claude-marketplace" }> {
+  return method.kind === "skills" || method.kind === "claude-marketplace";
+}
+
+/** The plugin.json of a `skills` install, and the warnings for skills past the roots cap. */
+async function skillsManifest(
+  stagedDir: string,
+  source: Pick<AgentPluginGitSource, "url" | "subpath">
+): Promise<{ manifest: Record<string, unknown>; warnings: string[] }> {
   const roots = await findSkillsPackageRoots(stagedDir);
   if (roots.length === 0) throw new Error(noInstallMethodMessage(source.subpath));
   // manifest.ts reads at most MAX_SKILLS_ROOTS roots; name the skills past the cap instead of
@@ -490,22 +668,99 @@ export async function writeGeneratedManifest(
     description: `Skills from ${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`,
     contributes: { skills: kept.map((root) => root.root), ...inert.contributes },
     extensions: {
-      mux: { generatedFrom: { kind: method.kind } satisfies GeneratedFrom },
+      mux: { generatedFrom: { kind: "skills" } satisfies GeneratedFrom },
       "com.openai": inert.openai,
     },
   };
+  const warnings =
+    dropped.length > 0
+      ? [
+          `Xum reads at most ${MAX_SKILLS_ROOTS} skill folders; these skills do not install: ${dropped.join(", ")}`,
+        ]
+      : [];
+  return { manifest, warnings };
+}
+
+/**
+ * The plugin.json of a marketplace entry without one: the entry read as a Claude manifest
+ * (normalizeClaudeManifest), with the marker last. Discovery gives the result the capabilities
+ * of a Claude package (see discoverPluginAt).
+ */
+export function marketplaceManifest(ctx: MarketplaceEntryContext): {
+  manifest: Record<string, unknown>;
+  warnings: string[];
+} {
+  const { raw, warnings } = entryAsManifest(ctx.entry);
+  // An entry name can hold what a plugin name cannot (`_`, capitals): the plugin takes the
+  // nearest valid name, and the marker keeps the entry name for updates.
+  raw.name = toPluginName(ctx.entry.name);
+  const normalized = normalizeClaudeManifest(raw, {
+    label: `the marketplace entry '${ctx.entry.name}'`,
+    replaceDefaultSkills: ctx.rootSource,
+  });
+  assert(isPlainObject(normalized.manifest), "marketplaceManifest: the entry is an object");
+  const { commands, agentFiles } = normalized.claude;
+  const generatedFrom: GeneratedFrom = {
+    kind: "claude-marketplace",
+    entry: ctx.entry.name,
+    ...(commands !== undefined ? { commands } : {}),
+    ...(agentFiles !== undefined ? { agentFiles } : {}),
+  };
+  const contributes = isPlainObject(normalized.manifest.contributes)
+    ? normalized.manifest.contributes
+    : {};
+  // Downgrade safety (inertGeneratedComponents): an older build reads this file as a plain
+  // plugin.json, so every component the entry does not declare points at the inert path. This
+  // build reads an inert agents or MCP path as "not declared" (claudeMarketplaceManifest), so
+  // the Claude defaults (agents/, .mcp.json) still apply here.
+  const inert = inertGeneratedComponents();
+  return {
+    manifest: {
+      ...normalized.manifest,
+      contributes: {
+        ...contributes,
+        hooks: inert.contributes.hooks,
+        workflows: inert.contributes.workflows,
+        agents: contributes.agents ?? inert.contributes.agents,
+        mcp: contributes.mcp ?? inert.contributes.mcp,
+      },
+      extensions: { mux: { generatedFrom }, "com.openai": inert.openai },
+    },
+    warnings: [...warnings, ...normalized.warnings],
+  };
+}
+
+/**
+ * Write the plugin.json of a `skills` or `claude-marketplace` install into the staged tree and
+ * return preview warnings. The file is part of the tree that the receipts hash and that install
+ * promotes, and preview and install generate it from the same commit, so their consent digests
+ * match. Callers run it only when the method fits (no root, Codex, Claude or Cursor manifest
+ * for a marketplace entry; no root or Codex manifest for skills).
+ */
+export async function writeGeneratedManifest(
+  stagedDir: string,
+  method: Extract<AgentPluginInstallMethod, { kind: "skills" | "claude-marketplace" }>,
+  source: Pick<AgentPluginGitSource, "url" | "subpath">,
+  marketplace?: MarketplaceEntryContext
+): Promise<string[]> {
+  let generated: { manifest: Record<string, unknown>; warnings: string[] };
+  if (method.kind === "skills") {
+    generated = await skillsManifest(stagedDir, source);
+  } else {
+    assert(
+      marketplace?.entry.name === method.entry,
+      "writeGeneratedManifest: a marketplace method needs its entry"
+    );
+    generated = marketplaceManifest(marketplace);
+  }
   // "wx": fail instead of replacing an entry. A dangling symlink at plugin.json would otherwise
   // redirect the write outside the staged tree.
   await fsPromises.writeFile(
     path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH),
-    `${JSON.stringify(manifest, null, 2)}\n`,
+    `${JSON.stringify(generated.manifest, null, 2)}\n`,
     { flag: "wx" }
   );
-  return dropped.length > 0
-    ? [
-        `Xum reads at most ${MAX_SKILLS_ROOTS} skill folders; these skills do not install: ${dropped.join(", ")}`,
-      ]
-    : [];
+  return generated.warnings;
 }
 
 /**

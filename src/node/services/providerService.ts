@@ -273,7 +273,7 @@ export class ProviderService {
   /**
    * Notify subscribers that provider-relevant config has changed.
    * Called internally on provider config edits, and externally when
-   * main config changes affect provider availability (e.g. muxGatewayEnabled).
+   * other config changes affect provider availability.
    */
   notifyConfigChanged(): void {
     this.lastWarnedShadowedCustomProviderIds = null;
@@ -379,7 +379,6 @@ export class ProviderService {
     // Request builders can project their creation-time snapshot without racing
     // a second disk read that changes instance types or scoped model aliases.
     const providersConfig = snapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
-    const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
 
@@ -439,10 +438,7 @@ export class ProviderService {
 
       const codexOauthSet =
         provider === "openai" && parseCodexOauthAuth(config.codexOauth) !== null;
-      let isEnabled = !isProviderDisabledInConfig(config);
-      if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
-        isEnabled = false;
-      }
+      const isEnabled = !isProviderDisabledInConfig(config);
 
       const explicitBaseUrl = resolveConfigBaseUrl(config);
 
@@ -606,24 +602,10 @@ export class ProviderService {
         }
       }
 
-      // Xum Gateway-specific fields (check couponCode first, fallback to legacy voucher).
-      // Gateway stores enabled/models in the global config (~/.xum/config.json), not
-      // in providers.jsonc, so override the generic isEnabled with the gateway-specific value.
-      if (provider === "mux-gateway") {
-        const muxConfig = config as { couponCode?: string; voucher?: string };
-        providerInfo.couponCodeSet = !!(muxConfig.couponCode ?? muxConfig.voucher);
-        const globalConfig = this.config.loadConfigOrDefault();
-        providerInfo.isEnabled = globalConfig.muxGatewayEnabled !== false;
-        providerInfo.gatewayModels = globalConfig.muxGatewayModels ?? [];
-      }
-
       // Compute isConfigured using shared utility (checks config + env vars).
       // Disabled providers intentionally surface as not configured in the UI.
-      // Use providerInfo.isEnabled (not the local `isEnabled`) because gateway
-      // overrides it from global config — using the providers.jsonc value would
-      // make a disabled gateway appear configured.
       const configCheck = checkProviderConfigured(provider, config);
-      providerInfo.isConfigured = providerInfo.isEnabled && configCheck.isConfigured;
+      providerInfo.isConfigured = isEnabled && configCheck.isConfigured;
       providerInfo.apiKeySource = configCheck.apiKeySource;
       if (configCheck.baseUrlSource && configCheck.baseUrlResolved) {
         providerInfo.baseUrlSource = configCheck.baseUrlSource;
@@ -669,13 +651,7 @@ export class ProviderService {
       // Legacy shadowed built-ins remain unavailable, never inheriting official environment keys.
       if (custom ? !validateCustomProviderId(provider).ok : !defaultBaseUrl)
         return { status: "unsupported" };
-      if (
-        isProviderDisabledInConfig(config) ||
-        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
-        (provider === "mux-gateway" &&
-          this.config.loadConfigOrDefault().muxGatewayEnabled === false)
-      )
-        return { status: "not-configured" };
+      if (isProviderDisabledInConfig(config)) return { status: "not-configured" };
       let apiKey: string | undefined, baseUrl: string | undefined, organization: string | undefined;
       if (custom) {
         const credentials = resolveCustomProviderCredentials(provider, config);
@@ -690,7 +666,7 @@ export class ProviderService {
         const credentials = resolveProviderCredentials(provider, config);
         // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
         if (!credentials.isConfigured) return { status: "not-configured" };
-        apiKey = provider === "mux-gateway" ? credentials.couponCode : credentials.apiKey;
+        apiKey = credentials.apiKey;
         baseUrl = credentials.baseUrl ?? resolveConfigBaseUrl(config) ?? defaultBaseUrl;
         organization = credentials.organization;
       }
@@ -699,19 +675,17 @@ export class ProviderService {
         ? custom === "anthropic-messages"
           ? "anthropic"
           : "openai"
-        : provider === "mux-gateway"
-          ? "gateway"
-          : provider === "anthropic" ||
-              provider === "google" ||
-              provider === "ollama" ||
-              provider === "openrouter"
-            ? provider
-            : "openai";
+        : provider === "anthropic" ||
+            provider === "google" ||
+            provider === "ollama" ||
+            provider === "openrouter"
+          ? provider
+          : "openai";
       return Object.freeze({
         provider,
         providerType: custom,
         format,
-        conditional: Boolean(custom) || provider === "zai" || provider === "mux-gateway",
+        conditional: Boolean(custom) || provider === "zai",
         baseUrl,
         apiKey,
         organization,
@@ -1213,13 +1187,7 @@ export class ProviderService {
             const insertIndex = directIndex === -1 ? priority.length : directIndex;
             const nextPriority = [...priority];
             nextPriority.splice(insertIndex, 0, providerName);
-            return (c) => ({
-              ...c,
-              routePriority: nextPriority,
-              // Clear legacy disable — routePriority presence is now the authoritative
-              // routing signal, so a stale muxGatewayEnabled: false must not veto it.
-              ...(providerName === "mux-gateway" ? { muxGatewayEnabled: undefined } : {}),
-            });
+            return (c) => ({ ...c, routePriority: nextPriority });
           } else if (!isAutoRouteEligible && priority.includes(providerName)) {
             // Only remove a gateway from routePriority when it is truly deconfigured
             // or explicitly disabled. Configured-but-not-auto-eligible providers
@@ -1572,14 +1540,6 @@ export class ProviderService {
           }
         }
 
-        // Track if this is first time setting couponCode for mux-gateway
-        const isFirstMuxGatewayCoupon =
-          provider === "mux-gateway" &&
-          keyPath.length === 1 &&
-          keyPath[0] === "couponCode" &&
-          value !== "" &&
-          !providersConfig[provider]?.couponCode;
-
         // Ensure provider exists
         if (!providersConfig[provider]) {
           providersConfig[provider] = {};
@@ -1617,19 +1577,6 @@ export class ProviderService {
             delete current[lastKey];
           } else {
             current[lastKey] = value;
-          }
-        }
-
-        // Add default models when setting up mux-gateway for the first time
-        if (isFirstMuxGatewayCoupon) {
-          const providerConfig = providersConfig[provider] as Record<string, unknown>;
-          const existingModels = normalizeProviderModelEntries(providerConfig.models);
-          if (existingModels.length === 0) {
-            providerConfig.models = [
-              "anthropic/claude-sonnet-5-5",
-              "anthropic/claude-opus-5-5",
-              "openai/gpt-6.1-sol",
-            ];
           }
         }
 

@@ -2,11 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { createTodoWriteTool, setTodosForSessionDir } from "./todo";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { getTodoFilePath, readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { createTodoReadTool, createTodoWriteTool, setTodosForSessionDir } from "./todo";
 import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { TodoItem } from "@/common/types/tools";
 import { MAX_TODOS } from "@/common/constants/toolLimits";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /** A valid ordered list: about two thirds completed, one in progress, the rest pending. */
 function buildTodos(count: number): TodoItem[] {
@@ -46,9 +50,15 @@ describe("Todo Storage", () => {
         },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, todos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        todos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
-      const storedTodos = await readTodosForSessionDir(workspaceSessionDir);
+      const storedTodos = await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles);
       expect(storedTodos).toEqual(todos);
     });
 
@@ -65,7 +75,13 @@ describe("Todo Storage", () => {
         },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, initialTodos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        initialTodos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       // Replace with updated list
       const updatedTodos: TodoItem[] = [
@@ -83,45 +99,83 @@ describe("Todo Storage", () => {
         },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, updatedTodos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        updatedTodos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       // Verify list was replaced, not merged
-      const storedTodos = await readTodosForSessionDir(workspaceSessionDir);
+      const storedTodos = await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles);
       expect(storedTodos).toEqual(updatedTodos);
     });
 
     it("should handle empty todo list", async () => {
       // Create initial list
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, [
-        {
-          content: "Task 1",
-          status: "pending",
-        },
-      ]);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        [
+          {
+            content: "Task 1",
+            status: "pending",
+          },
+        ],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       // Clear list
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, []);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        [],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
-      const storedTodos = await readTodosForSessionDir(workspaceSessionDir);
+      const storedTodos = await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles);
       expect(storedTodos).toEqual([]);
     });
 
     it("should reject one item over MAX_TODOS with the count and keep the stored list", async () => {
       const storedTodos = buildTodos(3);
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, storedTodos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        storedTodos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, buildTodos(MAX_TODOS + 1))
+        setTodosForSessionDir(
+          workspaceId,
+          workspaceSessionDir,
+          buildTodos(MAX_TODOS + 1),
+          nodeSessionLocks,
+          nodeSessionFiles
+        )
       ).rejects.toThrow(`(${MAX_TODOS + 1}/${MAX_TODOS})`);
       // A rejected write must leave the previous list in place.
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(storedTodos);
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(
+        storedTodos
+      );
     });
 
     it("should accept exactly MAX_TODOS items", async () => {
       const maxTodos = buildTodos(MAX_TODOS);
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, maxTodos);
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(maxTodos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        maxTodos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(maxTodos);
     });
 
     it("should accept multiple in_progress tasks", async () => {
@@ -130,8 +184,14 @@ describe("Todo Storage", () => {
         { content: "Step 2", status: "in_progress" },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, todos);
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        todos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(todos);
     });
 
     it("should accept mixed completed + multiple in_progress + pending", async () => {
@@ -143,8 +203,14 @@ describe("Todo Storage", () => {
         { content: "Next up", status: "pending" },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, todos);
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        todos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(todos);
     });
 
     it("should reject when in_progress tasks appear after pending", async () => {
@@ -160,7 +226,13 @@ describe("Todo Storage", () => {
       ];
 
       await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, invalidTodos)
+        setTodosForSessionDir(
+          workspaceId,
+          workspaceSessionDir,
+          invalidTodos,
+          nodeSessionLocks,
+          nodeSessionFiles
+        )
       ).rejects.toThrow(/in-progress tasks must appear before pending tasks/i);
     });
 
@@ -177,7 +249,13 @@ describe("Todo Storage", () => {
       ];
 
       await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, invalidTodos)
+        setTodosForSessionDir(
+          workspaceId,
+          workspaceSessionDir,
+          invalidTodos,
+          nodeSessionLocks,
+          nodeSessionFiles
+        )
       ).rejects.toThrow(/completed tasks must appear before in-progress or pending tasks/i);
     });
 
@@ -193,8 +271,14 @@ describe("Todo Storage", () => {
         },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, todos);
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        todos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(todos);
     });
 
     it("should create directory if it doesn't exist", async () => {
@@ -210,10 +294,16 @@ describe("Todo Storage", () => {
         ];
 
         // Should not throw even though directory doesn't exist
-        await setTodosForSessionDir(workspaceId, nonExistentDir, todos);
+        await setTodosForSessionDir(
+          workspaceId,
+          nonExistentDir,
+          todos,
+          nodeSessionLocks,
+          nodeSessionFiles
+        );
 
         // Verify the file was created and is readable
-        const retrievedTodos = await readTodosForSessionDir(nonExistentDir);
+        const retrievedTodos = await readTodosForSessionDir(nonExistentDir, nodeSessionFiles);
         expect(retrievedTodos).toEqual(todos);
 
         // Verify the directory was actually created
@@ -231,7 +321,7 @@ describe("Todo Storage", () => {
 
   describe("readTodosForSessionDir", () => {
     it("should return empty array when no todos exist", async () => {
-      const todos = await readTodosForSessionDir(workspaceSessionDir);
+      const todos = await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles);
       expect(todos).toEqual([]);
     });
 
@@ -247,9 +337,15 @@ describe("Todo Storage", () => {
         },
       ];
 
-      await setTodosForSessionDir(workspaceId, workspaceSessionDir, todos);
+      await setTodosForSessionDir(
+        workspaceId,
+        workspaceSessionDir,
+        todos,
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
-      const retrievedTodos = await readTodosForSessionDir(workspaceSessionDir);
+      const retrievedTodos = await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles);
       expect(retrievedTodos).toEqual(todos);
     });
   });
@@ -275,12 +371,12 @@ describe("Todo Storage", () => {
           },
         ];
 
-        await setTodosForSessionDir("ws-1", tempDir1, todos1);
-        await setTodosForSessionDir("ws-2", tempDir2, todos2);
+        await setTodosForSessionDir("ws-1", tempDir1, todos1, nodeSessionLocks, nodeSessionFiles);
+        await setTodosForSessionDir("ws-2", tempDir2, todos2, nodeSessionLocks, nodeSessionFiles);
 
         // Verify each session directory has its own todos
-        const retrievedTodos1 = await readTodosForSessionDir(tempDir1);
-        const retrievedTodos2 = await readTodosForSessionDir(tempDir2);
+        const retrievedTodos1 = await readTodosForSessionDir(tempDir1, nodeSessionFiles);
+        const retrievedTodos2 = await readTodosForSessionDir(tempDir2, nodeSessionFiles);
 
         expect(retrievedTodos1).toEqual(todos1);
         expect(retrievedTodos2).toEqual(todos2);
@@ -326,7 +422,21 @@ describe("Todo Storage", () => {
       const result: unknown = await tool.execute!({ todos }, mockToolCallOptions);
 
       expect(result).toEqual({ success: true, count: 15 });
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
+      expect(await readTodosForSessionDir(workspaceSessionDir, nodeSessionFiles)).toEqual(todos);
     });
+  });
+
+  it("todo_write and todo_read use the session's SessionFiles, not the disk", async () => {
+    const files = buildSessionFiles(SessionFilesMemory);
+    const sessionDir = path.join(workspaceSessionDir, "memory-session");
+    const config = { ...createTestToolConfig(sessionDir), sessionFiles: files };
+    const todos = buildTodos(3);
+
+    await createTodoWriteTool(config).execute!({ todos }, mockToolCallOptions);
+
+    const written = await files.promises.readFile(getTodoFilePath(sessionDir), "utf-8");
+    expect(JSON.parse(written)).toEqual(todos);
+    expect(await createTodoReadTool(config).execute!({}, mockToolCallOptions)).toEqual({ todos });
+    expect(await fs.readdir(workspaceSessionDir)).toEqual([]);
   });
 });

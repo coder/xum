@@ -41,8 +41,7 @@ describe("cacheStrategy", () => {
     });
 
     it("should return true for gateway providers routing to Anthropic", () => {
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5")).toBe(true);
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-sonnet-4-5-20250514")).toBe(true);
+      expect(supportsAnthropicCache("bedrock:anthropic.claude-opus-4-5")).toBe(true);
       expect(supportsAnthropicCache("openrouter:anthropic/claude-3.5-sonnet")).toBe(true);
     });
 
@@ -50,7 +49,7 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("openai:gpt-4")).toBe(false);
       expect(supportsAnthropicCache("google:gemini-2.0")).toBe(false);
       expect(supportsAnthropicCache("openrouter:meta-llama/llama-3.1")).toBe(false);
-      expect(supportsAnthropicCache("mux-gateway:openai/gpt-5.2")).toBe(false);
+      expect(supportsAnthropicCache("openrouter:openai/gpt-5.2")).toBe(false);
     });
 
     // Coder gateway instances: the wire comes from instance metadata, not the
@@ -124,7 +123,7 @@ describe("cacheStrategy", () => {
         },
       };
       expect(supportsAnthropicCache("anthropic:claude-opus-4-5", config)).toBe(false);
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("bedrock:anthropic.claude-opus-4-5", config)).toBe(false);
       expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(false);
       expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5", config)).toBe(false);
     });
@@ -412,7 +411,7 @@ describe("cacheStrategy", () => {
     });
 
     it("rejects missing, unknown, and gateway routes", () => {
-      for (const route of [undefined, "unknown", "mux-gateway", "openrouter", "github-copilot"]) {
+      for (const route of [undefined, "unknown", "openrouter", "github-copilot"]) {
         expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", route, config)).toBe(
           false
         );
@@ -547,7 +546,7 @@ describe("cacheStrategy", () => {
         createOpenAICachedSystemMessage("prompt", "openai:gpt-5.2", "openai", config)
       ).toBeNull();
       expect(
-        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", "mux-gateway", config)
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", "openrouter", config)
       ).toBeNull();
       expect(
         createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", undefined, config)

@@ -57,7 +57,7 @@ describe("eager rotation after a boundary write (#5344)", () => {
         ...args: Parameters<typeof readFile>
       ) => {
         const result = await readFile(...args);
-        if (successor == null && args.length === 1 && args[0] === chatPath) {
+        if (successor == null && args[1] == null && args[0] === chatPath) {
           const text = Buffer.isBuffer(result) ? result.toString("utf8") : String(result);
           if (text.includes('"compactionBoundary":true')) {
             const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);

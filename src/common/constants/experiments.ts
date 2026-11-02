@@ -15,13 +15,13 @@ export const EXPERIMENT_IDS = {
   AGENT_BROWSER: "agent-browser",
   PORTABLE_DESKTOP: "portable-desktop",
   MEMORY: "memory",
-  MEMORY_HOT_SET: "memory-hot-set",
-  MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   ARTIFACTS: "artifacts",
+  ARTIFACTS_AGENT_INTERFACE: "artifacts-agent-interface",
+  ARTIFACTS_STATUS_PAGE_AGENT: "artifacts-status-page-agent",
   MCP_APPS: "mcp-apps",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
@@ -41,6 +41,8 @@ export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
   "advisor-tool", // Retired; accepted only for CLI compatibility.
   "agent-plugins",
   "dynamic-workflows",
+  "memory-hot-set", // Retired; accepted only for CLI compatibility.
+  "memory-intuition", // Retired; accepted only for CLI compatibility.
   "timeline",
   "tool-search",
   "workspace-heartbeats",
@@ -151,24 +153,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  // Sub-experiment of Agent Memory (flat flag, gated on the parent at the call
-  // site; Settings nests it under the Agent Memory toggle). Without it, memories
-  // stay pull-based like skills: index advertised in the memory tool description,
-  // contents fetched on demand.
-  [EXPERIMENT_IDS.MEMORY_INTUITION]: {
-    id: EXPERIMENT_IDS.MEMORY_INTUITION,
-    name: "Memory Intuition",
-    description: "Recall relevant memories with a bounded, read-only intuition agent",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
-    id: EXPERIMENT_IDS.MEMORY_HOT_SET,
-    name: "Memory Hot Set",
-    description: "Preload pinned and frequently used memory files into the system prompt",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   // Sub-experiment of Agent Memory (flat flag, gated on the parent at call
   // sites; Settings nests it under the Agent Memory toggle): background "dream"
   // consolidation passes that merge, prune, and promote memory files (issue #3534).
@@ -201,6 +185,27 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Artifacts",
     description:
       "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Artifacts (flat flag, gated on the parent at call sites; Settings nests it
+  // under the Artifacts toggle): the main pane shows the agent's status page by default.
+  [EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE]: {
+    id: EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+    name: "Agent interface view",
+    description:
+      "Show the agent's status page (status.html) instead of the chat transcript by default. Switch back to the chat at any time; the message box stays at the bottom.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Artifacts (flat flag, gated on Artifacts and Agent interface view at call
+  // sites; Settings nests it under the Artifacts toggle): a host-run status page agent keeps
+  // status.html current from the main agent's status_update calls.
+  [EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT]: {
+    id: EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    name: "Status page agent",
+    description:
+      "A dedicated status page agent keeps status.html current with the model you pick under Settings > Agents > Status Page; the main agent only sends it short updates. Needs Agent interface view.",
     enabledByDefault: false,
     showInSettings: true,
   },

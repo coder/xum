@@ -56,12 +56,17 @@ def test_the_graph_skips_type_only_commented_and_fixture_imports(tmp_path):
             'import { d } from "@/d";',
             'export * from "@/e";',
             'const f = require("./f");',
+            'import { type G } from "@/g";',  # Bun drops it: every specifier is a type
+            'import { type H, h } from "@/h";',  # h is a value, so the module loads
+            'export { type I } from "@/i";',
+            'export { type J, type J2 } from "@/j";',  # erased too: more than one type specifier
+            'export { type K, k } from "@/k";',  # k is a value, so the module loads
         ]
     )
-    files = {f"src/{name}.ts" for name in "abcdef"}
+    files = {f"src/{name}.ts" for name in "abcdefghijk"}
     write(tmp_path, {**{path: "" for path in files}, "src/t.test.ts": test})
     graph = import_graph(tmp_path, ["src/t.test.ts"], files)
-    assert sorted(graph) == ["src/d.ts", "src/e.ts", "src/f.ts"]
+    assert sorted(graph) == ["src/d.ts", "src/e.ts", "src/f.ts", "src/h.ts", "src/k.ts"]
 
 
 def test_tests_for_puts_the_colocated_test_first_then_the_nearest_and_cuts():
@@ -238,3 +243,30 @@ def test_windows_is_a_tool_error_before_any_work(tmp_path, monkeypatch):
     monkeypatch.setattr(mutate_report.os, "name", "nt")
     missing = str(tmp_path / "missing.json")  # never read
     assert mutate_report.main(["--root", str(tmp_path), "--changes", missing, "--lane", missing]) == 2
+
+
+def test_a_site_in_a_bun_false_zero_window_runs_instead_of_uncovered():
+    # Bun 1.4.3 zeroes every line from an inlined const down to an uncalled
+    # user (scripts/crap/crapper_report.py). check() ran, but LCOV shows 0.
+    from mutate_report import false_zero_windows, triage
+
+    source = "\n".join(
+        [
+            "const LIMIT = 2;",  # 1
+            "export function check(n: number): boolean {",  # 2
+            "  return n < 1;",  # 3
+            "}",  # 4
+            "export function unused(n: number): number {",  # 5
+            "  return n + LIMIT;",  # 6
+            "}",  # 7
+        ]
+    )
+    reports = [{1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}]
+    windows = false_zero_windows(source, "src/m.ts", reports)
+    assert windows == [(1, 4)]
+    plan = {"src/m.ts": ["src/m.test.ts"]}
+    rows, to_run = triage([site(3)], plan, {"src/m.ts": reports}, set(), {"src/m.ts": windows})
+    assert rows == [] and to_run == [site(3)]
+    # Outside the window, a zero still means uncovered.
+    rows, _ = triage([site(6)], plan, {"src/m.ts": reports}, set(), {"src/m.ts": windows})
+    assert [r["outcome"] for r in rows] == ["uncovered"]

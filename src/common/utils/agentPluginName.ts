@@ -28,3 +28,14 @@ export function isValidAgentPluginName(name: string): boolean {
     !WINDOWS_RESERVED_NAME_PATTERN.test(name)
   );
 }
+
+/**
+ * The Claude Code marketplace grammar for plugin entry names: letters, digits, `.`, `_` and `-`,
+ * starting with a letter or digit, and no `..`. Wider than the plugin-name grammar: an entry
+ * without a manifest of its own installs under toPluginName of this name (installMethods.ts).
+ */
+const MARKETPLACE_ENTRY_NAME_PATTERN = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function isValidMarketplaceEntryName(name: string): boolean {
+  return MARKETPLACE_ENTRY_NAME_PATTERN.test(name);
+}

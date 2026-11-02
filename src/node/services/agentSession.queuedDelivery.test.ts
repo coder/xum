@@ -6,7 +6,7 @@ import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import { AgentSession } from "./agentSession";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createStreamLifecycleMocks, createTestStreamManager } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
@@ -76,6 +76,10 @@ describe("AgentSession queued delivery", () => {
       }),
       initStateManager,
       backgroundProcessManager,
+      // The AI service double carries the stream lifecycle mocks (stopStream above).
+      streamManager: createTestStreamManager(
+        aiService as unknown as Parameters<typeof createTestStreamManager>[0]
+      ),
     });
     return session;
   }

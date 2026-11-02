@@ -1,6 +1,6 @@
 import { GlobalWindow } from "happy-dom";
 import * as React from "react";
-import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
 import { captureDomGlobals } from "./domGlobals";
 
 /**
@@ -51,6 +51,9 @@ export function installDom(): () => void {
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
   globalThis.CustomEvent = domWindow.CustomEvent;
+  // Not `Event`: Node code under test dispatches on native EventTargets (wsFlowControl), which
+  // reject happy-dom events. happy-dom 21 dispatches only its own events, so DOM tests build
+  // them with `new window.Event(...)`.
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =
     domWindow.DocumentFragment;
@@ -242,12 +245,21 @@ require("@/browser/features/Tools/Shared/toolCardsLoader");
  * installDom() starts wide again.
  */
 export function stubNarrowViewport(narrow: boolean): void {
+  stubMediaQuery(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`, narrow);
+}
+
+/** Makes useShortViewport() read `short`, the way stubNarrowViewport() stubs the width. */
+export function stubShortViewport(short: boolean): void {
+  stubMediaQuery(`(max-height: ${SHORT_VIEWPORT_MAX_HEIGHT_PX}px)`, short);
+}
+
+function stubMediaQuery(stubbedQuery: string, matches: boolean): void {
   const original = window.matchMedia.bind(window);
   window.matchMedia = ((query: string) => {
-    if (query !== `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`) return original(query);
+    if (query !== stubbedQuery) return original(query);
     // A plain list: the viewport never changes during the test.
     return {
-      matches: narrow,
+      matches,
       media: query,
       onchange: null,
       addListener: () => undefined,

@@ -34,6 +34,7 @@ import type { RuntimeMode } from "@/common/types/runtime";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { log } from "@/node/services/log";
+import { guardAgainstBrotliResponses } from "@/node/utils/network/brotliResponseGuard";
 import {
   resolveProviderCredentials,
   type ProviderConfigRaw,
@@ -245,7 +246,9 @@ type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
 
 // Same outbound behavior as chat requests (providerModelFactory): honor HTTP(S)_PROXY and never
 // time out a long stream. One process-wide agent, like the chat path's.
-const outboundDispatcher = new EnvHttpProxyAgent({ bodyTimeout: 0, headersTimeout: 0 });
+const outboundDispatcher = guardAgainstBrotliResponses(
+  new EnvHttpProxyAgent({ bodyTimeout: 0, headersTimeout: 0 })
+);
 
 class ProxyRefusal extends Error {
   constructor(

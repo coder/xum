@@ -283,8 +283,7 @@ function stepObservedAtMs(step: RecordedStepRequest): number {
 
 /**
  * Whether the runtime monitor observed this step on an Anthropic wire. A wire record decides:
- * only the Anthropic cache wrapper writes one, also behind SDKs that report another provider
- * id (the mux-gateway SDK reports "gateway"), and the monitor observes a request only once it
+ * only the Anthropic cache wrapper writes one, and the monitor observes a request only once it
  * was answered OK with cache markers injected. One that failed before, got an error status, or
  * ran with caching off neither created nor broke a cache entry. Older logs carry no record:
  * their Anthropic steps stay audited.

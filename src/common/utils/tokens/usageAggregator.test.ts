@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { addModelUsage, getTotalCost, sumUsageHistory } from "./usageAggregator";
 
 describe("sumUsageHistory", () => {
   test("clamps each entry's 1h share to its own cache writes before summing", () => {
@@ -39,5 +39,27 @@ describe("sumUsageHistory", () => {
     expect(result).toBeDefined();
     expect(result?.hasUnknownCosts).toBe(true);
     expect(getTotalCost(result)).toBeCloseTo(0.544);
+  });
+});
+
+describe("addModelUsage", () => {
+  test("adds under model keys named after Object.prototype members as own entries", () => {
+    const usage = {
+      input: { tokens: 1, cost_usd: 0 },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 0, cost_usd: 0 },
+      reasoning: { tokens: 0, cost_usd: 0 },
+    };
+    const byModel: Record<string, typeof usage> = {};
+    for (const model of ["__proto__", "toString", "__proto__"]) {
+      addModelUsage(byModel, model, usage);
+    }
+
+    expect(Object.getPrototypeOf(byModel)).toBe(Object.prototype);
+    expect(Object.entries(byModel).map(([model, sum]) => [model, sum.input.tokens])).toEqual([
+      ["__proto__", 2],
+      ["toString", 1],
+    ]);
   });
 });

@@ -1,13 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "child_process";
+import { constants as fsConstants } from "fs";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions } from "@/node/runtime/Runtime";
 import {
   listArtifactsOnRuntime,
   parseArtifactListOutput,
-  parseArtifactReadOutput,
   readArtifactBytesOnRuntime,
   readArtifactOnRuntime,
   writeArtifactOnRuntime,
@@ -19,6 +20,7 @@ import {
   listArtifactsInDir,
   readArtifactFromDir,
   writeArtifactToDir,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 // A LocalRuntime over a temp dir stands in for SSH/Docker: the same scripts run through
@@ -226,6 +228,7 @@ describe("artifactRuntimeStore", () => {
         expect(await readArtifactOnRuntime(runtime, artifactsDir, relPath, CAP)).toEqual({
           success: false,
           error: `Artifact not found: ${relPath}`,
+          missing: true,
         });
       }
       for (const relPath of ["../outside/secret.md", "/etc/passwd", ".hidden", "a//b"]) {
@@ -241,6 +244,7 @@ describe("artifactRuntimeStore", () => {
       expect(await readArtifactOnRuntime(runtime, linked, "a.md", CAP)).toEqual({
         success: false,
         error: "Artifact not found: a.md",
+        missing: true,
       });
     });
 
@@ -261,6 +265,7 @@ describe("artifactRuntimeStore", () => {
       expect(await readArtifactOnRuntime(swapping, artifactsDir, "secret.md", CAP)).toEqual({
         success: false,
         error: "Artifact not found: secret.md",
+        missing: true,
       });
     });
 
@@ -304,41 +309,52 @@ describe("artifactRuntimeStore", () => {
       ).toEqual({ status: "missing" });
     });
 
+    test("skips a login banner before the header and throws on cut-off output", async () => {
+      await write("pic.png", Buffer.from([0x89, 0x50, 0x4e]));
+      // An SSH login banner (motd) reaches stdout before the script's own output.
+      class BannerRuntime extends LocalRuntime {
+        override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+          return super.exec(`printf 'motd\\n'\n${command}`, options);
+        }
+      }
+      expect(
+        await readArtifactBytesOnRuntime(new BannerRuntime(tempDir), artifactsDir, "pic.png", CAP)
+      ).toMatchObject({ status: "ok", bytes: Buffer.from([0x89, 0x50, 0x4e]) });
+
+      // A connection that drops mid-header leaves the size field unterminated.
+      class CutOffRuntime extends LocalRuntime {
+        override exec(_command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+          return super.exec(String.raw`printf 'XUMREAD1\000ok\000'; printf 3`, options);
+        }
+      }
+      const cutOff = await readArtifactBytesOnRuntime(
+        new CutOffRuntime(tempDir),
+        artifactsDir,
+        "pic.png",
+        CAP
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(cutOff).toMatchObject({ message: "Artifact read output is cut off" });
+    });
+
     test("refuses a FIFO without blocking", async () => {
       execFileSync("mkfifo", [path.join(artifactsDir, "pipe.txt")]);
       expect(await readArtifactOnRuntime(runtime, artifactsDir, "pipe.txt", CAP)).toEqual({
         success: false,
         error: "Artifact not found: pipe.txt",
+        missing: true,
       });
     });
   });
 
-  test("parseArtifactReadOutput skips a banner and keeps raw bytes", () => {
-    const output = Buffer.concat([
-      Buffer.from("motd\nXUMREAD1\0ok\0" + "3\0" + "9\0"),
-      Buffer.from([0x89, 0x50, 0x4e]),
-    ]);
-    expect(parseArtifactReadOutput(output, "a.png", 10)).toEqual({
-      success: true,
-      data: {
-        status: "ok",
-        path: "a.png",
-        kind: "image",
-        size: 3,
-        modifiedMs: 9000,
-        encoding: "base64",
-        content: Buffer.from([0x89, 0x50, 0x4e]).toString("base64"),
-      },
-    });
-    expect(() => parseArtifactReadOutput(Buffer.from("XUMREAD1\0ok\0" + "3"), "a", 10)).toThrow();
-  });
-
   // Host and runtime writers share one contract, so every case runs against both.
   const writers = {
-    host: (dir: string, relPath: string, content: string) =>
-      writeArtifactToDir(dir, relPath, content),
-    runtime: (dir: string, relPath: string, content: string) =>
-      writeArtifactOnRuntime(runtime, dir, relPath, content),
+    host: (dir: string, relPath: string, content: string, options?: ArtifactWriteOptions) =>
+      writeArtifactToDir(dir, relPath, content, options),
+    runtime: (dir: string, relPath: string, content: string, options?: ArtifactWriteOptions) =>
+      writeArtifactOnRuntime(runtime, dir, relPath, content, options),
   };
 
   const outcome = (write: Promise<void>) =>
@@ -347,7 +363,103 @@ describe("artifactRuntimeStore", () => {
       () => "refused"
     );
 
-  describe.each(Object.entries(writers))("writing (%s)", (_name, writeArtifact) => {
+  /** Runs the host writer's `write` with each fs.open it makes going through `open`. */
+  const withHostOpen = async (
+    open: (realOpen: typeof fs.open, ...args: Parameters<typeof fs.open>) => Promise<fs.FileHandle>,
+    write: () => Promise<void>
+  ) => {
+    const realOpen = fs.open;
+    const spy = spyOn(fs, "open").mockImplementation((...args) => open(realOpen, ...args));
+    try {
+      await write();
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  /** The runtime with `script` as its `cat`, ahead of the real one on PATH. */
+  const runtimeWithCat = async (script: string): Promise<LocalRuntime> => {
+    const bin = await fs.mkdtemp(path.join(tempDir, "bin-"));
+    await fs.writeFile(path.join(bin, "cat"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    return Object.create(runtime, {
+      exec: {
+        value: (command: string, execOptions: ExecOptions) =>
+          runtime.exec(command, {
+            ...execOptions,
+            env: { ...execOptions.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+          }),
+      },
+    }) as LocalRuntime;
+  };
+
+  type Writer = typeof writers.host;
+  // The same writers, failing after part of the content is on disk (a full disk, say).
+  const partlyFailingWriters: Record<keyof typeof writers, Writer> = {
+    host: (dir, relPath, content, options) =>
+      withHostOpen(
+        async (realOpen, ...args) => {
+          const handle = await realOpen(...args);
+          Object.defineProperty(handle, "writeFile", {
+            value: async () => {
+              await handle.write(content.slice(0, 3));
+              throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+            },
+          });
+          return handle;
+        },
+        () => writeArtifactToDir(dir, relPath, content, options)
+      ),
+    runtime: async (dir, relPath, content, options) =>
+      writeArtifactOnRuntime(
+        await runtimeWithCat("head -c 3; exit 1"),
+        dir,
+        relPath,
+        content,
+        options
+      ),
+  };
+  // The same writers, with the agent writing the file while they write it.
+  const racedWriters: Record<keyof typeof writers, Writer> = {
+    host: (dir, relPath, content, options) =>
+      withHostOpen(
+        async (realOpen, ...args) => {
+          const [, flags] = args;
+          if (typeof flags === "number" && (flags & fsConstants.O_CREAT) !== 0) {
+            await fs.writeFile(path.join(dir, relPath), "agent page");
+          }
+          return realOpen(...args);
+        },
+        () => writeArtifactToDir(dir, relPath, content, options)
+      ),
+    runtime: async (dir, relPath, content, options) => {
+      const realCat = execFileSync("sh", ["-c", "command -v cat"]).toString().trim();
+      // The script runs in the leaf's folder.
+      const cat = `${realCat}; printf 'agent page' > ${path.basename(relPath)}`;
+      await writeArtifactOnRuntime(await runtimeWithCat(cat), dir, relPath, content, options);
+    },
+  };
+
+  describe.each(Object.entries(writers))("writing (%s)", (name, writeArtifact) => {
+    test("a createOnly write that fails part way leaves nothing, so the next one writes", async () => {
+      const failPartWay = partlyFailingWriters[name as keyof typeof writers];
+      expect(
+        await outcome(failPartWay(artifactsDir, "status.html", "starter", { createOnly: true }))
+      ).toBe("refused");
+      // No partial page, which every later createOnly write would keep, and no temp file.
+      expect(await fs.readdir(artifactsDir)).toEqual([]);
+      await writeArtifact(artifactsDir, "status.html", "starter", { createOnly: true });
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("starter");
+    });
+
+    test("createOnly keeps a file that the agent writes while it writes", async () => {
+      const raced = racedWriters[name as keyof typeof writers];
+      expect(
+        await outcome(raced(artifactsDir, "status.html", "starter", { createOnly: true }))
+      ).toBe("written");
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("agent page");
+      expect(await fs.readdir(artifactsDir)).toEqual(["status.html"]);
+    });
+
     test("creates missing folders and replaces the file in place", async () => {
       // The scratch dir exists; the artifacts folder and nested folders are created.
       await fs.mkdir(path.join(tempDir, "fresh"));
@@ -372,6 +484,29 @@ describe("artifactRuntimeStore", () => {
           () => false
         )
       ).toBe(false);
+    });
+
+    test("createOnly writes a missing file and leaves an existing one as it is", async () => {
+      await writeArtifact(artifactsDir, "status.html", "seed", { createOnly: true });
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("seed");
+      await fs.writeFile(path.join(artifactsDir, "status.html"), "agent page");
+      expect(
+        await outcome(writeArtifact(artifactsDir, "status.html", "seed", { createOnly: true }))
+      ).toBe("written");
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("agent page");
+      expect(await fs.readdir(artifactsDir)).toEqual(["status.html"]);
+
+      const outside = path.join(tempDir, "outside.txt");
+      await fs.writeFile(outside, "keep");
+      await fs.symlink(outside, path.join(artifactsDir, "leaf.html"));
+      await fs.symlink(path.join(tempDir, "missing.txt"), path.join(artifactsDir, "dangling.html"));
+      for (const leaf of ["leaf.html", "dangling.html"]) {
+        expect(await outcome(writeArtifact(artifactsDir, leaf, "x", { createOnly: true }))).toBe(
+          "refused"
+        );
+      }
+      expect(await fs.readFile(outside, "utf8")).toBe("keep");
+      expect(await fs.readdir(tempDir)).not.toContain("missing.txt");
     });
 
     test("never writes through symlinks or outside the dir", async () => {

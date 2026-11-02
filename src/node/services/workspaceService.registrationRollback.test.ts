@@ -23,6 +23,7 @@ import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import type { InitStateManager } from "./initStateManager";
 import { WorkspaceUseLeases, type WorkspaceUseLease } from "./workspaceUseLeases";
 import type { WorkspaceService } from "./workspaceService";
+import { stubStableIds } from "./taskService.testHarness";
 import {
   createWorkspaceServiceHarness,
   withTempMuxRoot,
@@ -183,7 +184,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     "create ($label) removes its worktree, session and init state and keeps the save error",
     async ({ awaitMaterialization }) => {
       const workspaceId = "aaaaaaaaa1";
-      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      stubStableIds(harness.config, [workspaceId]);
 
       await expectFailsWithSaveError(() => createWorktree("feature-a", awaitMaterialization));
       await expectNoCreationLeftovers(workspaceId, "feature-a", [projectPath]);
@@ -201,7 +202,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     const hook = path.join(projectPath, ".git", "hooks", "post-checkout");
     await fs.writeFile(hook, "#!/bin/sh\necho generated > generated.txt\n", { mode: 0o755 });
     const workspaceId = "aaaaaaaaa2";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
 
     await expectFailsWithSaveError(() => createWorktree("feature-hook"));
     await expectNoCreationLeftovers(workspaceId, "feature-hook", [projectPath]);
@@ -228,7 +229,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
   test("createMultiProject removes its worktrees, container, session and init state", async () => {
     const workspaceId = "bbbbbbbbb1";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     await expectFailsWithSaveError(() =>
       service.createMultiProject(projects(), "multi-a", "main", undefined, {
         type: "worktree",
@@ -265,7 +266,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     if (!source.success) throw new Error(source.error);
     const sourceId = source.data.metadata.id;
     const forkId = "ccccccccc1";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+    stubStableIds(harness.config, [forkId]);
 
     await expectFailsWithSaveError(() => service.fork(sourceId, "fork-a"));
     await expectNoCreationLeftovers(forkId, "fork-a", [projectPath]);
@@ -435,7 +436,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     async ({ existingBranch }) => {
       const tip = existingBranch ? branchWithOwnCommit(projectPath, "after-reg") : undefined;
       const workspaceId = "ddddddddd1";
-      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      stubStableIds(harness.config, [workspaceId]);
       spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
 
       const result = await createWorktree("after-reg");
@@ -464,7 +465,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       if (existingBranch) git(projectPath, "branch", "sanitize-fail");
       const tip = existingBranch ? git(projectPath, "rev-parse", "sanitize-fail") : undefined;
       const workspaceId = "ddddddddd4";
-      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      stubStableIds(harness.config, [workspaceId]);
       spyOn(
         service as unknown as {
           sanitizeStalePluginOverridesForNewWorkspace: () => Promise<string | undefined>;
@@ -493,7 +494,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
   test("create whose cleanup throws after the deregistration still reports it rolled back", async () => {
     const workspaceId = "ddddddddd2";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
     spyOn(initStateManager, "deleteInitStatus").mockRejectedValueOnce(new Error("EBUSY"));
 
@@ -515,7 +516,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     service.setWorkspaceGoalService(goals);
     spyOn(goals, "inheritFromFork").mockRejectedValueOnce(new Error("goal store unavailable"));
     const forkId = "ddddddddd3";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+    stubStableIds(harness.config, [forkId]);
 
     const result = await service.fork(sourceId, "fork-after-reg");
     expect(result.success ? "" : result.error).toContain("goal store unavailable");
@@ -530,7 +531,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     git(projectPath, "branch", "multi-after");
     const tip = git(projectPath, "rev-parse", "multi-after");
     const workspaceId = "ddddddddd5";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
 
     const create = () =>
@@ -638,7 +639,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
   test("createMultiProject keeps a failed registration another backend already uses", async () => {
     const workspaceId = "ddddddddd6";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     // Another backend starts a turn in the persisted row before the metadata read fails.
     const foreignLeases = new WorkspaceUseLeases(harness.config.rootDir);
     let foreignTurn: WorkspaceUseLease | undefined;
@@ -684,7 +685,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
   test("create keeps a failed registration another backend already uses", async () => {
     const workspaceId = "ddddddddd7";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     const foreign = foreignTurn(workspaceId);
     spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementationOnce(async () => {
       await foreign.hold();
@@ -702,7 +703,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
   test("create whose mutation gate cannot be taken keeps the row and discards its creation state", async () => {
     const workspaceId = "ddddddddda";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    stubStableIds(harness.config, [workspaceId]);
     spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
     spyOn(WorkspaceUseLeases.prototype, "acquireMutationGate").mockRejectedValueOnce(
       Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
@@ -723,7 +724,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     "create ($label) aborted by a failed sanitization keeps a row another backend already uses",
     async ({ awaitMaterialization }) => {
       const workspaceId = "ddddddddd8";
-      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      stubStableIds(harness.config, [workspaceId]);
       const foreign = foreignTurn(workspaceId);
       spyOn(
         service as unknown as {
@@ -766,7 +767,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     );
     service.setWorkspaceGoalService(goals);
     const forkId = "ddddddddd9";
-    spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+    stubStableIds(harness.config, [forkId]);
     const foreign = foreignTurn(forkId);
     spyOn(goals, "inheritFromFork").mockImplementationOnce(async () => {
       await foreign.hold();
@@ -1244,7 +1245,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
           });
           return cfg;
         });
-        spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+        stubStableIds(harness.config, [forkId]);
         // CoderSSHRuntime.forkWorkspace wraps this and adds the shared (existingWorkspace) configs.
         spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({
           success: true,

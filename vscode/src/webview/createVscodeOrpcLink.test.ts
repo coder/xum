@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import { describe, expect, test } from "bun:test";
 
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
@@ -39,11 +40,13 @@ class TestBridge implements VscodeBridge {
   }
 }
 
-function getLastSent(
+function getLastSent<Type extends WebviewToExtensionMessage["type"]>(
   bridge: TestBridge,
-  type: WebviewToExtensionMessage["type"]
-): WebviewToExtensionMessage {
-  const msg = [...bridge.sent].reverse().find((m) => m.type === type);
+  type: Type
+): Extract<WebviewToExtensionMessage, { type: Type }> {
+  const msg = [...bridge.sent]
+    .reverse()
+    .find((m): m is Extract<WebviewToExtensionMessage, { type: Type }> => m.type === type);
   if (!msg) {
     throw new Error(`Expected a message of type ${type}`);
   }
@@ -58,10 +61,10 @@ describe("createVscodeOrpcLink", () => {
     const promise = link.call(
       ["workspace", "sendMessage"],
       { workspaceId: "w", message: "hi" },
-      {} as any
+      { context: {} }
     );
 
-    const callMsg = getLastSent(bridge, "orpcCall") as any;
+    const callMsg = getLastSent(bridge, "orpcCall");
     bridge.emit({
       type: "orpcResponse",
       requestId: callMsg.requestId,
@@ -78,14 +81,17 @@ describe("createVscodeOrpcLink", () => {
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000 });
 
     const controller = new AbortController();
-    const promise = link.call(["general", "ping"], "hi", { signal: controller.signal } as any);
+    const promise = link.call(["general", "ping"], "hi", {
+      context: {},
+      signal: controller.signal,
+    });
 
-    const callMsg = getLastSent(bridge, "orpcCall") as any;
+    const callMsg = getLastSent(bridge, "orpcCall");
     controller.abort();
 
     await expect(promise).rejects.toThrow("aborted");
 
-    const cancelMsg = getLastSent(bridge, "orpcCancel") as any;
+    const cancelMsg = getLastSent(bridge, "orpcCancel");
     expect(cancelMsg.requestId).toBe(callMsg.requestId);
   });
 
@@ -93,13 +99,13 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 10 });
 
-    const promise = link.call(["general", "ping"], "hi", {} as any);
+    const promise = link.call(["general", "ping"], "hi", { context: {} });
 
-    const callMsg = getLastSent(bridge, "orpcCall") as any;
+    const callMsg = getLastSent(bridge, "orpcCall");
 
     await expect(promise).rejects.toThrow("timed out");
 
-    const cancelMsg = getLastSent(bridge, "orpcCancel") as any;
+    const cancelMsg = getLastSent(bridge, "orpcCancel");
     expect(cancelMsg.requestId).toBe(callMsg.requestId);
   });
 
@@ -107,9 +113,9 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000 });
 
-    const promise = link.call(["providers", "onConfigChanged"], undefined, {} as any);
+    const promise = link.call(["providers", "onConfigChanged"], undefined, { context: {} });
 
-    const callMsg = getLastSent(bridge, "orpcCall") as any;
+    const callMsg = getLastSent(bridge, "orpcCall");
     bridge.emit({
       type: "orpcResponse",
       requestId: callMsg.requestId,
@@ -136,9 +142,9 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000, maxBufferedStreamEvents: 1 });
 
-    const promise = link.call(["providers", "onConfigChanged"], undefined, {} as any);
+    const promise = link.call(["providers", "onConfigChanged"], undefined, { context: {} });
 
-    const callMsg = getLastSent(bridge, "orpcCall") as any;
+    const callMsg = getLastSent(bridge, "orpcCall");
     bridge.emit({
       type: "orpcResponse",
       requestId: callMsg.requestId,
@@ -155,7 +161,7 @@ describe("createVscodeOrpcLink", () => {
 
     await expect(iterator.next()).rejects.toThrow("buffer overflow");
 
-    const cancelMsg = getLastSent(bridge, "orpcStreamCancel") as any;
+    const cancelMsg = getLastSent(bridge, "orpcStreamCancel");
     expect(cancelMsg.streamId).toBe("s-overflow");
   });
 });

@@ -11,6 +11,7 @@ import { userEvent, waitFor, within } from "storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
+import { waitForModalLayer } from "./storyPlayHelpers";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
@@ -54,7 +55,7 @@ async function openConsentDialog(canvasElement: HTMLElement): Promise<HTMLElemen
   if (!descriptionId || !document.getElementById(descriptionId)?.textContent?.trim()) {
     throw new Error("Consent dialog must expose a readable accessible description");
   }
-  return dialog;
+  return waitForModalLayer(dialog);
 }
 
 export default {

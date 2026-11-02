@@ -22,7 +22,7 @@ import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
+import { ChatStatsSchema, ChatUsageDisplaySchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   SendMessageAcceptedSchema,
@@ -68,7 +68,7 @@ import {
 import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
-  ArtifactReadResultSchema,
+  ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
   ArtifactVersionListSchema,
@@ -148,12 +148,13 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftDeleteInputSchema,
   CreationDraftImportLegacyInputSchema,
   CreationDraftListSchema,
   CreationDraftSchema,
   CreationDraftScopeSchema,
-  CreationDraftSummarySchema,
   CreationDraftUpdateInputSchema,
+  CreationDraftUpdateOutputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -215,7 +216,7 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallMethodSchema,
-  AgentPluginInstallPreviewSchema,
+  AgentPluginSourcePreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
@@ -452,10 +453,6 @@ export const ProviderConfigInfoSchema = z.object({
   aws: AWSCredentialStatusSchema.optional(),
   /** Google Vertex AI-specific fields (only present for google-vertex provider) */
   googleVertex: GoogleVertexCredentialStatusSchema.optional(),
-  /** Xum Gateway-specific fields */
-  couponCodeSet: z.boolean().optional(),
-  /** Xum Gateway-specific: which models are enabled for gateway routing */
-  gatewayModels: z.array(z.string()).optional(),
   /** Coder-only: deployment access URL (e.g. https://coder.example.com) */
   deploymentUrl: z.string().optional(),
   /** Coder-only: whether Coder OAuth tokens are present in providers.jsonc */
@@ -639,34 +636,6 @@ export const providers = {
   },
 };
 
-// Xum Gateway OAuth (desktop login flow)
-export const muxGatewayOauth = {
-  startDesktopFlow: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
 // GitHub Copilot OAuth (Device Code Flow)
 export const copilotOauth = {
   startDeviceFlow: {
@@ -782,20 +751,6 @@ export const coderOauth = {
   refreshProviders: {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
-  },
-};
-
-// Xum Gateway
-export const muxGateway = {
-  getAccountStatus: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        remaining_microdollars: z.number().int().nonnegative(),
-        ai_gateway_concurrent_requests_per_user: z.number().int().nonnegative(),
-      }),
-      z.string()
-    ),
   },
 };
 
@@ -1300,7 +1255,8 @@ export const agentPlugins = {
       /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
       method: AgentPluginInstallMethodSchema.nullish(),
     }),
-    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+    /** A plugin preview, or the entries of a Claude Code marketplace repository. */
+    output: ResultSchema(AgentPluginSourcePreviewSchema, z.string()),
   },
   /**
    * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
@@ -1344,6 +1300,8 @@ export const agentPlugins = {
       key: z.string(),
       hash: z.string(),
       state: z.enum(["trusted", "disabled"]).nullable(),
+      /** `getHooks().fileReview.digest`: required to trust while that review is shown. */
+      fileReviewDigest: z.string().optional(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -1505,6 +1463,10 @@ const DebugLlmRequestSnapshotSchema = z
 const ArchiveLossyUntrackedFilesConfirmationSchema = z.object({
   kind: z.literal("confirm-lossy-untracked-files"),
   paths: z.array(z.string()),
+  /** Sub-agents the archive cascades over whose snapshot archives would lose these paths. */
+  subagents: z
+    .array(z.object({ workspaceId: z.string(), title: z.string(), paths: z.array(z.string()) }))
+    .optional(),
 });
 
 const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
@@ -1533,7 +1495,7 @@ export const artifacts = {
       /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
       maxBytes: z.number().int().positive().nullish(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
   capabilities: {
@@ -1552,7 +1514,7 @@ export const artifacts = {
       artifactId: z.string(),
       version: z.number().int().positive(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
@@ -1579,7 +1541,7 @@ export const artifacts = {
   /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
   listShelf: {
@@ -1593,7 +1555,7 @@ export const artifacts = {
       scope: ArtifactShelfScopeSchema,
       name: z.string(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** User pin: copy one stored version to the project or global shelf. */
   pinToShelf: {
@@ -1616,7 +1578,7 @@ export const artifacts = {
     output: ResultSchema(z.void(), z.string()),
   },
   /**
-   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * A send the user clicked or confirmed in the Artifacts tab (window.xum.send or a canvas button). The
    * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
    * `version: null` targets the live file (latest stored version).
    */
@@ -2115,6 +2077,8 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
+      /** Per sub-agent workspace ID: the untracked paths the user confirmed losing. */
+      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).optional(),
     }),
     output: ResultSchema(ArchiveWorkspaceResultSchema, z.string()),
   },
@@ -2651,6 +2615,11 @@ export const workspace = {
             workspaceId: z.string(),
             activity: WorkspaceActivitySnapshotSchema.nullable(),
           }),
+          // A write changed this workspace's session usage (its ledger or a running stream's).
+          z.object({
+            type: z.literal("usage-changed"),
+            workspaceId: z.string(),
+          }),
           HeartbeatEventSchema,
         ])
       ),
@@ -2844,6 +2813,22 @@ export const workspace = {
   getSessionUsage: {
     input: z.object({ workspaceId: z.string() }),
     output: SessionUsageFileSchema.optional(),
+  },
+  /**
+   * Usage of the workspace's sub-agents that still exist (not yet rolled into its ledger).
+   * The Costs tab adds it to the session cost so delegated spend is visible before removal.
+   */
+  getSubagentUsage: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.object({
+      children: z.record(
+        z.string(),
+        z.object({
+          byModel: z.record(z.string(), ChatUsageDisplaySchema),
+          workspaceCount: z.number().int().nonnegative(),
+        })
+      ),
+    }),
   },
   /** Batch fetch session usage for multiple workspaces (for archived workspaces cost display) */
   getSessionUsageBatch: {
@@ -3420,8 +3405,6 @@ export const config = {
     output: z.object({
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
-      muxGatewayEnabled: z.boolean().optional(),
-      muxGatewayModels: z.array(z.string()).optional(),
       routePriority: z.array(z.string()).optional(),
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
@@ -3471,13 +3454,6 @@ export const config = {
   updateAgentAiDefaults: {
     input: z.object({
       agentAiDefaults: AgentAiDefaultsSchema,
-    }),
-    output: z.void(),
-  },
-  updateMuxGatewayPrefs: {
-    input: z.object({
-      muxGatewayEnabled: z.boolean(),
-      muxGatewayModels: z.array(z.string()),
     }),
     output: z.void(),
   },
@@ -3948,10 +3924,10 @@ export const drafts = {
   },
   updateCreation: {
     input: CreationDraftUpdateInputSchema,
-    output: CreationDraftSummarySchema,
+    output: CreationDraftUpdateOutputSchema,
   },
   deleteCreation: {
-    input: z.object({ scope: CreationDraftScopeSchema }),
+    input: CreationDraftDeleteInputSchema,
     output: z.void(),
   },
   importLegacyCreation: {
@@ -4081,8 +4057,10 @@ export const general = {
     input: z.object({
       workspaceId: z.string(),
       launchToken: z.string().min(1).max(128),
+      // An SSH checkout path the editor opens; one under `~` comes back resolved on the host.
+      remotePath: z.string().nullish(),
     }),
-    output: ResultSchema(z.void(), z.string()),
+    output: ResultSchema(z.object({ remotePath: z.string() }).nullish(), z.string()),
   },
   /**
    * Undo a recordEditorOpen whose deep-link launch provably never happened (the renderer's

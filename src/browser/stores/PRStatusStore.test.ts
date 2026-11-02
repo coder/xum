@@ -1,4 +1,6 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn, vi } from "bun:test";
+import { advanceClock, advanceClockUntil, drainMicrotasks } from "@/browser/testFakeClock";
+import { createTestApiClient } from "@/browser/testUtils";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeStatus } from "./RuntimeStatusStore";
@@ -9,7 +11,19 @@ const DEVCONTAINER_RUNTIME = {
   configPath: ".devcontainer/devcontainer.json",
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// The store refreshes through RefreshController (a 5 s debounce, a cooldown) and a promise pipeline,
+// so every test runs on a fake clock: waits take no real time, and a negative check advances past
+// the whole window it claims nothing happens in.
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+/** Longer than the store's 5 s refresh debounce: a refresh it scheduled has run by then. */
+const REFRESH_WINDOW_MS = 6000;
 
 function createWorkspaceMetadata(
   workspaceId: string,
@@ -25,14 +39,8 @@ function createWorkspaceMetadata(
   };
 }
 
-async function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
-    if (Date.now() >= deadline) {
-      throw new Error("Timed out waiting for passive GitHub refresh");
-    }
-    await sleep(10);
-  }
+function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<void> {
+  return advanceClockUntil(condition, timeoutMs, "passive GitHub refresh");
 }
 
 function createRuntimeStatusStoreMock(initialStatus: RuntimeStatus | null) {
@@ -78,25 +86,23 @@ async function runPassiveRefreshScenario(
     return Promise.resolve({ success: false as const, error: "gh unavailable" });
   });
 
-  const store = new PRStatusStore({
-    getStatus: () => runtimeStatus,
-  });
+  const runtime = createRuntimeStatusStoreMock(runtimeStatus);
+  const store = new PRStatusStore(runtime.runtimeStatusStore);
 
   try {
-    store.setClient({
-      workspace: {
-        executeBash,
-      },
-    } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+    store.setClient(createTestApiClient({ workspace: { executeBash } }));
 
     store.syncWorkspaces(new Map([[metadata.id, metadata]]));
-    await sleep(0);
+    await drainMicrotasks();
     store.subscribeWorkspace(metadata.id, () => undefined);
 
     if (shouldRun) {
       await waitUntil(() => executeBash.mock.calls.length === 2);
     } else {
-      await sleep(100);
+      // Positive barrier first: the refresh reached the runtime gate and now waits for the
+      // container to run. Then a whole refresh window passes without a probe.
+      await waitUntil(() => runtime.getListenerCount(metadata.id) > 0);
+      await advanceClock(REFRESH_WINDOW_MS);
     }
 
     return executeBash.mock.calls.length;
@@ -145,14 +151,10 @@ describe("passive refresh runtime gating", () => {
     const store = new PRStatusStore(runtimeStatusStore.runtimeStatusStore);
 
     try {
-      store.setClient({
-        workspace: {
-          executeBash,
-        },
-      } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+      store.setClient(createTestApiClient({ workspace: { executeBash } }));
 
       store.syncWorkspaces(new Map([[metadata.id, metadata]]));
-      await sleep(0);
+      await drainMicrotasks();
       store.subscribeWorkspace(metadata.id, () => undefined);
 
       await waitUntil(() => runtimeStatusStore.getListenerCount(metadata.id) > 0);
@@ -177,14 +179,10 @@ describe("passive refresh runtime gating", () => {
     const store = new PRStatusStore(runtimeStatusStore.runtimeStatusStore);
 
     try {
-      store.setClient({
-        workspace: {
-          executeBash,
-        },
-      } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+      store.setClient(createTestApiClient({ workspace: { executeBash } }));
 
       store.syncWorkspaces(new Map([[metadata.id, metadata]]));
-      await sleep(0);
+      await drainMicrotasks();
       store.subscribeWorkspace(metadata.id, () => undefined);
 
       await waitUntil(() => runtimeStatusStore.getListenerCount(metadata.id) > 0);
@@ -192,8 +190,10 @@ describe("passive refresh runtime gating", () => {
 
       runtimeStatusStore.setStatus("stopped");
       runtimeStatusStore.emit(metadata.id);
-      await sleep(100);
+      await advanceClock(REFRESH_WINDOW_MS);
 
+      // Still waiting for the container to run, and no probe in the whole refresh window.
+      expect(runtimeStatusStore.getListenerCount(metadata.id)).toBe(1);
       expect(executeBash.mock.calls.length).toBe(0);
     } finally {
       store.dispose();
@@ -232,9 +232,7 @@ describe("chat replay gating", () => {
             return () => gateListeners.delete(listener);
           },
         });
-        store.setClient({
-          workspace: { executeBash },
-        } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+        store.setClient(createTestApiClient({ workspace: { executeBash } }));
         store.syncWorkspaces(new Map([[metadata.id, metadata]]));
         const unsubscribe = store.subscribeWorkspace(metadata.id, () => undefined);
 
@@ -293,9 +291,7 @@ describe("metadata-driven refreshes", () => {
       await gate;
       return respond(input.script);
     });
-    const client = { workspace: { executeBash } } as unknown as Parameters<
-      PRStatusStore["setClient"]
-    >[0];
+    const client = createTestApiClient({ workspace: { executeBash } });
     const store = new PRStatusStore({ getStatus: () => null });
     let metadata = new Map([
       [open.id, open],
@@ -306,7 +302,9 @@ describe("metadata-driven refreshes", () => {
     store.syncWorkspaces(metadata);
     let unsubscribe = store.subscribeWorkspace(open.id, () => undefined);
     await waitUntil(() => executeBash.mock.calls.length >= 2);
-    await sleep(20);
+    // Let both probes settle and write their cache entries (no clock time passes).
+    await drainMicrotasks();
+    expect(store.getWorkspacePR(open.id)).toBeDefined();
 
     // Optionally age every PR and stack cache entry past its TTL so any refresh would probe again.
     const realNow = Date.now.bind(Date);
@@ -361,9 +359,13 @@ describe("metadata-driven refreshes", () => {
       workspace.emit("pr-other", { title: `Other ${i}`, isInitializing: i % 2 === 0 });
       workspace.emit("pr-open", { title: `Open ${i}`, tags: { round: String(i) } });
     }
-    await sleep(50);
-
+    // A refresh these events scheduled would run within the 5 s debounce.
+    await advanceClock(REFRESH_WINDOW_MS);
     expect(workspace.executeBash.mock.calls.length).toBe(0);
+
+    // Positive control: the store is live and its caches are stale, so a relevant change probes.
+    workspace.emit("pr-open", { name: "pr-open-renamed" });
+    await waitUntil(() => workspace.executeBash.mock.calls.length === 2, 1000);
   });
 
   it("probes promptly when the open workspace's runtime changes", async () => {
@@ -389,7 +391,9 @@ describe("metadata-driven refreshes", () => {
     using workspace = await openWorkspace({ ageCaches: false });
     workspace.unsubscribe();
     workspace.emit("pr-open", { name: "pr-open-renamed" });
-    await sleep(50);
+    // syncWorkspaces decides synchronously; no clock time passes, so the caches stay fresh and
+    // only the remembered change can make the resubscribe below probe.
+    await drainMicrotasks();
     expect(workspace.executeBash.mock.calls.length).toBe(0);
 
     workspace.resubscribe();
@@ -406,7 +410,8 @@ describe("metadata-driven refreshes", () => {
 
     workspace.unsubscribe();
     workspace.resubscribe();
-    await sleep(100);
+    // The resubscribe's refresh runs at once; stay inside the 5 s PR cache TTL.
+    await advanceClock(4000);
 
     expect(workspace.executeBash.mock.calls.length).toBe(2);
   });
@@ -433,7 +438,7 @@ describe("metadata-driven refreshes", () => {
     // The new checkout has no PR. No focus, subscription or metadata event follows.
     workspace.setResponse(noPullRequest);
     await waitUntil(() => workspace.store.getWorkspacePR("pr-open")?.prLink === null, 8000);
-  }, 15_000);
+  });
 
   it("stops retrying a failing checkout-change probe after three attempts", async () => {
     using workspace = await openWorkspace({ ageCaches: false });
@@ -443,9 +448,9 @@ describe("metadata-driven refreshes", () => {
 
     // Three attempts of two probes each, one 5 s refresh debounce apart, then nothing.
     await waitUntil(() => workspace.executeBash.mock.calls.length === 6, 12_000);
-    await sleep(6000);
+    await advanceClock(REFRESH_WINDOW_MS);
     expect(workspace.executeBash.mock.calls.length).toBe(6);
-  }, 25_000);
+  });
 
   it("probes again when the open workspace moves during a probe", async () => {
     using workspace = await openWorkspace({ ageCaches: false });
@@ -459,7 +464,7 @@ describe("metadata-driven refreshes", () => {
 
     // The follow-up waits for the 5 s refresh debounce after the in-flight probes finish.
     await waitUntil(() => workspace.executeBash.mock.calls.length === 4, 8000);
-  }, 15_000);
+  });
 });
 
 describe("parseMergeQueueEntry", () => {

@@ -13,6 +13,7 @@ import { isMultiProject } from "@/common/utils/multiProject";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import {
   pinTimelineRevealTarget,
+  sumSessionTokens,
   useWorkspaceLastUserPromptInfo,
   useWorkspaceRoundedStreamingTps,
   useWorkspaceSidebarState,
@@ -225,18 +226,19 @@ function FooterProjectLabel(props: { projectLabel: string }) {
 
 /** Subscribe at the leaf so streaming deltas do not re-render the transcript subtree. */
 function FooterUsageStats(props: { workspaceId: string }) {
-  const usage = useWorkspaceUsage(props.workspaceId);
+  // The whole tree's session tokens, as the Costs tab and the sidebar overview count them.
+  const tokens = sumSessionTokens(useWorkspaceUsage(props.workspaceId));
   // Chrome only paints a rounded value; keep identical provider chunks from committing/layouting it.
   const roundedTps = useWorkspaceRoundedStreamingTps(props.workspaceId);
 
-  if (usage.totalTokens <= 0 && roundedTps === null) {
+  if (tokens <= 0 && roundedTps === null) {
     return null;
   }
 
   return (
     <span className="flex shrink-0 items-center gap-1.5">
       <span className="text-foreground counter-nums">
-        {formatTokens(usage.totalTokens)} <span className="text-muted">tok</span>
+        {formatTokens(tokens)} <span className="text-muted">tok</span>
       </span>
       {roundedTps !== null && (
         <span className="text-foreground counter-nums">
@@ -445,7 +447,7 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
-      <div className="scrollbar-none scroll-fade-x flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
+      <div className="scroll-fade-x flex min-h-7 scrollbar-none items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
         <RuntimeBadge
           runtimeConfig={props.runtimeConfig}
           isWorking={isWorking}

@@ -11,6 +11,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 export class TestTempDir implements Disposable {
   public readonly path: string;
@@ -413,6 +414,7 @@ export function createTestToolConfig(
     // Production always wires a WorkspaceTurnManager next to TaskService; task tools require
     // it up front. Tests that exercise workspace turns override this with the methods they use.
     workspaceTurnManager: createFakeWorkspaceTurnManager(),
+    sessionLocks: nodeSessionLocks,
   };
 }
 

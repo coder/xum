@@ -22,7 +22,12 @@ const preview: AgentPluginInstallPreview = {
   manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
   targetPath: "~/.xum/plugins/review-tools",
   skills: [
-    { name: "review", description: "Review a change" },
+    // Long prose description: at phone width it must wrap between words, not mid-word.
+    {
+      name: "review",
+      description:
+        "Picks the smallest change that fully solves the task, then reviews it for scope creep",
+    },
     { name: "research", description: "Research a topic" },
   ],
   mcpServers: [
@@ -33,13 +38,16 @@ const preview: AgentPluginInstallPreview = {
     },
   ],
   agents: ["reviewer.md"],
+  readonlyAgents: [],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
   consentDigest: "c".repeat(64),
   reviewedComponents: [],
   codexHooks: [],
+  fileChanges: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
+  notApplied: [],
 };
 
 function setupPluginSettings(installed = false, conflict = false) {
@@ -70,7 +78,8 @@ function setupPluginSettings(installed = false, conflict = false) {
         }),
     },
   };
-  client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
+  client.agentPlugins.preview = () =>
+    Promise.resolve({ success: true, data: { kind: "plugin", preview } });
   client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
   client.agentPlugins.list = () =>
     Promise.resolve({

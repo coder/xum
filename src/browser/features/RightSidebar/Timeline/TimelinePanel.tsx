@@ -838,7 +838,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
       }}
     >
       <div className="border-border shrink-0 border-b px-3 py-2.5">
-        <div className="scrollbar-none scroll-fade-x flex min-w-0 gap-1.5 overflow-x-auto">
+        <div className="scroll-fade-x flex min-w-0 scrollbar-none gap-1.5 overflow-x-auto">
           {FILTERS.map((item) => (
             <button
               key={item.value}
@@ -856,7 +856,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
         </div>
       </div>
 
-      <div className="scrollbar-none min-h-0 min-w-0 flex-1 overflow-y-auto px-3 py-3">
+      <div className="min-h-0 min-w-0 flex-1 scrollbar-none overflow-y-auto px-3 py-3">
         {!timeline.initialized ? (
           <div className="text-muted flex h-full items-center justify-center text-sm">
             Loading timeline…

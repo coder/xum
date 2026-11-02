@@ -201,6 +201,36 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     expect(peekChatError("ws-notice")).toBeUndefined();
   });
 
+  test("a continuation notice (info) replaces the one still waiting, unlike a warning", () => {
+    const notice = (message: string, severity?: "info"): WorkspaceChatMessage => ({
+      type: "plugin-hook-notice",
+      workspaceId: "ws-info-notice",
+      plugin: "ralph",
+      message,
+      ...(severity != null ? { severity } : {}),
+    });
+    const aggregator = new StubAggregator();
+
+    applyWorkspaceChatEventToAggregator(
+      aggregator,
+      notice("plugin continued turn 1 of 50", "info")
+    );
+    applyWorkspaceChatEventToAggregator(
+      aggregator,
+      notice("plugin continued turn 2 of 50", "info")
+    );
+    expect(peekChatError("ws-info-notice")).toBe("Plugin ralph: plugin continued turn 2 of 50");
+    dismissChatError("ws-info-notice", "Plugin ralph: plugin continued turn 2 of 50");
+    expect(peekChatError("ws-info-notice")).toBeUndefined();
+
+    applyWorkspaceChatEventToAggregator(aggregator, notice("first warning"));
+    applyWorkspaceChatEventToAggregator(aggregator, notice("second warning"));
+    expect(peekChatError("ws-info-notice")).toBe("Plugin ralph: first warning");
+    dismissChatError("ws-info-notice", "Plugin ralph: first warning");
+    expect(peekChatError("ws-info-notice")).toBe("Plugin ralph: second warning");
+    dismissChatError("ws-info-notice", "Plugin ralph: second warning");
+  });
+
   test("a long plugin hook notice is cut to a toast-safe length", () => {
     const long = "x".repeat(16 * 1024);
     applyWorkspaceChatEventToAggregator(new StubAggregator(), {

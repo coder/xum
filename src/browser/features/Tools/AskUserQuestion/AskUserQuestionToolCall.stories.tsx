@@ -12,6 +12,18 @@ import type { ComponentType } from "react";
 const meta = { ...appMeta, title: "App/Chat/Tools/AskUserQuestion" };
 export default meta;
 
+/** The dock above the chat input that holds an open question's form. */
+async function findQuestionDock(storyRoot: HTMLElement): Promise<HTMLElement> {
+  return waitFor(
+    () => {
+      const dock = storyRoot.querySelector<HTMLElement>('[data-component="AskUserQuestionDock"]');
+      if (!dock) throw new Error("Open question is not docked above the chat input");
+      return dock;
+    },
+    { timeout: 8000 }
+  );
+}
+
 /** Streaming/working state with ask_user_question pending */
 export const AskUserQuestionPending: AppStory = {
   render: () => (
@@ -60,7 +72,8 @@ export const AskUserQuestionPending: AppStory = {
   ),
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
-    const canvas = within(storyRoot);
+    // The open question's form lives in the dock above the chat input; its transcript row is a stub.
+    const canvas = within(await findQuestionDock(storyRoot));
 
     // Wait for the tool card to appear (header is rendered even when collapsed).
     const toolTitle = await canvas.findByText(/ask_user_question/, {}, { timeout: 8000 });
@@ -295,7 +308,7 @@ export const AskUserQuestionTouchPhone: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
-    const canvas = within(storyRoot);
+    const canvas = within(await findQuestionDock(storyRoot));
     const toolTitle = await canvas.findByText(/ask_user_question/, {}, { timeout: 8000 });
     if (!canvas.queryByText("Summary")) {
       await userEvent.click(toolTitle);

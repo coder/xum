@@ -95,6 +95,7 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
  *   (native max; the API rejects "none", so reasoning cannot be disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
+ * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
  * - Gemini 3.8 Flash / Gemini 4 Argon → ["low", "medium", "high"] (no minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
@@ -146,7 +147,7 @@ const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"]
 function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Normalize to be robust to provider prefixes, whitespace, gateway wrappers, and version
   // suffixes. Strips both a `provider:` prefix and any upstream-provider path segment that
-  // proxies encode (e.g. `mux-gateway:openai/gpt-6-astra` -> `gpt-6-astra`).
+  // proxies encode (e.g. `openrouter:openai/gpt-6-astra` -> `gpt-6-astra`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
   // Claude Sonnet 5.5 rejects `disabled` too, but its "off" maps to `between_tools`
@@ -175,7 +176,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
-  // GPT-6 Luna supports both disabled reasoning and native max.
+  // GPT-6 Luna and the GPT-5.6 family support both disabled reasoning and native max.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }

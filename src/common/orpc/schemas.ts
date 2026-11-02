@@ -195,8 +195,6 @@ export {
   ModelCatalogEntrySchema,
   ModelCatalogSearchInputSchema,
   ModelCatalogSearchResultSchema,
-  muxGateway,
-  muxGatewayOauth,
   copilotOauth,
   codexOauth,
   coderOauth,

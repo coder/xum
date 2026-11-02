@@ -1,0 +1,117 @@
+[
+  {
+    "step": "a. append user and assistant rows",
+    "listing": ["chat.jsonl", "history-append-provenance.json"],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"model\":\"anthropic:test\",\"historySequence\":1},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"402\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}"
+    }
+  },
+  {
+    "step": "b. write and commit a partial",
+    "listing": ["chat.jsonl", "history-append-provenance.json"],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"model\":\"anthropic:test\",\"historySequence\":1},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-2\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225602000,\"historySequence\":2,\"model\":\"anthropic:test\",\"partial\":true},\"parts\":[{\"type\":\"text\",\"text\":\"Streamed answer\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"644\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}"
+    }
+  },
+  {
+    "step": "c. edit an assistant row",
+    "listing": ["chat.jsonl", "history-append-provenance.json"],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-2\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225602000,\"historySequence\":2,\"model\":\"anthropic:test\",\"partial\":true},\"parts\":[{\"type\":\"text\",\"text\":\"Streamed answer\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"652\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}"
+    }
+  },
+  {
+    "step": "d. append a compaction boundary (rotates rows into chat-archive.jsonl)",
+    "listing": ["chat-archive.jsonl", "chat.jsonl", "history-append-provenance.json"],
+    "files": {
+      "chat-archive.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-2\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225602000,\"historySequence\":2,\"model\":\"anthropic:test\",\"partial\":true},\"parts\":[{\"type\":\"text\",\"text\":\"Streamed answer\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "chat.jsonl": "{\"id\":\"boundary-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225603000,\"compacted\":\"user\",\"compactionBoundary\":true,\"compactionEpoch\":1,\"muxMetadata\":{\"type\":\"compaction-summary\"},\"historySequence\":3},\"parts\":[{\"type\":\"text\",\"text\":\"Compacted summary\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"312\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"652\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"}}}"
+    }
+  },
+  {
+    "step": "e. write the journal, the pending state and the cancellation record",
+    "listing": [
+      "chat-archive.jsonl",
+      "chat.jsonl",
+      "compaction-cancellation.json",
+      "continuous-compaction-generation",
+      "continuous-compaction.json",
+      "history-append-provenance.json",
+      "post-compaction.json"
+    ],
+    "files": {
+      "chat-archive.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-2\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225602000,\"historySequence\":2,\"model\":\"anthropic:test\",\"partial\":true},\"parts\":[{\"type\":\"text\",\"text\":\"Streamed answer\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "chat.jsonl": "{\"id\":\"boundary-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225603000,\"compacted\":\"user\",\"compactionBoundary\":true,\"compactionEpoch\":1,\"muxMetadata\":{\"type\":\"compaction-summary\"},\"historySequence\":3},\"parts\":[{\"type\":\"text\",\"text\":\"Compacted summary\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "compaction-cancellation.json": "{\"version\":2,\"nonce\":\"golden-nonce\",\"scope\":{\"kind\":\"unresolved\"},\"settledGeneration\":\"<random string>\"}",
+      "continuous-compaction-generation": "<random 36 chars>",
+      "continuous-compaction.json": "{\"version\":1,\"publicationGeneration\":\"<random string>\",\"boundary\":{\"id\":\"journal-summary\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225604000,\"compactionBoundary\":true,\"compactionEpoch\":2},\"parts\":[{\"type\":\"text\",\"text\":\"Prepared summary\",\"state\":\"done\"}]},\"staticCopies\":[],\"liveTailCopySpec\":{\"sourceMessageId\":\"live\",\"sourceHistorySequence\":4,\"copyId\":\"copy\",\"partIndex\":0,\"metadataTemplate\":{\"synthetic\":true,\"rlmPreservedTailCopy\":true}},\"postCompactionAttachments\":[],\"prefixSourceRows\":[],\"systemPrefix\":[],\"cacheEnabled\":false,\"preparation\":{\"modelString\":\"anthropic:test\",\"providerForMessages\":\"anthropic\",\"effectiveThinkingLevel\":\"off\",\"effectiveAgentId\":\"exec\",\"toolNamesForSentinel\":[]},\"providerFamily\":\"anthropic\",\"parentModel\":\"anthropic:test\",\"summaryModel\":\"anthropic:test\",\"headFingerprint\":\"head\",\"sourceFingerprint\":\"source\",\"headEnd\":{\"id\":\"boundary-1\",\"sequence\":3},\"epoch\":1,\"streamMessageId\":\"live\",\"streamHistorySequence\":4,\"stepNumber\":0,\"firstTailToolCallId\":\"tool\",\"prefix\":[{\"role\":\"user\",\"content\":\"Prepared prefix\"}]}",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"312\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"652\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"}}}",
+      "post-compaction.json": "{\"version\":1,\"createdAt\":\"<random number>\",\"diffs\":[],\"loadedSkills\":[],\"readFiles\":[\"/golden.ts\"],\"boundaryMessageId\":\"journal-summary\",\"writeId\":\"<random string>\",\"publicationGeneration\":\"<random string>\"}"
+    }
+  },
+  {
+    "step": "f. truncate after an archived message",
+    "listing": [
+      "chat.jsonl",
+      "compaction-cancellation.json",
+      "continuous-compaction-generation",
+      "continuous-compaction.json",
+      "history-append-provenance.json",
+      "post-compaction.json"
+    ],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "compaction-cancellation.json": "{\"version\":2,\"nonce\":\"golden-nonce\",\"scope\":{\"kind\":\"unresolved\"},\"settledGeneration\":\"<random string>\"}",
+      "continuous-compaction-generation": "<random 36 chars>",
+      "continuous-compaction.json": "{\"version\":1,\"publicationGeneration\":\"<random string>\",\"boundary\":{\"id\":\"journal-summary\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225604000,\"compactionBoundary\":true,\"compactionEpoch\":2},\"parts\":[{\"type\":\"text\",\"text\":\"Prepared summary\",\"state\":\"done\"}]},\"staticCopies\":[],\"liveTailCopySpec\":{\"sourceMessageId\":\"live\",\"sourceHistorySequence\":4,\"copyId\":\"copy\",\"partIndex\":0,\"metadataTemplate\":{\"synthetic\":true,\"rlmPreservedTailCopy\":true}},\"postCompactionAttachments\":[],\"prefixSourceRows\":[],\"systemPrefix\":[],\"cacheEnabled\":false,\"preparation\":{\"modelString\":\"anthropic:test\",\"providerForMessages\":\"anthropic\",\"effectiveThinkingLevel\":\"off\",\"effectiveAgentId\":\"exec\",\"toolNamesForSentinel\":[]},\"providerFamily\":\"anthropic\",\"parentModel\":\"anthropic:test\",\"summaryModel\":\"anthropic:test\",\"headFingerprint\":\"head\",\"sourceFingerprint\":\"source\",\"headEnd\":{\"id\":\"boundary-1\",\"sequence\":3},\"epoch\":1,\"streamMessageId\":\"live\",\"streamHistorySequence\":4,\"stepNumber\":0,\"firstTailToolCallId\":\"tool\",\"prefix\":[{\"role\":\"user\",\"content\":\"Prepared prefix\"}]}",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"410\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}",
+      "post-compaction.json": "{\"version\":1,\"createdAt\":\"<random number>\",\"diffs\":[],\"loadedSkills\":[],\"readFiles\":[\"/golden.ts\"],\"boundaryMessageId\":\"journal-summary\",\"writeId\":\"<random string>\",\"publicationGeneration\":\"<random string>\"}"
+    }
+  },
+  {
+    "step": "g. write a partial that stays on disk",
+    "listing": [
+      "chat.jsonl",
+      "compaction-cancellation.json",
+      "continuous-compaction-generation",
+      "continuous-compaction.json",
+      "history-append-provenance.json",
+      "partial.json",
+      "post-compaction.json"
+    ],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "compaction-cancellation.json": "{\"version\":2,\"nonce\":\"golden-nonce\",\"scope\":{\"kind\":\"unresolved\"},\"settledGeneration\":\"<random string>\"}",
+      "continuous-compaction-generation": "<random 36 chars>",
+      "continuous-compaction.json": "{\"version\":1,\"publicationGeneration\":\"<random string>\",\"boundary\":{\"id\":\"journal-summary\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225604000,\"compactionBoundary\":true,\"compactionEpoch\":2},\"parts\":[{\"type\":\"text\",\"text\":\"Prepared summary\",\"state\":\"done\"}]},\"staticCopies\":[],\"liveTailCopySpec\":{\"sourceMessageId\":\"live\",\"sourceHistorySequence\":4,\"copyId\":\"copy\",\"partIndex\":0,\"metadataTemplate\":{\"synthetic\":true,\"rlmPreservedTailCopy\":true}},\"postCompactionAttachments\":[],\"prefixSourceRows\":[],\"systemPrefix\":[],\"cacheEnabled\":false,\"preparation\":{\"modelString\":\"anthropic:test\",\"providerForMessages\":\"anthropic\",\"effectiveThinkingLevel\":\"off\",\"effectiveAgentId\":\"exec\",\"toolNamesForSentinel\":[]},\"providerFamily\":\"anthropic\",\"parentModel\":\"anthropic:test\",\"summaryModel\":\"anthropic:test\",\"headFingerprint\":\"head\",\"sourceFingerprint\":\"source\",\"headEnd\":{\"id\":\"boundary-1\",\"sequence\":3},\"epoch\":1,\"streamMessageId\":\"live\",\"streamHistorySequence\":4,\"stepNumber\":0,\"firstTailToolCallId\":\"tool\",\"prefix\":[{\"role\":\"user\",\"content\":\"Prepared prefix\"}]}",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"410\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}",
+      "partial.json": "{\n  \"id\": \"assistant-3\",\n  \"role\": \"assistant\",\n  \"metadata\": {\n    \"timestamp\": 1767225605000,\n    \"historySequence\": 2,\n    \"model\": \"anthropic:test\",\n    \"partial\": true\n  },\n  \"parts\": [\n    {\n      \"type\": \"text\",\n      \"text\": \"Still streaming\",\n      \"state\": \"done\"\n    }\n  ]\n}",
+      "post-compaction.json": "{\"version\":1,\"createdAt\":\"<random number>\",\"diffs\":[],\"loadedSkills\":[],\"readFiles\":[\"/golden.ts\"],\"boundaryMessageId\":\"journal-summary\",\"writeId\":\"<random string>\",\"publicationGeneration\":\"<random string>\"}"
+    }
+  },
+  {
+    "step": "h. accept one row (guarded append), then two rows (staged publication)",
+    "listing": [
+      "chat.jsonl",
+      "compaction-cancellation.json",
+      "continuous-compaction-generation",
+      "continuous-compaction.json",
+      "history-append-provenance.json",
+      "partial.json",
+      "post-compaction.json"
+    ],
+    "files": {
+      "chat.jsonl": "{\"id\":\"user-1\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225600000,\"historySequence\":0},\"parts\":[{\"type\":\"text\",\"text\":\"Hello\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"assistant-1\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225601000,\"historySequence\":1,\"model\":\"anthropic:test\"},\"parts\":[{\"type\":\"text\",\"text\":\"Hi there, edited\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"user-2\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225606000,\"historySequence\":2},\"parts\":[{\"type\":\"text\",\"text\":\"One more\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"user-3\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225607000,\"historySequence\":3},\"parts\":[{\"type\":\"text\",\"text\":\"And two\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n{\"id\":\"user-4\",\"role\":\"user\",\"metadata\":{\"timestamp\":1767225608000,\"historySequence\":4},\"parts\":[{\"type\":\"text\",\"text\":\"rows\",\"state\":\"done\"}],\"workspaceId\":\"golden-history-files\"}\n",
+      "compaction-cancellation.json": "{\"version\":2,\"nonce\":\"golden-nonce\",\"scope\":{\"kind\":\"unresolved\"},\"settledGeneration\":\"<random string>\"}",
+      "continuous-compaction-generation": "<random 36 chars>",
+      "continuous-compaction.json": "{\"version\":1,\"publicationGeneration\":\"<random string>\",\"boundary\":{\"id\":\"journal-summary\",\"role\":\"assistant\",\"metadata\":{\"timestamp\":1767225604000,\"compactionBoundary\":true,\"compactionEpoch\":2},\"parts\":[{\"type\":\"text\",\"text\":\"Prepared summary\",\"state\":\"done\"}]},\"staticCopies\":[],\"liveTailCopySpec\":{\"sourceMessageId\":\"live\",\"sourceHistorySequence\":4,\"copyId\":\"copy\",\"partIndex\":0,\"metadataTemplate\":{\"synthetic\":true,\"rlmPreservedTailCopy\":true}},\"postCompactionAttachments\":[],\"prefixSourceRows\":[],\"systemPrefix\":[],\"cacheEnabled\":false,\"preparation\":{\"modelString\":\"anthropic:test\",\"providerForMessages\":\"anthropic\",\"effectiveThinkingLevel\":\"off\",\"effectiveAgentId\":\"exec\",\"toolNamesForSentinel\":[]},\"providerFamily\":\"anthropic\",\"parentModel\":\"anthropic:test\",\"summaryModel\":\"anthropic:test\",\"headFingerprint\":\"head\",\"sourceFingerprint\":\"source\",\"headEnd\":{\"id\":\"boundary-1\",\"sequence\":3},\"epoch\":1,\"streamMessageId\":\"live\",\"streamHistorySequence\":4,\"stepNumber\":0,\"firstTailToolCallId\":\"tool\",\"prefix\":[{\"role\":\"user\",\"content\":\"Prepared prefix\"}]}",
+      "history-append-provenance.json": "{\"version\":1,\"epoch\":\"<random string>\",\"state\":\"stable\",\"files\":{\"chat\":{\"dev\":\"<random string>\",\"ino\":\"<random string>\",\"size\":\"960\",\"mtimeNs\":\"<random string>\",\"ctimeNs\":\"<random string>\"},\"archive\":null}}",
+      "partial.json": "{\n  \"id\": \"assistant-3\",\n  \"role\": \"assistant\",\n  \"metadata\": {\n    \"timestamp\": 1767225605000,\n    \"historySequence\": 2,\n    \"model\": \"anthropic:test\",\n    \"partial\": true\n  },\n  \"parts\": [\n    {\n      \"type\": \"text\",\n      \"text\": \"Still streaming\",\n      \"state\": \"done\"\n    }\n  ]\n}",
+      "post-compaction.json": "{\"version\":1,\"createdAt\":\"<random number>\",\"diffs\":[],\"loadedSkills\":[],\"readFiles\":[\"/golden.ts\"],\"boundaryMessageId\":\"journal-summary\",\"writeId\":\"<random string>\",\"publicationGeneration\":\"<random string>\"}"
+    }
+  }
+]

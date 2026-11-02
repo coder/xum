@@ -1,8 +1,12 @@
+import assert from "node:assert";
 import * as path from "path";
+import type { Layer } from "effect";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
+import type { SessionLocksTag } from "@/node/services/di/tags";
 import { HistoryService } from "@/node/services/historyService";
+import { historyServiceWithLocks } from "@/node/services/testHistoryService";
 import {
   buildAgentTaskIndex,
   countActiveAgentTasks,
@@ -187,6 +191,8 @@ export function createWorkspaceTurnManagerHarness(
   config: Config,
   overrides?: {
     historyService?: HistoryService;
+    /** The SessionLocks layer of the default history service, e.g. withForeignHolders. */
+    locks?: Layer.Layer<SessionLocksTag>;
     aiService?: AIService;
     workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
@@ -200,7 +206,15 @@ export function createWorkspaceTurnManagerHarness(
   workspaceService: WorkspaceHost;
   initStateManager: InitStateManager;
 } {
-  const historyService = overrides?.historyService ?? new HistoryService(config);
+  assert(
+    overrides?.historyService == null || overrides.locks == null,
+    "createWorkspaceTurnManagerHarness: locks only configures the default history service"
+  );
+  const historyService =
+    overrides?.historyService ??
+    (overrides?.locks != null
+      ? historyServiceWithLocks(config, overrides.locks)
+      : new HistoryService(config));
   const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
   const workspaceService =
     overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;

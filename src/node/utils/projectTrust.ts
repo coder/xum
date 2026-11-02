@@ -3,6 +3,8 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import type { Runtime } from "@/node/runtime/Runtime";
 
 /**
  * Workspace-scoped trust. Scratch workspaces are app-owned (created trusted
@@ -63,4 +65,22 @@ export function isProjectTrustedIn(
  */
 export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
   return projectPluginsTrusted === true && !projectAutomationDisabled();
+}
+
+/**
+ * #6426: the plugin container dirs of a project (`.xum/plugins`, `.mux/plugins`,
+ * `.agents/plugins` under `projectSearchRoot`), or none when projectPluginsAllowed is false.
+ */
+export function projectPluginContainerPaths(
+  runtime: Pick<Runtime, "normalizePath">,
+  projectSearchRoot: string,
+  projectPluginsTrusted: boolean | undefined
+): string[] {
+  if (!projectPluginsAllowed(projectPluginsTrusted)) return [];
+  return [
+    ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+      runtime.normalizePath(relativePath, projectSearchRoot)
+    ),
+    runtime.normalizePath(".agents/plugins", projectSearchRoot),
+  ];
 }

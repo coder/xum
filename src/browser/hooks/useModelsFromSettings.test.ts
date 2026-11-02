@@ -8,10 +8,10 @@ import * as RoutingModule from "@/browser/hooks/useRouting";
 import {
   filterHiddenModels,
   getDefaultModel,
-  getSuggestedModels,
   useModelsFromSettings,
 } from "./useModelsFromSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { getSuggestedModels } from "@/common/utils/ai/selectableModels";
 import type {
   ProviderConfigInfo,
   ProviderModelEntry,
@@ -165,13 +165,6 @@ describe("getSuggestedModels", () => {
         isConfigured: true,
         models: [builtInModelId],
       },
-      "mux-gateway": {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-        models: ["ignored"],
-      },
     };
 
     const suggested = getSuggestedModels(config);
@@ -179,9 +172,6 @@ describe("getSuggestedModels", () => {
     // Custom models are listed first (in config order)
     expect(suggested[0]).toBe("openai:my-team-model");
     expect(suggested[1]).toBe(`${builtInProvider}:${builtInModelId}`);
-
-    // mux-gateway models should never appear as selectable entries
-    expect(suggested.some((m) => m.startsWith("mux-gateway:"))).toBe(false);
 
     // Built-ins should be present, but deduped against any custom entry
     expect(countOccurrences(suggested, builtIn)).toBe(1);
@@ -292,7 +282,6 @@ describe("useModelsFromSettings selected model preservation", () => {
 
     act(() => {
       result.current.ensureModelInSettings("openrouter:anthropic/custom-model");
-      result.current.ensureModelInSettings("mux-gateway:anthropic/custom-model");
     });
 
     expect(setModels).not.toHaveBeenCalled();
@@ -430,14 +419,9 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
         codexOauthSet: true,
         models: SEEDED_OPENAI_CUSTOM_MODELS,
       },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["mux-gateway", "direct"];
+    routePriority = ["openrouter", "direct"];
 
     const { result } = renderHook(() => useModelsFromSettings());
 
@@ -456,15 +440,10 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
         codexOauthSet: true,
         models: SEEDED_OPENAI_CUSTOM_MODELS,
       },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["direct", "mux-gateway"];
-    routeOverrides = { "openai:gpt-5.2-codex": "mux-gateway" };
+    routePriority = ["direct", "openrouter"];
+    routeOverrides = { "openai:gpt-5.2-codex": "openrouter" };
 
     const { result } = renderHook(() => useModelsFromSettings());
 
@@ -528,19 +507,14 @@ describe("useModelsFromSettings provider availability gating", () => {
   test("keeps routed provider models visible when a gateway route is active", () => {
     providersConfig = {
       anthropic: { apiKeySet: false, isEnabled: true, isConfigured: false },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["mux-gateway", "direct"];
+    routePriority = ["openrouter", "direct"];
     routeOverrides = {};
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    // Routing availability is provider-level: a configured mux-gateway makes
+    // Routing availability is provider-level: a configured OpenRouter makes
     // all built-in Anthropic models visible, not just a per-model allowlist.
     expect(result.current.models).toContain(KNOWN_MODELS.OPUS.id);
     expect(result.current.models).toContain(KNOWN_MODELS.SONNET.id);
@@ -724,7 +698,7 @@ describe("useModelsFromSettings provider availability gating", () => {
     expect(result.current.hiddenModelsForSelector).not.toContain(OPENROUTER_OPENAI_CUSTOM_MODEL);
   });
 
-  test("shows explicit OpenRouter custom models when OpenRouter is unavailable but mux-gateway is configured", () => {
+  test("shows explicit OpenRouter custom models when OpenRouter is unavailable but another gateway is configured", () => {
     providersConfig = {
       openrouter: {
         apiKeySet: false,
@@ -733,9 +707,9 @@ describe("useModelsFromSettings provider availability gating", () => {
         models: ["openai/gpt-5"],
       },
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      "mux-gateway": { apiKeySet: false, isEnabled: true, isConfigured: true },
+      "github-copilot": { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["openrouter", "mux-gateway", "direct"];
+    routePriority = ["openrouter", "github-copilot", "direct"];
 
     const { result } = renderHook(() => useModelsFromSettings());
 
@@ -785,7 +759,7 @@ describe("useModelsFromSettings provider availability gating", () => {
 
   test("gateway-prefixed custom model stays available via canonical route override when gateway is unavailable", () => {
     routePriority = ["direct"];
-    routeOverrides = { "openai:gpt-5": "mux-gateway" };
+    routeOverrides = { "openai:gpt-5": "github-copilot" };
 
     providersConfig = {
       openrouter: {
@@ -795,12 +769,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         models: ["openai/gpt-5"],
       },
       openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      "github-copilot": { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
 
     const { result } = renderHook(() => useModelsFromSettings());

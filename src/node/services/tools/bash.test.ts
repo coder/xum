@@ -13,7 +13,14 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
 import { execFileSync } from "child_process";
-import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
+import { randomUUID } from "crypto";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  getTestDeps,
+  mockToolCallOptions,
+} from "./testHelpers";
+
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -31,6 +38,19 @@ import {
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
@@ -649,6 +669,7 @@ describe("bash tool", () => {
   it("should reject single overlong line before storing it (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-overlong-line");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -657,8 +678,11 @@ describe("bash tool", () => {
     });
 
     const args: BashToolArgs = {
-      // Generate a single 2MB line (exceeds 1MB total limit)
-      script: 'perl -e \'print "A" x 2000000 . "\\n"\'',
+      // Generate a single 2MB line (exceeds 1MB total limit). LC_ALL=C: perl
+      // prints a multi-line locale warning to stderr when it cannot load an
+      // inherited locale (Python sets LC_CTYPE=C.UTF-8 for its children, PEP 538),
+      // and those lines would count toward totalLines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 2000000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -686,6 +710,7 @@ describe("bash tool", () => {
   it("should reject overlong line at boundary (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-boundary");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -696,7 +721,8 @@ describe("bash tool", () => {
     const args: BashToolArgs = {
       // First line: 500KB (within limit)
       // Second line: 600KB (would exceed 1MB when added)
-      script: 'perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
+      // LC_ALL=C keeps perl's locale warning out of the counted lines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -727,6 +753,7 @@ describe("bash tool", () => {
   it("should use tmpfile policy by default when overflow_policy not specified", async () => {
     const tempDir = new TestTempDir("test-bash-default");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -765,6 +792,7 @@ describe("bash tool", () => {
   it("should preserve up to 100KB in temp file even after 16KB display limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -822,6 +850,7 @@ describe("bash tool", () => {
   it("should stop collection at 100KB file limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -870,6 +899,7 @@ describe("bash tool", () => {
   it("should NOT kill process at display limit (16KB) - verify command completes naturally", async () => {
     const tempDir = new TestTempDir("test-bash-no-kill-display");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -916,6 +946,7 @@ describe("bash tool", () => {
   it("should kill process immediately when single line exceeds per-line limit", async () => {
     const tempDir = new TestTempDir("test-bash-per-line-kill");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -961,6 +992,7 @@ describe("bash tool", () => {
   it("should handle output just under 16KB without truncation", async () => {
     const tempDir = new TestTempDir("test-bash-under-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -994,6 +1026,7 @@ describe("bash tool", () => {
   it("should trigger display truncation at exactly 300 lines", async () => {
     const tempDir = new TestTempDir("test-bash-exact-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -2099,6 +2132,7 @@ describe("SSH runtime redundant cd detection", () => {
     sshConnectionPool.markHealthy(sshConfig);
 
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd,
       runtime: sshRuntime,
@@ -2756,7 +2790,7 @@ console.log("ready");
         expect(isAlive(pid)).toBe(false);
       } finally {
         resumeCommand.resolve();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2808,7 +2842,7 @@ console.log("ready");
       } finally {
         finishTerminate.resolve();
         await otherClaim?.[Symbol.asyncDispose]();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2848,7 +2882,7 @@ console.log("ready");
       expect(result.success).toBe(true);
       const processId = "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
       expect(processId).toBeDefined();
-      const proc = (await manager.list("test-workspace")).find((p) => p.id === processId);
+      const proc = (await manager.list(TEST_WS)).find((p) => p.id === processId);
       expect(proc).toBeDefined();
       return proc!.outputDir;
     }
@@ -2876,7 +2910,7 @@ console.log("ready");
         const dirs = await Promise.all(managers.map((m, i) => migratedOutputDir(m, settled[i])));
         expect(dirs[0]).not.toBe(dirs[1]);
       } finally {
-        await Promise.all(managers.map((m) => m.cleanup("test-workspace")));
+        await Promise.all(managers.map((m) => m.cleanup(TEST_WS)));
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2899,7 +2933,7 @@ console.log("ready");
         // Another backend holds the spawn-name lock while this one sends its command to the
         // background; the command exits before the lock frees up.
         const otherBackendLock = await acquireProcessFileLock({
-          lockPath: path.join(bgRoot, "test-workspace", SPAWN_NAME_LOCK_FILENAME),
+          lockPath: path.join(bgRoot, TEST_WS, SPAWN_NAME_LOCK_FILENAME),
           timeoutMs: 5000,
           label: "test: other backend's spawn lock",
         });
@@ -2926,9 +2960,9 @@ console.log("ready");
         const result = await resultPromise;
         expect("backgroundProcessId" in result).toBe(false);
         expect(result.exitCode).toBe(3);
-        expect(await manager.list("test-workspace")).toEqual([]);
+        expect(await manager.list(TEST_WS)).toEqual([]);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2936,7 +2970,7 @@ console.log("ready");
     it("does not inherit a previous session's exit marker", async () => {
       const tempDir = new TestTempDir("test-bash-migrate-stale-marker");
       const bgRoot = path.join(tempDir.path, "bg-root");
-      const staleDir = path.join(bgRoot, "test-workspace", "stale-job");
+      const staleDir = path.join(bgRoot, TEST_WS, "stale-job");
       fs.mkdirSync(staleDir, { recursive: true });
       fs.writeFileSync(path.join(staleDir, "exit_code"), "0");
       fs.writeFileSync(
@@ -2959,7 +2993,7 @@ console.log("ready");
         // backend's name probe and to crash-orphan archive gating.
         expect(fs.existsSync(path.join(outputDir, "exit_code"))).toBe(false);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);

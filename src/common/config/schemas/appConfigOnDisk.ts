@@ -6,6 +6,7 @@ import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablemen
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
+import { CacheTtlSchema } from "./providersConfig";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
 import { AgentResourceLimitsSchema } from "./agentResourceLimits";
@@ -14,7 +15,6 @@ import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constant
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
 export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
@@ -26,11 +26,7 @@ export {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
 } from "./agentPluginInstalls";
-export type {
-  AgentPluginGitSource,
-  AgentPluginInstallEntry,
-  AgentPluginInstallSource,
-} from "./agentPluginInstalls";
+export type { AgentPluginGitSource, AgentPluginInstallEntry } from "./agentPluginInstalls";
 
 /**
  * Sparse delegated-run (sub-agent) override profile nested under an agent's
@@ -53,6 +49,9 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
+  // Anthropic prompt-cache TTL for this agent's runs (interactive and delegated alike);
+  // absent inherits the base chain, then the global providers.jsonc anthropic.cacheTtl.
+  cacheTtl: CacheTtlSchema.optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -179,7 +178,6 @@ export const AppConfigOnDiskSchema = z
     /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
     agentResourceLimitsEnabled: z.boolean().optional(),
     chatTranscriptFullWidth: z.boolean().optional(),
-    muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
@@ -198,7 +196,6 @@ export const AppConfigOnDiskSchema = z
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
     evaluationDefaults: EvaluationDefaultsSchema.optional(),
-    muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
     /**

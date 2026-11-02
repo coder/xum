@@ -10,6 +10,8 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  MAX_PLUGIN_MANIFEST_BYTES,
+  pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
@@ -17,7 +19,10 @@ import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } fro
 import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { loadPluginMcpServers } from "./mcpConfig";
 import { createTestPluginInstallEntry } from "./testFixtures";
+import { listPluginSkillScripts } from "./workflowFiles";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 async function writePlugin(
   containerPath: string,
@@ -1421,7 +1426,9 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toEqual([]);
     expect(result.diagnostics).toHaveLength(1);
-    expect(result.diagnostics[0].message).toContain("Unsupported Agent Plugins version");
+    expect(result.diagnostics[0].message).toStartWith(
+      "Unsupported Agent Plugins version (plugin.json): "
+    );
   });
 
   test("loads plugins with unknown top-level manifest fields and reports a warning", async () => {
@@ -2130,6 +2137,550 @@ describe("Claude Code plugin discovery", () => {
       ["c", "from-claude", true],
     ]);
   });
+
+  test("a root plugin.json without $schema yields to a Codex or Claude manifest", async () => {
+    // DietrichGebert/ponytail ships `{"name":"ponytail"}` at the root for another harness, next
+    // to its .codex-plugin and .claude-plugin manifests.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const claude = claudeManifest({ name: "from-claude" });
+    const codex = { ".codex-plugin/plugin.json": JSON.stringify({ name: "from-codex" }) };
+    const foreignRoot = { "plugin.json": JSON.stringify({ name: "from-root" }) };
+    await writeTree(path.join(container, "a"), { ...claude, ...codex, ...foreignRoot });
+    await writeTree(path.join(container, "b"), { ...claude, ...foreignRoot });
+    // Alone, the root manifest is still reported, so an author who forgot $schema learns why.
+    await writeTree(path.join(container, "c"), foreignRoot);
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => [p.dirName, p.name, p.claudeFallback === true])).toEqual([
+      ["a", "from-codex", false],
+      ["b", "from-claude", true],
+    ]);
+    expect(
+      result.diagnostics.map(({ path: diagnosticPath, severity, message }) => ({
+        diagnosticPath,
+        severity,
+        message,
+      }))
+    ).toEqual([
+      {
+        diagnosticPath: path.join(container, "c", "plugin.json"),
+        severity: "error",
+        message:
+          "Invalid plugin manifest (plugin.json): '$schema' is required and must be a string",
+      },
+    ]);
+  });
+
+  test("a manifest error names the file from the repository root when given the plugin folder", async () => {
+    // Settings installs a repository's `.codex-plugin` folder as the plugin root: its
+    // plugin.json must read as `.codex-plugin/plugin.json`, the path the user knows.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": JSON.stringify({ name: "multi-harness" }) });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "Invalid plugin manifest (.codex-plugin/plugin.json): '$schema' is required and must be a string",
+    ]);
+  });
+
+  test("a manifest read error names the file from the repository root too", async () => {
+    // Read, size and containment errors come before validation (Codex review, #7422).
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": "{ not json" });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    const messages = result.diagnostics.map((d) => d.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/^Failed to read \.codex-plugin\/plugin\.json: /);
+  });
+
+  test("an invalid Codex manifest error names .codex-plugin/plugin.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    // "--" has no safe name mapping, so the validator refuses the manifest.
+    await writeTree(path.join(container, "bad"), {
+      ".codex-plugin/plugin.json": JSON.stringify({ name: "my--plugin" }),
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics.map((d) => [d.severity, d.path])).toEqual([
+      ["error", path.join(container, "bad", ".codex-plugin", "plugin.json")],
+    ]);
+    expect(result.diagnostics[0].message).toStartWith(
+      "Invalid plugin manifest (.codex-plugin/plugin.json): "
+    );
+  });
+});
+
+describe("Cursor plugin discovery", () => {
+  async function writeTree(pluginDir: string, files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+  const cursorManifest = (manifest: unknown) => ({
+    ".cursor-plugin/plugin.json": JSON.stringify(manifest),
+  });
+  const skill = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
+  const rule = (description: string) => `---\ndescription: ${description}\n---\nBody\n`;
+
+  /** Disposing the result removes the plugin folder, so checks that read it run before that. */
+  async function discoverKit(files: Record<string, string>) {
+    const tmp = new DisposableTempDir("cursor-plugins");
+    try {
+      const container = path.join(tmp.path, "plugins");
+      await writeTree(path.join(container, "kit"), files);
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(result.plugins).toHaveLength(1);
+      const plugin = result.plugins[0];
+      return {
+        plugin,
+        messages: result.diagnostics.map((d) => d.message),
+        relative: (dir: string) => path.relative(plugin.rootPath, dir),
+        [Symbol.dispose]: () => tmp[Symbol.dispose](),
+      };
+    } catch (error) {
+      tmp[Symbol.dispose]();
+      throw error;
+    }
+  }
+
+  const ruleSkills = (plugin: { skillsDirs?: Array<{ name?: string; rule?: string }> }) =>
+    (plugin.skillsDirs ?? []).flatMap((root) =>
+      root.rule !== undefined ? [[root.name, root.rule]] : []
+    );
+
+  test("a folder with only a Cursor manifest and skills/ loads with its skills", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "skills/alpha/SKILL.md": skill("alpha"),
+    });
+    const { plugin, relative } = kit;
+    expect(plugin.cursorFallback).toBe(true);
+    expect(plugin.name).toBe("kit");
+    expect(plugin.skillsDirs?.map((root) => relative(root.dir))).toEqual(["skills"]);
+    expect(plugin.notApplied).toEqual([]);
+  });
+
+  test("a root plugin.json with $schema loads before a Cursor manifest", async () => {
+    using kit = await discoverKit({
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "from-root" }),
+      ...cursorManifest({ name: "from-cursor" }),
+    });
+    const { plugin } = kit;
+    expect([plugin.name, plugin.cursorFallback]).toEqual(["from-root", undefined]);
+  });
+
+  test("a schema-less root plugin.json yields to a Cursor manifest (D21)", async () => {
+    using kit = await discoverKit({
+      "plugin.json": JSON.stringify({ name: "from-root" }),
+      ...cursorManifest({ name: "from-cursor" }),
+    });
+    const { plugin } = kit;
+    expect([plugin.name, plugin.cursorFallback]).toEqual(["from-cursor", true]);
+  });
+
+  test("hooks.js, workflows/, skill scripts and com.openai of a Cursor folder do not load", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({
+        name: "kit",
+        contributes: { hooks: "hooks.js", workflows: "workflows" },
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+      }),
+      "hooks.js": "export default {};\n",
+      "workflows/run.js": "export {};\n",
+      "skills/alpha/SKILL.md": skill("alpha"),
+      "skills/alpha/workflow.js": "export {};\n",
+    });
+    const { plugin } = kit;
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.workflowsDir).toBeUndefined();
+    expect(plugin.manifest.extensions).toBeUndefined();
+    expect(plugin.manifest.contributes?.hooks).toBeUndefined();
+    expect(resolvePluginHookGrants(plugin.manifest).bridgeTools.allow).toEqual([]);
+    expect(await listPluginSkillScripts(plugin)).toEqual([]);
+  });
+
+  test("variables, category and a commands/ folder are listed as not applied", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", variables: { TOKEN: {} }, category: "developer-tools" }),
+      "commands/review.md": "Review\n",
+    });
+    const { plugin } = kit;
+    expect(plugin.notApplied).toEqual([
+      { part: "field", name: "variables", reason: "not applied in Xum" },
+      { part: "field", name: "category", reason: "not applied in Xum" },
+      { part: "command", name: "commands/", reason: "not applied in Xum" },
+    ]);
+    expect(plugin.skillsDirs).toBeUndefined();
+  });
+
+  test("hooks/hooks.json produces no Codex hooks; discovery parses it as Cursor hooks", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      // Cursor's `stop` and a Codex-shaped `Stop`: the Codex loader must read neither.
+      "hooks/hooks.json": JSON.stringify({
+        version: 1,
+        hooks: {
+          stop: [{ command: "./hooks/stop.sh" }],
+          Stop: [{ hooks: [{ type: "mcp_tool", server: "s", tool: "t" }] }],
+        },
+      }),
+    });
+    const { plugin } = kit;
+    expect(await loadPluginCodexHooks(plugin)).toEqual({ hooks: [], warnings: [] });
+    expect(plugin.cursorHooks?.hooks.map((hook) => [hook.key, hook.status])).toEqual([
+      ["cursor:hooks/hooks.json#stop[0]", "runnable"],
+    ]);
+    // The Codex-shaped entry has no command string: the Cursor parser drops it and says so.
+    expect(plugin.notApplied).toEqual([
+      { part: "hook", name: "Stop[0]", reason: "an entry needs a command string" },
+    ]);
+  });
+
+  test("the file that mcpServers names loads in the cursor MCP dialect", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./servers.json" }),
+      "servers.json": servers,
+      "mcp.json": servers,
+    });
+    const { plugin, relative } = kit;
+    expect(relative(plugin.mcpConfigPath ?? "")).toBe("servers.json");
+    expect(plugin.mcpConfigDialect).toBe("cursor");
+    expect(plugin.notApplied).toEqual([]);
+  });
+
+  test("MCP servers that need values, and auth and placement fields, are listed as not applied", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({
+        mcpServers: {
+          brevo: {
+            type: "http",
+            url: "https://mcp.brevo.example/mcp",
+            headers: { Authorization: "Bearer ${BREVO_MCP_TOKEN}" },
+          },
+          x: { type: "http", url: "https://api.x.example/mcp", auth: { CLIENT_ID: "fixed-id" } },
+          trello: { type: "http", url: "https://mcp.trello.example/v1", placement: "server" },
+          github: { command: "npx", env: { TOKEN: "${env:GITHUB_TOKEN}" } },
+          // Skipped for its url, so its auth block is not listed as well.
+          salesforce: { type: "http", url: "${SALESFORCE_MCP_URL}", auth: { CLIENT_ID: "x" } },
+          attio: { type: "http", url: "https://mcp.attio.example/mcp" },
+        },
+      }),
+    });
+    const { plugin } = kit;
+    expect(plugin.notApplied).toEqual([
+      {
+        part: "mcp",
+        name: "brevo",
+        reason: "needs values not supported in Xum (${BREVO_MCP_TOKEN})",
+      },
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+      { part: "mcp", name: "trello", reason: "placement not applied in Xum" },
+      {
+        part: "mcp",
+        name: "github",
+        reason: "needs values not supported in Xum (${env:GITHUB_TOKEN})",
+      },
+      {
+        part: "mcp",
+        name: "salesforce",
+        reason: "needs values not supported in Xum (${SALESFORCE_MCP_URL})",
+      },
+    ]);
+    // The loader skips exactly the servers listed as needing values.
+    using xumHome = new DisposableTempDir("cursor-plugins-home");
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: xumHome.path });
+    expect(Object.values(servers).map((server) => server.plugin?.serverName)).toEqual([
+      "x",
+      "trello",
+      "attio",
+    ]);
+  });
+
+  test("without mcpServers, a Cursor package loads mcp.json and never .mcp.json", async () => {
+    const servers = JSON.stringify({ mcpServers: { x: { url: "https://x.example/mcp" } } });
+    using codexSibling = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ".mcp.json": servers,
+    });
+    expect(codexSibling.plugin.mcpConfigPath).toBeUndefined();
+    using cursorDefault = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "mcp.json": servers,
+      ".mcp.json": servers,
+    });
+    const { plugin, relative } = cursorDefault;
+    expect([relative(plugin.mcpConfigPath ?? ""), plugin.mcpConfigDialect]).toEqual([
+      "mcp.json",
+      "cursor",
+    ]);
+  });
+
+  test("an unterminated ${ in a Cursor MCP file is read in linear time", async () => {
+    const value = "${".repeat(2) + "a".repeat(MAX_PLUGIN_MANIFEST_BYTES / 2);
+    const started = performance.now();
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: { slow: { command: "node", args: [value] } } }),
+    });
+    // A backtracking pattern took over 20 s on half this size; a scan takes milliseconds.
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(kit.plugin.notApplied).toEqual([]);
+  });
+
+  test("a flat Cursor server map is listed too; a server named __proto__ is not", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      // JSON.parse makes `__proto__` an own key, as reading the file does. The loader refuses it.
+      "mcp.json":
+        '{"__proto__": {"url": "https://${HOST}/mcp"}, ' +
+        '"x": {"url": "https://api.x.example/mcp", "auth": {"CLIENT_ID": "fixed-id"}}}',
+    });
+    expect(kit.plugin.notApplied).toEqual([
+      { part: "mcp", name: "x", reason: "auth not applied in Xum" },
+    ]);
+  });
+
+  test("an MCP file over the size cap lists no MCP entries", async () => {
+    const servers = {
+      brevo: { url: "https://mcp.brevo.example/mcp", headers: { Authorization: "${TOKEN}" } },
+      pad: { url: `https://x.example/${"a".repeat(MAX_PLUGIN_MANIFEST_BYTES)}` },
+    };
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", mcpServers: "./mcp.json" }),
+      "mcp.json": JSON.stringify({ mcpServers: servers }),
+    });
+    expect(kit.plugin.mcpConfigDialect).toBe("cursor");
+    expect(kit.plugin.notApplied).toEqual([]);
+  });
+
+  test("a manifest rules folder replaces the default rules/", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit", rules: "./my-rules/" }),
+      "my-rules/mine.mdc": rule("Mine"),
+      "rules/default.mdc": rule("Default"),
+    });
+    const { plugin, relative } = kit;
+    expect(ruleSkills(plugin)).toEqual([["mine", "mine.mdc"]]);
+    expect(plugin.skillsDirs?.map((root) => relative(root.dir))).toEqual(["my-rules"]);
+  });
+
+  test("rules ending in .mdc, .md and .markdown load as rule skills; other files do not", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/a.mdc": rule("A"),
+      "rules/b.md": rule("B"),
+      "rules/c.markdown": rule("C"),
+      "rules/notes.txt": "not a rule\n",
+    });
+    const { plugin } = kit;
+    expect(ruleSkills(plugin)).toEqual([
+      ["a", "a.mdc"],
+      ["b", "b.md"],
+      ["c", "c.markdown"],
+    ]);
+  });
+
+  test("a rule without a valid skill name is dropped with a warning", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/Bad_Name.mdc": rule("Bad"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([]);
+    expect(messages).toContain(
+      "Rule 'Bad_Name.mdc' has no valid skill name (kebab-case); ignoring it"
+    );
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "Bad_Name.mdc", reason: "not a valid skill name" },
+    ]);
+  });
+
+  test("of two rules with one name, the first in byte order wins", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/x.mdc": rule("From mdc"),
+      "rules/x.md": rule("From md"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([["x", "x.md"]]);
+    expect(messages).toContain("Rule 'x.mdc' is ignored: a skill or rule named 'x' comes first");
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "x.mdc", reason: "a skill or rule of the same name comes first" },
+    ]);
+  });
+
+  test("a skill wins over a rule of the same name", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "skills/review/SKILL.md": skill("review"),
+      "rules/review.mdc": rule("Review rule"),
+    });
+    const { plugin } = kit;
+    expect(ruleSkills(plugin)).toEqual([]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "review.mdc", reason: "a skill or rule of the same name comes first" },
+    ]);
+  });
+
+  test("a rule that does not convert to a skill is listed and does not take its name", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/x.md": "---\n: [\n---\nBroken\n",
+      "rules/x.mdc": rule("Valid"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([["x", "x.mdc"]]);
+    expect(messages).toContain("Rule 'x.md' has invalid frontmatter; ignoring it");
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "x.md", reason: "invalid frontmatter" },
+    ]);
+  });
+
+  test("rules refused at conversion are listed with their own reasons", async () => {
+    // Forty aliases of one anchor in `globs` grow the rewritten frontmatter past the file's own
+    // size, so a file just under the SKILL.md cap is over it once rewritten.
+    const frontmatter = `---\nx: &x "${"a".repeat(200)}"\nglobs: [${Array(40).fill("*x").join(", ")}]\n---\n`;
+    const overCap = `${frontmatter}${"p".repeat(MAX_FILE_SIZE - 100 - frontmatter.length)}`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/broken.mdc": "---\n: [\n---\nBroken\n",
+      "rules/huge.mdc": overCap,
+      "rules/ok.mdc": rule("Valid"),
+    });
+    const { plugin } = kit;
+    expect(ruleSkills(plugin)).toEqual([["ok", "ok.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "broken.mdc", reason: "invalid frontmatter" },
+      { part: "rule", name: "huge.mdc", reason: "too large once rewritten as a skill" },
+    ]);
+  });
+
+  test("refused rules count toward the rule cap", async () => {
+    const broken = Object.fromEntries(
+      Array.from({ length: 256 }, (_, index) => [
+        `rules/r${String(index).padStart(3, "0")}.mdc`,
+        "---\n: [\n---\nBroken\n",
+      ])
+    );
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      ...broken,
+      "rules/valid.mdc": rule("Valid"),
+    });
+    const { plugin, messages } = kit;
+    expect(ruleSkills(plugin)).toEqual([]);
+    expect(plugin.notApplied).toHaveLength(256);
+    expect(messages).toContain("More than 256 rules; ignoring the rest");
+  });
+
+  test("a rule that links to an earlier rule's file is refused without a second read", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "rules/a.mdc": rule("A"),
+    });
+    await fs.symlink("a.mdc", path.join(kit.plugin.rootPath, "rules", "b.mdc"));
+    const rediscovered = await discoverAgentPlugins([
+      { path: kit.plugin.containerPath, scope: "global" },
+    ]);
+    const [plugin] = rediscovered.plugins;
+    expect(ruleSkills(plugin)).toEqual([["a", "a.mdc"]]);
+    expect(plugin.notApplied).toEqual([
+      { part: "rule", name: "b.mdc", reason: "the same file as an earlier rule" },
+    ]);
+  });
+
+  test("a root SKILL.md is one skill only without skills/ and a skills field", async () => {
+    using rootSkill = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+    });
+    expect(rootSkill.plugin.skillsDirs).toEqual([
+      { dir: rootSkill.plugin.rootPath, single: true, name: "kit" },
+    ]);
+    using withFolder = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      "skills/alpha/SKILL.md": skill("alpha"),
+    });
+    expect(withFolder.plugin.skillsDirs?.map((root) => withFolder.relative(root.dir))).toEqual([
+      "skills",
+    ]);
+  });
+
+  test.each([
+    ["prompts.chat", "prompts-chat"],
+    ["foo.-bar", "foo-bar"],
+    ["a.-.b", "a-b"],
+  ])("a %s plugin's root skill is named %s", async (pluginName, skillName) => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: pluginName }),
+      "SKILL.md": skill(skillName),
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: skillName },
+    ]);
+  });
+
+  test("a skills entry that is not a folder leaves the root skill on", async () => {
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "SKILL.md": skill("kit"),
+      skills: "not a folder\n",
+    });
+    expect(kit.plugin.skillsDirs).toEqual([
+      { dir: kit.plugin.rootPath, single: true, name: "kit" },
+    ]);
+  });
+
+  test("agents in .mdc and .markdown files are listed; .md agents load", async () => {
+    const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nBody\n`;
+    using kit = await discoverKit({
+      ...cursorManifest({ name: "kit" }),
+      "agents/ok.md": agent("ok"),
+      "agents/rules.mdc": agent("rules"),
+      "agents/long.markdown": agent("long"),
+    });
+    const { plugin, relative } = kit;
+    expect(plugin.agentsDir === undefined ? undefined : relative(plugin.agentsDir)).toBe("agents");
+    expect(plugin.notApplied).toEqual([
+      { part: "agent", name: "long.markdown", reason: "only .md agent files are applied in Xum" },
+      { part: "agent", name: "rules.mdc", reason: "only .md agent files are applied in Xum" },
+    ]);
+  });
+
+  test("other package kinds list nothing as not applied", async () => {
+    using kit = await discoverKit({
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "kit", category: "tools" }),
+      "rules/a.mdc": rule("A"),
+    });
+    const { plugin } = kit;
+    expect(plugin.claudeFallback).toBe(true);
+    expect(plugin.notApplied).toEqual([]);
+    expect(ruleSkills(plugin)).toEqual([]);
+  });
 });
 
 describe("generatedFrom marker (skills-only packages)", () => {
@@ -2208,4 +2759,138 @@ describe("generatedFrom marker (skills-only packages)", () => {
       expect(plugin.skillsOnly).toBe(loaded ? undefined : true);
     }
   });
+});
+
+describe("generatedFrom marker (Claude marketplace packages)", () => {
+  const SKILL = "---\nname: s\ndescription: S\n---\n";
+  /** One tree with every component kind; `marker` adds extensions.mux.generatedFrom. */
+  async function writePlugin(pluginDir: string, marker: unknown): Promise<void> {
+    const files: Record<string, string> = {
+      "plugin.json": JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "kit",
+        contributes: {
+          slashCommands: [{ name: "go", expansion: "Go" }],
+          hooks: "hooks.js",
+          workflows: "workflows",
+          mcp: ".mcp.json",
+        },
+        extensions: {
+          mux: {
+            hooks: { tools: ["bash"] },
+            ...(marker !== undefined ? { generatedFrom: marker } : {}),
+          },
+          "com.openai": { hooks: ["hooks/hooks.json"] },
+        },
+      }),
+      "skills/s/SKILL.md": SKILL,
+      "skills/s/workflow.js": "export default async () => {};",
+      "commands/c.md": "Run c\n",
+      "hooks.js": "export default {};",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "mcp_tool", server: "x", tool: "y" }] }] },
+      }),
+      "agents/a.md": "---\nname: a\ndescription: A\n---\n",
+      "workflows/w.js": "export default async () => {};",
+      ".mcp.json": JSON.stringify({ mcpServers: {} }),
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+
+  async function surfaceOf(pluginDir: string) {
+    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    if (plugin === null) throw new Error(`${pluginDir}: not a plugin`);
+    const hooks = await loadPluginCodexHooks(plugin);
+    return {
+      skills: plugin.skillsDirs?.map((root) => path.relative(plugin.rootPath, root.dir)),
+      hooksJs: plugin.hooksPath !== undefined,
+      agents: plugin.agentsDir !== undefined,
+      workflows: plugin.workflowsDir !== undefined,
+      mcp: plugin.mcpConfigPath !== undefined,
+      runnableHooks: hooks.hooks.filter((hook) => hook.status === "runnable").length,
+      listedHooks: hooks.hooks.length,
+      slashCommands: plugin.manifest.contributes?.slashCommands !== undefined,
+      openai: plugin.openai !== undefined,
+      hookTools: resolvePluginHookGrants(plugin.manifest).bridgeTools.allow.length > 0,
+      claude: plugin.claudeFallback === true,
+      skillsOnly: plugin.skillsOnly === true,
+      // Skill workflow.js files offered for review (and so runnable once approved).
+      skillScripts: (await listPluginSkillScripts(plugin)).length,
+    };
+  }
+
+  test("a claude-marketplace marker gets the Claude package set and gains nothing over plain", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    await writePlugin(path.join(tmp.path, "plain"), undefined);
+    await writePlugin(path.join(tmp.path, "marked"), {
+      kind: "claude-marketplace",
+      entry: "kit",
+      commands: ["commands"],
+    });
+    const plain = await surfaceOf(path.join(tmp.path, "plain"));
+    const marked = await surfaceOf(path.join(tmp.path, "marked"));
+    expect(plain).toMatchObject({
+      hooksJs: true,
+      workflows: true,
+      runnableHooks: 1,
+      slashCommands: true,
+      openai: true,
+      hookTools: true,
+      skillScripts: 1,
+    });
+    expect(marked).toEqual({
+      // Commands load as user-only skills: prompt files, which plain can ship as skills too.
+      skills: ["skills", "commands"],
+      hooksJs: false,
+      agents: plain.agents,
+      workflows: false,
+      mcp: plain.mcp,
+      // hooks.json is listed and never runs.
+      runnableHooks: 0,
+      listedHooks: 1,
+      slashCommands: false,
+      openai: false,
+      hookTools: false,
+      claude: true,
+      skillsOnly: false,
+      // A Claude package runs no Xum code: no skill workflow.js either.
+      skillScripts: 0,
+    });
+  });
+
+  test("a malformed claude-marketplace marker is skills-only", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    for (const [dirName, marker] of [
+      ["no-entry", { kind: "claude-marketplace" }],
+      ["bad-entry", { kind: "claude-marketplace", entry: "Not A Name" }],
+      ["escaping-commands", { kind: "claude-marketplace", entry: "kit", commands: ["../x"] }],
+      ["commands-not-list", { kind: "claude-marketplace", entry: "kit", commands: "commands" }],
+    ] as const) {
+      await writePlugin(path.join(tmp.path, dirName), marker);
+      expect({ dirName, ...(await surfaceOf(path.join(tmp.path, dirName))) }).toMatchObject({
+        dirName,
+        skills: ["skills"],
+        agents: false,
+        mcp: false,
+        listedHooks: 0,
+        claude: false,
+        skillsOnly: true,
+      });
+    }
+  });
+});
+
+// On a case-insensitive filesystem (the macOS default), a `Foo-Bar` folder answers the lookup of
+// `foo-bar`, so its snake_case twin must not be offered although no entry is named `foo-bar`.
+test("a snake_case plugin skill folder yields to any kebab-case path that is a directory", async () => {
+  const caseInsensitive = (folder: string) => Promise.resolve(folder.toLowerCase() === "foo-bar");
+  expect(
+    await pluginSkillFolderNames(["Foo-Bar", "foo_bar", "other_skill"], caseInsensitive)
+  ).toEqual([
+    { folder: "Foo-Bar", name: "Foo-Bar" },
+    { folder: "other_skill", name: "other-skill" },
+  ]);
 });

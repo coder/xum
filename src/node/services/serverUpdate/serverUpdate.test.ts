@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import { resolveInstallLayout, inferChannel, type InstallLayout } from "./installLayout";
 import { activateUpdate } from "./activation";
-import { installCommand, stageUpdate, verifyStagedPackage } from "./staging";
+import { installCommands, stageUpdate, verifyStagedPackage } from "./staging";
 import { verifyStagedDependencies } from "./lockfile";
 import {
   downloadArtifact,
@@ -17,7 +19,7 @@ import {
   type ReleaseArtifact,
 } from "./registry";
 import { ServerUpdater, type ServerUpdaterDeps } from "./serverUpdater";
-import { SERVER_UPDATE_STAGE_MARKER } from "@/constants/serverUpdate";
+import { NPM_PUBLIC_REGISTRY, SERVER_UPDATE_STAGE_MARKER } from "@/constants/serverUpdate";
 import { createHash } from "node:crypto";
 
 const dirs: string[] = [];
@@ -83,21 +85,72 @@ async function fixture(
 
 const sri = (bytes: Uint8Array) => `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
 const sriOf = (text: string) => sri(new TextEncoder().encode(text));
+/** A release's pins (`name@version` to its recorded digests) from `name@version` to sri. */
+const pinsOf = (specs: Record<string, string>) =>
+  new Map(Object.entries(specs).map(([spec, integrity]) => [spec, integrity.split(" ")]));
 const splitSpec = (spec: string) => {
   const at = spec.lastIndexOf("@");
   return { name: spec.slice(0, at), version: spec.slice(at + 1) };
 };
 
+/** The npm-shrinkwrap.json a release publishes, pinning `deps` (`name@version` to sri). */
+function shrinkwrapFor(version: string, deps: Record<string, string> = {}) {
+  const pinned = Object.entries(deps).map(([spec, integrity]) => ({
+    ...splitSpec(spec),
+    integrity,
+  }));
+  return {
+    name: "@coder/xum",
+    version,
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      "": {
+        name: "@coder/xum",
+        version,
+        dependencies: Object.fromEntries(pinned.map((dep) => [dep.name, dep.version])),
+      },
+      ...Object.fromEntries(
+        pinned.map((dep) => [
+          `node_modules/${dep.name}`,
+          {
+            version: dep.version,
+            resolved: `${NPM_PUBLIC_REGISTRY}/${dep.name}/-/${path.posix.basename(dep.name)}-${dep.version}.tgz`,
+            integrity: dep.integrity,
+          },
+        ])
+      ),
+    },
+  };
+}
+
+/** A release tarball as npm packs it; `shrinkwrap: null` leaves the shrinkwrap out. */
+function releaseTarball(version: string, shrinkwrap: object | null = shrinkwrapFor(version)) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "server-update-release-"));
+  dirs.push(dir);
+  mkdirSync(path.join(dir, "package"));
+  writeFileSync(
+    path.join(dir, "package/package.json"),
+    JSON.stringify({ name: "@coder/xum", version })
+  );
+  if (shrinkwrap)
+    writeFileSync(path.join(dir, "package/npm-shrinkwrap.json"), JSON.stringify(shrinkwrap));
+  execFileSync("tar", ["-czf", path.join(dir, "release.tgz"), "-C", dir, "package"]);
+  return new Uint8Array(readFileSync(path.join(dir, "release.tgz")));
+}
+
 /**
  * Serves one release (version manifest and tarball) plus the manifests of the dependencies in
- * `deps` (`name@version` to sri), recording every request's options.
+ * `deps` (`name@version` to sri), recording every request's options. The default tarball's
+ * shrinkwrap pins `deps`.
  */
 function fakeRegistry(
   version: string,
-  bytes = new TextEncoder().encode(`tarball ${version}`),
+  tarballBytes?: Uint8Array<ArrayBuffer>,
   overrides: Partial<{ tarball: string; integrity: string; version: string }> = {},
   deps: Record<string, string> = {}
 ) {
+  const bytes = tarballBytes ?? releaseTarball(version, shrinkwrapFor(version, deps));
   const calls: Array<{ url: string; options: RequestInit }> = [];
   const tarball =
     overrides.tarball ?? `https://registry.example.com/@coder/xum/-/xum-${version}.tgz`;
@@ -144,15 +197,19 @@ function bunLock(tarball: string, packages: Record<string, string | null> = {}, 
   ].join("\n");
 }
 
-/** Stands in for the package manager: writes the staged package and the lockfile bun would. */
+/**
+ * Stands in for bun: the lockfile migration writes the bun.lock for the staged release, and the
+ * install writes the package but no lockfile, as a frozen install of bun 1.4.4 does.
+ */
 const fakeInstall =
   (version: string, packages: Record<string, string | null> = {}) =>
-  async (_file: string, _args: string[], cwd: string) => {
-    await writePackage(cwd, version);
-    await fs.writeFile(
-      path.join(cwd, "bun.lock"),
-      bunLock(path.join(cwd, `xum-${version}.tgz`), packages)
-    );
+  async (_file: string, args: string[], cwd: string) => {
+    if (args[0] === "pm")
+      await fs.writeFile(
+        path.join(cwd, "bun.lock"),
+        bunLock(path.join(cwd, `xum-${version}.tgz`), packages)
+      );
+    else await writePackage(cwd, version);
   };
 
 /** The stage directory a staged CLI entry lives in. */
@@ -256,36 +313,54 @@ describe("server install layout", () => {
 });
 
 describe("staging and activation", () => {
-  test("installs the verified local tarball with lifecycle scripts disabled for every manager", async () => {
+  test("installs the staged lockfile with lifecycle scripts disabled for every manager", async () => {
     const { layout } = await fixture();
+    const commands = (packageManager: InstallLayout["packageManager"]) =>
+      installCommands({ ...layout, packageManager });
     for (const packageManager of ["bun", "npm", "pnpm"] as const) {
-      const command = installCommand({ ...layout, packageManager }, "/stage/xum-2.0.0.tgz");
-      expect(command.file).toBe(packageManager);
-      expect(command.args).toContain("/stage/xum-2.0.0.tgz");
-      expect(command.args).toContain("--ignore-scripts");
-      expect(command.args.slice(-2)).toEqual(["--registry", layout.registry]);
+      const install = commands(packageManager).at(-1);
+      expect(install?.file).toBe(packageManager);
+      expect(install?.args).toContain("--ignore-scripts");
+      expect(install?.args.slice(-2)).toEqual(["--registry", layout.registry]);
     }
-    const npmArgs = installCommand({ ...layout, packageManager: "npm" }, "/x.tgz").args;
-    expect(npmArgs).toContain("--strict-ssl");
-    expect(npmArgs).toContain("--package-lock=true");
-    expect(npmArgs).toContain("--include=optional");
-    const pnpmArgs = installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args;
-    expect(pnpmArgs).toContain("--config.strict-ssl=true");
-    expect(pnpmArgs).toContain("--config.lockfile=true");
-    expect(pnpmArgs).toContain("--config.optional=true");
-    expect(installCommand({ ...layout, packageManager: "bun" }, "/x.tgz").args).toContain(
-      "--save-text-lockfile"
-    );
+    // npm and bun install the staged lockfile itself, which records the release tarball, and
+    // must not resolve anything it lacks. bun writes its text lockfile from it first.
+    const [npm] = commands("npm");
+    expect(npm.args[0]).toBe("ci");
+    expect(npm.args).toContain("--strict-ssl");
+    expect(npm.args).toContain("--include=optional");
+    const [bunMigrate, bunInstall] = commands("bun");
+    expect(bunMigrate.args.slice(0, 2)).toEqual(["pm", "migrate"]);
+    expect(bunMigrate.args).toContain("--save-text-lockfile");
+    expect(bunInstall.args.slice(0, 2)).toEqual(["install", "--frozen-lockfile"]);
+    // pnpm converts it first; both steps must keep TLS and the lockfile on, and the conversion
+    // must ask the configured registry.
+    const [pnpmImport, pnpmInstall] = commands("pnpm");
+    expect(pnpmImport.args[0]).toBe("import");
+    expect(pnpmImport.args).toContain(`--config.registry=${layout.registry}`);
+    expect(pnpmInstall.args[0]).toBe("install");
+    expect(pnpmInstall.args).toContain("--frozen-lockfile");
+    expect(pnpmInstall.args).toContain("--config.optional=true");
+    for (const { args } of [pnpmImport, pnpmInstall]) {
+      expect(args).toContain("--config.strict-ssl=true");
+      expect(args).toContain("--config.lockfile=true");
+    }
     await expectFailure(() => stageUpdate(layout, "../../escape", fakeRegistry("2.0.0")));
   });
   test("stages the digest-checked tarball, refusing a corrupted download before any install", async () => {
-    const { layout, root } = await fixture();
+    const { layout: installed, root } = await fixture();
+    const layout = { ...installed, registry: "https://mirror.example.com/npm" };
     const registry = fakeRegistry("2.0.0", undefined, {}, { "zod@4.5.4": sriOf("zod") });
-    let installed: string[] = [];
+    const readJson = async (file: string): Promise<Record<string, Record<string, unknown>>> =>
+      JSON.parse(await fs.readFile(file, "utf8")) as Record<string, Record<string, unknown>>;
+    let seed: { dependencies: unknown; packages: Record<string, unknown> } | undefined;
     const bin = await stageUpdate(layout, "2.0.0", {
       ...registry,
       install: async (file, args, cwd) => {
-        installed = args;
+        seed = {
+          dependencies: (await readJson(path.join(cwd, "package.json"))).dependencies,
+          packages: (await readJson(path.join(cwd, "package-lock.json"))).packages,
+        };
         await fakeInstall("2.0.0", { "zod@4.5.4": sriOf("zod") })(file, args, cwd);
       },
     });
@@ -293,7 +368,20 @@ describe("staging and activation", () => {
     expect(path.dirname(stageDir)).toBe(root);
     expect(path.basename(stageDir)).toMatch(/^xum-staging-2\.0\.0\./);
     const tarball = path.join(stageDir, "xum-2.0.0.tgz");
-    expect(installed).toContain(tarball);
+    // The manager gets the downloaded tarball and the tree its shrinkwrap pins, nested where npm
+    // installs a published package's shrinkwrap and fetched from the configured registry.
+    expect(seed?.dependencies).toEqual({ "@coder/xum": `file:${tarball}` });
+    expect(seed?.packages["node_modules/@coder/xum"]).toMatchObject({
+      version: "2.0.0",
+      resolved: `file:${tarball}`,
+    });
+    expect(seed?.packages["node_modules/@coder/xum/node_modules/zod"]).toMatchObject({
+      version: "4.5.4",
+      resolved: `${layout.registry}/zod/-/zod-4.5.4.tgz`,
+      integrity: sriOf("zod"),
+    });
+    // bun converted that npm lockfile into its own, which must be the stage's only lockfile.
+    expect(await fs.readdir(stageDir)).not.toContain("package-lock.json");
     expect(new Uint8Array(await fs.readFile(tarball))).toEqual(registry.bytes);
     expect(bin).toBe(path.join(stageDir, "node_modules/@coder/xum/dist/cli/index.js"));
     expect(registry.calls.map((call) => call.url)).toEqual([
@@ -320,6 +408,102 @@ describe("staging and activation", () => {
       "package.json",
     ]);
   });
+  test("installs only the versions the release pins, and refuses a release that pins none", async () => {
+    const { layout } = await fixture();
+    const release = releaseTarball("2.0.0", shrinkwrapFor("2.0.0", { "zod@4.5.4": sriOf("zod") }));
+    // A newer release of a dependency, or the pinned version under another digest from a mirror
+    // that serves matching metadata, is refused before any registry lookup.
+    const unpinnedTrees: Array<Record<string, string>> = [
+      { "zod@4.5.5": sriOf("zod") },
+      { "zod@4.5.4": sriOf("evil") },
+    ];
+    for (const staged of unpinnedTrees) {
+      const registry = fakeRegistry("2.0.0", release, {}, staged);
+      await expectFailure(() =>
+        stageUpdate(layout, "2.0.0", { ...registry, install: fakeInstall("2.0.0", staged) })
+      );
+      expect(registry.calls.map((call) => call.url)).toEqual([
+        `${layout.registry}/@coder%2Fxum/2.0.0`,
+        registry.tarball,
+      ]);
+    }
+    // Without a shrinkwrap, or with one npm generated at publish time that records a dependency by
+    // version alone, the manager would have to resolve the tree itself.
+    const versionOnly = shrinkwrapFor("2.0.0");
+    const unpinned = {
+      ...versionOnly,
+      packages: { ...versionOnly.packages, "node_modules/zod": { version: "4.5.4" } },
+    };
+    for (const shrinkwrap of [null, unpinned]) {
+      let installs = 0;
+      await expectFailure(() =>
+        stageUpdate(layout, "2.0.0", {
+          ...fakeRegistry("2.0.0", releaseTarball("2.0.0", shrinkwrap)),
+          install: () => {
+            installs++;
+            return Promise.resolve();
+          },
+        })
+      );
+      expect(installs).toBe(0);
+    }
+  });
+  test("npm installs the staged lockfile as written; bun and pnpm convert it to their own first", async () => {
+    const deps = { "zod@4.5.4": sriOf("zod") };
+    const pnpmLock = [
+      "lockfileVersion: '9.0'",
+      "packages:",
+      "  '@coder/xum@file:xum-2.0.0.tgz':",
+      "    resolution: {integrity: sha512-unchecked, tarball: file:xum-2.0.0.tgz}",
+      "    version: 2.0.0",
+      "  zod@4.5.4:",
+      `    resolution: {integrity: ${deps["zod@4.5.4"]}}`,
+      "",
+    ].join("\n");
+    const expected = {
+      npm: { steps: ["npm ci"], lockfiles: ["package-lock.json"] },
+      bun: { steps: ["bun pm", "bun install"], lockfiles: ["bun.lock"] },
+      pnpm: { steps: ["pnpm import", "pnpm install"], lockfiles: ["pnpm-lock.yaml"] },
+    };
+    for (const packageManager of ["npm", "bun", "pnpm"] as const) {
+      const { layout } = await fixture(packageManager);
+      const registry = fakeRegistry("2.0.0", undefined, {}, deps);
+      const steps: string[] = [];
+      const bin = await stageUpdate(layout, "2.0.0", {
+        ...registry,
+        install: async (file, args, cwd) => {
+          steps.push(`${file} ${args[0]}`);
+          // pnpm writes its lockfile while importing npm's; `npm ci` leaves the staged one as is.
+          if (file === "bun") await fakeInstall("2.0.0", deps)(file, args, cwd);
+          else if (args[0] === "import")
+            await fs.writeFile(path.join(cwd, "pnpm-lock.yaml"), pnpmLock);
+          else await writePackage(cwd, "2.0.0");
+        },
+      });
+      expect(steps).toEqual(expected[packageManager].steps);
+      const files = await fs.readdir(stageOf(bin));
+      expect(files.filter((name) => name.includes("lock")).sort()).toEqual(
+        expected[packageManager].lockfiles
+      );
+      expect(registry.calls.map((call) => call.url)).toContain(`${layout.registry}/zod/4.5.4`);
+    }
+  });
+  test.skipIf(!execFileSync("tar", ["--version"]).toString().includes("GNU tar"))(
+    "an inherited TAR_OPTIONS cannot hide the release's shrinkwrap",
+    async () => {
+      const { layout } = await fixture();
+      // Built first: the variable would strip the shrinkwrap from the fixture tarball as well.
+      const registry = fakeRegistry("2.0.0");
+      const inherited = process.env.TAR_OPTIONS;
+      process.env.TAR_OPTIONS = "--exclude=package/npm-shrinkwrap.json";
+      try {
+        await stageUpdate(layout, "2.0.0", { ...registry, install: fakeInstall("2.0.0") });
+      } finally {
+        if (inherited === undefined) delete process.env.TAR_OPTIONS;
+        else process.env.TAR_OPTIONS = inherited;
+      }
+    }
+  );
   test("prunes only its own old stages, preserves active and original installs, and swaps atomically", async () => {
     const { layout, root } = await fixture();
     const oldEntry = await fs.readFile(layout.entry, "utf8");
@@ -469,7 +653,12 @@ describe("staging and activation", () => {
       const managerLayout = { ...layout, packageManager };
       const expected = [`${layout.registry}/inner/1.0.0`, `${layout.registry}/zod/4.5.4`];
       expect(
-        await verifyStagedDependencies(managerLayout, stages[packageManager], registry.request)
+        await verifyStagedDependencies(
+          managerLayout,
+          stages[packageManager],
+          pinsOf(deps),
+          registry.request
+        )
       ).toBe(expected.length);
       expect(registry.calls.map((call) => call.url).sort()).toEqual(expected.sort());
       expect(registry.calls.every((call) => call.options.redirect === "error")).toBe(true);
@@ -481,8 +670,30 @@ describe("staging and activation", () => {
         { ...deps, "inner@1.0.0": sriOf("evil") }
       );
       await expectFailure(() =>
-        verifyStagedDependencies(managerLayout, stages[packageManager], tampered.request)
+        verifyStagedDependencies(
+          managerLayout,
+          stages[packageManager],
+          pinsOf(deps),
+          tampered.request
+        )
       );
+      // A version the release does not pin was resolved at update time; it is refused before
+      // any registry lookup, under any digest.
+      for (const pins of [
+        { "zod@4.5.4": deps["zod@4.5.4"] },
+        { ...deps, "inner@1.0.0": sriOf("x") },
+      ]) {
+        const unpinned = fakeRegistry("2.0.0", undefined, {}, deps);
+        await expectFailure(() =>
+          verifyStagedDependencies(
+            managerLayout,
+            stages[packageManager],
+            pinsOf(pins),
+            unpinned.request
+          )
+        );
+        expect(unpinned.calls).toHaveLength(0);
+      }
     }
     // A published digest listed beside a foreign one must not vouch for it: managers accept a
     // tarball matching either.
@@ -494,15 +705,25 @@ describe("staging and activation", () => {
         "inner@1.0.0": `${sriOf("evil")} ${deps["inner@1.0.0"]}`,
       })
     );
-    await expectFailure(() =>
-      verifyStagedDependencies(layout, mixed, fakeRegistry("2.0.0", undefined, {}, deps).request)
-    );
+    const mixedPins = { ...deps, "inner@1.0.0": `${sriOf("evil")} ${deps["inner@1.0.0"]}` };
+    for (const pins of [deps, mixedPins]) {
+      await expectFailure(() =>
+        verifyStagedDependencies(
+          layout,
+          mixed,
+          pinsOf(pins),
+          fakeRegistry("2.0.0", undefined, {}, deps).request
+        )
+      );
+    }
     const refused = {
       plaintext: `    "evil": ["evil@1.0.0", "http://mirror.example.com/evil-1.0.0.tgz", {}, "${sriOf("evil")}"],`,
       unpinned: '    "evil": ["evil@1.0.0", "", {}],',
       remote: '    "evil": ["evil@https://mirror.example.com/evil-1.0.0.tgz", {}],',
       local: '    "evil": ["evil@/tmp/evil.tgz", {}],',
       git: '    "evil": ["evil@github:evil/evil#abc", {}],',
+      digestedRemote: `    "evil": ["evil@https://mirror.example.com/evil-1.0.0.tgz", {}, "${sriOf("evil")}"],`,
+      digestedLocal: `    "evil": ["evil@/tmp/evil.tgz", {}, "${sriOf("evil")}"],`,
     };
     for (const extra of Object.values(refused)) {
       const dir = await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps, extra));
@@ -512,7 +733,15 @@ describe("staging and activation", () => {
         {},
         { ...deps, "evil@1.0.0": sriOf("evil") }
       );
-      await expectFailure(() => verifyStagedDependencies(layout, dir, registry.request));
+      // The refusal names the dependency; a crash on the malformed entry would not.
+      expect(
+        verifyStagedDependencies(
+          layout,
+          dir,
+          pinsOf({ ...deps, "evil@1.0.0": sriOf("evil") }),
+          registry.request
+        )
+      ).rejects.toThrow("Dependency evil");
       expect(registry.calls).toHaveLength(0);
     }
     // Redirected metadata can present any published package, or the release tarball itself, as
@@ -606,7 +835,12 @@ describe("staging and activation", () => {
         { ...deps, "is-number@6.0.0": sriOf("is-number") }
       );
       await expectFailure(() =>
-        verifyStagedDependencies({ ...layout, packageManager }, dir, registry.request)
+        verifyStagedDependencies(
+          { ...layout, packageManager },
+          dir,
+          pinsOf({ ...deps, "is-number@6.0.0": sriOf("is-number") }),
+          registry.request
+        )
       );
       expect(registry.calls).toHaveLength(0);
     }
@@ -617,12 +851,30 @@ describe("staging and activation", () => {
       await verifyStagedDependencies(
         layout,
         dir,
+        pinsOf({ ...deps, "bundled@1.0.0": sriOf("bundled") }),
         fakeRegistry("2.0.0", undefined, {}, { ...deps, "bundled@1.0.0": sriOf("bundled") }).request
       )
     ).toBe(3);
+    // bun 1.4 ends the release's tarball entry with its digest.
+    const digested = await stage(
+      "bun-digested",
+      "bun.lock",
+      bunLock("/stage/xum-2.0.0.tgz", deps).replace(
+        '{ "dependencies": {} }],',
+        `{ "dependencies": {} }, "${sriOf("release")}"],`
+      )
+    );
+    expect(
+      await verifyStagedDependencies(
+        layout,
+        digested,
+        pinsOf(deps),
+        fakeRegistry("2.0.0", undefined, {}, deps).request
+      )
+    ).toBe(2);
     const unreadable = await stage("bun", "bun.lock", "not a lockfile");
     await expectFailure(() =>
-      verifyStagedDependencies(layout, unreadable, fakeRegistry("2.0.0").request)
+      verifyStagedDependencies(layout, unreadable, pinsOf(deps), fakeRegistry("2.0.0").request)
     );
   });
   test("activation failure leaves the old link intact", async () => {

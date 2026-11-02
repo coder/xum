@@ -15,9 +15,9 @@ const DEFAULT_AGENT_LABEL =
   WORKSPACE_DEFAULTS.agentId.slice(0, 1).toUpperCase() + WORKSPACE_DEFAULTS.agentId.slice(1);
 
 /**
- * Model selector pretty display with mux-gateway enabled.
+ * Model selector pretty display with OpenRouter routing enabled.
  *
- * Regression test: when gateway is enabled, routing happens in the backend,
+ * Regression test: when a gateway route is active, routing happens in the backend,
  * but the UI should still display the canonical provider:model form
  * (e.g. GPT-4o, not "Openai/gpt 4o").
  */
@@ -32,15 +32,9 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
           workspaceId,
           aiSettings: { model: baseModel, thinkingLevel: "off" },
           messages: [],
-          routePriority: ["mux-gateway", "direct"],
+          routePriority: ["openrouter", "direct"],
           providersConfig: {
-            "mux-gateway": {
-              apiKeySet: false,
-              isEnabled: true,
-              couponCodeSet: true,
-              isConfigured: true,
-              gatewayModels: [baseModel],
-            },
+            openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },
         });
       }}
@@ -52,7 +46,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
     // Wait for chat input to mount.
     await canvas.findAllByText(DEFAULT_AGENT_LABEL, {}, { timeout: 15000 });
 
-    // With gateway enabled, we should still display the *pretty* model name.
+    // With a gateway route active, we should still display the *pretty* model name.
     // CI can take longer than the default waitFor timeout while workspace/model
     // state hydrates, so wait explicitly instead of triggering a flaky retry.
     await waitFor(
@@ -62,7 +56,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
       { interval: 50, timeout: 10000 }
     );
 
-    // The buggy rendering (mux-gateway:openai/gpt-4o) shows up as "Openai/gpt 4o".
+    // The buggy rendering (openrouter:openai/gpt-4o) shows up as "Openai/gpt 4o".
     const ugly = canvas.queryByText("Openai/gpt 4o");
     if (ugly) {
       throw new Error(`Unexpected gateway-formatted model label: ${ugly.textContent ?? "(empty)"}`);
@@ -71,7 +65,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
     // Sanity check that the gateway indicator exists (moved to the titlebar).
     const gatewayIndicator = await waitFor(
       () => {
-        const el = canvasElement.querySelector('[aria-label="Xum Gateway routing"]');
+        const el = canvasElement.querySelector('[aria-label="OpenRouter routing"]');
         if (!el) throw new Error("Gateway indicator not found");
         return el;
       },
@@ -84,7 +78,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
       () => {
         const tooltip = document.querySelector('[role="tooltip"]');
         if (!tooltip) throw new Error("Tooltip not visible");
-        if (!tooltip.textContent?.includes("Xum Gateway")) {
+        if (!tooltip.textContent?.includes("OpenRouter")) {
           throw new Error("Gateway tooltip not visible");
         }
       },
@@ -95,7 +89,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
     docs: {
       description: {
         story:
-          "Verifies the bottom-left model selector stays pretty (e.g. GPT-4o) even when mux-gateway routing is enabled.",
+          "Verifies the bottom-left model selector stays pretty (e.g. GPT-4o) even when OpenRouter routing is enabled.",
       },
     },
   },
@@ -103,7 +97,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
 
 /**
  * Model selector dropdown open, showing icon alignment.
- * The gateway toggle and default star icons should appear side-by-side without gaps.
+ * The visibility toggle and default star icons should appear side-by-side without gaps.
  */
 export const ModelSelectorDropdownOpen: AppStory = {
   render: () => (
@@ -117,13 +111,8 @@ export const ModelSelectorDropdownOpen: AppStory = {
           aiSettings: { model: baseModel, thinkingLevel: "off" },
           messages: [],
           providersConfig: {
-            openai: { apiKeySet: true, isEnabled: true, couponCodeSet: false, isConfigured: true },
-            anthropic: {
-              apiKeySet: true,
-              isEnabled: true,
-              couponCodeSet: false,
-              isConfigured: true,
-            },
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+            anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },
         });
       }}
@@ -156,7 +145,7 @@ export const ModelSelectorDropdownOpen: AppStory = {
     docs: {
       description: {
         story:
-          "Model selector dropdown open, showing gateway toggle and default star icons properly aligned without gaps.",
+          "Model selector dropdown open, showing visibility toggle and default star icons properly aligned without gaps.",
       },
     },
   },

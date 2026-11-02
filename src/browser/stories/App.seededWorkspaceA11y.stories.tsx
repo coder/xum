@@ -26,6 +26,7 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js"
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { expandLeftSidebar, expandProjects, expandRightSidebar } from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
+import { openLeftSidebar } from "./storyPlayHelpers";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
@@ -363,6 +364,7 @@ const LANDMARK_LAYOUTS: Record<
       });
     },
     open: async (canvasElement) => {
+      await openLeftSidebar(canvasElement);
       const body = within(canvasElement.ownerDocument.body);
       await userEvent.click(
         await body.findByRole("button", { name: "Create workspace in xum" }, { timeout: 15_000 })
@@ -376,6 +378,7 @@ const LANDMARK_LAYOUTS: Record<
       return createMockORPCClient({});
     },
     open: async (canvasElement) => {
+      await openLeftSidebar(canvasElement);
       const body = within(canvasElement.ownerDocument.body);
       await userEvent.click(
         await body.findByRole("button", { name: "New scratch chat" }, { timeout: 15_000 })

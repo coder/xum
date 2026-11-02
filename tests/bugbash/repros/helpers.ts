@@ -106,6 +106,11 @@ export async function resetTutorials(app: { baseUrl: string | undefined }): Prom
 /**
  * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
  * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
+ *
+ * Stories send setup messages with this, not `agent.act`: e2e records the composer's placeholder
+ * as part of the target, and the placeholder tip rotates on a wall-clock timer (placeholderTips.ts).
+ * So an agent step that typed here replayed only until the next tip, and missed
+ * (`target-not-found`) in almost every CI run.
  */
 export async function sendMessage(screen: Screen, text: string): Promise<void> {
   const composer = screen.getByRole("textbox", "Message");
@@ -344,4 +349,19 @@ export async function expectNotifyOnAllResponses(
   await waitForLayerEscapeReady(browser);
   await browser.keyboard.press("Escape");
   await expect(setting).toBeHidden();
+}
+
+/**
+ * The absolute path of the seeded plugin source `name` (tests/bugbash/pluginInstallFixtures.ts).
+ * Every source sits next to the seeded hook-review-demo plugin, whose install records its path.
+ */
+export async function pluginSourcePath(
+  app: { baseUrl: string | undefined },
+  name: string
+): Promise<string> {
+  const listed = await appClient(app).agentPlugins.list();
+  if (!listed.success) throw new Error(`agentPlugins.list failed: ${listed.error}`);
+  const demo = listed.data.find((item) => item.name === "hook-review-demo")?.source?.url;
+  if (demo === undefined) throw new Error("the seeded hook-review-demo plugin has no source");
+  return `${demo.slice(0, demo.lastIndexOf("/"))}/${name}`;
 }

@@ -5,7 +5,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * Handler convention (Effect migration, phases 1-4): new unary procedures
  * should ride `handlerGen` from `@orpc/experimental-effect` and yield a
  * wire-shaped Effect exposed by the backing service (see `memory.*`,
- * `providers.*` mutations, and `muxGateway*` for the house pattern). Plain
+ * `providers.*` mutations, and `codexOauth.*` for the house pattern). Plain
  * async handlers remain appropriate only when:
  * - the backing service is still Promise-based (convert the service surface
  *   first; do not wrap Promises in Effect at the router),
@@ -16,7 +16,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * handlerGen makes handlers interruptible on client abort: before converting
  * a mutation, audit its abort-atomicity and keep multi-step writes
  * uninterruptible in the service pipeline (see asAtomicMutation in
- * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
+ * providerService.ts and startDesktopFlowEffect in codexOauthService.ts).
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
@@ -489,18 +489,6 @@ export const router = (authToken?: string) => {
             );
           })
         ),
-
-      updateMuxGatewayPrefs: t
-        .input(schemas.config.updateMuxGatewayPrefs.input)
-        .output(schemas.config.updateMuxGatewayPrefs.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* atomicPromise(async () => {
-              await context.config.updateMuxGatewayPrefs(input);
-              context.providerService.notifyConfigChanged();
-            });
-          })
-        ),
       updateRoutePreferences: t
         .input(schemas.config.updateRoutePreferences.input)
         .output(schemas.config.updateRoutePreferences.output)
@@ -862,7 +850,9 @@ export const router = (authToken?: string) => {
       deleteCreation: t
         .input(schemas.drafts.deleteCreation.input)
         .output(schemas.drafts.deleteCreation.output)
-        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+        .handler(({ context, input }) =>
+          context.draftService.creation.delete(input.scope.draftId, input.ifStored)
+        ),
       importLegacyCreation: t
         .input(schemas.drafts.importLegacyCreation.input)
         .output(schemas.drafts.importLegacyCreation.output)
@@ -1017,52 +1007,13 @@ export const router = (authToken?: string) => {
         .output(schemas.providers.onConfigChanged.output)
         .handler(({ context, signal }) => subscribeProviderConfig(context, signal)),
     },
-    muxGateway: {
-      getAccountStatus: t
-        .input(schemas.muxGateway.getAccountStatus.input)
-        .output(schemas.muxGateway.getAccountStatus.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.muxGatewayOauthService.getAccountStatusEffect();
-          })
-        ),
-    },
-
-    // OAuth procedures (gateway/copilot/codex) run Effect generators
+    // OAuth procedures (copilot/codex) run Effect generators
     // via handlerGen; the wire contracts are unchanged. Flow-starting
     // mutations are uninterruptible in the services (see the respective
     // startDesktopFlowEffect/startDeviceFlowEffect), so a client abort cannot
     // leak a loopback server or strand a flow record; waits are interruptible
     // (abandoning a wait leaves the flow's own lifecycle intact) and cancels
     // run guaranteed-finalizer cleanup.
-    muxGatewayOauth: {
-      startDesktopFlow: t
-        .input(schemas.muxGatewayOauth.startDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.startDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* context.muxGatewayOauthService.startDesktopFlowEffect();
-          })
-        ),
-      waitForDesktopFlow: t
-        .input(schemas.muxGatewayOauth.waitForDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.waitForDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            return yield* context.muxGatewayOauthService.waitForDesktopFlowEffect(input.flowId, {
-              timeoutMs: input.timeoutMs,
-            });
-          })
-        ),
-      cancelDesktopFlow: t
-        .input(schemas.muxGatewayOauth.cancelDesktopFlow.input)
-        .output(schemas.muxGatewayOauth.cancelDesktopFlow.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* context.muxGatewayOauthService.cancelDesktopFlowEffect(input.flowId);
-          })
-        ),
-    },
     copilotOauth: {
       startDeviceFlow: t
         .input(schemas.copilotOauth.startDeviceFlow.input)
@@ -1249,7 +1200,11 @@ export const router = (authToken?: string) => {
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.recordExternalEditorOpen(input.workspaceId, input.launchToken)
+          context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken,
+            input.remotePath
+          )
         ),
       rollbackEditorOpen: t
         .input(schemas.general.rollbackEditorOpen.input)
@@ -2204,7 +2159,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.preflightArchive.input)
         .output(schemas.workspace.preflightArchive.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.preflightArchive(input.workspaceId)
+          context.workspaceService.preflightArchiveWithSubagents(input.workspaceId)
         ),
       archive: t
         .input(schemas.workspace.archive.input)
@@ -2212,7 +2167,8 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.archive(
             input.workspaceId,
-            input.acknowledgedUntrackedPaths ?? undefined
+            input.acknowledgedUntrackedPaths ?? undefined,
+            { acknowledgedSubagentUntrackedPaths: input.acknowledgedSubagentUntrackedPaths }
           )
         ),
       unarchive: t
@@ -2624,6 +2580,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getSessionUsage.output)
         .handler(async ({ context, input }) =>
           context.sessionUsageService.getSessionUsage(input.workspaceId)
+        ),
+      getSubagentUsage: t
+        .input(schemas.workspace.getSubagentUsage.input)
+        .output(schemas.workspace.getSubagentUsage.output)
+        .handler(async ({ context, input }) =>
+          context.sessionUsageService.getOpenSubagentUsage(input.workspaceId)
         ),
       getSessionUsageBatch: t
         .input(schemas.workspace.getSessionUsageBatch.input)

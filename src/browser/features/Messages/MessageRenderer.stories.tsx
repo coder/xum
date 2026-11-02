@@ -1088,11 +1088,10 @@ export const Streaming: AppStory = {
 /**
  * Stream error composite gallery.
  *
- * Folds three non-interactive error permutations into one chat, each rendering
+ * Folds two non-interactive error permutations into one chat, each rendering
  * as a distinct stream-error row in the message list:
  * - generic rate-limit error (StreamError)
  * - Anthropic overloaded / HTTP 529 server error (merged from AnthropicOverloaded)
- * - Xum gateway insufficient-balance quota error (merged from XumGatewayQuota)
  */
 export const StreamError: AppStory = {
   render: () => (
@@ -1136,24 +1135,6 @@ export const StreamError: AppStory = {
                 messageId: "assistant-1",
                 error: "Anthropic is temporarily overloaded (HTTP 529). Please try again later.",
                 errorType: "server_error",
-              });
-
-              // Xum gateway insufficient balance / quota (former XumGatewayQuota)
-              callback({
-                type: "stream-start",
-                workspaceId,
-                messageId: "assistant-2",
-                model: "mux-gateway:anthropic/claude-sonnet-4",
-                routedThroughGateway: true,
-                historySequence: 3,
-                startTime: STABLE_TIMESTAMP - 80000,
-                mode: "exec",
-              });
-              callback({
-                type: "stream-error",
-                messageId: "assistant-2",
-                error: "Insufficient balance. Please add credits to continue.",
-                errorType: "quota",
               });
             }, 50);
             // eslint-disable-next-line @typescript-eslint/no-empty-function

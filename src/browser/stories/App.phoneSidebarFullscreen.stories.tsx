@@ -302,6 +302,31 @@ export const SplitLayoutKeepsFocusedPane: AppStory = {
   },
 };
 
+/**
+ * Closing the view's only tab closes the view, as it closes the docked sidebar (user request),
+ * instead of showing the New tab in its place. The next open shows the New tab launcher.
+ */
+export const ClosingLastTabClosesView: AppStory = {
+  decorators: [PhoneFrameDecorator],
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setup(LAYOUT, "ws-phone-sidebar-last-tab")} />,
+  play: async ({ canvasElement }) => {
+    await waitForChatInputAutofocusDone(canvasElement);
+    const sidebar = await findRightSidebar(canvasElement);
+    const moreButton = within(canvasElement).getByTestId("workspace-more-actions");
+    await openSidebarFromMenu(canvasElement);
+    await waitFor(() => expect(sidebar).toBeVisible());
+
+    await userEvent.click(within(sidebar).getByRole("button", { name: "Close Workflows" }));
+    await waitFor(() => expect(sidebar).not.toBeVisible());
+    await waitFor(() => expect(moreButton).toHaveFocus());
+
+    await openSidebarFromMenu(canvasElement);
+    await waitFor(() => expect(sidebar).toBeVisible());
+    await expect(await within(sidebar).findByText("Open a tool")).toBeVisible();
+  },
+};
+
 /** The sidebar opened from the workspace menu's Sidebar row, full-screen at the phone viewport. */
 export const FullScreenSidebarOnPhone: AppStory = {
   // A phone viewport for local viewing (the fixed frame does not move innerWidth).

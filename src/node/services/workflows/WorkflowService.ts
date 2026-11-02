@@ -30,6 +30,7 @@ import { getSelfIdentity, judgeHolder } from "@/node/utils/concurrency/processLi
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
+import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
@@ -1430,6 +1431,8 @@ export interface WorkflowServiceContext {
   workspaceService: WorkspaceService;
   taskService: TaskService;
   workflowRuntimeFactory: IJSRuntimeFactory;
+  /** Its locks guard the parent's patch artifact index writes (phase 4: SessionLocks). */
+  historyService: Pick<HistoryService, "locks">;
 }
 
 export interface WorkflowStartRequest {
@@ -1482,6 +1485,7 @@ export async function resolveWorkflowContext(
     runtime,
     workspacePath,
     xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
 
@@ -1524,6 +1528,7 @@ export async function resolveWorkflowContext(
             runtimeTempDir: workflowRuntimeTempDir,
             workspaceSessionDir: path.join(context.config.sessionsDir, workspaceId),
             trusted: projectTrusted,
+            sessionLocks: context.historyService.locks,
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,
         }),
@@ -1535,6 +1540,7 @@ export async function resolveWorkflowContext(
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
         }),
       assertStoredPluginWorkflowReviewed: (stored) =>
         assertStoredPluginWorkflowReviewed({
@@ -1544,6 +1550,7 @@ export async function resolveWorkflowContext(
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
         }),
       // Settled markers are keyed by the run's terminal generation, so a resumed run's next
       // terminal transition re-arms attention by itself; only the downgrade-compat stable
@@ -1727,6 +1734,7 @@ export async function startWorkflowRun(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   if (input.rawCommand != null) {
     await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
@@ -1795,6 +1803,7 @@ export async function listWorkflowScripts(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
 }
 

@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import os from "node:os";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
@@ -432,6 +432,41 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists a plugin skill in a snake_case folder under its kebab-case name", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-snake-home");
+    using project = new TestTempDir("test-agent-skill-list-snake-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-snake-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+        const pluginDir = await writePlugin(path.join(xumHomeDir.path, "plugins"), "egm", []);
+        const skillDir = path.join(pluginDir, "skills", "egm_bootstrap");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\nBody\n"
+        );
+
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+        });
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(getSkill(result.skills, "egm-bootstrap").description).toBe("Bootstrap");
+      });
+    });
+  });
+
   it("lists a plugin skills path that holds SKILL.md as one skill", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-single-home");
     using project = new TestTempDir("test-agent-skill-list-single-project");
@@ -520,6 +555,51 @@ describe("agent_skill_list", () => {
 
         expect(await list(false)).toEqual(["greet"]);
         expect(await list(true)).toEqual(["greet", "review"]);
+      });
+    });
+  });
+
+  it("lists Cursor rules as skills and a manual rule only with includeUnadvertised", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-rule-home");
+    using project = new TestTempDir("test-agent-skill-list-rule-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-rule-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "kit");
+        await fs.mkdir(path.join(pluginDir, ".cursor-plugin"), { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, ".cursor-plugin", "plugin.json"),
+          JSON.stringify({ name: "kit" })
+        );
+        await fs.mkdir(path.join(pluginDir, "rules"));
+        await fs.writeFile(
+          path.join(pluginDir, "rules", "always.mdc"),
+          "---\nalwaysApply: true\n---\nAlways\n"
+        );
+        await fs.writeFile(path.join(pluginDir, "rules", "manual.md"), "Manual\n");
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const list = async (includeUnadvertised: boolean) => {
+          const result = (await tool.execute!(
+            { includeUnadvertised },
+            mockToolCallOptions
+          )) as AgentSkillListToolResult;
+          expect(result.success).toBe(true);
+          return result.success ? result.skills.map((skill) => skill.name) : [];
+        };
+
+        expect(await list(false)).toEqual(["always"]);
+        expect(await list(true)).toEqual(["always", "manual"]);
       });
     });
   });

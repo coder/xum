@@ -237,3 +237,49 @@ def test_a_new_function_added_after_a_rewrite_is_still_new():
     count = form("src/c.ts", "@1", 1, SHAPE)
     pairs = run([copy, count], [form("src/a.ts", "@1", 1, OTHER)], ["src/a.ts"], {"src/a.ts": [[10, 15]]}, {"src/a.ts": [[9, 0, 10, 6]]})
     assert names(pairs) == [("@1", "@10")]
+
+
+def test_a_copy_added_past_the_end_of_a_replacement_hunk_is_new():
+    # Base: cents (1-6) already matched count. One hunk replaces cents's six
+    # lines with twelve: cents rewritten (1-6) plus a new copy (7-12).
+    cents, copy = form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@7", 7, SHAPE)
+    count = form("src/c.ts", "@1", 1, SHAPE)
+    pairs = run([cents, copy, count], [form("src/a.ts", "@1", 1, SHAPE)], ["src/a.ts"], {"src/a.ts": [[1, 12]]}, {"src/a.ts": [[1, 6, 1, 12]]})
+    assert ("@1", "@7") in names(pairs)  # copy~count (a new pair) and copy~cents
+    assert len(pairs) == 2
+
+
+def test_a_function_reordered_within_its_file_keeps_its_old_pairs_quiet():
+    # Base: cents (1-6) and other (10-15) in src/a.ts; cents matched count in
+    # src/c.ts. The diff moves cents below other: a pure deletion and a pure addition.
+    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@10", 10, OTHER)]
+    head = [form("src/a.ts", "@1", 1, OTHER), form("src/a.ts", "@10", 10, SHAPE), form("src/c.ts", "@1", 1, SHAPE)]
+    hunks = {"src/a.ts": [[1, 9, 0, 0], [15, 0, 7, 9]]}
+    pairs = run(head, base, ["src/a.ts"], {"src/a.ts": [[7, 15]]}, hunks)
+    assert pairs == []
+
+
+def test_a_new_copy_next_to_a_reorder_is_still_reported():
+    # Same reorder, plus a second copy of cents: one removed form covers one
+    # added form, so the extra copy is new.
+    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@10", 10, OTHER)]
+    head = [form("src/a.ts", "@1", 1, OTHER), form("src/a.ts", "@10", 10, SHAPE), form("src/a.ts", "@20", 20, SHAPE), form("src/c.ts", "@1", 1, SHAPE)]
+    hunks = {"src/a.ts": [[1, 9, 0, 0], [15, 0, 7, 19]]}
+    pairs = run(head, base, ["src/a.ts"], {"src/a.ts": [[7, 25]]}, hunks)
+    assert len(pairs) == 2  # the extra copy pairs with the moved cents and with count
+
+
+def test_a_multiline_jsx_comment_container_is_a_comment_line():
+    from markers import Comments
+
+    jsx = [
+        "const v = (",  # 1
+        "  <div>",  # 2
+        "    {/*",  # 3
+        "     * mutation-equivalent: the label is never empty",  # 4
+        "     */}",  # 5
+        "    {label || 'none'}",  # 6
+        "  </div>",  # 7
+        ");",  # 8
+    ]
+    assert Comments("\n".join(jsx), "a.tsx").reason(6, 6, "mutation-equivalent") == "the label is never empty"

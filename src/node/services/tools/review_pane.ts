@@ -1,7 +1,5 @@
 import { tool } from "ai";
-import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -19,7 +17,9 @@ import {
   getAssistedReviewFilePath,
   readAssistedReviewForSessionDir,
 } from "@/node/services/reviewPane/assistedReviewStorage";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Persistence for the agent's assisted-review focus list.
@@ -33,19 +33,20 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
  * accidentally truncates prior flagged regions.
  *
  * The read/apply/write sequence (not just the write) goes through
- * `workspaceFileLocks` so concurrent `operation: "add"` calls from sibling
+ * the workspace FIFO (`SessionLocks.workspaceFiles`) so concurrent `operation: "add"` calls from sibling
  * agents cannot both read the same baseline and clobber each other.
  */
 async function writeAssistedReviewFile(
   workspaceSessionDir: string,
-  hunks: AssistedReviewHunk[]
+  hunks: AssistedReviewHunk[],
+  files: SessionFiles
 ): Promise<void> {
   const filePath = getAssistedReviewFilePath(workspaceSessionDir);
   if (hunks.length === 0) {
     // Clean up the file when the agent clears its hint set so a stale
     // file can't shadow a fresh start.
     try {
-      await fs.unlink(filePath);
+      await files.promises.unlink(filePath);
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return;
@@ -54,25 +55,27 @@ async function writeAssistedReviewFile(
     }
     return;
   }
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await writeFileAtomic(filePath, JSON.stringify(hunks, null, 2));
+  await files.promises.mkdir(path.dirname(filePath), { recursive: true });
+  await files.writeFileAtomic(filePath, JSON.stringify(hunks, null, 2));
 }
 
 async function applyReviewPaneUpdateForSessionDir(
   workspaceId: string,
   workspaceSessionDir: string,
   args: ReviewPaneUpdateArgs,
+  locks: SessionLocks,
+  files: SessionFiles,
   pathContext?: ProjectRelativePathContext
 ): Promise<{ hunks: AssistedReviewHunk[]; rejected: string[] }> {
-  return workspaceFileLocks.withLock(workspaceId, async () => {
+  return locks.workspaceFiles.withLock(workspaceId, async () => {
     // Read prior state from disk so `operation: "add"` sees the right
     // baseline across app/backend restarts. The whole read-modify-write is
     // locked so concurrent `add` calls compose instead of last-writer-wins.
-    const current = await readAssistedReviewForSessionDir(workspaceSessionDir);
+    const current = await readAssistedReviewForSessionDir(workspaceSessionDir, files);
     const result = applyReviewPaneUpdate(current, args, pathContext);
     // Persist before returning so a successful tool result is always backed
     // by durable state.
-    await writeAssistedReviewFile(workspaceSessionDir, result.hunks);
+    await writeAssistedReviewFile(workspaceSessionDir, result.hunks, files);
     return result;
   });
 }
@@ -188,6 +191,9 @@ export const createReviewPaneUpdateTool: ToolFactory = (config) => {
         config.workspaceId,
         config.workspaceSessionDir,
         args,
+        config.sessionLocks,
+        // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+        config.sessionFiles ?? nodeSessionFiles,
         {
           projectPath: config.workspaceProjectPath,
           executionRootPath: config.workspaceExecutionRootPath,
@@ -213,12 +219,17 @@ export const createReviewPaneGetTool: ToolFactory = (config) => {
     inputSchema: TOOL_DEFINITIONS.review_pane_get.schema,
     execute: async () => {
       assert(config.workspaceSessionDir, "review_pane_get requires workspaceSessionDir");
-      const hunks = (await readAssistedReviewForSessionDir(config.workspaceSessionDir)).map(
-        (hunk) =>
-          normalizeAssistedReviewHunk(hunk, {
-            projectPath: config.workspaceProjectPath,
-            executionRootPath: config.workspaceExecutionRootPath,
-          })
+      const hunks = (
+        await readAssistedReviewForSessionDir(
+          config.workspaceSessionDir,
+          // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+          config.sessionFiles ?? nodeSessionFiles
+        )
+      ).map((hunk) =>
+        normalizeAssistedReviewHunk(hunk, {
+          projectPath: config.workspaceProjectPath,
+          executionRootPath: config.workspaceExecutionRootPath,
+        })
       );
       return {
         hunks: hunks.map((h) => ({

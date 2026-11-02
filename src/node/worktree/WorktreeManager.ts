@@ -8,8 +8,10 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "@/node/runtime/Runtime";
+import assert from "@/common/utils/assert";
 import { listLocalBranches, cleanStaleLock, getCurrentBranch } from "@/node/git";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { execAsync, execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import { getBashPath } from "@/node/utils/main/bashPath";
 import { getProjectName } from "@/node/utils/runtime/helpers";
@@ -24,6 +26,7 @@ import {
   gitNoRepoAutomationEnvForLocalRepo,
 } from "@/node/utils/gitNoHooksEnv";
 import {
+  WORKTREE_CREATE_FETCH_REUSE_MS,
   WORKTREE_CREATE_FETCH_TIMEOUT_MS,
   WORKTREE_DELETE_GIT_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
@@ -58,9 +61,98 @@ const DEFERRED_SYNC_FALLBACK = "keeping the branch at its current commit";
  * rewrites of the workspace branch map, which is written whole, and `git branch -m`, which moves
  * a branch's reflog through one fixed temporary file (logs/refs/.tmp-renamed-log): two at once
  * drop a mapping or fail one rename. Worktree creations named in the backend rename their branch
- * as soon as their checkout is done, so their renames can meet.
+ * as soon as their checkout is done, so their renames can meet. Also serializes every other
+ * write of a branch's config section through .git/config.lock (`worktree add -b`,
+ * `branch --set-upstream-to`, `branch -d`): creations that share one origin fetch all reach
+ * them in the same tick.
  */
 const branchRefLocks = new MutexMap<string>();
+
+type OriginFetchOutcome =
+  | { kind: "fetched" }
+  | { kind: "timed-out" }
+  | { kind: "not-on-origin" }
+  | { kind: "failed"; message: string };
+
+interface SharedOriginFetch {
+  readonly source: string;
+  readonly outcome: Promise<OriginFetchOutcome>;
+  settledAtMs?: number;
+  waiters: number;
+  readonly controller: AbortController;
+}
+
+const originFetches = new Map<string, SharedOriginFetch>();
+
+function sweepOriginFetches(now: number): void {
+  for (const [key, { settledAtMs }] of originFetches) {
+    if (settledAtMs !== undefined && now - settledAtMs >= WORKTREE_CREATE_FETCH_REUSE_MS) {
+      originFetches.delete(key);
+    }
+  }
+}
+
+/**
+ * Keys a fetch by the ref it writes, refs/remotes/origin/<branch> in the repository's common git
+ * dir. `source` is the worktree and the origin URL git contacts from it: only creations from one
+ * worktree share a fetch, because per-worktree config (upload-pack, URL rewrites, transport) can
+ * make the same URL reach another repository, and a changed origin fetches again.
+ */
+async function originFetchTarget(
+  projectPath: string,
+  trunkBranch: string,
+  signal: AbortSignal | undefined
+): Promise<{ key: string; source: string }> {
+  const options = signal ? { signal } : undefined;
+  using repoProc = execFileAsync(
+    "git",
+    ["-C", projectPath, "rev-parse", "--show-toplevel", "--git-common-dir"],
+    options
+  );
+  using urlProc = execFileAsync(
+    "git",
+    // get-url applies url.<base>.insteadOf, so the key names the repository git contacts.
+    ["-C", projectPath, "remote", "get-url", "origin"],
+    options
+  );
+  const [[worktree, repository], originUrl] = await Promise.all([
+    repoProc.result
+      .then(async ({ stdout }) => {
+        const [toplevel = "", commonDir = ""] = stdout.trim().split("\n");
+        return [toplevel, await fsPromises.realpath(path.resolve(projectPath, commonDir))];
+      })
+      // An unreadable repository fails the fetch itself, which falls back to local refs.
+      .catch(() => [path.resolve(projectPath), path.resolve(projectPath)]),
+    // get-url exits 2 when the repository has no origin.
+    urlProc.result.then(
+      ({ stdout }) => stdout.trim(),
+      () => ""
+    ),
+  ]);
+  return {
+    key: JSON.stringify([repository, trunkBranch]),
+    source: JSON.stringify([worktree, originRemoteIdentity(originUrl, worktree)]),
+  };
+}
+
+/**
+ * Git resolves a relative local remote path against each worktree's top level, so one raw URL
+ * can name a different remote per worktree. Local means what git's url_is_local_not_ssh means:
+ * no scheme, and no colon before the first slash.
+ */
+function originRemoteIdentity(url: string, worktree: string): string {
+  const colon = url.indexOf(":");
+  const slash = url.indexOf("/");
+  const local = !url.includes("://") && (colon === -1 || (slash !== -1 && slash < colon));
+  return local && !path.isAbsolute(url) ? path.resolve(worktree, url) : url;
+}
+
+function leaveOriginFetchAndStopIfAbandoned(key: string, entry: SharedOriginFetch): void {
+  entry.waiters -= 1;
+  if (entry.waiters > 0 || entry.settledAtMs !== undefined) return;
+  if (originFetches.get(key) === entry) originFetches.delete(key);
+  entry.controller.abort();
+}
 
 interface OriginSyncParams {
   projectPath: string;
@@ -232,21 +324,23 @@ export class WorktreeManager {
       // can stream progress, and so callers may announce the workspace before populating it.
       // Restore flows may supply an exact saved commit instead of the current trunk.
       const newBranchBase = startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
-      using addProc = execFileAsync(
-        "git",
-        [
-          "-C",
-          projectPath,
-          "worktree",
-          "add",
-          "--no-checkout",
-          ...(branchExists
-            ? [workspacePath, branchName]
-            : ["-b", branchName, workspacePath, newBranchBase]),
-        ],
-        noHooksEnv
-      );
-      const addResult = await addProc.result;
+      const addResult = await branchRefLocks.withLock(projectPath, async () => {
+        using addProc = execFileAsync(
+          "git",
+          [
+            "-C",
+            projectPath,
+            "worktree",
+            "add",
+            "--no-checkout",
+            ...(branchExists
+              ? [workspacePath, branchName]
+              : ["-b", branchName, workspacePath, newBranchBase]),
+          ],
+          noHooksEnv
+        );
+        return await addProc.result;
+      });
       createdBranch = !branchExists;
       worktreeCreated = true;
       // git reports routine progress ("Preparing worktree", "Updating files") on stderr;
@@ -346,7 +440,12 @@ export class WorktreeManager {
     }
     if (!args.remoteSyncAllowed) return false;
     return (
-      (await this.fetchOriginTrunk(projectPath, trunkBranch, args.initLogger, noHooksEnv)) &&
+      (await this.fetchOriginTrunk(
+        projectPath,
+        trunkBranch,
+        args.initLogger,
+        noHooksEnv?.signal
+      )) &&
       this.canFastForwardToOrigin(projectPath, trunkBranch, args.initLogger, noHooksEnv?.signal)
     );
   }
@@ -626,7 +725,7 @@ export class WorktreeManager {
       projectPath,
       trunkBranch,
       initLogger,
-      noHooksEnv,
+      noHooksEnv?.signal,
       DEFERRED_SYNC_FALLBACK
     );
     if (
@@ -684,12 +783,14 @@ export class WorktreeManager {
     if (sync.createdFromOrigin) return;
     // An eager creation would have branched from origin/<trunk> and tracked it.
     try {
-      using upstreamProc = execFileAsync(
-        "git",
-        ["-C", projectPath, "branch", `--set-upstream-to=origin/${trunkBranch}`, branchName],
-        noHooksEnv
-      );
-      await upstreamProc.result;
+      await branchRefLocks.withLock(projectPath, async () => {
+        using upstreamProc = execFileAsync(
+          "git",
+          ["-C", projectPath, "branch", `--set-upstream-to=origin/${trunkBranch}`, branchName],
+          noHooksEnv
+        );
+        await upstreamProc.result;
+      });
     } catch (error) {
       if (isAbortError(error, params.abortSignal)) throw error;
       initLogger.logStderr(
@@ -729,12 +830,14 @@ export class WorktreeManager {
       return;
     }
 
-    using deleteProc = execFileAsync(
-      "git",
-      ["-C", args.projectPath, "branch", "-D", args.branchName],
-      noHooksEnv
-    );
-    await deleteProc.result;
+    await branchRefLocks.withLock(args.projectPath, async () => {
+      using deleteProc = execFileAsync(
+        "git",
+        ["-C", args.projectPath, "branch", "-D", args.branchName],
+        noHooksEnv
+      );
+      await deleteProc.result;
+    });
   }
 
   /**
@@ -747,52 +850,121 @@ export class WorktreeManager {
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
-    noHooksEnv: GitExecOptions,
+    signal: AbortSignal | undefined,
     fallback = "using local branch state"
   ): Promise<boolean> {
-    // A credential helper such as Coder's askpass can block the fetch indefinitely while it waits
-    // for external authentication, and even a killed fetch leaves helpers holding the stdio pipes.
-    // Bound the fetch separately from caller cancellation so a deadline falls back to the local
-    // trunk while an explicit abort still cancels creation.
-    const deadline = AbortSignal.timeout(this.fetchTimeoutMs);
-    const callerSignal = noHooksEnv?.signal;
-    try {
-      initLogger.logStep(`Fetching latest from origin/${trunkBranch}...`);
-
-      using fetchProc = execFileAsync("git", ["-C", projectPath, "fetch", "origin", trunkBranch], {
-        ...noHooksEnv,
-        signal: callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline,
-        killTreeOnTermination: true,
-      });
-      await fetchProc.result;
-
-      initLogger.logStep("Fetched latest from origin");
-      return true;
-    } catch (error) {
-      if (isAbortError(error, callerSignal)) {
-        throw error;
-      }
-      if (deadline.aborted) {
+    const outcome = await this.joinOriginFetch(projectPath, trunkBranch, initLogger, signal);
+    switch (outcome.kind) {
+      case "fetched":
+        initLogger.logStep("Fetched latest from origin");
+        return true;
+      case "timed-out": {
         const seconds = Math.round(this.fetchTimeoutMs / 1000);
         initLogger.logStderr(
           `Note: Fetch from origin did not finish within ${seconds}s (Git may be waiting on a credential helper or external authentication); ${fallback}`
         );
-        log.warn(`Worktree creation fetch timed out; ${fallback}`, {
-          projectPath,
-          trunkBranch,
-          timeoutMs: this.fetchTimeoutMs,
-        });
         return false;
       }
-      const errorMsg = getErrorMessage(error);
-      // Branch doesn't exist on origin (common for subagent local-only branches)
-      if (errorMsg.includes("couldn't find remote ref")) {
+      case "not-on-origin":
         initLogger.logStep(`Branch "${trunkBranch}" not found on origin; ${fallback}.`);
-      } else {
-        initLogger.logStderr(`Note: Could not fetch from origin (${errorMsg}), ${fallback}`);
-      }
-      return false;
+        return false;
+      case "failed":
+        initLogger.logStderr(`Note: Could not fetch from origin (${outcome.message}), ${fallback}`);
+        return false;
     }
+  }
+
+  private async joinOriginFetch(
+    projectPath: string,
+    trunkBranch: string,
+    initLogger: InitLogger,
+    callerSignal: AbortSignal | undefined
+  ): Promise<OriginFetchOutcome> {
+    const { key, source } = await originFetchTarget(projectPath, trunkBranch, callerSignal);
+    callerSignal?.throwIfAborted();
+    const now = performance.now();
+    sweepOriginFetches(now);
+    let entry = originFetches.get(key);
+    // A fetch from another worktree or origin wrote the same ref, so its result says nothing here.
+    if (entry?.source !== source) {
+      entry = this.startOriginFetch(key, source, projectPath, trunkBranch);
+      originFetches.set(key, entry);
+    }
+    entry.waiters += 1;
+    try {
+      initLogger.logStep(
+        entry.settledAtMs === undefined
+          ? `Fetching latest from origin/${trunkBranch}...`
+          : `Reusing the origin/${trunkBranch} fetch that finished ${((now - entry.settledAtMs) / 1000).toFixed(1)}s ago`
+      );
+      const result = await raceWithAbortAndTimeout(entry.outcome, { signal: callerSignal });
+      if (result.kind !== "ok") {
+        callerSignal?.throwIfAborted();
+        assert(false, "joinOriginFetch: only the caller's abort ends the wait early");
+      }
+      return result.value;
+    } finally {
+      leaveOriginFetchAndStopIfAbandoned(key, entry);
+    }
+  }
+
+  private startOriginFetch(
+    key: string,
+    source: string,
+    projectPath: string,
+    trunkBranch: string
+  ): SharedOriginFetch {
+    const controller = new AbortController();
+    // A credential helper such as Coder's askpass can block the fetch indefinitely while it waits
+    // for external authentication, and even a killed fetch leaves helpers holding the stdio pipes.
+    const deadline = AbortSignal.timeout(this.fetchTimeoutMs);
+    const run = async (): Promise<OriginFetchOutcome> => {
+      try {
+        using fetchProc = execFileAsync(
+          "git",
+          ["-C", projectPath, "fetch", "origin", trunkBranch],
+          {
+            signal: AbortSignal.any([controller.signal, deadline]),
+            killTreeOnTermination: true,
+          }
+        );
+        await fetchProc.result;
+        return { kind: "fetched" };
+      } catch (error) {
+        if (deadline.aborted) {
+          log.warn("Worktree creation fetch timed out", {
+            projectPath,
+            trunkBranch,
+            timeoutMs: this.fetchTimeoutMs,
+          });
+          return { kind: "timed-out" };
+        }
+        const message = getErrorMessage(error);
+        return message.includes("couldn't find remote ref")
+          ? { kind: "not-on-origin" }
+          : { kind: "failed", message };
+      }
+    };
+    const entry: SharedOriginFetch = {
+      outcome: run().then((outcome) => {
+        entry.settledAtMs = performance.now();
+        // Only origin's answer is reused: the branch, or that origin has none (the usual case for
+        // a sub-agent's unpushed parent branch). After a failure or timeout the next creation
+        // fetches again, so a burst never branches from local refs once the network is back. A
+        // fetch from another origin that finished first no longer describes the ref this one
+        // just wrote.
+        const published = originFetches.get(key);
+        const answered = outcome.kind === "fetched" || outcome.kind === "not-on-origin";
+        if (published === entry ? !answered : published?.settledAtMs !== undefined) {
+          originFetches.delete(key);
+        }
+        return outcome;
+      }),
+      source,
+      waiters: 0,
+      controller,
+    };
+    return entry;
   }
 
   /**
@@ -1458,12 +1630,14 @@ export class WorktreeManager {
 
     const deleteFlag = args.force ? "-D" : "-d";
     try {
-      using deleteProc = execFileAsync(
-        "git",
-        ["-C", args.projectPath, "branch", deleteFlag, branchToDelete],
-        args.noHooksEnv
-      );
-      await deleteProc.result;
+      await branchRefLocks.withLock(args.projectPath, async () => {
+        using deleteProc = execFileAsync(
+          "git",
+          ["-C", args.projectPath, "branch", deleteFlag, branchToDelete],
+          args.noHooksEnv
+        );
+        await deleteProc.result;
+      });
     } catch (error) {
       // Best-effort: workspace deletion should not fail just because branch cleanup failed.
       log.debug("Failed to delete git branch after removing worktree", {

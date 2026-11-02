@@ -1,5 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { execFile } from "child_process";
 import { EventEmitter } from "events";
+import { promisify } from "util";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -17,8 +19,11 @@ describe("sshAskpass", () => {
       const promptFile = path.join(askpassDir, `prompt.${requestId}.txt`);
       const responseFile = path.join(askpassDir, `response.${requestId}.txt`);
 
-      // Simulate askpass writing prompt content for this invocation.
-      await fs.promises.writeFile(promptFile, promptText, "utf-8");
+      // Simulate askpass writing prompt content for this invocation. Like the
+      // script, write a temp name and rename it, so the watcher never reads a
+      // half-written prompt.
+      await fs.promises.writeFile(`${promptFile}.tmp`, promptText, "utf-8");
+      await fs.promises.rename(`${promptFile}.tmp`, promptFile);
 
       // Poll for the response file written by createAskpassSession().
       for (let i = 0; i < 100; i += 1) {
@@ -139,6 +144,79 @@ describe("sshAskpass", () => {
         session.cleanup();
       }
     });
+
+    test("the script never reads an answer that is still being written (#7498)", async () => {
+      const session = await createAskpassSession(() => Promise.resolve("denied"));
+      const askpassDir = session.env.MUX_ASKPASS_DIR;
+      const requestId = "race";
+      const promptFile = path.join(askpassDir, `prompt.${requestId}.txt`);
+      const responseFile = path.join(askpassDir, `response.${requestId}.txt`);
+
+      // Force the window that writeFile always has: the answer's file exists but is
+      // still empty. Keep it open until the reader (standing in for the script) has
+      // looked at the response path once.
+      const realWriteFile = fs.promises.writeFile.bind(fs.promises);
+      const windowOpen = Promise.withResolvers<void>();
+      const readerLooked = Promise.withResolvers<void>();
+      const writeFileSpy = spyOn(fs.promises, "writeFile").mockImplementation(
+        async (...args: Parameters<typeof fs.promises.writeFile>) => {
+          const target = args[0];
+          if (typeof target === "string" && target.includes(`response.${requestId}`)) {
+            await realWriteFile(args[0], "");
+            windowOpen.resolve();
+            await readerLooked.promise;
+          }
+          return realWriteFile(...args);
+        }
+      );
+
+      try {
+        await realWriteFile(`${promptFile}.tmp`, "Enter passphrase:", "utf-8");
+        await fs.promises.rename(`${promptFile}.tmp`, promptFile);
+        await windowOpen.promise;
+
+        // The script's check: if the response file exists, its text is the answer.
+        const readAnswer = () => fs.promises.readFile(responseFile, "utf-8").catch(() => null);
+        let answer = await readAnswer();
+        readerLooked.resolve();
+        // Yield (no timer) until the answer lands.
+        for (let i = 0; answer === null && i < 100_000; i += 1) {
+          await new Promise((resolve) => setImmediate(resolve));
+          answer = await readAnswer();
+        }
+
+        expect(answer).toBe("denied\n");
+      } finally {
+        readerLooked.resolve();
+        writeFileSpy.mockRestore();
+        session.cleanup();
+      }
+    });
+
+    test.skipIf(process.platform === "win32")(
+      "the askpass script returns the answer to the prompt it was given",
+      async () => {
+        const prompts: string[] = [];
+        const session = await createAskpassSession((prompt) => {
+          prompts.push(prompt);
+          return Promise.resolve("yes");
+        });
+
+        try {
+          const prompt = "Are you sure you want to continue connecting (yes/no)?";
+          const { stdout } = await promisify(execFile)("sh", [session.env.SSH_ASKPASS, prompt], {
+            env: { ...process.env, ...session.env },
+          });
+
+          expect(stdout).toBe("yes\n");
+          expect(prompts).toEqual([prompt]);
+          // The script removes its prompt and answer files, temp names included.
+          expect(await fs.promises.readdir(session.env.MUX_ASKPASS_DIR)).toEqual([]);
+        } finally {
+          session.cleanup();
+        }
+      }
+    );
 
     test("cleanup is idempotent", async () => {
       // This test closes the session right after creating it. Bun 1.3.5 leaks one blocked

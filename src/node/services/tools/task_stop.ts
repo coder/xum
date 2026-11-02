@@ -195,6 +195,7 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
           const outcome = await raceWithAbortAndTimeout(terminationPromise, {
             signal: abortSignal,
             timeoutMs: TASK_TERMINATION_TOOL_TIMEOUT_MS,
+            clock: config.clock,
           });
           if (outcome.kind === "ok") {
             return outcome.value;

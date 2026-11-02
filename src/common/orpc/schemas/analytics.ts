@@ -122,7 +122,6 @@ export const RawQueryColumnSchema = z.object({
   name: z.string(),
   type: z.string(),
 });
-export type RawQueryColumn = z.infer<typeof RawQueryColumnSchema>;
 
 export const RawQueryResultSchema = z.object({
   columns: z.array(RawQueryColumnSchema),
@@ -132,7 +131,6 @@ export const RawQueryResultSchema = z.object({
   rowCountExact: z.boolean(),
   durationMs: z.number(),
 });
-export type RawQueryResult = z.infer<typeof RawQueryResultSchema>;
 /** ETL input validation — each row extracted from chat.jsonl is validated before insert */
 export const EventRowSchema = z.object({
   workspace_id: z.string(),

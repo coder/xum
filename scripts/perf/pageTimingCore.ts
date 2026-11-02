@@ -15,7 +15,7 @@ import {
 export type Page = "p1" | "p2" | "p1r";
 /** Text-matched targets. P2's code line comes from scripts/perf/fixtures/neutralSeed/chat.jsonl. */
 export const TARGET: Record<Page, { selector: string; text: string }> = {
-  p1: { selector: "p", text: "OSS contributors with GitHub accounts" },
+  p1: { selector: "p", text: "Xum is provider-agnostic" },
   p2: { selector: ".code-line", text: "export function subtract(" },
   p1r: {
     selector: "p",

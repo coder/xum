@@ -6,6 +6,7 @@ import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/us
 import {
   NoToolbarSpacer,
   PinnedViewToolbarSpacerContext,
+  ShellOverlayToolbarSpacerContext,
   usePinnedViewCoversWindow,
 } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -154,9 +155,14 @@ export function PinnedViewToggleBarSpacer() {
   return coversWindow ? null : <LeftSidebarToggleBarSpacer showNewChat />;
 }
 
+function ShellOverlayToggleBarSpacer() {
+  return <LeftSidebarToggleBarSpacer showNewChat />;
+}
+
 /**
  * Gives the pinned views inside (the right sidebar's Artifacts fullscreen and App View maximize)
- * the toggle bar spacer while the left sidebar is collapsed, and none while it is expanded.
+ * and immersive review the toggle bar spacer while the left sidebar is collapsed, and none while
+ * it is expanded.
  */
 export function PinnedViewToolbarSpacerProvider(props: {
   leftSidebarCollapsed: boolean;
@@ -166,7 +172,11 @@ export function PinnedViewToolbarSpacerProvider(props: {
     <PinnedViewToolbarSpacerContext.Provider
       value={props.leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
     >
-      {props.children}
+      <ShellOverlayToolbarSpacerContext.Provider
+        value={props.leftSidebarCollapsed ? ShellOverlayToggleBarSpacer : NoToolbarSpacer}
+      >
+        {props.children}
+      </ShellOverlayToolbarSpacerContext.Provider>
     </PinnedViewToolbarSpacerContext.Provider>
   );
 }

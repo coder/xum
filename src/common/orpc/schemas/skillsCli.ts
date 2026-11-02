@@ -18,5 +18,3 @@ export const SkillsCliCommandSchema = z.object({
   /** The exact command to copy. Every argument is shell-safe without quoting. */
   command: z.string(),
 });
-
-export type SkillsCliCommand = z.infer<typeof SkillsCliCommandSchema>;

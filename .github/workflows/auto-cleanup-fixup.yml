@@ -117,7 +117,10 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          bunx mux@next run \
+          # npm installs the published package with its npm-shrinkwrap.json, the dependency tree
+          # that CI tested; bunx would resolve every dependency afresh and run it with these keys.
+          npm install --prefix "$RUNNER_TEMP/xum" --ignore-scripts --no-audit --no-fund @coder/xum@next
+          "$RUNNER_TEMP/xum/node_modules/.bin/xum" run \
             --model anthropic:claude-opus-5-5 \
             --thinking xhigh \
             < .github/prompts/auto-cleanup-fixup.md

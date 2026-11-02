@@ -175,8 +175,3 @@ export function resolveSkillPaths(frontmatter: {
 export function createSkillPathsMatcher(paths: readonly string[]): (path: string) => boolean {
   return picomatch([...paths], PICOMATCH_OPTIONS);
 }
-
-/** True when a workspace-root-relative POSIX path matches any of the skill's globs. */
-export function matchesSkillPaths(paths: readonly string[], relativePosixPath: string): boolean {
-  return createSkillPathsMatcher(paths)(relativePosixPath);
-}

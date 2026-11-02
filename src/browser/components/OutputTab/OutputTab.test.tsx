@@ -168,7 +168,7 @@ describe("OutputTab", () => {
     resolveResetGate();
 
     await waitFor(() => {
-      expect(textOf(view.queryByText(formatEntryMessage(0)))).toBeNull();
+      expect(textOf(view.queryByText(formatEntryMessage(0))) === null).toBe(true);
     });
   });
 
@@ -234,8 +234,8 @@ describe("OutputTab", () => {
     resolvePostSnapshotGate();
 
     await waitFor(() => {
-      expect(textOf(view.queryByText(formatEntryMessage(0)))).toBeNull();
-      expect(textOf(view.queryByText(formatEntryMessage(1000)))).toBeNull();
+      expect(textOf(view.queryByText(formatEntryMessage(0))) === null).toBe(true);
+      expect(textOf(view.queryByText(formatEntryMessage(1000))) === null).toBe(true);
       expect(view.getByText(formatEntryMessage(2000))).toBeTruthy();
     });
   });

@@ -47,7 +47,7 @@ describe("Analytics modal", () => {
       const sampleItem = await body.findByRole("button", { name: "Top Models by Cost" });
       fireEvent.keyDown(sampleItem, { key: "Escape" });
       await waitFor(() => {
-        expect(body.queryByRole("button", { name: "Top Models by Cost" })).toBeNull();
+        expect(body.queryByRole("button", { name: "Top Models by Cost" }) === null).toBe(true);
       });
       expect(body.queryByRole("dialog", { name: "Analytics" })).toBe(dialog);
 
@@ -68,7 +68,7 @@ describe("Analytics modal", () => {
       await body.findByRole("dialog", { name: "Settings" }, { timeout: 10_000 });
       fireEvent.keyDown(window, { key: "Y", ctrlKey: true, shiftKey: true });
       await waitFor(() => {
-        expect(body.queryByRole("dialog", { name: "Settings" })).toBeNull();
+        expect(body.queryByRole("dialog", { name: "Settings" }) === null).toBe(true);
       });
       const analyticsAgain = await body.findByRole("dialog", { name: "Analytics" });
 
@@ -79,7 +79,7 @@ describe("Analytics modal", () => {
       fireEvent.keyDown(projectFilter, { key: "Escape" });
       await waitFor(
         () => {
-          expect(body.queryByRole("dialog", { name: "Analytics" })).toBeNull();
+          expect(body.queryByRole("dialog", { name: "Analytics" }) === null).toBe(true);
         },
         { timeout: 30_000 }
       );
@@ -116,7 +116,7 @@ describe("Analytics modal", () => {
           if (dialog.isConnected && dialog.getAttribute("data-state") === "open") {
             await user.keyboard("{Escape}");
           }
-          expect(body.queryByRole("dialog", { name: "Analytics" })).toBeNull();
+          expect(body.queryByRole("dialog", { name: "Analytics" }) === null).toBe(true);
         },
         { timeout: 30_000 }
       );

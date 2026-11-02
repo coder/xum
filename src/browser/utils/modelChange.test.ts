@@ -144,15 +144,15 @@ describe("modelChange", () => {
     expect(consumeWorkspaceModelChange(workspaceId, coderModel)).toBe("user");
   });
 
-  test("still collapses passthrough gateway aliases when tracking explicit changes", () => {
+  test("still collapses non-Coder gateway aliases when tracking explicit changes", () => {
     const workspaceId = nextWorkspaceId();
     const canonicalModel = "openai:gpt-5.2-codex";
-    const gatewayAlias = "mux-gateway:openai/gpt-5.2-codex";
+    const gatewayAlias = "openrouter:openai/gpt-5.2-codex";
 
     setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "sync");
     setWorkspaceModelWithOrigin(workspaceId, canonicalModel, "user");
 
-    // A persisted rewrite to the passthrough alias must still consume the entry.
+    // A persisted rewrite to the gateway alias must still consume the entry.
     expect(consumeWorkspaceModelChange(workspaceId, gatewayAlias)).toBe("user");
   });
 });

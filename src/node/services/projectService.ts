@@ -1,4 +1,5 @@
 import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
@@ -62,7 +63,7 @@ import {
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
 } from "@/node/config/projectRegistrationLock";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProjectTrusted, isProjectTrustedIn } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -408,6 +409,9 @@ export class ProjectService {
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
   private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
+  private unsubscribeProjectTrust?: () => void;
+  /** The effectively trusted project paths at the last config change (watchProjectTrust). */
+  private trustedProjectsKey?: string;
 
   constructor(
     private readonly config: Config,
@@ -960,6 +964,43 @@ export class ProjectService {
   /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.unsubscribeProjectTrust?.();
+    this.unsubscribeProjectTrust = undefined;
+  }
+
+  /**
+   * #7621: `xum trust` and other writers of config.json change trust without setTrust, so they
+   * reach this backend only as a config change. Drop the remote plugin snapshots when the set of
+   * effectively trusted projects changes, as setTrust does. Reads only the config snapshot that
+   * every config-change listener shares. The subscription keeps Config's config.json watch open
+   * until beginShutdown. Never throws: a startup step must not fail, and a throw in an own save's
+   * notification would reach that save's caller.
+   */
+  watchProjectTrust(): void {
+    if (this.unsubscribeProjectTrust) return;
+    try {
+      this.trustedProjectsKey = this.readTrustedProjectsKey();
+      this.unsubscribeProjectTrust = this.config.onConfigChanged(() => {
+        try {
+          const key = this.readTrustedProjectsKey();
+          if (key === this.trustedProjectsKey) return;
+          this.trustedProjectsKey = key;
+          clearRemoteProjectPluginSnapshots();
+        } catch (error) {
+          log.warn(`Project trust watch: config change not applied: ${getErrorMessage(error)}`);
+        }
+      });
+    } catch (error) {
+      log.warn(`Project trust watch: not started: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private readTrustedProjectsKey(): string {
+    const projects = this.config.loadConfigOrDefault().projects;
+    const trusted = [...projects.keys()].filter((projectPath) =>
+      isProjectTrustedIn(projects, projectPath)
+    );
+    return JSON.stringify(trusted.sort());
   }
 
   async *cloneWithProgress(
@@ -2067,12 +2108,18 @@ export class ProjectService {
         affectedPaths.push(candidatePath);
       }
     }
-    this.mcpServerManager?.applyProjectTrust(
-      affectedPaths.map((candidatePath) => ({
-        projectPath: candidatePath,
-        trusted: isProjectTrusted(this.config, candidatePath),
-      }))
-    );
+    try {
+      this.mcpServerManager?.applyProjectTrust(
+        affectedPaths.map((candidatePath) => ({
+          projectPath: candidatePath,
+          trusted: isProjectTrusted(this.config, candidatePath),
+        }))
+      );
+    } finally {
+      // #6426: snapshots of remote project plugins exist only for trusted projects. After the
+      // trust change is published, even when the MCP update throws; synchronous, never throws.
+      clearRemoteProjectPluginSnapshots();
+    }
   }
 
   async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {

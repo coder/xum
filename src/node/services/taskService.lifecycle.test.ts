@@ -37,6 +37,7 @@ import {
   removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -279,6 +280,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -604,6 +606,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -648,6 +651,7 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
 
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
@@ -1664,6 +1668,7 @@ describe("TaskService", () => {
     );
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: rootWorkspaceId,
       workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       childTaskId: removedWorkflowChildTaskId,

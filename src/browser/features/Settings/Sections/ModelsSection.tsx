@@ -44,7 +44,6 @@ import {
   MAX_RENDERED_MODELS,
   MODEL_CATALOG_SUGGESTION_PAGE_SIZE,
 } from "@/common/constants/ui";
-import { CUSTOM_MODEL_HIDDEN_PROVIDERS } from "@/common/constants/providers";
 import {
   matchesModelQueryTokens,
   tokenizeModelQuery,
@@ -163,13 +162,7 @@ export function ModelsSection() {
   // Page belongs to the filter it was chosen under, so a new filter shows page 1.
   const [customPage, setCustomPage] = useState({ filter: "", index: 0 });
 
-  const allowedProviders = useMemo(
-    () =>
-      getProviderIdsForUi(config).filter(
-        (provider) => !CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)
-      ),
-    [config]
-  );
+  const allowedProviders = useMemo(() => getProviderIdsForUi(config), [config]);
 
   useEffect(() => {
     if (config === null || !lastProvider || allowedProviders.includes(lastProvider)) {
@@ -209,12 +202,6 @@ export function ModelsSection() {
   // input on success (a rejected duplicate keeps the typed ID visible).
   const addModel = (provider: string, modelId: string): boolean => {
     if (!config) return false;
-
-    // mux-gateway is a routing layer, not a provider users should add models under.
-    if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) {
-      setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
-      return false;
-    }
 
     // Check for duplicates
     if (modelExists(provider, modelId)) {
@@ -649,7 +636,6 @@ export function ModelsSection() {
     );
   }
 
-  // Get all custom models across providers (excluding hidden providers like mux-gateway)
   const getCustomModels = (): Array<{
     provider: string;
     modelId: string;
@@ -666,8 +652,6 @@ export function ModelsSection() {
     }> = [];
 
     for (const [provider, providerConfig] of Object.entries(config)) {
-      // Skip hidden providers (mux-gateway models are routed, not managed as a standalone list)
-      if (CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)) continue;
       if (!providerConfig.models) continue;
 
       for (const modelEntry of providerConfig.models) {

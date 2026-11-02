@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
@@ -221,6 +223,68 @@ describe("RemoteRuntime.exec output streams", () => {
       abort.abort();
       await stream.exitCode;
     }
+  });
+});
+
+/**
+ * Spawns a fake child whose stdin never finishes flushing: `final` never calls back, so
+ * end() stays pending until the test destroys stdin, as Node does when a child exits.
+ */
+class PendingStdinRemoteRuntime extends TestRemoteRuntime {
+  readonly endCalled = Promise.withResolvers<void>();
+  readonly child = Object.assign(new EventEmitter(), {
+    stdin: new Writable({
+      write: (_chunk, _encoding, callback) => callback(),
+      final: () => this.endCalled.resolve(),
+    }),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    exitCode: null,
+    signalCode: null,
+    killed: false,
+    kill: () => true,
+  });
+
+  protected override spawnRemoteProcess(): Promise<SpawnResult> {
+    return Promise.resolve({ process: this.child as unknown as ChildProcess });
+  }
+}
+
+/** Resolves "settled" if `promise` settles before the next macrotask turn, else "pending". */
+function settledByNextTurn(promise: Promise<unknown>): Promise<"settled" | "pending"> {
+  return Promise.race([
+    promise.then(
+      () => "settled" as const,
+      () => "settled" as const
+    ),
+    new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+  ]);
+}
+
+describe("RemoteRuntime.exec stdin close (#7436)", () => {
+  // execBuffered awaits stdin.close(). When the child exited while end() was still
+  // flushing, Node destroyed stdin and emitted only 'close', so close() never settled.
+  it("settles when the child's stdin is destroyed while end() is pending", async () => {
+    const runtime = new PendingStdinRemoteRuntime();
+    const stream = await runtime.exec("cat", { cwd: "/workspace" });
+    const closing = stream.stdin.close();
+    await runtime.endCalled.promise;
+
+    runtime.child.stdin.destroy();
+    await once(runtime.child.stdin, "close");
+
+    expect(await settledByNextTurn(closing)).toBe("settled");
+    runtime.child.emit("close", 0, null);
+  });
+
+  it("settles at once when the child's stdin is already destroyed", async () => {
+    const runtime = new PendingStdinRemoteRuntime();
+    const stream = await runtime.exec("cat", { cwd: "/workspace" });
+    runtime.child.stdin.destroy();
+    await once(runtime.child.stdin, "close");
+
+    expect(await settledByNextTurn(stream.stdin.close())).toBe("settled");
+    runtime.child.emit("close", 0, null);
   });
 });
 

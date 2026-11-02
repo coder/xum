@@ -110,6 +110,7 @@ import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/Workspace
 import { invalidateGitStatus } from "@/browser/stores/GitStatusStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { runWithCatch, runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
+import { useReviewFocusRequest } from "./useReviewFocusRequest";
 
 /** Stats reported to parent for tab display */
 interface ReviewPanelStats {
@@ -1296,12 +1297,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     controllerRef.current?.requestImmediate();
   };
 
-  // Focus panel when focusTrigger changes (preserves current hunk selection)
-  useEffect(() => {
-    if (focusTrigger && focusTrigger > 0) {
-      panelRef.current?.focus();
-    }
-  }, [focusTrigger]);
+  useReviewFocusRequest(panelRef, focusTrigger, isCreating);
 
   // Debounce search input
   useEffect(() => {

@@ -1314,7 +1314,7 @@ describe("WorkflowRunToolCall", () => {
 
     fireEvent.click(view.getByLabelText("Close"));
     await waitFor(() => {
-      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(document.querySelector('[role="dialog"]') === null).toBe(true);
     });
   });
 
@@ -1411,7 +1411,7 @@ describe("WorkflowRunToolCall", () => {
     });
     fireEvent.click(view.getByLabelText("Close"));
     await waitFor(() => {
-      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(document.querySelector('[role="dialog"]') === null).toBe(true);
     });
 
     const completedTaskControl = view.getByRole("button", {

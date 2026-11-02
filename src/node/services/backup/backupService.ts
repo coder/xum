@@ -97,6 +97,7 @@ export interface BackupPayloadStore {
     projectBundleSkipped: boolean;
     /** Shelf files a restore would not write, with the reason (M5c). */
     shelfSkipped?: string[];
+    symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -111,6 +112,7 @@ export interface BackupPayloadStore {
      * to; restore writes only these exact pairs, never a newer or different match.
      */
     matchedProjects: BackupMatchedProject[];
+    symlinkSkipped?: string[];
   }>;
   /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
   writeSafetySnapshot(snapshotRoot: string, contents: BackupContents): Promise<void>;
@@ -122,11 +124,14 @@ export interface BackupPayloadStore {
     /** Receives the matched project memory snapshot, taken in the write's lock window. */
     snapshotPath: string;
     matchedProjects: readonly BackupMatchedProject[];
+    /** The preflight's skip set, so the write skips exactly what the snapshot left out. */
+    symlinkSkipped?: readonly string[];
   }): Promise<{
     changedFiles: string[];
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
     shelfSkipped?: string[];
+    symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -573,6 +578,7 @@ export class BackupService {
         projectBundleSkipped: boolean;
         /** Artifact shelf files left out of the push or the restore, with the reason. */
         shelfSkipped: string[];
+        symlinkSkipped?: string[];
         pushError: string | null;
       },
       BackupOperationError
@@ -618,6 +624,7 @@ export class BackupService {
           ...("pushError" in exported ? [] : (exported.shelfSkipped ?? [])),
           ...(restorePreview.shelfSkipped ?? []),
         ],
+        symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
@@ -708,6 +715,7 @@ export class BackupService {
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
         shelfSkipped: string[];
+        symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -792,6 +800,7 @@ export class BackupService {
               contents,
               snapshotPath,
               matchedProjects: validated.matchedProjects,
+              symlinkSkipped: validated.symlinkSkipped,
             });
             // Announced as soon as the memory is on disk: a failure recording the commit below
             // must not leave subscribers showing pre-restore contents.
@@ -826,6 +835,7 @@ export class BackupService {
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
               shelfSkipped: restored.shelfSkipped ?? [],
+              symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>

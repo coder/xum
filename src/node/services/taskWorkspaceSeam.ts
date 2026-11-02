@@ -135,6 +135,11 @@ export interface TaskCreateArgs {
    * the child's provenance tracking inherits it.
    */
   carriesProjectSkillContent?: boolean;
+  /**
+   * Direct create only (createMany takes its own): once aborted, the create refuses at its gate,
+   * before it counts, forks or writes a row. A create past the gate finishes as before.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export function formatSubagentReportUserMessage(params: {
@@ -288,6 +293,12 @@ export interface ArchiveCascadePreflight {
 }
 
 export interface ArchiveWorkspaceOptions {
+  /**
+   * Per sub-agent workspace ID, the untracked paths the user confirmed losing to its snapshot
+   * archive. Only the user's archive sets it: no tool acknowledgement can approve losing a
+   * sub-agent's work (#4930).
+   */
+  acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
    * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an

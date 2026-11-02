@@ -83,7 +83,7 @@ exit 99
   process.env.PATH = `${binDir}${path.delimiter}${savedEnv.PATH ?? ""}`;
 }
 
-function calls(): Array<{ command: string; cwd: string }> {
+function calls(): { command: string; cwd: string }[] {
   if (!fs.existsSync(callLog)) return [];
   return fs
     .readFileSync(callLog, "utf8")

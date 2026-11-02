@@ -23,6 +23,7 @@ import { ContextManagementService } from "@/node/services/contextManagement/cont
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { HistoryService } from "@/node/services/historyService";
 import { InitStateManager } from "@/node/services/initStateManager";
+import { StreamManager } from "@/node/services/streamManager";
 import { TaskService } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { WorkspaceService } from "@/node/services/workspaceService";
@@ -139,7 +140,12 @@ async function makeServices(count: number): Promise<BenchServices> {
     new ContextManagementService({ config, historyService, aiService }),
     initStateManager,
     new ExtensionMetadataService(path.join(root, "extensionMetadata.json")),
-    new BackgroundProcessManager(path.join(root, "bg"))
+    new BackgroundProcessManager(path.join(root, "bg")),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    new StreamManager(historyService)
   );
   const taskService = new TaskService(config, historyService, aiService, service, initStateManager);
   const lastId = workspaceId(count - 1);

@@ -26,7 +26,6 @@ import {
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { useReviews } from "@/browser/hooks/useReviews";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
@@ -54,9 +53,11 @@ import {
   type ArtifactAnnotationPick,
 } from "./artifactAnnotation";
 import { ArtifactAnnotationPopover } from "./ArtifactAnnotationPopover";
+import { shareArtifactListing, useArtifactsPanelListing } from "./agentInterfaceView";
 import { downloadArtifact } from "./artifactDownload";
 import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
 import { useArtifactInteractions } from "./useArtifactInteractions";
+import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactAnnotateMode } from "./useArtifactAnnotateMode";
 import {
@@ -67,9 +68,6 @@ import {
   writeArtifactSelection,
 } from "./artifactSelection";
 import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
-
-/** While the tab is visible, re-list this often to catch writes no tool event reports. */
-const ARTIFACTS_POLL_MS = 3000;
 
 interface ReadState {
   /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
@@ -333,7 +331,12 @@ export function ArtifactsPanel(props: {
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
   const [listError, setListError] = useState<string | null>(null);
-  const [refreshTick, setRefreshTick] = useState(0);
+  // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
+  const listInFlightRef = useRef(false);
+  const [refreshTick, setRefreshTick] = useArtifactsRefreshTick(props.workspaceId, {
+    online: api != null,
+    listInFlightRef,
+  });
   const [reloadTick, setReloadTick] = useState(0);
   const [readState, setReadState] = useState<ReadState | null>(null);
   // Whether the latest preview read failed: the next successful re-list (poll or file event)
@@ -364,8 +367,6 @@ export function ArtifactsPanel(props: {
     setShortcutFocused(document.activeElement === panelRef.current);
     onAutoFocusConsumed?.();
   }, [autoFocus, onAutoFocusConsumed]);
-  // Set while a list request runs, so a slow walk is not aborted by the next poll tick.
-  const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
   const [shelf, setShelf] = useState<ArtifactShelfListing | null>(null);
   const [versionsState, setVersionsState] = useState<VersionsState | null>(null);
@@ -388,6 +389,7 @@ export function ArtifactsPanel(props: {
     setSelection({ scope: next.scope, path: next.path, version: null });
   };
 
+  useArtifactsPanelListing(props.workspaceId);
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
@@ -405,6 +407,8 @@ export function ArtifactsPanel(props: {
         }
         setListError(null);
         setListing(result.data);
+        // The main pane's Agent interface view takes it instead of listing the folder again.
+        shareArtifactListing(props.workspaceId, result.data);
         if (readFailedRef.current) {
           readFailedRef.current = false;
           setRetryTick((tick) => tick + 1);
@@ -463,27 +467,6 @@ export function ArtifactsPanel(props: {
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
-
-  // Re-list after the agent's file edits and bash commands, the usual ways it writes files.
-  useEffect(() => {
-    return workspaceStore.subscribeFileModifyingTool((wsId) => {
-      if (wsId === props.workspaceId) setRefreshTick((tick) => tick + 1);
-    }, props.workspaceId);
-  }, [props.workspaceId]);
-
-  // Writes by scripts or other tools emit no event, so poll while the window is visible. Not
-  // while Xum reconnects: each poll re-reads canvas data files, and those reads wait for the
-  // connection (useArtifactAssetReader), so ticks during an outage would only pile them up.
-  const online = api != null;
-  useEffect(() => {
-    if (!online) return;
-    const interval = window.setInterval(() => {
-      if (document.visibilityState === "visible" && !listInFlightRef.current) {
-        setRefreshTick((tick) => tick + 1);
-      }
-    }, ARTIFACTS_POLL_MS);
-    return () => window.clearInterval(interval);
-  }, [online]);
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];

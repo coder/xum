@@ -100,9 +100,7 @@ function ChatComposerInner(props: {
   const apiState = useAPI();
   const api = apiState.api;
 
-  const { agentId, currentAgent, isAgentSelectionLocked } = useAgent();
-  // #4820: without a workspace scope a pick would write the webview's global agent key.
-  const agentPickerUsable = props.agentScoped && isAgentSelectionLocked !== true;
+  const { agentId, currentAgent } = useAgent();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { options: providerOptions } = useProviderOptions();
@@ -341,8 +339,9 @@ function ChatComposerInner(props: {
     return "Type a message...";
   })();
 
-  // Mirrors the desktop composer (ChatInput): same surface, hint row, and control row. Attach,
-  // voice, and send-mode menus are omitted because the webview does not support them.
+  // Mirrors the desktop workspace composer (ChatInput): same surface and control row, and no
+  // empty-input shortcut hints (desktop shows those only in creation, which the webview lacks).
+  // Attach, voice, and send-mode menus are omitted because the webview does not support them.
   const composerSurfaceStyle: CSSProperties & { "--composer-focus-border": string } = {
     "--composer-focus-border": currentAgent?.uiColor ?? "var(--color-border-light)",
   };
@@ -362,7 +361,9 @@ function ChatComposerInner(props: {
             onChange={setInput}
             placeholder={placeholder}
             disabled={props.disabled}
-            className="min-h-22"
+            // One-line floor, matching the desktop workspace composer (#7476, #7540). Long
+            // placeholders stay on that line instead of wrapping into a clipped second line.
+            className="min-h-9 placeholder:truncate"
             onKeyDown={(e) => {
               if (matchesKeybind(e, KEYBINDS.CYCLE_MODEL)) {
                 e.preventDefault();
@@ -396,24 +397,6 @@ function ChatComposerInner(props: {
               }
             }}
           />
-          {/* Only shortcuts the webview handles: no FOCUS_CHAT handler exists here, and agent
-              cycling is hinted only when the picker itself is usable. Unlike desktop, there is no
-              touch-layout hiding: the webview only runs inside VS Code, a keyboard surface where
-              these shortcuts work. */}
-          {input.trim() === "" && (
-            <div className="text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
-              <span className="shrink-0">
-                <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_MODEL)}</span>
-                <span> - change model</span>
-              </span>
-              {agentPickerUsable && (
-                <span className="shrink-0 [@container(max-width:520px)]:hidden">
-                  <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_AGENT)}</span>
-                  <span> - change agent</span>
-                </span>
-              )}
-            </div>
-          )}
         </div>
 
         <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">

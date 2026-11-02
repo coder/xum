@@ -30,10 +30,6 @@ import type {
   FileReadToolResultSchema,
   HeartbeatToolResultSchema,
   MemoryToolResultSchema,
-  IntuitionToolResultSchema,
-  IntuitionMemorySchema,
-  IntuitionCandidateSchema,
-  IntuitionStatsSchema,
   AttachFileToolResultSchema,
   TaskToolResultSchema,
   TaskSendMessageToolResultSchema,
@@ -190,6 +186,11 @@ export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
 
+// Status-update tool types (status page agent mode)
+export type StatusUpdateToolResult =
+  | { success: true; queued: true; note?: string }
+  | { success: false; error: string };
+
 // Session-history tool types, derived from schema (avoid drift)
 export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryToolResult = z.infer<
@@ -199,13 +200,6 @@ export type SessionHistoryToolResult = z.infer<
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
 export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
-
-export type IntuitionToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition.schema>;
-export type IntuitionToolResult = z.infer<typeof IntuitionToolResultSchema>;
-export type IntuitionMemory = z.infer<typeof IntuitionMemorySchema>;
-export type IntuitionCandidate = z.infer<typeof IntuitionCandidateSchema>;
-export type IntuitionStats = z.infer<typeof IntuitionStatsSchema>;
-export type IntuitionReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition_report.schema>;
 
 // AttachFileToolResult derived from Zod schema (single source of truth)
 export type AttachFileToolResult = z.infer<typeof AttachFileToolResultSchema>;

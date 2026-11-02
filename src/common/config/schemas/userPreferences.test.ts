@@ -63,7 +63,7 @@ describe("UserPreferencesSchema", () => {
           projectDefaults: {
             "/repo": {
               agentId: " Exec ",
-              model: "mux-gateway:openai",
+              model: "openai:",
               thinkingLevel: "xhigh",
             },
           },
@@ -105,7 +105,7 @@ describe("UserPreferencesSchema", () => {
         ai: {
           globalDefaults: { agentId: " Plan ", thinkingLevel: "med" },
           projectDefaults: {
-            "/a": { agentId: "exec", model: "mux-gateway:openai" },
+            "/a": { agentId: "exec", model: "openai:" },
             "/b": { model: " openai:gpt-4.1 ", thinkingLevel: "med" },
           },
         },

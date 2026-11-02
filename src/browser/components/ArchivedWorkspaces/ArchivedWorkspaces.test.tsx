@@ -820,14 +820,18 @@ describe("ArchivedWorkspaces", () => {
 
     await waitFor(() => {
       expect(
-        view.queryByLabelText(`Remove local checkout for workspace ${transcriptOnlyWorkspace.name}`)
-      ).toBeNull();
+        view.queryByLabelText(
+          `Remove local checkout for workspace ${transcriptOnlyWorkspace.name}`
+        ) === null
+      ).toBe(true);
       expect(
-        view.queryByLabelText(`Remove local checkout for workspace ${localWorkspace.name}`)
-      ).toBeNull();
+        view.queryByLabelText(`Remove local checkout for workspace ${localWorkspace.name}`) === null
+      ).toBe(true);
       expect(
-        view.queryByLabelText(`Remove local checkout for workspace ${sharedCheckoutWorkspace.name}`)
-      ).toBeNull();
+        view.queryByLabelText(
+          `Remove local checkout for workspace ${sharedCheckoutWorkspace.name}`
+        ) === null
+      ).toBe(true);
     });
   });
 });

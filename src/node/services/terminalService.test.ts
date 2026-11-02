@@ -1494,8 +1494,8 @@ describe("TerminalService.openNative", () => {
       const script = call[1]?.[1];
       expect(script).toContain('tell application "Terminal"');
       expect(script).toContain("ssh");
-      expect(script).toContain("-p 2222"); // port
-      expect(script).toContain("-i ~/.ssh/id_rsa"); // identity file
+      expect(script).toContain("'-p' '2222'"); // port
+      expect(script).toContain("'-i' '~/.ssh/id_rsa'"); // identity file
       expect(script).toContain("remote.example.com"); // host
     });
   });
@@ -1876,6 +1876,102 @@ describe("TerminalService.openNative", () => {
         '--config "C:/tmp/project/.devcontainer/%%TEMP%%/devcontainer.json"'
       );
       expect(cmdString).not.toContain("'C:/tmp/project/main%PATH%'");
+    });
+  });
+
+  // A native terminal gets ssh as one command string (Ghostty, Terminal.app, xfce4-terminal), so
+  // each argument must survive the shell's word splitting: a home like "/Users/John Smith" puts
+  // spaces in the identity file.
+  describe("SSH command strings", () => {
+    const identityFile = "/tmp/John Smith/id key";
+    const host = "dev-box";
+    const remotePath = "/home/user/it's here";
+    const expectedArgv = [
+      "ssh",
+      "-i",
+      identityFile,
+      "-t",
+      host,
+      `cd "${remotePath}" && exec $SHELL`,
+    ];
+    const configWithRemoteWorkspace = {
+      ...configWithSSHWorkspace,
+      getAllWorkspaceMetadata: mock(() =>
+        Promise.resolve([
+          {
+            id: "ws-remote",
+            projectPath: "/home/user/project",
+            name: "feature",
+            namedWorkspacePath: remotePath,
+            runtimeConfig: { type: "ssh", host, srcBaseDir: "~/src", identityFile },
+          },
+        ])
+      ),
+    } as unknown as Config;
+
+    /** The argv a POSIX shell splits `command` into. */
+    function shellArgv(command: string): string[] {
+      const printed = Bun.spawnSync(["sh", "-c", `printf '%s\\0' ${command}`]).stdout.toString();
+      return printed.split("\0").slice(0, -1);
+    }
+
+    async function spawnedArgs(): Promise<string[]> {
+      service = new TerminalService(configWithRemoteWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative("ws-remote");
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      return (spawnSpy.mock.calls[0] as [string, string[]])[1];
+    }
+
+    it("Ghostty", async () => {
+      setPlatform("darwin");
+      fsStatSpy.mockImplementation((statPath: string) =>
+        statPath === "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+          ? Promise.resolve({ isFile: () => true, mode: 0o755 })
+          : Promise.reject(new Error("ENOENT"))
+      );
+      const args = await spawnedArgs();
+      const command = args.find((arg) => arg.startsWith("--command="));
+      expect(shellArgv(command?.slice("--command=".length) ?? "")).toEqual(expectedArgv);
+    });
+
+    it("Terminal.app", async () => {
+      setPlatform("darwin");
+      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
+        cmd === "which" && args?.[0] === "ghostty" ? { status: 1 } : { status: 0 }
+      );
+      const script = (await spawnedArgs())[1];
+      const appleScriptString = /do script "((?:[^"\\]|\\.)*)"/.exec(script)?.[1] ?? "";
+      expect(shellArgv(appleScriptString.replace(/\\(.)/g, "$1"))).toEqual(expectedArgv);
+    });
+
+    it("xfce4-terminal", async () => {
+      setPlatform("linux");
+      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
+        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
+      );
+      const args = await spawnedArgs();
+      expect(shellArgv(args[1])).toEqual(expectedArgv);
+    });
+
+    it("expands a ~ workspace path on the remote host", async () => {
+      setPlatform("linux");
+      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
+        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
+      );
+      const [workspace] = await configWithRemoteWorkspace.getAllWorkspaceMetadata();
+      service = new TerminalService(
+        {
+          ...configWithRemoteWorkspace,
+          getAllWorkspaceMetadata: mock(() =>
+            Promise.resolve([{ ...workspace, namedWorkspacePath: "~/src/project/feature" }])
+          ),
+        } as unknown as Config,
+        mockPTYService,
+        mockSecretsStore
+      );
+      await service.openNative("ws-remote");
+      const args = (spawnSpy.mock.calls[0] as [string, string[]])[1];
+      expect(shellArgv(args[1]).at(-1)).toBe('cd "$HOME/src/project/feature" && exec $SHELL');
     });
   });
 

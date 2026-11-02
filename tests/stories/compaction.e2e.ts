@@ -9,7 +9,7 @@
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { disableTutorials } from "../bugbash/repros/helpers";
+import { disableTutorials, sendMessage } from "../bugbash/repros/helpers";
 import { openPlayground } from "./helpers";
 
 // Plain texts get the mock's default reply, "Mock response: <text>". Neither is part of the other.
@@ -28,7 +28,8 @@ test(
     // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
     await openPlayground(screen);
     for (const text of [FIRST, SECOND]) {
-      await agent.act(`send the chat message '${text}' and wait for the reply`);
+      // exact step: an agent step that types here stops replaying when the placeholder tip rotates.
+      await sendMessage(screen, text);
       await expect(transcript).toContainText(`Mock response: ${text}`, { timeout: 30_000 });
     }
 

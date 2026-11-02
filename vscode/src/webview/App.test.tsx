@@ -1,7 +1,7 @@
 import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
@@ -88,7 +88,7 @@ class TestBridge implements VscodeBridge {
     await this.emit({ type: "orpcStreamData", streamId, value });
   }
 
-  orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
+  orpcCalls(path: string): Extract<WebviewToExtensionMessage, { type: "orpcCall" }>[] {
     return this.sent.filter(
       (message): message is Extract<WebviewToExtensionMessage, { type: "orpcCall" }> =>
         message.type === "orpcCall" && message.path.join(".") === path
@@ -676,7 +676,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     });
 
   // Stop and Esc share one interrupt path; both must reach the host and mark the stream.
-  const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
+  const interruptTriggers: [string, (view: ReturnType<typeof render>) => void][] = [
     ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
     ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
     [
@@ -800,7 +800,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await selectWorkspace(bridge);
 
     const sentinel = view.getByTestId("transcript-bottom-sentinel");
-    const scrollport = sentinel.parentElement as HTMLElement;
+    const scrollport = sentinel.parentElement!;
     const content = scrollport.firstElementChild as HTMLElement;
     const scrollUp = () =>
       act(async () => {
@@ -1433,10 +1433,30 @@ describe("vscode webview workspace AI settings", () => {
 
     expect(agentPicker(view).textContent).toBe("Exec");
     expect(agentPicker(view).disabled).toBe(true);
-    // Agent cycling is locked too, so the composer does not advertise it.
-    expect(view.queryByText("- change agent")).toBeNull();
     const options = await send(bridge, view);
     expect(options.agentId).toBe("exec");
+  });
+
+  test("the empty composer shows no shortcut hints but Ctrl+/ still changes the model (#7540)", async () => {
+    const { view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "exec",
+        aiSettingsByAgent: {
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "medium" },
+        },
+      },
+    });
+    // Like the desktop workspace composer (#7476), the one-line empty box has no hint row.
+    expect(view.queryByText("- change model")).toBeNull();
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    const modelBefore = view.getByRole("combobox").textContent;
+    await pressKey(textarea, { key: "/", ctrlKey: true });
+    // Read the selector rather than sending: a send with a pick leaves module-level persistence
+    // state in flight for later suites.
+    expect(view.getByRole("combobox").textContent).not.toBe(modelBefore);
   });
 
   test("switching the agent restores that agent's own settings", async () => {
@@ -1600,12 +1620,10 @@ describe("vscode webview agent lookup", () => {
     await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
     expect(toggle().disabled).toBe(true);
-    expect(view.queryByText("- change agent")).toBeNull();
 
     // With a server connection, the scope follows the listed selection.
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(toggle().disabled).toBe(false);
-    expect(view.queryByText("- change agent")).not.toBeNull();
   });
 
   test("keeps the agent toggle disabled for a restored selection until the workspace list arrives (#4820)", async () => {
@@ -2195,6 +2213,7 @@ describe("vscode webview message rows", () => {
   // ChatPane-level derivations the webview shares with desktop (#5002).
   test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
     const scrolled: Element[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved only to restore the prototype method afterwards
     const originalScrollIntoView = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = function (this: Element) {
       scrolled.push(this);
@@ -2706,6 +2725,9 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
   const idle = { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] };
   const strip = (view: ReturnType<typeof render>) =>
     view.container.querySelector('[data-component="SubAgentTasksDecoration"]');
+  // The live line's sub-agents chip (#7689) names its counts in its accessible name.
+  const chipName = (view: ReturnType<typeof render>) =>
+    view.container.querySelector('[data-activity-id="sub-agents"]')?.getAttribute("aria-label");
 
   test("follows the host's live list and activity, and a row selects the sub-agent", async () => {
     const bridge = new TestBridge();
@@ -2714,20 +2736,23 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     expect(strip(view)).toBeNull();
 
     await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "running" })] });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(chipName(view)).toBe("1 sub-agent, 1 active");
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: /1 sub-agent/ }));
       await Promise.resolve();
     });
+    // The open panel's heading carries the activity.
+    expect(strip(view)?.textContent).toContain("1 active");
     fireEvent.click(view.getByRole("button", { name: /Explorer/ }));
     expect(bridge.sent.at(-1)).toEqual({ type: "selectWorkspace", workspaceId: "ws-child" });
 
     // The host re-posts the list when the task reports; an armed monitor keeps it active.
     await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "reported" })] });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · inactive");
+    expect(chipName(view)).toBe("1 sub-agent");
+    expect(strip(view)?.textContent).toContain("inactive");
     const activity = { [parent.id]: idle, "ws-child": { ...idle, activeBashMonitorCount: 1 } };
     await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(chipName(view)).toBe("1 sub-agent, 1 active");
     expect(view.getByRole("button", { name: /Explorer/ }).textContent).toContain("Monitoring");
 
     // Removed or archived descendants leave the strip.
@@ -2742,7 +2767,7 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     await selectWorkspace(bridge, [], parent);
     const activity = { [parent.id]: { ...idle, activeWorkflowRunIds: ["wfr_abcdef123456"] } };
     await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
-    expect(strip(view)?.textContent).toContain("running");
+    expect(chipName(view)).toContain("running");
   });
 });
 
@@ -2781,11 +2806,9 @@ describe("vscode webview background processes strip (#5092)", () => {
     await emitBackgroundBashes(bridge, workspaceA.id, [runningProcess]);
 
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    // Each row ends with its Terminate button.
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
-    await click(rowButtons[rowButtons.length - 1]);
+    // The row leads with its command.
+    expect(view.getByText("sleep 600")).toBeTruthy();
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
 
     expect(
@@ -2799,12 +2822,15 @@ describe("vscode webview background processes strip (#5092)", () => {
   const press = async (target: Element, init: KeyboardEventInit): Promise<boolean> => {
     let notPrevented = true;
     await act(async () => {
-      notPrevented = fireEvent.keyDown(target, init);
+      const event = createEvent.keyDown(target, init);
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(event, "getModifierState", { value: () => false });
+      notPrevented = fireEvent(target, event);
       await Promise.resolve();
     });
     return notPrevented;
   };
-  const FOCUS_STRIP = { key: "J", ctrlKey: true, shiftKey: true };
+  const FOCUS_STRIP = { key: "j", code: "KeyJ", ctrlKey: true, altKey: true };
   const stripRows = (view: ReturnType<typeof render>) =>
     Array.from(view.container.querySelectorAll<HTMLElement>("[data-process-row]"));
   const focusComposerWithProcesses = async (workspace: UiWorkspace) => {
@@ -3118,10 +3144,8 @@ describe("vscode webview background processes strip (#5092)", () => {
     await settle();
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
-    await click(rowButtons[rowButtons.length - 1]);
+    expect(view.getByText("sleep 600")).toBeTruthy();
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
     expect(bridge.orpcCalls("workspace.backgroundBashes.terminate")).toHaveLength(1);
 
@@ -3154,11 +3178,12 @@ describe("vscode webview background processes strip (#5092)", () => {
     };
     const bridge = new TestBridge();
     // Snapshot the document after every commit, before passive effects run.
-    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const commits: { rows: boolean; error: boolean }[] = [];
     const onRender = () => {
       const text = document.body.textContent ?? "";
       commits.push({
-        rows: text.includes("background bash"),
+        // The live line's bash chip shows only a count, so look for the chip itself.
+        rows: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
         error: text.includes("terminate refused"),
       });
     };
@@ -3171,11 +3196,9 @@ describe("vscode webview background processes strip (#5092)", () => {
     await settle();
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    expect(view.getByText("sleep 600")).toBeTruthy();
     // Terminate on server A.
-    await click(rowButtons[rowButtons.length - 1]);
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
     const answerTerminate = () =>
       bridge.answer("workspace.backgroundBashes.terminate", {
@@ -3212,7 +3235,7 @@ describe("vscode webview background processes strip (#5092)", () => {
     // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
-    expect(view.container.querySelectorAll('[title="sleep 600"]')).toHaveLength(0);
+    expect(view.queryByText("sleep 600")).toBeNull();
   });
 
   test("does not show another workspace's processes after a switch", async () => {
@@ -3236,6 +3259,141 @@ describe("vscode webview background processes strip (#5092)", () => {
     expect(view.queryByRole("button", { name: /background bash/ })).toBeNull();
     const subscriptions = bridge.orpcCalls("workspace.backgroundBashes.subscribe");
     expect(subscriptions.map((call) => call.input)).toContainEqual({ workspaceId: workspaceB.id });
+  });
+});
+
+describe("vscode webview live line (#7689)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Workspaces no other test selects: the background bash store keeps last-known processes.
+  const parentOf = (id: string): UiWorkspace => ({ ...WORKSPACE, id, workspaceName: id });
+  const childOf = (parent: UiWorkspace): UiWorkspace => ({
+    ...WORKSPACE,
+    id: `${parent.id}-child`,
+    workspaceName: "Explorer",
+    ai: { parentWorkspaceId: parent.id },
+    task: { taskStatus: "running" },
+  });
+  const chip = (view: ReturnType<typeof render>, id: string) => {
+    const element = view.container.querySelector<HTMLElement>(`[data-activity-id="${id}"]`);
+    if (!element) throw new Error(`the ${id} chip is not rendered`);
+    return element;
+  };
+  const expanded = (view: ReturnType<typeof render>, id: string) =>
+    chip(view, id).getAttribute("aria-expanded");
+  const click = async (element: Element) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+  const openParent = async (bridge: TestBridge, parent: UiWorkspace) => {
+    await selectWorkspace(bridge, [], parent);
+    await bridge.emit({ type: "workspaces", workspaces: [parent, childOf(parent)] });
+  };
+  const chat = (bridge: TestBridge, workspaceId: string, event: Record<string, unknown>) =>
+    bridge.emit({ type: "chatEvent", workspaceId, event });
+
+  test("the sub-agents and bash chips share one line and its one panel", async () => {
+    const parent = parentOf("ws-line-chips");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    await emitBackgroundBashes(bridge, parent.id, [runningProcess]);
+
+    const lines = view.container.querySelectorAll('[data-component="ChatActivityLine"]');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].contains(chip(view, "sub-agents"))).toBe(true);
+    expect(lines[0].contains(chip(view, "background-bashes"))).toBe(true);
+
+    await click(chip(view, "sub-agents"));
+    expect(expanded(view, "sub-agents")).toBe("true");
+    expect(view.queryByRole("button", { name: /Explorer/ }) !== null).toBe(true);
+
+    await click(chip(view, "background-bashes"));
+    expect(expanded(view, "sub-agents")).toBe("false");
+    expect(expanded(view, "background-bashes")).toBe("true");
+    expect(view.queryByRole("button", { name: /Explorer/ }) === null).toBe(true);
+    expect(view.queryByText("sleep 600") !== null).toBe(true);
+  });
+
+  test("the sub-agents chord opens its panel from the composer", async () => {
+    const parent = parentOf("ws-line-chord");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    expect(expanded(view, "sub-agents")).toBe("false");
+
+    const chord = new window.KeyboardEvent("keydown", {
+      key: "a",
+      code: "KeyA",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+    Object.defineProperty(chord, "getModifierState", { value: () => false });
+    await act(async () => {
+      fireEvent(textarea, chord);
+      await Promise.resolve();
+    });
+    expect(expanded(view, "sub-agents")).toBe("true");
+    const explorer = view.queryByRole("button", { name: /Explorer/ });
+    expect(explorer !== null).toBe(true);
+  });
+
+  test("the line keeps its chips and open panel across a turn, but not across workspaces", async () => {
+    const parent = parentOf("ws-line-turn");
+    const other = parentOf("ws-line-turn-other");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    // Between turns the line still shows the chip, without a turn status.
+    expect(view.queryByRole("button", { name: "Stop streaming" }) === null).toBe(true);
+    await click(chip(view, "sub-agents"));
+    expect(expanded(view, "sub-agents")).toBe("true");
+
+    await chat(bridge, parent.id, {
+      type: "stream-start",
+      workspaceId: parent.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    expect(view.queryByRole("button", { name: "Stop streaming" }) !== null).toBe(true);
+    await chat(bridge, parent.id, {
+      type: "stream-abort",
+      workspaceId: parent.id,
+      messageId: "a1",
+      abortReason: "user",
+    });
+    expect(view.queryByRole("button", { name: "Stop streaming" }) === null).toBe(true);
+    // The turn starting and ending did not remount the chip, which would close its panel.
+    expect(expanded(view, "sub-agents")).toBe("true");
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [parent, childOf(parent), other, childOf(other)],
+    });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await chat(bridge, other.id, { type: "caught-up" });
+    await emitBackgroundBashes(bridge, other.id);
+    expect(expanded(view, "sub-agents")).toBe("false");
   });
 });
 
@@ -3278,18 +3436,18 @@ describe("vscode webview first reveal (#5202)", () => {
         workspaceName: `reveal-${label}`,
       };
       const bridge = new TestBridge();
-      const commits: Array<{
+      const commits: {
         transcript: boolean;
         held: boolean;
         strip: boolean;
         status: boolean;
-      }> = [];
+      }[] = [];
       const onRender = () => {
         const text = document.body.textContent ?? "";
         commits.push({
           transcript: text.includes("earlier question"),
           held: text.includes("held follow-up"),
-          strip: text.includes("background bash"),
+          strip: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
           status: document.body.querySelector('[aria-label="Stop streaming"]') !== null,
         });
       };

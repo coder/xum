@@ -33,6 +33,7 @@ import {
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { CreationDraftGate } from "@/browser/features/ChatInput/CreationDraftGate";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { LeftSidebarToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
@@ -307,12 +308,13 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
     // Auto-focus the prompt once when entering the creation screen.
     // Defensive: avoid re-focusing on unrelated re-renders (e.g. workspace list updates),
-    // which can move the user's caret.
+    // which can move the user's caret. Phones skip it: focus opens the software keyboard,
+    // which covered the page from the moment the home-screen app launched.
     if (didAutoFocusRef.current) {
       return;
     }
     didAutoFocusRef.current = true;
-    api.focus();
+    autoFocusUnlessPhone(() => api.focus());
   }, []);
 
   return (

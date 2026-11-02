@@ -5,16 +5,10 @@
  * Designed to be independently testable from the main aggregator.
  */
 
-import {
-  calculateTPS,
-  calculateTokenCount,
-  createDeltaStorage,
-  type DeltaRecord,
-  type DeltaRecordStorage,
-} from "@/common/utils/tokens/tps";
+import { createDeltaStorage, type DeltaRecordStorage } from "@/common/utils/tokens/tps";
 
-export { calculateTPS, calculateTokenCount, createDeltaStorage };
-export type { DeltaRecord, DeltaRecordStorage };
+export { createDeltaStorage };
+export type { DeltaRecordStorage };
 
 /**
  * Maximum reasonable TPS for sanity checking.

@@ -1517,8 +1517,10 @@ describe("TaskService", () => {
     const sweep = () => sweepOwnerWorkflowRunAttention(taskService, parentId);
 
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
 
     await drain(parentId);
     ownerBusy = false;
@@ -1848,8 +1850,10 @@ describe("TaskService", () => {
     // Residual private seed: noteWorkflowRunTerminalAttention would also start a drain that
     // delivers and settles this run itself, racing the two settlements under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
 
     // Park the older generation's settlement inside its first marker write: the newer
     // generation's settlement (started while the older one is parked) can then only
@@ -2107,8 +2111,13 @@ describe("TaskService", () => {
     // Residual private seed: noteWorkflowRunTerminalAttention would also start a drain that
     // evaluates this entry concurrently with the settlement calls under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_marker_soft_fail"]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
+      parentId,
+      new Set(["wfr_marker_soft_fail"])
+    );
     const settleSpy = spyOn(terminalAttentionStore, "recordSettled")
       // Lazy rejection: an eager mockRejectedValueOnce promise trips bun's unhandled-rejection
       // detector on this host before the call consumes it.
@@ -2333,8 +2342,10 @@ describe("TaskService", () => {
     // Residual private seed so ONE drain observes both runs: a second note would schedule a
     // second drain, giving the older group another chance outside the cycle under test.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
@@ -2459,8 +2470,10 @@ describe("TaskService", () => {
     // Residual private seed so ONE drain observes both runs: a second note would schedule a
     // second drain that could deliver the older group even if the same-cycle re-poke broke.
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
@@ -3069,8 +3082,13 @@ describe("TaskService", () => {
     // and the second drain would deliver the other group before the assertions below.
     const terminalAttentionStore = new TerminalAttentionStore(config);
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_split_plan", "wfr_split_exec"]));
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
+      parentId,
+      new Set(["wfr_split_plan", "wfr_split_exec"])
+    );
     taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
@@ -3154,8 +3172,10 @@ describe("TaskService", () => {
     const terminalAttentionStore = new TerminalAttentionStore(config);
     // Residual private seed so ONE drain observes both runs (see the test above).
     (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(
+      taskService as unknown as {
+        workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+      }
+    ).workflowRunAttention.pendingWorkflowRunAttention.set(
       parentId,
       new Set(["wfr_pin_split_pinned", "wfr_pin_split_unpinned"])
     );

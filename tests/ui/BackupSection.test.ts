@@ -8,7 +8,12 @@ import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup";
+import { call, os } from "@orpc/server";
+import {
+  BACKUP_CONTENT_DEFAULTS,
+  SettingsBackupInputSchema,
+} from "@/common/config/schemas/settingsBackup";
+import { backup } from "@/common/orpc/schemas/backup";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments } from "@/browser/testUtils";
 
@@ -156,7 +161,7 @@ describe("BackupSection", () => {
         includeMcpHeaders: false,
       })
     );
-    await waitFor(() => expect(canvas.queryByText("Unsaved changes")).toBeNull());
+    await waitFor(() => expect(canvas.queryByText("Unsaved changes") === null).toBe(true));
   });
 
   test("toggles the content selection from the keyboard under the parent gate", async () => {
@@ -759,6 +764,40 @@ describe("BackupSection", () => {
     await canvas.findByText("Could not persist backup settings");
   });
 
+  test.each([
+    ["Branch", "no such branch!"],
+    ["Subdirectory", "../escape"],
+  ])("names the field and rule when the server rejects an invalid %s", async (label, value) => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    // The real contract's input validation produces the error oRPC sends to the client.
+    const saveSettings = os.input(backup.saveSettings.input).handler(() => {
+      throw new Error("invalid input must not reach the handler");
+    });
+    jest
+      .spyOn(client.backup, "saveSettings")
+      .mockImplementation((input) => call(saveSettings, input));
+
+    fireEvent.change(canvas.getByLabelText(label), { target: { value } });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+
+    const issues = SettingsBackupInputSchema.safeParse({
+      ...BACKUP_CONTENT_DEFAULTS,
+      repoUrl: "git@github.com:example/dotfiles.git",
+      branch: label === "Branch" ? value : "main",
+      path: label === "Subdirectory" ? value : "mux/",
+    }).error?.issues;
+    expect(issues).toHaveLength(1);
+    const [issue] = issues!;
+    const field = String(issue.path[0]);
+    const shown = await canvas.findByText(
+      (text) => text.includes(field) && text.includes(issue.message)
+    );
+    expect(shown).toBeTruthy();
+  });
+
   test("sends only approved project imports with their target paths on restore", async () => {
     const candidate = {
       sourcePath: "/home/dev/src/rocket",
@@ -1145,6 +1184,28 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText(/pinned artifacts were left out/);
     expect(canvas.getByText(/artifacts\/global\/big\.bin/)).toBeTruthy();
+  });
+
+  test("lists backed-up files a preview left behind a local symlink", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        symlinkSkipped: ["skills/gh-stack/SKILL.md"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText("skills/gh-stack/SKILL.md")).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("skills/gh-stack/SKILL.md");
   });
 
   test("drops the left-out artifact notice once different settings are saved", async () => {

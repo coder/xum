@@ -38,3 +38,15 @@ export function formatDuration(ms: number, style: DurationStyle = "coarse"): str
       return `${(ms / 60_000).toFixed(1)}m`;
   }
 }
+
+/**
+ * A running timer: 45s, 12m 04s, 1h 02m. The smaller unit is zero-padded so a value that ticks
+ * every second keeps its width.
+ */
+export function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}

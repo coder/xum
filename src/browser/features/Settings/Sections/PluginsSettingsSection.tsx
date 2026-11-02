@@ -24,9 +24,12 @@ import type {
   AgentPluginComponents,
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
+  AgentPluginNotApplied,
   AgentPluginPendingSignOuts,
+  AgentPluginRuleType,
   AgentPluginUpdateCheck,
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
@@ -34,6 +37,7 @@ import type {
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
   consumePendingPluginsSectionIntent,
@@ -41,11 +45,14 @@ import {
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
 import {
+  CURSOR_HOOK_REMOTE_NOTE,
   describePluginHookHandler,
-  PLUGIN_HOOK_STATUS_NOTE,
+  hookStatusNote,
+  isCursorHookHandler,
   PluginHooksPanel,
-  cutReviewText,
-  kilobytes,
+  ReviewChangeRow,
+  useCutTextExpansion,
+  type CutTextExpansion,
 } from "./PluginHooksPanel";
 import {
   InstallMethodPicker,
@@ -53,6 +60,7 @@ import {
   installMethodLabel,
   offersSkillsCli,
 } from "./PluginInstallMethods";
+import { MarketplaceListing } from "./PluginMarketplaceListing";
 
 /**
  * Settings → Plugins (global scope only).
@@ -194,6 +202,20 @@ const SkillDirectives: React.FC<{ directives?: readonly string[] }> = (props) =>
   );
 };
 
+/**
+ * The label of a skill that Xum made from a Cursor rule. Xum loads every rule as a skill, so the
+ * label says where that differs from Cursor.
+ */
+const RULE_TYPE_LABEL: Record<AgentPluginRuleType, string> = {
+  "always-apply": "always-apply rule, loaded on request in Xum",
+  description: "rule",
+  glob: "glob rule, not attached by file in Xum",
+  manual: "manual rule",
+};
+
+const RuleTypeLabel: React.FC<{ ruleType?: AgentPluginRuleType }> = (props) =>
+  props.ruleType ? <span className="text-muted"> — {RULE_TYPE_LABEL[props.ruleType]}</span> : null;
+
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">;
@@ -211,11 +233,13 @@ const ComponentChooser: React.FC<{
               name: skill.name,
               detail: skill.description,
               directives: skill.directives,
+              ruleType: skill.ruleType,
             }))
           : props.inventory.mcpServers.map((server) => ({
               name: server.serverName,
               detail: `${server.transport} · ${server.summary}`,
               directives: undefined,
+              ruleType: undefined,
             }));
       const imported = props.imported?.[group] ?? [];
       const selectable = entries.map((entry) => entry.name);
@@ -253,7 +277,7 @@ const ComponentChooser: React.FC<{
             </Button>
           </div>
           {entries.length === 0 && <p className="text-muted text-xs">None available</p>}
-          {entries.map(({ name, detail, directives }) => (
+          {entries.map(({ name, detail, directives, ruleType }) => (
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
@@ -269,9 +293,12 @@ const ComponentChooser: React.FC<{
               />
               <span className="min-w-0 break-words">
                 <span className="text-foreground font-mono break-all">{name}</span>
+                <RuleTypeLabel ruleType={ruleType} />
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
+                {/* Prose wraps between words. break-words still splits an unbroken URL or path
+                    that cannot fit, so nothing scrolls sideways at phone width. */}
                 {detail && (
-                  <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                  <span className="text-muted block break-words whitespace-pre-wrap">{detail}</span>
                 )}
                 <SkillDirectives directives={directives} />
               </span>
@@ -574,6 +601,53 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
+/**
+ * Whether keyboard focus fell out of an unmounted control: to the page body, or to the Settings
+ * dialog itself (Radix moves it there). A control the user focused, anywhere, is not lost focus.
+ * A slow preview or install must not take the focus from a control the user moved to meanwhile.
+ */
+function focusFellOut(near: HTMLElement): boolean {
+  const active = document.activeElement;
+  return active === null || active === document.body || active === near.closest('[role="dialog"]');
+}
+
+/**
+ * Focus an element when it next mounts, once, if focus fell out meanwhile: `arm()` before the
+ * state change that mounts it. A later rerender or remount does not move focus.
+ */
+function useFocusOnNextMount() {
+  const armedRef = useRef(false);
+  return {
+    arm: () => {
+      armedRef.current = true;
+    },
+    ref: (element: HTMLElement | null) => {
+      if (element === null || !armedRef.current) return;
+      armedRef.current = false;
+      if (focusFellOut(element)) element.focus();
+    },
+  };
+}
+
+/**
+ * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
+ * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
+ * control when it mounts, if focus fell out. It does not when a control inside already took focus
+ * (the Back button after a marketplace entry, #7134) or the user focused another control while
+ * the preview loaded. The function is module-level, so React calls it only on mount and unmount:
+ * a changed Install as method or the Skills CLI choice rerenders the view without moving focus.
+ */
+function focusFirstControlOnMount(view: HTMLDivElement | null): void {
+  if (view === null || !focusFellOut(view)) return;
+  const controls = view.querySelectorAll<HTMLElement>(
+    "button, input, select, textarea, [tabindex]"
+  );
+  const first = Array.from(controls).find(
+    (control) => control.tabIndex >= 0 && !control.matches(":disabled")
+  );
+  first?.focus();
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
@@ -586,12 +660,20 @@ const AddPluginPanel: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
+  /** A marketplace repository: the user picks an entry, then previews it. */
+  const [marketplace, setMarketplace] = useState<AgentPluginMarketplaceListing | null>(null);
   const [selected, setSelected] = useState<AgentPluginImportedComponents>({
     skills: [],
     mcpServers: [],
   });
   /** The "Skills CLI" choice of the Install as picker: not a managed install. */
   const [cliChosen, setCliChosen] = useState(false);
+  /**
+   * The marketplace entry of the current preview, if any. Its plugin can live in another
+   * repository or folder than the typed source, which the Skills CLI would install from, so an
+   * entry preview offers no Skills CLI choice. Back to the list picks this entry again.
+   */
+  const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
@@ -605,15 +687,19 @@ const AddPluginPanel: React.FC<{
         subpath: optionalField(subpath),
         method,
       });
-      if (result.success) {
-        setPreview(result.data);
+      if (!result.success) {
+        setError(result.error);
+      } else if (result.data.kind === "marketplace") {
+        setMarketplace(result.data.marketplace);
+      } else {
+        const next = result.data.preview;
+        setPreview(next);
+        setPreviewedEntry(method !== null && "entry" in method ? method.entry : null);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
-          skills: result.data.skills.map((skill) => skill.name),
-          mcpServers: result.data.mcpServers.map((server) => server.serverName),
+          skills: next.skills.map((skill) => skill.name),
+          mcpServers: next.mcpServers.map((server) => server.serverName),
         });
-      } else {
-        setError(result.error);
       }
     } catch (err) {
       setError(getErrorMessage(err));
@@ -626,6 +712,7 @@ const AddPluginPanel: React.FC<{
     if (e.key === "Enter") void handlePreview(null);
   };
 
+  /** Back from a preview: to the marketplace entries when they led here, else to the source. */
   const backToSource = () => {
     setPreview(null);
     setError(null);
@@ -661,7 +748,22 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
-      {preview === null ? (
+      {preview === null && marketplace !== null ? (
+        <MarketplaceListing
+          listing={marketplace}
+          busy={busy}
+          error={error}
+          initialEntry={previewedEntry}
+          onBack={() => {
+            setMarketplace(null);
+            setPreviewedEntry(null);
+            setError(null);
+          }}
+          onPickEntry={() => setError(null)}
+          onPreviewEntry={(selector) => void handlePreview(selector)}
+          onPickMethod={(method) => void handlePreview(method)}
+        />
+      ) : preview === null ? (
         <>
           <div>
             <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
@@ -717,7 +819,7 @@ const AddPluginPanel: React.FC<{
               className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
             >
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">{error}</span>
+              <span className="min-w-0 break-words">{error}</span>
             </div>
           )}
           <div className="flex gap-2">
@@ -735,10 +837,13 @@ const AddPluginPanel: React.FC<{
           </div>
         </>
       ) : (
-        <>
+        <div ref={focusFirstControlOnMount} className="space-y-3">
           <InstallMethodPicker
             preview={preview}
-            cliOffered={offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })}
+            cliOffered={
+              previewedEntry === null &&
+              offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })
+            }
             cliChosen={cliChosen}
             disabled={busy}
             onPickCurrent={() => {
@@ -762,42 +867,18 @@ const AddPluginPanel: React.FC<{
               onBack={backToSource}
             />
           ) : (
-            <>
-              <PreviewConsent
-                preview={preview}
-                selected={selected}
-                onSelect={setSelected}
-                busy={busy}
-                error={error}
-              />
-              {/* A name collision blocks only this method; the Install as choice above stays usable. */}
-              {preview.installBlockedReason !== undefined && (
-                <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
-                  <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span className="break-words">
-                    Xum cannot install this as {installMethodLabel(preview.method)}.{" "}
-                    {preview.installBlockedReason}
-                  </span>
-                </div>
-              )}
-
-              <div className="flex gap-2">
-                <Button variant="ghost" size="sm" onClick={backToSource} disabled={busy}>
-                  <ArrowLeft className="h-3.5 w-3.5" />
-                  Back
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={() => void handleInstall()}
-                  disabled={busy || preview.installBlockedReason !== undefined}
-                >
-                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-                  {busy ? "Installing…" : "Install"}
-                </Button>
-              </div>
-            </>
+            <PreviewConsent
+              preview={preview}
+              selected={selected}
+              onSelect={setSelected}
+              busy={busy}
+              error={error}
+              onBack={backToSource}
+              onInstall={() => void handleInstall()}
+              focusBack={previewedEntry !== null}
+            />
           )}
-        </>
+        </div>
       )}
     </div>
   );
@@ -826,10 +907,10 @@ const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) 
     {props.preview.manifest.interface && (
       <PluginInterfaceDetails info={props.preview.manifest.interface} />
     )}
-    {/* break-all: URLs and a 64-char separator-free plugin dir name
-        have no natural break points and would overflow the card on
-        phone widths. */}
-    <p className="text-muted text-[11px] break-all">
+    {/* break-words: wrap at spaces ("@ main" stays whole), and still break URLs and a 64-char
+        separator-free plugin dir name, which have no natural break points and would overflow
+        the card on phone widths. break-all split words mid-way. */}
+    <p className="text-muted text-[11px] break-words">
       {displayRepoUrl(props.preview.source.url)}
       {subpathSuffix(props.preview.source.subpath)} @ {props.preview.source.ref} →{" "}
       <code className="text-accent-text">{props.preview.targetPath}</code>
@@ -864,20 +945,27 @@ const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHo
         </h4>
         <p className="text-muted mb-1 text-xs">{hooksRunNote(props.hooks)}</p>
         <ul className="space-y-1">
-          {props.hooks.map((hook) => (
-            <li key={hook.key} className="text-xs break-all">
-              <span className="text-foreground font-mono">{hook.event}</span>
-              {hook.matcher !== undefined && (
-                <span className="text-muted font-mono"> ({hook.matcher})</span>
-              )}
-              <span className="text-muted">
-                {" "}
-                — {describePluginHookHandler(hook.handler)}
-                {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
-                  `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
-              </span>
-            </li>
-          ))}
+          {props.hooks.map((hook) => {
+            const note = hookStatusNote(hook);
+            return (
+              <li key={hook.key} className="text-xs break-all">
+                <span className="text-foreground font-mono">{showOneLineControls(hook.event)}</span>
+                {hook.matcher !== undefined && (
+                  <span className="text-muted font-mono">
+                    {" "}
+                    ({showOneLineControls(hook.matcher)})
+                  </span>
+                )}
+                <span className="text-muted">
+                  {" "}
+                  — {describePluginHookHandler(hook.handler)}
+                  {note !== null && `. ${note}`}
+                  {isCursorHookHandler(hook.handler) &&
+                    `${note === null ? "." : ""} ${CURSOR_HOOK_REMOTE_NOTE}`}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
     )}
@@ -891,52 +979,131 @@ const PreviewConsent: React.FC<{
   onSelect: (selection: AgentPluginImportedComponents) => void;
   busy: boolean;
   error: string | null;
-}> = (props) => (
-  <>
-    <PreviewHeader preview={props.preview} />
+  onBack: () => void;
+  onInstall: () => void;
+  /**
+   * An entry preview replaces the marketplace list and unmounts the focused Preview button, so
+   * Back takes the focus (as the list's picked radio does on the way back).
+   */
+  focusBack: boolean;
+}> = (props) => {
+  const expansion = useCutTextExpansion(props.preview.fileChanges);
+  return (
+    <>
+      <PreviewHeader preview={props.preview} />
 
-    {props.preview.warnings.length > 0 && (
-      <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
-        {props.preview.warnings.map((warning) => (
-          <div key={warning} className="text-warning flex items-start gap-2 text-xs">
-            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span className="break-words">{warning}</span>
-          </div>
+      {props.preview.warnings.length > 0 && (
+        <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
+          {props.preview.warnings.map((warning) => (
+            <div key={warning} className="text-warning flex items-start gap-2 text-xs">
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {/* The hook warnings quote plugin text (event names, paths): controls are marked. */}
+              <span className="min-w-0 break-words">{showOneLineControls(warning)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <ComponentChooser
+        inventory={props.preview}
+        selected={props.selected}
+        disabled={props.busy}
+        onChange={props.onSelect}
+      />
+      <p className="text-warning text-xs">
+        {props.selected.skills.length + props.selected.mcpServers.length === 0
+          ? "No skills or MCP servers selected. "
+          : ""}
+        Selection does not affect agents, workflows, slash commands, or hooks below: these remain
+        part of the install, even when neither group is selected. Skipped files stay on disk; this
+        is not a filesystem sandbox.
+      </p>
+
+      <PreviewDisclosures preview={props.preview} expansion={expansion} />
+
+      {props.error && (
+        <div
+          role="alert"
+          className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+        >
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">{props.error}</span>
+        </div>
+      )}
+
+      {expansion.mustExpand.length > 0 && (
+        <p className="text-warning text-xs">
+          Show the full text of each cut file to review it before you install.
+        </p>
+      )}
+
+      {/* A name collision blocks only this method; the Install as choice above stays usable. */}
+      {props.preview.installBlockedReason !== undefined && (
+        <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">
+            Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
+            {props.preview.installBlockedReason}
+          </span>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={props.onBack}
+          disabled={props.busy}
+          autoFocus={props.focusBack}
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back
+        </Button>
+        <Button
+          size="sm"
+          onClick={props.onInstall}
+          disabled={
+            props.busy ||
+            props.preview.installBlockedReason !== undefined ||
+            expansion.mustExpand.length > 0
+          }
+        >
+          {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          {props.busy ? "Installing…" : "Install"}
+        </Button>
+      </div>
+    </>
+  );
+};
+
+const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; className?: string }> = (
+  props
+) => {
+  if (props.items === undefined || props.items.length === 0) return null;
+  return (
+    <div className={props.className}>
+      <h4 className="text-foreground mb-1 text-xs font-medium">
+        Not applied in Xum ({props.items.length})
+      </h4>
+      <ul className="space-y-0.5">
+        {props.items.map((item, index) => (
+          <li key={index} className="min-w-0 text-xs break-words">
+            <span className="text-foreground">
+              {item.part} <span className="font-mono">{item.name}</span>
+            </span>
+            <span className="text-muted">: {item.reason}</span>
+          </li>
         ))}
-      </div>
-    )}
-
-    <ComponentChooser
-      inventory={props.preview}
-      selected={props.selected}
-      disabled={props.busy}
-      onChange={props.onSelect}
-    />
-    <p className="text-warning text-xs">
-      {props.selected.skills.length + props.selected.mcpServers.length === 0
-        ? "No skills or MCP servers selected. "
-        : ""}
-      Selection does not affect agents, workflows, slash commands, or hooks below: these remain part
-      of the install, even when neither group is selected. Skipped files stay on disk; this is not a
-      filesystem sandbox.
-    </p>
-
-    <PreviewDisclosures preview={props.preview} />
-
-    {props.error && (
-      <div
-        role="alert"
-        className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-      >
-        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span className="break-words">{props.error}</span>
-      </div>
-    )}
-  </>
-);
+      </ul>
+    </div>
+  );
+};
 
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
-const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
+const PreviewDisclosures: React.FC<{
+  preview: AgentPluginInstallPreview;
+  expansion: CutTextExpansion;
+}> = (props) => (
   <>
     {props.preview.agents.length > 0 && (
       <div>
@@ -946,9 +1113,15 @@ const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (pr
         {/* Activatable components: consent must name everything that
             becomes available after install, not just skills/MCP. */}
         <p className="text-xs">
-          <span className="text-foreground font-mono break-all">
-            {props.preview.agents.join(", ")}
-          </span>{" "}
+          {props.preview.agents.map((agent, index) => (
+            <React.Fragment key={agent}>
+              {index > 0 && ", "}
+              <span className="text-foreground font-mono break-all">{agent}</span>
+              {props.preview.readonlyAgents.includes(agent) && (
+                <span className="text-muted"> (edit tools removed, shell still available)</span>
+              )}
+            </React.Fragment>
+          ))}{" "}
           <span className="text-muted">
             — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
             such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
@@ -1012,6 +1185,30 @@ const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (pr
         </p>
       </div>
     )}
+
+    {props.preview.fileChanges.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          Files ({props.preview.fileChanges.length})
+        </h4>
+        <p className="text-muted mb-1 text-xs">
+          A command hook of this plugin can run any of these files.
+        </p>
+        <ul className="space-y-2">
+          {props.preview.fileChanges.map((change, index) => (
+            <ReviewChangeRow
+              key={`${index}:${change.summary}`}
+              change={change}
+              index={index}
+              isExpanded={props.expansion.isExpanded}
+              onExpand={props.expansion.expand}
+            />
+          ))}
+        </ul>
+      </div>
+    )}
+
+    <NotAppliedList items={props.preview.notApplied} />
   </>
 );
 
@@ -1141,100 +1338,6 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
-/** The keys of a review's texts that the panel shows cut (`<row>:before|after`). */
-function cutReviewTextKeys(review: AgentPluginUpdateReview): string[] {
-  return review.changes.flatMap((change, index) =>
-    (["before", "after"] as const).flatMap((field) => {
-      const text = change[field];
-      return text !== undefined && cutReviewText(text).cut ? [`${index}:${field}`] : [];
-    })
-  );
-}
-
-/**
- * Which cut texts of a review the user expanded (#6629). Keys are valid only for the review object
- * they were expanded in: a new review (same plugin, other rows) starts with nothing expanded.
- */
-function useCutTextExpansion(review: AgentPluginUpdateReview) {
-  const [expansion, setExpansion] = useState<{
-    review: AgentPluginUpdateReview | null;
-    keys: ReadonlySet<string>;
-  }>({ review: null, keys: new Set() });
-  const keys = expansion.review === review ? expansion.keys : new Set<string>();
-  return {
-    isExpanded: (key: string) => keys.has(key),
-    mustExpand: cutReviewTextKeys(review).filter((key) => !keys.has(key)),
-    expand: (key: string) =>
-      setExpansion((previous) => ({
-        review,
-        keys: new Set(previous.review === review ? previous.keys : []).add(key),
-      })),
-  };
-}
-
-/** One review row: its summary and its before/after texts. */
-const ReviewChangeRow: React.FC<{
-  change: AgentPluginUpdateReview["changes"][number];
-  index: number;
-  isExpanded: (key: string) => boolean;
-  onExpand: (key: string) => void;
-}> = (props) => {
-  const fields = (["before", "after"] as const).flatMap((field) => {
-    const text = props.change[field];
-    return text !== undefined ? [{ field, text, key: `${props.index}:${field}` }] : [];
-  });
-  return (
-    <li className="text-xs">
-      <span className="text-foreground break-words">{props.change.summary}</span>
-      {fields.length > 0 && (
-        <dl className="mt-1 space-y-1">
-          {fields.map((item) => (
-            <ReviewTextField
-              key={item.field}
-              label={item.field === "before" ? "Before" : "After"}
-              text={item.text}
-              expanded={props.isExpanded(item.key)}
-              onExpand={() => props.onExpand(item.key)}
-            />
-          ))}
-        </dl>
-      )}
-    </li>
-  );
-};
-
-/**
- * One before/after text of a review row (#6629). A long text is cut at the display bound, and the
- * user must show all of it before confirming: a plugin can pad a definition and hide the part that
- * matters after the cut.
- */
-const ReviewTextField: React.FC<{
-  label: string;
-  text: string;
-  expanded: boolean;
-  onExpand: () => void;
-}> = (props) => {
-  const view = cutReviewText(props.text);
-  return (
-    <div className="flex gap-2">
-      <dt className="text-muted w-10 shrink-0 text-[11px]">{props.label}</dt>
-      <dd className="bg-modal-bg border-border-medium min-w-0 flex-1 rounded border px-2 py-1 font-mono text-[11px] break-words whitespace-pre-wrap">
-        {view.cut && !props.expanded ? view.shown : props.text}
-        {view.cut && !props.expanded && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-1 h-7 px-2 font-sans text-xs"
-            onClick={props.onExpand}
-          >
-            Show full text ({kilobytes(props.text)} KB)
-          </Button>
-        )}
-      </dd>
-    </div>
-  );
-};
-
 const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
@@ -1244,7 +1347,7 @@ const UpdateReviewPanel: React.FC<{
   onCancel: () => void;
 }> = (props) => {
   const copy = REVIEW_PANEL_COPY[props.mode];
-  const expansion = useCutTextExpansion(props.review);
+  const expansion = useCutTextExpansion(props.review.changes);
   const mustExpand = expansion.mustExpand;
   return (
     <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
@@ -1271,11 +1374,13 @@ const UpdateReviewPanel: React.FC<{
           {props.review.warnings.map((warning) => (
             <div key={warning} className="text-warning flex items-start gap-2 text-xs">
               <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="break-words">{warning}</span>
+              {/* Warnings quote plugin text: controls are marked, as in the install preview. */}
+              <span className="min-w-0 break-words">{showOneLineControls(warning)}</span>
             </div>
           ))}
         </div>
       )}
+      <NotAppliedList items={props.review.notApplied} />
       <p className="text-muted text-[11px] break-all">{copy.commits(props.review)}</p>
       {mustExpand.length > 0 && (
         <p className="text-warning text-xs">
@@ -1381,7 +1486,7 @@ const PendingSignOutNotice: React.FC<{
       {status.kind === "broken" ? (
         <BrokenSignOutRecord reason={status.reason} onCleared={props.onCleared} />
       ) : (
-        <span className="space-y-1 break-words">
+        <span className="min-w-0 space-y-1 break-words">
           <span className="block">
             Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
             server whose sign-in changed in an update
@@ -1406,7 +1511,7 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
       className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-      <span className="break-words">
+      <span className="min-w-0 break-words">
         Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
         not reviewed on this install. Xum loads a plugin component only after you approve its
         current version. A skill or workflow script that changed after you approved it keeps working
@@ -1618,6 +1723,14 @@ export const PluginsSettingsSection: React.FC = () => {
     refresh: () => refresh(),
   });
 
+  // Install and Cancel unmount the Add plugin panel with the focused control in it. The Add plugin
+  // button comes back in its place and takes the focus, so it does not fall to the Settings
+  // dialog (#7121).
+  const addButtonFocus = useFocusOnNextMount();
+  const closeAddPanel = () => {
+    addButtonFocus.arm();
+    setAddOpen(false);
+  };
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
@@ -1863,7 +1976,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={openAddPanel}>
+              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1875,12 +1988,12 @@ export const PluginsSettingsSection: React.FC = () => {
           <div className="mb-4">
             <AddPluginPanel
               onInstalled={() => {
-                setAddOpen(false);
+                closeAddPanel();
                 setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
-              onClose={() => setAddOpen(false)}
+              onClose={closeAddPanel}
             />
           </div>
         )}
@@ -1893,13 +2006,13 @@ export const PluginsSettingsSection: React.FC = () => {
         {error && (
           <div className="bg-destructive/10 text-destructive mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">{error}</span>
+            <span className="min-w-0 break-words">{error}</span>
           </div>
         )}
         {updateCheckError && (
           <div className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">Update check failed: {updateCheckError}</span>
+            <span className="min-w-0 break-words">Update check failed: {updateCheckError}</span>
           </div>
         )}
 
@@ -1932,52 +2045,28 @@ export const PluginsSettingsSection: React.FC = () => {
                   key={`${item.location}:${item.name}`}
                   className="border-border-medium rounded-md border p-3"
                 >
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-baseline gap-2">
-                        {/* break-all: names can be 64 separator-free chars. */}
-                        <span className="text-foreground text-sm font-medium break-all">
-                          {item.name}
-                        </span>
-                        {item.version && (
-                          <span className="text-muted text-xs">v{item.version}</span>
-                        )}
-                        {!item.managed && <Badge tone="muted">unmanaged</Badge>}
-                        {item.managed && !item.present && <Badge tone="error">missing</Badge>}
-                        {check?.status === "update-available" && (
-                          <Badge tone="accent">update available</Badge>
-                        )}
-                        {check?.status === "tag-moved" && <Badge tone="warning">tag moved</Badge>}
-                        {check?.status === "pinned" && <Badge tone="muted">pinned</Badge>}
-                        {check?.status === "error" && <Badge tone="warning">check failed</Badge>}
-                        <NeedsReviewBadge item={item} />
-                      </div>
-                      {item.description && (
-                        <p className="text-muted mt-0.5 text-xs">{item.description}</p>
+                  {/* The header holds only name, badges and actions: whether the actions
+                      wrap then depends on the title alone, not on description length, so
+                      every card puts them in the same place. The flex-1 name block pushes the
+                      actions to the right on the name row. Once they wrap they start at the
+                      left, flush with the card text, so they need no ml-auto/justify-end. */}
+                  <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-2">
+                    <div className="flex min-w-0 flex-1 basis-48 flex-wrap items-baseline gap-2">
+                      {/* break-all: names can be 64 separator-free chars. */}
+                      <span className="text-foreground text-sm font-medium break-all">
+                        {item.name}
+                      </span>
+                      {item.version && <span className="text-muted text-xs">v{item.version}</span>}
+                      {!item.managed && <Badge tone="muted">unmanaged</Badge>}
+                      {item.managed && !item.present && <Badge tone="error">missing</Badge>}
+                      {check?.status === "update-available" && (
+                        <Badge tone="accent">update available</Badge>
                       )}
-                      {item.interface && <PluginInterfaceDetails info={item.interface} />}
-                      {/* break-all: locations/sources can contain unbreakable
-                          64-char tokens (max-length plugin names) that would
-                          otherwise overflow the card at phone widths. */}
-                      <p className="text-muted counter-nums mt-0.5 text-[11px] break-all">
-                        {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
-                        imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
-                        {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
-                      </p>
-                      {formatSource(item) && (
-                        <p className="text-muted mt-0.5 text-[11px] break-all">
-                          {formatSource(item)}
-                          {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
-                        </p>
-                      )}
-                      {check?.status === "error" && check.message && (
-                        <p className="text-warning mt-0.5 flex items-start gap-1 text-[11px]">
-                          <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                          <span className="break-words">{check.message}</span>
-                        </p>
-                      )}
+                      {check?.status === "tag-moved" && <Badge tone="warning">tag moved</Badge>}
+                      {check?.status === "pinned" && <Badge tone="muted">pinned</Badge>}
+                      {check?.status === "error" && <Badge tone="warning">check failed</Badge>}
+                      <NeedsReviewBadge item={item} />
                     </div>
-
                     {item.managed && (
                       <div className="flex flex-wrap gap-1">
                         <ReviewComponentsButton
@@ -2044,6 +2133,34 @@ export const PluginsSettingsSection: React.FC = () => {
                       </div>
                     )}
                   </div>
+
+                  {item.description && (
+                    <p className="text-muted mt-1 text-xs">{item.description}</p>
+                  )}
+                  {item.interface && <PluginInterfaceDetails info={item.interface} />}
+                  <div className="text-muted mt-2 space-y-0.5 text-[11px]">
+                    {/* break-all: locations/sources can contain unbreakable
+                        64-char tokens (max-length plugin names) that would
+                        otherwise overflow the card at phone widths. */}
+                    <p className="counter-nums break-all">
+                      {item.importedSkillCount ?? item.skillCount} of {item.skillCount} skills
+                      imported · {item.importedMcpServerCount ?? item.mcpServerCount} of{" "}
+                      {item.mcpServerCount} MCP servers imported · <code>{item.location}</code>
+                    </p>
+                    {formatSource(item) && (
+                      <p className="break-all">
+                        {formatSource(item)}
+                        {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
+                      </p>
+                    )}
+                  </div>
+                  <NotAppliedList items={item.notApplied} className="mt-2" />
+                  {check?.status === "error" && check.message && (
+                    <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
+                      <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span className="min-w-0 break-words">{check.message}</span>
+                    </p>
+                  )}
 
                   {/* Managed rows only: an unmanaged plugin in another
                       container can share the manifest name, and rendering the

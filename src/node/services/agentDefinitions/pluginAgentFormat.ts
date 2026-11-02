@@ -147,6 +147,15 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
+/**
+ * Cursor `readonly: true` in a Claude Code or Cursor format file: the mapping runs it on Explore,
+ * and a mapped tool list only removes tools, so file edits stay off. A Xum-format file keeps its
+ * own base and `tools.add`, so `readonly` means nothing there.
+ */
+export function isReadonlyForeignPluginAgent(raw: Record<string, unknown>): boolean {
+  return !isXumFormat(raw) && raw.readonly === true;
+}
+
 /** A Claude list key in a raw frontmatter (`tools` only in its list form). */
 function foreignToolListKeys(raw: Record<string, unknown>): ForeignToolListKey[] {
   return FOREIGN_TOOL_LIST_KEYS.filter(
@@ -302,12 +311,22 @@ function mapModel(value: unknown): string | undefined {
   return KNOWN_MODEL_IDS.has(anthropicId) ? anthropicId : undefined;
 }
 
-/** Claude `model` / `effort` as Xum `ai` defaults; empty when neither maps. */
-function mapAiDefaults(raw: Record<string, unknown>): { model?: string; thinkingLevel?: string } {
+/**
+ * Claude `model` / `effort` as Xum `ai` defaults; empty when neither maps. Cursor
+ * `model: fast` resolves its AI settings through Explore (Cursor plugin RFC, D11).
+ */
+function mapAiDefaults(raw: Record<string, unknown>): {
+  model?: string;
+  thinkingLevel?: string;
+  settingsBase?: string;
+} {
   const model = mapModel(raw.model);
   const effort = ThinkingLevelSchema.safeParse(raw.effort);
   return {
     ...(model !== undefined ? { model } : {}),
+    ...(typeof raw.model === "string" && raw.model.trim() === "fast"
+      ? { settingsBase: "explore" }
+      : {}),
     ...(effort.success ? { thinkingLevel: effort.data } : {}),
   };
 }
@@ -344,14 +363,13 @@ export function mapForeignPluginAgentFrontmatter(
     // Omitted tools inherit every tool in both ecosystems: Exec is Xum's
     // all-tools agent. Cursor `readonly: true` narrows to Explore (no file
     // edits or task spawning). Explore keeps bash, so it is not fully read-only.
-    base: raw.readonly === true ? "explore" : "exec",
+    base: isReadonlyForeignPluginAgent(raw) ? "explore" : "exec",
     // Both ecosystems spawn these as sub-agents, never as main-chat modes, and
     // their bodies are written for delegates, so keep them out of the picker.
     ui: { hidden: true },
-    subagent: { runnable: true },
-    // The body is the whole system prompt in both ecosystems, so it replaces
-    // the base body instead of Xum's default append.
-    prompt: { append: false },
+    subagent: { runnable: true, ...(raw.is_background === true ? { background_hint: true } : {}) },
+    // `readonly` agents get Explore's prompt before their own body (Cursor plugin RFC, D13).
+    prompt: { append: isReadonlyForeignPluginAgent(raw) },
     ...(Object.keys(ai).length > 0 ? { ai } : {}),
     // Replaces the Claude list. Kept in the mapped frontmatter, so the install
     // consent fingerprint changes when the effective tool list changes.
@@ -363,8 +381,8 @@ export function mapForeignPluginAgentFrontmatter(
     !("tools" in mapped) || isPlainObject(mapped.tools),
     "a Claude tools list must be mapped to Xum tools"
   );
-  // `is_background` / `background` stay ignored: Xum's task caller already
-  // chooses `run_in_background` per spawn.
+  // `is_background: true` becomes a hint in the task tool's agent list (Cursor plugin RFC, D12).
+  // `background` stays ignored: the parent chooses `run_in_background` per spawn.
   assert(isXumFormat(mapped), "mapped plugin agent frontmatter must use Xum format");
   return mapped;
 }

@@ -19,6 +19,7 @@ import * as WorkspaceLinksModule from "../WorkspaceLinks/WorkspaceLinks";
 import { TooltipProvider } from "../Tooltip/Tooltip";
 import type { WorkspaceFooterBar as WorkspaceFooterBarComponent } from "./WorkspaceFooterBar";
 import type { DisplayedMessage } from "@/common/types/message";
+import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
@@ -270,6 +271,49 @@ describe("WorkspaceFooterBar repository controls", () => {
     const { container } = renderFooter();
 
     expect(container.textContent).toContain("demo");
+  });
+});
+
+function inputUsage(tokens: number): ChatUsageDisplay {
+  return {
+    input: { tokens, cost_usd: 0 },
+    cached: { tokens: 0, cost_usd: 0 },
+    cacheCreate: { tokens: 0, cost_usd: 0 },
+    output: { tokens: 0, cost_usd: 0 },
+    reasoning: { tokens: 0, cost_usd: 0 },
+  };
+}
+
+describe("WorkspaceFooterBar usage stats", () => {
+  beforeEach(() => {
+    workspaceMetadata = new Map();
+    workspaceState = { messages: [], muxMessages: [], hasOlderHistory: false };
+    cleanupDom = installDom();
+    installFooterBarTestDoubles();
+    workspaceMetadata.set(workspaceId, repoMetadata);
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    ({ WorkspaceFooterBar } = require("./WorkspaceFooterBar?workspace-footer-bar-test=2") as {
+      WorkspaceFooterBar: typeof WorkspaceFooterBarComponent;
+    });
+    /* eslint-enable @typescript-eslint/no-require-imports */
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  it("counts open sub-agents and the live stream, as the sidebar overview does", () => {
+    spyOn(WorkspaceStoreModule, "useWorkspaceUsage").mockImplementation(() => ({
+      totalTokens: 1_000_000,
+      sessionTotal: inputUsage(1_000_000),
+      subagentTotal: inputUsage(2_000_000),
+      liveCostUsage: inputUsage(500_000),
+    }));
+
+    expect(renderFooter().container.textContent).toContain("3.5M tok");
   });
 });
 
@@ -533,7 +577,7 @@ describe("WorkspaceFooterBar at narrow viewports", () => {
   function mockFooterContent() {
     spyOn(WorkspaceStoreModule, "useWorkspaceUsage").mockImplementation(
       () =>
-        ({ totalTokens: 274_200 }) as unknown as ReturnType<
+        ({ totalTokens: 274_200, sessionTotal: inputUsage(274_200) }) as unknown as ReturnType<
           typeof WorkspaceStoreModule.useWorkspaceUsage
         >
     );

@@ -1,5 +1,3 @@
-import assert from "@/common/utils/assert";
-
 export interface Keybind {
   key: string;
   /**
@@ -33,54 +31,4 @@ export interface Keybind {
    * references (e.g. Settings → Keybinds) so they aren't advertised to users.
    */
   deprecated?: boolean;
-}
-
-export function hasModifierKeybind(keybind: Keybind): boolean {
-  return [keybind.ctrl, keybind.shift, keybind.alt, keybind.meta].some((v) => v === true);
-}
-
-export function normalizeKeybind(raw: unknown): Keybind | undefined {
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-
-  const record = raw as Record<string, unknown>;
-
-  const rawKey = typeof record.key === "string" ? record.key : "";
-  const key = rawKey === " " ? rawKey : rawKey.trim();
-  if (!key) {
-    return undefined;
-  }
-
-  const code =
-    typeof record.code === "string" && record.code.trim().length > 0
-      ? record.code.trim()
-      : undefined;
-  const allowShift = typeof record.allowShift === "boolean" ? record.allowShift : undefined;
-  const ctrl = typeof record.ctrl === "boolean" ? record.ctrl : undefined;
-  const shift = typeof record.shift === "boolean" ? record.shift : undefined;
-  const alt = typeof record.alt === "boolean" ? record.alt : undefined;
-  const meta = typeof record.meta === "boolean" ? record.meta : undefined;
-
-  const macCtrlBehavior =
-    record.macCtrlBehavior === "either" ||
-    record.macCtrlBehavior === "command" ||
-    record.macCtrlBehavior === "control"
-      ? record.macCtrlBehavior
-      : undefined;
-
-  const result: Keybind = {
-    key,
-    code,
-    allowShift,
-    ctrl,
-    shift,
-    alt,
-    meta,
-    macCtrlBehavior,
-  };
-
-  assert(typeof result.key === "string" && result.key.length > 0, "Keybind.key must be non-empty");
-
-  return result;
 }

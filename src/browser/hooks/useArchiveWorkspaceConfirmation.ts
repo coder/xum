@@ -1,18 +1,15 @@
 import { useState, type ComponentProps } from "react";
 import type { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { WorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import type { ArchiveLossyUntrackedFilesConfirmation } from "@/common/orpc/schemas/api";
 import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
+  buildArchiveConfirmText,
+  flattenLossyPaths,
+  type ArchiveConfirmTextInput,
 } from "@/browser/utils/archiveConfirmation";
 
-interface ArchiveConfirmation {
+interface ArchiveConfirmation extends ArchiveConfirmTextInput {
   workspaceId: string;
-  displayTitle: string | undefined;
-  /** When set, the confirmation warns about permanent deletion of untracked files. */
-  untrackedPaths?: string[];
-  /** Whether the workspace has an active stream that will be interrupted. */
-  isStreaming: boolean;
 }
 
 export interface UseArchiveWorkspaceConfirmationOptions {
@@ -28,12 +25,35 @@ export interface UseArchiveWorkspaceConfirmationOptions {
   showError: (workspaceId: string, error: string, anchorEl?: HTMLElement) => void;
 }
 
-function didUntrackedPathSetChange(acknowledged: string[], latest: string[]): boolean {
-  if (acknowledged.length !== latest.length) {
+const NOTHING_ACKNOWLEDGED: ArchiveLossyUntrackedFilesConfirmation = {
+  kind: "confirm-lossy-untracked-files",
+  paths: [],
+};
+
+function didUntrackedPathSetChange(
+  acknowledged: ArchiveLossyUntrackedFilesConfirmation,
+  latest: ArchiveLossyUntrackedFilesConfirmation
+): boolean {
+  // Tag sub-agent paths with their workspace so equal paths in two checkouts differ.
+  const tag = (subagent: { workspaceId: string }) => `${subagent.workspaceId}\0`;
+  const acknowledgedKeys = flattenLossyPaths(acknowledged, tag);
+  const latestKeys = flattenLossyPaths(latest, tag);
+  if (acknowledgedKeys.length !== latestKeys.length) {
     return true;
   }
-  const acknowledgedSet = new Set(acknowledged);
-  return latest.some((path) => !acknowledgedSet.has(path));
+  const acknowledgedSet = new Set(acknowledgedKeys);
+  return latestKeys.some((key) => !acknowledgedSet.has(key));
+}
+
+function archiveAcknowledgement(lossy: ArchiveLossyUntrackedFilesConfirmation) {
+  const subagents = lossy.subagents ?? [];
+  if (subagents.length === 0) return { acknowledgedUntrackedPaths: lossy.paths };
+  return {
+    acknowledgedUntrackedPaths: lossy.paths,
+    acknowledgedSubagentUntrackedPaths: Object.fromEntries(
+      subagents.map((subagent) => [subagent.workspaceId, subagent.paths])
+    ),
+  };
 }
 
 /**
@@ -48,20 +68,20 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
   const performArchive = async (
     workspaceId: string,
     anchorEl?: HTMLElement,
-    acknowledgedUntrackedPaths?: string[]
+    acknowledged?: ArchiveLossyUntrackedFilesConfirmation
   ): Promise<void> => {
     const result = await options.archiveWorkspace(
       workspaceId,
-      acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+      acknowledged ? archiveAcknowledgement(acknowledged) : undefined
     );
     if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
       setConfirmation({
         workspaceId,
         displayTitle: options.getDisplayTitle(workspaceId),
-        untrackedPaths: result.data.paths,
+        lossy: result.data,
         // The retry path already handled any earlier streaming warning. Only surface the
         // interruption warning again when the archive attempt has not yet been confirmed.
-        isStreaming: acknowledgedUntrackedPaths == null ? options.isStreaming(workspaceId) : false,
+        isStreaming: acknowledged == null ? options.isStreaming(workspaceId) : false,
       });
       return;
     }
@@ -69,23 +89,22 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       return;
     }
 
-    if (acknowledgedUntrackedPaths != null) {
-      // Archive may fail if new untracked files appear between confirmation and capture.
-      // Re-run preflight so we can reopen the modal with the latest paths.
-      const preflight = await options.preflightArchiveWorkspace(workspaceId);
-      if (
-        preflight.success &&
-        preflight.data?.kind === "confirm-lossy-untracked-files" &&
-        didUntrackedPathSetChange(acknowledgedUntrackedPaths, preflight.data.paths)
-      ) {
-        setConfirmation({
-          workspaceId,
-          displayTitle: options.getDisplayTitle(workspaceId),
-          untrackedPaths: preflight.data.paths,
-          isStreaming: options.isStreaming(workspaceId),
-        });
-        return;
-      }
+    // Archive may fail if new untracked files appear after the preflight or the confirmation,
+    // in the workspace or in a sub-agent its archive cascades over. Re-run preflight so we can
+    // reopen the modal with the latest paths.
+    const preflight = await options.preflightArchiveWorkspace(workspaceId);
+    if (
+      preflight.success &&
+      preflight.data?.kind === "confirm-lossy-untracked-files" &&
+      didUntrackedPathSetChange(acknowledged ?? NOTHING_ACKNOWLEDGED, preflight.data)
+    ) {
+      setConfirmation({
+        workspaceId,
+        displayTitle: options.getDisplayTitle(workspaceId),
+        lossy: preflight.data,
+        isStreaming: options.isStreaming(workspaceId),
+      });
+      return;
     }
 
     options.showError(workspaceId, result.error ?? "Failed to archive workspace", anchorEl);
@@ -108,14 +127,14 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       return;
     }
 
-    const untrackedPaths =
-      preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
-    if (isStreaming || untrackedPaths) {
+    const lossy =
+      preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data : undefined;
+    if (isStreaming || lossy) {
       // Show a single combined confirmation dialog for streaming + untracked-file warnings.
       setConfirmation({
         workspaceId,
         displayTitle: options.getDisplayTitle(workspaceId),
-        untrackedPaths,
+        lossy,
         isStreaming,
       });
       return;
@@ -124,23 +143,14 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
     await performArchive(workspaceId, anchorEl);
   };
 
-  const untrackedPaths = confirmation?.untrackedPaths;
-  const isStreaming = confirmation?.isStreaming ?? false;
   const modalProps: ComponentProps<typeof ConfirmationModal> = {
     isOpen: confirmation !== null,
-    title: untrackedPaths
-      ? "Archive workspace with untracked files?"
-      : confirmation?.displayTitle
-        ? `Archive "${confirmation.displayTitle}" while streaming?`
-        : "Archive workspace?",
-    description: buildArchiveConfirmDescription(isStreaming, untrackedPaths),
-    warning: buildArchiveConfirmWarning(isStreaming, untrackedPaths),
-    confirmLabel: untrackedPaths ? "Archive and delete files" : "Archive",
+    ...buildArchiveConfirmText(confirmation),
     confirmVariant: "destructive",
     onConfirm: async () => {
       if (!confirmation) return;
       setConfirmation(null);
-      await performArchive(confirmation.workspaceId, undefined, confirmation.untrackedPaths);
+      await performArchive(confirmation.workspaceId, undefined, confirmation.lossy);
     },
     onCancel: () => setConfirmation(null),
   };

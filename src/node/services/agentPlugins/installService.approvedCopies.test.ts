@@ -22,6 +22,8 @@ import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { computePluginInstanceId } from "./mcpConfig";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -78,8 +80,11 @@ describe("AgentPluginInstallService approved copies", () => {
       universalRoot: "",
       globalPluginRoots: [path.join(home, "plugins")],
     };
-    const { skills } = await discoverAgentSkills(runtime, home, { roots });
-    const read = await readAgentSkill(runtime, home, SkillNameSchema.parse("greet"), { roots });
+    const { skills } = await discoverAgentSkills(runtime, home, { roots, runtimeFactory });
+    const read = await readAgentSkill(runtime, home, SkillNameSchema.parse("greet"), {
+      roots,
+      runtimeFactory,
+    });
     expect(skills.find((skill) => skill.name === "greet")?.description).toBe(
       read.package.frontmatter.description
     );
@@ -89,6 +94,7 @@ describe("AgentPluginInstallService approved copies", () => {
       workspacePath: home,
       projectTrusted: false,
       roots,
+      runtimeFactory,
     });
     return { skill: read.package.frontmatter.description, workflow: workflow.source };
   }

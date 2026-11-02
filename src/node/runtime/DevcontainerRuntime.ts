@@ -18,6 +18,7 @@ import type {
   EnsureReadyOptions,
   FileStat,
   ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { buildGuardedCommand, buildShellPathExport } from "./shellEnv";
@@ -100,6 +101,10 @@ export function containerLabel(workspacePath: string): string {
 }
 
 export class DevcontainerRuntime extends LocalBaseRuntime {
+  override get location(): RuntimeLocation {
+    return "devcontainer";
+  }
+
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
   /** In-container stops started by aborts and timeouts and not finished yet (#6923). */

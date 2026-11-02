@@ -20,7 +20,6 @@ import {
   removeTabEverywhere,
   reorderTabInTabset,
   selectOrAddTab,
-  selectTabInFocusedTabset,
   splitFocusedTabset,
   type RightSidebarLayoutNode,
   type RightSidebarLayoutState,
@@ -96,8 +95,8 @@ test("removing the last tab leaves the New tab", () => {
   expect(rootTabset(next)).toMatchObject({ tabs: ["new"], activeTab: "new" });
 });
 
-test("selectTabInFocusedTabset adds missing tool and makes it active", () => {
-  const s = selectTabInFocusedTabset(single(["costs"]), "terminal");
+test("addTabToFocusedTabset adds a missing tab and makes it active by default", () => {
+  const s = addTabToFocusedTabset(single(["costs"]), "terminal");
   expect(rootTabset(s)).toMatchObject({
     tabs: ["costs", "terminal"],
     activeTab: "terminal",

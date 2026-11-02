@@ -39,7 +39,7 @@ function cacheViewedWizard(viewedIds: readonly string[]): void {
 }
 
 /**
- * The static first-run view shows the wizard's gateway step. Once the queue is known and the
+ * The static first-run view shows the wizard's providers step. Once the queue is known and the
  * wizard is not first (already viewed, read failed, splashes off, another splash), it must go.
  */
 function useFirstRunViewQueueGuard(loaded: boolean, wizardIsFirst: boolean): void {

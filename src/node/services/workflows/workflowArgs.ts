@@ -35,11 +35,31 @@ interface ArgsPropertySchema {
 const ARGS_SCHEMA_PROPERTIES_ERROR_MESSAGE =
   "Workflow meta.argsSchema.properties must be an object";
 
+/**
+ * Models sometimes send workflow_run args as a JSON-encoded string instead of an object (F51:
+ * `args.prompt` and `args.roles` were undefined in the script). A string whose trimmed text parses
+ * to a plain object becomes that object, in both the schema and the schema-less path. Run creation
+ * stores the result, so resume and replay see the same value. Every other string stays as it is,
+ * because a schema-less workflow can take a string. Arrays stay strings too: the tool's default
+ * args are an object, and a workflow that wants a list as text keeps it. A string-typed argsSchema
+ * cannot exist (assertObjectSchema), so no schema asks for the raw text of an object.
+ */
+function decodeJsonObjectArgs(rawArgs: unknown): unknown {
+  if (typeof rawArgs !== "string" || !rawArgs.trimStart().startsWith("{")) return rawArgs;
+  try {
+    const parsed: unknown = JSON.parse(rawArgs);
+    return isPlainObject(parsed) ? parsed : rawArgs;
+  } catch {
+    return rawArgs;
+  }
+}
+
 export function normalizeWorkflowArgsForSource(
   source: string,
-  rawArgs: unknown,
+  encodedArgs: unknown,
   options: WorkflowArgsNormalizationOptions = {}
 ): WorkflowArgsNormalizationResult {
+  const rawArgs = decodeJsonObjectArgs(encodedArgs);
   const meta = parseWorkflowMetadata(source);
   if (meta?.argsSchema == null) {
     return { args: rawArgs, metadata: meta };

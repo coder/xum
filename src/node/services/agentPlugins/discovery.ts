@@ -1,13 +1,13 @@
-import * as fsPromises from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import * as os from "node:os";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 
 import {
   PROJECT_METADATA_DIR_NAMES,
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
+import type { AgentPluginNotApplied } from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
@@ -23,6 +23,8 @@ import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   hasGeneratedFromMarker,
+  INERT_COMPONENT_PATH,
+  readGeneratedFrom,
   isPlainObject,
   isValidAgentPluginName,
   validatePluginManifest,
@@ -34,25 +36,34 @@ import {
   type OpenAIPluginExtension,
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
+import { normalizeCursorManifest, type CursorManifestResult } from "./cursorManifest";
+import { convertCursorRule, cursorRuleName, type CursorRuleRefusal } from "./cursorRules";
+import { loadPluginCursorHooks } from "./cursorHooks";
+import type { PluginHooksLoadResult } from "./codexHooks";
+import { cursorMcpNotApplied } from "./mcpDialects";
 import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
  *
  * A plugin is an immediate child directory of a configured container directory
  * that holds a regular `plugin.json` file (or, for Codex-scaffolded packages,
- * only `.codex-plugin/plugin.json`, or for Claude Code plugins only
- * `.claude-plugin/plugin.json`). Entries without any manifest are
+ * only `.codex-plugin/plugin.json`, for Claude Code plugins only
+ * `.claude-plugin/plugin.json`, or for Cursor plugins only `.cursor-plugin/plugin.json`).
+ * Entries without any manifest are
  * skipped silently (containers may hold unrelated files, e.g. Codex drops
  * `marketplace.json` into `~/.agents/plugins`). Failure isolation is per §11.3:
  * one broken plugin never affects sibling plugins, and one broken component
  * (skills/ or mcp.json) never affects the plugin's other component.
  *
- * Local host filesystem only (v1): plugin containers are host paths, so
- * discovery uses node:fs directly rather than a Runtime.
+ * Discovery reads through a PluginFs, not a Runtime: the host filesystem
+ * (nodePluginFs) by default, or a remote checkout's listing held in memory
+ * (discoverAgentPluginsIn, #6426).
  */
 
 export type AgentPluginScope = "project" | "global";
@@ -80,6 +91,7 @@ export const CODEX_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".codex-plugin", "p
  * both keeps its Agent Plugin or Codex reading.
  */
 export const CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".claude-plugin", "plugin.json");
+export const CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".cursor-plugin", "plugin.json");
 /** Codex MCP config, the default only when the root mcp.json is absent. */
 export const CODEX_MCP_CONFIG_RELATIVE_PATH = ".mcp.json";
 
@@ -104,6 +116,126 @@ export interface PluginFileReadResult {
   modifiedTime: Date;
 }
 
+/** The file kinds and size that discovery reads from a stat or lstat. */
+export interface PluginFsStat {
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+  size: number;
+}
+
+export interface PluginFsDirent {
+  name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * Every filesystem read that plugin discovery and the contained plugin reader make (#6426). The
+ * host filesystem is `nodePluginFs`. Another implementation (a remote checkout's listing held in
+ * memory) lets the unchanged discovery rules run without host files. Like node:fs/promises,
+ * methods reject (never throw synchronously), with the same `code` values (ENOENT when missing).
+ */
+export interface PluginFs {
+  realpath(filePath: string): Promise<string>;
+  stat(filePath: string): Promise<PluginFsStat>;
+  lstat(filePath: string): Promise<PluginFsStat>;
+  readdir(dirPath: string): Promise<PluginFsDirent[]>;
+  /** ensurePathContained: the realpath of `candidatePath`, which must stay inside `root`. */
+  ensureContained(
+    root: string,
+    candidatePath: string,
+    options?: { allowMissing?: boolean }
+  ): Promise<string>;
+  /** readPluginFileWithinRootCapped's contract: contained, identity-checked and capped. */
+  readFileCapped(args: PluginFileReadArgs): Promise<PluginFileReadResult>;
+}
+
+export interface PluginFileReadArgs {
+  filePath: string;
+  pluginRoot: string;
+  maxBytes: number;
+  /** Component name used in error messages (e.g. "hooks.js"). */
+  label: string;
+}
+
+const hostPluginFsByFiles = new WeakMap<HostFiles, PluginFs>();
+
+/**
+ * The PluginFs of a host filesystem: one object per HostFiles, so a read costs no wrapper per
+ * call. Phase 5: the host-local scans of skills, agents and plugins read the HostFiles of their
+ * RuntimeFactory, so a test graph's memory host serves them too.
+ */
+export function hostPluginFs(files: HostFiles): PluginFs {
+  const known = hostPluginFsByFiles.get(files);
+  if (known !== undefined) return known;
+  const fs: PluginFs = {
+    realpath: (filePath) => files.promises.realpath(filePath),
+    stat: (filePath) => files.promises.stat(filePath),
+    lstat: (filePath) => files.promises.lstat(filePath),
+    readdir: (dirPath) => files.promises.readdir(dirPath, { withFileTypes: true }),
+    ensureContained: (root, candidatePath, options) =>
+      ensurePathContained(root, candidatePath, options, files),
+    // The reader's own containment check (ensurePluginPathContained) reads the current PluginFs.
+    readFileCapped: (args) =>
+      pluginFsStorage.run(fs, () => readPluginFileWithinRootCapped(args, files)),
+  };
+  hostPluginFsByFiles.set(files, fs);
+  return fs;
+}
+
+/** The host filesystem. */
+export const nodePluginFs: PluginFs = hostPluginFs(nodeHostFiles);
+
+/**
+ * The PluginFs of the discovery that is running. AsyncLocalStorage, not a parameter, so the
+ * many internal helpers keep their signatures; concurrent discoveries never share a store.
+ */
+const pluginFsStorage = new AsyncLocalStorage<PluginFs>();
+
+function pluginFs(): PluginFs {
+  return pluginFsStorage.getStore() ?? nodePluginFs;
+}
+
+/**
+ * discoverAgentPlugins on another filesystem (#6426): every read of the discovery goes through
+ * `fs`, whose paths are POSIX paths (POSIX hosts only). The exported readers
+ * (readPluginFileWithinRootCapped, ensurePluginPathContained) stay host readers outside such a
+ * run; a caller reads a non-host plugin's files with `fs` itself.
+ */
+export async function discoverAgentPluginsIn(
+  fs: PluginFs,
+  containers: AgentPluginContainer[]
+): Promise<DiscoverAgentPluginsResult> {
+  // Managed installs (registries, journals) exist only on the host.
+  assert(
+    containers.every((container) => container.registryPath === undefined),
+    "discoverAgentPluginsIn: a non-host PluginFs cannot hold managed containers"
+  );
+  // Discovery joins paths with the host `node:path`. A non-host PluginFs holds POSIX paths, which
+  // a Windows host would rewrite with backslashes, so a Windows host finds no plugins there
+  // (fail closed; #7226 tracks Windows hosts).
+  if (process.platform === "win32") {
+    log.debug("discoverAgentPluginsIn: not supported on a Windows host");
+    return { plugins: [], diagnostics: [] };
+  }
+  return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers));
+}
+
+/**
+ * discoverAgentPlugins on a host filesystem (hostPluginFs of the caller's RuntimeFactory, phase
+ * 5). Unlike discoverAgentPluginsIn, managed containers are allowed: their registries and
+ * journals still read the Node host.
+ */
+export async function discoverAgentPluginsOnHost(
+  fs: PluginFs,
+  containers: AgentPluginContainer[],
+  options?: { managedHome?: string }
+): Promise<DiscoverAgentPluginsResult> {
+  return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers, options));
+}
+
 /** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
 export class PluginGitPathError extends Error {
   constructor() {
@@ -125,8 +257,8 @@ export async function ensurePluginPathContained(
   candidatePath: string,
   options?: { allowMissing?: boolean }
 ): Promise<string> {
-  const resolved = await ensurePathContained(pluginRoot, candidatePath, options);
-  const relative = path.relative(await fsPromises.realpath(pluginRoot), resolved);
+  const resolved = await pluginFs().ensureContained(pluginRoot, candidatePath, options);
+  const relative = path.relative(await pluginFs().realpath(pluginRoot), resolved);
   // Case-insensitive: on macOS and Windows `.GIT` is the same directory.
   if (relative.split(path.sep)[0].toLowerCase() === ".git") {
     throw new PluginGitPathError();
@@ -169,27 +301,25 @@ export async function ensurePluginPathContained(
  * pair post-open content with pre-open stat results. Over-blocking is safe —
  * the caller skips and re-measures on the next discovery.
  */
-export async function readPluginFileWithinRootCapped(args: {
-  filePath: string;
-  pluginRoot: string;
-  maxBytes: number;
-  /** Component name used in error messages (e.g. "hooks.js"). */
-  label: string;
-}): Promise<PluginFileReadResult> {
+export async function readPluginFileWithinRootCapped(
+  args: PluginFileReadArgs,
+  /** The host filesystem of the read (hostPluginFs). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
+): Promise<PluginFileReadResult> {
   const { filePath, pluginRoot, maxBytes, label } = args;
   // Opening a FIFO for reading blocks until a writer appears, which would hang every caller
   // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
   // before the open; O_NONBLOCK covers a swap to a FIFO between this stat and the open (it
   // has no effect on regular files), and the identity check below still runs after the open.
+  const fsPromises = files.promises;
   const target = await fsPromises.stat(filePath);
   if (!target.isFile()) {
     throw new Error(`${label} is not a regular file: ${filePath}`);
   }
+  const { O_RDONLY, O_NONBLOCK } = fsPromises.constants;
   const handle = await fsPromises.open(
     filePath,
-    process.platform === "win32"
-      ? fsConstants.O_RDONLY
-      : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+    process.platform === "win32" ? O_RDONLY : O_RDONLY | O_NONBLOCK
   );
   try {
     const stat = await handle.stat({ bigint: true });
@@ -237,6 +367,8 @@ export interface AgentPluginContainer {
   registryPath?: string;
 }
 
+export type { AgentPluginNotApplied };
+
 export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */
   importedComponents?: AgentPluginImportedComponents;
@@ -267,16 +399,31 @@ export interface AgentPluginInfo {
    */
   codexFallback?: true;
   /**
-   * Found through `.claude-plugin/plugin.json`: skills, agents and MCP are honored, hooks are
-   * listed but never run, and there is no hooks.js, workflows/, slash command or
-   * `extensions.mux` (see normalizeClaudeManifest's SECURITY AUDIT).
+   * A Claude Code package: found through `.claude-plugin/plugin.json`, or a plugin.json that Xum
+   * generated from a Claude marketplace entry (the `claude-marketplace` marker). Skills, agents
+   * and MCP are honored, hooks are listed but never run, and there is no hooks.js, workflows/,
+   * slash command or `extensions.mux` (see normalizeClaudeManifest's SECURITY AUDIT).
    */
   claudeFallback?: true;
-  /** Claude components without a `contributes` member (claudeFallback only). */
+  /** Claude components without a `contributes` member (claudeFallback only; a marketplace
+   * package carries its commands paths in the marker). */
   claude?: ClaudePluginComponents;
   /**
-   * The plugin.json carries `extensions.mux.generatedFrom` (Xum wrote it for a skills repository,
-   * or the repository claims so): only skills load. No hooks.js, hooks.json, agents, workflows,
+   * Found through `.cursor-plugin/plugin.json`: skills, rules (as skills), agents/, its MCP
+   * servers and its Cursor hooks (`cursorHooks`) load. Like a Claude package it gets no hooks.js,
+   * workflows/, skill workflow scripts, slash commands or `extensions`.
+   */
+  cursorFallback?: true;
+  /**
+   * A Cursor package's hooks, parsed when discovery read the package (cursorHooks.ts), so every
+   * reader (the per-call trust gate included) sees the hooks of that one read.
+   */
+  cursorHooks?: PluginHooksLoadResult;
+  notApplied: AgentPluginNotApplied[];
+  /**
+   * The plugin.json carries an `extensions.mux.generatedFrom` marker other than a well-formed
+   * `claude-marketplace` one (Xum wrote it for a skills repository, or the repository claims
+   * so): only skills load. No hooks.js, hooks.json, agents, workflows,
    * MCP, slash commands or com.openai (see discoverPluginAt).
    */
   skillsOnly?: true;
@@ -289,7 +436,7 @@ export interface AgentPluginInfo {
   openaiManifestPath?: string;
   /**
    * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`),
-   * then a Claude package's command roots. Each one exists, is a directory, and stays inside
+   * then a Claude package's command roots or a Cursor package's rule roots. Each one exists, is a directory, and stays inside
    * the root (§6.2). Absent when none does.
    */
   skillsDirs?: PluginSkillsRoot[];
@@ -297,9 +444,11 @@ export interface AgentPluginInfo {
   mcpConfigPath?: string;
   /**
    * "codex": the MCP file is in the Codex `.mcp.json` dialect. "claude": the Codex dialect plus
-   * the `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` names (see loadPluginMcpServers).
+   * the `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` names. "cursor": the Codex dialect plus
+   * `${CURSOR_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_ROOT}`, ignored `auth` and `placement` fields, and a
+   * skip for any other `${NAME}` (see mcpDialects.ts).
    */
-  mcpConfigDialect?: "codex" | "claude";
+  mcpConfigDialect?: "codex" | "claude" | "cursor";
   /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
    * when it exists, is a regular file, and stays inside the root. Resolved
    * with the same §6.2 component rules as mcp.json. */
@@ -319,40 +468,101 @@ export interface AgentPluginInfo {
  */
 export type PluginSkillsRoot =
   /** Holds `<name>/SKILL.md` skill folders. */
-  | { dir: string; single?: undefined; name?: undefined; command?: undefined }
+  | { dir: string; single?: undefined; name?: undefined; command?: undefined; rule?: undefined }
   /**
-   * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
-   * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
+   * Holds SKILL.md itself. `name` is the skill name of the folder as declared
+   * (pluginSkillNameOfFolder), or the plugin name when the path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
    * `command`: a Claude command instead, the file `<dir>/<name>.md` (claudeCommands.ts). Its
    * `dir` is the commands folder and its name is valid. Command roots follow every skills root,
    * so a skill of the same name wins; discovery drops such a command with a warning.
+   * `rule`: a Cursor rule instead, the file `<dir>/<rule>` (cursorRules.ts), for example
+   * `prefer-const.mdc`. Rule roots follow the same rules as command roots.
    */
-  | { dir: string; single: true; name: string; command?: true };
+  | { dir: string; single: true; name: string; command?: true; rule?: undefined }
+  | { dir: string; single: true; name: string; command?: undefined; rule: string };
+
+/**
+ * The skill name of a plugin skill folder. Claude Code and Codex name a skill by its SKILL.md
+ * `name`, not its folder, so plugins ship snake_case folders: google/elephant-goldfish-model
+ * has `skills/egm_bootstrap/SKILL.md` with `name: egm-bootstrap`. A folder with `_` and no `-`
+ * loads under the kebab-case name. The mapping is 1:1 (pluginSkillFolderAlias inverts it), so a
+ * lookup finds the folder without listing the root. Other names come back unchanged: scan sites
+ * reject an invalid one, and the SKILL.md `name` must still match the result.
+ */
+export function pluginSkillNameOfFolder(folder: string): string {
+  if (!folder.includes("_") || folder.includes("-")) return folder;
+  return folder.replaceAll("_", "-");
+}
+
+/** The snake_case folder that can also hold plugin skill `name` (pluginSkillNameOfFolder). */
+export function pluginSkillFolderAlias(name: string): string | undefined {
+  return name.includes("-") ? name.replaceAll("-", "_") : undefined;
+}
+
+/**
+ * The skill name of each plugin skill folder. A snake_case folder is dropped when the kebab-case
+ * path is a directory (`isDirectory` follows symlinks): lookups try that path first and fall
+ * back only when it is not a directory, so the two always agree. The path is stat'ed even when
+ * the listing has no entry of that exact name: on a case-insensitive filesystem a `Foo-Bar`
+ * folder answers the lookup of `foo-bar`.
+ */
+export async function pluginSkillFolderNames(
+  folders: readonly string[],
+  isDirectory: (folder: string) => Promise<boolean>
+): Promise<Array<{ folder: string; name: string }>> {
+  const entries: Array<{ folder: string; name: string }> = [];
+  for (const folder of folders) {
+    const name = pluginSkillNameOfFolder(folder);
+    if (name !== folder && (await isDirectory(name))) continue;
+    entries.push({ folder, name });
+  }
+  return entries;
+}
+
+/**
+ * Whether the kebab-case twin of a snake_case plugin skill folder is a directory
+ * (pluginSkillFolderNames). An entry Xum cannot stat for a reason other than absence (a symlink
+ * loop, a permission error) counts as present: a lookup refuses such a folder instead of falling
+ * back (#4438), so its snake_case twin must not load in its place anywhere.
+ */
+export function isPluginSkillDirectory(
+  stat: Promise<{ isDirectory(): boolean }>
+): Promise<boolean> {
+  return stat.then(
+    (result) => result.isDirectory(),
+    (error: unknown) => !(hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR"))
+  );
+}
 
 /**
  * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
  * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
+ * `name` is the skill name (pluginSkillNameOfFolder). `folder` is the folder's own name in a
+ * container root, and `name` for a single root (whose review label is the root's path).
  * `file` is the skill's Markdown file (SKILL.md, or a command's `<name>.md`). Names are not
  * validated: callers report an invalid one.
  */
 export async function listPluginSkillFolders(
   root: PluginSkillsRoot
-): Promise<Array<{ name: string; dir: string; file: string }>> {
+): Promise<Array<{ name: string; folder: string; dir: string; file: string }>> {
   if (root.single) {
-    const file = path.join(root.dir, pluginSkillFileName(root.name, root.command));
-    return [{ name: root.name, dir: root.dir, file }];
+    const file = path.join(root.dir, pluginSkillFileName(root.name, root));
+    return [{ name: root.name, folder: root.name, dir: root.dir, file }];
   }
   try {
-    const entries = await fsPromises.readdir(root.dir, { withFileTypes: true });
-    return entries
+    const entries = await pluginFs().readdir(root.dir);
+    const folders = entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b))
-      .map((name) => ({
-        name,
-        dir: path.join(root.dir, name),
-        file: path.join(root.dir, name, SKILL_FILENAME),
-      }));
+      .sort((a, b) => a.localeCompare(b));
+    const isDirectory = (folder: string) =>
+      isPluginSkillDirectory(pluginFs().stat(path.join(root.dir, folder)));
+    return (await pluginSkillFolderNames(folders, isDirectory)).map(({ folder, name }) => ({
+      name,
+      folder,
+      dir: path.join(root.dir, folder),
+      file: path.join(root.dir, folder, SKILL_FILENAME),
+    }));
   } catch {
     return [];
   }
@@ -374,7 +584,7 @@ export interface DiscoverAgentPluginsResult {
 
 async function listChildDirectories(containerPath: string): Promise<string[]> {
   try {
-    const entries = await fsPromises.readdir(containerPath, { withFileTypes: true });
+    const entries = await pluginFs().readdir(containerPath);
     // Include symlinks: a symlinked plugin directory is fine because its
     // realpath becomes the plugin root for all containment checks.
     return entries
@@ -427,7 +637,7 @@ async function resolveComponentPath(args: {
 
   let stat;
   try {
-    stat = await fsPromises.stat(canonical);
+    stat = await pluginFs().stat(canonical);
   } catch {
     return undefined;
   }
@@ -465,10 +675,14 @@ type ManifestCandidate =
   | { status: "invalid"; message: string }
   | { status: "ok"; raw: unknown };
 
-/** Read one manifest location with the shared containment and size caps. */
+/**
+ * Read one manifest location with the shared containment and size caps. `shown`: the path that
+ * error messages name (shownManifestPath), default `relative`.
+ */
 async function readManifestCandidate(
   rootReal: string,
-  relative: string
+  relative: string,
+  shown = relative
 ): Promise<ManifestCandidate> {
   let manifestReal: string;
   try {
@@ -483,32 +697,34 @@ async function readManifestCandidate(
       status: "invalid",
       message:
         error instanceof PluginGitPathError
-          ? `${relative} resolves into the plugin's .git directory`
-          : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+          ? `${shown} resolves into the plugin's .git directory`
+          : `${shown} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
-  const stat = await fsPromises.stat(manifestReal).catch(() => null);
+  const stat = await pluginFs()
+    .stat(manifestReal)
+    .catch(() => null);
   // A manifest of the wrong filesystem kind: not a plugin candidate.
   if (!stat?.isFile()) return { status: "missing" };
   if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
     return {
       status: "invalid",
-      message: `${relative} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
+      message: `${shown} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
     };
   }
   try {
     // The checks above only classify the candidate. The bytes come from one handle that is
     // identity-checked, contained and capped, so a local replacement after the size check
     // cannot redirect or grow the read (Codex PRRT_kwDOPxxmWM6rvwzc, #6297).
-    const { content } = await readPluginFileWithinRootCapped({
+    const { content } = await pluginFs().readFileCapped({
       filePath: manifestReal,
       pluginRoot: rootReal,
       maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-      label: relative,
+      label: shown,
     });
     return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
-    return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
+    return { status: "invalid", message: `Failed to read ${shown}: ${getErrorMessage(error)}` };
   }
 }
 
@@ -539,14 +755,14 @@ async function resolveSkillsRoots(args: {
 /**
  * The skills roots that a manifest `skills` value names in `pluginDir`, resolved as discovery
  * resolves them (containment, and a path that holds SKILL.md is one skill). For callers that
- * count skills without a plugin manifest on disk (the Skills CLI names).
+ * count skills without a plugin manifest on disk (the Skills CLI names, marketplace entries).
  */
 export async function resolveDeclaredSkillsRoots(args: {
   pluginDir: string;
   declared: string | string[] | undefined;
   pluginName: string;
 }): Promise<PluginSkillsRoot[]> {
-  const rootReal = await fsPromises.realpath(args.pluginDir);
+  const rootReal = await pluginFs().realpath(args.pluginDir);
   const diagnostics: AgentPluginDiagnostic[] = [];
   return resolveSkillsRoots({
     declared: args.declared,
@@ -574,7 +790,9 @@ async function classifySkillsRoot(args: {
   // lstat: a SKILL.md symlink still marks the folder as one skill, so the scan sites'
   // containment checks refuse an escaping link instead of this folder being read as a
   // container of skill folders.
-  const skillFile = await fsPromises.lstat(path.join(args.canonical, "SKILL.md")).catch(() => null);
+  const skillFile = await pluginFs()
+    .lstat(path.join(args.canonical, "SKILL.md"))
+    .catch(() => null);
   if (skillFile?.isFile() !== true && skillFile?.isSymbolicLink() !== true) {
     return { dir: args.canonical };
   }
@@ -583,7 +801,10 @@ async function classifySkillsRoot(args: {
   // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
   // the folder the author named `alias`.
   const declaredPath = path.resolve(args.rootReal, args.relative);
-  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
+  const name =
+    declaredPath === args.rootReal
+      ? args.pluginName
+      : pluginSkillNameOfFolder(path.basename(declaredPath));
   return { dir: args.canonical, single: true, name };
 }
 
@@ -608,7 +829,9 @@ async function listCommandFiles(
   }
   const dir = await resolveComponent(relative, "directory");
   if (dir === undefined) return [];
-  const entries = await fsPromises.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const entries = await pluginFs()
+    .readdir(dir)
+    .catch(() => []);
   // Symlinks too: every scan site reads them through the contained reader.
   return entries
     .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
@@ -637,7 +860,7 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
   try {
     // The hardened reader checks containment, file type and size on the opened handle, so a file
     // swapped (for a link out of the root, a FIFO or a bigger file) after a check is not read.
-    const { content, byteSize } = await readPluginFileWithinRootCapped({
+    const { content, byteSize } = await pluginFs().readFileCapped({
       filePath: file,
       pluginRoot: rootReal,
       maxBytes: MAX_FILE_SIZE,
@@ -656,14 +879,24 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
 }
 
 /**
- * Claude's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no `skills`
- * key loads as one skill (the caller passes "." as the declared skills path).
+ * Claude's and Cursor's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no
+ * `skills` key loads as one skill (the caller passes "." as the declared skills path). Any entry
+ * named `skills` turns the layout off for Claude. Cursor turns it off only for a `skills/` folder.
  */
-async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
-  if ((await fsPromises.lstat(path.join(rootReal, "skills")).catch(() => null)) !== null) {
-    return false;
-  }
-  const skillFile = await fsPromises.lstat(path.join(rootReal, SKILL_FILENAME)).catch(() => null);
+async function isClaudeRootSkill(
+  rootReal: string,
+  options: { onlySkillsFolderCounts: boolean }
+): Promise<boolean> {
+  const skillsPath = path.join(rootReal, "skills");
+  const skillsEntry = options.onlySkillsFolderCounts
+    ? await isPluginSkillDirectory(pluginFs().stat(skillsPath))
+    : (await pluginFs()
+        .lstat(skillsPath)
+        .catch(() => null)) !== null;
+  if (skillsEntry) return false;
+  const skillFile = await pluginFs()
+    .lstat(path.join(rootReal, SKILL_FILENAME))
+    .catch(() => null);
   return skillFile?.isFile() === true || skillFile?.isSymbolicLink() === true;
 }
 
@@ -680,7 +913,9 @@ async function keepDeclaredAgentsOnly(args: {
   if (args.agentsDir === undefined || args.declaredFiles === undefined) return args.agentsDir;
   // An empty list declares no agents (normalizeClaudeManifest warned when it was unmappable).
   if (args.declaredFiles.length === 0) return undefined;
-  const entries = await fsPromises.readdir(args.agentsDir, { withFileTypes: true }).catch(() => []);
+  const entries = await pluginFs()
+    .readdir(args.agentsDir)
+    .catch(() => []);
   const declared = new Set(args.declaredFiles);
   const undeclared = entries
     .filter((entry) => entry.isFile() && pluginAgentIdOf(entry.name) !== null)
@@ -729,6 +964,208 @@ async function resolveCommandRoots(args: {
     }
   }
   return roots;
+}
+
+async function listRuleFiles(dir: string): Promise<Array<{ file: string; name: string }>> {
+  const entries = await pluginFs()
+    .readdir(dir)
+    .catch(() => []);
+  // Symlinks too: every scan site reads them through the contained reader.
+  return entries
+    .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .flatMap((file) => {
+      const name = cursorRuleName(file);
+      return name === undefined ? [] : [{ file, name }];
+    });
+}
+
+/**
+ * The rule is read and converted here, as the scan sites do, so a refused rule is listed in
+ * `notApplied` and no scan site sees it.
+ */
+async function ruleRefusal(args: {
+  dir: string;
+  file: string;
+  name: string;
+  rootReal: string;
+}): Promise<CursorRuleRefusal | undefined> {
+  let content: string;
+  try {
+    ({ content } = await pluginFs().readFileCapped({
+      filePath: path.join(args.dir, args.file),
+      pluginRoot: args.rootReal,
+      maxBytes: MAX_FILE_SIZE,
+      label: args.file,
+    }));
+  } catch (error) {
+    return {
+      reason: "the file cannot be read",
+      warning: `Rule '${args.file}' cannot be read; ignoring it: ${getErrorMessage(error)}`,
+    };
+  }
+  const converted = convertCursorRule({ name: args.name, file: args.file }, content);
+  return "warning" in converted ? converted : undefined;
+}
+
+/**
+ * Why one rule file does not load, or undefined when it does. A file that an earlier rule of the
+ * plugin already read (through a link) is not read again, so links to one large file cost one read.
+ */
+async function ruleFileRefusal(args: {
+  dir: string;
+  file: string;
+  name: string;
+  rootReal: string;
+  taken: ReadonlySet<string>;
+  readFiles: Set<string>;
+}): Promise<CursorRuleRefusal | undefined> {
+  const { file, name } = args;
+  if (!SkillNameSchema.safeParse(name).success) {
+    return {
+      reason: "not a valid skill name",
+      warning: `Rule '${file}' has no valid skill name (kebab-case); ignoring it`,
+    };
+  }
+  if (args.taken.has(name)) {
+    return {
+      reason: "a skill or rule of the same name comes first",
+      warning: `Rule '${file}' is ignored: a skill or rule named '${name}' comes first`,
+    };
+  }
+  const canonical = await pluginFs()
+    .realpath(path.join(args.dir, file))
+    .catch(() => undefined);
+  if (canonical !== undefined && args.readFiles.has(canonical)) {
+    return {
+      reason: "the same file as an earlier rule",
+      warning: `Rule '${file}' is the same file as an earlier rule; ignoring it`,
+    };
+  }
+  if (canonical !== undefined) args.readFiles.add(canonical);
+  return ruleRefusal(args);
+}
+
+/**
+ * Every rule file counts toward MAX_PLUGIN_COMMANDS, a refused one too: discovery reads and parses
+ * each one before any consent, so a repository must not get past the cap with files that fail.
+ */
+async function resolveRuleRoots(args: {
+  ruleDirs: string[];
+  skillsDirs: PluginSkillsRoot[];
+  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
+  rootReal: string;
+  warn: (message: string) => void;
+}): Promise<{ roots: PluginSkillsRoot[]; notApplied: AgentPluginNotApplied[] }> {
+  const taken = await listSkillNames(args.skillsDirs, args.rootReal);
+  const readFiles = new Set<string>();
+  const roots: PluginSkillsRoot[] = [];
+  const notApplied: AgentPluginNotApplied[] = [];
+  let examined = 0;
+  for (const relative of args.ruleDirs) {
+    const dir = await args.resolveComponent(relative, "directory");
+    if (dir === undefined) continue;
+    for (const { file, name } of await listRuleFiles(dir)) {
+      if (examined >= MAX_PLUGIN_COMMANDS) {
+        args.warn(`More than ${MAX_PLUGIN_COMMANDS} rules; ignoring the rest`);
+        return { roots, notApplied };
+      }
+      examined++;
+      const refusal = await ruleFileRefusal({
+        dir,
+        file,
+        name,
+        rootReal: args.rootReal,
+        taken,
+        readFiles,
+      });
+      if (refusal !== undefined) {
+        args.warn(refusal.warning);
+        notApplied.push({ part: "rule", name: file, reason: refusal.reason });
+        continue;
+      }
+      taken.add(name);
+      roots.push({ dir, single: true, name, rule: file });
+    }
+  }
+  return { roots, notApplied };
+}
+
+async function firstExisting(rootReal: string, candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    const entry = await pluginFs()
+      .lstat(path.join(rootReal, candidate))
+      .catch(() => null);
+    if (entry !== null) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * A declared `commands` field lists itself, the normalizer lists inline MCP servers, and the
+ * hooks loader lists each hook that does not run.
+ */
+async function cursorPackageNotApplied(args: {
+  rootReal: string;
+  declaresCommands: boolean;
+}): Promise<AgentPluginNotApplied[]> {
+  const checks: Array<{
+    part: AgentPluginNotApplied["part"];
+    candidates: string[];
+    reason: string;
+  }> = [
+    {
+      part: "command",
+      candidates: args.declaresCommands ? [] : ["commands"],
+      reason: "not applied in Xum",
+    },
+  ];
+  const entries: AgentPluginNotApplied[] = [];
+  for (const { part, candidates, reason } of checks) {
+    const found = await firstExisting(args.rootReal, candidates);
+    if (found !== undefined)
+      entries.push({ part, name: part === "command" ? `${found}/` : found, reason });
+  }
+  return entries;
+}
+
+async function resolveCursorParts(args: {
+  cursor: CursorManifestResult | undefined;
+  rawManifest: unknown;
+  skillsDirs: PluginSkillsRoot[];
+  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
+  rootReal: string;
+  warn: (message: string) => void;
+}): Promise<{
+  ruleRoots: PluginSkillsRoot[];
+  notApplied: AgentPluginNotApplied[];
+  /** Spread into the plugin: `cursorHooks` for a Cursor package, nothing for any other. */
+  hooksField: Pick<AgentPluginInfo, "cursorHooks">;
+}> {
+  const { cursor } = args;
+  if (cursor === undefined) return { ruleRoots: [], notApplied: [], hooksField: {} };
+  const rules = await resolveRuleRoots({
+    ruleDirs: cursor.ruleDirs,
+    skillsDirs: args.skillsDirs,
+    resolveComponent: args.resolveComponent,
+    rootReal: args.rootReal,
+    warn: args.warn,
+  });
+  const onDisk = await cursorPackageNotApplied({
+    rootReal: args.rootReal,
+    declaresCommands: isPlainObject(args.rawManifest) && args.rawManifest.commands !== undefined,
+  });
+  const { notApplied: hooksNotApplied, ...hooks } = await loadPluginCursorHooks({
+    rootPath: args.rootReal,
+    source: cursor.hooks,
+    fs: pluginFs(),
+  });
+  return {
+    ruleRoots: rules.roots,
+    notApplied: [...cursor.notApplied, ...rules.notApplied, ...onDisk, ...hooksNotApplied],
+    hooksField: { cursorHooks: hooks },
+  };
 }
 
 /**
@@ -780,13 +1217,15 @@ async function selectOpenAISource(args: {
 async function resolvePluginMcpConfig(args: {
   rootReal: string;
   declared: string | undefined;
-  /** The MCP dialect of a Codex or Claude manifest; undefined for a root plugin.json. */
+  /** The MCP dialect of a Codex, Claude or Cursor manifest; undefined for a root plugin.json. */
   manifestDialect: AgentPluginInfo["mcpConfigDialect"];
   resolveComponent: (relativePath: string, expectKind: "file") => Promise<string | undefined>;
 }): Promise<Pick<AgentPluginInfo, "mcpConfigPath" | "mcpConfigDialect">> {
   const rootMcpJson =
     args.manifestDialect !== "claude" &&
-    (await fsPromises.lstat(path.join(args.rootReal, "mcp.json")).catch(() => null)) !== null;
+    (await pluginFs()
+      .lstat(path.join(args.rootReal, "mcp.json"))
+      .catch(() => null)) !== null;
   const defaultMcpPath = rootMcpJson ? "mcp.json" : CODEX_MCP_CONFIG_RELATIVE_PATH;
   const mcpConfigPath = await args.resolveComponent(args.declared ?? defaultMcpPath, "file");
   if (mcpConfigPath === undefined) return {};
@@ -801,6 +1240,94 @@ async function resolvePluginMcpConfig(args: {
 }
 
 /**
+ * A Cursor MCP file's servers that need values and its ignored fields, so the plugin lists them
+ * after install too. An unreadable or invalid file lists nothing: the MCP loader reports it.
+ */
+async function cursorMcpFileNotApplied(
+  rootReal: string,
+  mcpConfigPath: string
+): Promise<AgentPluginNotApplied[]> {
+  try {
+    const { content } = await pluginFs().readFileCapped({
+      filePath: mcpConfigPath,
+      pluginRoot: rootReal,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: path.basename(mcpConfigPath),
+    });
+    return cursorMcpNotApplied(JSON.parse(content) as unknown);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Cursor reads `.mdc` and `.markdown` agents too, but every plugin agent scan site reads `.md`
+ * files only (pluginAgentIdOf), so a Cursor package lists the others instead of dropping them
+ * without a word.
+ */
+async function cursorAgentFilesNotApplied(
+  cursor: CursorManifestResult | undefined,
+  agentsDir: string | undefined
+): Promise<AgentPluginNotApplied[]> {
+  if (cursor === undefined || agentsDir === undefined) return [];
+  const entries = await pluginFs()
+    .readdir(agentsDir)
+    .catch(() => []);
+  return entries
+    .filter((entry) => entry.isFile() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .filter((name) => /\.(mdc|markdown)$/i.test(name))
+    .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map((name) => ({ part: "agent", name, reason: "only .md agent files are applied in Xum" }));
+}
+
+/**
+ * Cursor plugin names may contain periods (`prompts.chat`, `foo.-bar`), and skill names may not, so
+ * a Cursor root skill loads under the name with one `-` for each run of `.` and `-`. Its SKILL.md
+ * `name` becomes the display name.
+ */
+function cursorRootSkillName(pluginName: string): string {
+  return pluginName.replace(/[.-]+/g, "-");
+}
+
+/** A Cursor package's MCP file comes from `mcpServers`, inert when it names no file Xum applies. */
+async function resolvePackageMcpConfig(args: {
+  packageKind: { skillsOnly: boolean; claudePackage: boolean; codexFallback: boolean };
+  cursor: CursorManifestResult | undefined;
+  rootReal: string;
+  declared: string | undefined;
+  resolveComponent: (relativePath: string, expectKind: "file") => Promise<string | undefined>;
+}): Promise<
+  Pick<AgentPluginInfo, "mcpConfigPath" | "mcpConfigDialect"> & {
+    mcpNotApplied: AgentPluginNotApplied[];
+  }
+> {
+  const { skillsOnly, claudePackage, codexFallback } = args.packageKind;
+  if (skillsOnly) return { mcpNotApplied: [] };
+  if (args.cursor !== undefined) {
+    const mcp = await resolvePluginMcpConfig({
+      rootReal: args.rootReal,
+      // Cursor discovers only `mcp.json`; a `.mcp.json` next to it belongs to another tool.
+      declared: args.cursor.mcpConfigPath ?? "mcp.json",
+      manifestDialect: "cursor",
+      resolveComponent: args.resolveComponent,
+    });
+    const mcpNotApplied =
+      mcp.mcpConfigPath === undefined
+        ? []
+        : await cursorMcpFileNotApplied(args.rootReal, mcp.mcpConfigPath);
+    return { ...mcp, mcpNotApplied };
+  }
+  const mcp = await resolvePluginMcpConfig({
+    rootReal: args.rootReal,
+    declared: args.declared,
+    manifestDialect: claudePackage ? "claude" : codexFallback ? "codex" : undefined,
+    resolveComponent: args.resolveComponent,
+  });
+  return { ...mcp, mcpNotApplied: [] };
+}
+
+/**
  * The manifest of a skills-only package: its metadata, `contributes.skills` and the marker. No
  * slash commands, component paths, hook tool grants or com.openai survive.
  */
@@ -811,6 +1338,72 @@ function skillsOnlyManifest(manifest: AgentPluginManifest): AgentPluginManifest 
     ...metadata,
     ...(contributes?.skills !== undefined ? { contributes: { skills: contributes.skills } } : {}),
     extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
+  };
+}
+
+/**
+ * The manifest of a package generated from a Claude marketplace entry: metadata, the Claude
+ * component paths (skills, agents, MCP file) and the marker. No slash commands, hooks.js or
+ * workflows paths, hook tool grants or com.openai survive.
+ */
+function claudeMarketplaceManifest(manifest: AgentPluginManifest): AgentPluginManifest {
+  const { contributes, extensions, ...metadata } = manifest;
+  // Absent members stay undefined, which every reader treats as "not declared". The generator
+  // writes the inert path for an agents or MCP path the entry did not declare (downgrade
+  // safety, inertGeneratedComponents), so it reads as "not declared" too: the Claude defaults.
+  const { skills, agents, mcp } = contributes ?? {};
+  const declared = (value: string | undefined) =>
+    value === INERT_COMPONENT_PATH ? undefined : value;
+  const mux = extensions?.mux;
+  return {
+    ...metadata,
+    contributes: { skills, agents: declared(agents), mcp: declared(mcp) },
+    extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
+  };
+}
+
+/**
+ * What a package loads, by its manifest file and its generatedFrom marker.
+ *
+ * SECURITY AUDIT: `extensions.mux.generatedFrom` marks a plugin.json that Xum generated
+ * (installMethods.ts). A repository can write the marker itself, so it may only REMOVE
+ * capabilities relative to a plain plugin.json. A well-formed `claude-marketplace` marker gets
+ * the Claude package set: skills, commands as user-only skills (prompt files that a plain
+ * plugin.json can ship as skills already), agents/ and MCP, but no hooks.js, workflows/, slash
+ * commands, extensions.mux grants or com.openai, and its hooks.json never runs. Every other
+ * marker, also a malformed or unknown one, is skills-only.
+ */
+function packageRules(args: {
+  manifest: AgentPluginManifest;
+  /** The manifest is the root plugin.json (the only file Xum generates). */
+  rootManifest: boolean;
+  claudeFallback: boolean;
+  claude: ClaudePluginComponents | undefined;
+}): {
+  manifest: AgentPluginManifest;
+  skillsOnly: boolean;
+  /** A .claude-plugin/plugin.json package, or one generated from a marketplace entry. */
+  claudePackage: boolean;
+  claudeComponents: ClaudePluginComponents | undefined;
+} {
+  const generatedFrom = args.rootManifest ? readGeneratedFrom(args.manifest) : undefined;
+  if (generatedFrom?.kind === "claude-marketplace") {
+    return {
+      manifest: claudeMarketplaceManifest(args.manifest),
+      skillsOnly: false,
+      claudePackage: true,
+      claudeComponents: {
+        ...(generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {}),
+        ...(generatedFrom.agentFiles !== undefined ? { agentFiles: generatedFrom.agentFiles } : {}),
+      },
+    };
+  }
+  const skillsOnly = hasGeneratedFromMarker(args.manifest);
+  return {
+    manifest: skillsOnly ? skillsOnlyManifest(args.manifest) : args.manifest,
+    skillsOnly,
+    claudePackage: args.claudeFallback,
+    claudeComponents: args.claudeFallback ? args.claude : undefined,
   };
 }
 
@@ -838,7 +1431,7 @@ const XUM_COMPONENTS: Record<
 
 /**
  * Which Xum components a package kind may load. A package that was not written for Xum
- * ("foreign": a Claude package, or a plugin.json with the generatedFrom marker) gets no Xum
+ * ("foreign": a Claude or Cursor package, or a plugin.json with the generatedFrom marker) gets no Xum
  * executable code: no hooks.js and no workflows/. A Codex-fallback package gets skills, MCP and
  * com.openai only: no agents/ either (see normalizeCodexManifest's SECURITY AUDIT). A Claude
  * package keeps agents/ (Claude-format agents, reviewed as usual); a skills-only package does not.
@@ -876,12 +1469,98 @@ async function resolveXumComponents(args: {
   return resolved;
 }
 
+/**
+ * A root plugin.json that other harnesses use (no `$schema` member): it yields to a Codex, a
+ * Claude or a Cursor manifest (selectManifest).
+ */
+function isSchemaLessManifest(raw: unknown): boolean {
+  return isPlainObject(raw) && raw.$schema === undefined;
+}
+
+/**
+ * True when the root plugin.json of `rootReal` reads, through the manifest containment and size
+ * caps, as a schema-less one. installMethods uses it so the method it offers is the manifest
+ * discovery loads.
+ */
+export async function isSchemaLessRootManifest(rootReal: string): Promise<boolean> {
+  const read = await readManifestCandidate(rootReal, PLUGIN_MANIFEST_RELATIVE_PATH);
+  return read.status === "ok" && isSchemaLessManifest(read.raw);
+}
+
+/**
+ * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex, the Claude Code and
+ * the Cursor manifests. Each one goes through the same caps and containment. Null when none exists.
+ *
+ * A root plugin.json with no `$schema` is not an Agent Plugins manifest: other harnesses use the
+ * same file name (DietrichGebert/ponytail ships `{"name":"ponytail"}` next to its Codex and Claude
+ * manifests). It yields to a later candidate, and is returned (so validation reports it) only
+ * when no other manifest exists. The fallback gets the narrower Codex, Claude or Cursor component
+ * set.
+ */
+async function selectManifest(
+  rootReal: string,
+  /** See discoverAgentPluginAt: read errors name the file from here, like validation errors. */
+  shownRoot: string | undefined
+): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
+  let schemaLessRoot: { relative: string; raw: unknown } | null = null;
+  for (const relative of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
+    const read = await readManifestCandidate(
+      rootReal,
+      relative,
+      shownManifestPath(shownRoot, relative)
+    );
+    if (read.status === "missing") continue;
+    if (read.status === "invalid") return { relative, error: read.message };
+    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && isSchemaLessManifest(read.raw)) {
+      schemaLessRoot = { relative, raw: read.raw };
+      continue;
+    }
+    return { relative, raw: read.raw };
+  }
+  return schemaLessRoot;
+}
+
+function normalizeSelectedManifest(
+  manifestRelative: string,
+  raw: unknown
+): {
+  manifest: unknown;
+  warnings: string[];
+  claude: ClaudePluginComponents | undefined;
+  cursor?: CursorManifestResult;
+} {
+  switch (manifestRelative) {
+    case CODEX_PLUGIN_MANIFEST_RELATIVE_PATH:
+      return { ...normalizeCodexManifest(raw), claude: undefined };
+    case CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH:
+      return normalizeClaudeManifest(raw);
+    case CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH: {
+      const cursor = normalizeCursorManifest(raw);
+      return { manifest: cursor.manifest, warnings: cursor.warnings, claude: undefined, cursor };
+    }
+    default:
+      return { manifest: raw, warnings: [], claude: undefined };
+  }
+}
+
+/** The manifest path an error shows: from `shownRoot` (default the plugin root), `/` on every OS. */
+function shownManifestPath(shownRoot: string | undefined, manifestRelative: string): string {
+  return path.posix.join(shownRoot ?? ".", manifestRelative.split(path.sep).join("/"));
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
   dirName: string;
   scope: AgentPluginScope;
   diagnostics: AgentPluginDiagnostic[];
+  /** See discoverAgentPluginAt. */
+  shownRoot?: string;
 }): Promise<AgentPluginInfo | null> {
   const { pluginDir, scope, diagnostics } = args;
 
@@ -893,54 +1572,40 @@ async function discoverPluginAt(args: {
   // The canonical plugin root anchors every §4.1 containment check.
   let rootReal: string;
   try {
-    rootReal = await fsPromises.realpath(pluginDir);
+    rootReal = await pluginFs().realpath(pluginDir);
   } catch {
     // Broken symlink / vanished entry: not a plugin.
     return null;
   }
 
-  // Root plugin.json wins, then the Codex and the Claude Code manifests. Each one goes through
-  // the same caps and containment.
-  let manifestRelative = PLUGIN_MANIFEST_RELATIVE_PATH;
-  let manifestPath = path.join(rootReal, manifestRelative);
-  let rawManifest: unknown;
-  let found = false;
-  for (const candidate of [
-    PLUGIN_MANIFEST_RELATIVE_PATH,
-    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-  ]) {
-    manifestRelative = candidate;
-    manifestPath = path.join(rootReal, candidate);
-    const read = await readManifestCandidate(rootReal, candidate);
-    if (read.status === "missing") continue;
-    if (read.status === "invalid") {
-      pushError(manifestPath, read.message);
-      return null;
-    }
-    rawManifest = read.raw;
-    found = true;
-    break;
-  }
-  if (!found) {
+  const selected = await selectManifest(rootReal, args.shownRoot);
+  if (selected === null) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
+  const manifestRelative = selected.relative;
+  const manifestPath = path.join(rootReal, manifestRelative);
+  if ("error" in selected) {
+    pushError(manifestPath, selected.error);
+    return null;
+  }
+  const rawManifest = selected.raw;
 
   const codexFallback = manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
   const claudeFallback = manifestRelative === CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH;
-  const normalized = codexFallback
-    ? { ...normalizeCodexManifest(rawManifest), claude: undefined }
-    : claudeFallback
-      ? normalizeClaudeManifest(rawManifest)
-      : { manifest: rawManifest, warnings: [], claude: undefined };
+  const { cursor, ...normalized } = normalizeSelectedManifest(manifestRelative, rawManifest);
+  const cursorFallback = cursor !== undefined;
   const validation = validatePluginManifest(normalized.manifest);
   if (!validation.ok) {
     const label =
       validation.reason === "unsupported-version"
         ? "Unsupported Agent Plugins version"
         : "Invalid plugin manifest";
-    pushError(manifestPath, `${label}: ${validation.errors.join("; ")}`);
+    // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
+    // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
+    // every OS, because the path is shown, not opened.
+    const shownManifest = shownManifestPath(args.shownRoot, manifestRelative);
+    pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }
 
@@ -949,24 +1614,21 @@ async function discoverPluginAt(args: {
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
   }
 
-  // SECURITY AUDIT: `extensions.mux.generatedFrom` marks a plugin.json that Xum generated for a
-  // skills repository (installMethods.ts). A repository can write the marker itself, so it may
-  // only REMOVE capabilities: such a package loads skills and nothing else. The only generated
-  // kind is skills, so a marker of any shape (also a malformed or unknown one) is skills-only.
-  const skillsOnly = hasGeneratedFromMarker(validation.manifest);
-  const manifest = skillsOnly ? skillsOnlyManifest(validation.manifest) : validation.manifest;
+  const { manifest, skillsOnly, claudePackage, claudeComponents } = packageRules({
+    manifest: validation.manifest,
+    rootManifest: manifestRelative === PLUGIN_MANIFEST_RELATIVE_PATH,
+    claudeFallback,
+    claude: normalized.claude,
+  });
 
+  const foreign = claudePackage || cursorFallback || skillsOnly;
   const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
     rootReal,
     manifest,
     manifestRelative,
-    // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
+    // A Claude or Cursor package has no extensions (its normalizer drops them), so it gets no
     // overlay either. Nor does a skills-only package: com.openai can point at hooks.
-    overlay:
-      !codexFallback &&
-      !claudeFallback &&
-      !skillsOnly &&
-      !isPlainObject(manifest.extensions?.["com.openai"]),
+    overlay: !codexFallback && !foreign && !isPlainObject(manifest.extensions?.["com.openai"]),
     scope,
     diagnostics,
   });
@@ -1005,15 +1667,18 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      (claudeFallback && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
+      ((claudePackage || cursorFallback) &&
+      (await isClaudeRootSkill(rootReal, { onlySkillsFolderCounts: cursorFallback }))
+        ? ["."]
+        : undefined),
     rootReal,
-    pluginName: manifest.name,
+    pluginName: cursorFallback ? cursorRootSkillName(manifest.name) : manifest.name,
     resolveComponent,
   });
   // Claude commands load as user-only skills, after every skills root (a skill wins).
-  const commandRoots = claudeFallback
+  const commandRoots = claudePackage
     ? await resolveCommandRoots({
-        declared: normalized.claude?.commands,
+        declared: claudeComponents?.commands,
         skillsDirs,
         resolveComponent,
         rootReal,
@@ -1023,23 +1688,33 @@ async function discoverPluginAt(args: {
         },
       })
     : [];
-  const allSkillsRoots = [...skillsDirs, ...commandRoots];
-  const mcp = skillsOnly
-    ? {}
-    : await resolvePluginMcpConfig({
-        rootReal,
-        declared: contributes?.mcp,
-        manifestDialect: claudeFallback ? "claude" : codexFallback ? "codex" : undefined,
-        resolveComponent,
-      });
+  const cursorParts = await resolveCursorParts({
+    cursor,
+    rawManifest,
+    skillsDirs,
+    resolveComponent,
+    rootReal,
+    warn: (message) => {
+      log.debug(`Agent plugin ${pluginDir}: ${message}`);
+      diagnostics.push({ path: rootReal, scope, severity: "warning", message });
+    },
+  });
+  const allSkillsRoots = [...skillsDirs, ...commandRoots, ...cursorParts.ruleRoots];
+  const { mcpNotApplied, ...mcp } = await resolvePackageMcpConfig({
+    packageKind: { skillsOnly, claudePackage, codexFallback },
+    cursor,
+    rootReal,
+    declared: contributes?.mcp,
+    resolveComponent,
+  });
   const { agentsDir: resolvedAgentsDir, ...xumComponents } = await resolveXumComponents({
-    allowed: xumComponentGate({ codexFallback, foreign: claudeFallback || skillsOnly, skillsOnly }),
+    allowed: xumComponentGate({ codexFallback, foreign, skillsOnly }),
     contributes,
     resolveComponent,
   });
   const agentsDir = await keepDeclaredAgentsOnly({
     agentsDir: resolvedAgentsDir,
-    declaredFiles: claudeFallback ? normalized.claude?.agentFiles : undefined,
+    declaredFiles: claudePackage ? claudeComponents?.agentFiles : undefined,
     warn: (message) => {
       log.debug(`Agent plugin ${pluginDir}: ${message}`);
       diagnostics.push({ path: rootReal, scope, severity: "warning", message });
@@ -1055,7 +1730,14 @@ async function discoverPluginAt(args: {
     manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(skillsOnly ? { skillsOnly: true } : {}),
-    ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
+    ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
+    ...(cursorFallback ? { cursorFallback: true } : {}),
+    ...cursorParts.hooksField,
+    notApplied: [
+      ...cursorParts.notApplied,
+      ...(await cursorAgentFilesNotApplied(cursor, agentsDir)),
+      ...mcpNotApplied,
+    ],
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,
@@ -1069,6 +1751,8 @@ export function computeAgentPluginContainers(args: {
   xumHome: string;
   projectRoot?: string;
   projectTrusted: boolean;
+  /** The home of ~/.agents/plugins (phase 5: the caller's HostPaths). Absent: the Node home. */
+  userHome?: string;
 }): AgentPluginContainer[] {
   const containers: AgentPluginContainer[] = [];
   // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
@@ -1091,7 +1775,11 @@ export function computeAgentPluginContainers(args: {
     scope: "global",
     registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
   });
-  containers.push({ path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" });
+  containers.push({
+    // mutation-equivalent: userHome is a string or undefined, and an empty home is no path
+    path: path.join(args.userHome ?? nodeHostPaths.userHome(), ".agents", "plugins"),
+    scope: "global",
+  });
   return containers;
 }
 
@@ -1146,6 +1834,12 @@ export async function discoverWorkspaceAgentPlugins(args: {
 export async function discoverAgentPluginAt(args: {
   pluginDir: string;
   scope: AgentPluginScope;
+  /**
+   * The plugin folder's path inside its repository (an install's "Plugin folder"), so a manifest
+   * error names the file the way the user sees the repository: `.codex-plugin/plugin.json`, not
+   * a bare `plugin.json`. Display only.
+   */
+  shownRoot?: string;
 }): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
   if (!path.isAbsolute(args.pluginDir)) {
     throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
@@ -1158,6 +1852,7 @@ export async function discoverAgentPluginAt(args: {
     dirName: path.basename(args.pluginDir),
     scope: args.scope,
     diagnostics,
+    shownRoot: args.shownRoot,
   });
   return { plugin, diagnostics };
 }
@@ -1241,6 +1936,14 @@ export async function journalDerivedDiscoveryGate(
 
 let discoveryGate: AgentPluginDiscoveryGate = journalDerivedDiscoveryGate;
 
+const noDiscoveryGate: AgentPluginDiscoveryGate = () =>
+  Promise.resolve({ suppressed: [], confirm: () => Promise.resolve([]) });
+
+/** The crash-recovery gate reads host journals; a non-host PluginFs has no managed containers. */
+function activeDiscoveryGate(): AgentPluginDiscoveryGate {
+  return pluginFs() === nodePluginFs ? discoveryGate : noDiscoveryGate;
+}
+
 export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): void {
   discoveryGate = gate;
 }
@@ -1248,7 +1951,7 @@ export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): voi
 /** Missing containers stay optional; other identity failures must never become unmanaged scans. */
 async function resolveAgentPluginContainerPath(containerPath: string): Promise<string | undefined> {
   try {
-    return await fsPromises.realpath(containerPath);
+    return await pluginFs().realpath(containerPath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) return undefined;
     throw error;
@@ -1504,7 +2207,7 @@ export async function discoverAgentPlugins(
       }
     }
   };
-  const gateSession = await discoveryGate([
+  const gateSession = await activeDiscoveryGate()([
     ...new Set([...groups.values()].flatMap((group) => [...group.paths])),
   ]);
   const suppressedContainers = new Set(gateSession.suppressed);

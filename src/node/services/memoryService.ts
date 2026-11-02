@@ -27,7 +27,6 @@ import assert from "@/common/utils/assert";
 import { FRONTMATTER_PATTERN } from "@/common/utils/markdownFrontmatter";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
-  MEMORY_HOT_SET_MAX_ITEM_BYTES,
   MEMORY_INDEX_DESCRIPTION_MAX_CHARS,
   MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES,
   MEMORY_MAX_FILE_BYTES,
@@ -78,11 +77,7 @@ import {
   type RefinementInverseDraft,
 } from "@/node/services/refinement/refinementJournal";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
-import {
-  escapeXmlAttribute,
-  selectHotMemories,
-  type MemoryHotSetItem,
-} from "@/node/services/memoryHotSet";
+import { escapeXmlAttribute } from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
 
 /** Per-request context required to resolve scope roots. */
@@ -158,8 +153,6 @@ export interface MemoryChangeEvent {
   path: string;
   actor: MemoryActor;
   workspaceId: string;
-  /** See MemoryFileChangeEventSchema.reason: "access" marks a read-side re-ranking, not an edit. */
-  reason?: "mutation" | "access";
   /**
    * Stable project identity of the emitting scope context. Lets subscribers
    * drop project-scope events from other projects: the same virtual path in
@@ -375,10 +368,9 @@ export function parseMemoryPath(virtualPath: string): ParsedMemoryPath {
         `Invalid memory path '${virtualPath}': control characters are not allowed`
       );
     }
-    // Paths are rendered into prompt context (the memory tool's index and
-    // the <hot_memories> block): names containing XML metacharacters could
-    // reassemble structure-breaking markup across segments (e.g. 'a<' +
-    // 'hot_memories>').
+    // Paths are rendered into prompt context (the memory tool's index):
+    // names containing XML metacharacters could reassemble structure-breaking
+    // markup across segments.
     // Windows also forbids these in filenames, so rejecting them keeps
     // host-local memory directories portable and prompt-safe.
     if (/[<>"]/.test(segment)) {
@@ -481,8 +473,8 @@ interface MemoryStore {
    */
   kind(relPath: string, options?: { strict?: boolean }): Promise<MemoryEntryKind>;
   /**
-   * Read at most `maxBytes` from the head of the file. Index/hot-set builds
-   * use this so files edited outside MemoryService cannot force unbounded reads
+   * Read at most `maxBytes` from the head of the file. Index builds use
+   * this so files edited outside MemoryService cannot force unbounded reads
    * on stream startup. May split a trailing multibyte code point; callers treat
    * the result as a best-effort prefix.
    */
@@ -869,11 +861,6 @@ class LocalMemoryStore implements MemoryStore {
 // Frontmatter description extraction (for the injected memory index)
 // ---------------------------------------------------------------------------
 
-/** Memory body without its leading YAML frontmatter (the index already carries the description). */
-export function stripMemoryFrontmatter(content: string): string {
-  return content.replace(FRONTMATTER_PATTERN, "");
-}
-
 /**
  * Extract a sanitized single-line description from optional YAML frontmatter.
  * Self-healing: malformed frontmatter yields an empty description.
@@ -1051,7 +1038,7 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Per-context owner cache: a context object is created per command / per
-   * index+hot-set build and reused for every entry within it, so the stamp
+   * index build and reused for every entry within it, so the stamp
    * stat behind resolveWorkspaceMemoryOwnerId runs once per operation instead
    * of once per candidate file. Staleness is bounded to that one operation;
    * writes are still gated by the store-bound tombstone check.
@@ -1140,15 +1127,6 @@ export class MemoryService extends EventEmitter {
           options.write && ctx.writeProvenance?.carriesProjectSkillContent === true,
         replacesContent: options.replacesContent,
       });
-      if (scope === "workspace" && !options.write) {
-        // A read-side access (view, recall) re-ranks the shared hot set the
-        // whole task tree derives from the owner's sidecar entries, so it is
-        // published like a pin: the other live sessions of the tree drop
-        // their cached memory context. Writes publish with their mutation.
-        // Marked as an access: the bytes did not change, and the UI must not
-        // label the note as edited by the agent.
-        this.emitChange(ctx, scope, relPath, "agent", "access");
-      }
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
     }
@@ -1195,13 +1173,6 @@ export class MemoryService extends EventEmitter {
       const key = this.logicalKeyFor(ctx, scope, relPath);
       return !memoryEntryCarriesProjectSkillContent(key === null ? undefined : meta.get(key));
     });
-  }
-
-  /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
-  async recordRecall(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
-    const parsed = parseMemoryPath(virtualPath);
-    const scope = this.requireFilePath(parsed, virtualPath);
-    await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
   }
 
   /**
@@ -1255,7 +1226,6 @@ export class MemoryService extends EventEmitter {
       });
     }
   }
-
   private async recordRename(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
@@ -2865,7 +2835,7 @@ export class MemoryService extends EventEmitter {
    * workspace's removal tombstone while the read is in flight, and the bytes
    * would then be exposed on behalf of a workspace that no longer exists.
    * Re-checked after every read whose result leaves the service (view,
-   * listings, index/hot-set builds, UI reads), before the result is
+   * listings, index builds, UI reads), before the result is
    * returned — for every scope (see assertWorkspaceStoreReadable).
    */
   private async assertWorkspaceReadExposable(
@@ -3103,14 +3073,12 @@ export class MemoryService extends EventEmitter {
     ctx: MemoryScopeContext,
     scope: MemoryScope,
     relPath: string,
-    actor: MemoryActor,
-    reason?: "access"
+    actor: MemoryActor
   ) {
     const event: MemoryChangeEvent = {
       scope,
       path: toVirtualPath(scope, relPath),
       actor,
-      ...(reason === undefined ? {} : { reason }),
       // Owner, not actor: subscribers filter workspace-scope events by the
       // store they display, and every tree member displays the owner's. The
       // session store belongs to the acting workspace alone.
@@ -3214,7 +3182,7 @@ export class MemoryService extends EventEmitter {
             sections.push(`  (unavailable: ${getErrorMessage(error)})`);
           }
         }
-        // Same final gate as the index and the hot set: a tombstone landing
+        // Same final gate as the index: a tombstone landing
         // while a later scope was enumerated withholds the filenames the
         // earlier scopes already contributed.
         if ((await this.withholdAfterTombstone(ctx, [sections], () => null)).length === 0) {
@@ -3791,7 +3759,7 @@ export class MemoryService extends EventEmitter {
       await this.assertWorkspaceReadExposable(ctx, store);
       // Deliberately NOT recorded as a use: this is a human browsing the
       // Memory tab/settings, and usage stats must reflect agent reads only so
-      // UI browsing never inflates hot-set ranking. (UI saves still count —
+      // UI browsing never inflates the use counts. (UI saves still count —
       // an edit is an explicit signal the file matters, like pinning.)
       return {
         success: true,
@@ -3903,8 +3871,8 @@ export class MemoryService extends EventEmitter {
       try {
         const store = this.getStore(ctx, scope);
         // Prompt context is a read of the (possibly shared) store: a removed
-        // child's stream in another backend must not keep indexing / hot-set
-        // reading its former owner's notes. Refused here (skipped below) like
+        // child's stream in another backend must not keep indexing
+        // its former owner's notes. Refused here (skipped below) like
         // any other scope failure.
         if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
         else await this.assertWorkspaceStoreReadable(ctx, store);
@@ -3998,96 +3966,7 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * Hot-set tier: user-pinned + top auto-hot files (by sidecar usage stats)
-   * under the budgets in src/common/constants/memory.ts. Reading files here
-   * intentionally bypasses usage recording — preloading is not a use, only
-   * explicit reads/writes are. `pinnedOnly` (sub-agents) skips auto-hot files.
-   */
-  async listHotMemories(
-    ctx: MemoryScopeContext,
-    options?: {
-      pinnedOnly?: boolean;
-      /** Leave files carrying project skill provenance out of the selection. */
-      excludeProjectSkillContent?: boolean;
-    }
-  ): Promise<MemoryHotSetItem[]> {
-    // The session scope is an agent's rollover checkpoint: it reads it on demand after a
-    // rollover, so it never takes preloaded hot-set space.
-    const entries = (await this.listIndexEntries(ctx)).filter(
-      (entry) =>
-        entry.scope !== "session" &&
-        (options?.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent)
-    );
-    const meta = await this.metaService.getEntries();
-    const candidates = entries.map((entry) => {
-      const key = this.logicalKeyFor(ctx, entry.scope, entry.relPath);
-      const stats = key === null ? undefined : meta.get(key);
-      return {
-        path: entry.path,
-        pinned: stats?.pinned ?? false,
-        accessCount: stats?.accessCount ?? 0,
-        lastAccessedAt: stats?.lastAccessedAt ?? null,
-        carriesProjectSkillContent: entry.carriesProjectSkillContent,
-      };
-    });
-    const taintedPaths = new Set<string>();
-    const selected = await selectHotMemories({
-      candidates,
-      pinnedOnly: options?.pinnedOnly,
-      readFile: async (virtualPath) => {
-        const parsed = parseMemoryPath(virtualPath);
-        const scope = this.requireFilePath(parsed, virtualPath);
-        const store = this.getStore(ctx, scope);
-        // The index snapshot above is stale by the time a candidate is read: a
-        // tainted write landing in between would preload the new content under
-        // the old verified-clean classification. Marker check and read run
-        // under the store's mutation lock (writers stamp and replace inside
-        // it): a turn that excludes project skill content skips a file that
-        // turned tainted, a trusted turn flags the item. Paths come from
-        // listIndexEntries (already enumerated under the scope roots), so no
-        // extra containment walk is needed for these reads.
-        return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
-          const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
-          const carries = memoryEntryCarriesProjectSkillContent(
-            key === null ? undefined : (await this.metaService.getEntries()).get(key)
-          );
-          if (carries) {
-            if (options?.excludeProjectSkillContent === true) {
-              throw new MemoryCommandError(MEMORY_PROJECT_SKILL_CONTENT_WITHHELD_MESSAGE);
-            }
-            taintedPaths.add(virtualPath);
-          }
-          // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
-          // anyway; +1 byte preserves its over-budget (truncation marker) check.
-          const content = await store.readFilePrefix(
-            parsed.relPath,
-            MEMORY_HOT_SET_MAX_ITEM_BYTES + 1
-          );
-          await this.assertWorkspaceReadExposable(ctx, store);
-          return content;
-        });
-      },
-    });
-    // Selection keeps reading later files after an item passed its per-file
-    // gate: a tombstone published meanwhile must still withhold the buffered
-    // notes. Final check once selection is done, unconditionally:
-    // the acting (or guarded) workspace removed means nothing goes out,
-    // whatever the scope; the owner removed drops the workspace items (that
-    // scope reads as unavailable, like in the index).
-    const items = await this.withholdAfterTombstone(
-      ctx,
-      selected,
-      (item) => parseMemoryPath(item.path).scope
-    );
-    return items.map((item) =>
-      taintedPaths.has(item.path) && item.carriesProjectSkillContent !== true
-        ? { ...item, carriesProjectSkillContent: true }
-        : item
-    );
-  }
-
-  /**
-   * Post-selection gate shared by the index and the hot set (see
+   * Post-selection gate of the index and the memory view (see
    * assertWorkspaceStoreReadable): a removal tombstone published while the
    * result was still being assembled. The acting/guarded check uses a
    * non-session store, whose guarded ids are exactly those two; the owner
@@ -4122,18 +4001,12 @@ export class MemoryService extends EventEmitter {
 /**
  * Session-segment memory context (memory experiment). Computed once per model
  * in a session segment (session start + compaction boundaries) and cached by
- * AgentSession so both the memory tool description (index) and the system
- * prompt (byte-budgeted hot block) stay byte-identical for repeated turns
- * (prompt-cache-stable).
+ * AgentSession so the memory tool description (index) stays byte-identical
+ * for repeated turns (prompt-cache-stable).
  */
 export interface MemorySessionContext {
   /** Index snapshot advertised in the memory tool description. */
   indexEntries: Array<Pick<MemoryIndexEntry, "path" | "description">>;
-  /**
-   * Rendered <hot_memories> system-prompt block; null when the hot-set
-   * sub-experiment is off or nothing qualifies.
-   */
-  hotMemoriesBlock: string | null;
   /**
    * An included memory (index entry or preloaded file) carries project skill
    * provenance: a routed turn arms its consent gate on it, and writes made
@@ -4163,7 +4036,7 @@ export function formatMemoryIndexForToolDescription(
     for (const entry of entries) {
       // Descriptions are untrusted frontmatter: escape XML
       // metacharacters so they cannot fabricate prompt-context markup (e.g.
-      // a fake </hot_memories> close) or escape their quotes (display-only,
+      // a fake closing tag) or escape their quotes (display-only,
       // so escaping has no tool round-trip cost; paths need no escaping —
       // parseMemoryPath rejects '<', '>' and '"').
       lines.push(

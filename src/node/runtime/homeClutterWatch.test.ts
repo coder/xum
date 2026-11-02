@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import {
+  ClutterScanner,
   diffClutterSnapshots,
   formatClutterNote,
   getClutterWatchRoots,
@@ -68,5 +69,20 @@ describe("homeClutterWatch", () => {
     expect(note).toContain(`\`~${path.sep}dir-0\``);
     expect(note).not.toContain("dir-5");
     expect(note).toContain("(+2 more)");
+  });
+
+  test("busyForMs counts from the time the caller passed to scan, and is 0 when idle", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const scanner = new ClutterScanner(getClutterWatchRoots(home), async () => {
+      await gate;
+      return [];
+    });
+    expect(scanner.busyForMs(5_000)).toBe(0);
+    const scan = scanner.scan(1_000);
+    expect(scanner.busyForMs(1_500)).toBe(500);
+    release();
+    await scan;
+    expect(scanner.busyForMs(9_000)).toBe(0);
   });
 });
