@@ -15,8 +15,6 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum}
-# Per-worktree path inside the git dir: two dev servers in one checkout share dist/ and
-# node_modules/.vite and corrupt each other, so launch refuses while this names a live group.
 LOCK=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-path verify-xum.lock)
 READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-300}
 
@@ -51,7 +49,6 @@ json_string() {
   node -p 'JSON.stringify(process.argv[1])' "$1"
 }
 
-# Prints field $2 (a dotted path) of the JSON file $1, or nothing.
 json_field() {
   node -e '
     const fs = require("fs");
@@ -62,8 +59,6 @@ json_field() {
     } catch {}' "$1" "$2"
 }
 
-# The backend is ready once the server that nodemon restarted after the first watch build
-# (dist/.main-build-complete, written in ms) owns server.lock and answers /health.
 backend_ready() {
   node -e '
     const fs = require("fs");
@@ -110,8 +105,6 @@ create_demo_repo() {
 seed() {
   local created status_file status i
   api splashScreens/markSplashScreenViewed '{"splashId":"onboarding-wizard-v1"}' >/dev/null
-  # The composer refuses to send without a configured provider. The mock never calls it,
-  # and port 9 on loopback keeps any stray call on the machine.
   api providers/setProviderConfig '{"provider":"anthropic","keyPath":["apiKey"],"value":"sk-ant-verify-xum-fake"}' >/dev/null
   api providers/setProviderConfig '{"provider":"anthropic","keyPath":["baseUrl"],"value":"http://127.0.0.1:9/v1"}' >/dev/null
   create_demo_repo "$VERIFY_XUM_PROJECT"
@@ -163,10 +156,9 @@ cmd_launch() {
   pidfile="$VERIFY_XUM_RUN/scratch/pgid"
   t0=$(date +%s)
 
-  # env -i: the agent's env carries the live Xum's PORT, auth token, proxy URIs and provider
-  # keys. setsid: the server outlives this shell, and its process group is what cleanup kills.
-  # The sh wrapper records that group: setsid forks when its caller already leads a group.
-  # shellcheck disable=SC2016 # $$ and $@ belong to the inner sh.
+  # setsid(1) forks when its caller already leads a process group, so $! can miss the new
+  # group. The inner sh records its own pid, which is the new group id.
+  # shellcheck disable=SC2016
   setsid sh -c 'echo "$$" >"$1"; shift; exec "$@"' sh "$pidfile" \
     env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" TERM=dumb \
     TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1 \
@@ -271,9 +263,6 @@ cmd_capture() {
   echo "$base.png $base.aria.txt $base.url.txt"
 }
 
-# Settled: no lazy chunk failed to load, no CSS transition runs (a click while the right sidebar
-# slides open lands where the target was), and on a workspace page the transcript is neither
-# loading nor streaming. A failed chunk exits 3: the page needs a reload.
 IDLE_FAILED_JS="[...document.querySelectorAll('[role=\"alert\"]')].some((e) => e.textContent.includes(' failed to load.'))"
 IDLE_JS="(() => {
   if ($IDLE_FAILED_JS) return true;
@@ -300,7 +289,7 @@ cmd_send_ready() {
 cmd_cleanup() {
   load_run "${1:-}"
   local i
-  # `close` on a session that does not exist starts a browser first.
+  # agent-browser `close` on a session that does not exist starts that session first.
   if agent-browser session list 2>/dev/null | grep -qF "$AGENT_BROWSER_SESSION"; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
   fi
@@ -312,8 +301,6 @@ cmd_cleanup() {
     done
     group_alive "$VERIFY_XUM_PGID" && kill -KILL -- "-$VERIFY_XUM_PGID" 2>/dev/null
   fi
-  # make dev-server-sandbox deletes its own root on a clean exit. Only a root it created
-  # (mux-dev-server-*) is removed here.
   if [[ -n $VERIFY_XUM_ROOT && -d $VERIFY_XUM_ROOT && $(basename "$VERIFY_XUM_ROOT") == mux-dev-server-* ]]; then
     rm -rf "$VERIFY_XUM_ROOT"
   fi
