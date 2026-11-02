@@ -299,6 +299,62 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     }
   });
 
+  // The user's archive confirms a sub-agent's lossy files in the parent's dialog instead of
+  // refusing with no way forward.
+  test("a user snapshot archive confirms a sub-agent's untracked files, then archives the tree", async () => {
+    await setArchiveBehavior("snapshot");
+    a.workspaceService.setWorktreeArchiveSnapshotService(
+      new WorktreeArchiveSnapshotService(a.config)
+    );
+    const notes = path.join(checkouts.get(grandchildId)!, "notes.txt");
+    await fsPromises.writeFile(notes, "unsaved\n");
+
+    const preflight = await a.workspaceService.preflightArchiveWithSubagents(rootId);
+    assert(preflight.success, "the preflight returns a result");
+    assert(
+      preflight.data.kind === "confirm-lossy-untracked-files",
+      "the preflight asks to confirm"
+    );
+    expect(preflight.data.paths).toEqual([]);
+    expect(
+      preflight.data.subagents?.map((subagent) => [subagent.workspaceId, subagent.paths])
+    ).toEqual([[grandchildId, ["notes.txt"]]]);
+
+    const unconfirmed = await a.workspaceService.archive(rootId);
+    expect(unconfirmed.success).toBe(false);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+    }
+
+    const result = await a.workspaceService.archive(rootId, preflight.data.paths, {
+      acknowledgedSubagentUntrackedPaths: { [grandchildId]: ["notes.txt"] },
+    });
+
+    expect(result).toEqual({ success: true, data: { kind: "archived" } });
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(b.config, id)?.archivedAt).toBeDefined();
+    }
+  });
+
+  test("a user snapshot archive refuses a sub-agent file created after the confirmation", async () => {
+    await setArchiveBehavior("snapshot");
+    a.workspaceService.setWorktreeArchiveSnapshotService(
+      new WorktreeArchiveSnapshotService(a.config)
+    );
+    await fsPromises.writeFile(path.join(checkouts.get(grandchildId)!, "notes.txt"), "unsaved\n");
+    await fsPromises.writeFile(path.join(checkouts.get(grandchildId)!, "later.txt"), "new\n");
+
+    const result = await a.workspaceService.archive(rootId, [], {
+      acknowledgedSubagentUntrackedPaths: { [grandchildId]: ["notes.txt"] },
+    });
+
+    expect(result.success).toBe(false);
+    for (const id of allIds) {
+      expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
+    }
+    expect(await exists(path.join(checkouts.get(grandchildId)!, "later.txt"))).toBe(true);
+  });
+
   test("a delete-mode archive of an idle tree archives every row and deletes every checkout", async () => {
     await setArchiveBehavior("delete");
 
