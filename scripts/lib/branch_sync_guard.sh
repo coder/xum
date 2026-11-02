@@ -1,128 +1,89 @@
 #!/usr/bin/env bash
-# Shared branch-sync guard for wait_pr_*.sh scripts.
-# Resolves the correct remote comparison target, fetches it,
-# and optionally bootstraps a first push when no upstream exists.
+# Shared checkout guard for the wait_pr_*.sh scripts.
 #
-# Usage: source this file, then call assert_branch_synced.
-# Returns 0 if local HEAD matches remote; non-zero otherwise.
-# Callers set CURRENT_BRANCH and REMOTE_BRANCH before proceeding.
+# Usage: source this file, then call assert_pr_checkout_synced <pr_number>.
+# Returns 0 when the checkout cannot hide work from the PR; non-zero otherwise.
+#
+# The guard applies only when this checkout is on the PR's head branch. There it fails on
+# uncommitted changes, or when HEAD is not the PR's head commit, so a watcher never reports
+# on a PR that is missing local work. Agents often watch several stacked PRs from one
+# checkout (#7877). On any other branch the local state says nothing about the PR, so the
+# guard passes. It never pushes, and it never reads @{u}: a stack branch's upstream is
+# often its parent's branch (#7874). A fork PR's branch name says nothing about this
+# checkout either: an unrelated local branch can share it, and origin is not the fork.
 
 set -euo pipefail
 
-# Resolve which remote ref to compare HEAD against.
-# Sets two variables in the caller's scope:
-#   CURRENT_BRANCH  — local branch name
-#   REMOTE_BRANCH   — remote tracking ref to compare against (e.g. origin/feature)
-#
-# Policy:
-#   1. If @{u} exists and points to a non-default branch, honor it.
-#      (Supports intentional cross-name tracking like local A -> origin/B.)
-#   2. If @{u} points to origin/<default> but we're on a non-default branch
-#      AND origin/<current_branch> exists on remote, use origin/<current_branch>.
-#      (Worktree protection: branches created from origin/main inherit origin/main
-#      as upstream, but the agent has already pushed origin/<feature>.)
-#   3. If no upstream is configured, use origin/<current_branch>.
-resolve_branch_sync_target() {
-  local upstream_branch
-  local default_branch
+assert_pr_checkout_synced() {
+  local pr_number="$1"
+  local pr_head
+  local head_ref
+  local head_oid
+  local current_branch
+  local local_hash
+  local from_fork
+  local quoted_ref
 
-  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-
-  upstream_branch=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
-  default_branch=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo "")
-  default_branch=${default_branch#origin/}
-
-  # Default: compare against same-named remote branch.
-  REMOTE_BRANCH="origin/$CURRENT_BRANCH"
-  _BRANCH_SYNC_HAS_UPSTREAM=0
-
-  if [[ -n "$upstream_branch" ]]; then
-    _BRANCH_SYNC_HAS_UPSTREAM=1
-    REMOTE_BRANCH="$upstream_branch"
-
-    # Worktree protection: if upstream is origin/<default> but we're on a
-    # non-default branch and origin/<current_branch> exists, prefer that.
-    if [[ -n "$default_branch" ]] \
-      && [[ "$upstream_branch" == "origin/$default_branch" ]] \
-      && [[ "$CURRENT_BRANCH" != "$default_branch" ]] \
-      && git ls-remote --exit-code --heads origin "$CURRENT_BRANCH" >/dev/null 2>&1; then
-      REMOTE_BRANCH="origin/$CURRENT_BRANCH"
-    fi
+  if ! pr_head=$(gh pr view "$pr_number" --json headRefName,headRefOid,isCrossRepository); then
+    echo "❌ Error: Failed to read PR #$pr_number's head branch with 'gh pr view'." >&2
+    return 1
   fi
-}
+  head_ref=$(jq -r '.headRefName // empty' <<<"$pr_head")
+  head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_head")
+  from_fork=$(jq -r '.isCrossRepository' <<<"$pr_head")
+  if [[ -z "$head_ref" ]] || ! [[ "$head_oid" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$from_fork" =~ ^(true|false)$ ]]; then
+    echo "❌ assertion failed: gh returned no head branch, head commit or fork flag for PR #$pr_number" >&2
+    echo "$pr_head" >&2
+    return 1
+  fi
 
-# Fetch the resolved remote ref. If the branch doesn't exist on the remote
-# AND no upstream is configured, bootstrap with git push -u.
-# If an upstream IS configured and fetch fails, error out (never auto-push
-# over an intentionally configured upstream).
-fetch_or_bootstrap() {
-  local remote_name
-  local remote_ref
-
-  remote_name="${REMOTE_BRANCH%%/*}"
-  remote_ref="${REMOTE_BRANCH#*/}"
-
-  if git fetch "$remote_name" "$remote_ref" --quiet 2>/dev/null; then
+  if [[ "$from_fork" == "true" ]]; then
+    echo "ℹ️  Skipping the local sync check: PR #$pr_number comes from a fork." >&2
     return 0
   fi
 
-  # Upstream exists but fetch failed — do not auto-push; the user configured
-  # this tracking relationship intentionally.
-  if [[ "$_BRANCH_SYNC_HAS_UPSTREAM" == "1" ]]; then
-    echo "❌ Error: Failed to fetch upstream '$REMOTE_BRANCH'." >&2
-    echo "This branch has a configured upstream; refusing to auto-push." >&2
-    echo "You may need to push manually: git push -u origin $CURRENT_BRANCH" >&2
-    return 1
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+  if [[ "$current_branch" != "$head_ref" ]]; then
+    echo "ℹ️  Skipping the local sync check: this checkout is on '$current_branch', not PR #$pr_number's branch '$head_ref'." >&2
+    return 0
   fi
 
-  # No upstream — bootstrap first push.
-  echo "⚠️  Branch '$CURRENT_BRANCH' has no upstream and does not exist on remote." >&2
-  echo "Pushing to origin/$CURRENT_BRANCH..." >&2
-
-  if git push -u origin "$CURRENT_BRANCH" 2>&1; then
-    echo "✅ Pushed and upstream set successfully!" >&2
-    REMOTE_BRANCH="origin/$CURRENT_BRANCH"
-  else
-    echo "❌ Error: Failed to push branch." >&2
-    echo "You may need to push manually: git push -u origin $CURRENT_BRANCH" >&2
+  if ! git diff-index --quiet HEAD --; then
+    echo "❌ Error: You have uncommitted changes in your working directory." >&2
+    echo "" >&2
+    git status --short >&2
+    echo "" >&2
+    echo "Please commit or stash your changes before checking PR status." >&2
     return 1
   fi
-}
-
-# Full sync assertion: resolve target, fetch, compare hashes.
-# Returns 0 if in sync, 1 otherwise (with diagnostic messages).
-assert_branch_synced() {
-  local local_hash
-  local remote_hash
-
-  resolve_branch_sync_target
-  fetch_or_bootstrap || return 1
 
   local_hash=$(git rev-parse HEAD)
-  remote_hash=$(git rev-parse "$REMOTE_BRANCH")
-
-  if [[ "$local_hash" != "$remote_hash" ]]; then
-    echo "❌ Error: Local branch is not in sync with remote." >&2
-    echo "" >&2
-    echo "Local:  $local_hash" >&2
-    echo "Remote: $remote_hash" >&2
-    echo "" >&2
-
-    if git merge-base --is-ancestor "$remote_hash" HEAD 2>/dev/null; then
-      local ahead
-      ahead=$(git rev-list --count "$REMOTE_BRANCH"..HEAD)
-      echo "Your branch is $ahead commit(s) ahead of '$REMOTE_BRANCH'." >&2
-      echo "Push your changes with: git push" >&2
-    elif git merge-base --is-ancestor HEAD "$remote_hash" 2>/dev/null; then
-      local behind
-      behind=$(git rev-list --count HEAD.."$REMOTE_BRANCH")
-      echo "Your branch is $behind commit(s) behind '$REMOTE_BRANCH'." >&2
-      echo "Pull the latest changes with: git pull" >&2
-    else
-      echo "Your branch has diverged from '$REMOTE_BRANCH'." >&2
-      echo "You may need to rebase or merge." >&2
-    fi
-
-    return 1
+  if [[ "$local_hash" == "$head_oid" ]]; then
+    return 0
   fi
+
+  echo "❌ Error: Local branch is not in sync with PR #$pr_number." >&2
+  echo "" >&2
+  echo "Local:   $local_hash" >&2
+  echo "PR head: $head_oid" >&2
+  echo "" >&2
+
+  # Fetch the PR's branch so the ahead/behind report can reach a PR head pushed from elsewhere.
+  # Full refs/heads/ names: a short name resolves to a tag of the same name first.
+  git fetch origin "refs/heads/$head_ref" --quiet 2>/dev/null || true
+  # Git allows shell syntax such as `$(...)` in branch names, so quote the ref in pasteable hints.
+  printf -v quoted_ref '%q' "refs/heads/$head_ref"
+  if ! git cat-file -e "$head_oid^{commit}" 2>/dev/null; then
+    echo "The PR head commit is not in this checkout. Fetch it with: git fetch origin $quoted_ref" >&2
+  elif git merge-base --is-ancestor "$head_oid" HEAD; then
+    echo "Your branch is $(git rev-list --count "$head_oid"..HEAD) commit(s) ahead of PR #$pr_number." >&2
+    echo "Push your changes with: git push origin $quoted_ref" >&2
+  elif git merge-base --is-ancestor HEAD "$head_oid"; then
+    echo "Your branch is $(git rev-list --count HEAD.."$head_oid") commit(s) behind PR #$pr_number." >&2
+    echo "Pull the latest changes with: git pull origin $quoted_ref" >&2
+  else
+    echo "Your branch has diverged from PR #$pr_number." >&2
+    echo "You may need to rebase or merge." >&2
+  fi
+  return 1
 }

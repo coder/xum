@@ -1297,7 +1297,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Test PR readiness gates
-        run: make test-codex-comments test-pr-checks test-required-superseded
+        run: make test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it
