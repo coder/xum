@@ -275,30 +275,7 @@ export class TaskStopLatch {
       const record = this.workspaceStopRecords.get(id);
       const expectedMessageId = record?.capturedStreamMessageId;
       const cleanup = (async () => {
-        if (options.clearQueue) {
-          // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
-          // descendant must not keep pending input; issued once, never re-issued later. The
-          // user's queued messages are handed back as held input, never silently dropped.
-          try {
-            const clearQueueResult = this.deps.workspaceService().clearQueue(id, {
-              preserveUserInput: true,
-            });
-            if (!clearQueueResult.success) {
-              log.debug(`${options.label}: clearQueue failed`, {
-                taskId: id,
-                error: clearQueueResult.error,
-              });
-            }
-          } catch (error: unknown) {
-            log.debug(`${options.label}: clearQueue threw`, { taskId: id, error });
-          }
-        }
-        // A backoff left armed would restart the stopped task once the latch drops.
-        try {
-          this.deps.workspaceService().abandonAutoRetry(id, "task_stopped");
-        } catch (error: unknown) {
-          log.debug(`${options.label}: abandonAutoRetry threw`, { taskId: id, error });
-        }
+        this.retirePendingWork(id, options.label, options.clearQueue);
         const execution = options.capturedExecutionsById?.get(id);
         if (execution != null) {
           await this.interruptCapturedExecution(id, execution, options.label);
@@ -338,6 +315,31 @@ export class TaskStopLatch {
       log.warn(`${options.label}: cleanup exceeded the aggregate deadline`, {
         taskIds: targets,
       });
+    }
+  }
+
+  /** Phase B's synchronous part: the stopped workspace keeps no queued input or armed retry. */
+  private retirePendingWork(id: string, label: string, clearQueue: boolean): void {
+    if (clearQueue) {
+      // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
+      // descendant must not keep pending input; issued once, never re-issued later. The
+      // user's queued messages are handed back as held input, never silently dropped.
+      try {
+        const clearQueueResult = this.deps.workspaceService().clearQueue(id, {
+          preserveUserInput: true,
+        });
+        if (!clearQueueResult.success) {
+          log.debug(`${label}: clearQueue failed`, { taskId: id, error: clearQueueResult.error });
+        }
+      } catch (error: unknown) {
+        log.debug(`${label}: clearQueue threw`, { taskId: id, error });
+      }
+    }
+    // A backoff left armed would restart the stopped task once the latch drops.
+    try {
+      this.deps.workspaceService().abandonAutoRetry(id, "task_stopped");
+    } catch (error: unknown) {
+      log.debug(`${label}: abandonAutoRetry threw`, { taskId: id, error });
     }
   }
 
