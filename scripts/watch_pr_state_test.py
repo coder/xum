@@ -16,7 +16,7 @@ START = 1_800_000_000
 # Strict protocol doubles. gh answers poll N with fixture entry N and fails on any call
 # the fixture does not cover. sleep advances the clock that date reads instead of waiting.
 GH = """
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 args = sys.argv[1:]
 calls = pathlib.Path(os.environ['WATCH_CALLS'])
 with calls.open('a') as log:
@@ -26,11 +26,31 @@ assert args[2:6] == ['-F', 'owner={owner}', '-F', 'name={repo}'], args
 assert args[6] == '-f' and args[7].startswith('query=') and len(args) == 8, args
 polls = json.loads(pathlib.Path(os.environ['WATCH_FIXTURE']).read_text())
 reply = polls[len(calls.read_text().splitlines()) - 1]
+if reply.get('hang'):
+    pathlib.Path(os.environ['WATCH_HUNG']).touch()
+    time.sleep(120)
 out = reply.get('stdout')
 if out is not None:
     print(out if isinstance(out, str) else json.dumps(out))
 print(reply.get('stderr', ''), end='', file=sys.stderr)
 sys.exit(reply.get('rc', 0))
+"""
+# timeout answers 124, as GNU timeout does when the limit passes, once gh reports that it
+# hangs, so no test waits for the real limit.
+TIMEOUT = """
+import os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+assert args[0] == '-k' and args[1].isdigit() and args[2].isdigit() and int(args[2]) > 0, args
+assert args[3] == 'gh', args
+hung = pathlib.Path(os.environ['WATCH_HUNG'])
+child = subprocess.Popen(args[3:])
+while child.poll() is None:
+    if hung.exists():
+        child.kill()
+        hung.unlink()
+        sys.exit(124)
+    time.sleep(0.01)
+sys.exit(child.returncode)
 """
 # WATCH_JUMP moves the clock further on the first sleep, to reach a far deadline quickly.
 SLEEP = """
@@ -111,6 +131,10 @@ def checked(number, nodes, merge_state="CLEAN", mergeable="MERGEABLE", more=Fals
         "mergeable": mergeable,
         "mergeStateStatus": merge_state,
         "headRefOid": HEAD,
+        "baseRef": {"rules": {"pageInfo": {"hasNextPage": False}, "nodes": [
+            {"type": "MERGE_QUEUE", "parameters": {}},
+            {"type": "REQUIRED_STATUS_CHECKS", "parameters": {"requiredStatusChecks": [{"context": "Required"}]}},
+        ]}},
         "commits": {"nodes": [{"commit": {"oid": HEAD, "statusCheckRollup": rollup(nodes, more)}}]},
         "potentialMergeCommit": None if merge_nodes is None else {"oid": MERGE, "statusCheckRollup": rollup(merge_nodes)},
     }
@@ -121,7 +145,7 @@ class WatchPrStateTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix="watch-pr-state-test-")
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
-        for name, body in (("gh", GH), ("sleep", SLEEP), ("date", DATE)):
+        for name, body in (("gh", GH), ("sleep", SLEEP), ("date", DATE), ("timeout", TIMEOUT)):
             stub = self.directory / name
             stub.write_text(f"#!{sys.executable}\n{body}")
             stub.chmod(0o755)
@@ -134,6 +158,7 @@ class WatchPrStateTest(unittest.TestCase):
         files["sleeps"].write_text("")
         env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
         env.update({f"WATCH_{name.upper()}": str(path) for name, path in files.items()})
+        env["WATCH_HUNG"] = str(self.directory / "hung")
         env["PATH"] = str(self.directory) + os.pathsep + os.environ["PATH"]
         env.update(env_extra)
         result = subprocess.run(
@@ -272,9 +297,29 @@ class WatchPrStateTest(unittest.TestCase):
         self.assertEqual(self.lines, [
             "#101 pending head 1111111 0/0 checks done",
             "#102 ready head 1111111",
+            "#101 blocked head 1111111 checks passed, merge state BLOCKED",
             "#101 ready head 1111111",
         ])
         self.assertEqual(self.result, "RESULT ok 101:ready 102:ready")
+
+    def test_blocked_after_every_required_check_passed_ends_on_the_second_read(self):
+        done = [check("Detect Changes"), check()]
+        self.assert_watch(1, [
+            reply(checked(101, [check("Detect Changes")], "BLOCKED")),
+            reply(checked(101, [check("Detect Changes"), check("Required", None, "QUEUED")], "BLOCKED")),
+            reply(checked(101, done, "BLOCKED")),
+            reply(checked(101, done, "BLOCKED")),
+        ], "101")
+        self.assertEqual(self.lines, [
+            "#101 pending head 1111111 waiting for required checks: Required",
+            "#101 blocked head 1111111 checks passed, merge state BLOCKED",
+        ])
+        self.assertEqual(self.result, "RESULT fail 101:blocked")
+
+    def test_a_hung_read_is_an_error_not_pending(self):
+        result = self.assert_watch(2, [reply(queued(101, "QUEUED")), {"hang": True}], "101", "--queue")
+        self.assertIn("timed out", result.stderr)
+        self.assertEqual(self.result, "RESULT error 101:queued(queued)")
 
     def test_unstable_without_a_visual_cause_stays_pending(self):
         self.assert_watch(3, [reply(checked(101, [check(), pixel("SUCCESS")], "UNSTABLE"))] * 2, "101", "--deadline-mins", "1")
@@ -306,6 +351,13 @@ class WatchPrStateTest(unittest.TestCase):
             (checked(101, [check()], "CLEAN", "MAYBE"), "unknown mergeable value MAYBE"),
             (dict(checked(101, [check()]), isDraft=None), "unknown draft flag null"),
             (moved, "is not the last listed commit"),
+            (dict(checked(101, [check()], "BLOCKED"), baseRef=None), "unreadable base branch rules"),
+            (
+                dict(checked(101, [check()], "BLOCKED"), baseRef={"rules": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                    {"type": "REQUIRED_STATUS_CHECKS", "parameters": {}},
+                ]}}),
+                "malformed required status checks rule",
+            ),
         ):
             with self.subTest(needle=needle):
                 result = self.assert_watch(2, [reply(pr)], "101")

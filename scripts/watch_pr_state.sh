@@ -12,9 +12,12 @@
 #   RESULT <ok|fail|error|timeout> <pr>:<state>...
 #
 # Without --queue, checks on the head and merge commit count as in wait_pr_checks.sh:
-#   pending, and the final states ready, failed, conflicting, behind, draft, closed,
-#   merged. ready means every non-visual check passed and GitHub's merge state is CLEAN,
-#   or UNSTABLE only from visual checks. It does not cover review threads or Codex.
+#   pending, and the final states ready, blocked, failed, conflicting, behind, draft,
+#   closed, merged. ready means every non-visual check passed and GitHub's merge state is
+#   CLEAN, or UNSTABLE only from visual checks. It does not cover review threads or Codex.
+#   blocked means every check passed, including each check the base branch's rules
+#   require, and GitHub still blocks the merge (for example on a required review). Like a
+#   queue removal, blocked is final only when two polls in a row read it.
 # With --queue:
 #   queued(<entry state>), queued(no_entry) (GitHub lists the PR as added but shows no
 #   entry yet or any more), and the final states merged, closed, removed(<reason>) and
@@ -23,13 +26,15 @@
 #
 # A PR keeps its first final state. The watch ends when every PR has one, or before the
 # next poll would pass the deadline (default 120 minutes). It polls once per 60 s with one
-# GraphQL query for all PRs, because every agent shares the GraphQL rate limit.
+# GraphQL query for all PRs, because every agent shares the GraphQL rate limit. A read
+# that takes longer than 30 s is an error, so a hung read cannot hold the watch open.
 #
 # Exit: 0 every PR ended ready or merged, 1 a PR ended in another final state, 2 usage
-# error, failed read or unknown value, 3 deadline.
+# error, failed or timed-out read, or unknown value, 3 deadline.
 set -euo pipefail
 
 POLL_SECS=60
+READ_TIMEOUT_SECS=30
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./lib/pr_check_filters.sh
 # shellcheck disable=SC1091
@@ -76,6 +81,11 @@ while (($#)); do
   shift
 done
 ((${#PRS[@]} > 0)) || usage_error "Name at least one PR"
+# macOS has no timeout; Homebrew's coreutils installs it as gtimeout.
+TIMEOUT=$(command -v timeout || command -v gtimeout) || {
+  echo "❌ This script needs GNU timeout (on macOS: brew install coreutils)." >&2
+  finish error 2
+}
 # Any other exit (a failed date or jq under set -e) still ends with a RESULT line.
 trap 'echo "❌ Unexpected failure (exit $?)" >&2; finish error 2' EXIT
 
@@ -91,6 +101,8 @@ if [[ $MODE == queue ]]; then
     }'
 else
   FIELDS="number state isDraft mergeable mergeStateStatus headRefOid
+    baseRef { rules(first: 100) { pageInfo { hasNextPage } nodes { type
+      parameters { ... on RequiredStatusChecksParameters { requiredStatusChecks { context } } } } } }
     commits(last: 1) { nodes { commit { oid $ROLLUP } } }
     potentialMergeCommit { oid $ROLLUP }"
 fi
@@ -129,6 +141,14 @@ def queue_state($pr; $p):
       else ["removed(\($event.reason | token))", "at \($event.createdAt)"] end
   end;
 
+def required_checks($pr; $p):
+  if ($p.baseRef.rules.nodes | type) != "array" or $p.baseRef.rules.pageInfo.hasNextPage != false
+  then fail($pr; "unreadable base branch rules")
+  else [$p.baseRef.rules.nodes[] | select(.type == "REQUIRED_STATUS_CHECKS") | .parameters.requiredStatusChecks
+    | if type == "array" and all(.[]; (.context | type) == "string") then .[].context
+      else fail($pr; "malformed required status checks rule") end]
+  end;
+
 def checks_state($pr; $p):
   if ($p.mergeable | IN("MERGEABLE", "CONFLICTING", "UNKNOWN") | not)
   then fail($pr; "unknown mergeable value \($p.mergeable)")
@@ -154,7 +174,13 @@ def checks_state($pr; $p):
       elif $p.mergeStateStatus == "CLEAN"
         or ($p.mergeStateStatus == "UNSTABLE" and any($all[]; is_visual_review_check and is_unready_check))
       then ["ready", $at]
-      else ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"] end
+      elif $p.mergeStateStatus != "BLOCKED" then ["pending", "\($at) checks passed, merge state \($p.mergeStateStatus)"]
+      # GitHub creates the check of a job only once the jobs it needs finish, so a required
+      # check can be missing while every listed check has passed.
+      else (required_checks($pr; $p) - [$all[] | select(is_passing_check or is_skipped_check) | .name]) as $missing
+        | if $missing != [] then ["pending", "\($at) waiting for required checks: \($missing | unique | join(", "))"]
+          else ["blocked", "\($at) checks passed, merge state BLOCKED"] end
+      end
   end;
 
 if (.errors // []) != [] then error("GraphQL errors: \(.errors | map(.message) | join("; "))")
@@ -175,14 +201,14 @@ else .data.repository end
 is_final() {
   case "$1" in
     merged | closed | ready | failed | conflicting | behind | draft) return 0 ;;
-    not_queued | removed\(*\)) [[ $2 == "$1" ]] ;;
+    not_queued | removed\(*\) | blocked) [[ $2 == "$1" ]] ;;
     *) return 1 ;;
   esac
 }
 
 # shellcheck disable=SC2016 # GraphQL and jq variables, not shell variables.
 poll() {
-  local query pending=() i response rows now ts pr state detail seen=0
+  local query pending=() i response rc=0 rows now ts pr state detail seen=0
   query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {'
   for i in "${!PRS[@]}"; do
     if [[ -z ${FINAL[i]:-} ]]; then
@@ -192,10 +218,18 @@ poll() {
   done
   query+=" } } fragment watched on PullRequest { $FIELDS }"
 
-  # gh prints GraphQL errors on stdout and HTTP errors on stderr: show both.
-  if ! response=$(gh api graphql -F owner='{owner}' -F name='{repo}' -f query="$query"); then
+  # gh prints GraphQL errors on stdout and HTTP errors on stderr: show both. gh has no
+  # timeout of its own. timeout signals the whole process group of the read, and -k kills
+  # a read that ignores the first signal. Not --foreground: it spares the children of gh,
+  # and a child that keeps stdout open keeps this read open too.
+  response=$("$TIMEOUT" -k 5 "$READ_TIMEOUT_SECS" gh api graphql -F owner='{owner}' -F name='{repo}' -f query="$query") || rc=$?
+  if ((rc != 0)); then
     printf '%s\n' "$response" >&2
-    echo "❌ GitHub read failed; this is an error, not a pending state." >&2
+    if ((rc == 124 || rc == 137)); then
+      echo "❌ GitHub read timed out after ${READ_TIMEOUT_SECS}s; this is an error, not a pending state." >&2
+    else
+      echo "❌ GitHub read failed; this is an error, not a pending state." >&2
+    fi
     finish error 2
   fi
   if ! rows=$(jq -r --argjson prs "$(printf '%s\n' "${pending[@]}" | jq -cs .)" --arg mode "$MODE" \
