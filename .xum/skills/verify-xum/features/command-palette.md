@@ -28,15 +28,13 @@ Preconditions:
   open of a page the list fills a moment after the combobox shows. The combobox
   `Command palette` is expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`.
   The combobox is gone.
-- **Switch workspace.** Read the id with `RN_ID=$(verify-xum.sh workspace-field release-notes id)`
-  (see [workspaces](./workspaces.md) **Open from the sidebar**). Press Ctrl+Shift+P, wait for the
-  palette as above, then run
+- **Switch workspace.** Press Ctrl+Shift+P, wait for the palette as above, then run
   `agent-browser keyboard type "release"` and
   `agent-browser wait '[role="option"][aria-selected="true"][aria-label="release-notes"]'`.
   `Suggestions` lists the option `release-notes`, selected. Run `agent-browser press Enter` and
-  `agent-browser wait --url "**/workspace/$RN_ID"`: the palette closes first and navigates a
-  moment later. The URL is `/workspace/$RN_ID`. Capture
-  `command-palette/switched`.
+  `agent-browser wait --url "**/workspace/$(verify-xum.sh workspace-field release-notes id)"`:
+  the palette closes first and navigates a moment later. The URL is the `release-notes`
+  workspace's. Capture `command-palette/switched`.
 - **Command mode.** Run `agent-browser press F4` and
   `agent-browser wait '[aria-label="Command palette"]'`. The combobox value is `>`, and
   `Suggestions` lists commands such as `Open Settings` and `Change Model…`.
