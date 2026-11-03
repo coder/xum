@@ -40,33 +40,30 @@ export function findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | u
   );
 }
 
+/** Rows a retry never replays. */
+const NEVER_RETRIED: ReadonlyArray<(message: MuxMessage) => boolean> = [
+  isVisibleCompletedSubagentReportMessage,
+  isSyntheticGoalPauseBoundaryMessage,
+  isSyntheticSnapshotUserMessage,
+  isContextBudgetWarningMessage,
+];
+
+// Include UI-visible synthetic rows (e.g., crash-recovered compaction follow-ups)
+// so retries continue the most recent pending user intent.
+function isRetriedSyntheticMessage(message: MuxMessage): boolean {
+  return (
+    message.metadata?.uiVisible === true ||
+    message.metadata?.muxMetadata?.contextBudgetContinuation === true ||
+    isCompactionRequestMetadata(message.metadata?.muxMetadata)
+  );
+}
+
 export function shouldUseUserMessageForRetry(message: MuxMessage): boolean {
   if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
     return false;
   }
-
-  if (isVisibleCompletedSubagentReportMessage(message)) {
+  if (NEVER_RETRIED.some((neverRetried) => neverRetried(message))) {
     return false;
   }
-  if (isSyntheticGoalPauseBoundaryMessage(message)) {
-    return false;
-  }
-  if (isSyntheticSnapshotUserMessage(message)) {
-    return false;
-  }
-  if (isContextBudgetWarningMessage(message)) {
-    return false;
-  }
-
-  // Include UI-visible synthetic rows (e.g., crash-recovered compaction follow-ups)
-  // so retries continue the most recent pending user intent.
-  if (message.metadata?.synthetic === true) {
-    return (
-      message.metadata?.uiVisible === true ||
-      message.metadata.muxMetadata?.contextBudgetContinuation === true ||
-      isCompactionRequestMetadata(message.metadata?.muxMetadata)
-    );
-  }
-
-  return true;
+  return message.metadata?.synthetic !== true || isRetriedSyntheticMessage(message);
 }
