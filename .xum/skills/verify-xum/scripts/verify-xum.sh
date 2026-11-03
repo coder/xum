@@ -305,6 +305,18 @@ backend_crashed_after_rebuild() {
 launch_failed() {
   echo "verify-xum: launch failed. Server log tail ($VERIFY_XUM_RUN/server.log):" >&2
   tail -n 30 "$VERIFY_XUM_RUN/server.log" >&2 || true
+  if [[ -z $VERIFY_XUM_PGID ]]; then
+    # A signal can stop the launcher after the spawn and before the new group records its id.
+    # That group holds the launch flock until it has written the id or died, so take the flock
+    # anew and let cleanup read the id. Without it cleanup would drop the newest-run link while
+    # the server starts, and the next launch would start a second one.
+    exec 9>&-
+    exec 9>"$LAUNCH_GUARD"
+    if ! flock -w 10 9; then
+      echo "verify-xum: the new process group did not record its id in 10 s. The newest-run link stays: run verify-xum.sh cleanup." >&2
+      return 0
+    fi
+  fi
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
