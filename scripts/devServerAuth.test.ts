@@ -4,6 +4,8 @@ import * as path from "node:path";
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 
 interface DryRun {
+  /** XUM_BACKEND_SOCKET as make exports it to the recipe's processes (env, not secret). */
+  socket: string | undefined;
   /** What make would run. Nothing starts, and it is argv-visible to every local account. */
   commands: string;
   /** XUM_SERVER_AUTH_TOKEN as make exports it to the recipe's processes (env, not argv). */
@@ -36,7 +38,8 @@ async function dryRun(
   const token = /^XUM_SERVER_AUTH_TOKEN := (.*)$/m
     .exec(stdout.slice(databaseStart))?.[1]
     ?.replaceAll("$$", "$");
-  return { commands, token };
+  const socket = /^XUM_BACKEND_SOCKET :?= (.*)$/m.exec(stdout.slice(databaseStart))?.[1];
+  return { commands, token, socket };
 }
 
 function exportedToken(run: DryRun): string {
@@ -164,4 +167,55 @@ describe("vite dev server", () => {
       source: true,
     });
   }, 60_000);
+});
+
+// Any local account can bind the backend's TCP port while nodemon restarts the backend, and the
+// browser's reconnect URL carries the token. So Vite reaches the backend over a Unix socket in a
+// private folder, and make hands both sides the same path.
+describe.skipIf(process.platform === "win32")("make dev-server backend socket", () => {
+  let socketRun: DryRun;
+  let otherPort: DryRun;
+  let chosen: DryRun;
+  let windows: DryRun;
+  let otherGoal: DryRun;
+
+  beforeAll(async () => {
+    [socketRun, otherPort, chosen, windows, otherGoal] = await Promise.all([
+      dryRun("dev-server", { XUM_BACKEND_PORT: "3111" }),
+      dryRun("dev-server", { XUM_BACKEND_PORT: "3222" }),
+      dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/custom.sock" }),
+      dryRun("dev-server", {}, ["OS=Windows_NT"]),
+      dryRun("help"),
+    ]);
+  }, 60_000);
+
+  const socketArgument = (run: DryRun) => /--unix-socket (\S+)/.exec(backendCommand(run))?.[1];
+
+  test("the backend listens on the exported path, and the path fits sun_path", () => {
+    expect(socketRun.socket).toBeDefined();
+    const socket = socketRun.socket as string;
+    expect(socket.startsWith("/")).toBe(true);
+    expect(socket).toMatch(/b3111\.sock$/);
+    expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);
+    expect(socketArgument(socketRun)).toBe(socket);
+  });
+
+  test("each backend port gets its own socket", () => {
+    expect(otherPort.socket).toMatch(/b3222\.sock$/);
+    expect(otherPort.socket).not.toBe(socketRun.socket);
+  });
+
+  test("XUM_BACKEND_SOCKET picks the path for both sides", () => {
+    expect(chosen.socket).toBe("/run/me/custom.sock");
+    expect(socketArgument(chosen)).toBe("/run/me/custom.sock");
+  });
+
+  test("Windows keeps TCP: no socket for Vite or the backend", () => {
+    expect(windows.socket).toBeUndefined();
+    expect(backendCommand(windows)).not.toContain("--unix-socket");
+  });
+
+  test("other goals export no socket", () => {
+    expect(otherGoal.socket).toBeUndefined();
+  });
 });
