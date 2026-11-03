@@ -267,6 +267,13 @@ import type { SessionContextController } from "./contextManagement/sessionContex
 import type { SessionContextHost } from "./contextManagement/sessionContextHost";
 import type { ContextDispatchRequest, CompactionContinuation } from "./contextManagement/types";
 import {
+  findLastRetryUserMessage,
+  isSyntheticGoalPauseBoundaryMessage,
+  retriedWorkspaceTurn,
+  isVisibleCompletedSubagentReportMessage,
+  shouldUseUserMessageForRetry,
+} from "./retryUserMessage";
+import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
@@ -375,7 +382,6 @@ import {
   MemoryContextStore,
 } from "@/node/services/memoryContextPersistence";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
-import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getEditTruncateTargetFromMessages } from "@/common/utils/history/editTruncation";
 import { isHistoryEditPreconditionMismatch, isStreamFinalizedPartial } from "./historyService";
@@ -2961,14 +2967,6 @@ export class AgentSession {
     );
   }
 
-  private isSyntheticGoalPauseBoundaryMessage(message: MuxMessage): boolean {
-    return (
-      message.role === "user" &&
-      message.metadata?.synthetic === true &&
-      message.metadata.muxMetadata?.type === "goal-pause-boundary"
-    );
-  }
-
   /**
    * Whether an edit targets authentic plan-review feedback, judged from the persisted row (never
    * from client flags or envelope-looking text), in getEditTruncateTargetId's lookup order. An
@@ -3032,7 +3030,7 @@ export class AgentSession {
     return historyTail.findLast(
       (candidate) =>
         candidate.role !== "system" &&
-        !this.isSyntheticGoalPauseBoundaryMessage(candidate) &&
+        !isSyntheticGoalPauseBoundaryMessage(candidate) &&
         !isSyntheticSnapshotUserMessage(candidate)
     );
   }
@@ -3263,61 +3261,6 @@ export class AgentSession {
     return metadata?.success ? metadata.data : undefined;
   }
 
-  private isVisibleCompletedSubagentReportMessage(message: MuxMessage): boolean {
-    if (
-      message.role !== "user" ||
-      message.metadata?.synthetic !== true ||
-      message.metadata.uiVisible !== true
-    ) {
-      return false;
-    }
-    const text = message.parts
-      .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
-    return parseSubagentReportEnvelope(text)?.status === "completed";
-  }
-
-  /** Rejected rows terminate retry lookup, including empty assistant capsules from newer builds. */
-  private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
-    return messages.findLast(
-      (message) =>
-        Boolean(message.metadata?.contextBudgetRejected) ||
-        this.shouldUseUserMessageForRetry(message)
-    );
-  }
-
-  private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
-    if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
-      return false;
-    }
-
-    if (this.isVisibleCompletedSubagentReportMessage(message)) {
-      return false;
-    }
-    if (this.isSyntheticGoalPauseBoundaryMessage(message)) {
-      return false;
-    }
-    if (isSyntheticSnapshotUserMessage(message)) {
-      return false;
-    }
-    if (isContextBudgetWarningMessage(message)) {
-      return false;
-    }
-
-    // Include UI-visible synthetic rows (e.g., crash-recovered compaction follow-ups)
-    // so retries continue the most recent pending user intent.
-    if (message.metadata?.synthetic === true) {
-      return (
-        message.metadata?.uiVisible === true ||
-        message.metadata.muxMetadata?.contextBudgetContinuation === true ||
-        isCompactionRequestMetadata(message.metadata?.muxMetadata)
-      );
-    }
-
-    return true;
-  }
-
   /**
    * Startup crash recovery replays the ORIGINAL interrupted request from
    * persisted retry options / history metadata / workspace buckets. This is
@@ -3330,7 +3273,7 @@ export class AgentSession {
     historyTail: MuxMessage[];
     workspaceMetadata?: WorkspaceMetadata;
   }): Promise<StartupRetrySendOptions | undefined> {
-    const lastUserMessage = this.findLastRetryUserMessage(params.historyTail);
+    const lastUserMessage = findLastRetryUserMessage(params.historyTail);
     if (lastUserMessage?.metadata?.contextBudgetRejected) return undefined;
 
     const lastAssistantMessage =
@@ -3565,7 +3508,7 @@ export class AgentSession {
     }
     const last = this.getLastNonSystemHistoryMessage(history);
     return last?.role === "user"
-      ? !this.isVisibleCompletedSubagentReportMessage(last)
+      ? !isVisibleCompletedSubagentReportMessage(last)
       : last?.role === "assistant" &&
           last.metadata?.partial === true &&
           !this.isPendingAskUserQuestion(last);
@@ -3600,10 +3543,9 @@ export class AgentSession {
    * after this read bumps the retry generation, so the arm refuses.
    */
   private async startupWorkspaceTurnOutcome(
-    retryMetadata: MuxMessageMetadata | undefined,
+    workspaceTurn: WorkspaceTurnTaskCorrelation | null,
     isCurrent: () => boolean
   ): Promise<StartupRecoveryOutcome | undefined> {
-    const workspaceTurn = parseWorkspaceTurnTaskCorrelation(retryMetadata);
     if (workspaceTurn == null) return undefined;
     let stopped: boolean;
     try {
@@ -3647,7 +3589,7 @@ export class AgentSession {
       return "retryable";
     }
 
-    const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
+    const startupRetryUserMessage = findLastRetryUserMessage(historyResult.data);
     if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
     if (!this.hasInterruptedStartupTail(partial, historyResult.data)) return "completed";
 
@@ -3677,7 +3619,10 @@ export class AgentSession {
 
     const triggerOutcome =
       this.startupHeartbeatOutcome(retryMetadata) ??
-      (await this.startupWorkspaceTurnOutcome(retryMetadata, isCurrent));
+      (await this.startupWorkspaceTurnOutcome(
+        retriedWorkspaceTurn(startupRetryUserMessage),
+        isCurrent
+      ));
     if (triggerOutcome != null) return triggerOutcome;
 
     if (this.startupAutoRetryAbandon) {
@@ -3861,7 +3806,7 @@ export class AgentSession {
       // Accepted synthetic guidance is new intent too; snapshots/notices are not.
       const latest = history.data.findLast(
         (message) =>
-          this.shouldUseUserMessageForRetry(message) ||
+          shouldUseUserMessageForRetry(message) ||
           (message.role === "user" && message.metadata?.retrySendOptions != null)
       );
       if (!abandon.userMessageId || !latest || latest.id === abandon.userMessageId)
@@ -7417,7 +7362,7 @@ export class AgentSession {
           extractAcpDelegatedTools(optionsMuxMetadata),
         muxMetadata: resolveStreamMuxMetadata(
           optionsMuxMetadata,
-          this.findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
+          findLastRetryUserMessage(messages)?.metadata?.muxMetadata,
           messages
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
@@ -8375,7 +8320,7 @@ export class AgentSession {
     // The same row a resume retries, searched across the whole active window: completed report
     // cards and other non-retry rows are skipped, however many follow the interrupted turn.
     const rows = await this.loadActiveRoutingRows();
-    const lastUserRow = this.findLastRetryUserMessage(rows);
+    const lastUserRow = findLastRetryUserMessage(rows);
     // History is untyped on disk; a hand-edited or damaged record must not brick Continue.
     const parsedRecord = AutoModelRoutingRecordSchema.safeParse(
       lastUserRow?.metadata?.autoModelRouting
@@ -9015,7 +8960,7 @@ export class AgentSession {
         // something resumable. Never search backward past an ineligible final row.
         const tail = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
         if (!tail.success) return await fail(createUnknownSendMessageError(tail.error));
-        const retryRequest = this.findLastRetryUserMessage(tail.data);
+        const retryRequest = findLastRetryUserMessage(tail.data);
         if (retryRequest?.metadata?.contextBudgetRejected)
           return await refuseRejectedResume(retryRequest);
         // Model-hidden records (plan-review snapshot/resolve/reopen rows) are UI state that can
@@ -9026,7 +8971,7 @@ export class AgentSession {
         );
         if (!target) return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
-        if (target.role !== "assistant" && !this.shouldUseUserMessageForRetry(target))
+        if (target.role !== "assistant" && !shouldUseUserMessageForRetry(target))
           return Ok(undefined);
         // Accepting stamps the resumed row (a history rewrite) and retires the Stop: a resume
         // refused by the lease leaves both as they were (#5434).
@@ -9105,7 +9050,7 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(historyResult.error));
       }
 
-      const lastUserMessage = this.findLastRetryUserMessage(historyResult.data);
+      const lastUserMessage = findLastRetryUserMessage(historyResult.data);
       if (lastUserMessage?.metadata?.contextBudgetRejected) {
         return await refuseRejectedResume(lastUserMessage);
       }

@@ -712,7 +712,7 @@ describe("WorkspaceTurnManager settlement authorization", () => {
           throw new Error("Interrupt returned without stopping the stream");
         }),
       ]);
-      expect(order).toEqual(["cause", "persist", "epoch", "latch", "mirror", "waiters", "stop"]);
+      expect(order).toEqual(["cause", "latch", "persist", "epoch", "mirror", "waiters", "stop"]);
       expect(causes).toHaveBeenCalledWith({ kind: "explicit-interrupt" });
       expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
       expect(await h.waiter).toBeInstanceOf(Error);

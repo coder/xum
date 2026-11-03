@@ -25,6 +25,9 @@
  *   - KEEP_SANDBOX=1                   # don't delete temp XUM_ROOT on exit
  *   - XUM_BACKEND_PORT / BACKEND_PORT # override picked backend port
  *   - XUM_VITE_PORT / VITE_PORT       # override picked Vite port
+ *   - XUM_VITE_ALLOWED_HOSTS / VITE_ALLOWED_HOSTS # Host headers Vite accepts besides loopback
+ *                                       (default: loopback, plus this sandbox's Coder
+ *                                       port-forward host; "all" disables the check)
  *   - XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
  *   - MAKE=gmake                       # override make binary
  */
@@ -42,6 +45,7 @@ import {
   chooseSeedSources,
   copyConfigClearingProjectsIfExists,
   copyFileIfExists,
+  deriveProxyAllowedHost,
   forwardSignalsToChildProcesses,
   getFreePort,
   parseOptionalPort,
@@ -80,6 +84,9 @@ Optional CLI flags:
   --clean-projects    Do not import projects from config.json (projects will be empty)
 
 Optional env vars:
+  XUM_VITE_ALLOWED_HOSTS=<host>[,<host>]  Accept these Host headers besides loopback
+                                         (default: loopback only, plus this sandbox's Coder
+                                         port-forward host; "all" is unsafe)
   XUM_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
 
 Examples:
@@ -143,6 +150,17 @@ async function main(): Promise<number> {
     }
   }
 
+  // Vite answers any Host header it does not allow with 403 (DNS-rebinding guard), and always
+  // allows loopback names and IPs. The sandbox backend runs --no-auth, so never default to `all`:
+  // any web page that rebinds its DNS to this machine could then read the checkout and call the
+  // backend. Remote access is an explicit opt-in (VITE_ALLOWED_HOSTS, any spelling), or the one
+  // Coder port-forward host of this sandbox.
+  const requestedHosts =
+    resolveXumEnvironmentValue("VITE_ALLOWED_HOSTS", process.env) ?? process.env.VITE_ALLOWED_HOSTS;
+  const allowedHosts = requestedHosts?.trim()
+    ? requestedHosts
+    : deriveProxyAllowedHost(process.env, vitePort);
+
   const muxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-dev-server-"));
 
   try {
@@ -173,6 +191,7 @@ async function main(): Promise<number> {
     }
     console.log(`  Backend:         http://127.0.0.1:${backendPort}`);
     console.log(`  Frontend:        http://localhost:${vitePort}`);
+    console.log(`  Allowed hosts:   ${allowedHosts ?? "loopback only"}`);
     if (keepSandbox) {
       console.log("  KEEP_SANDBOX=1 (temp root will not be deleted)");
     }
@@ -189,18 +208,16 @@ async function main(): Promise<number> {
     assignXumEnvironmentValue(childEnv, "VITE_PORT", String(vitePort));
     assignXumEnvironmentValue(
       childEnv,
-      "VITE_ALLOWED_HOSTS",
-      process.env.VITE_ALLOWED_HOSTS ?? "all"
-    );
-    assignXumEnvironmentValue(
-      childEnv,
       "ENABLE_TUTORIALS_IN_SANDBOX",
       resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", process.env) ?? "0"
     );
     // Keep unprefixed Make fallbacks working for older invocations.
     childEnv.BACKEND_PORT = String(backendPort);
     childEnv.VITE_PORT = String(vitePort);
-    childEnv.VITE_ALLOWED_HOSTS = process.env.VITE_ALLOWED_HOSTS ?? "all";
+    if (allowedHosts !== null) {
+      assignXumEnvironmentValue(childEnv, "VITE_ALLOWED_HOSTS", allowedHosts);
+      childEnv.VITE_ALLOWED_HOSTS = allowedHosts;
+    }
 
     let child: ReturnType<typeof spawn>;
     try {
