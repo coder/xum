@@ -51,6 +51,7 @@ Preconditions:
 
   `$VERIFY_XUM_ROOT/config.json` has `"sidebarFlatMode": true` under `userPreferences.ui`. Capture
   `settings/flat-on`.
+
 - **See the effect.** Run `agent-browser press Escape` and `agent-browser wait --text "RECENT"`.
   The sidebar has a `RECENT` group, and the workspace row is
   `Select workspace Verify playground (demo-app)`.
