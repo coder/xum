@@ -399,6 +399,11 @@ cmd_open() {
       token = JSON.parse(fs.readFileSync(serverLock, "utf8")).token ?? "";
     } catch {}
     const url = new URL(path, base);
+    // A PATH like //host or /\host resolves to another origin: never send the token there.
+    if (url.origin !== new URL(base).origin) {
+      process.stderr.write("verify-xum: open PATH must stay on " + base + "\n");
+      process.exit(1);
+    }
     if (token) url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
     "$VERIFY_XUM_ROOT/server.lock" "$VERIFY_XUM_URL" "$path" \

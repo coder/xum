@@ -22,9 +22,10 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 - Start every recipe whose preconditions name `Verify playground` by opening it, even after
   another recipe: the workspaces and command-palette recipes end on `release-notes`, and the
   recipes read evidence from `$VERIFY_XUM_WORKSPACE_ID`. Open the app with
-  `verify-xum.sh open "/workspace/$VERIFY_XUM_WORKSPACE_ID"` and run `verify-xum.sh idle`. A new browser session starts with the project collapsed, and the
-  recipes choose workspace rows by name, so expand it when it is collapsed. This form fails only
-  when the button is there and the click fails, so it is safe in an `&&` chain:
+  `verify-xum.sh open "/workspace/$VERIFY_XUM_WORKSPACE_ID"` and run `verify-xum.sh idle`. A new
+  browser session starts with the project collapsed, and the recipes choose workspace rows by
+  name, so expand it when it is collapsed. This form fails only when the button is there and the
+  click fails, so it is safe in an `&&` chain:
 
   ```bash
   { [[ $(agent-browser eval '!!document.querySelector("[aria-label=\"Expand project demo-app\"]")') != true ]] \
