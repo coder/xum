@@ -631,6 +631,18 @@ function isSelfHealEligibleSettledWorkspaceTurn(
 }
 
 /**
+ * A user row that the model reads as a prompt. Model-hidden user rows (plan-review snapshot,
+ * resolve and reopen records) and context-budget warnings are UI state.
+ */
+function isWorkspacePromptMessage(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    !isModelHiddenMessage(message) &&
+    !isContextBudgetWarningMessage(message)
+  );
+}
+
+/**
  * A workspace-turn stream error may resolve without parent intervention when
  * the child can still make progress on its own. The caller must still confirm
  * a retry/continuation is actually in flight
@@ -1100,6 +1112,21 @@ export class WorkspaceTurnManager {
       record.status === "interrupted" &&
       record.error == null
     );
+  }
+
+  /**
+   * Whether an interrupt of this handle has nothing left to stop. A restart-recovery interrupt
+   * is not a Stop: startup recovery and auto-retry resume that turn while its prompt is the
+   * newest in the workspace (they replay only that prompt), so it is stopped like a running one.
+   */
+  private async isSettledInterrupt(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
+    if (record.status !== "interrupted") return false;
+    if (record.error !== WORKSPACE_TURN_STALE_RESTART_ERROR) return true;
+    const history = await this.historyService.getHistoryFromLatestBoundary(record.workspaceId);
+    // Unreadable history: the Stop wins over a possibly unrelated stream.
+    if (!history.success) return false;
+    const prompt = history.data.findLast(isWorkspacePromptMessage);
+    return !this.matchesWorkspaceTurnRecord(record, prompt?.metadata?.muxMetadata);
   }
 
   private nextWorkspaceTurnCreatedAt(): string {
@@ -3564,13 +3591,8 @@ export class WorkspaceTurnManager {
           consumingWorkspaceId: options.consumingWorkspaceId,
         });
       }
-      // Model-hidden user rows (plan-review snapshot/resolve/reopen records) are UI state, not
-      // prompts: they must not read as a newer, superseding prompt that disables revival.
-      if (
-        message.role !== "user" ||
-        isModelHiddenMessage(message) ||
-        isContextBudgetWarningMessage(message)
-      ) {
+      // UI-state user rows must not read as a newer, superseding prompt that disables revival.
+      if (!isWorkspacePromptMessage(message)) {
         continue;
       }
       const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
@@ -3871,11 +3893,11 @@ export class WorkspaceTurnManager {
             if (record.status === "completed" || record.status === "error") {
               return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
             }
-            // Already-settled interrupts (explicit stop, restart recovery, queue-cut
-            // supersede) have nothing left to stop: proceeding would stopStream the
-            // target workspace's *current* stream — e.g. the manual message or
-            // /compact that superseded the delegated turn. Idempotent no-op instead.
-            if (record.status === "interrupted") {
+            // Already-settled interrupts (explicit stop, queue-cut supersede) have nothing left
+            // to stop: proceeding would stopStream the target workspace's *current* stream — e.g.
+            // the manual message or /compact that superseded the delegated turn. Idempotent
+            // no-op instead.
+            if (await this.isSettledInterrupt(record)) {
               return Ok({ workspaceId: record.workspaceId });
             }
 
@@ -3890,6 +3912,8 @@ export class WorkspaceTurnManager {
               status: "interrupted",
               updatedAt: getIsoNow(),
             };
+            // An explicit Stop's record carries no error (isWorkspaceTurnStopped).
+            delete next.error;
             await lock.assertStillOwned();
             await this.taskHandleStore.upsertWorkspaceTurn(next);
             // F4: latch with no await between the write completing and the latch, inside the
