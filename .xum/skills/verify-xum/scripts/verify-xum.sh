@@ -268,15 +268,25 @@ check_bun() {
     || die "bun $have is first on PATH but package.json pins $want. Put Bun $want first on PATH (mise: PATH=\"\$(mise where bun@$want)/bin:\$PATH\")."
 }
 
+# The seed's git commands. The real HOME stays (see SKILL.md), so your global git config applies:
+# an init.templateDir, a core.attributesFile or the system attributes could run a clean filter on
+# `git add`, and a hook or an fsmonitor could run on any command. None of them runs here, and each
+# command stops at the launch deadline.
+demo_git() {
+  GIT_ATTR_NOSYSTEM=1 timeout "$(launch_seconds_left)" git -c core.attributesFile=/dev/null \
+    -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
 create_demo_repo() {
   local repo=$1
   mkdir -p "$repo/src"
   printf '# Demo app\n\nA throwaway project for verify-xum.\n' >"$repo/README.md"
   printf 'export function add(a: number, b: number): number {\n  return a + b;\n}\n' >"$repo/src/math.ts"
-  git -C "$repo" init -q -b main
-  git -C "$repo" add .
-  git -C "$repo" -c user.name=verify-xum -c user.email=verify-xum@example.test \
-    -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm init
+  # --template= copies no template: no hooks and no info/attributes.
+  demo_git -C "$repo" init -q -b main --template=
+  demo_git -C "$repo" add .
+  demo_git -C "$repo" -c user.name=verify-xum -c user.email=verify-xum@example.test \
+    -c commit.gpgsign=false commit -qm init
 }
 
 seed_unreachable_fake_provider() {
