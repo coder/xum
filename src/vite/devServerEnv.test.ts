@@ -30,6 +30,11 @@ describe("resolveViteDevServerEnv", () => {
     expect(resolveViteDevServerEnv({ XUM_BACKEND_SOCKET: "/run/x/b.sock" }).backendSocket).toBe(
       "/run/x/b.sock"
     );
+    // The backend gets the value byte for byte from make, so a path that ends in a space is a
+    // different path from the one without it.
+    expect(resolveViteDevServerEnv({ XUM_BACKEND_SOCKET: " /run/x/b.sock " }).backendSocket).toBe(
+      " /run/x/b.sock "
+    );
   });
 
   test("falls back to leftover MUX values when XUM is unset", () => {
