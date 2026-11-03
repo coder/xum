@@ -19,7 +19,9 @@ afterEach(async () => {
  * to `make dev-server`. The child env is built from scratch so the host's own XUM_VITE_* and
  * proxy variables cannot leak into the result.
  */
-async function sandboxChildEnv(overrides: Record<string, string>): Promise<Record<string, string>> {
+async function runSandbox(
+  overrides: Record<string, string>
+): Promise<{ childEnv: Record<string, string>; stderr: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "dev-server-sandbox-test-"));
   tempDirs.push(dir);
   const dumpPath = path.join(dir, "child-env.txt");
@@ -46,7 +48,11 @@ async function sandboxChildEnv(overrides: Record<string, string>): Promise<Recor
     const separator = line.indexOf("=");
     if (separator > 0) childEnv[line.slice(0, separator)] = line.slice(separator + 1);
   }
-  return childEnv;
+  return { childEnv, stderr };
+}
+
+async function sandboxChildEnv(overrides: Record<string, string>): Promise<Record<string, string>> {
+  return (await runSandbox(overrides)).childEnv;
 }
 
 describe("dev-server-sandbox allowed hosts", () => {
@@ -88,6 +94,37 @@ describe("dev-server-sandbox allowed hosts", () => {
     });
 
     expect(resolveViteDevServerEnv(childEnv).allowedHosts).toEqual(["one.example"]);
+  });
+});
+
+describe("dev-server-sandbox proxy template warning", () => {
+  test("names the variable and the opt-in when the template yields no host", async () => {
+    const { stderr } = await runSandbox({ VSCODE_PROXY_URI: "https://coder.test/proxy/{{port}}/" });
+
+    expect(stderr).toContain("WARNING: VSCODE_PROXY_URI");
+    expect(stderr).toContain("XUM_VITE_ALLOWED_HOSTS=<host>");
+  });
+
+  test("names XUM_PROXY_URI when that is the variable in use", async () => {
+    const { stderr } = await runSandbox({
+      XUM_PROXY_URI: "https://coder.test",
+      VSCODE_PROXY_URI: "https://{{port}}.vscode.test",
+    });
+
+    expect(stderr).toContain("WARNING: XUM_PROXY_URI");
+  });
+
+  test.each([
+    ["no template is set", {}],
+    ["a host is derived", { VSCODE_PROXY_URI: "https://{{port}}.vscode.test" }],
+    [
+      "the user opted in",
+      { VSCODE_PROXY_URI: "https://coder.test", XUM_VITE_ALLOWED_HOSTS: "one.example" },
+    ],
+  ])("stays silent when %s", async (_name, overrides) => {
+    const { stderr } = await runSandbox(overrides);
+
+    expect(stderr).not.toContain("WARNING");
   });
 });
 

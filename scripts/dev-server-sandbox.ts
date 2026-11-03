@@ -49,6 +49,7 @@ import {
   forwardSignalsToChildProcesses,
   getFreePort,
   parseOptionalPort,
+  readProxyUriTemplate,
   sanitizeSandboxProviderEnv,
 } from "./sandboxUtils";
 
@@ -192,6 +193,12 @@ async function main(): Promise<number> {
     console.log(`  Backend:         http://127.0.0.1:${backendPort}`);
     console.log(`  Frontend:        http://localhost:${vitePort}`);
     console.log(`  Allowed hosts:   ${allowedHosts ?? "loopback only"}`);
+    const proxyUri = readProxyUriTemplate(process.env);
+    if (allowedHosts === null && proxyUri !== null) {
+      console.warn(
+        `  WARNING: ${proxyUri.name} yields no port-forward host (it needs {{port}} in a plain hostname), so only loopback is allowed. To allow a host: XUM_VITE_ALLOWED_HOSTS=<host>`
+      );
+    }
     if (keepSandbox) {
       console.log("  KEEP_SANDBOX=1 (temp root will not be deleted)");
     }
