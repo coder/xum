@@ -57,9 +57,11 @@ Preconditions:
 - **Archive from the row.** Focus the row's archive icon and press Enter. Run
   `agent-browser wait '[aria-label="Archive workspace release-notes"]'`,
   `agent-browser focus '[aria-label="Archive workspace release-notes"]'` and
-  `agent-browser press Enter`. The `Select workspace release-notes` row disappears, and in
-  `$VERIFY_XUM_ROOT/config.json` the `release-notes` entry gets an `archivedAt` time. Capture
-  `workspaces/archived`.
+  `agent-browser press Enter`. The archive request is still running when Enter returns. Wait for
+  its result with
+  `agent-browser wait --fn '!document.querySelector("[aria-label=\"Select workspace release-notes\"]")'`.
+  The `Select workspace release-notes` row is gone, and in `$VERIFY_XUM_ROOT/config.json` the
+  `release-notes` entry has an `archivedAt` time. Capture `workspaces/archived`.
 - **Archive with the keyboard.** Open `scratch-notes` from its row, run `verify-xum.sh idle`, and
   press Ctrl+Shift+Backspace. Run `agent-browser press Control+Shift+Backspace`. The
   `Select workspace scratch-notes` row disappears, and its `config.json` entry gets an
@@ -70,8 +72,10 @@ Preconditions:
   `agent-browser find role button click --name "Expand archived workspaces" --exact` and
   `agent-browser wait '[aria-label="Restore workspace release-notes"]'`. The region
   `Archived workspaces` lists `release-notes` and `scratch-notes`. Run
-  `agent-browser find role button click --name "Restore workspace release-notes" --exact`. The
-  app opens `/workspace/<release-notes id>`, the sidebar row is back, and `config.json` gets an
+  `agent-browser find role button click --name "Restore workspace release-notes" --exact`, then
+  wait for the result with `agent-browser wait --url "**/workspace/<release-notes id>"` and
+  `agent-browser wait '[aria-label="Select workspace release-notes"]'`. The app is on
+  `/workspace/<release-notes id>`, the sidebar row is back, and `config.json` has an
   `unarchivedAt` time for it. Capture `workspaces/restored`.
 - **CLI view.** List the workspaces through the CLI:
 

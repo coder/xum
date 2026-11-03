@@ -22,11 +22,19 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 - Start every recipe whose preconditions name `Verify playground` by opening it, even after
   another recipe: the workspaces and command-palette recipes end on `release-notes`, and the
   recipes read evidence from `$VERIFY_XUM_WORKSPACE_ID`. Open the app with
-  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"`,
-  run `verify-xum.sh idle`, and expand the project in the sidebar with
-  `agent-browser find role button click --name "Expand project demo-app" --exact`. A new browser
-  session starts with the project collapsed, and the recipes choose workspace rows by name. The
-  expand command fails when the project is already expanded. That failure is harmless.
+  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID$VERIFY_XUM_OPEN_QUERY"`
+  and run `verify-xum.sh idle`. A new browser session starts with the project collapsed, and the
+  recipes choose workspace rows by name, so expand it when it is collapsed. This form fails only
+  when the button is there and the click fails, so it is safe in an `&&` chain:
+
+  ```bash
+  [[ $(agent-browser eval '!!document.querySelector("[aria-label=\"Expand project demo-app\"]")') != true ]] \
+    || agent-browser find role button click --name "Expand project demo-app" --exact
+  ```
+
+- `$VERIFY_XUM_OPEN_QUERY` (SKILL.md Drive) holds the backend's auth token when it has one. Add
+  it to the first `open` of a browser session, as above. Later opens in that session do not need
+  it.
 - Send a message in three steps: fill `Message`, run `verify-xum.sh send-ready`, then press Enter
   or choose `Send message`.
 - Use accessible names with `agent-browser find role <role> <action> --name "<name>" --exact`.

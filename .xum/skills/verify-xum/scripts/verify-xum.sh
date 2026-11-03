@@ -4,6 +4,7 @@
 #   verify-xum.sh launch           start and seed a sandbox, print its state
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
 #   verify-xum.sh env [RUN]        print the run's `export` lines and put this script on PATH (eval them)
+#   verify-xum.sh open-query [RUN] print `?token=<token>` when the backend has one (env uses it)
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
@@ -16,7 +17,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 # make -C runs the sandbox from the checkout, so a relative TMPDIR would resolve there.
 [[ ${TMPDIR:-/tmp} == /* ]] || TMPDIR="$PWD/$TMPDIR"
-VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum}
+# Without XUM_SCRATCH_DIR the default is under the shared TMPDIR, so it carries the user id.
+VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:+$XUM_SCRATCH_DIR/verify-xum}}
+VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${TMPDIR:-/tmp}/verify-xum-$(id -u)}
 # The run link in the git dir must point at an absolute path.
 [[ $VERIFY_XUM_HOME == /* ]] || VERIFY_XUM_HOME="$PWD/$VERIFY_XUM_HOME"
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
@@ -62,8 +65,9 @@ group_is_ours() {
 
 # One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
 # run's process group, which records its own id in that run's state.env before it starts the
-# server, so the guard holds at whatever point the launcher dies. The flock only keeps two
-# launches from passing the check at once. The server does not inherit it.
+# server. Once that id is written, a moment after the spawn, the guard holds wherever the launcher
+# dies. A launcher killed inside that moment can leave a group that the guard does not see. The
+# flock only keeps two launches from passing the check at once. The server does not inherit it.
 refuse_while_checkout_server_runs() {
   exec 9>"$LAUNCH_GUARD"
   flock -w 30 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
@@ -89,15 +93,34 @@ before_launch_deadline() {
   ((SECONDS < LAUNCH_DEADLINE)) || die "launch did not finish in $READY_TIMEOUT s"
 }
 
+# Seconds left before the launch deadline, at least 1: curl reads `--max-time 0` as no limit.
+launch_seconds_left() {
+  local left=$((LAUNCH_DEADLINE - SECONDS))
+  ((left > 0)) || left=1
+  echo "$left"
+}
+
 # A readiness probe that gives up at the launch deadline.
 probe_before_launch_deadline() {
   before_launch_deadline
-  curl -fs --max-time $((LAUNCH_DEADLINE - SECONDS)) -o /dev/null "$1"
+  curl -fs --max-time "$(launch_seconds_left)" -o /dev/null "$1"
+}
+
+# A backend started with auth (#7904's `make dev-server`) records its token in server.lock. The
+# header goes to curl on stdin, so the token stays out of every process's argv.
+backend_curl() {
+  local token
+  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  if [[ -n $token ]]; then
+    printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
+  else
+    curl "$@"
+  fi
 }
 
 api() {
   before_launch_deadline
-  curl -fsS --max-time $((LAUNCH_DEADLINE - SECONDS)) -X POST "$VERIFY_XUM_BACKEND/api/$1" \
+  backend_curl -fsS --max-time "$(launch_seconds_left)" -X POST "$VERIFY_XUM_BACKEND/api/$1" \
     -H 'content-type: application/json' -d "$2"
 }
 
@@ -157,7 +180,7 @@ create_demo_repo() {
   git -C "$repo" init -q -b main
   git -C "$repo" add .
   git -C "$repo" -c user.name=verify-xum -c user.email=verify-xum@example.test \
-    -c commit.gpgsign=false commit -qm init
+    -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm init
 }
 
 seed_unreachable_fake_provider() {
@@ -184,6 +207,16 @@ seed() {
   done
   VERIFY_XUM_WORKTREE="$VERIFY_XUM_ROOT/src/$(basename "$VERIFY_XUM_PROJECT")/verify-playground"
   [[ -d $VERIFY_XUM_WORKTREE ]] || die "no worktree at $VERIFY_XUM_WORKTREE"
+}
+
+# nodemon waits for a file change after the backend crashes, and none comes during a launch. A
+# crash before the first rebuild is expected (a stale dist/): the rebuild restarts it.
+backend_crashed_after_rebuild() {
+  sed 's/\x1b\[[0-9;]*m//g' "$1" | awk '
+    /\[nodemon\] starting `.*dist\/cli\/index\.js server/ && prefix == "" { prefix = $1 }
+    prefix != "" && $1 == prefix && /\[nodemon\] restarting due to changes/ { rebuilt = 1; crashed = 0 }
+    prefix != "" && $1 == prefix && /\[nodemon\] app crashed/ { crashed = rebuilt }
+    END { exit !crashed }'
 }
 
 launch_failed() {
@@ -220,7 +253,7 @@ cmd_launch() {
   ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
   trap launch_failed EXIT
   # The new group's leader appends its pid, which is the group id, to state.env before it starts
-  # make. From then on the launch guard and cleanup find the group, whenever the launcher dies.
+  # make. From then on the launch guard and cleanup find the group, wherever the launcher dies.
   # (setsid(1) forks when its caller already leads a process group, so $! can miss the group.)
   # shellcheck disable=SC2016
   setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; shift; exec "$@"' sh \
@@ -244,6 +277,8 @@ cmd_launch() {
     before_launch_deadline
     sleep 0.5
   done
+  # The recipes assume default preferences. With both --clean flags the sandbox copies no config.
+  grep -q '^  Seed config: *(none)$' "$log" || die "the sandbox copied a config.json, so the run would not start from default preferences"
   VERIFY_XUM_BACKEND="http://127.0.0.1:$backend_port"
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
@@ -251,6 +286,7 @@ cmd_launch() {
   until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/"; do
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
+    backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
     sleep 1
   done
 
@@ -291,8 +327,8 @@ cmd_doctor() {
     pid_in_group "$backend_pid" "$VERIFY_XUM_PGID"
   check "server.lock names $VERIFY_XUM_BACKEND" \
     test "$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
-  check "GET $VERIFY_XUM_BACKEND/health answers" curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
-  version=$(curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" 2>/dev/null | json_field_or_empty /dev/stdin git_commit || true)
+  check "GET $VERIFY_XUM_BACKEND/health answers" backend_curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
+  version=$(backend_curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" 2>/dev/null | json_field_or_empty /dev/stdin git_commit || true)
   check "backend build ${version:-unknown} is the launch commit $VERIFY_XUM_COMMIT" \
     test -n "$version" -a "${VERIFY_XUM_COMMIT#"$version"}" != "$VERIFY_XUM_COMMIT"
   if [[ $(git -C "$VERIFY_XUM_CHECKOUT" rev-parse HEAD) != "$VERIFY_XUM_COMMIT" ]]; then
@@ -312,6 +348,17 @@ cmd_env() {
   # The feature recipes call the helper by its bare name. $PATH expands when the caller evals.
   # shellcheck disable=SC2016
   printf 'export PATH=%q:"$PATH"\n' "$SCRIPT_DIR"
+  # Read when the caller evals, so the token never shows in this output.
+  # shellcheck disable=SC2016
+  printf 'export VERIFY_XUM_OPEN_QUERY="$(%q open-query %q)"\n' "$SCRIPT_DIR/verify-xum.sh" "$VERIFY_XUM_RUN"
+}
+
+# `?token=<token>` for the first page a browser opens when the backend has a token, else nothing.
+cmd_open_query() {
+  load_run "${1:-}"
+  local token
+  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  [[ -z $token ]] || printf '?token=%s' "$(node -p 'encodeURIComponent(process.argv[1])' "$token")"
 }
 
 cmd_capture() {
@@ -386,9 +433,10 @@ case ${1:-} in
   launch) cmd_launch ;;
   doctor) cmd_doctor "${2:-}" ;;
   env) cmd_env "${2:-}" ;;
+  open-query) cmd_open_query "${2:-}" ;;
   capture) cmd_capture "${2:-}" "${3:-}" ;;
   idle) cmd_idle "${2:-}" ;;
   send-ready) cmd_send_ready "${2:-}" ;;
   cleanup) cmd_cleanup "${2:-}" ;;
-  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
+  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open-query [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
 esac

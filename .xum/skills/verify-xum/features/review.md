@@ -59,8 +59,13 @@ Preconditions:
 - **Restore.** Run `agent-browser find role button click --name "Mark as read (M)" --exact`. The
   tab reads `Review 0/1`, and `review-state.json` has no `"isRead": true`. Run
   `agent-browser find role checkbox click --name "Uncommitted:" --exact`. The box is
-  `checked=false`, and `config.json` has `"includeUncommitted": false` under
-  `userPreferences.review`. Run `git -C "$VERIFY_XUM_WORKTREE" checkout -- src/math.ts`,
+  `checked=false` at once. Wait until the server has written it:
+
+  ```bash
+  timeout 10 sh -c 'until grep -qF "\"includeUncommitted\": false" "$1"; do sleep 0.2; done' sh "$VERIFY_XUM_ROOT/config.json"
+  ```
+
+  `config.json` has `"includeUncommitted": false` under `userPreferences.review`. Run `git -C "$VERIFY_XUM_WORKTREE" checkout -- src/math.ts`,
   `agent-browser find role button click --name "Close Review" --exact` and
   `agent-browser wait '[aria-label="Expand right sidebar"]'`. Closing the last tab collapses the
   sidebar.

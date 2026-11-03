@@ -61,8 +61,10 @@ It prints the run's `export` lines and the URL of the seeded workspace. A failed
 server log tail and cleans up. Launch refuses while the process group of this checkout's newest
 run is alive, by the same identity check as cleanup: two dev servers in one checkout share `dist/`
 and `node_modules/.vite`. The group's first process writes the group id into the run's
-`state.env` before it starts the server, so the check and cleanup find the group even when the
-launcher was killed partway.
+`state.env` before it starts the server. From that moment, right after the spawn, the check and
+cleanup find the group even when the launcher was killed. Launch also stops at once when the
+sandbox copied a `config.json` (the recipes assume default preferences) and when the backend
+crashes after its rebuild (nodemon then waits for a file change that never comes).
 
 ## Doctor
 
@@ -76,16 +78,18 @@ Every check line must read `ok`. A `note` line only informs. It checks that the 
 lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
 names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
 `/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
+When the backend has an auth token, doctor and launch read it from `server.lock` and send it to
+curl on stdin, never in argv.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
 
 Every bash call starts by loading the run. This sets `AGENT_BROWSER_SESSION` (a session name only
-this run uses) and the `VERIFY_XUM_*` paths and URLs:
+this run uses), the `VERIFY_XUM_*` paths and URLs, and `VERIFY_XUM_OPEN_QUERY`:
 
 ```bash
 eval "$(.xum/skills/verify-xum/scripts/verify-xum.sh env)"
-agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"
+agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID$VERIFY_XUM_OPEN_QUERY"
 .xum/skills/verify-xum/scripts/verify-xum.sh idle
 agent-browser snapshot -i
 agent-browser find role button click --name "Open settings" --exact
@@ -94,6 +98,10 @@ agent-browser find role button click --name "Open settings" --exact
 - Prefer `find role <role> <action> --name "<accessible name>" --exact` and the names in the
   feature map over `@eN` refs, which change with every snapshot. Without `--exact`, `--name`
   matches substrings and can act on a different element.
+- `VERIFY_XUM_OPEN_QUERY` is `?token=<token>` when the backend has an auth token (`make dev-server`
+  with #7904), and empty otherwise. Put it on the first `open` of a browser session: the app
+  keeps the token and strips it from the address bar. CAUTION: that URL puts the token in the
+  `agent-browser` command line, which every local account can read while it runs.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
@@ -126,7 +134,8 @@ agent-browser find role button click --name "Open settings" --exact
 ## Evidence
 
 Evidence goes to `$VERIFY_XUM_EVIDENCE`, which is `$VERIFY_XUM_HOME/<run>/evidence`.
-`VERIFY_XUM_HOME` defaults to `${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum`. Cleanup never
+`VERIFY_XUM_HOME` defaults to `$XUM_SCRATCH_DIR/verify-xum`, or without `XUM_SCRATCH_DIR` to
+`${TMPDIR:-/tmp}/verify-xum-<uid>`. Cleanup never
 deletes the evidence or the server log next to it (`<run>/server.log`).
 
 ```bash
@@ -164,14 +173,14 @@ then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and pr
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
-the run's `state.env`. Run it after every run, failed ones too.
+the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`, `capture`,
+`idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use the newest
+launch from this checkout.
 
 Limit: if the launcher dies in the moment after the sandbox logs its `XUM_ROOT` and before launch
 records it (up to 0.5 s), and a server process then ignores SIGTERM, cleanup must SIGKILL the
 group. `dev-server-sandbox.ts` then cannot delete its `mux-dev-server-*` folder, and the run never
-recorded it. Delete that folder in TMPDIR by hand. `doctor`, `env`,
-`capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
-the newest launch from this checkout.
+recorded it. Delete that folder in TMPDIR by hand.
 
 ## Gotchas
 

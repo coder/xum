@@ -56,7 +56,7 @@ Preconditions:
   The sidebar has a `RECENT` group, and the workspace row is
   `Select workspace Verify playground (demo-app)`.
 - **Reload.** Run `agent-browser reload`,
-  `agent-browser open "$VERIFY_XUM_URL/settings/general"` and
+  `agent-browser open "$VERIFY_XUM_URL/settings/general$VERIFY_XUM_OPEN_QUERY"` and
   `agent-browser wait --text "Choose your preferred theme"`. The switch `Toggle flat chat list` is
   still `checked=true`. Capture `settings/persisted`.
 - **Restore.** Run
@@ -64,7 +64,7 @@ Preconditions:
   `config.json` has `"sidebarFlatMode": false` (the same `timeout 10` loop with `false`), and run
   `agent-browser press Escape`. The page opened
   Settings by its URL, so Escape lands on `/project?...`. Run
-  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"` and
+  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID$VERIFY_XUM_OPEN_QUERY"` and
   `verify-xum.sh idle` to be back on `Verify playground`.
 
 ## Gotchas
