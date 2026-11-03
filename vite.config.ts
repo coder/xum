@@ -213,7 +213,9 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: previewPort,
       strictPort: true,
-      allowedHosts: ["localhost", "127.0.0.1"],
+      // Preview inherits server.proxy, whose ws entries check devServerAllowedHosts, so preview's
+      // own HTTP check must use the same list.
+      allowedHosts: devServerAllowedHosts,
     },
     optimizeDeps: {
       // noVNC ships Babel-style CJS plus top-level await in lib/, which breaks esbuild
