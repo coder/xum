@@ -62,7 +62,8 @@ server log tail and cleans up. Launch refuses while the process group of this ch
 run is alive, by the same identity check as cleanup: two dev servers in one checkout share `dist/`
 and `node_modules/.vite`. The group's first process writes the group id into the run's
 `state.env` before it starts the server. From that moment, right after the spawn, the check and
-cleanup find the group even when the launcher was killed. Launch also stops at once when the
+cleanup find the group even when the launcher was killed. Until then the group holds the launch
+lock, so a second launch waits for it. Launch also stops at once when the
 sandbox copied a `config.json` (the recipes assume default preferences) and when the backend
 crashes after its rebuild (nodemon then waits for a file change that never comes).
 
@@ -178,9 +179,9 @@ then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and pr
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
-the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`, `capture`,
-`idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use the newest
-launch from this checkout.
+the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`, `open`,
+`workspace-field`, `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory
+after their other arguments. Without one they use the newest launch from this checkout.
 
 Limit: if the launcher dies in the moment after the sandbox logs its `XUM_ROOT` and before launch
 records it (up to 0.5 s), and a server process then ignores SIGTERM, cleanup must SIGKILL the

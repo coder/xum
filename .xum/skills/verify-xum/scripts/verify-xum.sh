@@ -5,6 +5,7 @@
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
 #   verify-xum.sh env [RUN]        print the run's `export` lines and put this script on PATH (eval them)
 #   verify-xum.sh open PATH [RUN]  open PATH of the run's UI in its browser session, token in no argv
+#   verify-xum.sh workspace-field NAME FIELD [RUN]  print FIELD of workspace NAME from config.json
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
@@ -87,12 +88,13 @@ private_run_dir() {
 
 # One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
 # run's process group, which records its own id in that run's state.env before it starts the
-# server. Once that id is written, a moment after the spawn, the guard holds wherever the launcher
-# dies. A launcher killed inside that moment can leave a group that the guard does not see. The
-# flock only keeps two launches from passing the check at once. The server does not inherit it.
+# server. The flock keeps two launches from passing the check at once, and it also covers the
+# moment between the spawn and that record: the new group holds the flock until it has written
+# its id, wherever the launcher dies. The server does not inherit it.
 refuse_while_checkout_server_runs() {
   exec 9>"$LAUNCH_GUARD"
-  flock -w 30 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
+  # Part of the launch deadline: a short VERIFY_XUM_READY_TIMEOUT also bounds this wait.
+  flock -w "$(launch_seconds_left)" 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
   [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
   local run
   run=$(private_run_dir "$CURRENT_RUN_LINK") || exit 1
@@ -254,6 +256,7 @@ cmd_launch() {
   local t0 backend_port vite_port log
   need git curl node bun make setsid flock ss agent-browser
   check_bun
+  LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
   refuse_while_checkout_server_runs
 
   VERIFY_XUM_RUN_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
@@ -264,7 +267,8 @@ cmd_launch() {
   VERIFY_XUM_COMMIT=$(git -C "$CHECKOUT" rev-parse HEAD)
   AGENT_BROWSER_SESSION="verify-xum-$VERIFY_XUM_RUN_ID"
   if [[ ! -e $VERIFY_XUM_HOME ]]; then
-    mkdir -p "$(dirname "$VERIFY_XUM_HOME")"
+    # Parents this creates are private too, whatever the caller's umask.
+    (umask 077 && mkdir -p "$(dirname "$VERIFY_XUM_HOME")")
     mkdir -m 700 "$VERIFY_XUM_HOME"
   fi
   require_private_dir "$VERIFY_XUM_HOME"
@@ -273,7 +277,6 @@ cmd_launch() {
   log="$VERIFY_XUM_RUN/server.log"
   # Milliseconds: a stamp from earlier in the launch's own second is a stale build.
   t0=$(date +%s%3N)
-  LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
@@ -286,12 +289,14 @@ cmd_launch() {
   trap launch_failed EXIT
   # The new group's leader appends its pid, which is the group id, to state.env before it starts
   # make. From then on the launch guard and cleanup find the group, wherever the launcher dies.
+  # The leader carries VERIFY_XUM_SERVER_OF from its start, so group_is_ours matches it as soon
+  # as the id is written. It holds the launch flock (fd 9) until then and closes it before make.
   # (setsid(1) forks when its caller already leads a process group, so $! can miss the group.)
   # shellcheck disable=SC2016
-  setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; shift; exec "$@"' sh \
+  VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID" setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; exec 9>&-; shift; exec "$@"' sh \
     "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
-    >"$log" 2>&1 </dev/null 9>&- &
+    >"$log" 2>&1 </dev/null &
   until VERIFY_XUM_PGID=$(sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1)
     [[ -n $VERIFY_XUM_PGID ]]; do
     before_launch_deadline
@@ -412,6 +417,27 @@ cmd_open() {
   # The success output repeats the URL with the token: it is not printed.
 }
 
+# Prints FIELD (id, archivedAt, ...) of the workspace named NAME in the run's config.json, or
+# nothing when that field is unset. Exits 1 unless exactly one workspace has that name. The
+# recipes read ids with it: the app makes them up at create time.
+cmd_workspace_field() {
+  local name=${1:-} field=${2:-}
+  [[ -n $name && -n $field ]] || die "usage: verify-xum.sh workspace-field NAME FIELD [RUN]"
+  load_run "${3:-}"
+  node -e '
+    const fs = require("fs");
+    const [configPath, name, field] = process.argv.slice(1);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const matches = config.projects.flatMap(([, project]) => project.workspaces ?? []).filter((w) => w.name === name);
+    if (matches.length !== 1) {
+      process.stderr.write("verify-xum: " + matches.length + " workspaces are named " + name + " in " + configPath + "\n");
+      process.exit(1);
+    }
+    const value = matches[0][field];
+    if (value !== undefined && value !== null) console.log(String(value));' \
+    "$VERIFY_XUM_ROOT/config.json" "$name" "$field"
+}
+
 cmd_capture() {
   local name=${1:-} base
   [[ $name =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "capture NAME must look like <feature>/<step>, lowercase"
@@ -485,9 +511,10 @@ case ${1:-} in
   doctor) cmd_doctor "${2:-}" ;;
   env) cmd_env "${2:-}" ;;
   open) cmd_open "${2:-}" "${3:-}" ;;
+  workspace-field) cmd_workspace_field "${2:-}" "${3:-}" "${4:-}" ;;
   capture) cmd_capture "${2:-}" "${3:-}" ;;
   idle) cmd_idle "${2:-}" ;;
   send-ready) cmd_send_ready "${2:-}" ;;
   cleanup) cmd_cleanup "${2:-}" ;;
-  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
+  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | workspace-field NAME FIELD [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
 esac
