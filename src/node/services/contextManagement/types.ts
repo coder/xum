@@ -22,6 +22,8 @@ export interface StreamContextSnapshot {
   goalId?: string;
   taskTurnKind?: TaskTurnKind;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /** AgentSession.autoRetryStops when this stream started: a Stop since then arms no retry. */
+  admissionAutoRetryStops?: number;
 }
 
 export interface ContextDispatchRequest {

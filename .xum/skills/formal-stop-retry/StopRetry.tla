@@ -94,8 +94,10 @@ CancelRetry == BumpGen /\ fiber' = "none" /\ UNCHANGED fGen
 \* The code reads the cancellation record (compactionRecoveryBlocked) one await before
 \* the other checks, and the model reads it at the last check. The outcome is the same:
 \* a Stop that sets cancelDebt between the two reads also bumps gen in the same step, so
-\* the code's capturedGen = gen check refuses too.
-MayArm(capturedGen) == ~cancelDebt /\ latch = 0 /\ capturedGen = gen /\ enabled
+\* the code's capturedGen = gen check refuses too. It does not read the latch: an
+\* interrupt of a queued workspace turn latches too, and must leave the running turn's
+\* retry alone.
+MayArm(capturedGen) == ~cancelDebt /\ capturedGen = gen /\ enabled
 \* handleStreamError passes its turn's admissionAutoRetryStops: no abandonAutoRetry since
 \* the failed turn's stream started.
 PolicyMayArm == MayArm(pCap) /\ pStops = stops
@@ -191,8 +193,8 @@ RetryReschedules ==
 \*   record that blocks automatic recovery until a user send replaces it) and
 \*   retryManager.abandon("user_interrupt"), which is not abandonAutoRetry (stops stays).
 \* task: beginWorkspaceStop's latch (Phase A).
-\* turn: interruptWorkspaceTurn's latch, under the publication lock. A queued handle owns
-\*   no turn and is not modeled: it leaves the running turn's retry alone.
+\* turn: interruptWorkspaceTurn's latch, under the publication lock. A queued handle latches
+\*   too but owns no turn and abandons nothing; it is not modeled (MayArm ignores the latch).
 \* timeout: failAgentTaskForHardTimeout's clearQueue and abandonAutoRetry.
 StopBegins(k) ==
   /\ stop = "none"

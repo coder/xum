@@ -25,20 +25,24 @@ Tests rarely reach the break. It needs a Stop to land while a stream error's han
 
 ## Does my change touch the verified code?
 
-The sync commit is the last commit that changed this folder: `git log -1 --format=%H -- .xum/skills/formal-stop-retry`. Each such commit either changed the model together with its code, or confirmed the model against the code at that commit. Main squash-merges PRs, so a recorded branch SHA would not survive; this rule does.
+`make formal-check` never reads `src/`. It checks the model only, so it checks a code change only after you change the model to match that code.
+
+The sync commit is the last commit that changed the line below. Change that line only after you confirmed that the model describes the code at your commit, with or without a model change. A typo fix elsewhere in this folder does not move the sync commit. Main squash-merges PRs, so write the PR number, not a branch SHA, which would not survive the squash.
+
+Model confirmed against the code in: #7896
 
 | Model action | Code |
 | --- | --- |
 | `StreamErrors`, `PolicySettles` | `src/node/services/agentSession.ts` `handleStreamError` (entry, which keeps its turn's `activeStreamContext.admissionAutoRetryStops`, and tail), `src/node/services/turnCoordinator.ts` `consumeCompletion` |
 | `PolicyCaptures` | `handleStreamError` awaits `restoreGoalAccountingSnapshot` and `chargeEvaluatorSpendToGoal`, then calls `handleStreamFailureForAutoRetry`, which captures `isCurrent` |
-| `PolicySchedules`, `RetryReschedules` (`MayArm`, `PolicyMayArm`) | `agentSession.ts` `handleStreamFailureForAutoRetry`: `compactionRecoveryBlocked`, the preference load, `isCurrent`, `isStopInProgress`, `autoRetryStops` (`handleStreamError` passes its turn's `admissionAutoRetryStops`), then `RetryManager.handleStreamFailure` |
+| `PolicySchedules`, `RetryReschedules` (`MayArm`, `PolicyMayArm`) | `agentSession.ts` `handleStreamFailureForAutoRetry`: `compactionRecoveryBlocked`, the preference load, `isCurrent`, `autoRetryStops` (`handleStreamError` passes its turn's `admissionAutoRetryStops`), then `RetryManager.handleStreamFailure`. It does not read the stop latch: an interrupt of a queued workspace turn latches too |
 | `RetryFires` | `src/node/services/retryManager.ts` `scheduleRetry` (the fiber's guards and `onRetry`), `agentSession.ts` `retryActiveStream` up to `resumeStream`, `resumeStream` up to `applyAutoRoutedResume` |
 | `RetryRoutes` | `resumeStream`: the `isBusy` check |
 | `RetryGate` | `resumeStream`: `captureCompactionReplacement`, `compactionRecoveryBlocked`, the pricing gate, the synchronous gate (`compactionStopGeneration`, the retry signal, `isStopInProgress`) and `coordinator.prepare`; the resumed turn's `admissionAutoRetryStops` (`streamWithHistory`) |
 | `RetryReschedules` | `retryActiveStream`: its `handleStreamFailureForAutoRetry` calls after a resume that did not start or failed |
-| `StopBegins` (ui, api) | `src/node/services/workspaceService.ts` `interruptStream` (`latchHardInterruptCascade`, the `setAutoRetryEnabled(false)` start); `agentSession.ts` `interruptStream` (`cancelCompaction`, `RetryManager.abandon`); `src/node/services/compactionCancellation.ts` `cancel`, `blocksRecovery` |
+| `StopBegins` (ui, api) | `src/node/services/workspaceService.ts` `interruptStream` (`latchHardInterruptCascade`, the `setAutoRetryEnabled(false)` start); `agentSession.ts` `interruptStream` (`cancelCompaction`, `RetryManager.abandon`); `src/node/services/compactionCancellation.ts` `cancel`, `blocksRecovery`. The model reads the record (`cancelDebt`) in `MayArm` and in `RetryGate`, like the code's two `compactionRecoveryBlocked` calls. Either read alone keeps `api` holding: `api` fails only without both |
 | `StopBegins` (task) | `src/node/services/taskStopLatch.ts` `beginWorkspaceStop`; callers in `src/node/services/taskService.ts`: `stopDescendantAgentTaskUnderLifecycleLock`, `terminateAllDescendantAgentTasks`, `terminateDescendantAgentTask`, `stopFailedTaskLaunch`, `failAgentTaskTerminally` |
-| `StopBegins` (turn) | `src/node/services/workspaceTurnManager.ts` `interruptWorkspaceTurn`: `latchWorkspaceStopsInProgress`, then `abandonAutoRetry` when the handle owns the running turn (`shouldStopStream`) |
+| `StopBegins` (turn) | `src/node/services/workspaceTurnManager.ts` `interruptWorkspaceTurn`: `latchWorkspaceStopsInProgress`, then `abandonAutoRetry` when the handle owns the running turn (`shouldStopStream`). A queued handle latches too but abandons nothing. The model has no queued handle (see Scope) |
 | `StopBegins` (timeout) | `taskService.ts` `failAgentTaskForHardTimeout`: `clearQueue`, `abandonAutoRetry` |
 | `TurnStopReleases` | `interruptWorkspaceTurn`: `releaseStopLatch` in the method-level `finally` |
 | `TimeoutFails` | `taskService.ts` `failAgentTaskTerminally`: `sampleLiveExecution`, then `beginWorkspaceStop` and the task cleanup, or nothing for an idle task |
@@ -49,14 +53,22 @@ The sync commit is the last commit that changed this folder: `git log -1 --forma
 | `OptOutApplies` | `agentSession.ts` `applyAutoRetryEnabled` with `enabled: false` |
 | `TaskStopReleases` | `taskStopLatch.ts` `recheckWorkspaceStopRelease` |
 
-To list the commits since the sync commit that touched these files, run:
+To see what changed in the covered files since the sync commit, uncommitted edits included, run:
 
 ```sh
-sync=$(git log -1 --format=%H -- .xum/skills/formal-stop-retry)
-git log --oneline "$sync"..HEAD -- src/node/services/retryManager.ts src/node/services/agentSession.ts src/node/services/workspaceService.ts src/node/services/taskStopLatch.ts src/node/services/turnCoordinator.ts src/node/services/compactionCancellation.ts src/node/services/taskService.ts src/node/services/workspaceTurnManager.ts
+sync=$(git log -1 --format=%H -G '^Model confirmed against the code in:' -- .xum/skills/formal-stop-retry/SKILL.md)
+files="src/node/services/retryManager.ts src/node/services/agentSession.ts src/node/services/workspaceService.ts
+  src/node/services/taskStopLatch.ts src/node/services/turnCoordinator.ts src/node/services/compactionCancellation.ts
+  src/node/services/taskService.ts src/node/services/workspaceTurnManager.ts src/node/services/taskWorkspaceSeam.ts
+  src/node/services/turnRequestBuilder.ts src/node/services/contextManagement/strategies/summarize.ts
+  src/node/acp/agent.ts src/node/orpc/router.ts src/browser/utils/stopStream.ts
+  src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx
+  src/browser/hooks/useAIViewKeybinds.ts src/browser/utils/commands/sources.ts src/browser/utils/compaction/handler.ts"
+git diff --stat "$sync" -- $files
+git diff "$sync" -- $files
 ```
 
-`agentSession.ts`, `workspaceService.ts`, `taskService.ts` and `workspaceTurnManager.ts` change often. Read the diff of the functions in the table, not only the file list. When a change adds an await inside a row, adds a new caller of `handleStreamFailureForAutoRetry` or `RetryManager.handleStreamFailure`, adds a new Stop path, or moves a check across an await, the model needs another look.
+The `src/node` files hold the functions in the table and in Scope. The ACP agent, the ORPC router and the renderer files decide which Stop kind a Stop is (`disableAutoRetry`, `soft`). `agentSession.ts`, `workspaceService.ts`, `taskService.ts` and `workspaceTurnManager.ts` change often. Read the diff of the functions in the table and in Scope, not only the file list. When a change adds an await inside a row, adds a new caller of `handleStreamFailureForAutoRetry` or `RetryManager.handleStreamFailure`, adds a new Stop path, or moves a check across an await, the model needs another look.
 
 ## Run it
 
@@ -64,15 +76,15 @@ git log --oneline "$sync"..HEAD -- src/node/services/retryManager.ts src/node/se
 make formal-check
 ```
 
-It needs Java 11 or newer. The first run downloads the pinned `tla2tools.jar` (TLA+ tools 1.7.4) into `build/tla/`, which git ignores. Each config takes about a second. The script prints one line per config and ends with a count line:
+It needs Java 11 or newer. The first run downloads the pinned `tla2tools.jar` (TLA+ tools 1.7.4) into `build/tla/`, which git ignores. Set `TLA2TOOLS_CACHE` to keep the jar in another folder, for example one that several checkouts share. Each config takes about a second. The script prints one line per config and ends with a count line:
 
 ```
 config        result               expected              distinct generated   secs
 reachability  NoRetryEverResumes   NoRetryEverResumes          12        14      1
 ui            holds                holds                     3200      5905      1
 api           holds                holds                     2165      3610      1
-task          holds                holds                     3000      5598      1
-turn          holds                holds                     2237      3946      1
+task          holds                holds                     2778      5265      1
+turn          holds                holds                     3042      5793      1
 timeout       holds                holds                     3399      5619      1
 formal-stop-retry: 6 of 6 configs as expected
 ```
@@ -81,7 +93,7 @@ It exits 0 when every config matches, 1 when one does not or a config name is un
 
 ## Read a failure
 
-Read every TLC result with the pstack `/statechart` skill. Give it `StopRetry.tla` and the failing config. It shows each violation as its shortest path in plain words, and when the check passes it draws how a workspace moves between states. Without pstack, read the trace in `<log folder>/<config>.log`, which `check.sh` names: each `State N:` block starts with the action that TLC took. A violation of `StopEndsRetries` ends in a `RetryGate` step that starts a turn after the Stop began.
+Read every TLC result with the pstack `/statechart` skill. Give it `StopRetry.tla` and the failing config. It shows each violation as its shortest path in plain words, and when the check passes it draws how a workspace moves between states. Without pstack, read the trace in `<config>.log` in the folder that `check.sh` prints on its first line (`TLC logs in ...`): each `State N:` block starts with the action that TLC took. A violation of `StopEndsRetries` ends in a `RetryGate` step that starts a turn after the Stop began.
 
 Then decide whether it is a real bug or a modeling error:
 
@@ -96,7 +108,7 @@ When a change to the code above is intended:
 1. Edit the action that stands for the changed code. Keep one action per stretch of code between two awaits that can yield (I/O, an IPC call, a timer). A microtask-only await does not split an action.
 2. If the change adds a Stop path, add a Stop kind and a config with its own expected verdict in `check.sh`.
 3. Run `make formal-check`. Then break the change on purpose in the real code and in the model, check that a config fails, and revert both.
-4. Move the sync commit forward only after you have confirmed that the model describes the code at the new commit. With a model change, the commit that changes `StopRetry.tla` moves it. Without one, change this folder in the commit that records the confirmation, for example a coverage-table row that changed.
+4. Move the sync commit forward only after you have confirmed that the model describes the code at the new commit, with or without a model change: write your PR number in the `Model confirmed against the code in:` line, in the same commit.
 
 The pstack `/maintain-formal-verification-skill` skill, where installed, brings the model back in line after changes that skipped this check.
 
@@ -110,5 +122,10 @@ It leaves these out:
 - Other automatic turns: a goal's resume after a stream error, bash monitor wakes, queued sends, startup recovery's own scheduling, and compaction follow-ups.
 - Soft Stops (`soft: true`), session disposal, shutdown, and a second backend on the same `XUM_ROOT`.
 - The first preference load from disk. The model assumes the preference is already loaded.
-- A stream error handled without a stream context (the startup replay path). `handleStreamFailureForAutoRetry` then reads `autoRetryStops` when it is called, after the accounting awaits, so a Stop during those awaits is not seen.
-- Retries that should happen. The model checks safety only: `reachability.cfg` proves that a retry can start, but no property catches a retry that the code refuses wrongly. For example, an interrupt of a queued workspace turn must leave the running turn's retry alone. The repro test "interrupting a queued workspace turn leaves the running turn's retry armed" covers that case, not the model.
+- A stream error handled without a stream context (the startup replay path, `agentSession.ts:3689`). `handleStreamFailureForAutoRetry` then reads `autoRetryStops` when it is called, after the accounting awaits, so a Stop during those awaits is not seen.
+- A restart. After a workspace-turn interrupt, a session disposal and a backend restart, startup recovery can arm a retry for a root workspace-turn target again: `runStartupRecovery` (`agentSession.ts:3843`) skips only sub-agents. This gap is older than this check, and it is not fixed.
+- Three more callers of `handleStreamFailureForAutoRetry`, which the model has no steps for:
+  - `sendCompactionRequest` (`agentSession.ts:7939`), when a mid-stream compaction's dispatch fails. A workspace-turn interrupt or a hard timeout does not cancel the compaction, so its latch refuses the dispatch with a retryable error. The call passes the interrupted stream's `admissionAutoRetryStops`, like `handleStreamError`. The test "a Stop during the mid-stream compaction dispatch arms no retry" in `src/node/services/agentSession.autoCompaction.test.ts` fails without it.
+  - `settleRuntimeFailureWithoutErrorEvent` (`agentSession.ts:8809`), which `handleStreamWithHistoryFailure` calls, for a `runtime_not_ready` or `runtime_start_failed` failure without a pre-start error. An emergency context-window rollover produces one: its request preparation (`prepareContextRecovery`, `prepareRolloverRequest`) reports a failed runtime start only as its result, and a remote runtime reports an aborted start as `runtime_start_failed`. The call passes its turn's `admissionAutoRetryStops`. The test "a Stop during an emergency rollover's runtime start arms no retry" in `src/node/services/agentSession.pinnedBudget.test.ts` fails without it.
+  - The turn-abort path (`agentSession.ts:10448`). It passes `aborted`, which `RetryManager` never schedules (`NON_RETRYABLE_STREAM_ERRORS` in `src/common/utils/messages/retryEligibility.ts`).
+- Retries that should happen. The model checks safety only: `reachability.cfg` proves that a retry can start, but no property catches a retry that the code refuses wrongly. For example, an interrupt of a queued workspace turn must leave the running turn's retry alone, also when the running turn's error handling ends inside the interrupt's latch window. The repro test "interrupting a queued workspace turn leaves the running turn's retry armed" covers that case, not the model.

@@ -510,7 +510,7 @@ export interface WorkspaceTurnHost {
     workspaceId: string,
     options?: { cancelReason?: string; preserveUserInput?: boolean }
   ): Result<void>;
-  /** Cancel the session's scheduled or starting auto-retry, as a user Stop does. */
+  /** Cancel the session's scheduled or starting auto-retry, as a user Stop does. Never throws. */
   abandonAutoRetry(workspaceId: string, reason: string): void;
   replaceHistory(
     workspaceId: string,

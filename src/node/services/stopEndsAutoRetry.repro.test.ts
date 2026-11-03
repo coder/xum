@@ -212,23 +212,82 @@ describe("a Stop ends the auto-retry loop", () => {
       const childId = created.data.taskId;
       assert((await hold.entered) === childId, "the child's error handling is held");
 
+      // The error handling resumes right after the cascade's cleanup abandoned the child's retry
+      // loop, while the cascade still latches the child. (A retry it armed before that abandon
+      // would be cancelled by it.)
+      const abandon = workspaceService.abandonAutoRetry.bind(workspaceService);
+      spyOn(workspaceService, "abandonAutoRetry").mockImplementation((workspaceId, reason) => {
+        abandon(workspaceId, reason);
+        if (workspaceId !== childId) return;
+        assert(taskService.isWorkspaceStopInProgress(childId), "the cascade latches the child");
+        hold.release();
+      });
+
       const since = retries.from(childId);
-      const stopping = workspaceService.interruptStream(parentId, {
+      const stopped = await workspaceService.interruptStream(parentId, {
         disableAutoRetry: true,
         retireBashMonitorAttention: true,
       });
-      assert(
-        await waitFor(() => taskService.isWorkspaceStopInProgress(childId), 5_000),
-        "the cascade latches the child"
-      );
-      hold.release();
-      assert((await stopping).success, "the parent's Stop succeeds");
+      assert(stopped.success, "the parent's Stop succeeds");
       assert(
         await waitFor(() => workspaceService.getActiveTurnGeneration(childId) == null, 5_000),
         "the child's error handling ends"
       );
 
       expectRetryLoopEnded(env, childId, since);
+    });
+  }, 60_000);
+
+  test("a parent's Stop during a sub-agent's fired retry keeps the retry from starting a turn", async () => {
+    await withWorkspace(async (env, parentId) => {
+      useModel(env, failsOnceModel());
+      const { taskService, workspaceService } = env.services;
+      const retries = watchRetries(env);
+      const created = await createChild(env, parentId);
+      if (!created.success) throw new Error(created.error);
+      const childId = created.data.taskId;
+      await assertBackoffPending(env, retries, childId);
+
+      // Hold the fired retry before its resume, and the cascade's cleanup (which abandons the
+      // retry) until that resume returned: only the resume's own gate sees the child's latch.
+      const session = workspaceService.getOrCreateSession(childId);
+      const resume = session.resumeStream.bind(session);
+      const fired = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      const resumed = Promise.withResolvers<Awaited<ReturnType<typeof resume>>>();
+      spyOn(session, "resumeStream").mockImplementation(async (...args) => {
+        if (args[1]?.acceptanceOrigin !== "automatic") return resume(...args);
+        fired.resolve();
+        await proceed.promise;
+        const result = await resume(...args);
+        resumed.resolve(result);
+        return result;
+      });
+      const cleanupHost = taskService as unknown as {
+        runWorkspaceStopCleanup: (targets: readonly string[], ...rest: unknown[]) => Promise<void>;
+      };
+      const cleanup = cleanupHost.runWorkspaceStopCleanup.bind(taskService);
+      spyOn(cleanupHost, "runWorkspaceStopCleanup").mockImplementation(async (targets, ...rest) => {
+        if (targets.includes(childId)) {
+          assert(taskService.isWorkspaceStopInProgress(childId), "the cascade latched the child");
+          proceed.resolve();
+          await resumed.promise;
+        }
+        return cleanup(targets, ...rest);
+      });
+      await fired.promise;
+
+      const stopped = await workspaceService.interruptStream(parentId, {
+        disableAutoRetry: true,
+        retireBashMonitorAttention: true,
+      });
+      assert(stopped.success, "the parent's Stop succeeds");
+
+      const result = await resumed.promise;
+      expect({
+        started: result.success && result.data.started,
+        pending: workspaceService.hasPendingAutoRetry(childId),
+      }).toEqual({ started: false, pending: false });
     });
   }, 60_000);
 
@@ -355,7 +414,7 @@ describe("a Stop ends the auto-retry loop", () => {
   test("interrupting a queued workspace turn leaves the running turn's retry armed", async () => {
     await withWorkspace(async (env, ownerId) => {
       useModel(env, failsOnceModel());
-      const { workspaceService, workspaceTurnManager } = env.services;
+      const { taskService, workspaceService, workspaceTurnManager } = env.services;
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
       const running = await workspaceTurnManager.createWorkspaceTurn({
         ownerWorkspaceId: ownerId,
@@ -374,17 +433,39 @@ describe("a Stop ends the auto-retry loop", () => {
       });
       if (!queued.success) throw new Error(queued.error);
       assert(queued.data.status === "queued", "the second turn waits behind the running one");
+      // The running turn's error handling ends inside the interrupt's latch window: the
+      // interrupt latches the target for a queued handle too, until its method-level finally.
+      const queuedHandleId = queued.data.taskId;
+      const updateExecution =
+        workspaceTurnManager.updateAgentTaskExecutionState.bind(workspaceTurnManager);
+      let latchedRelease = false;
+      spyOn(workspaceTurnManager, "updateAgentTaskExecutionState").mockImplementation(
+        async (workspaceId, handleId, ...rest) => {
+          if (handleId === queuedHandleId && !latchedRelease) {
+            latchedRelease = true;
+            assert(
+              taskService.isWorkspaceStopInProgress(targetId),
+              "the interrupt latched the target"
+            );
+            hold.release();
+            assert(
+              await waitFor(
+                () => workspaceService.getActiveTurnGeneration(targetId) == null,
+                5_000
+              ),
+              "the running turn's error handling ends"
+            );
+          }
+          return updateExecution(workspaceId, handleId, ...rest);
+        }
+      );
 
       const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
         ownerId,
-        queued.data.taskId
+        queuedHandleId
       );
       assert(interrupted.success, "the queued turn's interrupt succeeds");
-      hold.release();
-      assert(
-        await waitFor(() => workspaceService.getActiveTurnGeneration(targetId) == null, 5_000),
-        "the running turn's error handling ends"
-      );
+      assert(latchedRelease, "the error handling ended inside the latch window");
 
       expect(workspaceService.hasPendingAutoRetry(targetId)).toBe(true);
     });

@@ -2510,8 +2510,9 @@ export class AgentSession {
     // Every Stop abandons a pending retry, but a workspace-turn interrupt drops its latch without
     // waiting for this handler, and a hard timeout of an idle task takes none: a retry armed now
     // would restart the stopped workspace. A Stop since the failed turn's stream started
-    // (autoRetryStops) or one still in progress ends the retry loop.
-    if (this.isStopInProgress() || this.autoRetryStops !== autoRetryStops) return;
+    // (autoRetryStops) ends the retry loop. The stop latch is no signal here: an interrupt of a
+    // queued workspace turn latches too, and must leave the running turn's retry alone.
+    if (this.autoRetryStops !== autoRetryStops) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -7932,10 +7933,17 @@ export class AgentSession {
       const handledByNestedSend = sendResult.failureHandled === true;
 
       if (!handledByNestedSend) {
-        await this.handleStreamFailureForAutoRetry({
-          type: failureType,
-          message: this.extractRetryFailureMessage(sendResult.error),
-        });
+        // A workspace-turn interrupt or a hard timeout stops without cancelCompaction, so
+        // admissionStale stays false and the dispatch fails as a retryable refusal: only the
+        // interrupted stream's Stop count shows that the turn was stopped.
+        await this.handleStreamFailureForAutoRetry(
+          {
+            type: failureType,
+            message: this.extractRetryFailureMessage(sendResult.error),
+          },
+          undefined,
+          streamContext.admissionAutoRetryStops
+        );
         await this.updateStartupAutoRetryAbandonFromFailure(
           failureType,
           continuation.interruptedUserMessageId
@@ -8773,28 +8781,48 @@ export class AgentSession {
     const failureType = error.type;
 
     if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
-      const failedUserMessageId = this.activeStreamUserMessageId;
-      const failedContext = this.activeStreamContext;
-      this.activeCompactionRequest = undefined;
-      this.resetActiveStreamState();
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: this.extractRetryFailureMessage(error),
-      });
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      // This failure has no stream error event, so handleStreamError's goal settlement never runs:
-      // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
-      // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
-      await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
+      await this.settleRuntimeFailureWithoutErrorEvent(turn, operation, failureType, error);
     } else {
       await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }), operation);
     }
 
     return { success: false, error, failureHandled: true };
+  }
+
+  /**
+   * A runtime failure without a pre-start error event, such as an emergency rollover's request
+   * preparation reports: no handleStreamError runs for it, so its retry decision, startup
+   * abandon marker and goal settlement happen here.
+   */
+  private async settleRuntimeFailureWithoutErrorEvent(
+    turn: TurnId,
+    operation: OperationId,
+    failureType: "runtime_not_ready" | "runtime_start_failed",
+    error: SendMessageError
+  ): Promise<void> {
+    const failedUserMessageId = this.activeStreamUserMessageId;
+    const failedContext = this.activeStreamContext;
+    this.activeCompactionRequest = undefined;
+    this.resetActiveStreamState();
+    // The failure comes after the turn's stream started (a remote runtime reports a Stop-aborted
+    // start as runtime_start_failed): a Stop since then arms no retry.
+    await this.handleStreamFailureForAutoRetry(
+      {
+        type: failureType,
+        message: this.extractRetryFailureMessage(error),
+      },
+      undefined,
+      failedContext?.admissionAutoRetryStops
+    );
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    // This failure has no stream error event, so handleStreamError's goal settlement never runs:
+    // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
+    // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
+    await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
   }
 
   private async streamWithHistory(

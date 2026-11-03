@@ -640,6 +640,32 @@ describe("pinned full-payload rollover admission", () => {
     }
   });
 
+  test("a Stop during an emergency rollover's runtime start arms no retry", async () => {
+    const fixture = await setup("deferred-schema", true);
+    const { h, service } = fixture;
+    // The rollover's request preparation reports a runtime failure without a pre-start error.
+    // A workspace-turn interrupt or a hard timeout lands while it waits for the runtime: it ends
+    // the retry loop, and the aborted runtime start fails as retryable runtime_start_failed.
+    spyOn(service, "prepareStreamMessage").mockImplementation(() => {
+      h.session.abandonAutoRetry("task_stopped");
+      return Promise.resolve(Err({ type: "runtime_start_failed", message: "Aborted" }));
+    });
+    const scheduled: string[] = [];
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "auto-retry-scheduled") scheduled.push(message.type);
+    });
+    try {
+      const result = await h.session.sendMessage("Small follow-up", { model, agentId: "exec" });
+      expect(result).toMatchObject({ success: false, error: { type: "runtime_start_failed" } });
+      expect({ pending: h.session.hasPendingAutoRetry(), scheduled }).toEqual({
+        pending: false,
+        scheduled: [],
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("real prepared tools retain a usable runtime after old sandbox and cache state is discarded", async () => {
     const getToolsForModel = toolsModule.getToolsForModel;
     const fixture = await setup("small");
