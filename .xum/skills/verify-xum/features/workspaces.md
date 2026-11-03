@@ -49,10 +49,11 @@ Preconditions:
   `agent-browser wait '[aria-label="Workspace name"]'`. The URL changes to
   `/project?project=demo-app-<hash>&draft=<id>`. Create `scratch-notes` the same way as above,
   with the message `Collect scratch notes`, and run `verify-xum.sh idle` after its reply.
-- **Open from the sidebar.** Run
+- **Open from the sidebar.** The app made up the workspace id at create time. Read it from
+  `config.json` in each bash call that needs it:
+  `RN_ID=$(verify-xum.sh workspace-field release-notes id)`. Run
   `agent-browser find role button click --name "Select workspace release-notes" --exact` and
-  `agent-browser wait --url "**/workspace/<release-notes id>"`. The URL is
-  `/workspace/<release-notes id>`. Run
+  `agent-browser wait --url "**/workspace/$RN_ID"`. The URL is `/workspace/$RN_ID`. Run
   `agent-browser find role button click --name "Select workspace Verify playground" --exact` and
   `agent-browser wait --url "**/workspace/$VERIFY_XUM_WORKSPACE_ID"`. The URL is
   `/workspace/$VERIFY_XUM_WORKSPACE_ID`.
@@ -62,14 +63,22 @@ Preconditions:
   `agent-browser press Enter`. The archive request is still running when Enter returns. Wait for
   its result with
   `agent-browser wait --fn '!document.querySelector("[aria-label=\"Select workspace release-notes\"]")'`.
-  The `Select workspace release-notes` row is gone, and in `$VERIFY_XUM_ROOT/config.json` the
-  `release-notes` entry has an `archivedAt` time. Capture `workspaces/archived`.
+  The `Select workspace release-notes` row is gone. Wait until the server has written the
+  archive:
+
+  ```bash
+  timeout 10 sh -c 'until [ -n "$(verify-xum.sh workspace-field release-notes archivedAt)" ]; do sleep 0.2; done'
+  ```
+
+  In `$VERIFY_XUM_ROOT/config.json` the `release-notes` entry has an `archivedAt` time. Capture
+  `workspaces/archived`.
+
 - **Archive with the keyboard.** Open `scratch-notes` from its row, run `verify-xum.sh idle`, and
   press Ctrl+Shift+Backspace. Run `agent-browser press Control+Shift+Backspace` and wait for the
   archive with
   `agent-browser wait --fn '!document.querySelector("[aria-label=\"Select workspace scratch-notes\"]")'`.
-  The `Select workspace scratch-notes` row is gone, and its `config.json` entry has an
-  `archivedAt` time.
+  The `Select workspace scratch-notes` row is gone. Wait for its `archivedAt` time with the same
+  `timeout 10` loop for `scratch-notes`.
 - **Restore.** Open the project page and the archived list. Run
   `agent-browser find role button click --name "Create workspace in demo-app" --exact`,
   `agent-browser wait '[aria-label="Expand archived workspaces"]'`,
@@ -77,9 +86,10 @@ Preconditions:
   `agent-browser wait '[aria-label="Restore workspace release-notes"]'`. The region
   `Archived workspaces` lists `release-notes` and `scratch-notes`. Run
   `agent-browser find role button click --name "Restore workspace release-notes" --exact`, then
-  wait for the result with `agent-browser wait --url "**/workspace/<release-notes id>"` and
+  wait for the result with `agent-browser wait --url "**/workspace/$RN_ID"` (`RN_ID` as in
+  **Open from the sidebar**) and
   `agent-browser wait '[aria-label="Select workspace release-notes"]'`. The app is on
-  `/workspace/<release-notes id>`, the sidebar row is back, and `config.json` has an
+  `/workspace/$RN_ID`, the sidebar row is back, and `config.json` has an
   `unarchivedAt` time for it. Capture `workspaces/restored`.
 - **CLI view.** List the workspaces through the CLI:
 

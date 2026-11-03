@@ -34,6 +34,10 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 
 - Open pages with `verify-xum.sh open <path>`. It adds the backend's auth token without putting
   it on any command line (SKILL.md Drive).
+- Read a workspace's id, or another field of its `config.json` entry, with
+  `verify-xum.sh workspace-field <name> <field>`, for example
+  `RN_ID=$(verify-xum.sh workspace-field release-notes id)`. The app makes up ids at create time,
+  and a shell variable is gone in the next bash call, so read it in each call that needs it.
 - Send a message in three steps: fill `Message`, run `verify-xum.sh send-ready`, then press Enter
   or choose `Send message`.
 - Use accessible names with `agent-browser find role <role> <action> --name "<name>" --exact`.

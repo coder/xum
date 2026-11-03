@@ -48,9 +48,10 @@ Preconditions:
   `agent-browser wait --text "math.ts"`. The file tree lists `src` and `math.ts` with `+3`, the
   hunk shows the three added lines of `sub`, and the tab reads `Review 0/1`. Capture
   `review/diff`.
-- **Mark as read.** Run `verify-xum.sh idle`, then
-  `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads
-  `Review 1/1`, and the hunk reads `Hunk marked as read`.
+- **Mark as read.** Run `verify-xum.sh idle` and
+  `agent-browser wait '[aria-label="Mark as read (M)"]'` (after a reload the hunk's button shows
+  late), then `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab
+  reads `Review 1/1`, and the hunk reads `Hunk marked as read`.
   `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has
   `"isRead": true` for that hunk within a second. Capture `review/read`.
 - **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the

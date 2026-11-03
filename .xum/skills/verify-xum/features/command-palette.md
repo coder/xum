@@ -22,16 +22,20 @@ Preconditions:
   [workspaces](./workspaces.md) recipe, or skip `palette-switch` and report it).
 - The app is open on `Verify playground`, and `verify-xum.sh idle` returned.
 
-- **Open and close.** Run `agent-browser press Control+Shift+P` and
-  `agent-browser wait '[aria-label="Command palette"]'`. The combobox `Command palette` is
-  expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`. The combobox is
-  gone.
-- **Switch workspace.** Press Ctrl+Shift+P, wait for the palette as above, then run
+- **Open and close.** Run `agent-browser press Control+Shift+P`,
+  `agent-browser wait '[aria-label="Command palette"]'` and
+  `agent-browser wait '[role="listbox"][aria-label="Suggestions"] [role="option"]'`: on the first
+  open of a page the list fills a moment after the combobox shows. The combobox
+  `Command palette` is expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`.
+  The combobox is gone.
+- **Switch workspace.** Read the id with `RN_ID=$(verify-xum.sh workspace-field release-notes id)`
+  (see [workspaces](./workspaces.md) **Open from the sidebar**). Press Ctrl+Shift+P, wait for the
+  palette as above, then run
   `agent-browser keyboard type "release"` and
   `agent-browser wait '[role="option"][aria-selected="true"][aria-label="release-notes"]'`.
   `Suggestions` lists the option `release-notes`, selected. Run `agent-browser press Enter` and
-  `agent-browser wait --url "**/workspace/<release-notes id>"`: the palette closes first and
-  navigates a moment later. The URL is `/workspace/<release-notes id>`. Capture
+  `agent-browser wait --url "**/workspace/$RN_ID"`: the palette closes first and navigates a
+  moment later. The URL is `/workspace/$RN_ID`. Capture
   `command-palette/switched`.
 - **Command mode.** Run `agent-browser press F4` and
   `agent-browser wait '[aria-label="Command palette"]'`. The combobox value is `>`, and
