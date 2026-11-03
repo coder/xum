@@ -96,7 +96,7 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     resolveXumEnvironmentValue("VITE_PREVIEW_PORT", env),
     DEFAULT_VITE_PREVIEW_PORT
   );
-  const backendSocket = resolveXumEnvironmentValue("BACKEND_SOCKET", env)?.trim();
+  const backendSocket = resolveXumEnvironmentValue("BACKEND_SOCKET", env);
   const backendHost = resolveXumEnvironmentValue("BACKEND_HOST", env) ?? DEFAULT_BACKEND_PROXY_HOST;
   const backendPort = parsePort(
     resolveXumEnvironmentValue("BACKEND_PORT", env),
@@ -110,8 +110,9 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     previewPort,
     backendHost,
     backendPort,
-    // A blank value (a recipe that exports it empty) is no socket.
-    backendSocket: backendSocket === "" ? undefined : backendSocket,
+    // A blank value (a recipe that exports it empty) is no socket. A path is never trimmed: the
+    // backend listens on the value as make exported it, so Vite must connect to the same bytes.
+    backendSocket: backendSocket?.trim() === "" ? undefined : backendSocket,
     enableTutorialsInSandbox: resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
   };
 }
