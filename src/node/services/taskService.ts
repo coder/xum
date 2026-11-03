@@ -174,6 +174,7 @@ import {
   isContextBudgetWarningMessage,
   type MuxMessage,
   type MuxMessageMetadata,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import {
   createCompactionSummaryMessageId,
@@ -4009,6 +4010,16 @@ export class TaskService implements AgentTaskIntegration {
   /** AgentTaskIntegration: a stop cascade holds the workspace's latch. */
   isWorkspaceStopInProgress(workspaceId: string): boolean {
     return this.taskStopLatch.isWorkspaceStopInProgress(workspaceId);
+  }
+
+  /** AgentTaskIntegration (see WorkspaceTurnManager.isWorkspaceTurnStopped). */
+  async isWorkspaceTurnStopped(
+    workspaceId: string,
+    correlation: WorkspaceTurnTaskCorrelation
+  ): Promise<boolean> {
+    return (
+      (await this.workspaceTurnManager?.isWorkspaceTurnStopped(workspaceId, correlation)) === true
+    );
   }
 
   /** Tests spy on this; TaskStopLatch owns Phase B. */
@@ -15951,6 +15962,8 @@ export class TaskService implements AgentTaskIntegration {
       } catch (error: unknown) {
         log.debug("failAgentTaskForHardTimeout: clearQueue threw", { taskId, error });
       }
+      // An idle task in its backoff gets no stop record below, so end its retry loop here.
+      this.workspaceService.abandonAutoRetry(taskId, "task_failed");
       try {
         await this.aiService.stopStream(taskId, {
           abandonPartial: true,
@@ -21647,6 +21660,7 @@ export class TaskService implements AgentTaskIntegration {
         label: "failAgentTaskTerminally",
         abandonPartial: false,
         clearQueue: true,
+        retryAbandonReason: "task_failed",
       });
     } else {
       this.workspaceService.clearQueue(workspaceId);

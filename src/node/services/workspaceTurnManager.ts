@@ -80,6 +80,7 @@ import {
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
@@ -1073,6 +1074,32 @@ export class WorkspaceTurnManager {
     handleId: string
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+  }
+
+  /**
+   * Whether an explicit Stop ended this workspace turn: interruptWorkspaceTurn and a user abort
+   * write the handle `interrupted` without an error, before they stop anything. Restart recovery
+   * and supersedes interrupt with an error, and those turns may continue. A missing, corrupt or
+   * newer-schema record reads as stopped; other read errors reject.
+   */
+  async isWorkspaceTurnStopped(
+    workspaceId: string,
+    correlation: WorkspaceTurnTaskCorrelation
+  ): Promise<boolean> {
+    const record = await this.taskHandleStore.getWorkspaceTurn(
+      correlation.ownerWorkspaceId,
+      correlation.taskHandleId
+    );
+    // No readable record: removing the owner deletes its session folder, which holds the handles,
+    // or the record is corrupt or from a newer schema. Nothing shows that the turn may go on, so
+    // its tail stays stopped.
+    if (record == null) return true;
+    return (
+      record.workspaceId === workspaceId &&
+      record.turnId === correlation.turnId &&
+      record.status === "interrupted" &&
+      record.error == null
+    );
   }
 
   private nextWorkspaceTurnCreatedAt(): string {
@@ -3865,7 +3892,7 @@ export class WorkspaceTurnManager {
             };
             await lock.assertStillOwned();
             await this.taskHandleStore.upsertWorkspaceTurn(next);
-            // F4: latch in the same await-free segment as the `interrupted` write, inside the
+            // F4: latch with no await between the write completing and the latch, inside the
             // lock (both calls are synchronous), so an owner send at its final admission gate is
             // already stale once the record reads `interrupted`; latching after the lock's
             // release let it be accepted as a continuation of the interrupted turn. The level
@@ -3932,6 +3959,9 @@ export class WorkspaceTurnManager {
         }
       }
       if (shouldStopStream && workspaceId != null) {
+        // A backoff left armed would restart the interrupted turn once the latch drops. A queued
+        // handle owns no turn, so the target's running turn keeps its retry.
+        this.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
         try {
           await this.aiService.stopStream(workspaceId, { abandonPartial: false });
         } catch (error: unknown) {
