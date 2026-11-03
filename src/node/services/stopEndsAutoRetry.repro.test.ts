@@ -9,6 +9,7 @@ import { createConfigStores } from "@/node/config";
 import { AgentSession } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import { ServiceContainer } from "@/node/services/serviceContainer";
+import type { TaskHandleStore } from "@/node/services/taskHandleStore";
 import type {
   ProviderModelFactory,
   ResolveAndCreateModelResult,
@@ -800,6 +801,68 @@ describe("a Stop ends the auto-retry loop", () => {
       const restarted = await restart(env, model, turn.workspaceId);
       try {
         expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a restart still resumes a workspace turn that restart recovery settled as interrupted", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      const record = await env.services.workspaceTurnManager.getWorkspaceTurnRecord(
+        ownerId,
+        turn.taskId
+      );
+      assert(record?.status === "running", "the failed turn's handle is running");
+
+      // The restarted backend settles the stale handle before the target's startup recovery reads
+      // it, as settleStaleWorkspaceTurn does: `interrupted`, with an error. Nobody stopped the turn.
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        const store = (
+          services.workspaceTurnManager as unknown as { taskHandleStore: TaskHandleStore }
+        ).taskHandleStore;
+        await store.upsertWorkspaceTurn({
+          ...record,
+          status: "interrupted",
+          updatedAt: new Date().toISOString(),
+          error: "Workspace turn interrupted after restart",
+        });
+      });
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(true);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a crash after a manual retry of a stopped turn does not resume the turn", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const { aiService, workspaceService } = env.services;
+      const turn = await startFailedTurn(env, ownerId);
+      await interruptTurn(env.services, ownerId, turn.taskId);
+
+      // The user retries the stopped tail by hand, and the backend exits while it streams.
+      const resumed = await workspaceService.resumeStream(turn.workspaceId, {
+        model: HAIKU_MODEL,
+        agentId: "exec",
+      });
+      assert(resumed.success && resumed.data.started, "the manual retry starts");
+      assert(await waitFor(() => aiService.isStreaming(turn.workspaceId), 20_000), "it streams");
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect({
+          pending: restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          streaming: restarted.aiService.isStreaming(turn.workspaceId),
+        }).toEqual({ pending: false, streaming: false });
       } finally {
         await restarted.dispose();
         await restarted.shutdown();
