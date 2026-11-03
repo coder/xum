@@ -142,13 +142,26 @@ private_run_dir() {
   echo "$run"
 }
 
+# Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which another
+# account can write in a shared repository: a symlink planted there made `9>` truncate its target.
+# The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
+# only, which can neither create nor truncate anything (flock needs no write access). Then fd 9
+# must be the regular file of this user that the path names.
+open_launch_guard() {
+  [[ -e $LAUNCH_GUARD || -L $LAUNCH_GUARD ]] || (set -C && : >"$LAUNCH_GUARD") 2>/dev/null || true
+  [[ -f $LAUNCH_GUARD && ! -L $LAUNCH_GUARD ]] || die "$LAUNCH_GUARD is not a regular file (a symlink?). Remove it."
+  exec 9<"$LAUNCH_GUARD"
+  [[ $(stat -L -c '%d:%i:%u' /proc/self/fd/9) == "$(stat -c '%d:%i' -- "$LAUNCH_GUARD"):$(id -u)" ]] \
+    || die "$LAUNCH_GUARD is not owned by user $(id -u), or it changed while it was opened. Remove it."
+}
+
 # One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
 # run's process group, which records its own id in that run's state.env before it starts the
 # server. The flock keeps two launches from passing the check at once, and it also covers the
 # moment between the spawn and that record: the new group holds the flock until it has written
 # its id, wherever the launcher dies. The server does not inherit it.
 refuse_while_checkout_server_runs() {
-  exec 9>"$LAUNCH_GUARD"
+  open_launch_guard
   # Part of the launch deadline: a short VERIFY_XUM_READY_TIMEOUT also bounds this wait.
   flock -w "$(launch_seconds_left)" 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
   [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
@@ -311,7 +324,7 @@ launch_failed() {
     # anew and let cleanup read the id. Without it cleanup would drop the newest-run link while
     # the server starts, and the next launch would start a second one.
     exec 9>&-
-    exec 9>"$LAUNCH_GUARD"
+    open_launch_guard
     if ! flock -w 10 9; then
       echo "verify-xum: the new process group did not record its id in 10 s. The newest-run link stays: run verify-xum.sh cleanup." >&2
       return 0
