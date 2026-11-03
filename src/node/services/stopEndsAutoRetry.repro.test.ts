@@ -1014,6 +1014,27 @@ describe("a Stop ends the auto-retry loop", () => {
         }),
     },
     {
+      row: "a legacy compaction request (continueMessage)",
+      build: (turnMetadata: MuxMessageMetadata) =>
+        createMuxMessage("legacy-compaction-request", "user", "Summarize", {
+          synthetic: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            source: "auto-compaction",
+            // Older builds stored the follow-up under `continueMessage`.
+            parsed: {
+              continueMessage: {
+                text: "Continue",
+                model: HAIKU_MODEL,
+                agentId: "exec",
+                muxMetadata: turnMetadata,
+              },
+            } as unknown as CompactionRequestData,
+          },
+        }),
+    },
+    {
       row: "a child's completed report",
       build: () =>
         createMuxMessage(
@@ -1278,8 +1299,8 @@ describe("a Stop ends the auto-retry loop", () => {
       try {
         const { aiService, workspaceService, workspaceTurnManager } = restarted;
         const retries = watchRetries({ ...env, services: restarted });
-        // The user writes in the turn's workspace after the restart: the turn is no longer
-        // its newest prompt, so nothing resumes the turn.
+        // The user writes in the turn's workspace after the restart: a retry now replays the
+        // user's row, not the turn's, so nothing resumes the turn.
         const sent = await workspaceService.sendMessage(turn.workspaceId, "Do something else", {
           model: HAIKU_MODEL,
           agentId: "exec",
@@ -1296,16 +1317,19 @@ describe("a Stop ends the auto-retry loop", () => {
 
         // The newer turn must not see a stop in progress (stoppedSince, goal advancement).
         const latch = spyOn(restarted.taskService, "latchWorkspaceStopsInProgress");
+        const epoch = restarted.taskService.getWorkspaceStopEpoch(turn.workspaceId);
         await interruptTurn(restarted, ownerId, turn.taskId);
 
         const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
         expect({
           streaming: aiService.isStreaming(turn.workspaceId),
           latched: latch.mock.calls.length,
+          epochMoved: restarted.taskService.getWorkspaceStopEpoch(turn.workspaceId) !== epoch,
           handle: { status: record?.status, error: record?.error },
         }).toEqual({
           streaming: true,
           latched: 0,
+          epochMoved: false,
           handle: { status: "interrupted", error: "Workspace turn interrupted after restart" },
         });
       } finally {
@@ -1350,11 +1374,168 @@ describe("a Stop ends the auto-retry loop", () => {
           }
         );
 
+        const epoch = restarted.taskService.getWorkspaceStopEpoch(turn.workspaceId);
         interrupting = true;
         await interruptTurn(restarted, ownerId, turn.taskId);
 
         assert(sent?.success === true, "the user's message is sent");
-        expect(aiService.isStreaming(turn.workspaceId)).toBe(true);
+        // The second read finds the user's row: the interrupt drops its latch and bumps nothing.
+        expect({
+          streaming: aiService.isStreaming(turn.workspaceId),
+          stopInProgress: restarted.taskService.isWorkspaceStopInProgress(turn.workspaceId),
+          epochMoved: restarted.taskService.getWorkspaceStopEpoch(turn.workspaceId) !== epoch,
+        }).toEqual({ streaming: true, stopInProgress: false, epochMoved: false });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a user's send during a turn interrupt's second read is refused, not aborted", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { aiService, workspaceService, workspaceTurnManager } = restarted;
+        const { historyService } = restarted as unknown as { historyService: HistoryService };
+        const read = historyService.getHistoryFromLatestBoundary.bind(historyService);
+        let reads = 0;
+        let sent: Awaited<ReturnType<typeof workspaceService.sendMessage>> | undefined;
+        // Both reads find the turn's prompt newest. The send starts while the second one runs.
+        spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          async (workspaceId, ...rest) => {
+            const history = await read(workspaceId, ...rest);
+            if (reads > 0 && workspaceId === turn.workspaceId && (reads += 1) === 3) {
+              sent = await workspaceService.sendMessage(turn.workspaceId, "Do something else", {
+                model: HAIKU_MODEL,
+                agentId: "exec",
+              });
+            }
+            return history;
+          }
+        );
+
+        reads = 1;
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        assert(sent != null, "the user's send ran during the second read");
+        const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        expect({
+          sendAccepted: sent.success,
+          streaming: aiService.isStreaming(turn.workspaceId),
+          handle: { status: record?.status, error: record?.error },
+        }).toEqual({
+          sendAccepted: false,
+          streaming: false,
+          handle: { status: "interrupted", error: undefined },
+        });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a rejected second read leaves no stop latch behind", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { historyService } = restarted as unknown as { historyService: HistoryService };
+        const read = historyService.getHistoryFromLatestBoundary.bind(historyService);
+        let reads = 0;
+        spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          async (workspaceId, ...rest) => {
+            if (reads > 0 && workspaceId === turn.workspaceId && (reads += 1) === 3) {
+              throw new Error("history read crashed");
+            }
+            return read(workspaceId, ...rest);
+          }
+        );
+
+        reads = 1;
+        const interrupted = await restarted.workspaceTurnManager
+          .interruptWorkspaceTurn(ownerId, turn.taskId)
+          .then(
+            () => "returned",
+            () => "rejected"
+          );
+
+        expect({
+          interrupted,
+          stopInProgress: restarted.taskService.isWorkspaceStopInProgress(turn.workspaceId),
+        }).toEqual({ interrupted: "rejected", stopInProgress: false });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a failed handle write keeps the restart outcome's wake", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId, "notify_on_terminal");
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { workspaceTurnManager } = restarted;
+        const internals = workspaceTurnManager as unknown as {
+          taskHandleStore: TaskHandleStore;
+          terminalAttentionStore: TerminalAttentionStore;
+        };
+        const wakesForTurn = async () =>
+          (await internals.terminalAttentionStore.listPending(ownerId)).filter(
+            (wake) => wake.sourceId === turn.taskId
+          );
+        assert((await wakesForTurn()).length > 0, "restart recovery queued a wake");
+        const upsert = internals.taskHandleStore.upsertWorkspaceTurn.bind(
+          internals.taskHandleStore
+        );
+        let failedWrite = false;
+        // Only the Stop's own write (no error) fails.
+        spyOn(internals.taskHandleStore, "upsertWorkspaceTurn").mockImplementation(
+          async (record) => {
+            if (!failedWrite && record.handleId === turn.taskId && record.error == null) {
+              failedWrite = true;
+              throw new Error("disk full");
+            }
+            return upsert(record);
+          }
+        );
+
+        const interrupted = await workspaceTurnManager
+          .interruptWorkspaceTurn(ownerId, turn.taskId)
+          .then(
+            () => "returned",
+            () => "rejected"
+          );
+
+        const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        assert(failedWrite, "the Stop's handle write failed");
+        expect({
+          interrupted,
+          error: record?.error,
+          wakes: (await wakesForTurn()).length,
+        }).toEqual({
+          interrupted: "rejected",
+          error: "Workspace turn interrupted after restart",
+          wakes: 1,
+        });
       } finally {
         await restarted.dispose();
         await restarted.shutdown();
@@ -1396,6 +1577,56 @@ describe("a Stop ends the auto-retry loop", () => {
           sendAccepted: sent.success,
           streaming: aiService.isStreaming(turn.workspaceId),
         }).toEqual({ sendAccepted: false, streaming: false });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a restart after interrupting a turn whose tail is its automatic compaction does not resume it", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      const { historyService } = env.services as unknown as { historyService: HistoryService };
+      const history = await historyService.getHistoryFromLatestBoundary(turn.workspaceId);
+      const turnMetadata = history.success
+        ? history.data.find((row) => row.metadata?.muxMetadata?.type === "workspace-turn-task")
+            ?.metadata?.muxMetadata
+        : undefined;
+      assert(turnMetadata != null, "the turn's prompt is in its history");
+      // The turn's stream ran into a mid-stream compaction: its request is the tail that a
+      // retry replays, and its follow-up carries the turn.
+      const compaction = createMuxMessage("auto-compaction-request", "user", "Summarize", {
+        synthetic: true,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          source: "auto-compaction",
+          parsed: {
+            followUpContent: {
+              text: "Continue",
+              model: HAIKU_MODEL,
+              agentId: "exec",
+              muxMetadata: turnMetadata,
+              dispatchOptions: { source: "internal-resume" },
+            },
+          },
+        },
+      });
+      assert(
+        (await historyService.appendToHistory(turn.workspaceId, compaction)).success,
+        "the compaction request is the turn's tail"
+      );
+      await interruptTurn(env.services, ownerId, turn.taskId);
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect({
+          pending: restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          streaming: restarted.aiService.isStreaming(turn.workspaceId),
+        }).toEqual({ pending: false, streaming: false });
       } finally {
         await restarted.dispose();
         await restarted.shutdown();

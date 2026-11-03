@@ -269,6 +269,7 @@ import type { ContextDispatchRequest, CompactionContinuation } from "./contextMa
 import {
   findLastRetryUserMessage,
   isSyntheticGoalPauseBoundaryMessage,
+  retriedWorkspaceTurn,
   isVisibleCompletedSubagentReportMessage,
   shouldUseUserMessageForRetry,
 } from "./retryUserMessage";
@@ -3542,10 +3543,9 @@ export class AgentSession {
    * after this read bumps the retry generation, so the arm refuses.
    */
   private async startupWorkspaceTurnOutcome(
-    retryMetadata: MuxMessageMetadata | undefined,
+    workspaceTurn: WorkspaceTurnTaskCorrelation | null,
     isCurrent: () => boolean
   ): Promise<StartupRecoveryOutcome | undefined> {
-    const workspaceTurn = parseWorkspaceTurnTaskCorrelation(retryMetadata);
     if (workspaceTurn == null) return undefined;
     let stopped: boolean;
     try {
@@ -3619,7 +3619,10 @@ export class AgentSession {
 
     const triggerOutcome =
       this.startupHeartbeatOutcome(retryMetadata) ??
-      (await this.startupWorkspaceTurnOutcome(retryMetadata, isCurrent));
+      (await this.startupWorkspaceTurnOutcome(
+        retriedWorkspaceTurn(startupRetryUserMessage),
+        isCurrent
+      ));
     if (triggerOutcome != null) return triggerOutcome;
 
     if (this.startupAutoRetryAbandon) {

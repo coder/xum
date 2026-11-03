@@ -29,6 +29,7 @@ import type { AIService } from "@/node/services/aiService";
 import {
   buildWorkspaceAgentContext,
   workspaceTurnTerminalAttentionSuppressed,
+  workspaceTurnWakeReplacedByStop,
   type WorkspaceTurnCreateArgs,
   type WorkspaceTurnManager,
 } from "@/node/services/workspaceTurnManager";
@@ -3143,8 +3144,9 @@ function classifyWorkflowGroupRevalidation(
 }
 
 /**
- * Partitions the reread workspace-turn candidates: a suppressed handle is marked superseded later,
- * a backed-off non-workflow batch sits out the drain, and every other candidate is delivered.
+ * Partitions the reread workspace-turn candidates: a suppressed handle, or a wake for an outcome
+ * that an explicit Stop replaced, is marked superseded later, a backed-off non-workflow batch sits
+ * out the drain, and every other candidate is delivered.
  */
 function partitionWorkspaceTurnWakeCandidates(revalidation: TerminalWakeRevalidation): {
   deliverableWorkspaceTurnNotificationIds: Set<string>;
@@ -3156,7 +3158,11 @@ function partitionWorkspaceTurnWakeCandidates(revalidation: TerminalWakeRevalida
   const suppressedNotificationIds: string[] = [];
   revalidation.workspaceTurnCandidates.forEach((candidate, index) => {
     const record = revalidation.candidateRecords[index];
-    if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+    if (
+      record != null &&
+      (workspaceTurnTerminalAttentionSuppressed(record) ||
+        workspaceTurnWakeReplacedByStop(candidate.notification, record))
+    ) {
       suppressedNotificationIds.push(candidate.notification.id);
       return;
     }

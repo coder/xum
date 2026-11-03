@@ -28,7 +28,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
-import { findLastRetryUserMessage } from "@/node/services/retryUserMessage";
+import { findLastRetryUserMessage, retriedWorkspaceTurn } from "@/node/services/retryUserMessage";
 import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -76,7 +76,6 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
-  getCompactionFollowUpContent,
   isContextBudgetWarningMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
@@ -143,6 +142,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import {
   TerminalAttentionStore,
+  type TerminalAttentionNotification,
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
 
@@ -579,6 +579,36 @@ export function workspaceTurnTerminalAttentionSuppressed(
 }
 
 /**
+ * A terminal outcome's version. A handle can self-heal from an error into a corrected completion,
+ * so a wake names the exact outcome it announces and an in-flight stale drain cannot transition
+ * the replacement's notification.
+ */
+function workspaceTurnTerminalOutcomeGenerationId(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
+): string {
+  return `${record.handleId}:${record.status}:${record.updatedAt}`;
+}
+
+/**
+ * Whether a pending wake announces an outcome that an explicit Stop replaced (a restart
+ * recovery outcome). The Stop is quiet, and its delete of that wake cannot retract a drain's
+ * listPending snapshot, so the drain's reread of the record decides. A wake for the Stop's own
+ * outcome still notifies. A legacy wake names no generation: it counts as replaced when it is
+ * older than the Stop's write, the timestamp test that
+ * recoverTerminalWorkspaceTurnAttentionNotifications applies to legacy wakes.
+ */
+export function workspaceTurnWakeReplacedByStop(
+  notification: Pick<TerminalAttentionNotification, "generationId" | "createdAt">,
+  record: WorkspaceTurnTaskHandleRecord
+): boolean {
+  if (record.status !== "interrupted" || record.error != null) return false;
+  // An unparsable time compares false, so that wake still notifies.
+  return notification.generationId == null
+    ? Date.parse(notification.createdAt) < Date.parse(record.updatedAt)
+    : notification.generationId !== workspaceTurnTerminalOutcomeGenerationId(record);
+}
+
+/**
  * True when the direct parent initiated the superseding follow-up and needs no
  * failure envelope: the outcome is the expected consequence of its own
  * follow-up (announced in that follow-up's task tool result). When parent ≠
@@ -630,6 +660,14 @@ function isSelfHealEligibleSettledWorkspaceTurn(
     // self-heal eligible: late correlated evidence proves the turn continued.
     isSupersededWorkspaceTurnInterrupt(record)
   );
+}
+
+/** The error and delivery markers of a settled outcome that `next` replaces. */
+function retireSettledOutcomeFields(next: WorkspaceTurnTaskHandleRecord): void {
+  delete next.error;
+  delete next.directParentResultDeliveryRequiredAt;
+  delete next.directParentResultDeliveredAt;
+  delete next.terminalAttentionNotifiedAt;
 }
 
 /**
@@ -1146,25 +1184,32 @@ export class WorkspaceTurnManager {
   ): Promise<(() => void) | undefined> {
     if (await this.isSupersededRestartInterrupt(record)) return undefined;
     const release = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
-    if (!(await this.isSupersededRestartInterrupt(record))) return release;
-    release();
-    return undefined;
+    // A rejected read must not leave the workspace latched: nothing else holds this release.
+    let superseded = true;
+    try {
+      superseded = await this.isSupersededRestartInterrupt(record);
+    } finally {
+      if (superseded) release();
+    }
+    return superseded ? undefined : release;
   }
 
   /**
-   * Whether a resume of the row that auto-retry and startup recovery replay continues this turn.
-   * A compaction request (mid-stream, or a send compacted first) resumes into its follow-up. That
-   * follow-up carries the turn's correlation in `workspaceTurnMetadata` when another trigger (a
-   * wake) owns its `muxMetadata`. Unreadable history: the Stop wins.
+   * Whether a resume of the row that auto-retry and startup recovery replay continues this turn
+   * (retriedWorkspaceTurn, which startup recovery's Stop check reads too). Unreadable history:
+   * the Stop wins.
    */
   private async ownsRetryRow(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
     const history = await this.historyService.getHistoryFromLatestBoundary(record.workspaceId);
     if (!history.success) return true;
-    const muxMetadata = findLastRetryUserMessage(history.data)?.metadata?.muxMetadata;
-    const followUp = getCompactionFollowUpContent(muxMetadata);
-    return this.matchesWorkspaceTurnRecord(
-      record,
-      followUp == null ? muxMetadata : (followUp.workspaceTurnMetadata ?? followUp.muxMetadata)
+    const turn = retriedWorkspaceTurn(findLastRetryUserMessage(history.data));
+    return (
+      turn != null &&
+      isSameWorkspaceTurnTaskCorrelation(turn, {
+        taskHandleId: record.handleId,
+        ownerWorkspaceId: record.ownerWorkspaceId,
+        turnId: record.turnId,
+      })
     );
   }
 
@@ -2710,9 +2755,7 @@ export class WorkspaceTurnManager {
   workspaceTurnTerminalAttentionGenerationId(
     record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
   ): string {
-    // A handle can self-heal from an error into a corrected completion. Include the exact terminal
-    // outcome version so an in-flight stale drain cannot transition the replacement notification.
-    return `${record.handleId}:${record.status}:${record.updatedAt}`;
+    return workspaceTurnTerminalOutcomeGenerationId(record);
   }
 
   private workspaceTurnTerminalAttentionIds(
@@ -3781,10 +3824,29 @@ export class WorkspaceTurnManager {
     settled: WorkspaceTurnTaskHandleRecord,
     next: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
-    delete next.error;
-    delete next.directParentResultDeliveryRequiredAt;
-    delete next.directParentResultDeliveredAt;
-    delete next.terminalAttentionNotifiedAt;
+    retireSettledOutcomeFields(next);
+    await this.deleteSettledOutcomeWakes(settled);
+  }
+
+  /**
+   * After a Stop's record replaced a restart recovery outcome: that outcome's stored wake, so it
+   * does not wake the owner. Only once the record is written, so a failed write keeps the outcome
+   * and its wake together. Best effort: the Stop is already written and must still stop the turn.
+   */
+  private async deleteReplacedRestartWakes(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    if (record.status !== "interrupted") return;
+    try {
+      await this.deleteSettledOutcomeWakes(record);
+    } catch (error: unknown) {
+      log.warn("interruptWorkspaceTurn: could not delete the restart outcome's wake", {
+        handleId: record.handleId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /** The stored notifications of a settled outcome (see retireSettledOutcome). */
+  private async deleteSettledOutcomeWakes(settled: WorkspaceTurnTaskHandleRecord): Promise<void> {
     await this.deleteWorkspaceTurnTerminalAttention(settled);
     await this.deletePersistentChildWorkspaceTurnAttention(settled);
   }
@@ -3969,13 +4031,14 @@ export class WorkspaceTurnManager {
               status: "interrupted",
               updatedAt: getIsoNow(),
             };
-            // An explicit Stop's record carries no error (isWorkspaceTurnStopped), and the restart
-            // recovery outcome it replaces must not wake the owner.
-            if (record.status === "interrupted") await this.retireSettledOutcome(record, next);
+            // An explicit Stop's record carries no error (isWorkspaceTurnStopped) and no delivery
+            // markers of an outcome it replaces.
+            retireSettledOutcomeFields(next);
             await lock.assertStillOwned();
             await this.taskHandleStore.upsertWorkspaceTurn(next);
             // A turn admitted before the latch fails its start fence after this bump.
             this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
+            await this.deleteReplacedRestartWakes(record);
             return Ok({ workspaceId: record.workspaceId, next });
           }
         );
