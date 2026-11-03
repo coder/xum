@@ -402,8 +402,10 @@ StartupArms ==
 \* Restart recovery (settleStaleWorkspaceTurn, from the startup stale-turn sweep or any
 \* active-turn scan) finds nothing of the turn live and writes the handle `interrupted` with
 \* an error. Nobody stopped the turn: startup recovery still resumes it. The code sees no
-\* live work while a startup recovery runs, since its session is not registered yet.
+\* live work while a startup recovery runs, since its session is not registered yet. Only a
+\* turn Stop reads the difference, so the other configs skip this step.
 StaleSettles ==
+  /\ "turn" \in StopKinds
   /\ handle = "running" /\ ~Busy /\ fiber = "none" /\ rpc = "idle"
   /\ handle' = "stale"
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
