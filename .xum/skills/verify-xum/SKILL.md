@@ -146,7 +146,11 @@ else `$HOME/.cache/verify-xum`, and never to a shared TMPDIR. Launch creates it 
 Every command that reads a run's `state.env` first checks that the home and the run folder are
 real folders (no symlinks), owned by you and not writable by group or others, and refuses
 otherwise: the script sources that file. Cleanup never
-deletes the evidence or the server log next to it (`<run>/server.log`).
+deletes the evidence or the server log next to it (`<run>/server.log`). Evidence is meant to be
+shared: `capture` replaces the backend's auth token (and any `token=` URL value) with
+`<redacted>` in the URL and snapshot it writes, and cleanup does the same in every text file of
+the evidence and in the server log. A screenshot is not redacted, so do not capture a page that
+shows the token.
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh capture chat/reply
