@@ -39,7 +39,9 @@ VARIABLES
   cancelDebt,  \* a ui/api Stop's compaction cancellation record: blocks automatic recovery
   resumed,          \* ghost: an auto-retry started a turn
   resumedAfterStop, \* ghost: an auto-retry started a turn after the Stop began
-  handle,      \* the workspace-turn handle of the tail is `interrupted` on disk (task-handles)
+  handle,      \* the tail's workspace-turn handle on disk (task-handles): "running"; "stale", which
+               \* restart recovery wrote (`interrupted` with an error); or "stopped", which a turn
+               \* interrupt wrote (`interrupted` without an error)
   boot,        \* "first" | "restarted" | "recovering" | "scheduling" | "checking" | "recovered"
   sCap,        \* the retry generation that scheduleStartupAutoRetryIfNeeded captured
   hSeen        \* the handle state that scheduleStartupAutoRetryIfNeeded read
@@ -70,7 +72,7 @@ TypeOK ==
   /\ optOut \in {"none", "loading", "done"} /\ cancelDebt \in BOOLEAN
   /\ stops \in Nat /\ pStops \in Nat /\ sStops \in Nat
   /\ resumed \in BOOLEAN /\ resumedAfterStop \in BOOLEAN
-  /\ handle \in BOOLEAN /\ hSeen \in BOOLEAN
+  /\ handle \in {"running", "stale", "stopped"} /\ hSeen \in BOOLEAN
   /\ boot \in {"first", "restarted", "recovering", "scheduling", "checking", "recovered"}
   /\ sCap \in Nat
 
@@ -93,7 +95,7 @@ Init ==
   /\ rpc = "idle" /\ rGen = 0 /\ rStopGen = 0
   /\ stopGen = 0 /\ latch = 0 /\ stops = 0 /\ pStops = 0 /\ sStops = 0 /\ stop = "none" /\ spc = "none" /\ optOut = "none"
   /\ cancelDebt = FALSE /\ resumed = FALSE /\ resumedAfterStop = FALSE
-  /\ handle = FALSE /\ boot = "first" /\ sCap = 0 /\ hSeen = FALSE
+  /\ handle = "running" /\ boot = "first" /\ sCap = 0 /\ hSeen = FALSE
 
 (* Every retryGeneration bump makes a fired retry stale: from then on its gate *)
 (* refuses and its reschedule is a no-op, so it changes nothing. The model     *)
@@ -237,7 +239,7 @@ StopBegins(k) ==
             /\ spc' = "cleanup"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "turn" ->
-            /\ handle' = TRUE /\ latch' = latch + 1 /\ UNCHANGED stops
+            /\ handle' = "stopped" /\ latch' = latch + 1 /\ UNCHANGED stops
             /\ spc' = "turnCleanup"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "timeout" ->
@@ -379,7 +381,7 @@ StartupSchedules ==
 \* handleStreamFailureForAutoRetry's reads follow.
 StartupReads ==
   /\ boot = "scheduling"
-  /\ boot' = "checking" /\ hSeen' = handle
+  /\ boot' = "checking" /\ hSeen' = (handle = "stopped")
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
                  stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed,
                  resumedAfterStop, handle, sCap>>
@@ -397,6 +399,17 @@ StartupArms ==
                  pStops, sStops, stop, spc, optOut, cancelDebt, resumed, resumedAfterStop, handle,
                  sCap, hSeen>>
 
+\* Restart recovery (settleStaleWorkspaceTurn, from the startup stale-turn sweep or any
+\* active-turn scan) finds nothing of the turn live and writes the handle `interrupted` with
+\* an error. Nobody stopped the turn: startup recovery still resumes it. The code sees no
+\* live work while a startup recovery runs, since its session is not registered yet.
+StaleSettles ==
+  /\ handle = "running" /\ ~Busy /\ fiber = "none" /\ rpc = "idle"
+  /\ handle' = "stale"
+  /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
+                 stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed,
+                 resumedAfterStop, boot, sCap, hSeen>>
+
 -----------------------------------------------------------------------------
 
 \* Nothing is left to happen: no backoff, no fired retry, no policy, no Stop in progress.
@@ -411,7 +424,7 @@ Next ==
   \/ TaskCleanupAbandons \/ StopAbortsStream \/ StopJoinsPolicy \/ StopReleases
   \/ OptOutApplies \/ TaskStopReleases \/ TurnAbandons \/ TurnStopReleases
   \/ TimeoutFails \/ Restart \/ StartupBegins \/ StartupSchedules \/ StartupReads
-  \/ StartupArms
+  \/ StartupArms \/ StaleSettles
   \/ Settled
 
 Spec == Init /\ [][Next]_vars
