@@ -536,28 +536,31 @@ cmd_workspace_field() {
 # ?token= in its URL when the app fails before it strips it. This replaces the token (raw, and
 # URL-encoded as a path part and as a form value) and the value of any token= query parameter
 # with <redacted>. With no PATH it filters stdin to stdout. With PATHs it rewrites each text file
-# under them in place, skipping binary files and symlinks. The token comes from server.lock,
-# never from argv.
+# under them in place, skipping binary files and symlinks. The token is $REDACT_TOKEN when set
+# (cleanup reads it before the sandbox deletes server.lock), else server.lock's. node gets it on
+# fd 3, never in argv.
+REDACT_TOKEN=
 redact_token() { # redact_token [PATH...]
+  local token=$REDACT_TOKEN
+  [[ -n $token ]] || token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
   # shellcheck disable=SC2016 # $1 is the regex group, for node
   node -e '
     const fs = require("fs");
     const path = require("path");
-    let token = "";
-    try {
-      token = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).token ?? "";
-    } catch {}
+    const token = fs.readFileSync(3, "utf8");
     const forms = [...new Set([token, encodeURIComponent(token), new URLSearchParams({ t: token }).toString().slice(2)])].filter(Boolean);
     const redact = (text) => {
       for (const form of forms) text = text.split(form).join("<redacted>");
-      return text.replace(/([?&]token=)(?!<redacted>)[^&#\s"\x27<>]*/g, "$1<redacted>");
+      // A value of at least one character: an empty ?token= and a placeholder such as
+      // ?token=<token> (the Makefile banner in server.log) stay as they are.
+      return text.replace(/([?&]token=)[^&#\s"\x27<>]+/g, "$1<redacted>");
     };
     const filesUnder = (p) => {
       const st = fs.lstatSync(p);
       if (st.isDirectory()) return fs.readdirSync(p).flatMap((name) => filesUnder(path.join(p, name)));
       return st.isFile() ? [p] : [];
     };
-    const paths = process.argv.slice(2);
+    const paths = process.argv.slice(1);
     if (paths.length === 0) {
       process.stdout.write(redact(fs.readFileSync(0, "utf8")));
       process.exit(0);
@@ -568,7 +571,7 @@ redact_token() { # redact_token [PATH...]
       const text = data.toString("utf8");
       const clean = redact(text);
       if (clean !== text) fs.writeFileSync(file, clean);
-    }' "$VERIFY_XUM_ROOT/server.lock" "$@"
+    }' "$@" 3< <(printf %s "$token")
 }
 
 cmd_capture() {
@@ -613,6 +616,8 @@ is_dev_server_sandbox_root() {
 cmd_cleanup() {
   load_run "${1:-}"
   local i
+  # Read the token while server.lock exists: stopping the group makes the sandbox delete its root.
+  REDACT_TOKEN=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
   # agent-browser `close` on a session that does not exist starts that session first.
   if [[ $(agent-browser session list 2>/dev/null) == *"$AGENT_BROWSER_SESSION"* ]]; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
@@ -629,7 +634,7 @@ cmd_cleanup() {
   elif group_alive "$VERIFY_XUM_PGID"; then
     echo "verify-xum: process group $VERIFY_XUM_PGID is not this run's dev server. Not signaling it." >&2
   fi
-  # Before the root and its server.lock go: text you saved by hand is evidence too.
+  # Text you saved by hand is evidence too.
   redact_token "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/server.log" || true
   if is_dev_server_sandbox_root "$VERIFY_XUM_ROOT"; then
     rm -rf "$VERIFY_XUM_ROOT"
