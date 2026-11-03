@@ -15,6 +15,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum}
+# The run link in the git dir must point at an absolute path.
+[[ $VERIFY_XUM_HOME == /* ]] || VERIFY_XUM_HOME="$PWD/$VERIFY_XUM_HOME"
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
 ONE_SERVER_PER_CHECKOUT_LOCK="$CHECKOUT_GIT_DIR/verify-xum.lock"
 CURRENT_RUN_LINK="$CHECKOUT_GIT_DIR/verify-xum.current"

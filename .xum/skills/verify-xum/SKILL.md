@@ -111,11 +111,12 @@ agent-browser find role button click --name "Open settings" --exact
   `[mock:list-languages]` are in `src/node/services/mock/mockAiRouter.ts`. Mock tool calls are
   canned and leave the worktree alone. A canned `todo_write` (`[mock:todo-nudge]`) still writes
   its TODO list to the workspace's session folder.
-- The CLI drives the same server. Unset the live server's variables, or the CLI talks to the Xum
-  you run in:
+- The CLI drives the same server. Run it under `env -i`: the live Xum's server URL and auth
+  token are in your env under both `XUM_*` and legacy `MUX_*` names, and the CLI reads either.
+  With them gone it finds the sandbox through `XUM_ROOT`:
 
   ```bash
-  env -u XUM_SERVER_URL -u XUM_SERVER_AUTH_TOKEN XUM_ROOT="$VERIFY_XUM_ROOT" \
+  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
     node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list
   ```
 

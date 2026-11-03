@@ -77,7 +77,7 @@ Preconditions:
 
   ```bash
   mkdir -p "$VERIFY_XUM_EVIDENCE/workspaces"
-  env -u XUM_SERVER_URL -u XUM_SERVER_AUTH_TOKEN XUM_ROOT="$VERIFY_XUM_ROOT" \
+  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
     node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list >"$VERIFY_XUM_EVIDENCE/workspaces/cli-list.txt"
   ```
 
