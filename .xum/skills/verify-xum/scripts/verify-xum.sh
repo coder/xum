@@ -237,7 +237,7 @@ cmd_doctor() {
     pid_in_group "$backend_pid" "$VERIFY_XUM_PGID"
   check "server.lock names $VERIFY_XUM_BACKEND" \
     test "$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
-  check "GET $VERIFY_XUM_BACKEND/health answers" curl -fsS -o /dev/null "$VERIFY_XUM_BACKEND/health"
+  check "GET $VERIFY_XUM_BACKEND/health answers" curl -fs -o /dev/null "$VERIFY_XUM_BACKEND/health"
   curl -fsS "$VERIFY_XUM_BACKEND/version" -o "$VERIFY_XUM_RUN/scratch/version.json" 2>/dev/null || true
   version=$(json_field_or_empty "$VERIFY_XUM_RUN/scratch/version.json" git_commit)
   check "backend build ${version:-unknown} is the launch commit $VERIFY_XUM_COMMIT" \
