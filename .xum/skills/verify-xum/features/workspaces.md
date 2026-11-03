@@ -73,9 +73,12 @@ Preconditions:
   In `$VERIFY_XUM_ROOT/config.json` the `release-notes` entry has an `archivedAt` time. Capture
   `workspaces/archived`.
 
-- **Archive with the keyboard.** Open `scratch-notes` from its row, run `verify-xum.sh idle`, and
-  press Ctrl+Shift+Backspace. Run `agent-browser press Control+Shift+Backspace` and wait for the
-  archive with
+- **Archive with the keyboard.** Open `scratch-notes` from its row and wait until the app is on
+  it: the shortcut archives whichever workspace is open. Run
+  `agent-browser find role button click --name "Select workspace scratch-notes" --exact`,
+  `agent-browser wait --url "**/workspace/$(verify-xum.sh workspace-field scratch-notes id)"` and
+  `verify-xum.sh idle`. Then press Ctrl+Shift+Backspace. Run
+  `agent-browser press Control+Shift+Backspace` and wait for the archive with
   `agent-browser wait --fn '!document.querySelector("[aria-label=\"Select workspace scratch-notes\"]")'`.
   The `Select workspace scratch-notes` row is gone. Wait for its `archivedAt` time with the same
   `timeout 10` loop for `scratch-notes`.
