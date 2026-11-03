@@ -38,7 +38,7 @@ make dev-server-sandbox
   (API key env vars are always kept so env-key fallback still works)
 - Picks free ports (`BACKEND_PORT`, `VITE_PORT`)
 - Disables tutorials by default inside the sandbox (`XUM_ENABLE_TUTORIALS_IN_SANDBOX=1` opts back in)
-- Makes Vite accept loopback Host headers only (`localhost` and IPs). On a Coder workspace it also accepts the one port-forward host for the sandbox's Vite port, built from `XUM_PROXY_URI`, else `VSCODE_PROXY_URI`. The startup banner prints an `Allowed hosts:` line
+- Makes Vite accept loopback Host headers only (`localhost` and IPs). On a Coder workspace it also accepts the one port-forward host for the sandbox's Vite port, built from `XUM_PROXY_URI`, else `VSCODE_PROXY_URI`. The startup banner prints an `Allowed hosts:` line, and a `WARNING` that names the variable when that template yields no host (set `XUM_VITE_ALLOWED_HOSTS=<host>` then)
 - Runs `make dev-server` with those env overrides
 
 ## Agent usage with `bash.monitor`
