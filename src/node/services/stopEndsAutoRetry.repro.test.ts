@@ -783,6 +783,30 @@ describe("a Stop ends the auto-retry loop", () => {
     });
   }, 90_000);
 
+  test("a restart after the owner of a stopped turn was removed does not resume the turn", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const { workspaceService } = env.services;
+      const turn = await startFailedTurn(env, ownerId);
+      await interruptTurn(env.services, ownerId, turn.taskId);
+      // Removing the owner deletes its session folder, and the turn's handle with it.
+      assert((await workspaceService.remove(ownerId, true)).success, "the owner is removed");
+      assert(
+        (await workspaceService.getInfo(turn.workspaceId)) != null,
+        "the stopped turn's workspace stays"
+      );
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
   test("interrupting a turn whose workspace was removed creates no session for it", async () => {
     await withWorkspace(async (env, ownerId) => {
       replaceModel(env, failsOnceModel());
