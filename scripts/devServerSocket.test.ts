@@ -90,7 +90,9 @@ describe.skipIf(process.platform === "win32")(
       (vite.stdin as { end(): void }).end();
       await vite.exited;
       await new Promise<void>((resolve) => squatter.close(() => resolve()));
-      backend.listening && (await new Promise<void>((resolve) => backend.close(() => resolve())));
+      if (backend.listening) {
+        await new Promise<void>((resolve) => backend.close(() => resolve()));
+      }
       fs.rmSync(base, { recursive: true, force: true });
     });
 

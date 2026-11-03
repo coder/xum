@@ -2553,7 +2553,7 @@ describe("createOrpcServer unixSocketPath", () => {
         bridged.push(req.url ?? "");
         socket.destroy();
       },
-      async stop() {},
+      stop: () => Promise.resolve(),
     };
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
     try {
