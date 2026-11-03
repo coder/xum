@@ -267,6 +267,17 @@ async function startFailedTurn(env: TestEnvironment, ownerId: string) {
   return { workspaceId: turn.data.workspaceId, taskId: turn.data.taskId };
 }
 
+/** The turn's backend died: a new backend on the same XUM_ROOT can take the turn's owner lock. */
+async function dropTurnOwnerLock(services: ServiceContainer, handleId: string): Promise<void> {
+  const locks = (
+    services.workspaceTurnManager as unknown as { turnOwnerLocks: Map<string, () => Promise<void>> }
+  ).turnOwnerLocks;
+  const release = locks.get(handleId);
+  assert(release != null, "the turn's backend holds its owner lock");
+  locks.delete(handleId);
+  await release();
+}
+
 /** What task_stop runs for a workspace-turn ID. */
 async function interruptTurn(services: ServiceContainer, ownerId: string, taskId: string) {
   const interrupted = await services.workspaceTurnManager.interruptWorkspaceTurn(ownerId, taskId);
@@ -834,6 +845,156 @@ describe("a Stop ends the auto-retry loop", () => {
       });
       try {
         expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(true);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test.each([{ phase: "in its retry backoff" }, { phase: "while its stream runs" }])(
+    "interrupting a turn that startup recovery resumed after restart recovery settled it stops it $phase",
+    async (args) => {
+      await withWorkspace(async (env, ownerId) => {
+        const model = failsOnceThenStreamsModel();
+        replaceModel(env, model);
+        const turn = await startFailedTurn(env, ownerId);
+
+        // The backend crashes: no live owner holds the turn. The startup stale-turn sweep
+        // (TaskService's queue drain) wins the race with the target's startup recovery: it finds
+        // nothing live and settles the handle `interrupted`, with an error. Startup recovery then
+        // resumes the turn, since nobody stopped it.
+        await dropTurnOwnerLock(env.services, turn.taskId);
+        let services = await restart(env, model, turn.workspaceId, async (restarted) => {
+          await restarted.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+        });
+        try {
+          const { aiService, workspaceService, workspaceTurnManager } = services;
+          const retries = watchRetries({ ...env, services });
+          const settled = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+          assert(
+            settled?.status === "interrupted" && settled.error != null,
+            "restart recovery settled the turn's handle"
+          );
+          assert(
+            workspaceService.hasPendingAutoRetry(turn.workspaceId),
+            "startup recovery resumes the turn"
+          );
+          if (args.phase === "while its stream runs") {
+            assert(
+              await waitFor(() => aiService.isStreaming(turn.workspaceId), 20_000),
+              "the resumed turn streams"
+            );
+          }
+
+          const since = retries.from(turn.workspaceId);
+          await interruptTurn(services, ownerId, turn.taskId);
+          await waitFor(() => !aiService.isStreaming(turn.workspaceId), 5_000);
+          const stopped = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+          const afterStop = {
+            streaming: aiService.isStreaming(turn.workspaceId),
+            pending: workspaceService.hasPendingAutoRetry(turn.workspaceId),
+            armedOrFired: since().filter((type) => type !== "auto-retry-abandoned"),
+            handle: { status: stopped?.status, error: stopped?.error },
+          };
+          services = await restart({ ...env, services }, model, turn.workspaceId);
+          expect({
+            ...afterStop,
+            resumedAfterRestart:
+              services.workspaceService.hasPendingAutoRetry(turn.workspaceId) ||
+              services.aiService.isStreaming(turn.workspaceId),
+          }).toEqual({
+            streaming: false,
+            pending: false,
+            armedOrFired: [],
+            handle: { status: "interrupted", error: undefined },
+            resumedAfterRestart: false,
+          });
+        } finally {
+          await services.dispose();
+          await services.shutdown();
+        }
+      });
+    },
+    90_000
+  );
+
+  test("interrupting a turn that restart recovery settled, during its startup recovery, keeps it from arming a retry", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+
+      // Nothing of the turn runs yet when the interrupt lands: startup recovery has read the
+      // settled handle as not stopped and has not armed its retry.
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        const { taskService, workspaceTurnManager } = services;
+        await workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+        const settled = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        assert(
+          settled?.status === "interrupted" && settled.error != null,
+          "restart recovery settled the turn's handle"
+        );
+        const read = taskService.isWorkspaceTurnStopped.bind(taskService);
+        let stopped = false;
+        spyOn(taskService, "isWorkspaceTurnStopped").mockImplementation(async (...args) => {
+          const result = await read(...args);
+          if (!stopped) {
+            stopped = true;
+            assert(!result, "startup recovery read the settled handle as not stopped");
+            await interruptTurn(services, ownerId, turn.taskId);
+          }
+          return result;
+        });
+      });
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("interrupting a turn that restart recovery settled leaves a newer prompt's stream running", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { aiService, workspaceService, workspaceTurnManager } = restarted;
+        const retries = watchRetries({ ...env, services: restarted });
+        // The user writes in the turn's workspace after the restart: the turn is no longer
+        // its newest prompt, so nothing resumes the turn.
+        const sent = await workspaceService.sendMessage(turn.workspaceId, "Do something else", {
+          model: HAIKU_MODEL,
+          agentId: "exec",
+        });
+        assert(sent.success, "the user's message is sent");
+        assert(
+          await waitFor(() => aiService.isStreaming(turn.workspaceId), 20_000),
+          "the user's message streams"
+        );
+        assert(
+          !retries.of(turn.workspaceId).includes("auto-retry-starting"),
+          "the stream is the user's, not the turn's retry"
+        );
+
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        expect({
+          streaming: aiService.isStreaming(turn.workspaceId),
+          handle: { status: record?.status, error: record?.error },
+        }).toEqual({
+          streaming: true,
+          handle: { status: "interrupted", error: "Workspace turn interrupted after restart" },
+        });
       } finally {
         await restarted.dispose();
         await restarted.shutdown();
