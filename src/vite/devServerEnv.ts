@@ -15,6 +15,12 @@ export interface ViteDevServerEnv {
   previewPort: number;
   backendHost: string;
   backendPort: number;
+  /**
+   * Unix socket of the backend, when `make dev-server` started it with `--unix-socket`. The proxy
+   * then never uses the backend's TCP port: any local account can bind that port while the backend
+   * restarts, and the browser's reconnect URL carries the token.
+   */
+  backendSocket: string | undefined;
   enableTutorialsInSandbox: string | undefined;
 }
 
@@ -103,6 +109,7 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     previewPort,
     backendHost,
     backendPort,
+    backendSocket: resolveXumEnvironmentValue("BACKEND_SOCKET", env)?.trim() || undefined,
     enableTutorialsInSandbox: resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
   };
 }

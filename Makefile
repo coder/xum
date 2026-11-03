@@ -65,6 +65,22 @@ endif
 endif
 endif
 
+# While nodemon restarts the backend, its TCP port is free for any local account to bind, and the
+# browser's reconnect URL carries the token. So Vite reaches the backend over a Unix socket in a
+# private folder (`xum server --unix-socket` makes it 0700 and refuses a folder that is not yours):
+# no other account can create the socket's name. The TCP port stays for the CLI and scripts, which
+# read the lockfile. The path is short on purpose (sun_path holds about 100 bytes) and has the
+# backend port in its name, so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
+# Windows has no such folder and keeps TCP for the Vite hop.
+ifneq ($(OS),Windows_NT)
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+ifndef XUM_BACKEND_SOCKET
+XUM_BACKEND_SOCKET := $(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)/b$(XUM_BACKEND_PORT).sock
+endif
+export XUM_BACKEND_SOCKET
+endif
+endif
+
 # Use PATH-resolved bash for portability across different systems.
 # - Windows: /usr/bin/bash doesn't exist in Chocolatey's make environment or GitHub Actions
 # - NixOS: /bin/bash doesn't exist, bash is in /nix/store/...
@@ -228,13 +244,14 @@ dev-server: node_modules/.installed build-main ## Start server mode with hot rel
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
 	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
+	@echo "  Vite -> backend:         Unix socket $(XUM_BACKEND_SOCKET)"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
 		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --unix-socket $(XUM_BACKEND_SOCKET) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
 		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 
