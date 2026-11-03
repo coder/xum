@@ -10,11 +10,8 @@ import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import {
   AgentSession,
-  AUTO_RETRY_PREFERENCE_FILE,
   type AgentSessionAIService,
   type AgentSessionStreamManager,
 } from "@/node/services/agentSession";
@@ -298,19 +295,6 @@ export async function seedAutoCompactionThreshold(
   await config.updateUserPreferences([
     { ai: { autoCompactionThresholdByModel: { [model]: percent } } },
   ]);
-}
-
-/** Whether the session's startup abandon marker is on disk, where a restart's recovery reads it. */
-export async function hasStartupAbandonMarker(
-  sessionsDir: string,
-  workspaceId: string
-): Promise<boolean> {
-  const raw = await fs
-    .readFile(path.join(sessionsDir, workspaceId, AUTO_RETRY_PREFERENCE_FILE), "utf-8")
-    .catch(() => null);
-  if (raw == null) return false;
-  const parsed = JSON.parse(raw) as { startupAutoRetryAbandon?: unknown };
-  return parsed.startupAutoRetryAbandon != null;
 }
 
 export async function createAgentSessionHarness(

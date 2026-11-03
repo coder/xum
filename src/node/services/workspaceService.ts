@@ -5286,6 +5286,9 @@ export class WorkspaceService
         this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -20655,27 +20658,6 @@ export class WorkspaceService
       )?.abandonAutoRetry(reason);
     } catch (error: unknown) {
       log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
-    }
-  }
-
-  async recordStopForStartupRecovery(workspaceId: string): Promise<void> {
-    // The marker must reach the session that startup recovery uses: adopt one still in its
-    // startup recovery, or create it, so a recovery that starts later reads the marker. A
-    // removed workspace has nothing left to resume: it gets no session and no session file.
-    // The interrupt already stopped the turn and settled its handle, so a failed write does not
-    // fail it; the session keeps the marker owed, and its next auto-retry state write retries it.
-    if (this.config.findWorkspace(workspaceId) == null) return;
-    let recorded = false;
-    try {
-      recorded = await this.getOrCreateSession(workspaceId).recordStopForStartupRecovery();
-    } catch (error: unknown) {
-      log.warn("recordStopForStartupRecovery failed", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
-    if (!recorded) {
-      log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
     }
   }
 

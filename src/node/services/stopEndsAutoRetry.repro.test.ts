@@ -1,14 +1,14 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import { APICallError } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { createConfigStores } from "@/node/config";
-import { AUTO_RETRY_PREFERENCE_FILE, AgentSession } from "@/node/services/agentSession";
-import { hasStartupAbandonMarker } from "@/node/services/agentSession.testHarness";
+import { AgentSession } from "@/node/services/agentSession";
+import type { HistoryService } from "@/node/services/historyService";
 import { ServiceContainer } from "@/node/services/serviceContainer";
-import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type {
   ProviderModelFactory,
   ResolveAndCreateModelResult,
@@ -49,8 +49,10 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<boo
   return true;
 }
 
-/** The first request fails with a retryable provider error; later ones answer "done". */
-function failsOnceModel(): MockLanguageModelV3 {
+/** The first request fails, by default with a retryable provider error; later ones answer "done". */
+function failsOnceModel(
+  error: unknown = new Error("upstream connection reset")
+): MockLanguageModelV3 {
   let requests = 0;
   return new MockLanguageModelV3({
     doStream: () => {
@@ -61,7 +63,7 @@ function failsOnceModel(): MockLanguageModelV3 {
           start(controller) {
             controller.enqueue({ type: "stream-start", warnings: [] });
             if (failing) {
-              controller.enqueue({ type: "error", error: new Error("upstream connection reset") });
+              controller.enqueue({ type: "error", error });
               controller.close();
               return;
             }
@@ -97,6 +99,19 @@ function streamsUntilStoppedModel(): MockLanguageModelV3 {
           },
         }),
       }),
+  });
+}
+
+/** The first request fails with a retryable provider error; later ones stream until stopped. */
+function failsOnceThenStreamsModel(): MockLanguageModelV3 {
+  const fails = failsOnceModel();
+  const streams = streamsUntilStoppedModel();
+  let requests = 0;
+  return new MockLanguageModelV3({
+    doStream: (options) => {
+      requests += 1;
+      return requests === 1 ? fails.doStream(options) : streams.doStream(options);
+    },
   });
 }
 
@@ -235,6 +250,26 @@ async function assertBackoffPending(
     "the failed first stream schedules an auto-retry"
   );
   assert(!retries.of(workspaceId).includes("auto-retry-starting"), "the backoff has not fired");
+}
+
+/** A new workspace turn whose first stream failed and armed a backoff that has not fired. */
+async function startFailedTurn(env: TestEnvironment, ownerId: string) {
+  const retries = watchRetries(env);
+  const turn = await env.services.workspaceTurnManager.createWorkspaceTurn({
+    ownerWorkspaceId: ownerId,
+    prompt: "Survey the repository",
+    title: "Stopped turn",
+    workspace: { mode: "new" },
+  });
+  if (!turn.success) throw new Error(turn.error);
+  await assertBackoffPending(env, retries, turn.data.workspaceId);
+  return { workspaceId: turn.data.workspaceId, taskId: turn.data.taskId };
+}
+
+/** What task_stop runs for a workspace-turn ID. */
+async function interruptTurn(services: ServiceContainer, ownerId: string, taskId: string) {
+  const interrupted = await services.workspaceTurnManager.interruptWorkspaceTurn(ownerId, taskId);
+  assert(interrupted.success, "the turn interrupt succeeds");
 }
 
 /** Target assertion: no backoff is left, and none was armed or fired since the Stop began. */
@@ -538,51 +573,16 @@ describe("a Stop ends the auto-retry loop", () => {
     90_000
   );
 
-  test("a turn interrupt's startup record reaches a session that is still in its startup recovery", async () => {
-    await withWorkspace(async (env, workspaceId) => {
+  test("a turn interrupt during startup recovery's first await ends the retry, also after another restart", async () => {
+    await withWorkspace(async (env, ownerId) => {
       const model = failsOnceModel();
       replaceModel(env, model);
-      const retries = watchRetries(env);
-      const sent = await env.services.workspaceService.sendMessage(
-        workspaceId,
-        "Survey the repository",
-        { model: HAIKU_MODEL, agentId: "exec" }
-      );
-      assert(sent.success, "the turn is accepted");
-      await assertBackoffPending(env, retries, workspaceId);
+      const turn = await startFailedTurn(env, ownerId);
 
       // The backend exits with the turn in its backoff, so startup recovery resumes it in a
-      // session that is not registered yet. What interruptWorkspaceTurn does to its target lands
-      // while that recovery runs.
-      const restarted = await restart(env, model, workspaceId, async (services) => {
-        services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
-        await services.workspaceService.recordStopForStartupRecovery(workspaceId);
-      });
-      try {
-        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
-      } finally {
-        await restarted.dispose();
-        await restarted.shutdown();
-      }
-    });
-  }, 90_000);
-
-  test("a Stop during startup recovery's first await keeps it from arming a retry", async () => {
-    await withWorkspace(async (env, workspaceId) => {
-      const model = failsOnceModel();
-      replaceModel(env, model);
-      const retries = watchRetries(env);
-      const sent = await env.services.workspaceService.sendMessage(
-        workspaceId,
-        "Survey the repository",
-        { model: HAIKU_MODEL, agentId: "exec" }
-      );
-      assert(sent.success, "the turn is accepted");
-      await assertBackoffPending(env, retries, workspaceId);
-
-      // A turn interrupt's abandon lands while startup recovery awaits its first read (the
-      // cancellation record), and its startup record has not been written yet.
-      const restarted = await restart(env, model, workspaceId, (services, session) => {
+      // session that is not registered yet. The interrupt lands while that recovery awaits its
+      // first read (the cancellation record).
+      const restarted = await restart(env, model, turn.workspaceId, (services, session) => {
         const host = session as unknown as { compactionRecoveryBlocked: () => Promise<boolean> };
         const blocked = host.compactionRecoveryBlocked.bind(session);
         let stopped = false;
@@ -590,14 +590,49 @@ describe("a Stop ends the auto-retry loop", () => {
           const result = await blocked();
           if (!stopped) {
             stopped = true;
-            services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
+            await interruptTurn(services, ownerId, turn.taskId);
+          }
+          return result;
+        });
+        return Promise.resolve();
+      });
+      const pending = { first: restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId) };
+      const again = await restart({ ...env, services: restarted }, model, turn.workspaceId);
+      try {
+        expect({
+          ...pending,
+          second: again.workspaceService.hasPendingAutoRetry(turn.workspaceId),
+        }).toEqual({ first: false, second: false });
+      } finally {
+        await again.dispose();
+        await again.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a turn interrupt after startup recovery read the turn's handle keeps it from arming a retry", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+
+      const restarted = await restart(env, model, turn.workspaceId, (services) => {
+        const { taskService } = services;
+        const read = taskService.isWorkspaceTurnStopped.bind(taskService);
+        let stopped = false;
+        spyOn(taskService, "isWorkspaceTurnStopped").mockImplementation(async (...args) => {
+          const result = await read(...args);
+          if (!stopped) {
+            stopped = true;
+            assert(!result, "startup recovery read the handle before the interrupt");
+            await interruptTurn(services, ownerId, turn.taskId);
           }
           return result;
         });
         return Promise.resolve();
       });
       try {
-        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
       } finally {
         await restarted.dispose();
         await restarted.shutdown();
@@ -605,45 +640,121 @@ describe("a Stop ends the auto-retry loop", () => {
     });
   }, 90_000);
 
-  test("a turn interrupt's startup record ends a retry that startup recovery armed after its abandon", async () => {
-    await withWorkspace(async (env, workspaceId) => {
-      const model = failsOnceModel();
-      replaceModel(env, model);
-      const retries = watchRetries(env);
-      const sent = await env.services.workspaceService.sendMessage(
-        workspaceId,
-        "Survey the repository",
-        { model: HAIKU_MODEL, agentId: "exec" }
-      );
-      assert(sent.success, "the turn is accepted");
-      await assertBackoffPending(env, retries, workspaceId);
-
-      // The interrupt's abandon lands before startup recovery captures anything, and its record
-      // only after that recovery armed the interrupted tail again.
-      const restarted = await restart(env, model, workspaceId, (services) => {
-        services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
-        return Promise.resolve();
-      });
-      try {
-        assert(
-          restarted.workspaceService.hasPendingAutoRetry(workspaceId),
-          "startup recovery armed a retry after the abandon"
-        );
-        await restarted.workspaceService.recordStopForStartupRecovery(workspaceId);
-        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
-      } finally {
-        await restarted.dispose();
-        await restarted.shutdown();
-      }
-    });
-  }, 90_000);
-
-  test("a turn interrupt writes its startup record again after a failed write", async () => {
+  test("a restart while a turn interrupt's stream stop is still running does not resume the turn", async () => {
     await withWorkspace(async (env, ownerId) => {
       const model = failsOnceModel();
       replaceModel(env, model);
-      const { workspaceTurnManager } = env.services;
-      const retries = watchRetries(env);
+      const turn = await startFailedTurn(env, ownerId);
+      const { aiService } = env.services;
+      const stopStream = aiService.stopStream.bind(aiService);
+      const stopping = Promise.withResolvers<void>();
+      let held = false;
+      // The backend exits inside the interrupt's stream stop: the stop never settles.
+      spyOn(aiService, "stopStream").mockImplementation((workspaceId, ...rest) => {
+        if (workspaceId !== turn.workspaceId || held) return stopStream(workspaceId, ...rest);
+        held = true;
+        stopping.resolve();
+        return new Promise(() => undefined);
+      });
+      void env.services.workspaceTurnManager.interruptWorkspaceTurn(ownerId, turn.taskId);
+      await stopping.promise;
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a failed tail read during a turn interrupt does not keep a later turn from resuming after a restart", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      const history = (env.services as unknown as { historyService: HistoryService })
+        .historyService;
+      const getLastMessages = history.getLastMessages.bind(history);
+      let failing = true;
+      spyOn(history, "getLastMessages").mockImplementation((workspaceId, ...rest) =>
+        failing && workspaceId === turn.workspaceId
+          ? Promise.reject(new Error("EIO: i/o error"))
+          : getLastMessages(workspaceId, ...rest)
+      );
+      await interruptTurn(env.services, ownerId, turn.taskId);
+      failing = false;
+
+      // The owner's next turn on the same workspace streams when the backend exits.
+      const next = await env.services.workspaceTurnManager.createWorkspaceTurn({
+        ownerWorkspaceId: ownerId,
+        prompt: "Then list the TODOs",
+        title: "Later turn",
+        workspace: { mode: "existing", workspaceId: turn.workspaceId },
+      });
+      if (!next.success) throw new Error(next.error);
+      assert(
+        await waitFor(() => env.services.aiService.isStreaming(turn.workspaceId), 20_000),
+        "the later turn streams"
+      );
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect(
+          restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId) ||
+            restarted.aiService.isStreaming(turn.workspaceId)
+        ).toBe(true);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a turn interrupt while the config is unreadable still keeps a restart from resuming the turn", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      const { config } = env;
+      const findWorkspace = config.findWorkspace.bind(config);
+      // The lenient read falls back to an empty config, where the workspace is missing.
+      const unreadable = spyOn(config, "findWorkspace").mockImplementation((workspaceId) =>
+        workspaceId === turn.workspaceId ? null : findWorkspace(workspaceId)
+      );
+      try {
+        await interruptTurn(env.services, ownerId, turn.taskId);
+      } finally {
+        unreadable.mockRestore();
+      }
+
+      const restarted = await restart(env, model, turn.workspaceId);
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(turn.workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a non-retryable failure that ends after a turn interrupt keeps a restart from resuming the turn", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel(
+        new APICallError({
+          message: "invalid x-api-key",
+          url: "https://api.anthropic.com/v1/messages",
+          requestBodyValues: {},
+          statusCode: 401,
+          responseHeaders: {},
+          responseBody: '{"type":"error","error":{"type":"authentication_error"}}',
+          isRetryable: false,
+        })
+      );
+      replaceModel(env, model);
+      const { workspaceService, workspaceTurnManager } = env.services;
+      const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
       const turn = await workspaceTurnManager.createWorkspaceTurn({
         ownerWorkspaceId: ownerId,
         prompt: "Survey the repository",
@@ -652,33 +763,15 @@ describe("a Stop ends the auto-retry loop", () => {
       });
       if (!turn.success) throw new Error(turn.error);
       const targetId = turn.data.workspaceId;
-      await assertBackoffPending(env, retries, targetId);
-
-      // The real stack's HistoryService writes the session files through nodeSessionFiles.
-      const files = nodeSessionFiles.promises;
-      const writeFile = files.writeFile.bind(files);
-      let failedWrites = 0;
-      const write = spyOn(files, "writeFile").mockImplementation((file, ...rest) => {
-        if (
-          failedWrites === 0 &&
-          typeof file === "string" &&
-          file.endsWith(AUTO_RETRY_PREFERENCE_FILE)
-        ) {
-          failedWrites += 1;
-          return Promise.reject(new Error("ENOSPC: no space left on device"));
-        }
-        return writeFile(file, ...rest);
-      });
-      try {
-        const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
-          ownerId,
-          turn.data.taskId
-        );
-        assert(interrupted.success, "the turn interrupt succeeds");
-      } finally {
-        write.mockRestore();
-      }
-      assert(failedWrites === 1, "the first write of the startup record failed");
+      assert((await hold.entered) === targetId, "the turn's error handling is held");
+      await interruptTurn(env.services, ownerId, turn.data.taskId);
+      hold.release();
+      assert(
+        await waitFor(() => workspaceService.getActiveTurnGeneration(targetId) == null, 5_000),
+        "the failed turn's error handling ends"
+      );
+      // A credential fix clears a provider-config failure's startup marker.
+      await workspaceService.getOrCreateSession(targetId).handleProviderConfigChanged();
 
       const restarted = await restart(env, model, targetId);
       try {
@@ -693,37 +786,25 @@ describe("a Stop ends the auto-retry loop", () => {
   test("interrupting a turn whose workspace was removed creates no session for it", async () => {
     await withWorkspace(async (env, ownerId) => {
       replaceModel(env, failsOnceModel());
-      const { aiService, workspaceService, workspaceTurnManager } = env.services;
-      const retries = watchRetries(env);
-      const turn = await workspaceTurnManager.createWorkspaceTurn({
-        ownerWorkspaceId: ownerId,
-        prompt: "Survey the repository",
-        title: "Removed turn",
-        workspace: { mode: "new" },
-      });
-      if (!turn.success) throw new Error(turn.error);
-      const targetId = turn.data.workspaceId;
-      await assertBackoffPending(env, retries, targetId);
+      const { aiService, workspaceService } = env.services;
+      const turn = await startFailedTurn(env, ownerId);
       // Removing the workspace leaves its turn's handle running.
-      assert((await workspaceService.remove(targetId, true)).success, "the workspace is removed");
+      assert(
+        (await workspaceService.remove(turn.workspaceId, true)).success,
+        "the workspace is removed"
+      );
       const listeners = aiService.listenerCount("stream-start");
 
-      const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
-        ownerId,
-        turn.data.taskId
-      );
-      assert(interrupted.success, "the turn interrupt succeeds");
+      await interruptTurn(env.services, ownerId, turn.taskId);
 
-      expect({
-        sessionListeners: aiService.listenerCount("stream-start") - listeners,
-        startupRecord: await hasStartupAbandonMarker(env.config.sessionsDir, targetId),
-      }).toEqual({ sessionListeners: 0, startupRecord: false });
+      expect(aiService.listenerCount("stream-start") - listeners).toBe(0);
     });
   }, 90_000);
 
   test("interrupting a queued workspace turn leaves the running turn's retry armed", async () => {
     await withWorkspace(async (env, ownerId) => {
-      replaceModel(env, failsOnceModel());
+      const model = failsOnceModel();
+      replaceModel(env, model);
       const { taskService, workspaceService, workspaceTurnManager } = env.services;
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
       const running = await workspaceTurnManager.createWorkspaceTurn({
@@ -777,11 +858,18 @@ describe("a Stop ends the auto-retry loop", () => {
       assert(interrupted.success, "the queued turn's interrupt succeeds");
       assert(latchedRelease, "the error handling ended inside the latch window");
 
-      expect({
-        pending: workspaceService.hasPendingAutoRetry(targetId),
-        // A restart must still resume the running turn: the queued interrupt records no Stop.
-        startupRecord: await hasStartupAbandonMarker(env.config.sessionsDir, targetId),
-      }).toEqual({ pending: true, startupRecord: false });
+      const pending = { live: workspaceService.hasPendingAutoRetry(targetId) };
+      // A restart still resumes the running turn: only the queued handle was stopped.
+      const restarted = await restart(env, model, targetId);
+      try {
+        expect({
+          ...pending,
+          restarted: restarted.workspaceService.hasPendingAutoRetry(targetId),
+        }).toEqual({ live: true, restarted: true });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
     });
   }, 90_000);
 });

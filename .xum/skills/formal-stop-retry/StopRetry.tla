@@ -39,19 +39,19 @@ VARIABLES
   cancelDebt,  \* a ui/api Stop's compaction cancellation record: blocks automatic recovery
   resumed,          \* ghost: an auto-retry started a turn
   resumedAfterStop, \* ghost: an auto-retry started a turn after the Stop began
-  marker,      \* the startup abandon marker of the stopped tail is on disk (auto-retry preference file)
-  boot,        \* "first" | "restarted" | "recovering" | "scheduling" | "recovered": startup recovery
-  stCap,       \* the autoRetryStops that runStartupRecovery captured at its start
-  sCap         \* the retry generation that scheduleStartupAutoRetryIfNeeded captured
+  handle,      \* the workspace-turn handle of the tail is `interrupted` on disk (task-handles)
+  boot,        \* "first" | "restarted" | "recovering" | "scheduling" | "checking" | "recovered"
+  sCap,        \* the retry generation that scheduleStartupAutoRetryIfNeeded captured
+  hSeen        \* the handle state that scheduleStartupAutoRetryIfNeeded read
 
 vars == <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
           stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed, resumedAfterStop,
-          marker, boot, stCap, sCap>>
+          handle, boot, sCap, hSeen>>
 
 \* The variables of the restart, which the actions of one backend lifetime leave unchanged.
-restartVars == <<marker, boot, stCap, sCap>>
+restartVars == <<handle, boot, sCap, hSeen>>
 \* The startup recovery's own variables.
-startupVars == <<boot, stCap, sCap>>
+startupVars == <<boot, sCap, hSeen>>
 
 Kinds == {"ui", "api", "task", "turn", "timeout"}
 
@@ -65,14 +65,14 @@ TypeOK ==
   /\ stopGen \in Nat /\ latch \in Nat
   /\ stop \in {"none"} \cup Kinds
   /\ spc \in {"none", "stopping", "cleanup", "aborting", "awaitPolicy", "awaitOptOut",
-              "awaitSettle", "turnCleanup", "turnAborting", "turnRecording", "turnReleasing",
+              "awaitSettle", "turnCleanup", "turnAborting", "turnReleasing",
               "timeoutStopping", "timeoutFailing", "done"}
   /\ optOut \in {"none", "loading", "done"} /\ cancelDebt \in BOOLEAN
   /\ stops \in Nat /\ pStops \in Nat /\ sStops \in Nat
   /\ resumed \in BOOLEAN /\ resumedAfterStop \in BOOLEAN
-  /\ marker \in BOOLEAN
-  /\ boot \in {"first", "restarted", "recovering", "scheduling", "recovered"}
-  /\ stCap \in Nat /\ sCap \in Nat
+  /\ handle \in BOOLEAN /\ hSeen \in BOOLEAN
+  /\ boot \in {"first", "restarted", "recovering", "scheduling", "checking", "recovered"}
+  /\ sCap \in Nat
 
 \* The property.
 StopEndsRetries == ~resumedAfterStop
@@ -93,7 +93,7 @@ Init ==
   /\ rpc = "idle" /\ rGen = 0 /\ rStopGen = 0
   /\ stopGen = 0 /\ latch = 0 /\ stops = 0 /\ pStops = 0 /\ sStops = 0 /\ stop = "none" /\ spc = "none" /\ optOut = "none"
   /\ cancelDebt = FALSE /\ resumed = FALSE /\ resumedAfterStop = FALSE
-  /\ marker = FALSE /\ boot = "first" /\ stCap = 0 /\ sCap = 0
+  /\ handle = FALSE /\ boot = "first" /\ sCap = 0 /\ hSeen = FALSE
 
 (* Every retryGeneration bump makes a fired retry stale: from then on its gate *)
 (* refuses and its reschedule is a no-op, so it changes nothing. The model     *)
@@ -148,16 +148,14 @@ PolicySchedules ==
                  optOut, cancelDebt, resumed, resumedAfterStop, stops, pStops, sStops>>
   /\ UNCHANGED restartVars
 
-\* The rest of handleStreamError ends; the operation's settlement resolves. Its
-\* updateStartupAutoRetryAbandonFromFailure clears the marker for a retryable error,
-\* unless a Stop since the failed turn's stream started (autoRetryStops) owns it.
+\* The rest of handleStreamError ends; the operation's settlement resolves. No retry path
+\* changes the handle.
 PolicySettles ==
   /\ policy = "settling"
   /\ policy' = "none"
-  /\ marker' = IF pStops = stops THEN FALSE ELSE marker
   /\ UNCHANGED <<stream, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
                  stopGen, latch, stop, spc, optOut, cancelDebt, resumed, resumedAfterStop, stops, pStops, sStops>>
-  /\ UNCHANGED startupVars
+  /\ UNCHANGED restartVars
 
 -----------------------------------------------------------------------------
 (* The retry (retryManager.ts scheduleRetry; agentSession.ts retryActiveStream *)
@@ -200,16 +198,13 @@ RetryGate ==
                  latch, stop, spc, optOut, cancelDebt, stops, pStops>>
   /\ UNCHANGED restartVars
 
-\* retryActiveStream's handleStreamFailureForAutoRetry(..., isCurrent). A failed resume
-\* first clears the marker while isCurrent holds (updateStartupAutoRetryAbandonFromFailure);
-\* the model clears it for a deferred resume too, which can only add violations.
+\* retryActiveStream's handleStreamFailureForAutoRetry(..., isCurrent).
 RetryReschedules ==
   /\ rpc = "deferring"
   /\ IF MayArm(rGen) THEN Schedule ELSE rpc' = "idle" /\ UNCHANGED <<gen, fiber, fGen>>
-  /\ marker' = IF rGen = gen THEN FALSE ELSE marker
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, rGen, rStopGen, stopGen, latch, stop,
                  spc, optOut, cancelDebt, resumed, resumedAfterStop, stops, pStops, sStops>>
-  /\ UNCHANGED startupVars
+  /\ UNCHANGED restartVars
 
 -----------------------------------------------------------------------------
 (* The Stop. ui and api: workspaceService.ts interruptStream, then          *)
@@ -223,8 +218,9 @@ RetryReschedules ==
 \*   record that blocks automatic recovery until a user send replaces it) and
 \*   retryManager.abandon("user_interrupt"), which is not abandonAutoRetry (stops stays).
 \* task: beginWorkspaceStop's latch (Phase A).
-\* turn: interruptWorkspaceTurn's latch, under the publication lock. A queued handle latches
-\*   too but owns no turn and abandons nothing; it is not modeled (MayArm ignores the latch).
+\* turn: interruptWorkspaceTurn writes the handle `interrupted`, then latches in the same
+\*   await-free segment, under the publication lock. A queued handle latches too but owns no
+\*   turn and abandons nothing; it is not modeled (MayArm ignores the latch).
 \* timeout: failAgentTaskForHardTimeout's clearQueue and abandonAutoRetry.
 StopBegins(k) ==
   /\ stop = "none"
@@ -241,7 +237,7 @@ StopBegins(k) ==
             /\ spc' = "cleanup"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "turn" ->
-            /\ latch' = latch + 1 /\ UNCHANGED stops
+            /\ handle' = TRUE /\ latch' = latch + 1 /\ UNCHANGED stops
             /\ spc' = "turnCleanup"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "timeout" ->
@@ -251,7 +247,7 @@ StopBegins(k) ==
             /\ UNCHANGED <<latch, stopGen, cancelDebt, optOut>>
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, rGen, rStopGen, pStops, sStops, resumed,
                  resumedAfterStop>>
-  /\ UNCHANGED restartVars
+  /\ IF k = "turn" THEN UNCHANGED startupVars ELSE UNCHANGED restartVars
 
 \* task, Phase B: clearQueue and workspaceService.abandonAutoRetry.
 TaskCleanupAbandons ==
@@ -279,24 +275,11 @@ StopAbortsStream ==
   /\ stream' = "idle"
   /\ spc' = CASE spc = "stopping" -> "awaitPolicy"
               [] spc = "aborting" -> "awaitSettle"
-              [] spc = "turnAborting" -> "turnRecording"
+              [] spc = "turnAborting" -> "turnReleasing"
               [] spc = "timeoutStopping" -> "timeoutFailing"
   /\ UNCHANGED <<policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
                  stopGen, latch, stops, pStops, sStops, stop, optOut, cancelDebt, resumed, resumedAfterStop>>
   /\ UNCHANGED restartVars
-
-\* turn: recordStopForStartupRecovery after the stream stop persists the startup abandon
-\* marker of the stopped tail, as a user abort does, then abandons again: a startup recovery
-\* that armed a retry since the first abandon (its session was not reached yet) loses it.
-\* The code awaits the marker write between the two; the model takes both in one step
-\* (SKILL.md, Scope, lists the marker clear that this hides).
-TurnRecords ==
-  /\ spc = "turnRecording"
-  /\ spc' = "turnReleasing" /\ marker' = TRUE
-  /\ CancelRetry /\ stops' = stops + 1
-  /\ UNCHANGED <<stream, policy, pCap, errors, enabled, rGen, rStopGen, stopGen, latch, pStops,
-                 sStops, stop, optOut, cancelDebt, resumed, resumedAfterStop>>
-  /\ UNCHANGED startupVars
 
 \* turn: the method-level finally releases the latch after the stream stop and the
 \* cleanup. It does not wait for an error policy that is still running.
@@ -361,7 +344,7 @@ TaskStopReleases ==
 (* before the restart or during that recovery.                              *)
 
 \* Every in-memory state is gone. What is on disk stays: the ui opt-out (enabled), the
-\* cancellation record (cancelDebt) and the startup abandon marker. A crash inside a Stop
+\* cancellation record (cancelDebt) and the workspace-turn handle. A crash inside a Stop
 \* is out of scope.
 Restart ==
   /\ boot = "first" /\ spc \in {"none", "done"}
@@ -369,41 +352,50 @@ Restart ==
   /\ stream' = "idle" /\ policy' = "none" /\ fiber' = "none" /\ rpc' = "idle" /\ latch' = 0
   /\ enabled' = (optOut # "done")
   /\ UNCHANGED <<pCap, errors, gen, fGen, rGen, rStopGen, stopGen, stops, pStops, sStops, stop,
-                 spc, optOut, cancelDebt, resumed, resumedAfterStop, marker, stCap, sCap>>
+                 spc, optOut, cancelDebt, resumed, resumedAfterStop, handle, sCap, hSeen>>
 
 \* The workspace is a sub-agent: runStartupRecovery skips it (TaskService owns its recovery).
 SubAgent == StopKinds \cap {"task", "timeout"} # {}
 
-\* runStartupRecovery captures autoRetryStops before its first await, then awaits the
-\* metadata read and the earlier recovery steps (compaction recovery, follow-ups).
+\* runStartupRecovery awaits the metadata read and the earlier recovery steps (compaction
+\* recovery, follow-ups).
 StartupBegins ==
   /\ boot = "restarted"
-  /\ boot' = "recovering" /\ stCap' = stops
+  /\ boot' = "recovering"
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
                  stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed,
-                 resumedAfterStop, marker, sCap>>
+                 resumedAfterStop, handle, sCap, hSeen>>
 
-\* scheduleStartupAutoRetryIfNeeded captures the retry generation before its first await,
-\* then awaits the cancellation record, the preference, the tail read and the derivation.
+\* scheduleStartupAutoRetryIfNeeded awaits the cancellation record, captures the retry
+\* generation, then awaits the preference and the tail read.
 StartupSchedules ==
   /\ boot = "recovering"
   /\ boot' = "scheduling" /\ sCap' = gen
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
                  stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed,
-                 resumedAfterStop, marker, stCap>>
+                 resumedAfterStop, handle, hSeen>>
 
-\* The scheduler stops at the cancellation record, the opt-out or a marker that matches the
-\* tail; its handleStreamFailureForAutoRetry refuses a moved generation or Stop count, and
-\* otherwise arms a retry of the interrupted tail.
-StartupArms ==
+\* The tail's workspace-turn handle read (isWorkspaceTurnStopped) resolves; the derivation and
+\* handleStreamFailureForAutoRetry's reads follow.
+StartupReads ==
   /\ boot = "scheduling"
+  /\ boot' = "checking" /\ hSeen' = handle
+  /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
+                 stopGen, latch, stops, pStops, sStops, stop, spc, optOut, cancelDebt, resumed,
+                 resumedAfterStop, handle, sCap>>
+
+\* The scheduler stops at the cancellation record, the opt-out or a stopped handle; its
+\* handleStreamFailureForAutoRetry refuses a moved generation, and otherwise arms a retry of
+\* the interrupted tail.
+StartupArms ==
+  /\ boot = "checking"
   /\ boot' = "recovered"
-  /\ IF SubAgent \/ cancelDebt \/ ~enabled \/ marker \/ sCap # gen \/ stCap # stops
+  /\ IF SubAgent \/ cancelDebt \/ ~enabled \/ hSeen \/ sCap # gen
        THEN UNCHANGED <<gen, fiber, fGen, rpc>>
        ELSE Schedule
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, rGen, rStopGen, stopGen, latch, stops,
-                 pStops, sStops, stop, spc, optOut, cancelDebt, resumed, resumedAfterStop, marker,
-                 stCap, sCap>>
+                 pStops, sStops, stop, spc, optOut, cancelDebt, resumed, resumedAfterStop, handle,
+                 sCap, hSeen>>
 
 -----------------------------------------------------------------------------
 
@@ -417,8 +409,9 @@ Next ==
   \/ RetryFires \/ RetryRoutes \/ RetryGate \/ RetryReschedules
   \/ \E k \in StopKinds : StopBegins(k)
   \/ TaskCleanupAbandons \/ StopAbortsStream \/ StopJoinsPolicy \/ StopReleases
-  \/ OptOutApplies \/ TaskStopReleases \/ TurnAbandons \/ TurnRecords \/ TurnStopReleases
-  \/ TimeoutFails \/ Restart \/ StartupBegins \/ StartupSchedules \/ StartupArms
+  \/ OptOutApplies \/ TaskStopReleases \/ TurnAbandons \/ TurnStopReleases
+  \/ TimeoutFails \/ Restart \/ StartupBegins \/ StartupSchedules \/ StartupReads
+  \/ StartupArms
   \/ Settled
 
 Spec == Init /\ [][Next]_vars

@@ -24,12 +24,10 @@ import { createTestHistoryService } from "./testHistoryService";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
-  hasStartupAbandonMarker,
   seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import assert from "@/common/utils/assert";
 import { eventSpine } from "./events/eventSpine";
 import * as contextLimit from "@/common/utils/compaction/contextLimit";
 import * as toolsModule from "@/common/utils/tools/tools";
@@ -644,15 +642,13 @@ describe("pinned full-payload rollover admission", () => {
 
   test("a Stop during an emergency rollover's runtime start arms no retry", async () => {
     const fixture = await setup("deferred-schema", true);
-    const { h, service, config } = fixture;
+    const { h, service } = fixture;
     // The rollover's request preparation reports a runtime failure without a pre-start error.
-    // A workspace-turn interrupt lands while it waits for the runtime: it ends the retry loop and
-    // records the stopped tail, and the aborted runtime start fails as retryable
-    // runtime_start_failed.
-    spyOn(service, "prepareStreamMessage").mockImplementation(async () => {
+    // A workspace-turn interrupt or a hard timeout lands while it waits for the runtime: it ends
+    // the retry loop, and the aborted runtime start fails as retryable runtime_start_failed.
+    spyOn(service, "prepareStreamMessage").mockImplementation(() => {
       h.session.abandonAutoRetry("task_stopped");
-      assert(await h.session.recordStopForStartupRecovery(), "the Stop records the stopped tail");
-      return Err({ type: "runtime_start_failed", message: "Aborted" });
+      return Promise.resolve(Err({ type: "runtime_start_failed", message: "Aborted" }));
     });
     const scheduled: string[] = [];
     h.session.onChatEvent(({ message }) => {
@@ -661,12 +657,10 @@ describe("pinned full-payload rollover admission", () => {
     try {
       const result = await h.session.sendMessage("Small follow-up", { model, agentId: "exec" });
       expect(result).toMatchObject({ success: false, error: { type: "runtime_start_failed" } });
-      expect({
-        pending: h.session.hasPendingAutoRetry(),
-        scheduled,
-        // The runtime failure is retryable, which must not clear the Stop's record.
-        startupRecord: await hasStartupAbandonMarker(config.sessionsDir, workspaceId),
-      }).toEqual({ pending: false, scheduled: [], startupRecord: true });
+      expect({ pending: h.session.hasPendingAutoRetry(), scheduled }).toEqual({
+        pending: false,
+        scheduled: [],
+      });
     } finally {
       await fixture.cleanup();
     }

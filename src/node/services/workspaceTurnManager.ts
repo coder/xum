@@ -80,6 +80,7 @@ import {
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
@@ -1073,6 +1074,28 @@ export class WorkspaceTurnManager {
     handleId: string
   ): Promise<WorkspaceTurnTaskHandleRecord | null> {
     return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+  }
+
+  /**
+   * Whether an explicit Stop ended this workspace turn: interruptWorkspaceTurn and a user abort
+   * write the handle `interrupted` without an error, before they stop anything. Restart recovery
+   * and supersedes interrupt with an error, and those turns may continue. A missing or corrupt
+   * record reads as not stopped; other read errors reject.
+   */
+  async isWorkspaceTurnStopped(
+    workspaceId: string,
+    correlation: WorkspaceTurnTaskCorrelation
+  ): Promise<boolean> {
+    const record = await this.taskHandleStore.getWorkspaceTurn(
+      correlation.ownerWorkspaceId,
+      correlation.taskHandleId
+    );
+    return (
+      record?.workspaceId === workspaceId &&
+      record.turnId === correlation.turnId &&
+      record.status === "interrupted" &&
+      record.error == null
+    );
   }
 
   private nextWorkspaceTurnCreatedAt(): string {
@@ -3940,8 +3963,6 @@ export class WorkspaceTurnManager {
         } catch (error: unknown) {
           log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
         }
-        // The interrupt's only trace on disk: without it, a restart resumes the stopped turn.
-        await this.workspaceService.recordStopForStartupRecovery(workspaceId);
       }
       if (interruptedRecord != null && options?.suppressDisposableCleanup !== true) {
         await this.cleanupDisposableWorkspaceTurn(interruptedRecord);

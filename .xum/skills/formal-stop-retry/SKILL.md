@@ -18,7 +18,7 @@ Tests rarely reach the break. It needs a Stop to land while a stream error's han
   - `ui` is the renderer's Stop button, which passes `disableAutoRetry: true`.
   - `api` is a Stop without `disableAutoRetry`, such as an ACP client's cancel (`src/node/acp/agent.ts`) or an API call.
   - `task` is a `TaskStopLatch` stop: a parent's Stop cascade, `task_stop` on a sub-agent, a failed launch, a removal, or a terminal stream failure while work is live.
-  - `turn` is a workspace-turn interrupt (`WorkspaceTurnManager.interruptWorkspaceTurn`, which `task_stop` runs for a workspace-turn ID). Its latch drops after its stream stop and cleanup, without waiting for the target's error handling. Before that it persists the startup abandon marker of the stopped tail, its only trace on disk.
+  - `turn` is a workspace-turn interrupt (`WorkspaceTurnManager.interruptWorkspaceTurn`, which `task_stop` runs for a workspace-turn ID). Its latch drops after its stream stop and cleanup, without waiting for the target's error handling. It writes the turn's handle `interrupted` before it latches, and that handle is its only trace on disk: startup recovery reads it.
   - `timeout` is a workflow step's hard timeout (`TaskService.failAgentTaskForHardTimeout`). It latches only when the task still has live work.
 - `reachability.cfg` must fail. It proves that an auto-retry can start a turn at all, so a model change that makes retries unreachable cannot pass vacuously.
 - `check.sh` runs every config and compares each result with its expected verdict. `make formal-check` runs it.
@@ -33,18 +33,18 @@ Model confirmed against the code in: #7898
 
 | Model action | Code |
 | --- | --- |
-| `StreamErrors`, `PolicySettles` | `src/node/services/agentSession.ts` `handleStreamError` (entry, which keeps its turn's `activeStreamContext.admissionAutoRetryStops`, and tail), `src/node/services/turnCoordinator.ts` `consumeCompletion`. In the tail, `updateStartupAutoRetryAbandonFromFailure` clears the marker for a retryable error only while that count has not moved |
+| `StreamErrors`, `PolicySettles` | `src/node/services/agentSession.ts` `handleStreamError` (entry, which keeps its turn's `activeStreamContext.admissionAutoRetryStops`, and tail), `src/node/services/turnCoordinator.ts` `consumeCompletion`. |
 | `PolicyCaptures` | `handleStreamError` awaits `restoreGoalAccountingSnapshot` and `chargeEvaluatorSpendToGoal`, then calls `handleStreamFailureForAutoRetry`, which captures `isCurrent` |
 | `PolicySchedules`, `RetryReschedules` (`MayArm`, `PolicyMayArm`) | `agentSession.ts` `handleStreamFailureForAutoRetry`: `compactionRecoveryBlocked`, the preference load, `isCurrent`, `autoRetryStops` (`handleStreamError` passes its turn's `admissionAutoRetryStops`), then `RetryManager.handleStreamFailure`. It does not read the stop latch: an interrupt of a queued workspace turn latches too |
 | `RetryFires` | `src/node/services/retryManager.ts` `scheduleRetry` (the fiber's guards and `onRetry`), `agentSession.ts` `retryActiveStream` up to `resumeStream`, `resumeStream` up to `applyAutoRoutedResume` |
 | `RetryRoutes` | `resumeStream`: the `isBusy` check |
 | `RetryGate` | `resumeStream`: `captureCompactionReplacement`, `compactionRecoveryBlocked`, the pricing gate, the synchronous gate (`compactionStopGeneration`, the retry signal, `isStopInProgress`) and `coordinator.prepare`; the resumed turn's `admissionAutoRetryStops` (`streamWithHistory`) |
-| `RetryReschedules` | `retryActiveStream`: its `handleStreamFailureForAutoRetry` calls after a resume that did not start or failed, and the `updateStartupAutoRetryAbandonFromFailure` call (behind `isCurrent`) before the second |
+| `RetryReschedules` | `retryActiveStream`: its `handleStreamFailureForAutoRetry` calls after a resume that did not start or failed |
 | `StopBegins` (ui, api) | `src/node/services/workspaceService.ts` `interruptStream` (`latchHardInterruptCascade`, the `setAutoRetryEnabled(false)` start); `agentSession.ts` `interruptStream` (`cancelCompaction`, `RetryManager.abandon`); `src/node/services/compactionCancellation.ts` `cancel`, `blocksRecovery`. The model reads the record (`cancelDebt`) in `MayArm` and in `RetryGate`, like the code's two `compactionRecoveryBlocked` calls. Either read alone keeps `api` holding: `api` fails only without both |
 | `StopBegins` (task) | `src/node/services/taskStopLatch.ts` `beginWorkspaceStop`; callers in `src/node/services/taskService.ts`: `stopDescendantAgentTaskUnderLifecycleLock`, `terminateAllDescendantAgentTasks`, `terminateDescendantAgentTask`, `stopFailedTaskLaunch`, `failAgentTaskTerminally` |
-| `StopBegins` (turn) | `src/node/services/workspaceTurnManager.ts` `interruptWorkspaceTurn`: `latchWorkspaceStopsInProgress`, then `abandonAutoRetry` when the handle owns the running turn (`shouldStopStream`). A queued handle latches too but abandons nothing. The model has no queued handle (see Scope) |
+| `StopBegins` (turn) | `src/node/services/workspaceTurnManager.ts` `interruptWorkspaceTurn`: `upsertWorkspaceTurn` with `status: "interrupted"` (`handle`) and `latchWorkspaceStopsInProgress` in one await-free segment, then `abandonAutoRetry` when the handle owns the running turn (`shouldStopStream`). A queued handle latches too but abandons nothing. The model has no queued handle (see Scope) |
 | `StopBegins` (timeout) | `taskService.ts` `failAgentTaskForHardTimeout`: `clearQueue`, `abandonAutoRetry` |
-| `TurnRecords` | `interruptWorkspaceTurn`: `WorkspaceService.recordStopForStartupRecovery` after the stream stop, which adopts or creates the session (`getOrCreateSession`); `agentSession.ts` `recordStopForStartupRecovery`: `persistStartupAutoRetryAbandon("aborted", ...)` for the tail's retry user message, then a second `abandonAutoRetry`. The record skips a removed workspace (`findWorkspace`). `WorkspaceService.abandonAutoRetry` also reaches a session still in its startup recovery (`transientStartupRecoverySessions`). The model has no step for that lookup, because it has one session: only the repro test "a Stop during startup recovery's first await keeps it from arming a retry" fails without it |
+| `TurnAbandons` | `interruptWorkspaceTurn`: `WorkspaceService.abandonAutoRetry`, which also reaches a session still in its startup recovery (`transientStartupRecoverySessions`). The model has one session; without that lookup, an abandon that misses the recovering session fails `turn` |
 | `TurnStopReleases` | `interruptWorkspaceTurn`: `releaseStopLatch` in the method-level `finally` |
 | `TimeoutFails` | `taskService.ts` `failAgentTaskTerminally`: `sampleLiveExecution`, then `beginWorkspaceStop` and the task cleanup, or nothing for an idle task |
 | `TaskCleanupAbandons` | `taskStopLatch.ts` `runWorkspaceStopCleanup` and `retirePendingWork` (`clearQueue`, `abandonAutoRetry`); `abandonAutoRetry` in `agentSession.ts` counts `autoRetryStops` |
@@ -53,10 +53,11 @@ Model confirmed against the code in: #7898
 | `StopReleases` | `workspaceService.ts` `interruptStream`: the opt-out join, then `releaseHardStopLatch` in the `finally` |
 | `OptOutApplies` | `agentSession.ts` `applyAutoRetryEnabled` with `enabled: false` |
 | `TaskStopReleases` | `taskStopLatch.ts` `recheckWorkspaceStopRelease` |
-| `Restart` | A new backend on the same `XUM_ROOT`: `readAutoRetryState` loads the opt-out and the marker, `readCompactionCancellation` the cancellation record |
-| `StartupBegins` | `workspaceService.ts` `initialize` (skips sub-agents, `SubAgent`) and `startStartupRecovery`; `agentSession.ts` `runStartupRecovery`: captures `autoRetryStops` before its first await, then the metadata read and the recovery steps before the check |
-| `StartupSchedules` | `scheduleStartupAutoRetryIfNeeded`: captures the retry generation (`isCurrent`) before its first await |
-| `StartupArms` | `scheduleStartupAutoRetryIfNeeded`: `compactionRecoveryBlocked`, the preference, a non-retryable marker that matches the tail, then `handleStreamFailureForAutoRetry` with `isCurrent` and the count from `runStartupRecovery`. A marker check that runs before the turn's record sets the marker is safe: the record's second abandon comes after the set, so the arm refuses (`isCurrent`) or loses the retry it armed |
+| `Restart` | A new backend on the same `XUM_ROOT`: `readAutoRetryState` loads the opt-out, `readCompactionCancellation` the cancellation record; the handle stays in the owner's `task-handles` |
+| `StartupBegins` | `workspaceService.ts` `initialize` (skips sub-agents, `SubAgent`) and `startStartupRecovery`; `agentSession.ts` `runStartupRecovery`: the metadata read and the recovery steps before the check |
+| `StartupSchedules` | `scheduleStartupAutoRetryIfNeeded`: `compactionRecoveryBlocked`, then captures the retry generation (`isCurrent`) |
+| `StartupReads` | `startupWorkspaceTurnOutcome`: `isWorkspaceTurnStopped` for the tail's workspace-turn correlation (`TaskService`, `WorkspaceTurnManager.isWorkspaceTurnStopped`: the handle is `interrupted` without an error), then `isCurrent` |
+| `StartupArms` | `scheduleStartupAutoRetryIfNeeded`: the preference, the tail read and the derivation, then `handleStreamFailureForAutoRetry` with `isCurrent` |
 
 To see what changed in the covered files since the sync commit, uncommitted edits included, run:
 
@@ -85,12 +86,12 @@ It needs Java 11 or newer. The first run downloads the pinned `tla2tools.jar` (T
 
 ```
 config        result               expected              distinct generated   secs
-reachability  NoRetryEverResumes   NoRetryEverResumes          28        43      1
-ui            holds                holds                    23139     44483      1
-api           holds                holds                    14985     26423      1
-task          holds                holds                     9863     19159      1
-turn          holds                holds                    31655     57139      1
-timeout       holds                holds                    10204     19185      1
+reachability  NoRetryEverResumes   NoRetryEverResumes          28        45      1
+ui            holds                holds                    26397     51995      1
+api           holds                holds                    16763     30211      1
+task          holds                holds                     9772     19782      1
+turn          holds                holds                    24496     45664      1
+timeout       holds                holds                    10043     19668      1
 formal-stop-retry: 6 of 6 configs as expected
 ```
 
@@ -121,9 +122,9 @@ The pstack `/maintain-formal-verification-skill` skill, where installed, brings 
 
 The check covers one workspace with one Stop of one kind and one backend restart while no Stop is in progress, so the Stop can come before the restart or during startup recovery. It allows at most 3 provider errors and a retry generation of at most 10. It treats `isStopInProgress` as the latch count of that workspace, and assumes the tail is interrupted at the restart, so startup recovery would resume it without a durable Stop record.
 
-Startup recovery also runs without a restart, in a new session when a chat subscribes (`subscribeChat`, `agentSession.ts:2299`, and `routerSubscriptions.ts:529`), and `StartupRecovery` reruns its check after a deferred check or a failed read (`startupRecovery.ts:75`, `:93`). The model's one startup pass covers these runs: every rerun of the check passes the count from the start of `runStartupRecovery` and captures a new retry generation, and a new session reads the same disk state as a session after a restart.
+Startup recovery also runs without a restart, in a new session when a chat subscribes (`subscribeChat`, `agentSession.ts:2309`, and `routerSubscriptions.ts:529`), and `StartupRecovery` reruns its check after a deferred check or a failed read (`startupRecovery.ts:75`, `:93`). The model's one startup pass covers these runs: every rerun of the check captures a new retry generation and reads the handle again, and a new session reads the same disk state as a session after a restart.
 
-For `turn`, the record's second abandon keeps the property when the interrupt's first abandon lands before startup recovery begins and its record after that recovery armed a retry: without it, `turn` fails. Startup recovery's own count and generation checks are redundant in the model (it holds without them), because every `turn` Stop ends with the record. They still end the retry for an abandon whose record does not come. The repro test "a turn interrupt's startup record ends a retry that startup recovery armed after its abandon" fails without the second abandon, and "a Stop during startup recovery's first await keeps it from arming a retry", which abandons without a record, fails without the count check.
+For `turn`, the order in `interruptWorkspaceTurn` keeps the property: the handle write comes before the abandon. A startup recovery that reads the handle before the write meets the abandon after its read, which bumps its retry generation, and one that reads it after the write refuses. `turn` fails when the handle is written after the stream stop instead, when startup recovery does not read the handle, when it does not check its generation, or when the abandon misses a session in its startup recovery. The repro tests in `stopEndsAutoRetry.repro.test.ts` that restart the backend fail without the handle read.
 
 It leaves these out:
 
@@ -131,17 +132,13 @@ It leaves these out:
 - Other automatic turns: a goal's resume after a stream error, bash monitor wakes, queued sends, compaction follow-ups, and a sub-agent's startup recovery, which TaskService owns.
 - Soft Stops (`soft: true`), session disposal, shutdown, and a second backend on the same `XUM_ROOT`.
 - The first preference load from disk. The model assumes the preference is already loaded.
-- A crash inside a Stop, and a second restart. A crash inside the Stop can lose the record that the Stop had not written yet.
-- A failed write of the turn's record. `recordStopForStartupRecovery` retries the write once (`recordPendingAutoRetryState`) and only logs when it still fails, while a user Stop fails the Stop (`STOP_UNRECORDED_MESSAGE`). The interrupt already settled its handle, and an error would skip its callers' terminal-attention suppression.
-- A stream error handled without a stream context (`activeStreamContext` unset). `handleStreamError` then passes no admission count, so `handleStreamFailureForAutoRetry` and the marker update read `autoRetryStops` when they are called, after the accounting awaits, and a Stop during those awaits is not seen.
-- These marker clears:
-  - `retryActiveStream` after a resume started (`agentSession.ts:2673`), left out because a resume that starts after the Stop is already a violation, and before the Stop the marker is unset.
-  - `handleProviderConfigChanged` (`agentSession.ts:2911`), left out because it clears only a provider-config reason, never `aborted`.
-  - A manual user send (`agentSession.ts:6492`), left out because user sends after the Stop are out of scope.
-  - A stream that ends normally (`agentSession.ts:10561`), left out because the model has no normal stream end, and a turn that ended normally is not resumed.
-  - `retryActiveStream` after a fired retry failed (`agentSession.ts:2685`), inside the turn's record. The model takes `TurnRecords` as one step, but the record awaits the marker write between the in-memory marker set (`agentSession.ts:2880`) and the second abandon (`agentSession.ts:2592`). A retry that fires in that window fails at the latch, and its failure handling can clear the marker (`updateStartupAutoRetryAbandonFromFailure` at `agentSession.ts:2930`, then `clearStartupAutoRetryAbandon` at `:2896`). Left out because only a retry that startup recovery armed after the interrupt's first abandon is still current there, and the second abandon ends it, so the lost marker matters only on a second restart.
+- A crash inside a Stop, and a second restart. A crash inside a turn interrupt keeps its handle, which it writes first.
+- A failed handle write. It fails the interrupt before the interrupt latches or stops anything, so the caller sees the Stop fail.
+- A stream error handled without a stream context (`activeStreamContext` unset). `handleStreamError` then passes no admission count, so `handleStreamFailureForAutoRetry` reads `autoRetryStops` when it is called, after the accounting awaits, and a Stop during those awaits is not seen.
+- The startup abandon marker. No Stop kind in the model relies on it: ui and api rely on the opt-out and the cancellation record, turn on its handle.
+- A tail whose retry user message carries no workspace-turn correlation, and a handle that is gone with its owner's session folder. Startup recovery then resumes a stopped turn's tail.
 - Three more callers of `handleStreamFailureForAutoRetry`, which the model has no steps for:
-  - `sendCompactionRequest` (`agentSession.ts:7975`), when a mid-stream compaction's dispatch fails. A workspace-turn interrupt or a hard timeout does not cancel the compaction, so its latch refuses the dispatch with a retryable error. The call passes the interrupted stream's `admissionAutoRetryStops`, like `handleStreamError`. The test "a Stop during the mid-stream compaction dispatch arms no retry" in `src/node/services/agentSession.autoCompaction.test.ts` fails without it.
-  - `settleRuntimeFailureWithoutErrorEvent` (`agentSession.ts:8847`), which `handleStreamWithHistoryFailure` calls, for a `runtime_not_ready` or `runtime_start_failed` failure without a pre-start error. An emergency context-window rollover produces one: its request preparation (`prepareContextRecovery`, `prepareRolloverRequest`) reports a failed runtime start only as its result, and a remote runtime reports an aborted start as `runtime_start_failed`. The call passes its turn's `admissionAutoRetryStops`. The test "a Stop during an emergency rollover's runtime start arms no retry" in `src/node/services/agentSession.pinnedBudget.test.ts` fails without it.
-  - The turn-abort path (`agentSession.ts:10497`). It passes `aborted`, which `RetryManager` never schedules (`NON_RETRYABLE_STREAM_ERRORS` in `src/common/utils/messages/retryEligibility.ts`).
+  - `sendCompactionRequest` (`agentSession.ts:7979`), when a mid-stream compaction's dispatch fails. A workspace-turn interrupt or a hard timeout does not cancel the compaction, so its latch refuses the dispatch with a retryable error. The call passes the interrupted stream's `admissionAutoRetryStops`, like `handleStreamError`. The test "a Stop during the mid-stream compaction dispatch arms no retry" in `src/node/services/agentSession.autoCompaction.test.ts` fails without it.
+  - `settleRuntimeFailureWithoutErrorEvent` (`agentSession.ts:8849`), which `handleStreamWithHistoryFailure` calls, for a `runtime_not_ready` or `runtime_start_failed` failure without a pre-start error. An emergency context-window rollover produces one: its request preparation (`prepareContextRecovery`, `prepareRolloverRequest`) reports a failed runtime start only as its result, and a remote runtime reports an aborted start as `runtime_start_failed`. The call passes its turn's `admissionAutoRetryStops`. The test "a Stop during an emergency rollover's runtime start arms no retry" in `src/node/services/agentSession.pinnedBudget.test.ts` fails without it.
+  - The turn-abort path (`agentSession.ts:10488`). It passes `aborted`, which `RetryManager` never schedules (`NON_RETRYABLE_STREAM_ERRORS` in `src/common/utils/messages/retryEligibility.ts`).
 - Retries that should happen. The model checks safety only: `reachability.cfg` proves that a retry can start, but no property catches a retry that the code refuses wrongly. For example, an interrupt of a queued workspace turn must leave the running turn's retry alone, also when the running turn's error handling ends inside the interrupt's latch window. The repro test "interrupting a queued workspace turn leaves the running turn's retry armed" covers that case, not the model.
