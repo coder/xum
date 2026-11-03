@@ -79,8 +79,10 @@ Every check line must read `ok`. A `note` line only informs. It checks that the 
 lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
 names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
 `/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
-When the backend has an auth token, doctor and launch read it from `server.lock` and send it to
-curl on stdin, never in argv.
+The backend always has an auth token: launch runs make under `env -i`, which drops
+`XUM_DEV_SERVER_NO_AUTH`. (A checkout from before #7904 starts it without one, and the skill works
+the same.) Doctor and launch read the token from `server.lock` and send it to curl on stdin, never
+in argv.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive

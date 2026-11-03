@@ -453,6 +453,16 @@ cmd_open() {
   local path=${1:-} out
   [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
   load_run "${2:-}"
+  # Checked before agent-browser runs. A PATH like //host, /\host or /<tab>/host resolves to
+  # another origin: never send the token there. One that normalizes to //... (/..//host) stays on
+  # the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
+  node -e '
+    const [base, path] = process.argv.slice(1);
+    const url = new URL(path, base);
+    if (url.origin !== new URL(base).origin || url.pathname.startsWith("//")) {
+      process.stderr.write("verify-xum: open PATH must stay on " + base + " and must not start with // once normalized\n");
+      process.exit(1);
+    }' "$VERIFY_XUM_URL" "$path" || exit 1
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
@@ -462,11 +472,6 @@ cmd_open() {
       token = JSON.parse(fs.readFileSync(serverLock, "utf8")).token ?? "";
     } catch {}
     const url = new URL(path, base);
-    // A PATH like //host or /\host resolves to another origin: never send the token there.
-    if (url.origin !== new URL(base).origin) {
-      process.stderr.write("verify-xum: open PATH must stay on " + base + "\n");
-      process.exit(1);
-    }
     if (token) url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
     "$VERIFY_XUM_ROOT/server.lock" "$VERIFY_XUM_URL" "$path" \
