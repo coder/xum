@@ -3,7 +3,11 @@ import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { APICallError } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
-import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionRequestData,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
@@ -988,6 +992,28 @@ describe("a Stop ends the auto-retry loop", () => {
         }),
     },
     {
+      row: "an on-send compaction of a wake that continues the turn",
+      build: (turnMetadata: MuxMessageMetadata) =>
+        createMuxMessage("wake-compaction-request", "user", "Summarize", {
+          synthetic: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            source: "auto-compaction",
+            parsed: {
+              followUpContent: {
+                text: "Wake",
+                model: HAIKU_MODEL,
+                agentId: "exec",
+                muxMetadata: { type: "bash-monitor-wake", records: [] },
+                workspaceTurnMetadata:
+                  turnMetadata.type === "workspace-turn-task" ? turnMetadata : undefined,
+              },
+            },
+          },
+        }),
+    },
+    {
       row: "a child's completed report",
       build: () =>
         createMuxMessage(
@@ -1160,6 +1186,45 @@ describe("a Stop ends the auto-retry loop", () => {
     });
   }, 90_000);
 
+  test("a malformed compaction request in a restart-settled turn's history does not fail the interrupt", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { historyService } = restarted as unknown as { historyService: HistoryService };
+        // Persisted rows from a damaged or older file: no `parsed` object to read.
+        const malformed = createMuxMessage("malformed-compaction", "user", "Summarize", {
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: null as unknown as CompactionRequestData,
+          },
+        });
+        assert(
+          (await historyService.appendToHistory(turn.workspaceId, malformed)).success,
+          "the malformed row is in the turn's history"
+        );
+
+        const interrupted = await restarted.workspaceTurnManager.interruptWorkspaceTurn(
+          ownerId,
+          turn.taskId
+        );
+
+        expect(interrupted.success).toBe(true);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
   test("interrupting a superseded turn stays a no-op while its workspace still retries", async () => {
     await withWorkspace(async (env, ownerId) => {
       const model = failsOnceModel();
@@ -1229,16 +1294,67 @@ describe("a Stop ends the auto-retry loop", () => {
           "the stream is the user's, not the turn's retry"
         );
 
+        // The newer turn must not see a stop in progress (stoppedSince, goal advancement).
+        const latch = spyOn(restarted.taskService, "latchWorkspaceStopsInProgress");
         await interruptTurn(restarted, ownerId, turn.taskId);
 
         const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
         expect({
           streaming: aiService.isStreaming(turn.workspaceId),
+          latched: latch.mock.calls.length,
           handle: { status: record?.status, error: record?.error },
         }).toEqual({
           streaming: true,
+          latched: 0,
           handle: { status: "interrupted", error: "Workspace turn interrupted after restart" },
         });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a user's send that starts between a turn interrupt's first read and its latch keeps streaming", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { aiService, workspaceService } = restarted;
+        const { historyService } = restarted as unknown as { historyService: HistoryService };
+        const read = historyService.getHistoryFromLatestBoundary.bind(historyService);
+        let interrupting = false;
+        let sent: Awaited<ReturnType<typeof workspaceService.sendMessage>> | undefined;
+        // The first read still finds the turn's prompt newest. The user's message starts
+        // streaming before the interrupt latches.
+        spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          async (workspaceId, ...rest) => {
+            const history = await read(workspaceId, ...rest);
+            if (interrupting && workspaceId === turn.workspaceId) {
+              interrupting = false;
+              sent = await workspaceService.sendMessage(turn.workspaceId, "Do something else", {
+                model: HAIKU_MODEL,
+                agentId: "exec",
+              });
+              assert(
+                await waitFor(() => aiService.isStreaming(turn.workspaceId), 20_000),
+                "the user's message streams"
+              );
+            }
+            return history;
+          }
+        );
+
+        interrupting = true;
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        assert(sent?.success === true, "the user's message is sent");
+        expect(aiService.isStreaming(turn.workspaceId)).toBe(true);
       } finally {
         await restarted.dispose();
         await restarted.shutdown();

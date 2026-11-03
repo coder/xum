@@ -76,6 +76,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   isContextBudgetWarningMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
@@ -1133,19 +1134,37 @@ export class WorkspaceTurnManager {
   }
 
   /**
+   * The interrupt's stop latch, or undefined when a restart-recovery interrupt finds its turn
+   * superseded. The first read runs before the latch: a superseding turn must never see a stop
+   * in progress (stoppedSince, goal advancement) for a no-op. The second read runs under the
+   * latch: a send writes its row before its final admission, which the latch refuses, so that
+   * read sees every send that can still start a stream, and a later send is refused, never
+   * aborted.
+   */
+  private async latchUnlessSuperseded(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<(() => void) | undefined> {
+    if (await this.isSupersededRestartInterrupt(record)) return undefined;
+    const release = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
+    if (!(await this.isSupersededRestartInterrupt(record))) return release;
+    release();
+    return undefined;
+  }
+
+  /**
    * Whether a resume of the row that auto-retry and startup recovery replay continues this turn.
-   * A compaction request (mid-stream, or a send compacted first) resumes into its follow-up,
-   * which carries the turn's metadata. Unreadable history: the Stop wins.
+   * A compaction request (mid-stream, or a send compacted first) resumes into its follow-up. That
+   * follow-up carries the turn's correlation in `workspaceTurnMetadata` when another trigger (a
+   * wake) owns its `muxMetadata`. Unreadable history: the Stop wins.
    */
   private async ownsRetryRow(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
     const history = await this.historyService.getHistoryFromLatestBoundary(record.workspaceId);
     if (!history.success) return true;
     const muxMetadata = findLastRetryUserMessage(history.data)?.metadata?.muxMetadata;
+    const followUp = getCompactionFollowUpContent(muxMetadata);
     return this.matchesWorkspaceTurnRecord(
       record,
-      muxMetadata?.type === "compaction-request"
-        ? muxMetadata.parsed.followUpContent?.muxMetadata
-        : muxMetadata
+      followUp == null ? muxMetadata : (followUp.workspaceTurnMetadata ?? followUp.muxMetadata)
     );
   }
 
@@ -3935,12 +3954,9 @@ export class WorkspaceTurnManager {
             // interrupted turn. The level latch stays held through stopStream (the method-level
             // finally releases it): ROOT targets have no task status to refuse on, so a send
             // admitted during the wind-down would queue behind the dying stream and auto-dispatch
-            // when it ends, defeating the stop. A send writes its row before that gate, so the
-            // restart-interrupt read below sees every send that can still start a stream.
-            releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
-            if (await this.isSupersededRestartInterrupt(record)) {
-              return Ok({ workspaceId: record.workspaceId });
-            }
+            // when it ends, defeating the stop.
+            releaseStopLatch = await this.latchUnlessSuperseded(record);
+            if (releaseStopLatch == null) return Ok({ workspaceId: record.workspaceId });
 
             workspaceId = record.workspaceId;
             shouldClearQueuedPrompt =

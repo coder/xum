@@ -220,9 +220,9 @@ RetryReschedules ==
 \*   record that blocks automatic recovery until a user send replaces it) and
 \*   retryManager.abandon("user_interrupt"), which is not abandonAutoRetry (stops stays).
 \* task: beginWorkspaceStop's latch (Phase A).
-\* turn: interruptWorkspaceTurn latches under the publication lock, then reads which row a
-\*   retry replays and writes the handle (TurnWrites). The model's one tail is the turn's, so
-\*   the read always lets the Stop go on. A queued handle latches too but owns no turn and
+\* turn: interruptWorkspaceTurn reads which row a retry replays, latches under the
+\*   publication lock, then reads that row again and writes the handle (TurnWrites). The
+\*   model's one tail is the turn's, so the reads always let the Stop go on. A queued handle latches too but owns no turn and
 \*   abandons nothing; it is not modeled (MayArm ignores the latch).
 \* timeout: failAgentTaskForHardTimeout's clearQueue and abandonAutoRetry.
 StopBegins(k) ==
