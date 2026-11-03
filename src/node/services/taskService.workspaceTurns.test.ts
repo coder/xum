@@ -2184,7 +2184,8 @@ describe("TaskService", () => {
     const handleId = "wst_stopped_after_restart";
     const stoppedAt = "2026-08-11T00:00:05.000Z";
 
-    async function drainWakeOf(outcome: { status: "interrupted"; updatedAt: string }) {
+    /** Drains one pending wake (`generationId` unset: a legacy wake, created now). */
+    async function drainWakeOf(params: { stoppedAt: string; generationId?: string }) {
       const config = await createTestConfig(rootDir);
       const { parentId } = await saveLocalParentWorkspace(config, rootDir);
       const sendMessage = mock(
@@ -2195,16 +2196,15 @@ describe("TaskService", () => {
       await new TaskHandleStore(config).upsertWorkspaceTurn(
         workspaceTurnRecord(parentId, parentId, handleId, "interrupted", {
           attentionPolicy: "notify_on_terminal",
-          updatedAt: stoppedAt,
+          updatedAt: params.stoppedAt,
         })
       );
       const attentionStore = new TerminalAttentionStore(config);
-      const generationId = `${handleId}:${outcome.status}:${outcome.updatedAt}`;
       await attentionStore.enqueueIfAbsent({
         ownerWorkspaceId: parentId,
         sourceKind: "workspace_turn",
         sourceId: handleId,
-        generationId,
+        ...(params.generationId != null ? { generationId: params.generationId } : {}),
         terminalOutcome: "interrupted",
       });
 
@@ -2213,7 +2213,7 @@ describe("TaskService", () => {
 
       const wake = await attentionStore.get(
         parentId,
-        TerminalAttentionStore.notificationId("workspace_turn", handleId, generationId)
+        TerminalAttentionStore.notificationId("workspace_turn", handleId, params.generationId)
       );
       return {
         woke: sendMessage.mock.calls.some((call) => String(call[1]).includes(handleId)),
@@ -2223,15 +2223,29 @@ describe("TaskService", () => {
 
     test("drops the wake of the restart outcome that the Stop replaced", async () => {
       expect(
-        await drainWakeOf({ status: "interrupted", updatedAt: "2026-08-11T00:00:01.000Z" })
+        await drainWakeOf({
+          stoppedAt,
+          generationId: `${handleId}:interrupted:2026-08-11T00:00:01.000Z`,
+        })
       ).toEqual({ woke: false, status: "superseded" });
     });
 
     test("delivers a wake of the Stop's own outcome", async () => {
-      expect(await drainWakeOf({ status: "interrupted", updatedAt: stoppedAt })).toEqual({
-        woke: true,
-        status: "delivered",
+      expect(
+        await drainWakeOf({ stoppedAt, generationId: `${handleId}:interrupted:${stoppedAt}` })
+      ).toEqual({ woke: true, status: "delivered" });
+    });
+
+    test("drops a legacy wake older than the Stop", async () => {
+      const later = new Date(Date.now() + 60_000).toISOString();
+      expect(await drainWakeOf({ stoppedAt: later })).toEqual({
+        woke: false,
+        status: "superseded",
       });
+    });
+
+    test("delivers a legacy wake newer than the Stop", async () => {
+      expect(await drainWakeOf({ stoppedAt })).toEqual({ woke: true, status: "delivered" });
     });
   });
 

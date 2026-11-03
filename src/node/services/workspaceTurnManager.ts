@@ -593,18 +593,19 @@ function workspaceTurnTerminalOutcomeGenerationId(
  * Whether a pending wake announces an outcome that an explicit Stop replaced (a restart
  * recovery outcome). The Stop is quiet, and its delete of that wake cannot retract a drain's
  * listPending snapshot, so the drain's reread of the record decides. A wake for the Stop's own
- * outcome, or a legacy wake with no generation, still notifies.
+ * outcome still notifies. A legacy wake names no generation: it counts as replaced when it is
+ * older than the Stop's write, the timestamp test that
+ * recoverTerminalWorkspaceTurnAttentionNotifications applies to legacy wakes.
  */
 export function workspaceTurnWakeReplacedByStop(
-  notification: Pick<TerminalAttentionNotification, "generationId">,
+  notification: Pick<TerminalAttentionNotification, "generationId" | "createdAt">,
   record: WorkspaceTurnTaskHandleRecord
 ): boolean {
-  return (
-    record.status === "interrupted" &&
-    record.error == null &&
-    notification.generationId != null &&
-    notification.generationId !== workspaceTurnTerminalOutcomeGenerationId(record)
-  );
+  if (record.status !== "interrupted" || record.error != null) return false;
+  // An unparsable time compares false, so that wake still notifies.
+  return notification.generationId == null
+    ? Date.parse(notification.createdAt) < Date.parse(record.updatedAt)
+    : notification.generationId !== workspaceTurnTerminalOutcomeGenerationId(record);
 }
 
 /**
