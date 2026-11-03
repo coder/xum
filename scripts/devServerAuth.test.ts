@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
@@ -50,6 +52,21 @@ function exportedToken(run: DryRun): string {
 function exportedSocket(run: DryRun): string {
   if (run.socket === undefined) throw new Error("make did not export XUM_BACKEND_SOCKET");
   return run.socket;
+}
+
+async function shell(script: string, env: Record<string, string>): Promise<string> {
+  const proc = Bun.spawn(["sh", "-c", script], {
+    env: { PATH: process.env.PATH ?? "", ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  expect(exitCode, stderr).toBe(0);
+  return stdout.replace(/\n$/, "");
 }
 
 function backendCommand(run: DryRun): string {
@@ -215,6 +232,34 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
     expect(chosen.socket).toBe("/run/me/custom.sock");
     expect(socketArgument(chosen)).toBe("/run/me/custom.sock");
   });
+
+  // The path reaches the backend through three shells: the recipe's, concurrently's and nodemon's
+  // `--exec`. A path with spaces or quotes must still be one argument.
+  test("a path with spaces and quotes reaches the backend as one argument", async () => {
+    const spaced = `/tmp/xum a'b "c"/b.sock`;
+    const run = await dryRun("dev-server", { XUM_BACKEND_SOCKET: spaced });
+    const line = backendCommand(run).trim().replace(/\\$/, "");
+    // What the recipe's shell hands to concurrently as one argument.
+    const handedOn = await shell(`printf '%s' ${line}`, { XUM_BACKEND_SOCKET: spaced });
+    const exec = /--exec '(.*)'$/s.exec(handedOn)?.[1];
+    if (exec === undefined) throw new Error(`no --exec in ${handedOn}`);
+    // nodemon runs the exec string in a shell: record the argv that `node` receives.
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-node-"));
+    try {
+      await fs.writeFile(path.join(bin, "node"), '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', {
+        mode: 0o755,
+      });
+      const argv = (
+        await shell(exec, {
+          XUM_BACKEND_SOCKET: spaced,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+        })
+      ).split("\n");
+      expect(argv[argv.indexOf("--unix-socket") + 1]).toBe(spaced);
+    } finally {
+      await fs.rm(bin, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("Windows keeps TCP: no socket for Vite or the backend", () => {
     expect(windows.socket).toBeUndefined();

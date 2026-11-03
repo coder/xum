@@ -96,6 +96,82 @@ describe.skipIf(!posix)("preparePrivateUnixSocketPath", () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
+  // Someone who can write to a parent folder can rename the verified folder away and put their own
+  // in its place, so a 0700 folder is private only if no other user can modify its parents.
+  describe("parent folders", () => {
+    let shared: string;
+
+    beforeEach(async () => {
+      shared = path.join(base, "shared");
+      await fs.mkdir(shared);
+    });
+
+    test("refuses a parent that other users can write to", async () => {
+      await fs.chmod(shared, 0o777);
+      const underShared = path.join(shared, "run", "b.sock");
+      await expect(preparePrivateUnixSocketPath(underShared)).rejects.toThrow(
+        /parent folder .*writable by other users/
+      );
+      // It must not leave a folder behind for someone to swap.
+      expect(await fs.readdir(shared)).toEqual([]);
+    });
+
+    test("refuses a group-writable parent", async () => {
+      await fs.chmod(shared, 0o770);
+      await expect(
+        preparePrivateUnixSocketPath(path.join(shared, "run", "b.sock"))
+      ).rejects.toThrow(/writable by other users/);
+    });
+
+    test("accepts a sticky parent, which stops others from renaming our folder (like /tmp)", async () => {
+      await fs.chmod(shared, 0o1777);
+      await preparePrivateUnixSocketPath(path.join(shared, "run", "b.sock"));
+    });
+
+    test("checks every ancestor, not only the parent", async () => {
+      await fs.chmod(shared, 0o777);
+      const inner = path.join(shared, "inner");
+      await fs.mkdir(inner, { mode: 0o700 });
+      await expect(preparePrivateUnixSocketPath(path.join(inner, "run", "b.sock"))).rejects.toThrow(
+        /writable by other users/
+      );
+    });
+
+    test("checks where a symlinked parent leads", async () => {
+      await fs.chmod(shared, 0o777);
+      const link = path.join(base, "link");
+      await fs.symlink(shared, link);
+      await expect(preparePrivateUnixSocketPath(path.join(link, "b.sock"))).rejects.toThrow(
+        /writable by other users/
+      );
+    });
+
+    test("accepts a symlink to a private parent", async () => {
+      const link = path.join(base, "link");
+      await fs.symlink(shared, link);
+      await preparePrivateUnixSocketPath(path.join(link, "run", "b.sock"));
+    });
+  });
+
+  test("refuses to remove the socket of a server that is still listening", async () => {
+    await preparePrivateUnixSocketPath(socketPath);
+    const server = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+    try {
+      await expect(preparePrivateUnixSocketPath(socketPath)).rejects.toThrow(/in use/);
+      // The live server must still own the path.
+      await new Promise<void>((resolve, reject) => {
+        const client = net.connect(socketPath, () => client.end(resolve));
+        client.once("error", reject);
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("never removes something at the socket path that is not a socket", async () => {
     await preparePrivateUnixSocketPath(socketPath);
     await fs.writeFile(socketPath, "precious");
