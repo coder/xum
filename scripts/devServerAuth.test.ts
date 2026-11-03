@@ -1,0 +1,97 @@
+import { beforeAll, describe, expect, test } from "bun:test";
+import * as path from "node:path";
+
+const REPO_ROOT = path.resolve(import.meta.dir, "..");
+
+interface DryRun {
+  /** What make would run. Nothing starts, and it is argv-visible to every local account. */
+  commands: string;
+  /** XUM_SERVER_AUTH_TOKEN as make exports it to the recipe's processes (env, not argv). */
+  token: string | undefined;
+}
+
+// `make -pn` prints the commands a goal would run, then make's variable database. The environment
+// is minimal on purpose: the host's own server token (agent shells export one) must not leak in.
+async function dryRun(goal: string, env: Record<string, string> = {}): Promise<DryRun> {
+  const proc = Bun.spawn(["make", "-pn", goal], {
+    cwd: REPO_ROOT,
+    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  expect(exitCode, stderr).toBe(0);
+  const databaseStart = stdout.indexOf("# Make data base");
+  expect(databaseStart, "make -p must print its database").toBeGreaterThan(0);
+  const commands = stdout.slice(0, databaseStart);
+  const token = /^XUM_SERVER_AUTH_TOKEN := (.*)$/m.exec(stdout.slice(databaseStart))?.[1];
+  return { commands, token };
+}
+
+function backendCommand(run: DryRun): string {
+  const lines = run.commands
+    .split("\n")
+    .filter((line) => line.includes("dist/cli/index.js server"));
+  expect(lines, "the dev-server recipe must start the backend").toHaveLength(1);
+  return lines[0];
+}
+
+// Any other local account can reach a loopback port, and an open backend runs commands as the
+// developer. `make dev-server` therefore starts the backend with a token.
+describe("make dev-server auth", () => {
+  let first: DryRun;
+  let second: DryRun;
+  let ambient: DryRun;
+  let chosen: DryRun;
+  let open: DryRun;
+  let otherGoal: DryRun;
+
+  beforeAll(async () => {
+    [first, second, ambient, chosen, open, otherGoal] = await Promise.all([
+      dryRun("dev-server"),
+      dryRun("dev-server"),
+      dryRun("dev-server", {
+        XUM_SERVER_AUTH_TOKEN: "host-server-token",
+        MUX_SERVER_AUTH_TOKEN: "legacy-host-server-token",
+      }),
+      dryRun("dev-server", { XUM_DEV_SERVER_AUTH_TOKEN: "chosen-dev-token" }),
+      dryRun("dev-server", { XUM_DEV_SERVER_NO_AUTH: "1" }),
+      dryRun("help"),
+    ]);
+  }, 60_000);
+
+  test("starts the backend with auth on and a fresh random token per run", () => {
+    expect(backendCommand(first)).not.toContain("--no-auth");
+    expect(first.token).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.token).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.token).not.toBe(first.token);
+  });
+
+  test("keeps the token out of every command line", () => {
+    expect(first.token).toBeDefined();
+    expect(first.commands).not.toContain(first.token as string);
+  });
+
+  test("never reuses the token of the server the shell already talks to", () => {
+    expect(ambient.token).toMatch(/^[0-9a-f]{64}$/);
+    expect(backendCommand(ambient)).not.toContain("--no-auth");
+  });
+
+  test("XUM_DEV_SERVER_AUTH_TOKEN picks the token", () => {
+    expect(chosen.token).toBe("chosen-dev-token");
+    expect(backendCommand(chosen)).not.toContain("--no-auth");
+  });
+
+  test("XUM_DEV_SERVER_NO_AUTH=1 is the only way to an open backend", () => {
+    expect(backendCommand(open)).toContain("--no-auth");
+    expect(open.token).toBeUndefined();
+  });
+
+  test("goals other than dev-server do not generate a token", () => {
+    expect(otherGoal.token).toBeUndefined();
+  });
+});
