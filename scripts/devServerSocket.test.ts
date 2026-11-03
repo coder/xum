@@ -132,7 +132,7 @@ describe.skipIf(process.platform === "win32")(
 
       expect(squatterConnections).toBe(0);
       expect(Buffer.concat(squatterBytes).toString()).not.toContain(SECRET);
-      expect(answers).toEqual(Array(7).fill("backend"));
+      expect(answers).toEqual(Array.from({ length: 7 }, () => "backend"));
       expect(backendSeen).toHaveLength(7);
       expect(backendSeen.every((line) => line.endsWith(`token=${SECRET}`))).toBe(true);
     }, 30_000);
@@ -146,7 +146,7 @@ describe.skipIf(process.platform === "win32")(
           );
         });
         let data = "";
-        socket.on("data", (chunk) => (data += chunk));
+        socket.on("data", (chunk) => (data += chunk.toString()));
         socket.on("close", () => resolve(data));
         socket.on("error", () => resolve(data));
       });

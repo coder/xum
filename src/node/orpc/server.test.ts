@@ -2512,6 +2512,7 @@ describe("the static workspace view on a phone's workspace page", () => {
   });
 });
 
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `rejects` as non-thenable */
 describe("createOrpcServer unixSocketPath", () => {
   type Upgrade = Parameters<
     NonNullable<Parameters<typeof createOrpcServer>[0]["desktopBridgeServer"]>["handleUpgrade"]
@@ -2615,3 +2616,4 @@ describe("createOrpcServer unixSocketPath", () => {
     await new Promise<void>((resolve) => reuse.close(() => resolve()));
   });
 });
+/* eslint-enable @typescript-eslint/await-thenable */

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `rejects` as non-thenable */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";

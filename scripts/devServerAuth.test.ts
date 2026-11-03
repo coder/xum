@@ -47,6 +47,11 @@ function exportedToken(run: DryRun): string {
   return run.token;
 }
 
+function exportedSocket(run: DryRun): string {
+  if (run.socket === undefined) throw new Error("make did not export XUM_BACKEND_SOCKET");
+  return run.socket;
+}
+
 function backendCommand(run: DryRun): string {
   const lines = run.commands
     .split("\n")
@@ -194,8 +199,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
   const socketArgument = (run: DryRun) => /--unix-socket (\S+)/.exec(backendCommand(run))?.[1];
 
   test("the backend listens on the exported path, and the path fits sun_path", () => {
-    expect(socketRun.socket).toBeDefined();
-    const socket = socketRun.socket as string;
+    const socket = exportedSocket(socketRun);
     expect(socket.startsWith("/")).toBe(true);
     expect(socket).toMatch(/b3111\.sock$/);
     expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);

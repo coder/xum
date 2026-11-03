@@ -96,6 +96,7 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     resolveXumEnvironmentValue("VITE_PREVIEW_PORT", env),
     DEFAULT_VITE_PREVIEW_PORT
   );
+  const backendSocket = resolveXumEnvironmentValue("BACKEND_SOCKET", env)?.trim();
   const backendHost = resolveXumEnvironmentValue("BACKEND_HOST", env) ?? DEFAULT_BACKEND_PROXY_HOST;
   const backendPort = parsePort(
     resolveXumEnvironmentValue("BACKEND_PORT", env),
@@ -109,7 +110,8 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     previewPort,
     backendHost,
     backendPort,
-    backendSocket: resolveXumEnvironmentValue("BACKEND_SOCKET", env)?.trim() || undefined,
+    // A blank value (a recipe that exports it empty) is no socket.
+    backendSocket: backendSocket === "" ? undefined : backendSocket,
     enableTutorialsInSandbox: resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
   };
 }
