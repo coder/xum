@@ -25,7 +25,7 @@ Surfaces:
   keys stay out.
 
   ```bash
-  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1 \
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="$VERIFY_XUM_RUN/tmp" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1 \
     ANTHROPIC_API_KEY=sk-ant-verify-xum-fake \
     XUM_ROOT="$VERIFY_XUM_RUN/scratch/cli-root" \
     XUM_RUN_SESSION_ROOT="$VERIFY_XUM_RUN/scratch/cli-sessions" \
@@ -179,18 +179,14 @@ Proof standards:
 ```
 
 Cleanup closes this run's browser session, stops the process group that launch started (SIGTERM,
-then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and prints the evidence
+then SIGKILL after 20 s), deletes the sandbox XUM_ROOT, the run's `tmp` folder (the server tree's
+TMPDIR, where the sandbox makes its XUM_ROOT) and the demo repo, and prints the evidence
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
 the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`, `open`,
 `workspace-field`, `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory
 after their other arguments. Without one they use the newest launch from this checkout.
-
-Limit: if the launcher dies in the moment after the sandbox logs its `XUM_ROOT` and before launch
-records it (up to 0.5 s), and a server process then ignores SIGTERM, cleanup must SIGKILL the
-group. `dev-server-sandbox.ts` then cannot delete its `mux-dev-server-*` folder, and the run never
-recorded it. Delete that folder in TMPDIR by hand.
 
 ## Gotchas
 

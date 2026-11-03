@@ -32,10 +32,11 @@ set -euo pipefail
   unset $GIT_REPO_ENV
 }
 
+# With CDPATH set, `cd` to a relative folder can pick another folder and print its name, which
+# the command substitutions below would capture.
+unset CDPATH
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
-# make -C runs the sandbox from the checkout, so a relative TMPDIR would resolve there.
-[[ ${TMPDIR:-/tmp} == /* ]] || TMPDIR="$PWD/$TMPDIR"
 # Never a shared TMPDIR: another local account could create the folder first and swap a run's
 # state.env, which this script sources (see require_private_dir).
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:+$XUM_SCRATCH_DIR/verify-xum}}
@@ -331,12 +332,17 @@ cmd_launch() {
   AGENT_BROWSER_SESSION="verify-xum-$VERIFY_XUM_RUN_ID"
   mkdir -m 700 "$VERIFY_XUM_RUN"
   mkdir -p "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/scratch"
+  # The server tree's TMPDIR is a folder of this run, never the caller's: the sandbox makes its
+  # XUM_ROOT there, and the backend writes server.lock with the token into it. In a shared TMPDIR
+  # another account could swap that folder before the backend writes.
+  mkdir -m 700 "$VERIFY_XUM_RUN/tmp"
+  require_private_dir "$VERIFY_XUM_RUN/tmp"
   log="$VERIFY_XUM_RUN/server.log"
   # Milliseconds: a stamp from earlier in the launch's own second is a stale build.
   t0=$(date +%s%3N)
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
-    TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
+    TERM=dumb TMPDIR="$VERIFY_XUM_RUN/tmp" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
     VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID")
   # A shell that ran `eval "$(verify-xum.sh env)"` still exports the previous run's values.
   VERIFY_XUM_PGID='' VERIFY_XUM_ROOT='' VERIFY_XUM_BACKEND='' VERIFY_XUM_URL=''
@@ -562,7 +568,7 @@ cmd_cleanup() {
   if is_dev_server_sandbox_root "$VERIFY_XUM_ROOT"; then
     rm -rf "$VERIFY_XUM_ROOT"
   fi
-  rm -rf "$VERIFY_XUM_RUN/scratch"
+  rm -rf "$VERIFY_XUM_RUN/scratch" "$VERIFY_XUM_RUN/tmp"
   [[ $(readlink "$CURRENT_RUN_LINK" 2>/dev/null) == "$VERIFY_XUM_RUN" ]] && rm -f "$CURRENT_RUN_LINK"
   VERIFY_XUM_PGID=
   write_state
