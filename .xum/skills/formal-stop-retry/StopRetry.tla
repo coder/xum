@@ -67,7 +67,7 @@ TypeOK ==
   /\ stopGen \in Nat /\ latch \in Nat
   /\ stop \in {"none"} \cup Kinds
   /\ spc \in {"none", "stopping", "cleanup", "aborting", "awaitPolicy", "awaitOptOut",
-              "awaitSettle", "turnCleanup", "turnAborting", "turnReleasing",
+              "awaitSettle", "turnWriting", "turnCleanup", "turnAborting", "turnReleasing",
               "timeoutStopping", "timeoutFailing", "done"}
   /\ optOut \in {"none", "loading", "done"} /\ cancelDebt \in BOOLEAN
   /\ stops \in Nat /\ pStops \in Nat /\ sStops \in Nat
@@ -220,9 +220,10 @@ RetryReschedules ==
 \*   record that blocks automatic recovery until a user send replaces it) and
 \*   retryManager.abandon("user_interrupt"), which is not abandonAutoRetry (stops stays).
 \* task: beginWorkspaceStop's latch (Phase A).
-\* turn: interruptWorkspaceTurn writes the handle `interrupted`, then latches with no await
-\*   between the write completing and the latch, under the publication lock. A queued handle latches too but owns no
-\*   turn and abandons nothing; it is not modeled (MayArm ignores the latch).
+\* turn: interruptWorkspaceTurn latches under the publication lock, then reads which row a
+\*   retry replays and writes the handle (TurnWrites). The model's one tail is the turn's, so
+\*   the read always lets the Stop go on. A queued handle latches too but owns no turn and
+\*   abandons nothing; it is not modeled (MayArm ignores the latch).
 \* timeout: failAgentTaskForHardTimeout's clearQueue and abandonAutoRetry.
 StopBegins(k) ==
   /\ stop = "none"
@@ -239,8 +240,8 @@ StopBegins(k) ==
             /\ spc' = "cleanup"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "turn" ->
-            /\ handle' = "stopped" /\ latch' = latch + 1 /\ UNCHANGED stops
-            /\ spc' = "turnCleanup"
+            /\ latch' = latch + 1 /\ UNCHANGED stops
+            /\ spc' = "turnWriting"
             /\ UNCHANGED <<stopGen, cancelDebt, gen, fiber, fGen, rpc, optOut>>
        [] k = "timeout" ->
             /\ CancelRetry
@@ -249,7 +250,17 @@ StopBegins(k) ==
             /\ UNCHANGED <<latch, stopGen, cancelDebt, optOut>>
   /\ UNCHANGED <<stream, policy, pCap, errors, enabled, rGen, rStopGen, pStops, sStops, resumed,
                  resumedAfterStop>>
-  /\ IF k = "turn" THEN UNCHANGED startupVars ELSE UNCHANGED restartVars
+  /\ UNCHANGED restartVars
+
+\* turn: after the row read and the publication lock's ownership check, upsertWorkspaceTurn
+\* writes the handle `interrupted` without an error.
+TurnWrites ==
+  /\ spc = "turnWriting"
+  /\ spc' = "turnCleanup" /\ handle' = "stopped"
+  /\ UNCHANGED <<stream, policy, pCap, errors, enabled, gen, fiber, fGen, rpc, rGen, rStopGen,
+                 stopGen, latch, stops, pStops, sStops, stop, optOut, cancelDebt, resumed,
+                 resumedAfterStop>>
+  /\ UNCHANGED startupVars
 
 \* task, Phase B: clearQueue and workspaceService.abandonAutoRetry.
 TaskCleanupAbandons ==
@@ -401,9 +412,9 @@ StartupArms ==
 
 \* Restart recovery (settleStaleWorkspaceTurn, from the startup stale-turn sweep or any
 \* active-turn scan) finds nothing of the turn live and writes the handle `interrupted` with
-\* an error. Nobody stopped the turn: startup recovery still resumes it. The code sees no
-\* live work while a startup recovery runs, since its session is not registered yet. Only a
-\* turn Stop reads the difference, so the other configs skip this step.
+\* an error. Nobody stopped the turn: startup recovery still resumes it. Startup recovery
+\* arms its retry only in StartupArms, so a sweep can settle the turn while that recovery
+\* runs. Only a turn Stop reads the difference, so the other configs skip this step.
 StaleSettles ==
   /\ "turn" \in StopKinds
   /\ handle = "running" /\ ~Busy /\ fiber = "none" /\ rpc = "idle"
@@ -424,7 +435,7 @@ Next ==
   \/ RetryFires \/ RetryRoutes \/ RetryGate \/ RetryReschedules
   \/ \E k \in StopKinds : StopBegins(k)
   \/ TaskCleanupAbandons \/ StopAbortsStream \/ StopJoinsPolicy \/ StopReleases
-  \/ OptOutApplies \/ TaskStopReleases \/ TurnAbandons \/ TurnStopReleases
+  \/ OptOutApplies \/ TaskStopReleases \/ TurnWrites \/ TurnAbandons \/ TurnStopReleases
   \/ TimeoutFails \/ Restart \/ StartupBegins \/ StartupSchedules \/ StartupReads
   \/ StartupArms \/ StaleSettles
   \/ Settled
