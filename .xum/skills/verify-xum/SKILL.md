@@ -63,10 +63,11 @@ Run it first whenever anything looks off. It changes nothing.
 .xum/skills/verify-xum/scripts/verify-xum.sh doctor
 ```
 
-Every line must read `ok`. It checks that the process group lives, the checkout lock names it, the
-backend pid in the sandbox `server.lock` and the app port belong to the group, `/health` answers,
-`/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`. Exit 1 means do not
-drive this instance: run cleanup, then launch again.
+Every line must read `ok`. It checks that the process group lives and carries the run's id
+(`VERIFY_XUM_SERVER_OF` in its env), the checkout lock names it, the backend pid in the sandbox
+`server.lock` and the app port belong to the group, `/health` answers, `/version` reports the
+launch commit, and the backend env has `XUM_MOCK_AI=1`. Exit 1 means do not drive this instance:
+run cleanup, then launch again.
 
 ## Drive
 
@@ -100,7 +101,8 @@ agent-browser find role button click --name "Open settings" --exact
 - Mock replies are `Mock response: <your text>`. `[mock:long-stream]` in a message streams for
   about 20 s, long enough to press Stop. Markers such as `[mock:error:api]` and
   `[mock:list-languages]` are in `src/node/services/mock/mockAiRouter.ts`. Mock tool calls are
-  canned and change no files.
+  canned and leave the worktree alone. A canned `todo_write` (`[mock:todo-nudge]`) still writes
+  its TODO list to the workspace's session folder.
 - The CLI drives the same server. Unset the live server's variables, or the CLI talks to the Xum
   you run in:
 
@@ -142,9 +144,10 @@ Proof standards:
 
 Cleanup closes this run's browser session, stops the process group that launch started (SIGTERM,
 then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and prints the evidence
-path and file count. It kills nothing it did not start. Run it after every run, failed ones too.
-`doctor`, `env`, `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory for
-a run other than the newest.
+path and file count. It signals the group only while one of its processes carries the run's id,
+so it kills nothing it did not start. Run it after every run, failed ones too. `doctor`, `env`,
+`capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
+the newest launch from this checkout.
 
 ## Gotchas
 
