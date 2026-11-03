@@ -38,7 +38,7 @@ make dev-server-sandbox
   (API key env vars are always kept so env-key fallback still works)
 - Picks free ports (`BACKEND_PORT`, `VITE_PORT`)
 - Disables tutorials by default inside the sandbox (`XUM_ENABLE_TUTORIALS_IN_SANDBOX=1` opts back in)
-- Makes Vite accept loopback Host headers only (`localhost` and IPs). On a Coder workspace it also accepts the one port-forward host for the sandbox's Vite port, built from `XUM_PROXY_URI`, else `VSCODE_PROXY_URI`. The startup banner prints an `Allowed hosts:` line
+- Makes Vite accept loopback Host headers only (`localhost` and IPs). On a Coder workspace it also accepts the one port-forward host for the sandbox's Vite port, built from `XUM_PROXY_URI`, else `VSCODE_PROXY_URI`. The startup banner prints an `Allowed hosts:` line, and a `WARNING` that names the variable when that template yields no host (set `XUM_VITE_ALLOWED_HOSTS=<host>` then)
 - Runs `make dev-server` with those env overrides
 
 ## Agent usage with `bash.monitor`
@@ -60,6 +60,21 @@ bash({
 ```
 
 Use this for line-oriented server readiness/errors. For external status polling (PR checks, deployment health, remote CI), use a background task/workflow monitor instead.
+
+## Auth
+
+The backend runs with auth on. `make dev-server` generates a random token per run, passes it to the backend through its environment (never argv), and the server records it in `<XUM_ROOT>/server.lock` (mode 0600). Nothing prints the token. The sandbox prints `XUM_ROOT` and both ports at startup.
+
+```bash
+TOKEN=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token' "$XUM_ROOT/server.lock")
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
+```
+
+- Browser: open `http://localhost:$VITE_PORT/?token=$(node -p 'encodeURIComponent(process.argv[1])' "$TOKEN")` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token.
+- `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
+- The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
+- Keep `XUM_ROOT` outside the checkout. Vite serves the checkout to anyone who can reach its port, and its `public/` folder without any file checks. The sandbox root is under the system temp dir.
+- `XUM_DEV_SERVER_AUTH_TOKEN=<token>` picks the token. `XUM_DEV_SERVER_NO_AUTH=1` starts an open backend, which any local account can control: use it only on a host where you are the only account.
 
 ## Options
 

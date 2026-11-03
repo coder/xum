@@ -10,12 +10,26 @@ const LEGACY_MUX_ENV_PREFIX = "MUX_";
 
 export type XumEnvironment = Record<string, string | undefined>;
 
+/** Like resolveXumEnvironmentValue, but also returns the name of the variable that supplied the value. */
+export function resolveXumEnvironmentEntry(
+  suffix: string,
+  env: XumEnvironment
+): { name: string; value: string } | undefined {
+  const canonicalName = XUM_ENV_PREFIX + suffix;
+  const canonical = env[canonicalName];
+  if (canonical !== undefined) return { name: canonicalName, value: canonical };
+
+  const legacyName = LEGACY_MUX_ENV_PREFIX + suffix;
+  const legacy = env[legacyName];
+  return legacy === undefined ? undefined : { name: legacyName, value: legacy };
+}
+
 /** Resolve a canonical XUM_* variable, falling back to its legacy MUX_* alias. */
 export function resolveXumEnvironmentValue(
   suffix: string,
   env: XumEnvironment
 ): string | undefined {
-  return env[XUM_ENV_PREFIX + suffix] ?? env[LEGACY_MUX_ENV_PREFIX + suffix];
+  return resolveXumEnvironmentEntry(suffix, env)?.value;
 }
 
 /** Write both the canonical XUM_* name and the legacy MUX_* alias. */

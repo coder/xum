@@ -140,6 +140,11 @@ export default defineConfig(({ mode }) => {
       strictPort: true,
       allowedHosts: devServerAllowedHosts,
 
+      // Vite serves any file under its root at /@fs/<path> to whoever reaches its port, and a
+      // custom XUM_ROOT can sit inside the checkout. The dev backend's token lives in server.lock.
+      // `deny` replaces Vite's defaults, so they are repeated first.
+      fs: { deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "**/server.lock"] },
+
       proxy: {
         "/orpc": {
           target: backendProxyTarget,
@@ -213,7 +218,9 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: previewPort,
       strictPort: true,
-      allowedHosts: ["localhost", "127.0.0.1"],
+      // Preview inherits server.proxy, whose ws entries check devServerAllowedHosts, so preview's
+      // own HTTP check must use the same list.
+      allowedHosts: devServerAllowedHosts,
     },
     optimizeDeps: {
       // noVNC ships Babel-style CJS plus top-level await in lib/, which breaks esbuild

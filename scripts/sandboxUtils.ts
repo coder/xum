@@ -6,7 +6,7 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
-import { resolveXumEnvironmentValue, type XumEnvironment } from "../src/common/compat/xumEnv";
+import { resolveXumEnvironmentEntry, type XumEnvironment } from "../src/common/compat/xumEnv";
 import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
@@ -273,15 +273,28 @@ export function sanitizeSandboxProviderEnv(options: {
 }
 
 /**
+ * The proxy URL template the sandbox reads, with the name of the variable that holds it:
+ * XUM_PROXY_URI (or its leftover alias), else VSCODE_PROXY_URI, as src/desktop/main.ts does.
+ */
+export function readProxyUriTemplate(
+  env: XumEnvironment
+): { name: string; template: string } | null {
+  const xum = resolveXumEnvironmentEntry("PROXY_URI", env);
+  if (xum?.value.trim()) return { name: xum.name, template: xum.value.trim() };
+
+  const vscode = env.VSCODE_PROXY_URI?.trim();
+  return vscode ? { name: "VSCODE_PROXY_URI", template: vscode } : null;
+}
+
+/**
  * Hostname that Coder's subdomain port-forward proxy serves `port` under, or null.
  *
- * Reads the proxy URL template (XUM_PROXY_URI, else VSCODE_PROXY_URI). Only a template with
- * `{{port}}` in its hostname names a host that belongs to this sandbox. A path-based template names
- * a host shared by every app, so it is not derived.
+ * Reads the proxy URL template (see readProxyUriTemplate). Only a template with `{{port}}` in its
+ * hostname names a host that belongs to this sandbox. A path-based template names a host shared by
+ * every app, so it is not derived.
  */
 export function deriveProxyAllowedHost(env: XumEnvironment, port: number): string | null {
-  const template =
-    resolveXumEnvironmentValue("PROXY_URI", env)?.trim() || env.VSCODE_PROXY_URI?.trim();
+  const template = readProxyUriTemplate(env)?.template;
   if (!template) return null;
 
   // `{` is not valid in a hostname, so swap the placeholder for a hostname-safe marker before parsing.
