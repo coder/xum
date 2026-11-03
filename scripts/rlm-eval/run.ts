@@ -29,12 +29,15 @@ import { execSync } from "node:child_process";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractMetrics } from "./metrics";
+import { readSandboxToken } from "./sandboxToken";
 import { CONFIGS, SCENARIOS } from "./scenarios";
 import type { CellMetrics } from "./metrics";
 
 interface CliArgs {
   baseUrl: string;
   root: string;
+  /** Bearer token of the sandbox backend, from its server.lock. Empty when the backend is open. */
+  token: string;
   model: string;
   thinking: string;
   seeds: number;
@@ -44,7 +47,7 @@ interface CliArgs {
   turnTimeoutMs: number;
 }
 
-function parseArgs(argv: string[]): CliArgs {
+function parseArgs(argv: string[]): Omit<CliArgs, "token"> {
   const get = (flag: string): string | undefined => {
     const i = argv.indexOf(flag);
     return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
@@ -75,10 +78,17 @@ function parseArgs(argv: string[]): CliArgs {
   };
 }
 
-async function post(baseUrl: string, route: string, body: unknown): Promise<unknown> {
-  const res = await fetch(`${baseUrl}/api${route}`, {
+async function post(
+  args: Pick<CliArgs, "baseUrl" | "token">,
+  route: string,
+  body: unknown
+): Promise<unknown> {
+  const res = await fetch(`${args.baseUrl}/api${route}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(args.token ? { Authorization: `Bearer ${args.token}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   const json: unknown = await res.json();
@@ -239,7 +249,7 @@ async function runCell(
   const truth = scenario.setup(fixtureDir);
   const turns = scenario.turns(truth, fixtureDir);
 
-  const created = await post(args.baseUrl, "/workspace/createScratch", {
+  const created = await post(args, "/workspace/createScratch", {
     title: `rlm-eval ${scenario.id} ${config.id} s${seed}`,
   });
   const metadata = isRecord(created) && isRecord(created.metadata) ? created.metadata : {};
@@ -247,16 +257,16 @@ async function runCell(
   if (workspaceId === "") throw new Error("createScratch returned no workspace id");
   const sessionDir = path.join(args.root, "sessions", workspaceId);
 
-  await post(args.baseUrl, "/experiments/set", {
+  await post(args, "/experiments/set", {
     experimentId: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     enabled: config.experiments.programmaticToolCalling,
   });
-  await post(args.baseUrl, "/experiments/set", {
+  await post(args, "/experiments/set", {
     experimentId: EXPERIMENT_IDS.RLM,
     enabled: config.experiments.rlm,
   });
   for (let i = 0; i < turns.length; i++) {
-    await post(args.baseUrl, "/workspace/sendMessage", {
+    await post(args, "/workspace/sendMessage", {
       workspaceId,
       message: turns[i],
       options: {
@@ -331,10 +341,11 @@ function printAggregate(results: CellResult[]): void {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  const parsed = parseArgs(process.argv.slice(2));
+  const args: CliArgs = { ...parsed, token: await readSandboxToken(parsed) };
   const gitSha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
   // devtools.jsonl (providerRequests metric) only exists when debug logs are on.
-  await post(args.baseUrl, "/config/updateLlmDebugLogs", { enabled: true });
+  await post(args, "/config/updateLlmDebugLogs", { enabled: true });
   const results: CellRow[] = [];
   for (const scenarioId of args.scenarios) {
     for (const configId of args.configs) {
