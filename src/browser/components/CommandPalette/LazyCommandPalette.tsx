@@ -33,8 +33,9 @@ const CommandPalette = React.lazy(() =>
 /**
  * The palette's box with a plain input while the chunk loads. Typed text goes to the registry
  * query, so the loaded palette opens with every key the user pressed right after the shortcut.
+ * An Enter is kept too: the loaded palette runs it (`enterPressedWhileLoading`).
  */
-function LoadingPaletteInput(props: { openOrigin: HTMLElement | null }) {
+function LoadingPaletteInput(props: { openOrigin: HTMLElement | null; onEnter: () => void }) {
   const { isOpen, initialQuery, open, close } = useCommandRegistry();
   if (!isOpen) return null;
   const dismiss = () => {
@@ -57,6 +58,13 @@ function LoadingPaletteInput(props: { openOrigin: HTMLElement | null }) {
           aria-label="Command palette"
           autoFocus
           onKeyDown={(e) => {
+            // An IME Enter only commits the composition, as in the loaded palette: cmdk's check,
+            // since Safari and older IMEs send it with isComposing false but keyCode 229.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+              e.preventDefault();
+              props.onEnter();
+              return;
+            }
             if (e.key !== "Escape") return;
             e.preventDefault();
             stopKeyboardPropagation(e);
@@ -73,6 +81,7 @@ export function LazyCommandPalette(props: { getSlashContext?: () => { workspaceI
   // undefined until the first open. The palette stays mounted after it, so later opens are
   // synchronous and capture their own focus origin.
   const [openOrigin, setOpenOrigin] = useState<HTMLElement | null | undefined>(undefined);
+  const [enterPressedWhileLoading, setEnterPressedWhileLoading] = useState(false);
   if (isOpen && openOrigin === undefined) {
     // Captured during render, before the loading input's autoFocus moves focus.
     setOpenOrigin(document.activeElement instanceof HTMLElement ? document.activeElement : null);
@@ -80,10 +89,25 @@ export function LazyCommandPalette(props: { getSlashContext?: () => { workspaceI
     // Closed before the chunk arrived: the next open captures its own origin.
     setOpenOrigin(undefined);
   }
+  // The loading input's Enter belongs to its open: closed before the palette ran it (Escape, or
+  // in the moment between the chunk's arrival and the palette's mount), it runs nothing.
+  if (!isOpen && enterPressedWhileLoading) setEnterPressedWhileLoading(false);
   if (openOrigin === undefined) return null;
   return (
-    <LazyFeature name="Command palette" fallback={<LoadingPaletteInput openOrigin={openOrigin} />}>
-      <CommandPalette getSlashContext={props.getSlashContext} openOrigin={openOrigin} />
+    <LazyFeature
+      name="Command palette"
+      fallback={
+        <LoadingPaletteInput
+          openOrigin={openOrigin}
+          onEnter={() => setEnterPressedWhileLoading(true)}
+        />
+      }
+    >
+      <CommandPalette
+        getSlashContext={props.getSlashContext}
+        openOrigin={openOrigin}
+        enterPressedWhileLoading={enterPressedWhileLoading}
+      />
     </LazyFeature>
   );
 }
