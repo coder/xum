@@ -166,6 +166,12 @@ Proof standards:
   the worktree alone. A mock run does not prove a change to provider requests or tool execution:
   report that part as not verified, or prove it at that boundary.
 - Capture the action and the resulting state, not only the final screen.
+- Check a UI change at phone width too. Run `agent-browser set viewport 375 812` and
+  `verify-xum.sh idle`, repeat the changed recipe's steps and captures with names that end in
+  `-375`, and look for clipped text, content past the right edge
+  (`agent-browser eval 'document.documentElement.scrollWidth <= innerWidth'` prints `true`) and
+  controls that cover each other. Run `agent-browser set viewport 1280 720` afterwards. A change
+  with no UI needs no phone pass: say so.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.
