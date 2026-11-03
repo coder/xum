@@ -134,7 +134,7 @@ describe("make dev-server auth", () => {
 // passes the token check on to the backend. So the token on disk must not be servable there. Its
 // public/ folder is served without file checks, so XUM_ROOT still has to stay outside the checkout.
 describe("vite dev server", () => {
-  test("never serves a server.lock or the files Vite denies by default, but serves source", async () => {
+  test("never serves a server.lock (or its temporary file) or the files Vite denies by default, but serves source", async () => {
     // Vite's config cannot be loaded under Bun (its plugins need Node), so ask Node.
     const script = `
       import { isFileLoadingAllowed, resolveConfig } from "vite";
@@ -144,6 +144,7 @@ describe("vite dev server", () => {
       console.log(JSON.stringify({
         rootLock: allowed("server.lock"),
         nestedLock: allowed(".dev-home/nested/server.lock"),
+        tempLock: allowed(".dev-home/server.lock.4242.tmp"),
         env: allowed(".env"),
         gitConfig: allowed(".git/config"),
         source: allowed("src/browser/App.tsx"),
@@ -162,6 +163,7 @@ describe("vite dev server", () => {
     expect(JSON.parse(stdout)).toEqual({
       rootLock: false,
       nestedLock: false,
+      tempLock: false,
       env: false,
       gitConfig: false,
       source: true,
