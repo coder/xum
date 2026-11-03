@@ -53,7 +53,10 @@ Preconditions:
   still `checked=true`. Capture `settings/persisted`.
 - **Restore.** Run
   `agent-browser find role switch click --name "Toggle flat chat list" --exact` and
-  `agent-browser press Escape`. `config.json` has `"sidebarFlatMode": false`.
+  `agent-browser press Escape`. `config.json` has `"sidebarFlatMode": false`. The page opened
+  Settings by its URL, so Escape lands on `/project?...`. Run
+  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"` and
+  `verify-xum.sh idle` to be back on `Verify playground`.
 
 ## Gotchas
 

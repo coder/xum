@@ -39,7 +39,8 @@ Preconditions:
   lists a `Review` button.
 - **Open Review.** Run `agent-browser find role button click --name "Review" --exact` and
   `agent-browser wait --text "Uncommitted:"`. The tab `Review Close Review` is selected, and the
-  panel reads `No changes found` with `Uncommitted:` unchecked.
+  panel reads `No changes found` with `Uncommitted:` unchecked. If the page reloads here instead
+  (a cold Vite cache, see Gotchas), run `verify-xum.sh idle` and repeat from **Open the sidebar**.
 - **Include uncommitted edits.** Run
   `agent-browser find role checkbox check --name "Uncommitted:" --exact` and
   `agent-browser wait --text "math.ts"`. The file tree lists `src` and `math.ts` with `+3`, the

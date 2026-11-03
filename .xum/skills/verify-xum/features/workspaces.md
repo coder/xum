@@ -40,15 +40,15 @@ Preconditions:
   `agent-browser find role textbox fill "Draft the release notes" --name "Message" --exact`,
   `verify-xum.sh send-ready`,
   `agent-browser find role button click --name "Send message" --exact` and
-  `agent-browser wait --text "Mock response: Draft the release notes"`. The URL changes to
-  `/workspace/<new id>`, and the sidebar has a `Select workspace release-notes` row. Capture
-  `workspaces/created`.
+  `agent-browser wait --text "Mock response: Draft the release notes"` and `verify-xum.sh idle`.
+  The URL changes to `/workspace/<new id>`, and the sidebar has a `Select workspace release-notes`
+  row. Capture `workspaces/created`.
 - **Check the worktree.** Run `git -C "$VERIFY_XUM_PROJECT" worktree list`. It lists
   `$VERIFY_XUM_ROOT/src/demo-app/release-notes` on branch `release-notes`.
 - **Keyboard create.** Press Ctrl+N. Run `agent-browser press Control+n` and
   `agent-browser wait '[aria-label="Workspace name"]'`. The URL changes to
   `/project?project=demo-app-<hash>&draft=<id>`. Create `scratch-notes` the same way as above,
-  with the message `Collect scratch notes`.
+  with the message `Collect scratch notes`, and run `verify-xum.sh idle` after its reply.
 - **Open from the sidebar.** Run
   `agent-browser find role button click --name "Select workspace release-notes" --exact`. The URL
   is `/workspace/<release-notes id>`. Run
@@ -85,6 +85,9 @@ Preconditions:
 
 ## Gotchas
 
+- The reply text shows before its stream ends. Run `verify-xum.sh idle` after it. Archiving a
+  workspace that still streams opens the dialog `Archive "<title>" while streaming?`, and the
+  row stays.
 - The project row's accessible name is `Create workspace in demo-app`, but choosing it opens the
   project page. It creates nothing.
 - Right after a create, the next new-workspace composer keeps `Send message` disabled for a few

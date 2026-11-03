@@ -44,11 +44,11 @@ group_alive() {
 # state.env never exports that name, so processes an agent starts after `eval "$(verify-xum.sh env)"`
 # do not carry it. A live leader must also still be the `make dev-server-sandbox` that launch
 # started. Linux reuses no pid while it names a process group, so a group whose leader exited
-# keeps its id and stays ours.
+# keeps its id and stays ours. A zombie leader has an empty cmdline and counts as exited.
 group_is_ours() {
   local pid leader_cmdline
   [[ -n $1 ]] || return 1
-  if [[ -e /proc/$1 ]]; then
+  if [[ -e /proc/$1 && $(ps -o stat= -p "$1" 2>/dev/null) != Z* ]]; then
     leader_cmdline=$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline" || true)
     [[ $leader_cmdline == *dev-server-sandbox* ]] || return 1
   fi
