@@ -936,6 +936,15 @@ export interface AgentTaskIntegration {
    * WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE while this is true.
    */
   isWorkspaceStopInProgress(workspaceId: string): boolean;
+  /**
+   * Whether an explicit Stop ended the workspace turn that a history row of `workspaceId`
+   * correlates to: its handle is `interrupted` on disk. Startup recovery reads it to keep a
+   * stopped tail stopped. Rejects when the handle cannot be read.
+   */
+  isWorkspaceTurnStopped(
+    workspaceId: string,
+    correlation: WorkspaceTurnTaskCorrelation
+  ): Promise<boolean>;
   /** Monotonic stop generation; an accepted turn captures it at admission for the start fence. */
   getWorkspaceStopEpoch(workspaceId: string): number;
   /**

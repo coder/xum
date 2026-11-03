@@ -117,6 +117,7 @@ export function makeAgentTaskIntegrationFake(
     noteWorkspaceUnarchived: () => Promise.resolve(),
     settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
+    isWorkspaceTurnStopped: () => Promise.resolve(false),
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
     // Derived from the (possibly overridden) boolean rescue, so suites that script only

@@ -5286,6 +5286,9 @@ export class WorkspaceService
         this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -20647,8 +20650,12 @@ export class WorkspaceService
 
   abandonAutoRetry(workspaceId: string, reason: string): void {
     // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
     try {
-      this.sessions.get(workspaceId)?.abandonAutoRetry(reason);
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
     } catch (error: unknown) {
       log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
     }

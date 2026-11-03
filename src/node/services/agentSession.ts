@@ -1155,6 +1155,11 @@ interface AgentSessionOptions {
    */
   isStopInProgress?: () => boolean;
   getStopEpoch?: () => number;
+  /**
+   * Whether an explicit Stop ended the workspace turn that a history row correlates to: its
+   * handle is `interrupted` on disk (WorkspaceTurnManager.isWorkspaceTurnStopped).
+   */
+  isWorkspaceTurnStopped?: (correlation: WorkspaceTurnTaskCorrelation) => Promise<boolean>;
   /** Authoritative turn settlement for stop cascades: the admitted generation ended for good. */
   onTurnSettled?: (turnGeneration: symbol) => void;
   /**
@@ -1476,6 +1481,9 @@ export class AgentSession {
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasExternalManualSendPreflight?: () => boolean;
   private readonly isStopInProgress: () => boolean;
+  private readonly isWorkspaceTurnStopped?: (
+    correlation: WorkspaceTurnTaskCorrelation
+  ) => Promise<boolean>;
   private readonly getStopEpoch: () => number;
   private readonly onTurnSettled?: (turnGeneration: symbol) => void;
   /**
@@ -1974,6 +1982,7 @@ export class AgentSession {
       hasExternalSendPreflight,
       hasExternalManualSendPreflight,
       isStopInProgress,
+      isWorkspaceTurnStopped,
       getStopEpoch,
       onTurnSettled,
       onTurnSuperseded,
@@ -2015,6 +2024,7 @@ export class AgentSession {
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
     this.isStopInProgress = isStopInProgress ?? (() => false);
+    this.isWorkspaceTurnStopped = isWorkspaceTurnStopped;
     this.getStopEpoch = getStopEpoch ?? (() => 0);
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
@@ -3567,6 +3577,46 @@ export class AgentSession {
     return await step();
   }
 
+  /** A heartbeat turn resumes only while the heartbeat is on (#5610). */
+  private startupHeartbeatOutcome(
+    retryMetadata: MuxMessageMetadata | undefined
+  ): StartupRecoveryOutcome | undefined {
+    if (!isHeartbeatTriggerMetadata(retryMetadata)) return undefined;
+    // An unreadable config retries the read and never resumes the turn.
+    let heartbeatOn: boolean;
+    try {
+      heartbeatOn = this.isHeartbeatOnOnDisk();
+    } catch {
+      return "retryable";
+    }
+    if (heartbeatOn) return undefined;
+    this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "heartbeat_disabled" });
+    return "completed";
+  }
+
+  /**
+   * A workspace-turn interrupt writes the turn's handle `interrupted` before it abandons the
+   * retry loop or stops the stream: that handle is the Stop's trace on disk. A Stop that lands
+   * after this read bumps the retry generation, so the arm refuses.
+   */
+  private async startupWorkspaceTurnOutcome(
+    retryMetadata: MuxMessageMetadata | undefined,
+    isCurrent: () => boolean
+  ): Promise<StartupRecoveryOutcome | undefined> {
+    const workspaceTurn = parseWorkspaceTurnTaskCorrelation(retryMetadata);
+    if (workspaceTurn == null) return undefined;
+    let stopped: boolean;
+    try {
+      stopped = (await this.isWorkspaceTurnStopped?.(workspaceTurn)) === true;
+    } catch {
+      return "retryable";
+    }
+    if (!isCurrent()) return "completed";
+    if (!stopped) return undefined;
+    this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "task_stopped" });
+    return "completed";
+  }
+
   private async scheduleStartupAutoRetryIfNeeded(
     workspaceMetadata?: WorkspaceMetadata
   ): Promise<StartupRecoveryOutcome> {
@@ -3625,20 +3675,10 @@ export class AgentSession {
       return "completed";
     }
 
-    // A heartbeat turn resumes only while the heartbeat is on (#5610). An unreadable config retries
-    // the read and never resumes the turn.
-    if (isHeartbeatTriggerMetadata(retryMetadata)) {
-      let heartbeatOn: boolean;
-      try {
-        heartbeatOn = this.isHeartbeatOnOnDisk();
-      } catch {
-        return "retryable";
-      }
-      if (!heartbeatOn) {
-        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "heartbeat_disabled" });
-        return "completed";
-      }
-    }
+    const triggerOutcome =
+      this.startupHeartbeatOutcome(retryMetadata) ??
+      (await this.startupWorkspaceTurnOutcome(retryMetadata, isCurrent));
+    if (triggerOutcome != null) return triggerOutcome;
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
