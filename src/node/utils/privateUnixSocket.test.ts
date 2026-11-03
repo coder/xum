@@ -44,10 +44,17 @@ describe.skipIf(!posix)("preparePrivateUnixSocketPath", () => {
     );
   });
 
-  test("refuses a folder owned by another user", async () => {
+  // /usr is a real folder that another user (root) owns.
+  test.skipIf(process.getuid?.() === 0)("refuses a folder owned by another user", async () => {
+    await expect(preparePrivateUnixSocketPath("/usr/xum-never-created.sock")).rejects.toThrow(
+      /owned by another user/
+    );
+  });
+
+  test("refuses a parent folder owned by another user", async () => {
     await fs.mkdir(dir, { mode: 0o700 });
     await expect(preparePrivateUnixSocketPath(socketPath, process.getuid!() + 1)).rejects.toThrow(
-      /owned by another user/
+      /parent folder .*owned by another user/
     );
   });
 
@@ -141,7 +148,7 @@ describe.skipIf(!posix)("preparePrivateUnixSocketPath", () => {
       await fs.chmod(shared, 0o777);
       const link = path.join(base, "link");
       await fs.symlink(shared, link);
-      await expect(preparePrivateUnixSocketPath(path.join(link, "b.sock"))).rejects.toThrow(
+      await expect(preparePrivateUnixSocketPath(path.join(link, "run", "b.sock"))).rejects.toThrow(
         /writable by other users/
       );
     });

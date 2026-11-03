@@ -95,7 +95,7 @@ async function main(): Promise<void> {
     )
     .option(
       "--unix-socket <path>",
-      "also listen on a Unix socket (absolute path that fits the platform limit). Its folder must be mode 0700 and owned by you: it is created if missing"
+      "also listen on a Unix socket (absolute path that fits the platform limit). Its folder must be mode 0700 and owned by you (it is created if missing), and no other user may be able to rename it"
     )
     .option("--ssh-host <host>", "SSH hostname/alias for editor deep links (e.g., devbox)")
     .option("--add-project <path>", "add and open project at the specified path (idempotent)")

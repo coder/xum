@@ -71,6 +71,8 @@ endif
 # no other account can create the socket's name. The TCP port stays for the CLI and scripts, which
 # read the lockfile. The path is short on purpose (sun_path holds about 100 bytes) and has the
 # backend port in its name, so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
+# The recipe reads the path from the environment (`"$XUM_BACKEND_SOCKET"`), never from the command
+# text: it crosses three shells, and a path with spaces or quotes must stay one argument.
 # Windows has no such folder and keeps TCP for the Vite hop.
 ifneq ($(OS),Windows_NT)
 ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
@@ -244,14 +246,14 @@ dev-server: node_modules/.installed build-main ## Start server mode with hot rel
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
 	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
-	@echo "  Vite -> backend:         Unix socket $(XUM_BACKEND_SOCKET)"
+	@echo "  Vite -> backend:         Unix socket $$XUM_BACKEND_SOCKET"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
 		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --unix-socket $(XUM_BACKEND_SOCKET) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --unix-socket \"\$$XUM_BACKEND_SOCKET\" --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
 		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 

@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 
 /**
@@ -30,6 +31,22 @@ async function assertPrivateFolder(dir: string, ownerUid: number): Promise<void>
   }
 }
 
+/** True when a server accepts connections at `socketPath`: only a refused connection is stale. */
+function isListening(socketPath: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const probe = net.connect(socketPath);
+    probe.once("connect", () => {
+      probe.destroy();
+      resolve(true);
+    });
+    probe.once("error", (error) => {
+      const code = errorCode(error);
+      if (code === "ECONNREFUSED" || code === "ENOENT") resolve(false);
+      else reject(error);
+    });
+  });
+}
+
 async function removeStaleSocket(socketPath: string, ownerUid: number): Promise<void> {
   let entry;
   try {
@@ -44,7 +61,41 @@ async function removeStaleSocket(socketPath: string, ownerUid: number): Promise<
   if (entry.uid !== ownerUid) {
     throw new Error(`${socketPath} is owned by another user: refusing to remove it`);
   }
-  await fs.unlink(socketPath);
+  // Unlinking a live server's socket leaves that server listening on a name nobody can reach, and
+  // lets a second server take the name: the first one's clients then talk to the wrong backend.
+  if (await isListening(socketPath)) {
+    throw new Error(`${socketPath} is in use by a running server: choose another socket path`);
+  }
+  await fs.rm(socketPath, { force: true });
+}
+
+/**
+ * Every folder above `dir` must be one that only this user (or root) can modify. A user who can
+ * write to a parent can rename the private folder away and put their own in its place, and then bind
+ * the socket path. A sticky parent (like /tmp) is safe: there only the owner of an entry can rename
+ * it. A symlink is followed, so `assertAncestorsTrusted` runs on both the path as given (a symlink
+ * must belong to us or root, and its folder was checked on the way up) and where it leads.
+ */
+async function assertAncestorsTrusted(start: string, ownerUid: number): Promise<void> {
+  for (let current = start; ; current = path.dirname(current)) {
+    const stat = await fs.lstat(current);
+    const trusted = stat.uid === ownerUid || stat.uid === 0;
+    if (!trusted) {
+      throw new Error(
+        `The parent folder ${current} is owned by another user: that user could replace the socket folder`
+      );
+    }
+    // A symlink's own mode is always 0777 and means nothing: the folder it lives in decides who can
+    // swap it, and that folder is checked next.
+    const writableByOthers = !stat.isSymbolicLink() && (stat.mode & 0o022) !== 0;
+    const sticky = (stat.mode & 0o1000) !== 0;
+    if (writableByOthers && !sticky) {
+      throw new Error(
+        `The parent folder ${current} is writable by other users (mode ${(stat.mode & 0o777).toString(8)}) and not sticky: one of them could rename the socket folder and put their own there. Choose a path under a folder that only you can write to`
+      );
+    }
+    if (path.dirname(current) === current) return;
+  }
 }
 
 function assertSocketPathFits(socketPath: string): void {
@@ -67,11 +118,13 @@ function assertSocketPathFits(socketPath: string): void {
  * folder that this user owns. So a client that connects to `socketPath` reaches this user's server
  * or nothing. The folder is the whole guarantee, so this refuses (never repairs) a symlink, a folder
  * of another user and a folder with group or other permissions. Only the last path component is
- * created: the parent must exist, and a sticky parent such as /tmp stops others from renaming ours.
+ * created: the parent must exist, and no other user may be able to rename the folder: every folder
+ * above it must be ours (or root's) and either not writable by others or sticky, like /tmp.
  *
  * The stale-socket removal runs only when the entry is a socket owned by this user. The folder is
  * private, so nobody else can have put it there, and a regular file or a symlink at that path is
- * somebody's data: this throws instead of deleting it.
+ * somebody's data: this throws instead of deleting it. A socket that still accepts connections
+ * belongs to a running server, so that throws too.
  *
  * `ownerUid` is a parameter so that a test can stand in for another user.
  */
@@ -85,6 +138,10 @@ export async function preparePrivateUnixSocketPath(
   assertSocketPathFits(socketPath);
 
   const dir = path.dirname(socketPath);
+  // Before mkdir, so that a refused path leaves nothing behind. The second pass follows symlinks.
+  const parent = path.dirname(dir);
+  await assertAncestorsTrusted(path.resolve(parent), ownerUid);
+  await assertAncestorsTrusted(await fs.realpath(parent), ownerUid);
   try {
     await fs.mkdir(dir, { mode: 0o700 });
   } catch (error) {

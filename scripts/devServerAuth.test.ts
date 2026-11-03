@@ -77,6 +77,34 @@ function backendCommand(run: DryRun): string {
   return lines[0];
 }
 
+/**
+ * The `--unix-socket` value that `node` receives when the recipe's backend line runs with the
+ * socket that make exports. It runs the real shell layers with a `node` that prints its argv.
+ */
+async function backendSocketArgument(run: DryRun): Promise<string> {
+  const socket = exportedSocket(run);
+  const line = backendCommand(run).trim().replace(/\\$/, "");
+  // What the recipe's shell hands to concurrently as one argument.
+  const handedOn = await shell(`printf '%s' ${line}`, { XUM_BACKEND_SOCKET: socket });
+  const exec = /--exec '(.*)'$/s.exec(handedOn)?.[1];
+  if (exec === undefined) throw new Error(`no --exec in ${handedOn}`);
+  // nodemon runs the exec string in a shell.
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-node-"));
+  try {
+    await fs.writeFile(path.join(bin, "node"), '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', {
+      mode: 0o755,
+    });
+    const argv = (
+      await shell(exec, { XUM_BACKEND_SOCKET: socket, PATH: `${bin}:${process.env.PATH ?? ""}` })
+    ).split("\n");
+    const flag = argv.indexOf("--unix-socket");
+    expect(flag, `no --unix-socket in ${JSON.stringify(argv)}`).toBeGreaterThanOrEqual(0);
+    return argv[flag + 1];
+  } finally {
+    await fs.rm(bin, { recursive: true, force: true });
+  }
+}
+
 // Any other local account can reach a loopback port, and an open backend runs commands as the
 // developer. `make dev-server` therefore starts the backend with a token.
 describe("make dev-server auth", () => {
@@ -213,14 +241,12 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
     ]);
   }, 60_000);
 
-  const socketArgument = (run: DryRun) => /--unix-socket (\S+)/.exec(backendCommand(run))?.[1];
-
-  test("the backend listens on the exported path, and the path fits sun_path", () => {
+  test("the backend listens on the exported path, and the path fits sun_path", async () => {
     const socket = exportedSocket(socketRun);
     expect(socket.startsWith("/")).toBe(true);
     expect(socket).toMatch(/b3111\.sock$/);
     expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);
-    expect(socketArgument(socketRun)).toBe(socket);
+    expect(await backendSocketArgument(socketRun)).toBe(socket);
   });
 
   test("each backend port gets its own socket", () => {
@@ -228,9 +254,9 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
     expect(otherPort.socket).not.toBe(socketRun.socket);
   });
 
-  test("XUM_BACKEND_SOCKET picks the path for both sides", () => {
+  test("XUM_BACKEND_SOCKET picks the path for both sides", async () => {
     expect(chosen.socket).toBe("/run/me/custom.sock");
-    expect(socketArgument(chosen)).toBe("/run/me/custom.sock");
+    expect(await backendSocketArgument(chosen)).toBe("/run/me/custom.sock");
   });
 
   // The path reaches the backend through three shells: the recipe's, concurrently's and nodemon's
@@ -238,27 +264,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
   test("a path with spaces and quotes reaches the backend as one argument", async () => {
     const spaced = `/tmp/xum a'b "c"/b.sock`;
     const run = await dryRun("dev-server", { XUM_BACKEND_SOCKET: spaced });
-    const line = backendCommand(run).trim().replace(/\\$/, "");
-    // What the recipe's shell hands to concurrently as one argument.
-    const handedOn = await shell(`printf '%s' ${line}`, { XUM_BACKEND_SOCKET: spaced });
-    const exec = /--exec '(.*)'$/s.exec(handedOn)?.[1];
-    if (exec === undefined) throw new Error(`no --exec in ${handedOn}`);
-    // nodemon runs the exec string in a shell: record the argv that `node` receives.
-    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-node-"));
-    try {
-      await fs.writeFile(path.join(bin, "node"), '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', {
-        mode: 0o755,
-      });
-      const argv = (
-        await shell(exec, {
-          XUM_BACKEND_SOCKET: spaced,
-          PATH: `${bin}:${process.env.PATH ?? ""}`,
-        })
-      ).split("\n");
-      expect(argv[argv.indexOf("--unix-socket") + 1]).toBe(spaced);
-    } finally {
-      await fs.rm(bin, { recursive: true, force: true });
-    }
+    expect(await backendSocketArgument(run)).toBe(spaced);
   }, 60_000);
 
   test("Windows keeps TCP: no socket for Vite or the backend", () => {
