@@ -38,7 +38,7 @@ make dev-server-sandbox
   (API key env vars are always kept so env-key fallback still works)
 - Picks free ports (`BACKEND_PORT`, `VITE_PORT`)
 - Disables tutorials by default inside the sandbox (`XUM_ENABLE_TUTORIALS_IN_SANDBOX=1` opts back in)
-- Allows all hosts (`VITE_ALLOWED_HOSTS=all`) so it works behind port-forwarding domains
+- Makes Vite accept loopback Host headers only (`localhost` and IPs). On a Coder workspace it also accepts the one port-forward host for the sandbox's Vite port, built from `XUM_PROXY_URI`, else `VSCODE_PROXY_URI`. The startup banner prints an `Allowed hosts:` line
 - Runs `make dev-server` with those env overrides
 
 ## Agent usage with `bash.monitor`
@@ -91,6 +91,8 @@ MAKE=gmake make dev-server-sandbox
 
 ## Security notes
 
+- The sandbox backend runs with `--no-auth`, and Vite proxies `/api`, `/orpc` and `/auth` to it. Any Host header Vite accepts therefore reaches an unauthenticated backend and the checkout's source. A web page that rebinds its DNS to this machine can use `Host: <its own name>` for that. So the sandbox never defaults to `all`.
+- For another remote or proxy host, opt in with `XUM_VITE_ALLOWED_HOSTS=<host>[,<host>]` (the unprefixed `VITE_ALLOWED_HOSTS` also works). A Vite `403 Blocked request. This host ("...") is not allowed` means the Host is missing from that list. Use `all` only on a machine that no other user or browser can reach.
 - `providers.jsonc` may contain API keys.
 - The sandbox root directory is created on disk (usually under your system temp dir).
 - This flow intentionally **does not** copy `secrets.json`.

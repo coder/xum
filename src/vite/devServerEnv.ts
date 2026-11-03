@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 import { resolveXumEnvironmentValue, type XumEnvironment } from "../common/compat/xumEnv";
 
 export const DEFAULT_VITE_DEV_HOST = "127.0.0.1";
@@ -25,6 +27,7 @@ function parseAllowedHosts(raw: string | undefined, host: string): true | string
   const trimmed = raw?.trim();
   if (trimmed) {
     if (trimmed === "true" || trimmed === "all") {
+      // Explicit opt-in only: this turns off Vite's DNS-rebinding Host check.
       return true;
     }
 
@@ -42,6 +45,41 @@ function parseAllowedHosts(raw: string | undefined, host: string): true | string
   }
 
   return defaults;
+}
+
+/**
+ * Same rules as Vite 7's `server.allowedHosts` check: loopback names and IP addresses always pass
+ * (an IP cannot be DNS-rebound), anything else must be listed, and a "." prefix matches that name
+ * and its subdomains. Vite applies its check to HTTP requests and its own HMR socket, but not to
+ * WebSocket upgrades that its proxy forwards, so vite.config.ts calls this from the proxy `bypass`.
+ * Stricter than Vite in one case: a missing Host is refused, because every browser sends one.
+ */
+export function isDevServerHostAllowed(
+  hostHeader: string | undefined,
+  allowedHosts: true | string[]
+): boolean {
+  if (allowedHosts === true) {
+    return true;
+  }
+  if (hostHeader === undefined) {
+    return false;
+  }
+
+  const host = hostHeader.trim();
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    return end > 0 && isIP(host.slice(1, end)) === 6;
+  }
+
+  const hostname = host.split(":")[0];
+  if (isIP(hostname) === 4 || hostname === "localhost" || hostname.endsWith(".localhost")) {
+    return true;
+  }
+  return allowedHosts.some(
+    (allowed) =>
+      allowed === hostname ||
+      (allowed.startsWith(".") && (allowed.slice(1) === hostname || hostname.endsWith(allowed)))
+  );
 }
 
 /** Resolve Vite/dev-server env with XUM_* winning over leftover MUX_* aliases. */

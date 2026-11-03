@@ -3,13 +3,14 @@ import react from "@vitejs/plugin-react";
 import topLevelAwait from "vite-plugin-top-level-await";
 import svgr from "vite-plugin-svgr";
 import tailwindcss from "@tailwindcss/vite";
+import type { IncomingMessage } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
 import { streamdownShikiLangsPlugin } from "./src/vite/streamdownShikiLangsPlugin";
 import { streamdownRehypeKatexPlugin } from "./src/vite/streamdownRehypeKatexPlugin";
-import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
+import { isDevServerHostAllowed, resolveViteDevServerEnv } from "./src/vite/devServerEnv";
 // React Compiler automatically optimizes React components through memoization.
 import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
 
@@ -24,6 +25,12 @@ const {
   backendPort: backendProxyPort,
   enableTutorialsInSandbox,
 } = resolveViteDevServerEnv(process.env);
+
+// Vite answers a disallowed Host with 403 on HTTP and on its own HMR socket, but its proxy forwards
+// WebSocket upgrades without that check. /orpc/ws is the whole backend API, so apply the check here
+// (`false` makes Vite end the upgrade with 404).
+const rejectDisallowedHost = (req: IncomingMessage) =>
+  isDevServerHostAllowed(req.headers.host, devServerAllowedHosts) ? undefined : false;
 
 const enableTutorialsInSandboxDefine =
   enableTutorialsInSandbox == null ? "null" : JSON.stringify(enableTutorialsInSandbox === "1");
@@ -140,16 +147,19 @@ export default defineConfig(({ mode }) => {
           // the public dev-server origin (localhost:5173) instead of 127.0.0.1:3000.
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [BROWSER_BRIDGE_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         [DESKTOP_WS_PATH]: {
           target: backendProxyTarget,
           changeOrigin: false,
           ws: true,
+          bypass: rejectDisallowedHost,
         },
         "/api": {
           target: backendProxyTarget,
