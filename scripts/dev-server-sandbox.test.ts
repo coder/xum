@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 
 import { resolveViteDevServerEnv } from "../src/vite/devServerEnv";
+import { deriveProxyAllowedHost } from "./sandboxUtils";
 
 const SCRIPT = path.join(import.meta.dir, "dev-server-sandbox.ts");
 
@@ -68,5 +69,53 @@ describe("dev-server-sandbox allowed hosts", () => {
     const childEnv = await sandboxChildEnv({ VITE_ALLOWED_HOSTS: "legacy.example" });
 
     expect(resolveViteDevServerEnv(childEnv).allowedHosts).toEqual(["legacy.example"]);
+  });
+
+  test("allows only the Coder port-forward host of the sandbox's own Vite port", async () => {
+    const childEnv = await sandboxChildEnv({
+      VSCODE_PROXY_URI: "https://{{port}}--main--ws--user.coder.test",
+    });
+
+    expect(resolveViteDevServerEnv(childEnv).allowedHosts).toEqual([
+      `${childEnv.XUM_VITE_PORT}--main--ws--user.coder.test`,
+    ]);
+  });
+
+  test("an explicit opt-in replaces the derived Coder port-forward host", async () => {
+    const childEnv = await sandboxChildEnv({
+      VSCODE_PROXY_URI: "https://{{port}}--main--ws--user.coder.test",
+      XUM_VITE_ALLOWED_HOSTS: "one.example",
+    });
+
+    expect(resolveViteDevServerEnv(childEnv).allowedHosts).toEqual(["one.example"]);
+  });
+});
+
+describe("deriveProxyAllowedHost", () => {
+  test("puts the port into a subdomain proxy template", () => {
+    expect(
+      deriveProxyAllowedHost({ VSCODE_PROXY_URI: "https://{{port}}--main--ws--user.coder.test" }, 5173)
+    ).toBe("5173--main--ws--user.coder.test");
+  });
+
+  test("XUM_PROXY_URI wins over VSCODE_PROXY_URI", () => {
+    expect(
+      deriveProxyAllowedHost(
+        {
+          XUM_PROXY_URI: "https://{{port}}.xum.test",
+          VSCODE_PROXY_URI: "https://{{port}}.vscode.test",
+        },
+        5173
+      )
+    ).toBe("5173.xum.test");
+  });
+
+  test.each([
+    ["no template", {}],
+    ["a template without the port", { VSCODE_PROXY_URI: "https://coder.test" }],
+    ["a path-based template", { VSCODE_PROXY_URI: "https://coder.test/proxy/{{port}}/" }],
+    ["a template that is not a URL", { VSCODE_PROXY_URI: "{{port}}--main" }],
+  ])("derives nothing from %s", (_name, env) => {
+    expect(deriveProxyAllowedHost(env, 5173)).toBeNull();
   });
 });

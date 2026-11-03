@@ -409,7 +409,6 @@ async function main() {
       BACKEND_PORT: String(backendPort),
       VITE_PORT: String(vitePort),
       MUX_ENABLE_TUTORIALS_IN_SANDBOX: "0",
-      VITE_ALLOWED_HOSTS: "all",
       NODE_ENV: "development",
     },
   });

@@ -25,6 +25,7 @@ function parseAllowedHosts(raw: string | undefined, host: string): true | string
   const trimmed = raw?.trim();
   if (trimmed) {
     if (trimmed === "true" || trimmed === "all") {
+      // Explicit opt-in only: this turns off Vite's DNS-rebinding Host check.
       return true;
     }
 

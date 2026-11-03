@@ -6,7 +6,7 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
-import { type XumEnvironment } from "../src/common/compat/xumEnv";
+import { resolveXumEnvironmentValue, type XumEnvironment } from "../src/common/compat/xumEnv";
 import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
@@ -270,6 +270,29 @@ export function sanitizeSandboxProviderEnv(options: {
   }
 
   return env;
+}
+
+/**
+ * Hostname that Coder's subdomain port-forward proxy serves `port` under, or null.
+ *
+ * Reads the proxy URL template (XUM_PROXY_URI, else VSCODE_PROXY_URI). Only a template with
+ * `{{port}}` in its hostname names a host that belongs to this sandbox. A path-based template names
+ * a host shared by every app, so it is not derived.
+ */
+export function deriveProxyAllowedHost(env: XumEnvironment, port: number): string | null {
+  const template =
+    resolveXumEnvironmentValue("PROXY_URI", env)?.trim() || env.VSCODE_PROXY_URI?.trim();
+  if (!template) return null;
+
+  // `{` is not valid in a hostname, so swap the placeholder for a hostname-safe marker before parsing.
+  const marker = "xumportmarker";
+  let hostname: string;
+  try {
+    hostname = new URL(template.replaceAll("{{port}}", marker)).hostname;
+  } catch {
+    return null;
+  }
+  return hostname.includes(marker) ? hostname.replaceAll(marker, String(port)) : null;
 }
 
 export function copyConfigClearingProjectsIfExists(sourcePath: string, destPath: string): boolean {
