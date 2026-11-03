@@ -532,14 +532,53 @@ cmd_workspace_field() {
     "$VERIFY_XUM_ROOT/config.json" "$name" "$field"
 }
 
+# Evidence is meant to be shared, so no text in it may keep the backend's token: the page keeps
+# ?token= in its URL when the app fails before it strips it. This replaces the token (raw, and
+# URL-encoded as a path part and as a form value) and the value of any token= query parameter
+# with <redacted>. With no PATH it filters stdin to stdout. With PATHs it rewrites each text file
+# under them in place, skipping binary files and symlinks. The token comes from server.lock,
+# never from argv.
+redact_token() { # redact_token [PATH...]
+  # shellcheck disable=SC2016 # $1 is the regex group, for node
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    let token = "";
+    try {
+      token = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).token ?? "";
+    } catch {}
+    const forms = [...new Set([token, encodeURIComponent(token), new URLSearchParams({ t: token }).toString().slice(2)])].filter(Boolean);
+    const redact = (text) => {
+      for (const form of forms) text = text.split(form).join("<redacted>");
+      return text.replace(/([?&]token=)(?!<redacted>)[^&#\s"\x27<>]*/g, "$1<redacted>");
+    };
+    const filesUnder = (p) => {
+      const st = fs.lstatSync(p);
+      if (st.isDirectory()) return fs.readdirSync(p).flatMap((name) => filesUnder(path.join(p, name)));
+      return st.isFile() ? [p] : [];
+    };
+    const paths = process.argv.slice(2);
+    if (paths.length === 0) {
+      process.stdout.write(redact(fs.readFileSync(0, "utf8")));
+      process.exit(0);
+    }
+    for (const file of paths.filter((p) => fs.existsSync(p)).flatMap(filesUnder)) {
+      const data = fs.readFileSync(file);
+      if (data.subarray(0, 8192).includes(0)) continue;
+      const text = data.toString("utf8");
+      const clean = redact(text);
+      if (clean !== text) fs.writeFileSync(file, clean);
+    }' "$VERIFY_XUM_ROOT/server.lock" "$@"
+}
+
 cmd_capture() {
   local name=${1:-} base
   [[ $name =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "capture NAME must look like <feature>/<step>, lowercase"
   load_run "${2:-}"
   base="$VERIFY_XUM_EVIDENCE/$name"
   mkdir -p "$(dirname "$base")"
-  agent-browser --session "$AGENT_BROWSER_SESSION" get url >"$base.url.txt"
-  agent-browser --session "$AGENT_BROWSER_SESSION" snapshot >"$base.aria.txt"
+  agent-browser --session "$AGENT_BROWSER_SESSION" get url | redact_token >"$base.url.txt"
+  agent-browser --session "$AGENT_BROWSER_SESSION" snapshot | redact_token >"$base.aria.txt"
   agent-browser --session "$AGENT_BROWSER_SESSION" screenshot "$base.png" >/dev/null
   echo "$base.png $base.aria.txt $base.url.txt"
 }
@@ -590,6 +629,8 @@ cmd_cleanup() {
   elif group_alive "$VERIFY_XUM_PGID"; then
     echo "verify-xum: process group $VERIFY_XUM_PGID is not this run's dev server. Not signaling it." >&2
   fi
+  # Before the root and its server.lock go: text you saved by hand is evidence too.
+  redact_token "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/server.log" || true
   if is_dev_server_sandbox_root "$VERIFY_XUM_ROOT"; then
     rm -rf "$VERIFY_XUM_ROOT"
   fi
