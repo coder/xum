@@ -262,7 +262,8 @@ cmd_launch() {
 }
 
 serves_vite_ui() {
-  curl -fs --max-time 5 "$1/" 2>/dev/null | grep -q '/@vite/client'
+  # Not `curl | grep -q`: grep exits at the match, and under pipefail curl's SIGPIPE fails the check.
+  [[ $(curl -fs --max-time 5 "$1/" 2>/dev/null) == *"/@vite/client"* ]]
 }
 
 pid_in_group() {
@@ -356,7 +357,7 @@ cmd_cleanup() {
   load_run "${1:-}"
   local i
   # agent-browser `close` on a session that does not exist starts that session first.
-  if agent-browser session list 2>/dev/null | grep -qF "$AGENT_BROWSER_SESSION"; then
+  if [[ $(agent-browser session list 2>/dev/null) == *"$AGENT_BROWSER_SESSION"* ]]; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
   fi
   if group_is_ours "$VERIFY_XUM_PGID" "$VERIFY_XUM_RUN_ID"; then
