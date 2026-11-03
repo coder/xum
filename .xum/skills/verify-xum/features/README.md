@@ -19,7 +19,10 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 - Run each step's commands as one `&&` chain, or under `set -e`, so the first failed `wait` stops
   the step. Keys pressed after a failed wait go to whatever has focus. In one run a palette query
   went into the composer, and the Enter after it sent that text as a chat message.
-- Open the app with `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"`,
+- Start every recipe whose preconditions name `Verify playground` by opening it, even after
+  another recipe: the workspaces and command-palette recipes end on `release-notes`, and the
+  recipes read evidence from `$VERIFY_XUM_WORKSPACE_ID`. Open the app with
+  `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"`,
   run `verify-xum.sh idle`, and expand the project in the sidebar with
   `agent-browser find role button click --name "Expand project demo-app" --exact`. A new browser
   session starts with the project collapsed, and the recipes choose workspace rows by name. The

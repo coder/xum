@@ -14,6 +14,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
+# make -C runs the sandbox from the checkout, so a relative TMPDIR would resolve there.
+[[ ${TMPDIR:-/tmp} == /* ]] || TMPDIR="$PWD/$TMPDIR"
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xum}
 # The run link in the git dir must point at an absolute path.
 [[ $VERIFY_XUM_HOME == /* ]] || VERIFY_XUM_HOME="$PWD/$VERIFY_XUM_HOME"
