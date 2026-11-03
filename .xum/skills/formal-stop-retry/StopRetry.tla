@@ -288,6 +288,8 @@ StopAbortsStream ==
 \* turn: recordStopForStartupRecovery after the stream stop persists the startup abandon
 \* marker of the stopped tail, as a user abort does, then abandons again: a startup recovery
 \* that armed a retry since the first abandon (its session was not reached yet) loses it.
+\* The code awaits the marker write between the two; the model takes both in one step
+\* (SKILL.md, Scope, lists the marker clear that this hides).
 TurnRecords ==
   /\ spc = "turnRecording"
   /\ spc' = "turnReleasing" /\ marker' = TRUE

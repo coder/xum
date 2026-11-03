@@ -20660,9 +20660,11 @@ export class WorkspaceService
 
   async recordStopForStartupRecovery(workspaceId: string): Promise<void> {
     // The marker must reach the session that startup recovery uses: adopt one still in its
-    // startup recovery, or create it, so a recovery that starts later reads the marker.
+    // startup recovery, or create it, so a recovery that starts later reads the marker. A
+    // removed workspace has nothing left to resume: it gets no session and no session file.
     // The interrupt already stopped the turn and settled its handle, so a failed write does not
     // fail it; the session keeps the marker owed, and its next auto-retry state write retries it.
+    if (this.config.findWorkspace(workspaceId) == null) return;
     let recorded = false;
     try {
       recorded = await this.getOrCreateSession(workspaceId).recordStopForStartupRecovery();

@@ -538,7 +538,7 @@ describe("a Stop ends the auto-retry loop", () => {
     90_000
   );
 
-  test("a turn interrupt reaches a session that is still in its startup recovery", async () => {
+  test("a turn interrupt's startup record reaches a session that is still in its startup recovery", async () => {
     await withWorkspace(async (env, workspaceId) => {
       const model = failsOnceModel();
       replaceModel(env, model);
@@ -687,6 +687,37 @@ describe("a Stop ends the auto-retry loop", () => {
         await restarted.dispose();
         await restarted.shutdown();
       }
+    });
+  }, 90_000);
+
+  test("interrupting a turn whose workspace was removed creates no session for it", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      replaceModel(env, failsOnceModel());
+      const { aiService, workspaceService, workspaceTurnManager } = env.services;
+      const retries = watchRetries(env);
+      const turn = await workspaceTurnManager.createWorkspaceTurn({
+        ownerWorkspaceId: ownerId,
+        prompt: "Survey the repository",
+        title: "Removed turn",
+        workspace: { mode: "new" },
+      });
+      if (!turn.success) throw new Error(turn.error);
+      const targetId = turn.data.workspaceId;
+      await assertBackoffPending(env, retries, targetId);
+      // Removing the workspace leaves its turn's handle running.
+      assert((await workspaceService.remove(targetId, true)).success, "the workspace is removed");
+      const listeners = aiService.listenerCount("stream-start");
+
+      const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
+        ownerId,
+        turn.data.taskId
+      );
+      assert(interrupted.success, "the turn interrupt succeeds");
+
+      expect({
+        sessionListeners: aiService.listenerCount("stream-start") - listeners,
+        startupRecord: await hasStartupAbandonMarker(env.config.sessionsDir, targetId),
+      }).toEqual({ sessionListeners: 0, startupRecord: false });
     });
   }, 90_000);
 
