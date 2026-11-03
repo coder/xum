@@ -61,6 +61,20 @@ bash({
 
 Use this for line-oriented server readiness/errors. For external status polling (PR checks, deployment health, remote CI), use a background task/workflow monitor instead.
 
+## Auth
+
+The backend runs with auth on. `make dev-server` generates a random token per run, passes it to the backend through its environment (never argv), and the server records it in `<XUM_ROOT>/server.lock` (mode 0600). Nothing prints the token. The sandbox prints `XUM_ROOT` and both ports at startup.
+
+```bash
+TOKEN=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token' "$XUM_ROOT/server.lock")
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
+```
+
+- Browser: open `http://localhost:$VITE_PORT/?token=$TOKEN` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token.
+- `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
+- The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
+- `XUM_DEV_SERVER_AUTH_TOKEN=<token>` picks the token. `XUM_DEV_SERVER_NO_AUTH=1` starts an open backend, which any local account can control: use it only on a host where you are the only account.
+
 ## Options
 
 ```bash

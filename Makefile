@@ -42,6 +42,27 @@ XUM_VITE_ALLOWED_HOSTS ?= $(or $(MUX_VITE_ALLOWED_HOSTS),$(VITE_ALLOWED_HOSTS))
 XUM_BACKEND_HOST ?= $(or $(MUX_BACKEND_HOST),$(BACKEND_HOST),127.0.0.1)
 XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 
+# `make dev-server` starts the backend with auth on: any local account can reach a loopback port,
+# and an open backend runs commands as you. Make generates one random token per run, so nodemon
+# restarts keep it, and exports it to the recipe's processes. It stays in the environment (argv is
+# visible to every local account) and in <XUM_ROOT>/server.lock (mode 0600). The browser sends it
+# through the Vite proxy as `/?token=<token>` once; the proxy adds nothing, so the Vite port is no
+# way around auth. XUM_DEV_SERVER_AUTH_TOKEN picks the token. The ambient XUM_SERVER_AUTH_TOKEN is
+# never reused: agent shells export the real server's token. XUM_DEV_SERVER_NO_AUTH=1 restores the
+# open backend, for hosts where you are the only account.
+ifeq ($(XUM_DEV_SERVER_NO_AUTH),1)
+DEV_SERVER_AUTH_FLAG := --no-auth
+else
+DEV_SERVER_AUTH_FLAG :=
+# Only when dev-server is a goal: `:=` runs node at parse time, and every make invocation parses this.
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+export XUM_SERVER_AUTH_TOKEN := $(or $(XUM_DEV_SERVER_AUTH_TOKEN),$(shell node -p "require('crypto').randomBytes(32).toString('hex')"))
+ifeq ($(XUM_SERVER_AUTH_TOKEN),)
+$(error could not generate the dev-server auth token: is node on PATH?)
+endif
+endif
+endif
+
 # Use PATH-resolved bash for portability across different systems.
 # - Windows: /usr/bin/bash doesn't exist in Chocolatey's make environment or GitHub Actions
 # - NixOS: /bin/bash doesn't exist, bash is in /nix/store/...
@@ -190,26 +211,28 @@ dev-server: node_modules/.installed build-main ## Start server mode with hot rel
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# On Windows, use npm run because bunx doesn't correctly pass arguments
 	@npm x concurrently -k \
 		"nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules scripts/build-main-watch.js" \
 		'npx esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
+		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
 		"set XUM_VITE_HOST=$(XUM_VITE_HOST)&& set XUM_VITE_PORT=$(XUM_VITE_PORT)&& set XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS)&& set XUM_BACKEND_HOST=$(XUM_BACKEND_HOST)&& set XUM_BACKEND_PORT=$(XUM_BACKEND_PORT)&& vite"
 else
 dev-server: node_modules/.installed build-main ## Start server mode with hot reload. Use XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host> for remote access
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
 		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
 		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 

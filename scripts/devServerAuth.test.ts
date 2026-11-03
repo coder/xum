@@ -32,6 +32,11 @@ async function dryRun(goal: string, env: Record<string, string> = {}): Promise<D
   return { commands, token };
 }
 
+function exportedToken(run: DryRun): string {
+  if (run.token === undefined) throw new Error("make did not export XUM_SERVER_AUTH_TOKEN");
+  return run.token;
+}
+
 function backendCommand(run: DryRun): string {
   const lines = run.commands
     .split("\n")
@@ -72,8 +77,7 @@ describe("make dev-server auth", () => {
   });
 
   test("keeps the token out of every command line", () => {
-    expect(first.token).toBeDefined();
-    expect(first.commands).not.toContain(first.token as string);
+    expect(first.commands).not.toContain(exportedToken(first));
   });
 
   test("never reuses the token of the server the shell already talks to", () => {
