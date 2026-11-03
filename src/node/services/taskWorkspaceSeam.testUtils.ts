@@ -14,6 +14,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
     abandonAutoRetry: () => undefined,
+    recordStopForStartupRecovery: () => Promise.resolve(),
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
     refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),

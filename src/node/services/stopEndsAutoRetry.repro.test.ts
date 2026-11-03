@@ -1,8 +1,12 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { MockLanguageModelV3 } from "ai/test";
 import { Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
+import { createConfigStores } from "@/node/config";
+import { AgentSession } from "@/node/services/agentSession";
+import { ServiceContainer } from "@/node/services/serviceContainer";
 import type {
   ProviderModelFactory,
   ResolveAndCreateModelResult,
@@ -75,7 +79,26 @@ function failsOnceModel(): MockLanguageModelV3 {
   });
 }
 
-function useModel(env: TestEnvironment, model: MockLanguageModelV3): void {
+/** Streams text and stays open until the request is aborted. */
+function streamsUntilStoppedModel(): MockLanguageModelV3 {
+  return new MockLanguageModelV3({
+    doStream: (options: LanguageModelV3CallOptions) =>
+      Promise.resolve({
+        stream: new ReadableStream<LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+            controller.enqueue({ type: "text-start", id: "a" });
+            controller.enqueue({ type: "text-delta", id: "a", delta: "working" });
+            options.abortSignal?.addEventListener("abort", () => controller.close(), {
+              once: true,
+            });
+          },
+        }),
+      }),
+  });
+}
+
+function replaceModel(env: TestEnvironment, model: MockLanguageModelV3): void {
   const factory = (
     env.services.aiService as unknown as { providerModelFactory: ProviderModelFactory }
   ).providerModelFactory;
@@ -148,6 +171,43 @@ async function withWorkspace(
   }
 }
 
+/**
+ * Disposes the backend and starts a new one on the same XUM_ROOT, as a restart of Xum does, and
+ * waits for the startup recovery of `workspaceId` to end.
+ */
+async function restart(
+  env: TestEnvironment,
+  model: MockLanguageModelV3,
+  workspaceId: string
+): Promise<ServiceContainer> {
+  await env.services.dispose();
+  await env.services.shutdown();
+  const recovered = Promise.withResolvers<void>();
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called with each session as `this`
+  const runStartupRecovery = AgentSession.prototype.runStartupRecovery;
+  const recovery = spyOn(AgentSession.prototype, "runStartupRecovery").mockImplementation(
+    async function (this: AgentSession, ...args) {
+      try {
+        await runStartupRecovery.apply(this, args);
+      } finally {
+        if (args[0]?.id === workspaceId) recovered.resolve();
+      }
+    }
+  );
+  try {
+    const services = new ServiceContainer(createConfigStores(env.tempDir));
+    replaceModel({ ...env, services }, model);
+    await services.initialize();
+    assert(
+      await Promise.race([recovered.promise.then(() => true), sleep(20_000).then(() => false)]),
+      "the restarted backend runs the workspace's startup recovery"
+    );
+    return services;
+  } finally {
+    recovery.mockRestore();
+  }
+}
+
 function createChild(env: TestEnvironment, parentId: string) {
   return env.services.taskService.create({
     parentWorkspaceId: parentId,
@@ -182,7 +242,7 @@ function expectRetryLoopEnded(env: TestEnvironment, workspaceId: string, since: 
 describe("a Stop ends the auto-retry loop", () => {
   test("a parent's Stop keeps a sub-agent in its retry backoff from restarting", async () => {
     await withWorkspace(async (env, parentId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const retries = watchRetries(env);
       const created = await createChild(env, parentId);
       if (!created.success) throw new Error(created.error);
@@ -203,7 +263,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("a parent's Stop during a sub-agent's stream error handling arms no retry", async () => {
     await withWorkspace(async (env, parentId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { taskService, workspaceService } = env.services;
       const retries = watchRetries(env);
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== parentId);
@@ -240,7 +300,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("a parent's Stop during a sub-agent's fired retry keeps the retry from starting a turn", async () => {
     await withWorkspace(async (env, parentId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { taskService, workspaceService } = env.services;
       const retries = watchRetries(env);
       const created = await createChild(env, parentId);
@@ -293,7 +353,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("a workflow step's hard timeout keeps a sub-agent in its retry backoff from restarting", async () => {
     await withWorkspace(async (env, parentId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const retries = watchRetries(env);
       const created = await createChild(env, parentId);
       if (!created.success) throw new Error(created.error);
@@ -314,7 +374,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("a hard timeout during a sub-agent's stream error handling arms no retry", async () => {
     await withWorkspace(async (env, parentId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { taskService, workspaceService } = env.services;
       const retries = watchRetries(env);
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== parentId);
@@ -352,7 +412,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("interrupting a workspace turn keeps its retry backoff from restarting the turn", async () => {
     await withWorkspace(async (env, ownerId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { workspaceTurnManager } = env.services;
       const retries = watchRetries(env);
       const turn = await workspaceTurnManager.createWorkspaceTurn({
@@ -379,7 +439,7 @@ describe("a Stop ends the auto-retry loop", () => {
 
   test("interrupting a workspace turn during its stream error handling arms no retry", async () => {
     await withWorkspace(async (env, ownerId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { taskService, workspaceService, workspaceTurnManager } = env.services;
       const retries = watchRetries(env);
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
@@ -411,9 +471,70 @@ describe("a Stop ends the auto-retry loop", () => {
     });
   }, 90_000);
 
+  test.each([
+    { phase: "in its retry backoff", model: failsOnceModel },
+    { phase: "while it streams", model: streamsUntilStoppedModel },
+    { phase: "during its stream error handling", model: failsOnceModel },
+  ])(
+    "a restart after interrupting a workspace turn $phase does not resume it",
+    async (args) => {
+      await withWorkspace(async (env, ownerId) => {
+        const model = args.model();
+        replaceModel(env, model);
+        const { aiService, workspaceService, workspaceTurnManager } = env.services;
+        const retries = watchRetries(env);
+        const hold = holdErrorHandling(
+          env,
+          (workspaceId) =>
+            args.phase === "during its stream error handling" && workspaceId !== ownerId
+        );
+        const turn = await workspaceTurnManager.createWorkspaceTurn({
+          ownerWorkspaceId: ownerId,
+          prompt: "Survey the repository",
+          title: "Stopped turn",
+          workspace: { mode: "new" },
+        });
+        if (!turn.success) throw new Error(turn.error);
+        const targetId = turn.data.workspaceId;
+        if (args.phase === "in its retry backoff")
+          await assertBackoffPending(env, retries, targetId);
+        else if (args.phase === "while it streams")
+          assert(await waitFor(() => aiService.isStreaming(targetId), 20_000), "the turn streams");
+        else assert((await hold.entered) === targetId, "the turn's error handling is held");
+
+        const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
+          ownerId,
+          turn.data.taskId
+        );
+        assert(interrupted.success, "the turn interrupt succeeds");
+        hold.release();
+        assert(
+          await waitFor(() => workspaceService.getActiveTurnGeneration(targetId) == null, 5_000),
+          "the interrupted turn ends"
+        );
+        assert(
+          !workspaceService.hasPendingAutoRetry(targetId),
+          "the interrupt ended the retry loop"
+        );
+
+        const restarted = await restart(env, model, targetId);
+        try {
+          expect({
+            pending: restarted.workspaceService.hasPendingAutoRetry(targetId),
+            streaming: restarted.aiService.isStreaming(targetId),
+          }).toEqual({ pending: false, streaming: false });
+        } finally {
+          await restarted.dispose();
+          await restarted.shutdown();
+        }
+      });
+    },
+    90_000
+  );
+
   test("interrupting a queued workspace turn leaves the running turn's retry armed", async () => {
     await withWorkspace(async (env, ownerId) => {
-      useModel(env, failsOnceModel());
+      replaceModel(env, failsOnceModel());
       const { taskService, workspaceService, workspaceTurnManager } = env.services;
       const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
       const running = await workspaceTurnManager.createWorkspaceTurn({

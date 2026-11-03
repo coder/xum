@@ -2573,6 +2573,21 @@ export class AgentSession {
     this.retryManager.abandon(reason);
   }
 
+  /**
+   * A workspace-turn interrupt stops the turn with a system abort, or while no stream runs, so it
+   * leaves no durable trace of the Stop. Record the stopped tail as a user abort does, or startup
+   * recovery after a restart resumes the turn that was stopped.
+   */
+  async recordStopForStartupRecovery(): Promise<void> {
+    if (this.coordinator.closing) return;
+    const tail = await this.historyService
+      .getLastMessages(this.workspaceId, STARTUP_TAIL_MESSAGE_COUNT)
+      .catch(() => null);
+    // Without the tail, a marker that matches any tail still keeps the Stop; a user send clears it.
+    const userMessageId = tail?.success ? this.findLastRetryUserMessage(tail.data)?.id : undefined;
+    await this.persistStartupAutoRetryAbandon("aborted", userMessageId);
+  }
+
   private async retryActiveStream(
     isCurrent = this.retryManager.captureGeneration(),
     signal?: AbortSignal
@@ -2893,7 +2908,8 @@ export class AgentSession {
   private async updateStartupAutoRetryAbandonFromFailure(
     errorType: string,
     userMessageId?: string,
-    isCurrent = () => true
+    isCurrent = () => true,
+    autoRetryStops = this.autoRetryStops
   ): Promise<void> {
     if (
       isNonRetryableSendError({ type: errorType }) ||
@@ -2903,6 +2919,9 @@ export class AgentSession {
       return;
     }
 
+    // A Stop since the failed turn's stream started refused its retry and may have recorded the
+    // stopped tail (recordStopForStartupRecovery): a retryable failure must not clear that.
+    if (this.autoRetryStops !== autoRetryStops) return;
     await this.clearStartupAutoRetryAbandon(isCurrent);
   }
 
@@ -7946,7 +7965,9 @@ export class AgentSession {
         );
         await this.updateStartupAutoRetryAbandonFromFailure(
           failureType,
-          continuation.interruptedUserMessageId
+          continuation.interruptedUserMessageId,
+          undefined,
+          streamContext.admissionAutoRetryStops
         );
       }
 
@@ -8816,7 +8837,12 @@ export class AgentSession {
     );
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
-    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    await this.updateStartupAutoRetryAbandonFromFailure(
+      failureType,
+      failedUserMessageId,
+      undefined,
+      failedContext?.admissionAutoRetryStops
+    );
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     // This failure has no stream error event, so handleStreamError's goal settlement never runs:
@@ -10146,11 +10172,12 @@ export class AgentSession {
       this.clearQueue();
     }
 
+    const admissionAutoRetryStops = context?.admissionAutoRetryStops;
     try {
       await this.handleStreamFailureForAutoRetry(
         streamErrorRetryFailure(failureType, data),
         undefined,
-        context?.admissionAutoRetryStops
+        admissionAutoRetryStops
       );
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.
@@ -10159,7 +10186,12 @@ export class AgentSession {
     }
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
-    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    await this.updateStartupAutoRetryAbandonFromFailure(
+      failureType,
+      failedUserMessageId,
+      undefined,
+      admissionAutoRetryStops
+    );
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
     this.coordinator.resolveErrorDecision(data.messageId, "terminal");

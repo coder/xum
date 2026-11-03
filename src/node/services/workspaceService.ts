@@ -20654,6 +20654,17 @@ export class WorkspaceService
     }
   }
 
+  async recordStopForStartupRecovery(workspaceId: string): Promise<void> {
+    try {
+      await this.sessions.get(workspaceId)?.recordStopForStartupRecovery();
+    } catch (error: unknown) {
+      log.warn("recordStopForStartupRecovery failed", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   async getGoalContinuationKickoffSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {

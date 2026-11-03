@@ -3940,6 +3940,8 @@ export class WorkspaceTurnManager {
         } catch (error: unknown) {
           log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
         }
+        // The interrupt's only trace on disk: without it, a restart resumes the stopped turn.
+        await this.workspaceService.recordStopForStartupRecovery(workspaceId);
       }
       if (interruptedRecord != null && options?.suppressDisposableCleanup !== true) {
         await this.cleanupDisposableWorkspaceTurn(interruptedRecord);

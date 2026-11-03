@@ -437,6 +437,8 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
       mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true }))),
     clearQueue: overrides.clearQueue ?? mock((): Result<void> => Ok(undefined)),
     abandonAutoRetry: overrides.abandonAutoRetry ?? mock(() => undefined),
+    recordStopForStartupRecovery:
+      overrides.recordStopForStartupRecovery ?? mock((): Promise<void> => Promise.resolve()),
     removeQueuedWorkspaceTurn:
       overrides.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true)),
     isBusyForMessage: overrides.isBusyForMessage ?? mock(() => false),

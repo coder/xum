@@ -512,6 +512,11 @@ export interface WorkspaceTurnHost {
   ): Result<void>;
   /** Cancel the session's scheduled or starting auto-retry, as a user Stop does. Never throws. */
   abandonAutoRetry(workspaceId: string, reason: string): void;
+  /**
+   * Persist that a Stop ended the session's turn, so startup recovery does not resume it.
+   * Never throws.
+   */
+  recordStopForStartupRecovery(workspaceId: string): Promise<void>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
