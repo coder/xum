@@ -1503,7 +1503,9 @@ describe("a Stop ends the auto-retry loop", () => {
             (wake) => wake.sourceId === turn.taskId
           );
         assert((await wakesForTurn()).length > 0, "restart recovery queued a wake");
-        const upsert = internals.taskHandleStore.upsertWorkspaceTurn.bind(internals.taskHandleStore);
+        const upsert = internals.taskHandleStore.upsertWorkspaceTurn.bind(
+          internals.taskHandleStore
+        );
         let failedWrite = false;
         // Only the Stop's own write (no error) fails.
         spyOn(internals.taskHandleStore, "upsertWorkspaceTurn").mockImplementation(
