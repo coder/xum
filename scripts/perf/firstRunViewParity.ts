@@ -25,6 +25,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import sharp from "sharp";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { FIRST_RUN_VIEW_HTML } from "@/node/orpc/firstRunView";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 export interface Box {
   x: number;
@@ -108,8 +109,15 @@ async function startServer(tree: string, root: string, logFile: string) {
   const { port } = probePort.address() as net.AddressInfo;
   probePort.close();
   const log = fs.openSync(logFile, "w");
-  const env = { PATH: process.env.PATH, HOME: root, XUM_ROOT: root, XUM_DISABLE_TELEMETRY: "1" };
-  const args = `dist/cli/index.js server --no-auth --host 127.0.0.1 --port ${port}`.split(" ");
+  const token = newServerToken();
+  const env = {
+    PATH: process.env.PATH,
+    HOME: root,
+    XUM_ROOT: root,
+    XUM_DISABLE_TELEMETRY: "1",
+    ...serverTokenEnv(token),
+  };
+  const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {
     cwd: tree,
     env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null" },
@@ -133,7 +141,7 @@ async function startServer(tree: string, root: string, logFile: string) {
     await stop();
     throw new Error(`the server did not start, see ${logFile}`);
   }
-  return { origin, stop };
+  return { origin, token, stop };
 }
 
 /** The box of the first `selector` match starting with `text`, in the static view or outside it. */
@@ -171,7 +179,7 @@ async function main(): Promise<number> {
   let injected = false;
   try {
     server = await startServer(path.resolve(a.tree), root, path.join(out, "server.log"));
-    const { origin } = server;
+    const { origin, token } = server;
     // A route-fulfilled document has no local address space, so Local Network Access would block the
     // app's WebSocket to 127.0.0.1. pageTiming.ts navigates without fulfill and needs no such flag.
     browser = await chromium.launch({
@@ -190,20 +198,24 @@ async function main(): Promise<number> {
         const page = await context.newPage();
         let release!: () => void;
         const held = new Promise<void>((resolve) => (release = resolve));
-        await page.route(`${origin}/`, async (route) => {
-          const response = await route.fetch();
-          const html = await response.text();
-          injected ||= !html.includes(`id="${FIRST_RUN_VIEW_ID}"`);
-          const body = html.includes(`id="${FIRST_RUN_VIEW_ID}"`)
-            ? html
-            : withFirstRunView(html, FIRST_RUN_VIEW_HTML);
-          await route.fulfill({ status: response.status(), contentType: "text/html", body });
-        });
+        // The page loads with `?token=`, so match the path, not the whole URL.
+        await page.route(
+          (url) => url.origin === origin && url.pathname === "/",
+          async (route) => {
+            const response = await route.fetch();
+            const html = await response.text();
+            injected ||= !html.includes(`id="${FIRST_RUN_VIEW_ID}"`);
+            const body = html.includes(`id="${FIRST_RUN_VIEW_ID}"`)
+              ? html
+              : withFirstRunView(html, FIRST_RUN_VIEW_HTML);
+            await route.fulfill({ status: response.status(), contentType: "text/html", body });
+          }
+        );
         await page.route(/\/main-[^/]+\.js$/, async (route) => {
           await held;
           await route.continue();
         });
-        await page.goto(`${origin}/`, { waitUntil: "commit" });
+        await page.goto(withServerToken(`${origin}/`, token), { waitUntil: "commit" });
         // Measure the painted static view: stylesheets applied (a stylesheet that never loads is an
         // invalid run after 60 s), then the fonts that layout asked for.
         const sheets = "link[rel=stylesheet]";

@@ -67,12 +67,25 @@ The backend runs with auth on. `make dev-server` generates a random token per ru
 
 ```bash
 TOKEN=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token' "$XUM_ROOT/server.lock")
-printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST -H @- "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -s -X POST -H @- "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
 ```
 
 Command lines are readable by every local account. So node gets only the lockfile path, and the header goes to `curl -H @-` on stdin from the `printf` builtin. Never pass the token as an argument.
 
-- Browser: open `http://localhost:$VITE_PORT/?token=$(node -p 'encodeURIComponent(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token)' "$XUM_ROOT/server.lock")` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token. The URL reaches the browser tool as an argument, so other local accounts can see it for the length of that call.
+Open the app in a browser once with the token in the URL. Node builds the URL and pipes it to `agent-browser batch` on stdin, so the token is in no command line. The batch prints the URL it opened, with the token, so the recipe keeps that output in a variable: it prints nothing when the open works, and prints it with the token removed when it fails:
+
+```bash
+out=$(node -e '
+const [lock, port] = process.argv.slice(1);
+const token = JSON.parse(require("fs").readFileSync(lock, "utf8")).token;
+const url = `http://localhost:${port}/?token=${encodeURIComponent(token)}`;
+process.stdout.write(JSON.stringify([["open", url]]));
+' "$XUM_ROOT/server.lock" "$VITE_PORT" | agent-browser batch --bail 2>&1) ||
+  { sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out" >&2; false; }
+```
+
+The app keeps the token and strips it from the address bar, so later `agent-browser` commands carry no token. Without it, the app asks for the token. Do not use `agent-browser open "<url with token>"`: it puts the token in the command line. Do not pipe the batch straight to the terminal: its output repeats the URL with the token.
+
 - `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
 - The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
 - Keep `XUM_ROOT` outside the checkout. Vite serves the checkout to anyone who can reach its port, and its `public/` folder without any file checks. The sandbox root is under the system temp dir.
@@ -109,7 +122,7 @@ MAKE=gmake make dev-server-sandbox
 
 ## Security notes
 
-- The sandbox backend runs with `--no-auth`, and Vite proxies `/api`, `/orpc` and `/auth` to it. Any Host header Vite accepts therefore reaches an unauthenticated backend and the checkout's source. A web page that rebinds its DNS to this machine can use `Host: <its own name>` for that. So the sandbox never defaults to `all`.
+- Vite proxies `/api`, `/orpc` and `/auth` to a backend that requires the token, but it serves the checkout's source to any Host header it accepts. A web page that rebinds its DNS to this machine can use `Host: <its own name>` for that. So the sandbox never defaults to `all`.
 - For another remote or proxy host, opt in with `XUM_VITE_ALLOWED_HOSTS=<host>[,<host>]` (the unprefixed `VITE_ALLOWED_HOSTS` also works). A Vite `403 Blocked request. This host ("...") is not allowed` means the Host is missing from that list. Use `all` only on a machine that no other user or browser can reach.
 - `providers.jsonc` may contain API keys.
 - The sandbox root directory is created on disk (usually under your system temp dir).

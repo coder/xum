@@ -152,10 +152,10 @@ async function main(): Promise<number> {
   }
 
   // Vite answers any Host header it does not allow with 403 (DNS-rebinding guard), and always
-  // allows loopback names and IPs. The sandbox backend runs --no-auth, so never default to `all`:
-  // any web page that rebinds its DNS to this machine could then read the checkout and call the
-  // backend. Remote access is an explicit opt-in (VITE_ALLOWED_HOSTS, any spelling), or the one
-  // Coder port-forward host of this sandbox.
+  // allows loopback names and IPs. The sandbox backend needs its token, but Vite serves the checkout
+  // without one, so never default to `all`: any web page that rebinds its DNS to this machine could
+  // then read the checkout. Remote access is an explicit opt-in (VITE_ALLOWED_HOSTS, any spelling),
+  // or the one Coder port-forward host of this sandbox.
   const requestedHosts =
     resolveXumEnvironmentValue("VITE_ALLOWED_HOSTS", process.env) ?? process.env.VITE_ALLOWED_HOSTS;
   const allowedHosts = requestedHosts?.trim()
