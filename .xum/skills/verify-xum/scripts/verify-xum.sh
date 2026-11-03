@@ -3,7 +3,8 @@
 #
 #   verify-xum.sh launch           start and seed a sandbox, print its state
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
-#   verify-xum.sh env [RUN]        print the run's `export` lines and put this script on PATH (eval them)
+#   verify-xum.sh env [RUN]        print the run's `export` lines, put this script on PATH, clear git's
+#                                  repo variables (eval them)
 #   verify-xum.sh open PATH [RUN]  open PATH of the run's UI in its browser session, token in no argv
 #   verify-xum.sh workspace-field NAME FIELD [RUN]  print FIELD of workspace NAME from config.json
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
@@ -13,6 +14,23 @@
 #
 # RUN defaults to the newest launch from this checkout.
 set -euo pipefail
+
+# Git variables that point git at another repository (a hook's GIT_INDEX_FILE, an exported
+# GIT_DIR, config from GIT_CONFIG_*) would make the checkout lookups and the demo repo's
+# `git -C` commands below act on that repository: `git add .` would replace its index. This
+# script clears them, and the `env` output clears them for the recipes' git commands too. The
+# list is `git rev-parse --local-env-vars` plus the discovery and config variables.
+# shellcheck disable=SC2046,SC2086 # lists of variable names
+{
+  GIT_REPO_ENV="GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE
+    GIT_NO_REPLACE_OBJECTS GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE GIT_PREFIX GIT_NAMESPACE
+    GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM ${!GIT_CONFIG*}"
+  unset $GIT_REPO_ENV
+  # Names a newer git adds to its own list.
+  GIT_REPO_ENV=$(printf '%s\n' $GIT_REPO_ENV $(git rev-parse --local-env-vars) | sort -u | tr '\n' ' ')
+  unset $GIT_REPO_ENV
+}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
@@ -385,6 +403,7 @@ cmd_env() {
   # The feature recipes call the helper by its bare name. $PATH expands when the caller evals.
   # shellcheck disable=SC2016
   printf 'export PATH=%q:"$PATH"\n' "$SCRIPT_DIR"
+  echo "unset $GIT_REPO_ENV"
 }
 
 # Opens PATH of the run's UI in the run's browser session. When the backend has an auth token, the

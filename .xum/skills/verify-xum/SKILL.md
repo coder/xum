@@ -86,7 +86,9 @@ Exit 1 means do not drive this instance: run cleanup, then launch again.
 ## Drive
 
 Every bash call starts by loading the run. This sets `AGENT_BROWSER_SESSION` (a session name only
-this run uses) and the `VERIFY_XUM_*` paths and URLs:
+this run uses) and the `VERIFY_XUM_*` paths and URLs. It also unsets the Git variables that point
+git at another repository (`GIT_DIR`, `GIT_INDEX_FILE` and the rest of
+`git rev-parse --local-env-vars`), so the recipes' git commands act on the demo repo:
 
 ```bash
 eval "$(.xum/skills/verify-xum/scripts/verify-xum.sh env)"
