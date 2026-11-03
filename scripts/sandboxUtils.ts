@@ -6,7 +6,7 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
-import { type XumEnvironment } from "../src/common/compat/xumEnv";
+import { resolveXumEnvironmentEntry, type XumEnvironment } from "../src/common/compat/xumEnv";
 import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
@@ -272,18 +272,18 @@ export function sanitizeSandboxProviderEnv(options: {
   return env;
 }
 
-/** Proxy URL template variables, in the order the sandbox reads them: the first one that is set wins. */
-const PROXY_URI_ENV_NAMES = ["XUM_PROXY_URI", "MUX_PROXY_URI", "VSCODE_PROXY_URI"] as const;
-
-/** The proxy URL template the sandbox reads, with the name of the variable that holds it. */
+/**
+ * The proxy URL template the sandbox reads, with the name of the variable that holds it:
+ * XUM_PROXY_URI (or its leftover alias), else VSCODE_PROXY_URI, as src/desktop/main.ts does.
+ */
 export function readProxyUriTemplate(
   env: XumEnvironment
-): { name: (typeof PROXY_URI_ENV_NAMES)[number]; template: string } | null {
-  for (const name of PROXY_URI_ENV_NAMES) {
-    const template = env[name]?.trim();
-    if (template) return { name, template };
-  }
-  return null;
+): { name: string; template: string } | null {
+  const xum = resolveXumEnvironmentEntry("PROXY_URI", env);
+  if (xum?.value.trim()) return { name: xum.name, template: xum.value.trim() };
+
+  const vscode = env.VSCODE_PROXY_URI?.trim();
+  return vscode ? { name: "VSCODE_PROXY_URI", template: vscode } : null;
 }
 
 /**
