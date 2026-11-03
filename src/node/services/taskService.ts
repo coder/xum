@@ -15951,6 +15951,10 @@ export class TaskService implements AgentTaskIntegration {
       } catch (error: unknown) {
         log.debug("failAgentTaskForHardTimeout: clearQueue threw", { taskId, error });
       }
+      // An idle task in its backoff gets no stop record below, so the timeout is its own stop
+      // boundary: the epoch bump refuses a retry that a failure handled meanwhile would arm.
+      this.taskStopLatch.bumpWorkspaceStopEpoch(taskId);
+      this.workspaceService.abandonAutoRetry(taskId, "task_stopped");
       try {
         await this.aiService.stopStream(taskId, {
           abandonPartial: true,

@@ -21,11 +21,11 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 
 # Expected verdict per config: "holds", or the invariant that must be violated.
 # A case, not an associative array: macOS ships Bash 3.2, which has none.
-ORDER=(reachability ui api task)
+ORDER=(reachability ui api task turn timeout)
 expected_for() {
   case $1 in
     reachability) echo NoRetryEverResumes ;;
-    ui | api | task) echo holds ;;
+    ui | api | task | turn | timeout) echo holds ;;
     *) echo "" ;;
   esac
 }

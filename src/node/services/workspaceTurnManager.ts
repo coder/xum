@@ -3875,6 +3875,8 @@ export class WorkspaceTurnManager {
             // auto-dispatch when it ends, defeating the stop.
             this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
             releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
+            // A backoff left armed would restart the interrupted turn once the latch drops.
+            this.workspaceService.abandonAutoRetry(record.workspaceId, "task_stopped");
             return Ok({ workspaceId: record.workspaceId, next });
           }
         );

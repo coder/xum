@@ -76,6 +76,32 @@ function failsOnceModel(requests: { count: number }): MockLanguageModelV3 {
   });
 }
 
+/** Stream starts per workspace: a stopped workspace's count must not grow. */
+function countStreams(env: TestEnvironment): (workspaceId: string) => number {
+  const counts = new Map<string, number>();
+  env.services.aiService.on("stream-start", (event: { workspaceId?: string }) => {
+    if (event.workspaceId == null) return;
+    counts.set(event.workspaceId, (counts.get(event.workspaceId) ?? 0) + 1);
+  });
+  return (workspaceId) => counts.get(workspaceId) ?? 0;
+}
+
+/** Holds handleStreamError of one workspace at its goal accounting restore, before it arms a retry. */
+function holdErrorHandling(env: TestEnvironment, held: (workspaceId: string) => boolean) {
+  const goals = env.services.workspaceGoalService;
+  const restore = goals.restoreGoalAccountingSnapshot.bind(goals);
+  const entered = Promise.withResolvers<string>();
+  const release = Promise.withResolvers<void>();
+  spyOn(goals, "restoreGoalAccountingSnapshot").mockImplementation(async (workspaceId, ...rest) => {
+    if (held(workspaceId)) {
+      entered.resolve(workspaceId);
+      await release.promise;
+    }
+    return restore(workspaceId, ...rest);
+  });
+  return { entered: entered.promise, release: () => release.resolve() };
+}
+
 function useModel(env: TestEnvironment, model: MockLanguageModelV3): void {
   const factory = (
     env.services.aiService as unknown as { providerModelFactory: ProviderModelFactory }
@@ -195,6 +221,153 @@ describe("a Stop ends the auto-retry loop", () => {
       await sleep(PAST_FIRST_BACKOFF_MS);
 
       expect(requests.count).toBe(afterStop);
+    });
+  }, 60_000);
+  test("a workflow step's hard timeout keeps a sub-agent in its retry backoff from restarting", async () => {
+    await withWorkspace(async (env, parentId) => {
+      useModel(env, failsOnceModel({ count: 0 }));
+      const { taskService, workspaceService } = env.services;
+      // The terminal failure wakes the parent, which streams too: count the child's streams only.
+      const streams = countStreams(env);
+      const created = await taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "Survey the repository",
+        title: "Timed-out child",
+      });
+      if (!created.success) throw new Error(created.error);
+      const childId = created.data.taskId;
+      assert(
+        await waitFor(() => workspaceService.hasPendingAutoRetry(childId), 10_000),
+        "the child's failed first stream schedules an auto-retry"
+      );
+
+      await taskService.failAgentTaskForHardTimeout(childId, {
+        workflowRunId: "wfr_hard_timeout",
+        stepId: "survey",
+        inputHash: "hash",
+        reason: "The step timed out",
+      });
+      const afterTimeout = streams(childId);
+      assert(afterTimeout > 0, "the child's first stream started");
+      await sleep(PAST_FIRST_BACKOFF_MS);
+
+      expect(streams(childId)).toBe(afterTimeout);
+    });
+  }, 60_000);
+
+  test("interrupting a workspace turn keeps its retry backoff from restarting the turn", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const requests = { count: 0 };
+      useModel(env, failsOnceModel(requests));
+      const { taskService, workspaceService, workspaceTurnManager } = env.services;
+      const turn = await workspaceTurnManager.createWorkspaceTurn({
+        ownerWorkspaceId: ownerId,
+        prompt: "Survey the repository",
+        title: "Retrying turn",
+        workspace: { mode: "new" },
+      });
+      if (!turn.success) throw new Error(turn.error);
+      const targetId = turn.data.workspaceId;
+      assert(
+        await waitFor(() => workspaceService.hasPendingAutoRetry(targetId), 20_000),
+        "the turn's failed first stream schedules an auto-retry"
+      );
+
+      // What task_stop runs for a workspace-turn ID.
+      const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
+        ownerId,
+        turn.data.taskId
+      );
+      assert(interrupted.success, "the turn interrupt succeeds");
+      assert(
+        await waitFor(() => !taskService.isWorkspaceStopInProgress(targetId), 5_000),
+        "the target's stop latch drops"
+      );
+      const afterStop = requests.count;
+      await sleep(PAST_FIRST_BACKOFF_MS);
+
+      expect(requests.count).toBe(afterStop);
+    });
+  }, 90_000);
+  test("interrupting a workspace turn during its stream error handling arms no retry", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      useModel(env, failsOnceModel({ count: 0 }));
+      const { taskService, workspaceService, workspaceTurnManager } = env.services;
+      const streams = countStreams(env);
+      const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== ownerId);
+      const turn = await workspaceTurnManager.createWorkspaceTurn({
+        ownerWorkspaceId: ownerId,
+        prompt: "Survey the repository",
+        title: "Failing turn",
+        workspace: { mode: "new" },
+      });
+      if (!turn.success) throw new Error(turn.error);
+      const targetId = turn.data.workspaceId;
+      assert((await hold.entered) === targetId, "the turn's error handling is held");
+
+      // The interrupt's latch drops after its stream stop, while the error handling still runs.
+      const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
+        ownerId,
+        turn.data.taskId
+      );
+      assert(interrupted.success, "the turn interrupt succeeds");
+      assert(!taskService.isWorkspaceStopInProgress(targetId), "the target's stop latch dropped");
+      hold.release();
+      assert(
+        await waitFor(() => workspaceService.getActiveTurnGeneration(targetId) == null, 5_000),
+        "the target's error handling ends"
+      );
+      const afterStop = streams(targetId);
+      await sleep(PAST_FIRST_BACKOFF_MS);
+
+      expect(streams(targetId)).toBe(afterStop);
+    });
+  }, 90_000);
+
+  test("a hard timeout during a sub-agent's stream error handling arms no retry", async () => {
+    await withWorkspace(async (env, parentId) => {
+      useModel(env, failsOnceModel({ count: 0 }));
+      const { taskService, workspaceService } = env.services;
+      const streams = countStreams(env);
+      const hold = holdErrorHandling(env, (workspaceId) => workspaceId !== parentId);
+      const created = await taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "Survey the repository",
+        title: "Failing child",
+      });
+      if (!created.success) throw new Error(created.error);
+      const childId = created.data.taskId;
+      assert((await hold.entered) === childId, "the child's error handling is held");
+      // The error handling ends after the timeout's queue clear and stream stop, but before its
+      // terminal failure samples live work, so no stop record (and no latch) covers it.
+      const terminate = taskService.terminateAllDescendantAgentTasks.bind(taskService);
+      spyOn(taskService, "terminateAllDescendantAgentTasks").mockImplementation(
+        async (workspaceId, ...rest) => {
+          if (workspaceId === childId) {
+            hold.release();
+            assert(
+              await waitFor(() => workspaceService.getActiveTurnGeneration(childId) == null, 5_000),
+              "the child's error handling ends"
+            );
+          }
+          return terminate(workspaceId, ...rest);
+        }
+      );
+
+      await taskService.failAgentTaskForHardTimeout(childId, {
+        workflowRunId: "wfr_hard_timeout",
+        stepId: "survey",
+        inputHash: "hash",
+        reason: "The step timed out",
+      });
+      const afterTimeout = streams(childId);
+      await sleep(PAST_FIRST_BACKOFF_MS);
+
+      expect(streams(childId)).toBe(afterTimeout);
     });
   }, 60_000);
 });

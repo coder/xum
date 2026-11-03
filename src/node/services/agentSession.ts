@@ -523,6 +523,19 @@ function isRetriedGoalStillRunning(
   return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
 }
 
+/** The auto-retry failure for a terminal stream error. */
+function streamErrorRetryFailure(failureType: string, data: StreamErrorPayload): RetryFailureError {
+  return {
+    type: failureType,
+    message: data.error,
+    // Only for the final rate_limit class: the rollover/budget rewrites in handleStreamError
+    // spread `data` and can replace the error type while an older retryAfterMs survives.
+    ...(failureType === "rate_limit" && data.retryAfterMs != null
+      ? { retryAfterMs: data.retryAfterMs }
+      : {}),
+  };
+}
+
 /** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
   return (
@@ -2469,7 +2482,8 @@ export class AgentSession {
 
   private async handleStreamFailureForAutoRetry(
     error: RetryFailureError,
-    isCurrent = this.retryManager.captureGeneration()
+    isCurrent = this.retryManager.captureGeneration(),
+    stopEpoch = this.getStopEpoch()
   ): Promise<void> {
     assert(
       typeof error.type === "string" && error.type.length > 0,
@@ -2485,9 +2499,11 @@ export class AgentSession {
     const turn = this.coordinator.turnId;
     await this.loadAutoRetryEnabledPreference(isCurrent);
     if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
-    // A task Stop releases its latch once this turn settles, after its cleanup abandoned the
-    // retry, so a retry armed now would restart the stopped workspace.
-    if (this.isStopInProgress()) return;
+    // Every Stop abandons a pending retry, but a workspace-turn interrupt drops its latch without
+    // waiting for this handler, and a hard timeout of an idle task takes none: a retry armed now
+    // would restart the stopped workspace. A Stop since the failed turn's admission (stopEpoch)
+    // or one still in progress ends the retry loop.
+    if (this.stoppedSince(stopEpoch)) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -10093,15 +10109,11 @@ export class AgentSession {
     }
 
     try {
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: data.error,
-        // Only for the final rate_limit class: the rollover/budget rewrites above spread `data`
-        // and can replace the error type while an older retryAfterMs survives the spread.
-        ...(failureType === "rate_limit" && data.retryAfterMs != null
-          ? { retryAfterMs: data.retryAfterMs }
-          : {}),
-      });
+      await this.handleStreamFailureForAutoRetry(
+        streamErrorRetryFailure(failureType, data),
+        undefined,
+        context?.admissionStopEpoch
+      );
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.
       // Startup callers keep the rejection so their recovery checkpoint remains retryable.
