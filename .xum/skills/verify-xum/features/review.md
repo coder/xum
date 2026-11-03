@@ -57,7 +57,14 @@ Preconditions:
   button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
   button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
 - **Restore.** Run `agent-browser find role button click --name "Mark as read (M)" --exact`. The
-  tab reads `Review 0/1`, and `review-state.json` has no `"isRead": true`. Run
+  tab reads `Review 0/1` at once, and the app writes `review-state.json` a moment later. Wait for
+  it:
+
+  ```bash
+  timeout 10 sh -c 'while grep -qF "\"isRead\": true" "$1"; do sleep 0.2; done' sh "$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json"
+  ```
+
+  `review-state.json` has no `"isRead": true`. Run
   `agent-browser find role checkbox click --name "Uncommitted:" --exact`. The box is
   `checked=false` at once. Wait until the server has written it:
 

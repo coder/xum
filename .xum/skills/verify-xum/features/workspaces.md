@@ -50,10 +50,12 @@ Preconditions:
   `/project?project=demo-app-<hash>&draft=<id>`. Create `scratch-notes` the same way as above,
   with the message `Collect scratch notes`, and run `verify-xum.sh idle` after its reply.
 - **Open from the sidebar.** Run
-  `agent-browser find role button click --name "Select workspace release-notes" --exact`. The URL
-  is `/workspace/<release-notes id>`. Run
-  `agent-browser find role button click --name "Select workspace Verify playground" --exact`. The
-  URL is `/workspace/$VERIFY_XUM_WORKSPACE_ID`.
+  `agent-browser find role button click --name "Select workspace release-notes" --exact` and
+  `agent-browser wait --url "**/workspace/<release-notes id>"`. The URL is
+  `/workspace/<release-notes id>`. Run
+  `agent-browser find role button click --name "Select workspace Verify playground" --exact` and
+  `agent-browser wait --url "**/workspace/$VERIFY_XUM_WORKSPACE_ID"`. The URL is
+  `/workspace/$VERIFY_XUM_WORKSPACE_ID`.
 - **Archive from the row.** Focus the row's archive icon and press Enter. Run
   `agent-browser wait '[aria-label="Archive workspace release-notes"]'`,
   `agent-browser focus '[aria-label="Archive workspace release-notes"]'` and
@@ -63,8 +65,10 @@ Preconditions:
   The `Select workspace release-notes` row is gone, and in `$VERIFY_XUM_ROOT/config.json` the
   `release-notes` entry has an `archivedAt` time. Capture `workspaces/archived`.
 - **Archive with the keyboard.** Open `scratch-notes` from its row, run `verify-xum.sh idle`, and
-  press Ctrl+Shift+Backspace. Run `agent-browser press Control+Shift+Backspace`. The
-  `Select workspace scratch-notes` row disappears, and its `config.json` entry gets an
+  press Ctrl+Shift+Backspace. Run `agent-browser press Control+Shift+Backspace` and wait for the
+  archive with
+  `agent-browser wait --fn '!document.querySelector("[aria-label=\"Select workspace scratch-notes\"]")'`.
+  The `Select workspace scratch-notes` row is gone, and its `config.json` entry has an
   `archivedAt` time.
 - **Restore.** Open the project page and the archived list. Run
   `agent-browser find role button click --name "Create workspace in demo-app" --exact`,

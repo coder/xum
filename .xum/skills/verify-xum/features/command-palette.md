@@ -29,8 +29,10 @@ Preconditions:
 - **Switch workspace.** Press Ctrl+Shift+P, wait for the palette as above, then run
   `agent-browser keyboard type "release"` and
   `agent-browser wait '[role="option"][aria-selected="true"][aria-label="release-notes"]'`.
-  `Suggestions` lists the option `release-notes`, selected. Run `agent-browser press Enter`. The URL
-  is `/workspace/<release-notes id>`. Capture `command-palette/switched`.
+  `Suggestions` lists the option `release-notes`, selected. Run `agent-browser press Enter` and
+  `agent-browser wait --url "**/workspace/<release-notes id>"`: the palette closes first and
+  navigates a moment later. The URL is `/workspace/<release-notes id>`. Capture
+  `command-palette/switched`.
 - **Command mode.** Run `agent-browser press F4` and
   `agent-browser wait '[aria-label="Command palette"]'`. The combobox value is `>`, and
   `Suggestions` lists commands such as `Open Settings` and `Change Model…`.

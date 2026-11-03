@@ -4,7 +4,7 @@
 #   verify-xum.sh launch           start and seed a sandbox, print its state
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
 #   verify-xum.sh env [RUN]        print the run's `export` lines and put this script on PATH (eval them)
-#   verify-xum.sh open-query [RUN] print `?token=<token>` when the backend has one (env uses it)
+#   verify-xum.sh open PATH [RUN]  open PATH of the run's UI in its browser session, token in no argv
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
@@ -166,11 +166,11 @@ json_field_or_empty() {
 backend_ready() {
   node -e '
     const fs = require("fs");
-    const [serverLock, buildStamp, launchSeconds] = process.argv.slice(1);
+    const [serverLock, buildStamp, launchMs] = process.argv.slice(1);
     try {
       const buildStampMs = Number(fs.readFileSync(buildStamp, "utf8"));
       const serverStartedMs = Date.parse(JSON.parse(fs.readFileSync(serverLock, "utf8")).startedAt);
-      const builtSinceLaunch = buildStampMs >= Number(launchSeconds) * 1000;
+      const builtSinceLaunch = buildStampMs >= Number(launchMs);
       const serverRestartedAfterBuild = serverStartedMs > buildStampMs;
       process.exit(builtSinceLaunch && serverRestartedAfterBuild ? 0 : 1);
     } catch {
@@ -271,7 +271,8 @@ cmd_launch() {
   mkdir -m 700 "$VERIFY_XUM_RUN"
   mkdir -p "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/scratch"
   log="$VERIFY_XUM_RUN/server.log"
-  t0=$(date +%s)
+  # Milliseconds: a stamp from earlier in the launch's own second is a stale build.
+  t0=$(date +%s%3N)
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
@@ -379,17 +380,31 @@ cmd_env() {
   # The feature recipes call the helper by its bare name. $PATH expands when the caller evals.
   # shellcheck disable=SC2016
   printf 'export PATH=%q:"$PATH"\n' "$SCRIPT_DIR"
-  # Read when the caller evals, so the token never shows in this output.
-  # shellcheck disable=SC2016
-  printf 'export VERIFY_XUM_OPEN_QUERY="$(%q open-query %q)"\n' "$SCRIPT_DIR/verify-xum.sh" "$VERIFY_XUM_RUN"
 }
 
-# `?token=<token>` for the first page a browser opens when the backend has a token, else nothing.
-cmd_open_query() {
-  load_run "${1:-}"
-  local token
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  [[ -z $token ]] || printf '?token=%s' "$(printf %s "$token" | node -p 'encodeURIComponent(require("fs").readFileSync(0, "utf8"))')"
+# Opens PATH of the run's UI in the run's browser session. When the backend has an auth token, the
+# URL carries `?token=` (the app keeps the token and strips it from the address bar). node reads
+# the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
+# is in no process's argv or environment: every local account can read argv.
+cmd_open() {
+  local path=${1:-} out
+  [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
+  load_run "${2:-}"
+  # shellcheck disable=SC2001 # sed's character class; bash patterns have none
+  out=$(node -e '
+    const fs = require("fs");
+    const [serverLock, base, path] = process.argv.slice(1);
+    let token = "";
+    try {
+      token = JSON.parse(fs.readFileSync(serverLock, "utf8")).token ?? "";
+    } catch {}
+    const url = new URL(path, base);
+    if (token) url.searchParams.set("token", token);
+    process.stdout.write(JSON.stringify([["open", url.href]]));' \
+    "$VERIFY_XUM_ROOT/server.lock" "$VERIFY_XUM_URL" "$path" \
+    | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
+    || die "agent-browser could not open $path: $(sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out")"
+  # The success output repeats the URL with the token: it is not printed.
 }
 
 cmd_capture() {
@@ -464,10 +479,10 @@ case ${1:-} in
   launch) cmd_launch ;;
   doctor) cmd_doctor "${2:-}" ;;
   env) cmd_env "${2:-}" ;;
-  open-query) cmd_open_query "${2:-}" ;;
+  open) cmd_open "${2:-}" "${3:-}" ;;
   capture) cmd_capture "${2:-}" "${3:-}" ;;
   idle) cmd_idle "${2:-}" ;;
   send-ready) cmd_send_ready "${2:-}" ;;
   cleanup) cmd_cleanup "${2:-}" ;;
-  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open-query [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
+  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
 esac

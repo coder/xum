@@ -85,11 +85,11 @@ Exit 1 means do not drive this instance: run cleanup, then launch again.
 ## Drive
 
 Every bash call starts by loading the run. This sets `AGENT_BROWSER_SESSION` (a session name only
-this run uses), the `VERIFY_XUM_*` paths and URLs, and `VERIFY_XUM_OPEN_QUERY`:
+this run uses) and the `VERIFY_XUM_*` paths and URLs:
 
 ```bash
 eval "$(.xum/skills/verify-xum/scripts/verify-xum.sh env)"
-agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID$VERIFY_XUM_OPEN_QUERY"
+.xum/skills/verify-xum/scripts/verify-xum.sh open "/workspace/$VERIFY_XUM_WORKSPACE_ID"
 .xum/skills/verify-xum/scripts/verify-xum.sh idle
 agent-browser snapshot -i
 agent-browser find role button click --name "Open settings" --exact
@@ -98,12 +98,12 @@ agent-browser find role button click --name "Open settings" --exact
 - Prefer `find role <role> <action> --name "<accessible name>" --exact` and the names in the
   feature map over `@eN` refs, which change with every snapshot. Without `--exact`, `--name`
   matches substrings and can act on a different element.
-- `VERIFY_XUM_OPEN_QUERY` is `?token=<token>` when the backend has an auth token (`make dev-server`
-  with #7904), and empty otherwise. Put it on the first `open` of a browser session: the app
-  keeps the token and strips it from the address bar. CAUTION: that URL puts the token in the
-  `agent-browser` command line, which every local account can read while it runs. The variable
-  itself sits in your shell's environment after the `eval`, so every process you start from that
-  shell inherits the token.
+- Open pages with `verify-xum.sh open <path>`, not `agent-browser open`. `make dev-server` starts
+  the backend with an auth token, and the first page of a browser session needs it as
+  `?token=<token>` (the app keeps it and strips it from the address bar). `open` builds that URL in
+  node from `server.lock` and hands it to `agent-browser batch` on stdin, so the token is in no
+  command line or environment. CAUTION: never put the token in an `agent-browser` argument. Every
+  local account can read a process's command line while it runs.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
