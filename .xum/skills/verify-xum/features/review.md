@@ -32,6 +32,7 @@ Preconditions:
   ```
 
   `git -C "$VERIFY_XUM_WORKTREE" status --short` prints ` M src/math.ts`.
+
 - **Open the sidebar.** Run
   `agent-browser find role button click --name "Expand right sidebar" --exact`,
   `agent-browser wait --text "Open a tool"` and `verify-xum.sh idle`. The heading `Open a tool`
@@ -71,6 +72,6 @@ Preconditions:
 - A click on `Review` while the sidebar still slides open is lost. Keep the `idle` call before it.
 - Skip a Restore step and a rerun in the same run fails. A hunk's id comes from its content, so
   the same edit comes back already read. With `Uncommitted:` already checked, the panel did not
-  show a new edit within 25 s, until `Refresh diff`. With the Review tab open, `Expand right
-  sidebar` opens that tab instead of `Open a tool`.
+  show a new edit within 25 s, until `Refresh diff`. With the Review tab open,
+  `Expand right sidebar` opens that tab instead of `Open a tool`.
 - `find` has no `uncheck` action. `find role checkbox click` toggles the box.

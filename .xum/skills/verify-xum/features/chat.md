@@ -40,6 +40,7 @@ Preconditions:
   ```
 
   The file has two `"role":"user"` rows and two `"role":"assistant"` rows with the reply texts.
+
 - **Stop a stream.** Fill `[mock:long-stream] tell a long story`, run `verify-xum.sh send-ready`
   and press Enter. Run `agent-browser wait '[aria-label="Stop streaming"]'`, then wait for a few
   chunks with
