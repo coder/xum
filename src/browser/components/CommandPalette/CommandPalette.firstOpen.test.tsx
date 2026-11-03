@@ -172,13 +172,20 @@ describe("command palette first open", () => {
     await expectOpenWithNothingRun(view, pick);
   });
 
-  test("an IME Enter while the chunk loads only commits the composition", async () => {
-    const pick = mock();
-    const view = renderFreshApp("./LazyCommandPalette?ime-enter=1", [
-      { id: "test:pick", title: "Pick me", section: "Tests", run: pick },
-    ]);
-    const loading = openActionsAndTypeWhileLoading(view, ">Pick");
-    fireEvent.keyDown(loading, { key: "Enter", isComposing: true });
-    await expectOpenWithNothingRun(view, pick);
-  });
+  // Safari and older IMEs send the composition-commit Enter with isComposing false but keyCode
+  // 229, and cmdk ignores both forms.
+  for (const [tag, init] of [
+    ["is-composing", { isComposing: true }],
+    ["key-code-229", { isComposing: false, keyCode: 229 }],
+  ] as const) {
+    test(`an IME Enter (${tag}) while the chunk loads only commits the composition`, async () => {
+      const pick = mock();
+      const view = renderFreshApp(`./LazyCommandPalette?ime-enter=${tag}`, [
+        { id: "test:pick", title: "Pick me", section: "Tests", run: pick },
+      ]);
+      const loading = openActionsAndTypeWhileLoading(view, ">Pick");
+      fireEvent.keyDown(loading, { key: "Enter", ...init });
+      await expectOpenWithNothingRun(view, pick);
+    });
+  }
 });

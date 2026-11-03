@@ -58,8 +58,9 @@ function LoadingPaletteInput(props: { openOrigin: HTMLElement | null; onEnter: (
           aria-label="Command palette"
           autoFocus
           onKeyDown={(e) => {
-            // An IME Enter only commits the composition, as in the loaded palette (cmdk).
-            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+            // An IME Enter only commits the composition, as in the loaded palette: cmdk's check,
+            // since Safari and older IMEs send it with isComposing false but keyCode 229.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
               e.preventDefault();
               props.onEnter();
               return;
