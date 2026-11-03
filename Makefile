@@ -56,7 +56,8 @@ else
 DEV_SERVER_AUTH_FLAG :=
 # Only when dev-server is a goal: `:=` runs node at parse time, and every make invocation parses this.
 ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
-export XUM_SERVER_AUTH_TOKEN := $(or $(XUM_DEV_SERVER_AUTH_TOKEN),$(shell node -p "require('crypto').randomBytes(32).toString('hex')"))
+# `override` beats `make -e`; `$(value ...)` keeps a chosen token's dollar signs from being expanded.
+override export XUM_SERVER_AUTH_TOKEN := $(or $(value XUM_DEV_SERVER_AUTH_TOKEN),$(shell node -p "require('crypto').randomBytes(32).toString('hex')"))
 ifeq ($(XUM_SERVER_AUTH_TOKEN),)
 $(error could not generate the dev-server auth token: is node on PATH?)
 endif

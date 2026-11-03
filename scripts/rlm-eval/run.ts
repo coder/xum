@@ -28,8 +28,8 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { ServerLockfile } from "@/node/services/serverLockfile";
 import { extractMetrics } from "./metrics";
+import { readSandboxToken } from "./sandboxToken";
 import { CONFIGS, SCENARIOS } from "./scenarios";
 import type { CellMetrics } from "./metrics";
 
@@ -342,9 +342,7 @@ function printAggregate(results: CellResult[]): void {
 
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
-  // `make dev-server` starts the backend with a per-run token and records it in the root's server.lock.
-  const lock = await new ServerLockfile(parsed.root).peek();
-  const args: CliArgs = { ...parsed, token: lock?.token ?? "" };
+  const args: CliArgs = { ...parsed, token: await readSandboxToken(parsed) };
   const gitSha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
   // devtools.jsonl (providerRequests metric) only exists when debug logs are on.
   await post(args, "/config/updateLlmDebugLogs", { enabled: true });

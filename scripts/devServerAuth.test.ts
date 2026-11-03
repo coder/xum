@@ -124,7 +124,7 @@ describe("make dev-server auth", () => {
 // passes the token check on to the backend. So the token on disk must not be servable, wherever
 // XUM_ROOT sits (for example inside the checkout).
 describe("vite dev server", () => {
-  test("never serves a server.lock, but still serves source files", async () => {
+  test("never serves a server.lock or the files Vite denies by default, but serves source", async () => {
     // Vite's config cannot be loaded under Bun (its plugins need Node), so ask Node.
     const script = `
       import { isFileLoadingAllowed, resolveConfig } from "vite";
@@ -134,6 +134,8 @@ describe("vite dev server", () => {
       console.log(JSON.stringify({
         rootLock: allowed("server.lock"),
         nestedLock: allowed(".dev-home/nested/server.lock"),
+        env: allowed(".env"),
+        gitConfig: allowed(".git/config"),
         source: allowed("src/browser/App.tsx"),
       }));`;
     const proc = Bun.spawn(["node", "--input-type=module", "-e", script], {
@@ -147,6 +149,12 @@ describe("vite dev server", () => {
       new Response(proc.stderr).text(),
     ]);
     expect(exitCode, stderr).toBe(0);
-    expect(JSON.parse(stdout)).toEqual({ rootLock: false, nestedLock: false, source: true });
+    expect(JSON.parse(stdout)).toEqual({
+      rootLock: false,
+      nestedLock: false,
+      env: false,
+      gitConfig: false,
+      source: true,
+    });
   }, 60_000);
 });
