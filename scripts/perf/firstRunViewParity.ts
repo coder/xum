@@ -25,7 +25,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import sharp from "sharp";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { FIRST_RUN_VIEW_HTML } from "@/node/orpc/firstRunView";
-import { newServerToken, withServerToken } from "./serverToken";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 export interface Box {
   x: number;
@@ -115,7 +115,7 @@ async function startServer(tree: string, root: string, logFile: string) {
     HOME: root,
     XUM_ROOT: root,
     XUM_DISABLE_TELEMETRY: "1",
-    XUM_SERVER_AUTH_TOKEN: token,
+    ...serverTokenEnv(token),
   };
   const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {

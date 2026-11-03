@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { assignXumEnvironmentValue, type XumEnvironment } from "../../src/common/compat/xumEnv";
 
 /**
  * A perf server listens on loopback, which every local account can reach, so it starts with a token
@@ -7,6 +8,17 @@ import { randomBytes } from "node:crypto";
  */
 export function newServerToken(): string {
   return randomBytes(32).toString("hex");
+}
+
+/**
+ * The environment entries that hand `token` to a server. The `--tree` benchmarks also start built
+ * trees from before the MUX_ to XUM_ rename, which read only `MUX_SERVER_AUTH_TOKEN`, so this
+ * writes both names through the shared compat helper.
+ */
+export function serverTokenEnv(token: string): XumEnvironment {
+  const env: XumEnvironment = {};
+  assignXumEnvironmentValue(env, "SERVER_AUTH_TOKEN", token);
+  return env;
 }
 
 /**

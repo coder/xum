@@ -26,7 +26,7 @@ import * as core from "./pageTimingCore";
 import { probe, STATIC_VIEW_IDS } from "./pageTimingProbe";
 import * as stats from "./pageTimingStats";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
-import { newServerToken, withServerToken } from "./serverToken";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
 const viewport = { width: 412, height: 823 };
@@ -112,7 +112,7 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     HOME: home,
     XUM_ROOT: root,
     XUM_DISABLE_TELEMETRY: "1",
-    XUM_SERVER_AUTH_TOKEN: token,
+    ...serverTokenEnv(token),
   };
   const args = `dist/cli/index.js server --host 127.0.0.1 --port ${port}`.split(" ");
   const server = spawn("node", args, {

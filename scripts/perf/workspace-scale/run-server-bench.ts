@@ -10,7 +10,7 @@ import type { RouterClient } from "@orpc/server";
 import { z } from "zod";
 import type { AppRouter } from "../../../src/node/orpc/router";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
-import { newServerToken } from "../serverToken";
+import { newServerToken, serverTokenEnv } from "../serverToken";
 import {
   benchArgs,
   copyFixture,
@@ -85,7 +85,7 @@ async function runOnce(root: string, label: string, repetition: number, launch: 
     ["dist/cli/index.js", "server", "--host", "127.0.0.1", "--port", String(port)],
     {
       cwd: repoRoot,
-      env: { ...isolatedEnv(root), XUM_SERVER_AUTH_TOKEN: token },
+      env: { ...isolatedEnv(root), ...serverTokenEnv(token) },
       stdio: ["ignore", "pipe", "pipe"],
     }
   );

@@ -21,7 +21,7 @@ import { chromium, type Browser } from "playwright";
 import { PHONE_CHROME_JSON } from "../../src/common/staticWorkspaceView/phoneChrome.generated";
 import { PHONE_CHROME_WIDTHS } from "../../src/common/staticWorkspaceView/phoneChrome";
 import { writeNeutralSeed } from "./neutralSeed";
-import { newServerToken, withServerToken } from "./serverToken";
+import { newServerToken, serverTokenEnv, withServerToken } from "./serverToken";
 
 const OUT = path.join(
   import.meta.dirname,
@@ -42,7 +42,7 @@ async function startServer(root: string, home: string, log: string) {
     HOME: home,
     XUM_ROOT: root,
     XUM_DISABLE_TELEMETRY: "1",
-    XUM_SERVER_AUTH_TOKEN: token,
+    ...serverTokenEnv(token),
   };
   const server = spawn("node", args, {
     cwd: path.join(import.meta.dirname, "../.."),
