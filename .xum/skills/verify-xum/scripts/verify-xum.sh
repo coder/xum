@@ -94,12 +94,49 @@ require_private_dir() {
   (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)"
 }
 
+# Every folder above a run home must be owned by root or this user and writable by nobody else,
+# unless it is sticky like /tmp (as ssh's StrictModes checks): another account could otherwise
+# rename the checked home away and put its own state.env in its place. Takes a physical path.
+require_safe_ancestors() {
+  local dir=$1 owner mode
+  while [[ $dir != / ]]; do
+    dir=$(dirname "$dir")
+    owner=$(stat -c %u "$dir")
+    mode=$(stat -c %a "$dir")
+    [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above the run home, is owned by user $owner"
+    (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
+      || die "$dir, above the run home, is writable by group or others and not sticky (mode $mode)"
+  done
+}
+
+# A path without its trailing slashes: `-L dir/` follows the link, so `link//` would pass as a
+# real folder.
+without_trailing_slashes() {
+  local path=$1
+  while [[ $path == ?*/ ]]; do path=${path%/}; done
+  echo "$path"
+}
+
+# The physical path of a run home, after checking it and every folder above it. Later reads use
+# that path, so no symlink above the home is followed again.
+checked_home() {
+  local home
+  home=$(without_trailing_slashes "$1")
+  [[ -d $home && ! -L $home ]] || die "$home is not a real folder"
+  home=$(cd -P -- "$home" && pwd -P)
+  require_private_dir "$home"
+  require_safe_ancestors "$home"
+  echo "$home"
+}
+
 # The run folder of a run argument, or behind the newest-run link (the one symlink allowed),
 # checked before its state.env is read.
 private_run_dir() {
-  local run=${1%/}
+  local run home
+  run=$(without_trailing_slashes "$1")
   [[ $run == "$CURRENT_RUN_LINK" ]] && run=$(readlink "$run")
-  require_private_dir "$(dirname "$run")"
+  home=$(checked_home "$(dirname "$run")") || exit 1
+  run="$home/$(basename "$run")"
   require_private_dir "$run"
   echo "$run"
 }
@@ -277,6 +314,14 @@ cmd_launch() {
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
   refuse_while_checkout_server_runs
 
+  if [[ ! -e $VERIFY_XUM_HOME ]]; then
+    # Parents this creates are private too, whatever the caller's umask.
+    (umask 077 && mkdir -p "$(dirname "$VERIFY_XUM_HOME")")
+    # Check the folders above before the home is made in them (the home itself does not exist yet).
+    require_safe_ancestors "$(cd -P -- "$(dirname "$VERIFY_XUM_HOME")" && pwd -P)/home"
+    mkdir -m 700 "$VERIFY_XUM_HOME"
+  fi
+  VERIFY_XUM_HOME=$(checked_home "$VERIFY_XUM_HOME") || exit 1
   VERIFY_XUM_RUN_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
   VERIFY_XUM_RUN="$VERIFY_XUM_HOME/$VERIFY_XUM_RUN_ID"
   VERIFY_XUM_EVIDENCE="$VERIFY_XUM_RUN/evidence"
@@ -284,12 +329,6 @@ cmd_launch() {
   VERIFY_XUM_CHECKOUT=$CHECKOUT
   VERIFY_XUM_COMMIT=$(git -C "$CHECKOUT" rev-parse HEAD)
   AGENT_BROWSER_SESSION="verify-xum-$VERIFY_XUM_RUN_ID"
-  if [[ ! -e $VERIFY_XUM_HOME ]]; then
-    # Parents this creates are private too, whatever the caller's umask.
-    (umask 077 && mkdir -p "$(dirname "$VERIFY_XUM_HOME")")
-    mkdir -m 700 "$VERIFY_XUM_HOME"
-  fi
-  require_private_dir "$VERIFY_XUM_HOME"
   mkdir -m 700 "$VERIFY_XUM_RUN"
   mkdir -p "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/scratch"
   log="$VERIFY_XUM_RUN/server.log"
