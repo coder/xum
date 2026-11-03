@@ -61,24 +61,27 @@ describe("make dev-server auth", () => {
   let chosen: DryRun;
   let dollar: DryRun;
   let envOverrides: DryRun;
+  let poisonedFlag: DryRun;
   let open: DryRun;
   let otherGoal: DryRun;
 
   beforeAll(async () => {
-    [first, second, ambient, chosen, dollar, envOverrides, open, otherGoal] = await Promise.all([
-      dryRun("dev-server"),
-      dryRun("dev-server"),
-      dryRun("dev-server", {
-        XUM_SERVER_AUTH_TOKEN: "host-server-token",
-        MUX_SERVER_AUTH_TOKEN: "legacy-host-server-token",
-      }),
-      dryRun("dev-server", { XUM_DEV_SERVER_AUTH_TOKEN: "chosen-dev-token" }),
-      dryRun("dev-server", { XUM_DEV_SERVER_AUTH_TOKEN: "pa$$word$(x)$" }),
-      // `make -e` lets the environment override makefile assignments.
-      dryRun("dev-server", { XUM_SERVER_AUTH_TOKEN: "host-server-token" }, ["-e"]),
-      dryRun("dev-server", { XUM_DEV_SERVER_NO_AUTH: "1" }),
-      dryRun("help"),
-    ]);
+    [first, second, ambient, chosen, dollar, envOverrides, poisonedFlag, open, otherGoal] =
+      await Promise.all([
+        dryRun("dev-server"),
+        dryRun("dev-server"),
+        dryRun("dev-server", {
+          XUM_SERVER_AUTH_TOKEN: "host-server-token",
+          MUX_SERVER_AUTH_TOKEN: "legacy-host-server-token",
+        }),
+        dryRun("dev-server", { XUM_DEV_SERVER_AUTH_TOKEN: "chosen-dev-token" }),
+        dryRun("dev-server", { XUM_DEV_SERVER_AUTH_TOKEN: "pa$$word$(x)$" }),
+        // `make -e` lets the environment override makefile assignments.
+        dryRun("dev-server", { XUM_SERVER_AUTH_TOKEN: "host-server-token" }, ["-e"]),
+        dryRun("dev-server", { DEV_SERVER_AUTH_FLAG: "--no-auth" }, ["-e"]),
+        dryRun("dev-server", { XUM_DEV_SERVER_NO_AUTH: "1" }),
+        dryRun("help"),
+      ]);
   }, 60_000);
 
   test("starts the backend with auth on and a fresh random token per run", () => {
@@ -108,6 +111,10 @@ describe("make dev-server auth", () => {
 
   test("make -e does not let the ambient server token override the generated one", () => {
     expect(envOverrides.token).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("make -e does not let an inherited flag switch auth off", () => {
+    expect(backendCommand(poisonedFlag)).not.toContain("--no-auth");
   });
 
   test("XUM_DEV_SERVER_NO_AUTH=1 is the only way to an open backend", () => {
