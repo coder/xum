@@ -28,6 +28,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { HistoryControlRow } from "@/node/services/historyScanner";
+import { findLastRetryUserMessage } from "@/node/services/retryUserMessage";
 import type { SendIdentity } from "@/node/services/sendIds";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -75,6 +76,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   isContextBudgetWarningMessage,
   isSameWorkspaceTurnTaskCorrelation,
   parseWorkspaceTurnTaskCorrelation,
@@ -631,6 +633,24 @@ function isSelfHealEligibleSettledWorkspaceTurn(
 }
 
 /**
+ * The interrupt's answer when a handle has nothing left to stop: an error for a finished turn,
+ * and an idempotent no-op for an explicit Stop or a supersede. Proceeding would stopStream the
+ * target workspace's *current* stream, e.g. the manual message or /compact that superseded the
+ * delegated turn. A restart-recovery interrupt gets no answer here (isSupersededRestartInterrupt).
+ */
+function settledInterruptResult(
+  record: WorkspaceTurnTaskHandleRecord
+): Result<{ workspaceId: string }, string> | undefined {
+  if (record.status === "completed" || record.status === "error") {
+    return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
+  }
+  if (record.status === "interrupted" && record.error !== WORKSPACE_TURN_STALE_RESTART_ERROR) {
+    return Ok({ workspaceId: record.workspaceId });
+  }
+  return undefined;
+}
+
+/**
  * A workspace-turn stream error may resolve without parent intervention when
  * the child can still make progress on its own. The caller must still confirm
  * a retry/continuation is actually in flight
@@ -1099,6 +1119,52 @@ export class WorkspaceTurnManager {
       record.turnId === correlation.turnId &&
       record.status === "interrupted" &&
       record.error == null
+    );
+  }
+
+  /**
+   * A restart-recovery interrupt is not a Stop: auto-retry and startup recovery resume that turn
+   * while it owns the row they replay. Once another row is the one they replay, such as a newer
+   * user message, the interrupt has nothing of the turn's to stop.
+   */
+  private async isSupersededRestartInterrupt(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<boolean> {
+    return record.status === "interrupted" && !(await this.ownsRetryRow(record));
+  }
+
+  /**
+   * The interrupt's stop latch, or undefined when a restart-recovery interrupt finds its turn
+   * superseded. The first read runs before the latch: a superseding turn must never see a stop
+   * in progress (stoppedSince, goal advancement) for a no-op. The second read runs under the
+   * latch: a send writes its row before its final admission, which the latch refuses, so that
+   * read sees every send that can still start a stream, and a later send is refused, never
+   * aborted.
+   */
+  private async latchUnlessSuperseded(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<(() => void) | undefined> {
+    if (await this.isSupersededRestartInterrupt(record)) return undefined;
+    const release = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
+    if (!(await this.isSupersededRestartInterrupt(record))) return release;
+    release();
+    return undefined;
+  }
+
+  /**
+   * Whether a resume of the row that auto-retry and startup recovery replay continues this turn.
+   * A compaction request (mid-stream, or a send compacted first) resumes into its follow-up. That
+   * follow-up carries the turn's correlation in `workspaceTurnMetadata` when another trigger (a
+   * wake) owns its `muxMetadata`. Unreadable history: the Stop wins.
+   */
+  private async ownsRetryRow(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(record.workspaceId);
+    if (!history.success) return true;
+    const muxMetadata = findLastRetryUserMessage(history.data)?.metadata?.muxMetadata;
+    const followUp = getCompactionFollowUpContent(muxMetadata);
+    return this.matchesWorkspaceTurnRecord(
+      record,
+      followUp == null ? muxMetadata : (followUp.workspaceTurnMetadata ?? followUp.muxMetadata)
     );
   }
 
@@ -3704,6 +3770,25 @@ export class WorkspaceTurnManager {
     return next;
   }
 
+  /**
+   * Retire a settled outcome that `next` replaces (a revive, or a Stop of a turn that restart
+   * recovery settled): its error, its delivery markers and its stored notifications. Its next
+   * terminal transition is a new outcome, and no drain delivers the old one. The notification
+   * tombstone must go too: enqueueIfAbsent would otherwise treat the stale settlement's delivered
+   * wake-up as "already notified" and swallow the new one.
+   */
+  private async retireSettledOutcome(
+    settled: WorkspaceTurnTaskHandleRecord,
+    next: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    delete next.error;
+    delete next.directParentResultDeliveryRequiredAt;
+    delete next.directParentResultDeliveredAt;
+    delete next.terminalAttentionNotifiedAt;
+    await this.deleteWorkspaceTurnTerminalAttention(settled);
+    await this.deletePersistentChildWorkspaceTurnAttention(settled);
+  }
+
   private async reviveRetryingWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord,
     options: { deferredMessageIds?: string[] } = {}
@@ -3758,15 +3843,7 @@ export class WorkspaceTurnManager {
           return current;
         }
       }
-      delete next.error;
-      // The revived turn's next terminal transition is a new outcome; re-arm its wake-up.
-      // The notification tombstone must go too: enqueueIfAbsent would otherwise treat the
-      // stale settlement's delivered wake-up as "already notified" and swallow the new one.
-      delete next.directParentResultDeliveryRequiredAt;
-      delete next.directParentResultDeliveredAt;
-      delete next.terminalAttentionNotifiedAt;
-      await this.deleteWorkspaceTurnTerminalAttention(record);
-      await this.deletePersistentChildWorkspaceTurnAttention(current);
+      await this.retireSettledOutcome(current, next);
       await this.taskHandleStore.upsertWorkspaceTurn(next);
       // Re-register so stream-end/abort/error settlement paths own the handle again. The
       // revived turn is a retry of an already-admitted turn, so the registration is accepted.
@@ -3868,16 +3945,18 @@ export class WorkspaceTurnManager {
             if (record == null) {
               return Err("Workspace turn not found or out of scope");
             }
-            if (record.status === "completed" || record.status === "error") {
-              return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
-            }
-            // Already-settled interrupts (explicit stop, restart recovery, queue-cut
-            // supersede) have nothing left to stop: proceeding would stopStream the
-            // target workspace's *current* stream — e.g. the manual message or
-            // /compact that superseded the delegated turn. Idempotent no-op instead.
-            if (record.status === "interrupted") {
-              return Ok({ workspaceId: record.workspaceId });
-            }
+            const settled = settledInterruptResult(record);
+            if (settled != null) return settled;
+
+            // F4: latch before the write, inside the lock, so an owner send at its final
+            // admission gate is refused until the record reads `interrupted` and stale after;
+            // latching after the lock's release let it be accepted as a continuation of the
+            // interrupted turn. The level latch stays held through stopStream (the method-level
+            // finally releases it): ROOT targets have no task status to refuse on, so a send
+            // admitted during the wind-down would queue behind the dying stream and auto-dispatch
+            // when it ends, defeating the stop.
+            releaseStopLatch = await this.latchUnlessSuperseded(record);
+            if (releaseStopLatch == null) return Ok({ workspaceId: record.workspaceId });
 
             workspaceId = record.workspaceId;
             shouldClearQueuedPrompt =
@@ -3890,18 +3969,13 @@ export class WorkspaceTurnManager {
               status: "interrupted",
               updatedAt: getIsoNow(),
             };
+            // An explicit Stop's record carries no error (isWorkspaceTurnStopped), and the restart
+            // recovery outcome it replaces must not wake the owner.
+            if (record.status === "interrupted") await this.retireSettledOutcome(record, next);
             await lock.assertStillOwned();
             await this.taskHandleStore.upsertWorkspaceTurn(next);
-            // F4: latch with no await between the write completing and the latch, inside the
-            // lock (both calls are synchronous), so an owner send at its final admission gate is
-            // already stale once the record reads `interrupted`; latching after the lock's
-            // release let it be accepted as a continuation of the interrupted turn. The level
-            // latch covers sends ENTERING after the bump, and stays held through stopStream (the
-            // method-level finally releases it): ROOT targets have no task status to refuse on,
-            // so a send admitted during the wind-down would queue behind the dying stream and
-            // auto-dispatch when it ends, defeating the stop.
+            // A turn admitted before the latch fails its start fence after this bump.
             this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
-            releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
             return Ok({ workspaceId: record.workspaceId, next });
           }
         );
