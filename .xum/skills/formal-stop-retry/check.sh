@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Model-check StopRetry.tla with TLC: one run per config, each compared with EXPECT below.
+# Model-check StopRetry.tla with TLC: one run per config, each compared with expected_for below.
 #
-# Usage: .xum/skills/formal-stop-retry/check.sh [config...]   (default: every config in EXPECT)
-# Env:   FORMAL_OUT       folder for the TLC logs (default: a new temp folder)
+# Usage: .xum/skills/formal-stop-retry/check.sh [config...]   (default: every config in ORDER)
+# Env:   FORMAL_OUT       folder for the TLC logs (default: a new temp folder, kept so the
+#                         counterexample traces stay readable after the run)
 #        TLA2TOOLS_CACHE  folder for the pinned tla2tools.jar (default: <repo>/build/tla, git-ignored)
-# Exit:  0 when every result matches EXPECT, 1 otherwise, 2 when Java or the jar is unavailable.
+# Exit:  0 when every result matches expected_for, 1 on a mismatch or an unknown config,
+#        2 when Java or the jar is unavailable.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -18,13 +20,15 @@ TLA_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 
 # Expected verdict per config: "holds", or the invariant that must be violated.
-declare -A EXPECT=(
-  [reachability]=NoRetryEverResumes
-  [ui]=holds
-  [api]=holds
-  [task]=holds
-)
+# A case, not an associative array: macOS ships Bash 3.2, which has none.
 ORDER=(reachability ui api task)
+expected_for() {
+  case $1 in
+    reachability) echo NoRetryEverResumes ;;
+    ui | api | task) echo holds ;;
+    *) echo "" ;;
+  esac
+}
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -68,7 +72,7 @@ echo "TLC logs in $out"
 printf '%-13s %-20s %-20s %9s %9s %6s\n' config result expected distinct generated secs
 matched=0
 for name in "${configs[@]}"; do
-  expected=${EXPECT[$name]-}
+  expected=$(expected_for "$name")
   if [[ -z $expected || ! -f $here/$name.cfg ]]; then
     echo "formal-stop-retry: unknown config '$name' (known: ${ORDER[*]})" >&2
     exit 1

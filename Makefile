@@ -612,7 +612,7 @@ test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate
 	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
 	@bun test ./scripts/mutate/check.test.ts
 
-formal-check: ## Model-check the TLA+ models of the formal-verification skills (Java 11+; see .xum/skills/formal-stop-retry)
+formal-check: ## Model-check that a Stop ends the auto-retry loop (TLA+/TLC, Java 11+; see .xum/skills/formal-stop-retry)
 	@./.xum/skills/formal-stop-retry/check.sh
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)

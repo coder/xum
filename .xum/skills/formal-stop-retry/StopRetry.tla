@@ -86,6 +86,10 @@ Schedule == BumpGen /\ fiber' = "sleeping" /\ fGen' = gen + 1
 CancelRetry == BumpGen /\ fiber' = "none" /\ UNCHANGED fGen
 
 \* handleStreamFailureForAutoRetry's checks before retryManager.handleStreamFailure.
+\* The code reads the cancellation record (compactionRecoveryBlocked) one await before
+\* the other checks, and the model reads it at the last check. The outcome is the same:
+\* a Stop that sets cancelDebt between the two reads also bumps gen in the same step, so
+\* the code's capturedGen = gen check refuses too.
 MayArm(capturedGen) == ~cancelDebt /\ latch = 0 /\ capturedGen = gen /\ enabled
 
 -----------------------------------------------------------------------------
