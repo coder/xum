@@ -31,6 +31,8 @@ interface CommandPaletteProps {
   getSlashContext?: () => { workspaceId?: string };
   /** Focus to restore on close, captured before the first open's loading input took focus. */
   openOrigin?: HTMLElement | null;
+  /** Enter was pressed in the first open's loading input. Read once, at mount. */
+  enterPressedWhileLoading?: boolean;
 }
 
 type PromptDef = NonNullable<NonNullable<CommandAction["prompt"]>>;
@@ -94,7 +96,31 @@ function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
   );
 }
 
-export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext, openOrigin }) => {
+/**
+ * #6997: the first open shows a plain input until this chunk arrives, and a quick paste + Enter
+ * lands there. On mount, run that Enter as Enter runs in the palette: on the first option, which
+ * cmdk selects. An effect, because only this chunk knows the options. The ref keeps it to the
+ * open that pressed it.
+ */
+function useEnterPressedWhileLoading(
+  enterPressed: boolean | undefined,
+  groupsWithItems: PaletteGroup[],
+  selectItem: (item: PaletteItem) => void
+) {
+  const enterPendingRef = useRef(enterPressed);
+  useEffect(() => {
+    if (!enterPendingRef.current) return;
+    enterPendingRef.current = false;
+    const firstItem = groupsWithItems[0]?.items[0];
+    if (firstItem) selectItem(firstItem);
+  });
+}
+
+export const CommandPalette: React.FC<CommandPaletteProps> = ({
+  getSlashContext,
+  openOrigin,
+  enterPressedWhileLoading,
+}) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
@@ -112,7 +138,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext,
       ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
       : null
   );
-  const [query, setQuery] = useState("");
+  // Starts at the open's query, so the mount below selects from the same options it renders.
+  const [query, setQuery] = useState(initialQuery);
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;
     fields: PromptDef["fields"];
@@ -521,6 +548,30 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext,
     }
   }
 
+  const groupsWithItems = groups.filter((group) => group.items.length > 0);
+
+  // What Enter (or a click) on an item runs.
+  const selectItem = (item: PaletteItem) => {
+    if ("prompt" in item && item.prompt) {
+      addRecent(item.id);
+      startPrompt(item);
+      return;
+    }
+
+    if (currentField) {
+      void item.run();
+      return;
+    }
+
+    addRecent(item.id);
+    close();
+    setTimeout(() => {
+      void item.run();
+    }, 0);
+  };
+
+  useEnterPressedWhileLoading(enterPressedWhileLoading, groupsWithItems, selectItem);
+
   // Capture during render before Command.Input autoFocus moves focus into the palette.
   if (isOpen && !paletteOpenOriginRef.current) {
     paletteOpenOriginRef.current =
@@ -529,7 +580,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext,
 
   if (!isOpen) return null;
 
-  const groupsWithItems = groups.filter((group) => group.items.length > 0);
   const hasAnyItems = groupsWithItems.length > 0;
 
   return (
@@ -601,24 +651,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext,
                     keywords={itemKeywords}
                     aria-label={item.title}
                     className="hover:bg-hover aria-selected:bg-hover mx-1 my-0.5 grid cursor-pointer grid-cols-[1fr_auto] items-center gap-2 rounded-md px-3 py-2 text-[13px] aria-selected:text-[var(--color-command-foreground)]"
-                    onSelect={() => {
-                      if ("prompt" in item && item.prompt) {
-                        addRecent(item.id);
-                        startPrompt(item);
-                        return;
-                      }
-
-                      if (currentField) {
-                        void item.run();
-                        return;
-                      }
-
-                      addRecent(item.id);
-                      close();
-                      setTimeout(() => {
-                        void item.run();
-                      }, 0);
-                    }}
+                    onSelect={() => selectItem(item)}
                   >
                     <div>
                       {item.title}
