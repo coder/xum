@@ -268,6 +268,8 @@ export class TaskStopLatch {
        */
       capturedExecutionsById?: ReadonlyMap<string, { ownerWorkspaceId: string; handleId: string }>;
       onTimeout?: (workspaceId: string) => void;
+      /** The reason the renderer shows for the abandoned retry (default "task_stopped"). */
+      retryAbandonReason?: "task_stopped" | "task_failed";
     }
   ): Promise<void> {
     const waits = targets.map(async (id) => {
@@ -275,7 +277,7 @@ export class TaskStopLatch {
       const record = this.workspaceStopRecords.get(id);
       const expectedMessageId = record?.capturedStreamMessageId;
       const cleanup = (async () => {
-        this.retirePendingWork(id, options.label, options.clearQueue);
+        this.retirePendingWork(id, options);
         const execution = options.capturedExecutionsById?.get(id);
         if (execution != null) {
           await this.interruptCapturedExecution(id, execution, options.label);
@@ -319,8 +321,16 @@ export class TaskStopLatch {
   }
 
   /** Phase B's synchronous part: the stopped workspace keeps no queued input or armed retry. */
-  private retirePendingWork(id: string, label: string, clearQueue: boolean): void {
-    if (clearQueue) {
+  private retirePendingWork(
+    id: string,
+    options: {
+      label: string;
+      clearQueue: boolean;
+      retryAbandonReason?: "task_stopped" | "task_failed";
+    }
+  ): void {
+    const { label } = options;
+    if (options.clearQueue) {
       // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
       // descendant must not keep pending input; issued once, never re-issued later. The
       // user's queued messages are handed back as held input, never silently dropped.
@@ -337,7 +347,9 @@ export class TaskStopLatch {
     }
     // A backoff left armed would restart the stopped task once the latch drops.
     try {
-      this.deps.workspaceService().abandonAutoRetry(id, "task_stopped");
+      this.deps
+        .workspaceService()
+        .abandonAutoRetry(id, options.retryAbandonReason ?? "task_stopped");
     } catch (error: unknown) {
       log.debug(`${label}: abandonAutoRetry threw`, { taskId: id, error });
     }

@@ -15951,6 +15951,8 @@ export class TaskService implements AgentTaskIntegration {
       } catch (error: unknown) {
         log.debug("failAgentTaskForHardTimeout: clearQueue threw", { taskId, error });
       }
+      // An idle task in its backoff gets no stop record below, so end its retry loop here.
+      this.workspaceService.abandonAutoRetry(taskId, "task_failed");
       try {
         await this.aiService.stopStream(taskId, {
           abandonPartial: true,
@@ -21647,6 +21649,7 @@ export class TaskService implements AgentTaskIntegration {
         label: "failAgentTaskTerminally",
         abandonPartial: false,
         clearQueue: true,
+        retryAbandonReason: "task_failed",
       });
     } else {
       this.workspaceService.clearQueue(workspaceId);

@@ -3932,6 +3932,9 @@ export class WorkspaceTurnManager {
         }
       }
       if (shouldStopStream && workspaceId != null) {
+        // A backoff left armed would restart the interrupted turn once the latch drops. A queued
+        // handle owns no turn, so the target's running turn keeps its retry.
+        this.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
         try {
           await this.aiService.stopStream(workspaceId, { abandonPartial: false });
         } catch (error: unknown) {

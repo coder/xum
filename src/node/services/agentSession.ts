@@ -523,6 +523,19 @@ function isRetriedGoalStillRunning(
   return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
 }
 
+/** The auto-retry failure for a terminal stream error. */
+function streamErrorRetryFailure(failureType: string, data: StreamErrorPayload): RetryFailureError {
+  return {
+    type: failureType,
+    message: data.error,
+    // Only for the final rate_limit class: the rollover/budget rewrites in handleStreamError
+    // spread `data` and can replace the error type while an older retryAfterMs survives.
+    ...(failureType === "rate_limit" && data.retryAfterMs != null
+      ? { retryAfterMs: data.retryAfterMs }
+      : {}),
+  };
+}
+
 /** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
   return (
@@ -1633,6 +1646,12 @@ export class AgentSession {
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
   /**
+   * Stops that ended this session's retry loop through abandonAutoRetry (a task Stop, a
+   * workspace-turn interrupt, a hard timeout). Unlike the workspace stop epoch, an interrupt of a
+   * queued workspace turn leaves it alone, so the turn that keeps running still retries.
+   */
+  private autoRetryStops = 0;
+  /**
    * turn.stop continuations queued since the last manual send or the last turn Stop did not
    * continue: the hooks see `stopHookActive`, and the ceiling ends the loop.
    */
@@ -1907,6 +1926,8 @@ export class AgentSession {
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
     /** The Stop epoch at this turn's admission: a Stop since then fences its turn.stop continuation. */
     admissionStopEpoch: number;
+    /** autoRetryStops when this turn's stream started: a Stop since then arms no retry for it. */
+    admissionAutoRetryStops: number;
   };
 
   private activeCompactionRequest?: {
@@ -2469,7 +2490,8 @@ export class AgentSession {
 
   private async handleStreamFailureForAutoRetry(
     error: RetryFailureError,
-    isCurrent = this.retryManager.captureGeneration()
+    isCurrent = this.retryManager.captureGeneration(),
+    autoRetryStops = this.autoRetryStops
   ): Promise<void> {
     assert(
       typeof error.type === "string" && error.type.length > 0,
@@ -2485,9 +2507,12 @@ export class AgentSession {
     const turn = this.coordinator.turnId;
     await this.loadAutoRetryEnabledPreference(isCurrent);
     if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
-    // A task Stop releases its latch once this turn settles, after its cleanup abandoned the
-    // retry, so a retry armed now would restart the stopped workspace.
-    if (this.isStopInProgress()) return;
+    // Every Stop abandons a pending retry, but a workspace-turn interrupt drops its latch without
+    // waiting for this handler, and a hard timeout of an idle task takes none: a retry armed now
+    // would restart the stopped workspace. A Stop since the failed turn's stream started
+    // (autoRetryStops) ends the retry loop. The stop latch is no signal here: an interrupt of a
+    // queued workspace turn latches too, and must leave the running turn's retry alone.
+    if (this.autoRetryStops !== autoRetryStops) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -2544,6 +2569,7 @@ export class AgentSession {
 
   /** End the auto-retry loop for a Stop that does not run interruptStream (a task Stop). */
   abandonAutoRetry(reason: string): void {
+    this.autoRetryStops += 1;
     this.retryManager.abandon(reason);
   }
 
@@ -7907,10 +7933,17 @@ export class AgentSession {
       const handledByNestedSend = sendResult.failureHandled === true;
 
       if (!handledByNestedSend) {
-        await this.handleStreamFailureForAutoRetry({
-          type: failureType,
-          message: this.extractRetryFailureMessage(sendResult.error),
-        });
+        // A workspace-turn interrupt or a hard timeout stops without cancelCompaction, so
+        // admissionStale stays false and the dispatch fails as a retryable refusal: only the
+        // interrupted stream's Stop count shows that the turn was stopped.
+        await this.handleStreamFailureForAutoRetry(
+          {
+            type: failureType,
+            message: this.extractRetryFailureMessage(sendResult.error),
+          },
+          undefined,
+          streamContext.admissionAutoRetryStops
+        );
         await this.updateStartupAutoRetryAbandonFromFailure(
           failureType,
           continuation.interruptedUserMessageId
@@ -8748,28 +8781,48 @@ export class AgentSession {
     const failureType = error.type;
 
     if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
-      const failedUserMessageId = this.activeStreamUserMessageId;
-      const failedContext = this.activeStreamContext;
-      this.activeCompactionRequest = undefined;
-      this.resetActiveStreamState();
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: this.extractRetryFailureMessage(error),
-      });
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
-      if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
-        return { success: false, error, failureHandled: true };
-      // This failure has no stream error event, so handleStreamError's goal settlement never runs:
-      // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
-      // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
-      await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
+      await this.settleRuntimeFailureWithoutErrorEvent(turn, operation, failureType, error);
     } else {
       await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }), operation);
     }
 
     return { success: false, error, failureHandled: true };
+  }
+
+  /**
+   * A runtime failure without a pre-start error event, such as an emergency rollover's request
+   * preparation reports: no handleStreamError runs for it, so its retry decision, startup
+   * abandon marker and goal settlement happen here.
+   */
+  private async settleRuntimeFailureWithoutErrorEvent(
+    turn: TurnId,
+    operation: OperationId,
+    failureType: "runtime_not_ready" | "runtime_start_failed",
+    error: SendMessageError
+  ): Promise<void> {
+    const failedUserMessageId = this.activeStreamUserMessageId;
+    const failedContext = this.activeStreamContext;
+    this.activeCompactionRequest = undefined;
+    this.resetActiveStreamState();
+    // The failure comes after the turn's stream started (a remote runtime reports a Stop-aborted
+    // start as runtime_start_failed): a Stop since then arms no retry.
+    await this.handleStreamFailureForAutoRetry(
+      {
+        type: failureType,
+        message: this.extractRetryFailureMessage(error),
+      },
+      undefined,
+      failedContext?.admissionAutoRetryStops
+    );
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
+      return;
+    // This failure has no stream error event, so handleStreamError's goal settlement never runs:
+    // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
+    // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
+    await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
   }
 
   private async streamWithHistory(
@@ -8873,6 +8926,7 @@ export class AgentSession {
         ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
         admissionStopEpoch,
+        admissionAutoRetryStops: this.autoRetryStops,
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
@@ -10093,15 +10147,11 @@ export class AgentSession {
     }
 
     try {
-      await this.handleStreamFailureForAutoRetry({
-        type: failureType,
-        message: data.error,
-        // Only for the final rate_limit class: the rollover/budget rewrites above spread `data`
-        // and can replace the error type while an older retryAfterMs survives the spread.
-        ...(failureType === "rate_limit" && data.retryAfterMs != null
-          ? { retryAfterMs: data.retryAfterMs }
-          : {}),
-      });
+      await this.handleStreamFailureForAutoRetry(
+        streamErrorRetryFailure(failureType, data),
+        undefined,
+        context?.admissionAutoRetryStops
+      );
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.
       // Startup callers keep the rejection so their recovery checkpoint remains retryable.

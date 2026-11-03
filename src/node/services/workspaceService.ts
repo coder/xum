@@ -20646,7 +20646,12 @@ export class WorkspaceService
   }
 
   abandonAutoRetry(workspaceId: string, reason: string): void {
-    this.sessions.get(workspaceId)?.abandonAutoRetry(reason);
+    // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    try {
+      this.sessions.get(workspaceId)?.abandonAutoRetry(reason);
+    } catch (error: unknown) {
+      log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
+    }
   }
 
   async getGoalContinuationKickoffSendOptions(
