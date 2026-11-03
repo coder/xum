@@ -35,6 +35,7 @@ Preconditions:
 - **Check history.** Save the last four rows of the workspace history:
 
   ```bash
+  mkdir -p "$VERIFY_XUM_EVIDENCE/chat"
   tail -n 4 "$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/chat.jsonl" >"$VERIFY_XUM_EVIDENCE/chat/history.txt"
   ```
 

@@ -45,7 +45,8 @@ feature file with the `verify-xum` harness. Update the file in the same change a
   name below.
 - Capture the state after each action that the recipe marks as proof, not only the last screen.
 - Check the side effect the recipe names (`chat.jsonl`, `config.json`, git state, or the CLI)
-  and save its output next to the captures, as `$VERIFY_XUM_EVIDENCE/<feature>/<step>.txt`.
+  and save its output next to the captures, as `$VERIFY_XUM_EVIDENCE/<feature>/<step>.txt`. Run
+  `mkdir -p "$VERIFY_XUM_EVIDENCE/<feature>"` first: only `capture` creates that folder.
 - Report an entry point you could not drive with the command you ran and the unmet precondition.
 
 ## Feature entry contract

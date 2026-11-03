@@ -76,6 +76,7 @@ Preconditions:
 - **CLI view.** List the workspaces through the CLI:
 
   ```bash
+  mkdir -p "$VERIFY_XUM_EVIDENCE/workspaces"
   env -u XUM_SERVER_URL -u XUM_SERVER_AUTH_TOKEN XUM_ROOT="$VERIFY_XUM_ROOT" \
     node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list >"$VERIFY_XUM_EVIDENCE/workspaces/cli-list.txt"
   ```
@@ -91,10 +92,12 @@ Preconditions:
   waits for it.
 - With `Workspace name` empty, Xum names the workspace with random words (`curvy-mangos-pull`).
   Fill the name so rows and branches have known names.
-- In agent-browser's Chromium, `document.hasFocus()` is false, so a reply that finishes while you
-  watch does not mark the workspace read. When you leave it, its row shows an unread status dot,
-  and that dot takes the archive icon's place. Open the workspace once more, as the recipe does,
-  before you archive it from its row.
+- Xum marks a reply read only while `document.hasFocus()` is true (`src/browser/App.tsx:1386`).
+  An earlier run saw it false in agent-browser's Chromium: a reply that finished while the
+  workspace was open left an unread status dot on its row, and the dot took the archive icon's
+  place. On agent-browser 0.33.2 (2026-11-03) `agent-browser eval 'document.hasFocus()'` printed
+  `true`, and a workspace watched until its reply kept its archive icon. If it prints `false`,
+  open the workspace once more before you archive it from its row, as the recipe does.
 - A click on the archive icon selects the row instead in agent-browser's Chromium. The icon takes
   clicks only on row hover, and that browser matches `(hover: none)`, so Tailwind's `group-hover`
   never applies (see SKILL.md Gotchas). Focus the icon, as above.

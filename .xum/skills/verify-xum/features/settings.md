@@ -6,13 +6,14 @@ the server's `config.json`.
 
 ## Sub-features
 
-- `settings-open` opens the dialog from the sidebar button, the palette, and its route.
+- `settings-open` opens the dialog from the sidebar button, its shortcut, the palette, and its route.
 - `settings-toggle` changes the `Flat chat list` switch and shows its effect on the sidebar.
 - `settings-persist` keeps the change across a reload and in `config.json`.
 
 ## How to get to it (user POV)
 
 - Choose `Open settings` (the gear in the sidebar header).
+- Press Ctrl+, (`OPEN_SETTINGS`).
 - Press F4, type `Open Settings`, and press Enter.
 - Open `$VERIFY_XUM_URL/settings/general`.
 
@@ -30,6 +31,9 @@ Preconditions:
   `Models`. Run `agent-browser press Escape` and
   `agent-browser wait --fn '!document.querySelector("[data-modal-dialog-overlay][data-state=open], [role=dialog][aria-modal=true]")'`.
   The URL is back on the workspace.
+- **Open with the keyboard.** Run `agent-browser press Control+,` and
+  `agent-browser wait --text "Choose your preferred theme"`. The URL is `/settings/general`. Close
+  it with Escape and the same wait as above.
 - **Open from the palette.** Run `agent-browser press F4`,
   `agent-browser wait '[aria-label="Command palette"]'`,
   `agent-browser keyboard type "Open Settings"`,

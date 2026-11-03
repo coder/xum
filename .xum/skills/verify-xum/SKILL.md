@@ -19,12 +19,16 @@ Surfaces:
 - Electron: the same renderer in the desktop shell. This skill does not launch or prove it. See
   the [dev-desktop-sandbox](../dev-desktop-sandbox/SKILL.md) and [electron](../electron/SKILL.md)
   skills.
-- CLI: `xum api` against the sandbox (see Drive). Headless `xum run` needs no server. Give it
-  its own two roots under the run's scratch folder, which cleanup deletes:
+- CLI: `xum api` against the sandbox (see Drive). Headless `xum run` needs no server. Run it
+  under `env -i` with its own two roots under the run's scratch folder, which cleanup deletes. It
+  refuses to start without a provider key, so pass a fake one: the mock answers, and your real
+  keys stay out.
 
   ```bash
-  XUM_ROOT="$VERIFY_XUM_RUN/scratch/cli-root" \
-    XUM_RUN_SESSION_ROOT="$VERIFY_XUM_RUN/scratch/cli-sessions" XUM_MOCK_AI=1 \
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1 \
+    ANTHROPIC_API_KEY=sk-ant-verify-xum-fake \
+    XUM_ROOT="$VERIFY_XUM_RUN/scratch/cli-root" \
+    XUM_RUN_SESSION_ROOT="$VERIFY_XUM_RUN/scratch/cli-sessions" \
     bun src/cli/index.ts run --dir "$VERIFY_XUM_PROJECT" --json "[mock:list-languages] hi"
   ```
 
@@ -33,7 +37,8 @@ Surfaces:
 
 ## Launch
 
-Bun on PATH must be the version in `package.json` `packageManager`. Launch refuses another Bun.
+The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Bun on PATH must be
+the version in `package.json` `packageManager`. Launch refuses another Bun.
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh launch
@@ -64,7 +69,7 @@ Run it first whenever anything looks off. It changes nothing.
 .xum/skills/verify-xum/scripts/verify-xum.sh doctor
 ```
 
-Every line must read `ok`. It checks that the process group lives and carries the run's id
+Every check line must read `ok`. A `note` line only informs. It checks that the process group lives and carries the run's id
 (`VERIFY_XUM_SERVER_OF` in its env), the checkout lock names it, the backend pid in the sandbox
 `server.lock` and the app port belong to the group, `/health` answers, `/version` reports the
 launch commit, and the backend env has `XUM_MOCK_AI=1`. Exit 1 means do not drive this instance:
@@ -132,6 +137,11 @@ Proof standards:
 
 - Drive the path a user takes. No test-only routes, no state written behind the UI's back except
   the seed, and edits to the worktree that stand in for the user's own editor.
+- Mock only at a production boundary. The mock AI stands in for the model provider. Do not stub
+  Xum's own code, routes or stores to make a step pass.
+- Name what the mock skips. It never calls a provider, and its tool calls are canned and leave
+  the worktree alone. A mock run does not prove a change to provider requests or tool execution:
+  report that part as not verified, or prove it at that boundary.
 - Capture the action and the resulting state, not only the final screen.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
@@ -147,8 +157,10 @@ Proof standards:
 
 Cleanup closes this run's browser session, stops the process group that launch started (SIGTERM,
 then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and prints the evidence
-path and file count. It signals the group only while one of its processes carries the run's id,
-so it kills nothing it did not start. Run it after every run, failed ones too. `doctor`, `env`,
+path and file count. It refuses a run that another checkout launched. It signals the group only
+while one of its processes carries the run's id and a live group leader is still the launch's
+`make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
+the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`,
 `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
 the newest launch from this checkout.
 

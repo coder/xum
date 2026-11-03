@@ -34,15 +34,22 @@ need() {
 }
 
 group_alive() {
-  kill -0 -- "-$1" 2>/dev/null
+  [[ -n $1 ]] && kill -0 -- "-$1" 2>/dev/null
 }
 
 # A process group belongs to this run only while one of its processes has
 # VERIFY_XUM_SERVER_OF=<run id> in its env, so a group id reused after the run died is left alone.
 # state.env never exports that name, so processes an agent starts after `eval "$(verify-xum.sh env)"`
-# do not carry it.
+# do not carry it. A live leader must also still be the `make dev-server-sandbox` that launch
+# started. Linux reuses no pid while it names a process group, so a group whose leader exited
+# keeps its id and stays ours.
 group_is_ours() {
-  local pid
+  local pid leader_cmdline
+  [[ -n $1 ]] || return 1
+  if [[ -e /proc/$1 ]]; then
+    leader_cmdline=$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline" || true)
+    [[ $leader_cmdline == *dev-server-sandbox* ]] || return 1
+  fi
   for pid in $(ps -o pid= -g "$1" 2>/dev/null); do
     grep -qszx "VERIFY_XUM_SERVER_OF=$2" "/proc/$pid/environ" && return 0
   done
@@ -66,6 +73,8 @@ load_run() {
   [[ -f $run/state.env ]] || die "no run at $run (run: verify-xum.sh launch)"
   # shellcheck source=/dev/null
   source "$run/state.env"
+  [[ $VERIFY_XUM_CHECKOUT == "$CHECKOUT" ]] \
+    || die "run $run belongs to the checkout $VERIFY_XUM_CHECKOUT. Use that checkout's verify-xum.sh."
 }
 
 LAUNCH_DEADLINE=
@@ -264,9 +273,7 @@ cmd_doctor() {
   check "server.lock names $VERIFY_XUM_BACKEND" \
     test "$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" baseUrl)" = "$VERIFY_XUM_BACKEND"
   check "GET $VERIFY_XUM_BACKEND/health answers" curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
-  rm -f "$VERIFY_XUM_RUN/scratch/version.json"
-  curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" -o "$VERIFY_XUM_RUN/scratch/version.json" || true
-  version=$(json_field_or_empty "$VERIFY_XUM_RUN/scratch/version.json" git_commit)
+  version=$(curl -fs --max-time 5 "$VERIFY_XUM_BACKEND/version" 2>/dev/null | json_field_or_empty /dev/stdin git_commit || true)
   check "backend build ${version:-unknown} is the launch commit $VERIFY_XUM_COMMIT" \
     test -n "$version" -a "${VERIFY_XUM_COMMIT#"$version"}" != "$VERIFY_XUM_COMMIT"
   if [[ $(git -C "$VERIFY_XUM_CHECKOUT" rev-parse HEAD) != "$VERIFY_XUM_COMMIT" ]]; then
@@ -344,7 +351,7 @@ cmd_cleanup() {
       kill -KILL -- "-$VERIFY_XUM_PGID" 2>/dev/null || true
     fi
   elif group_alive "$VERIFY_XUM_PGID"; then
-    echo "verify-xum: process group $VERIFY_XUM_PGID no longer carries this run's id. Not signaling it." >&2
+    echo "verify-xum: process group $VERIFY_XUM_PGID is not this run's dev server. Not signaling it." >&2
   fi
   if is_dev_server_sandbox_root "$VERIFY_XUM_ROOT"; then
     rm -rf "$VERIFY_XUM_ROOT"
@@ -352,6 +359,8 @@ cmd_cleanup() {
   rm -rf "$VERIFY_XUM_RUN/scratch"
   [[ $(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null) == "$VERIFY_XUM_PGID" ]] && rm -f "$ONE_SERVER_PER_CHECKOUT_LOCK"
   [[ $(readlink "$CURRENT_RUN_LINK" 2>/dev/null) == "$VERIFY_XUM_RUN" ]] && rm -f "$CURRENT_RUN_LINK"
+  VERIFY_XUM_PGID=
+  write_state
   echo "cleaned up run $VERIFY_XUM_RUN_ID; evidence kept in $VERIFY_XUM_EVIDENCE ($(find "$VERIFY_XUM_EVIDENCE" -type f | wc -l | tr -d ' ') files) and $VERIFY_XUM_RUN/server.log"
 }
 

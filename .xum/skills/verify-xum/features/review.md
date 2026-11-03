@@ -21,7 +21,9 @@ label counts read hunks against all hunks.
 Preconditions:
 
 - Baseline state. The worktree `$VERIFY_XUM_WORKTREE` has no changes.
-- The app is open on `Verify playground`, and the right sidebar is collapsed.
+- The app is open on `Verify playground`, the right sidebar is collapsed with no tab open, and
+  `Uncommitted:` is unchecked (`userPreferences.review.includeUncommitted` is not `true` in
+  `config.json`). The recipe's Restore step leaves this state.
 
 - **Edit a file.** Change the worktree the way an editor would:
 
@@ -50,7 +52,14 @@ Preconditions:
 - **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
   button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
   button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
-- **Restore.** Run `git -C "$VERIFY_XUM_WORKTREE" checkout -- src/math.ts`.
+- **Restore.** Run `agent-browser find role button click --name "Mark as read (M)" --exact`. The
+  tab reads `Review 0/1`, and `review-state.json` has no `"isRead": true`. Run
+  `agent-browser find role checkbox click --name "Uncommitted:" --exact`. The box is
+  `checked=false`, and `config.json` has `"includeUncommitted": false` under
+  `userPreferences.review`. Run `git -C "$VERIFY_XUM_WORKTREE" checkout -- src/math.ts`,
+  `agent-browser find role button click --name "Close Review" --exact` and
+  `agent-browser wait '[aria-label="Expand right sidebar"]'`. Closing the last tab collapses the
+  sidebar.
 
 ## Gotchas
 
@@ -60,3 +69,8 @@ Preconditions:
 - On a cold Vite cache the first open of Review reloads the page (see SKILL.md Gotchas). Open it
   again after the reload.
 - A click on `Review` while the sidebar still slides open is lost. Keep the `idle` call before it.
+- Skip a Restore step and a rerun in the same run fails. A hunk's id comes from its content, so
+  the same edit comes back already read. With `Uncommitted:` already checked, the panel did not
+  show a new edit within 25 s, until `Refresh diff`. With the Review tab open, `Expand right
+  sidebar` opens that tab instead of `Open a tool`.
+- `find` has no `uncheck` action. `find role checkbox click` toggles the box.
