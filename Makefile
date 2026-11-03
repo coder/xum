@@ -52,9 +52,9 @@ XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 # open backend, for hosts where you are the only account. Keep XUM_ROOT outside the checkout: Vite
 # serves the checkout to anyone who can reach its port, and public/ without any file checks.
 ifeq ($(XUM_DEV_SERVER_NO_AUTH),1)
-DEV_SERVER_AUTH_FLAG := --no-auth
+override DEV_SERVER_AUTH_FLAG := --no-auth
 else
-DEV_SERVER_AUTH_FLAG :=
+override DEV_SERVER_AUTH_FLAG :=
 # Only when dev-server is a goal: `:=` runs node at parse time, and every make invocation parses this.
 ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
 # `override` beats `make -e`; `$(value ...)` keeps a chosen token's dollar signs from being expanded.
