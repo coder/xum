@@ -164,9 +164,7 @@ then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and pr
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
-the run's `state.env`. A launch killed with SIGKILL before it printed `ready` can leave its
-`mux-dev-server-*` folder in TMPDIR: cleanup stops the group, but the run never recorded that
-folder. Run cleanup after every run, failed ones too. `doctor`, `env`,
+the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`,
 `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
 the newest launch from this checkout.
 
