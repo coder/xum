@@ -14,8 +14,11 @@ feature file with the `verify-xum` harness. Update the file in the same change a
 
 ## Driving conventions
 
-- Start each bash call with `eval "$(.xum/skills/verify-xum/scripts/verify-xum.sh env)"`. The
-  recipes write the helper as `verify-xum.sh`.
+- Start each bash call with `eval "$(.xum/skills/verify-xum/scripts/verify-xum.sh env)"`. It also
+  puts the helper on `PATH`, so the recipes call it as `verify-xum.sh`.
+- Run each step's commands as one `&&` chain, or under `set -e`, so the first failed `wait` stops
+  the step. Keys pressed after a failed wait go to whatever has focus. In one run a palette query
+  went into the composer, and the Enter after it sent that text as a chat message.
 - Open the app with `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"`,
   run `verify-xum.sh idle`, and expand the project in the sidebar with
   `agent-browser find role button click --name "Expand project demo-app" --exact`. A new browser

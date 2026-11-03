@@ -3,7 +3,7 @@
 #
 #   verify-xum.sh launch           start and seed a sandbox, print its state
 #   verify-xum.sh doctor [RUN]     read-only health check of a run
-#   verify-xum.sh env [RUN]        print the run's `export` lines (eval them)
+#   verify-xum.sh env [RUN]        print the run's `export` lines and put this script on PATH (eval them)
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
@@ -68,8 +68,15 @@ load_run() {
   source "$run/state.env"
 }
 
+LAUNCH_DEADLINE=
+before_launch_deadline() {
+  ((SECONDS < LAUNCH_DEADLINE)) || die "launch did not finish in $READY_TIMEOUT s"
+}
+
 api() {
-  curl -fsS --max-time 60 -X POST "$VERIFY_XUM_BACKEND/api/$1" -H 'content-type: application/json' -d "$2"
+  before_launch_deadline
+  curl -fsS --max-time $((LAUNCH_DEADLINE - SECONDS)) -X POST "$VERIFY_XUM_BACKEND/api/$1" \
+    -H 'content-type: application/json' -d "$2"
 }
 
 json_string() {
@@ -137,7 +144,7 @@ seed_unreachable_fake_provider() {
 }
 
 seed() {
-  local created status_file status i
+  local created status_file status
   api splashScreens/markSplashScreenViewed '{"splashId":"onboarding-wizard-v1"}' >/dev/null
   seed_unreachable_fake_provider
   create_demo_repo "$VERIFY_XUM_PROJECT"
@@ -148,13 +155,11 @@ seed() {
   VERIFY_XUM_WORKSPACE_ID=$(json_field_or_empty "$created" metadata.id)
   [[ -n $VERIFY_XUM_WORKSPACE_ID ]] || die "workspace/create returned no id: $(head -c 400 "$created")"
   status_file="$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/init-status.json"
-  for ((i = 0; i < 120; i++)); do
-    status=$(json_field_or_empty "$status_file" status)
-    [[ $status == success ]] && break
+  while status=$(json_field_or_empty "$status_file" status); [[ $status != success ]]; do
     [[ $status == error ]] && die "workspace setup failed, see $status_file"
+    before_launch_deadline
     sleep 0.5
   done
-  [[ $status == success ]] || die "workspace setup did not finish in 60 s"
   VERIFY_XUM_WORKTREE="$VERIFY_XUM_ROOT/src/$(basename "$VERIFY_XUM_PROJECT")/verify-playground"
   [[ -d $VERIFY_XUM_WORKTREE ]] || die "no worktree at $VERIFY_XUM_WORKTREE"
 }
@@ -166,7 +171,7 @@ launch_failed() {
 }
 
 cmd_launch() {
-  local t0 deadline i backend_port vite_port log pidfile
+  local t0 i backend_port vite_port log pidfile
   need git curl node bun make setsid flock ss agent-browser
   check_bun
   take_checkout_lock
@@ -182,7 +187,7 @@ cmd_launch() {
   log="$VERIFY_XUM_RUN/server.log"
   pidfile="$VERIFY_XUM_RUN/scratch/pgid"
   t0=$(date +%s)
-  deadline=$((SECONDS + READY_TIMEOUT))
+  LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
@@ -203,21 +208,21 @@ cmd_launch() {
   ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
   trap launch_failed EXIT
 
-  for ((i = 0; i < 120; i++)); do
+  while true; do
     VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$log")
     backend_port=$(sed -n 's|^  Backend: *http://127.0.0.1:||p' "$log")
     vite_port=$(sed -n 's|^  Frontend: *http://localhost:||p' "$log")
     [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port ]] && break
     group_alive "$VERIFY_XUM_PGID" || die "make dev-server-sandbox exited during startup"
+    before_launch_deadline
     sleep 0.5
   done
-  [[ -n $vite_port ]] || die "make dev-server-sandbox printed no XUM_ROOT and ports in 60 s"
   VERIFY_XUM_BACKEND="http://127.0.0.1:$backend_port"
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
 
   until backend_ready "$t0" && curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_URL/"; do
-    ((SECONDS < deadline)) || die "the dev server was not ready in $READY_TIMEOUT s"
+    before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     sleep 1
   done
@@ -278,6 +283,9 @@ cmd_doctor() {
 cmd_env() {
   load_run "${1:-}"
   cat "$VERIFY_XUM_RUN/state.env"
+  # The feature recipes call the helper by its bare name. $PATH expands when the caller evals.
+  # shellcheck disable=SC2016
+  printf 'export PATH=%q:"$PATH"\n' "$SCRIPT_DIR"
 }
 
 cmd_capture() {

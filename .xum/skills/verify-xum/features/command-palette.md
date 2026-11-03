@@ -27,13 +27,15 @@ Preconditions:
   expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`. The combobox is
   gone.
 - **Switch workspace.** Press Ctrl+Shift+P, wait for the palette as above, then run
-  `agent-browser keyboard type "release"`. `Suggestions` lists the option `release-notes`. Run
-  `agent-browser press Enter`. The URL is `/workspace/<release-notes id>`. Capture
-  `command-palette/switched`.
+  `agent-browser keyboard type "release"` and
+  `agent-browser wait '[role="option"][aria-selected="true"][aria-label="release-notes"]'`.
+  `Suggestions` lists the option `release-notes`, selected. Run `agent-browser press Enter`. The URL
+  is `/workspace/<release-notes id>`. Capture `command-palette/switched`.
 - **Command mode.** Run `agent-browser press F4` and
   `agent-browser wait '[aria-label="Command palette"]'`. The combobox value is `>`, and
   `Suggestions` lists commands such as `Open Settings` and `Change Model…`.
 - **Run a command.** Run `agent-browser keyboard type "Change Model"`,
+  `agent-browser wait '[role="option"][aria-selected="true"][aria-label="Change Model…"]'`,
   `agent-browser press Enter` and `agent-browser wait --text "Show all models…"`. The model picker
   opens with the textbox `Search [provider:model-name]`. Run
   `agent-browser find text "Sonnet 5.5" click --exact`. The composer's combobox reads
@@ -41,6 +43,12 @@ Preconditions:
 
 ## Gotchas
 
+- Wait for the option you want to be selected before you press Enter. The first palette open after
+  a page load shows a plain input while the palette's code loads (`LoadingPaletteInput` at
+  `src/browser/components/CommandPalette/LazyCommandPalette.tsx:37`). It has the same label
+  `Command palette` and keeps typed text, but it ignores Enter (line 60). agent-browser types and
+  presses Enter in a few milliseconds, before the code arrives. A person who pastes a query and
+  presses Enter on a slow connection loses the Enter the same way.
 - Type into the palette with `agent-browser keyboard type`. The combobox has focus as soon as it
   opens.
 - Workspace options show the title only. A leading `•` marks the open workspace.

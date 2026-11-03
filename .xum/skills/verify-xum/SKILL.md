@@ -41,7 +41,8 @@ Bun on PATH must be the version in `package.json` `packageManager`. Launch refus
 
 Launch runs `make dev-server-sandbox` with `--clean-providers --clean-projects`, the mock AI and an
 `env -i` allowlist, in its own process group. It returns when the app is usable, in about 15 s when
-`dist/` is already built. It gives up after `VERIFY_XUM_READY_TIMEOUT` seconds (default 300).
+`dist/` is already built. It gives up when the whole launch, seed included, takes longer than
+`VERIFY_XUM_READY_TIMEOUT` seconds (default 300).
 Ready means all of these hold:
 
 - the backend that nodemon restarts after the first watch build owns `server.lock` and answers
@@ -96,6 +97,8 @@ agent-browser find role button click --name "Open settings" --exact
 - After an action that opens a view, wait for the view's text (`agent-browser wait --text "<text>"`)
   before the next key press. The URL changes before the view mounts, and an Escape sent too early
   leaves a dialog open that hides the rest of the page from `find`.
+- Chain a wait and the key presses after it with `&&`. A failed wait then stops the chain, and no
+  keys go to whatever has focus instead.
 - `snapshot -i` lists only interactive elements. Use a full `snapshot` to read text, headings and
   states such as `INTERRUPTED`.
 - Mock replies are `Mock response: <your text>`. `[mock:long-stream]` in a message streams for
