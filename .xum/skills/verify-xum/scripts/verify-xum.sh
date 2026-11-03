@@ -60,16 +60,14 @@ group_is_ours() {
   return 1
 }
 
+# The kernel holds this flock while any process keeps fd 9 open: the launcher, and the server's
+# `make` and `dev-server-sandbox.ts`, which inherit it at the spawn and live as long as the server.
+# So the lock is held while a server from this checkout runs, at whatever point the launcher
+# dies. The lock file only names the group, for doctor.
 take_checkout_lock() {
-  local holder
   exec 9>"$ONE_SERVER_PER_CHECKOUT_LOCK.guard"
-  flock -w 30 9 || die "another verify-xum launch holds $ONE_SERVER_PER_CHECKOUT_LOCK.guard"
-  holder=$(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null || true)
-  if [[ -n $holder ]] && { kill -0 "$holder" 2>/dev/null || group_alive "$holder"; }; then
-    die "a verify-xum server already runs from this checkout (process $holder), and two would share dist/ and node_modules/.vite. Run verify-xum.sh cleanup first."
-  fi
-  echo "$$" >"$ONE_SERVER_PER_CHECKOUT_LOCK"
-  exec 9>&-
+  flock -n 9 \
+    || die "a verify-xum launch or server from this checkout holds $ONE_SERVER_PER_CHECKOUT_LOCK.guard, and two would share dist/ and node_modules/.vite. Run verify-xum.sh cleanup first. If it stays held, lsof that file to find the holder."
 }
 
 load_run() {
@@ -205,6 +203,10 @@ cmd_launch() {
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
     VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID")
+  # Saved before the spawn, so cleanup finds a launch killed at any point after it.
+  write_state
+  ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
+  trap launch_failed EXIT
   # setsid(1) forks when its caller already leads a process group, so $! can miss the new
   # group. The inner sh records its own pid, which is the new group id.
   # shellcheck disable=SC2016
@@ -218,8 +220,6 @@ cmd_launch() {
   VERIFY_XUM_PGID=$(cat "$pidfile")
   echo "$VERIFY_XUM_PGID" >"$ONE_SERVER_PER_CHECKOUT_LOCK"
   write_state
-  ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
-  trap launch_failed EXIT
 
   while true; do
     VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$log")
@@ -341,6 +341,9 @@ is_dev_server_sandbox_root() {
 cmd_cleanup() {
   load_run "${1:-}"
   local i
+  # A launch killed before it saved these left them only in the pidfile and the server log.
+  [[ -n $VERIFY_XUM_PGID ]] || VERIFY_XUM_PGID=$(cat "$VERIFY_XUM_RUN/scratch/pgid" 2>/dev/null || true)
+  [[ -n $VERIFY_XUM_ROOT ]] || VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$VERIFY_XUM_RUN/server.log" 2>/dev/null || true)
   # agent-browser `close` on a session that does not exist starts that session first.
   if agent-browser session list 2>/dev/null | grep -qF "$AGENT_BROWSER_SESSION"; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true

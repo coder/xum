@@ -58,8 +58,9 @@ Ready means all of these hold:
   repo) and the workspace `Verify playground` with its worktree set up.
 
 It prints the run's `export` lines and the URL of the seeded workspace. A failed launch prints the
-server log tail and cleans up. Launch refuses while another verify-xum server runs from this
-checkout: two dev servers in one checkout share `dist/` and `node_modules/.vite`.
+server log tail and cleans up. Launch refuses while another verify-xum launch or server runs from
+this checkout: two dev servers in one checkout share `dist/` and `node_modules/.vite`. The server's
+processes hold that lock, so it holds even when the launcher was killed partway.
 
 ## Doctor
 

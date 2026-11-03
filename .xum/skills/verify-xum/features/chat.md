@@ -32,11 +32,15 @@ Preconditions:
 - **Send with the button.** Fill `Second message`, run `verify-xum.sh send-ready`, then run
   `agent-browser find role button click --name "Send message" --exact` and
   `agent-browser wait --text "Mock response: Second message"`.
-- **Check history.** Save the last four rows of the workspace history:
+- **Check history.** The transcript shows a reply before the server writes it to `chat.jsonl` at
+  the end of the stream. Wait for the saved reply, then save the last four rows of the workspace
+  history:
 
   ```bash
+  chat_jsonl="$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/chat.jsonl"
+  timeout 10 sh -c 'until grep -qF "Mock response: Second message" "$1"; do sleep 0.2; done' sh "$chat_jsonl"
   mkdir -p "$VERIFY_XUM_EVIDENCE/chat"
-  tail -n 4 "$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/chat.jsonl" >"$VERIFY_XUM_EVIDENCE/chat/history.txt"
+  tail -n 4 "$chat_jsonl" >"$VERIFY_XUM_EVIDENCE/chat/history.txt"
   ```
 
   The file has two `"role":"user"` rows and two `"role":"assistant"` rows with the reply texts.
