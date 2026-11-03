@@ -85,7 +85,8 @@ Optional CLI flags:
 
 Optional env vars:
   XUM_VITE_ALLOWED_HOSTS=<host>[,<host>]  Accept these Host headers besides loopback
-                                         (default: loopback only; "all" is unsafe)
+                                         (default: loopback only, plus this sandbox's Coder
+                                         port-forward host; "all" is unsafe)
   XUM_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
 
 Examples:

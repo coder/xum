@@ -292,7 +292,12 @@ export function deriveProxyAllowedHost(env: XumEnvironment, port: number): strin
   } catch {
     return null;
   }
-  return hostname.includes(marker) ? hostname.replaceAll(marker, String(port)) : null;
+  if (!hostname.includes(marker)) return null;
+
+  // Only plain DNS labels: a leading "." would match every subdomain in Vite's allowedHosts, and
+  // "," would add a second entry.
+  const derived = hostname.replaceAll(marker, String(port));
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(derived) ? derived : null;
 }
 
 export function copyConfigClearingProjectsIfExists(sourcePath: string, destPath: string): boolean {

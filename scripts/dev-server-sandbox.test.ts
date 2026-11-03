@@ -115,6 +115,8 @@ describe("deriveProxyAllowedHost", () => {
     ["a template without the port", { VSCODE_PROXY_URI: "https://coder.test" }],
     ["a path-based template", { VSCODE_PROXY_URI: "https://coder.test/proxy/{{port}}/" }],
     ["a template that is not a URL", { VSCODE_PROXY_URI: "{{port}}--main" }],
+    ["a leading dot, which Vite matches as a suffix", { VSCODE_PROXY_URI: "https://.{{port}}.test" }],
+    ["a comma, which would add a second host", { VSCODE_PROXY_URI: "https://{{port}}.a,.b.test" }],
   ])("derives nothing from %s", (_name, env) => {
     expect(deriveProxyAllowedHost(env, 5173)).toBeNull();
   });
