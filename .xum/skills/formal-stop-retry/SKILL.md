@@ -29,7 +29,7 @@ Tests rarely reach the break. It needs a Stop to land while a stream error's han
 
 The sync commit is the last commit that changed the line below. Change that line only after you confirmed that the model describes the code at your commit, with or without a model change. A typo fix elsewhere in this folder does not move the sync commit. Main squash-merges PRs, so write the PR number, not a branch SHA, which would not survive the squash.
 
-Model confirmed against the code in: #7898
+Model confirmed against the code in: #7901
 
 | Model action | Code |
 | --- | --- |
