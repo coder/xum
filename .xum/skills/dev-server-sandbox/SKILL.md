@@ -67,14 +67,17 @@ The backend runs with auth on. `make dev-server` generates a random token per ru
 
 ```bash
 TOKEN=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token' "$XUM_ROOT/server.lock")
-curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST -H @- "http://127.0.0.1:$BACKEND_PORT/api/config/getConfig"
 ```
 
-- Browser: open `http://localhost:$VITE_PORT/?token=$(node -p 'encodeURIComponent(process.argv[1])' "$TOKEN")` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token.
+Command lines are readable by every local account. So node gets only the lockfile path, and the header goes to `curl -H @-` on stdin from the `printf` builtin. Never pass the token as an argument.
+
+- Browser: open `http://localhost:$VITE_PORT/?token=$(node -p 'encodeURIComponent(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).token)' "$XUM_ROOT/server.lock")` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token. The URL reaches the browser tool as an argument, so other local accounts can see it for the length of that call.
 - `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
 - The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
 - Keep `XUM_ROOT` outside the checkout. Vite serves the checkout to anyone who can reach its port, and its `public/` folder without any file checks. The sandbox root is under the system temp dir.
 - `XUM_DEV_SERVER_AUTH_TOKEN=<token>` picks the token. `XUM_DEV_SERVER_NO_AUTH=1` starts an open backend, which any local account can control: use it only on a host where you are the only account.
+- Scope: while the backend restarts, another local account can bind its port and capture the token that a connected browser sends.
 
 ## Options
 
