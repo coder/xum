@@ -20647,21 +20647,33 @@ export class WorkspaceService
 
   abandonAutoRetry(workspaceId: string, reason: string): void {
     // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
     try {
-      this.sessions.get(workspaceId)?.abandonAutoRetry(reason);
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
     } catch (error: unknown) {
       log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
     }
   }
 
   async recordStopForStartupRecovery(workspaceId: string): Promise<void> {
+    // The marker must reach the session that startup recovery uses: adopt one still in its
+    // startup recovery, or create it, so a recovery that starts later reads the marker.
+    // The interrupt already stopped the turn and settled its handle, so a failed write does not
+    // fail it; the session keeps the marker owed, and its next auto-retry state write retries it.
+    let recorded = false;
     try {
-      await this.sessions.get(workspaceId)?.recordStopForStartupRecovery();
+      recorded = await this.getOrCreateSession(workspaceId).recordStopForStartupRecovery();
     } catch (error: unknown) {
       log.warn("recordStopForStartupRecovery failed", {
         workspaceId,
         error: getErrorMessage(error),
       });
+    }
+    if (!recorded) {
+      log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
     }
   }
 

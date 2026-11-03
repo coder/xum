@@ -5,8 +5,10 @@ import { MockLanguageModelV3 } from "ai/test";
 import { Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { createConfigStores } from "@/node/config";
-import { AgentSession } from "@/node/services/agentSession";
+import { AUTO_RETRY_PREFERENCE_FILE, AgentSession } from "@/node/services/agentSession";
+import { hasStartupAbandonMarker } from "@/node/services/agentSession.testHarness";
 import { ServiceContainer } from "@/node/services/serviceContainer";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type {
   ProviderModelFactory,
   ResolveAndCreateModelResult,
@@ -173,29 +175,33 @@ async function withWorkspace(
 
 /**
  * Disposes the backend and starts a new one on the same XUM_ROOT, as a restart of Xum does, and
- * waits for the startup recovery of `workspaceId` to end.
+ * waits for the startup recovery of `workspaceId` to end. `whileRecovering` runs as that recovery
+ * starts, while its session is not registered yet.
  */
 async function restart(
   env: TestEnvironment,
   model: MockLanguageModelV3,
-  workspaceId: string
+  workspaceId: string,
+  whileRecovering?: (services: ServiceContainer, session: AgentSession) => Promise<void>
 ): Promise<ServiceContainer> {
   await env.services.dispose();
   await env.services.shutdown();
   const recovered = Promise.withResolvers<void>();
+  const services = new ServiceContainer(createConfigStores(env.tempDir));
   // eslint-disable-next-line @typescript-eslint/unbound-method -- called with each session as `this`
   const runStartupRecovery = AgentSession.prototype.runStartupRecovery;
   const recovery = spyOn(AgentSession.prototype, "runStartupRecovery").mockImplementation(
     async function (this: AgentSession, ...args) {
+      const target = args[0]?.id === workspaceId;
       try {
+        if (target) await whileRecovering?.(services, this);
         await runStartupRecovery.apply(this, args);
       } finally {
-        if (args[0]?.id === workspaceId) recovered.resolve();
+        if (target) recovered.resolve();
       }
     }
   );
   try {
-    const services = new ServiceContainer(createConfigStores(env.tempDir));
     replaceModel({ ...env, services }, model);
     await services.initialize();
     assert(
@@ -532,6 +538,158 @@ describe("a Stop ends the auto-retry loop", () => {
     90_000
   );
 
+  test("a turn interrupt reaches a session that is still in its startup recovery", async () => {
+    await withWorkspace(async (env, workspaceId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const retries = watchRetries(env);
+      const sent = await env.services.workspaceService.sendMessage(
+        workspaceId,
+        "Survey the repository",
+        { model: HAIKU_MODEL, agentId: "exec" }
+      );
+      assert(sent.success, "the turn is accepted");
+      await assertBackoffPending(env, retries, workspaceId);
+
+      // The backend exits with the turn in its backoff, so startup recovery resumes it in a
+      // session that is not registered yet. What interruptWorkspaceTurn does to its target lands
+      // while that recovery runs.
+      const restarted = await restart(env, model, workspaceId, async (services) => {
+        services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
+        await services.workspaceService.recordStopForStartupRecovery(workspaceId);
+      });
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a Stop during startup recovery's first await keeps it from arming a retry", async () => {
+    await withWorkspace(async (env, workspaceId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const retries = watchRetries(env);
+      const sent = await env.services.workspaceService.sendMessage(
+        workspaceId,
+        "Survey the repository",
+        { model: HAIKU_MODEL, agentId: "exec" }
+      );
+      assert(sent.success, "the turn is accepted");
+      await assertBackoffPending(env, retries, workspaceId);
+
+      // A turn interrupt's abandon lands while startup recovery awaits its first read (the
+      // cancellation record), and its startup record has not been written yet.
+      const restarted = await restart(env, model, workspaceId, (services, session) => {
+        const host = session as unknown as { compactionRecoveryBlocked: () => Promise<boolean> };
+        const blocked = host.compactionRecoveryBlocked.bind(session);
+        let stopped = false;
+        spyOn(host, "compactionRecoveryBlocked").mockImplementation(async () => {
+          const result = await blocked();
+          if (!stopped) {
+            stopped = true;
+            services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
+          }
+          return result;
+        });
+        return Promise.resolve();
+      });
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a turn interrupt's startup record ends a retry that startup recovery armed after its abandon", async () => {
+    await withWorkspace(async (env, workspaceId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const retries = watchRetries(env);
+      const sent = await env.services.workspaceService.sendMessage(
+        workspaceId,
+        "Survey the repository",
+        { model: HAIKU_MODEL, agentId: "exec" }
+      );
+      assert(sent.success, "the turn is accepted");
+      await assertBackoffPending(env, retries, workspaceId);
+
+      // The interrupt's abandon lands before startup recovery captures anything, and its record
+      // only after that recovery armed the interrupted tail again.
+      const restarted = await restart(env, model, workspaceId, (services) => {
+        services.workspaceService.abandonAutoRetry(workspaceId, "task_stopped");
+        return Promise.resolve();
+      });
+      try {
+        assert(
+          restarted.workspaceService.hasPendingAutoRetry(workspaceId),
+          "startup recovery armed a retry after the abandon"
+        );
+        await restarted.workspaceService.recordStopForStartupRecovery(workspaceId);
+        expect(restarted.workspaceService.hasPendingAutoRetry(workspaceId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a turn interrupt writes its startup record again after a failed write", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const { workspaceTurnManager } = env.services;
+      const retries = watchRetries(env);
+      const turn = await workspaceTurnManager.createWorkspaceTurn({
+        ownerWorkspaceId: ownerId,
+        prompt: "Survey the repository",
+        title: "Stopped turn",
+        workspace: { mode: "new" },
+      });
+      if (!turn.success) throw new Error(turn.error);
+      const targetId = turn.data.workspaceId;
+      await assertBackoffPending(env, retries, targetId);
+
+      // The real stack's HistoryService writes the session files through nodeSessionFiles.
+      const files = nodeSessionFiles.promises;
+      const writeFile = files.writeFile.bind(files);
+      let failedWrites = 0;
+      const write = spyOn(files, "writeFile").mockImplementation((file, ...rest) => {
+        if (
+          failedWrites === 0 &&
+          typeof file === "string" &&
+          file.endsWith(AUTO_RETRY_PREFERENCE_FILE)
+        ) {
+          failedWrites += 1;
+          return Promise.reject(new Error("ENOSPC: no space left on device"));
+        }
+        return writeFile(file, ...rest);
+      });
+      try {
+        const interrupted = await workspaceTurnManager.interruptWorkspaceTurn(
+          ownerId,
+          turn.data.taskId
+        );
+        assert(interrupted.success, "the turn interrupt succeeds");
+      } finally {
+        write.mockRestore();
+      }
+      assert(failedWrites === 1, "the first write of the startup record failed");
+
+      const restarted = await restart(env, model, targetId);
+      try {
+        expect(restarted.workspaceService.hasPendingAutoRetry(targetId)).toBe(false);
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
   test("interrupting a queued workspace turn leaves the running turn's retry armed", async () => {
     await withWorkspace(async (env, ownerId) => {
       replaceModel(env, failsOnceModel());
@@ -588,7 +746,11 @@ describe("a Stop ends the auto-retry loop", () => {
       assert(interrupted.success, "the queued turn's interrupt succeeds");
       assert(latchedRelease, "the error handling ended inside the latch window");
 
-      expect(workspaceService.hasPendingAutoRetry(targetId)).toBe(true);
+      expect({
+        pending: workspaceService.hasPendingAutoRetry(targetId),
+        // A restart must still resume the running turn: the queued interrupt records no Stop.
+        startupRecord: await hasStartupAbandonMarker(env.config.sessionsDir, targetId),
+      }).toEqual({ pending: true, startupRecord: false });
     });
   }, 90_000);
 });

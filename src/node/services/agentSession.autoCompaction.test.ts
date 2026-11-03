@@ -19,6 +19,7 @@ import { buildAutoCompactionFollowUp } from "./contextManagement/compactionReque
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  hasStartupAbandonMarker,
   seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
@@ -1037,7 +1038,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
-    return { session, events, stopStream };
+    return { session, events, stopStream, sessionsDir: config.sessionsDir };
   }
 
   test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
@@ -1058,16 +1059,16 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   });
 
   test("a Stop during the mid-stream compaction dispatch arms no retry", async () => {
-    const { session, events } = await runMidStreamCompactionDispatch(
-      "ws-auto-compaction-mid-stream-dispatch-stopped",
-      (stopped) => {
-        // What a workspace-turn interrupt or a hard timeout does while the compaction request is
-        // in preflight: it ends the retry loop, and its stop latch refuses the send with a
-        // retryable error. Neither runs cancelCompaction, so the continuation stays admitted.
+    const workspaceId = "ws-auto-compaction-mid-stream-dispatch-stopped";
+    const { session, events, sessionsDir } = await runMidStreamCompactionDispatch(
+      workspaceId,
+      async (stopped) => {
+        // What a workspace-turn interrupt does while the compaction request is in preflight: it
+        // ends the retry loop and records the stopped tail, and its stop latch refuses the send
+        // with a retryable error. It runs no cancelCompaction, so the continuation stays admitted.
         stopped.abandonAutoRetry("task_stopped");
-        return Promise.resolve(
-          Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE })
-        );
+        assert(await stopped.recordStopForStartupRecovery(), "the Stop records the stopped tail");
+        return Err({ type: "unknown", raw: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE });
       }
     );
     assert(
@@ -1078,7 +1079,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect({
       pending: session.hasPendingAutoRetry(),
       armed: events.filter((event) => event.type === "auto-retry-scheduled").length,
-    }).toEqual({ pending: false, armed: 0 });
+      // The refused dispatch is a retryable failure, which must not clear the Stop's record.
+      startupRecord: await hasStartupAbandonMarker(sessionsDir, workspaceId),
+    }).toEqual({ pending: false, armed: 0, startupRecord: true });
 
     await session.dispose();
   });

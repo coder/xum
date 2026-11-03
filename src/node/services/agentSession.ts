@@ -863,7 +863,7 @@ function hasSameWorkspaceTurnCorrelation(
  */
 export { inheritOpenWorkspaceTurnMetadata } from "./contextManagement/compactionRequests";
 
-const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
+export const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
 
 /**
  * Clear provider-config-fixable startup abandon markers persisted by workspaces
@@ -2576,16 +2576,22 @@ export class AgentSession {
   /**
    * A workspace-turn interrupt stops the turn with a system abort, or while no stream runs, so it
    * leaves no durable trace of the Stop. Record the stopped tail as a user abort does, or startup
-   * recovery after a restart resumes the turn that was stopped.
+   * recovery after a restart resumes the turn that was stopped. Best effort: it resolves false when
+   * the marker is still not on disk, and the interrupt only logs that (a user Stop fails instead).
    */
-  async recordStopForStartupRecovery(): Promise<void> {
-    if (this.coordinator.closing) return;
+  async recordStopForStartupRecovery(): Promise<boolean> {
+    if (this.coordinator.closing) return false;
     const tail = await this.historyService
       .getLastMessages(this.workspaceId, STARTUP_TAIL_MESSAGE_COUNT)
       .catch(() => null);
     // Without the tail, a marker that matches any tail still keeps the Stop; a user send clears it.
     const userMessageId = tail?.success ? this.findLastRetryUserMessage(tail.data)?.id : undefined;
     await this.persistStartupAutoRetryAbandon("aborted", userMessageId);
+    // Startup recovery can run in this session since the interrupt's first abandon, which missed
+    // a session that did not exist yet: end any retry it armed before it could see the marker.
+    this.abandonAutoRetry("task_stopped");
+    // A failed read or write leaves the marker owed: retry it once, as a user Stop does.
+    return this.recordPendingAutoRetryState();
   }
 
   private async retryActiveStream(
@@ -3587,15 +3593,19 @@ export class AgentSession {
   }
 
   private async scheduleStartupAutoRetryIfNeeded(
-    workspaceMetadata?: WorkspaceMetadata
+    workspaceMetadata?: WorkspaceMetadata,
+    // runStartupRecovery passes the count at its start; see there.
+    autoRetryStops = this.autoRetryStops
   ): Promise<StartupRecoveryOutcome> {
     if (this.coordinator.closing) return "completed";
     using _execution = this.coordinator.enterExecution();
-    if (await this.compactionRecoveryBlocked()) return "completed";
+    // Capture before the first await: a Stop that lands during any await below bumps the retry
+    // generation (RetryManager.cancel), so the arm at the end refuses.
     const turn = this.coordinator.turnId;
     const generation = this.retryManager.captureGeneration();
     const isCurrent = () =>
       !this.coordinator.closing && generation() && this.coordinator.isCurrentTurn(turn);
+    if (await this.compactionRecoveryBlocked()) return "completed";
     if (this.coordinator.disposed || this.isBusy() || this.isAiStreaming()) {
       return "deferred";
     }
@@ -3710,7 +3720,8 @@ export class AgentSession {
         type: "unknown",
         message: "startup_interrupted_stream",
       },
-      isCurrent
+      isCurrent,
+      autoRetryStops
     );
     return "completed";
   }
@@ -3860,6 +3871,10 @@ export class AgentSession {
   }
 
   async runStartupRecovery(metadata?: WorkspaceMetadata): Promise<void> {
+    // A Stop that ends the retry loop from here on (a workspace-turn interrupt) ends this
+    // recovery's retry too, also one that lands before the scheduler below captures its retry
+    // generation, while the metadata read or the compaction recovery step awaits.
+    const autoRetryStops = this.autoRetryStops;
     // TaskService owns child recovery; replaying a stopped child must never restart it.
     metadata ??= await this.getWorkspaceMetadataForRetry();
     if (!metadata || metadata.parentWorkspaceId != null) return;
@@ -3867,7 +3882,9 @@ export class AgentSession {
     // with resumable partials or compaction follow-ups. Only explicit user send/retry starts it.
     if (metadata.sideChatParentWorkspaceId != null) return;
     // Reuse the bulk startup snapshot throughout retry derivation instead of rescanning all workspaces.
-    return this.startupRecovery.run(() => this.scheduleStartupAutoRetryIfNeeded(metadata));
+    return this.startupRecovery.run(() =>
+      this.scheduleStartupAutoRetryIfNeeded(metadata, autoRetryStops)
+    );
   }
 
   shouldRetainAfterStartupRecovery(): boolean {
