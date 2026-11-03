@@ -2178,6 +2178,63 @@ describe("TaskService", () => {
     });
   });
 
+  describe("a drain whose snapshot holds a wake of a stopped handle", () => {
+    // A Stop of a restart-settled turn deletes the restart outcome's wake only after its write, so
+    // a drain's listPending snapshot can still hold that wake when it rereads the Stop's record.
+    const handleId = "wst_stopped_after_restart";
+    const stoppedAt = "2026-08-11T00:00:05.000Z";
+
+    async function drainWakeOf(outcome: { status: "interrupted"; updatedAt: string }) {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const sendMessage = mock(
+        (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await new TaskHandleStore(config).upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, parentId, handleId, "interrupted", {
+          attentionPolicy: "notify_on_terminal",
+          updatedAt: stoppedAt,
+        })
+      );
+      const attentionStore = new TerminalAttentionStore(config);
+      const generationId = `${handleId}:${outcome.status}:${outcome.updatedAt}`;
+      await attentionStore.enqueueIfAbsent({
+        ownerWorkspaceId: parentId,
+        sourceKind: "workspace_turn",
+        sourceId: handleId,
+        generationId,
+        terminalOutcome: "interrupted",
+      });
+
+      taskService.scheduleTerminalAttentionDrain(parentId);
+      await flushTerminalAttentionDrains(taskService);
+
+      const wake = await attentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workspace_turn", handleId, generationId)
+      );
+      return {
+        woke: sendMessage.mock.calls.some((call) => String(call[1]).includes(handleId)),
+        status: wake?.status,
+      };
+    }
+
+    test("drops the wake of the restart outcome that the Stop replaced", async () => {
+      expect(
+        await drainWakeOf({ status: "interrupted", updatedAt: "2026-08-11T00:00:01.000Z" })
+      ).toEqual({ woke: false, status: "superseded" });
+    });
+
+    test("delivers a wake of the Stop's own outcome", async () => {
+      expect(await drainWakeOf({ status: "interrupted", updatedAt: stoppedAt })).toEqual({
+        woke: true,
+        status: "delivered",
+      });
+    });
+  });
+
   test("natural completion transfers disposable ownership to the queued same-owner follow-up", async () => {
     // Codex P1: a disposable predecessor that finishes naturally (finishReason
     // "stop") while a same-owner follow-up is queued — here turn-end, which

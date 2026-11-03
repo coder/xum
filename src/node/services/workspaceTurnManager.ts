@@ -142,6 +142,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import {
   TerminalAttentionStore,
+  type TerminalAttentionNotification,
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
 
@@ -575,6 +576,35 @@ export function workspaceTurnTerminalAttentionSuppressed(
   record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
 ): boolean {
   return isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record);
+}
+
+/**
+ * A terminal outcome's version. A handle can self-heal from an error into a corrected completion,
+ * so a wake names the exact outcome it announces and an in-flight stale drain cannot transition
+ * the replacement's notification.
+ */
+function workspaceTurnTerminalOutcomeGenerationId(
+  record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
+): string {
+  return `${record.handleId}:${record.status}:${record.updatedAt}`;
+}
+
+/**
+ * Whether a pending wake announces an outcome that an explicit Stop replaced (a restart
+ * recovery outcome). The Stop is quiet, and its delete of that wake cannot retract a drain's
+ * listPending snapshot, so the drain's reread of the record decides. A wake for the Stop's own
+ * outcome, or a legacy wake with no generation, still notifies.
+ */
+export function workspaceTurnWakeReplacedByStop(
+  notification: Pick<TerminalAttentionNotification, "generationId">,
+  record: WorkspaceTurnTaskHandleRecord
+): boolean {
+  return (
+    record.status === "interrupted" &&
+    record.error == null &&
+    notification.generationId != null &&
+    notification.generationId !== workspaceTurnTerminalOutcomeGenerationId(record)
+  );
 }
 
 /**
@@ -2724,9 +2754,7 @@ export class WorkspaceTurnManager {
   workspaceTurnTerminalAttentionGenerationId(
     record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
   ): string {
-    // A handle can self-heal from an error into a corrected completion. Include the exact terminal
-    // outcome version so an in-flight stale drain cannot transition the replacement notification.
-    return `${record.handleId}:${record.status}:${record.updatedAt}`;
+    return workspaceTurnTerminalOutcomeGenerationId(record);
   }
 
   private workspaceTurnTerminalAttentionIds(
