@@ -2,9 +2,12 @@
 // replay this row, and WorkspaceTurnManager reads the same row to tell whether a turn can still
 // be resumed, so both sides must select it here.
 import {
+  getCompactionFollowUpContent,
   isContextBudgetWarningMessage,
   isSyntheticSnapshotUserMessage,
+  parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { isCompactionRequestMetadata } from "./contextManagement/compactionRequests";
@@ -66,4 +69,19 @@ export function shouldUseUserMessageForRetry(message: MuxMessage): boolean {
     return false;
   }
   return message.metadata?.synthetic !== true || isRetriedSyntheticMessage(message);
+}
+
+/**
+ * The delegated workspace turn that a resume of this retry row continues. A compaction request
+ * resumes into its follow-up, which carries the turn in `workspaceTurnMetadata` when another
+ * trigger (a wake) owns its `muxMetadata`.
+ */
+export function retriedWorkspaceTurn(
+  row: MuxMessage | undefined
+): WorkspaceTurnTaskCorrelation | null {
+  const muxMetadata = row?.metadata?.muxMetadata;
+  const followUp = getCompactionFollowUpContent(muxMetadata);
+  return parseWorkspaceTurnTaskCorrelation(
+    followUp == null ? muxMetadata : (followUp.workspaceTurnMetadata ?? followUp.muxMetadata)
+  );
 }
