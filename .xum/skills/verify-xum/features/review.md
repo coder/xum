@@ -56,8 +56,9 @@ Preconditions:
 - **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
   button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
   button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
-- **Restore.** Run `agent-browser find role button click --name "Mark as read (M)" --exact`. The
-  tab reads `Review 0/1` at once, and the app writes `review-state.json` a moment later. Wait for
+- **Restore.** The sidebar slid open again: run `verify-xum.sh idle`, then
+  `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads
+  `Review 0/1` at once, and the app writes `review-state.json` a moment later. Wait for
   it:
 
   ```bash
