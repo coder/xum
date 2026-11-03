@@ -283,7 +283,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
   }, 60_000);
 
   test("Windows keeps TCP: no socket for Vite or the backend", () => {
-    expect(windows.socket).toBeUndefined();
+    expect(windows.socket ?? "").toBe("");
     expect(backendCommand(windows)).not.toContain("--unix-socket");
   });
 

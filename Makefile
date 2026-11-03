@@ -70,17 +70,21 @@ endif
 # private folder (`xum server --unix-socket` makes it 0700 and refuses a folder that is not yours):
 # no other account can create the socket's name. The TCP port stays for the CLI and scripts, which
 # read the lockfile. The path is short on purpose (sun_path holds about 100 bytes) and has the
-# backend port in its name, so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
+# backend host and port in its name (a TCP address can be bound once, so no two running backends
+# share it), so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
 # The recipe reads the path from the environment (`"$XUM_BACKEND_SOCKET"`), never from the command
 # text: it crosses three shells, and a path with spaces or quotes must stay one argument.
 # Windows has no such folder and keeps TCP for the Vite hop.
 ifneq ($(OS),Windows_NT)
 ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
 ifndef XUM_BACKEND_SOCKET
-XUM_BACKEND_SOCKET := $(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)/b$(XUM_BACKEND_PORT).sock
+XUM_BACKEND_SOCKET := $(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)/b$(XUM_BACKEND_PORT)-$(subst /,_,$(subst :,_,$(XUM_BACKEND_HOST))).sock
 endif
 export XUM_BACKEND_SOCKET
 endif
+else
+# The Windows recipe starts the backend on TCP only: an ambient path must not reach the Vite proxy.
+override XUM_BACKEND_SOCKET :=
 endif
 
 # Use PATH-resolved bash for portability across different systems.
