@@ -141,9 +141,10 @@ export default defineConfig(({ mode }) => {
       allowedHosts: devServerAllowedHosts,
 
       // Vite serves any file under its root at /@fs/<path> to whoever reaches its port, and a
-      // custom XUM_ROOT can sit inside the checkout. The dev backend's token lives in server.lock.
+      // custom XUM_ROOT can sit inside the checkout. The dev backend's token lives in server.lock, and in
+      // server.lock.<pid>.tmp while the server writes it.
       // `deny` replaces Vite's defaults, so they are repeated first.
-      fs: { deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "**/server.lock"] },
+      fs: { deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "**/server.lock*"] },
 
       proxy: {
         "/orpc": {
