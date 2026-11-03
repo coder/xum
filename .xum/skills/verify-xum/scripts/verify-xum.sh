@@ -89,6 +89,12 @@ before_launch_deadline() {
   ((SECONDS < LAUNCH_DEADLINE)) || die "launch did not finish in $READY_TIMEOUT s"
 }
 
+# A readiness probe that gives up at the launch deadline.
+probe_before_launch_deadline() {
+  before_launch_deadline
+  curl -fs --max-time $((LAUNCH_DEADLINE - SECONDS)) -o /dev/null "$1"
+}
+
 api() {
   before_launch_deadline
   curl -fsS --max-time $((LAUNCH_DEADLINE - SECONDS)) -X POST "$VERIFY_XUM_BACKEND/api/$1" \
@@ -122,7 +128,7 @@ backend_ready() {
     } catch {
       process.exit(1);
     }' "$VERIFY_XUM_ROOT/server.lock" "$CHECKOUT/dist/.main-build-complete" "$1" \
-    && curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_BACKEND/health"
+    && probe_before_launch_deadline "$VERIFY_XUM_BACKEND/health"
 }
 
 write_state() {
@@ -207,6 +213,9 @@ cmd_launch() {
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
     VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID")
+  # A shell that ran `eval "$(verify-xum.sh env)"` still exports the previous run's values.
+  VERIFY_XUM_PGID='' VERIFY_XUM_ROOT='' VERIFY_XUM_BACKEND='' VERIFY_XUM_URL=''
+  VERIFY_XUM_WORKSPACE_ID='' VERIFY_XUM_WORKTREE=''
   write_state
   ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
   trap launch_failed EXIT
@@ -218,7 +227,7 @@ cmd_launch() {
     "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
     >"$log" 2>&1 </dev/null 9>&- &
-  until VERIFY_XUM_PGID=$(sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env")
+  until VERIFY_XUM_PGID=$(sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1)
     [[ -n $VERIFY_XUM_PGID ]]; do
     before_launch_deadline
     sleep 0.1
@@ -239,7 +248,7 @@ cmd_launch() {
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
 
-  until backend_ready "$t0" && curl -fs --max-time 5 -o /dev/null "$VERIFY_XUM_URL/"; do
+  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/"; do
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     sleep 1

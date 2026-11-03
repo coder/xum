@@ -164,7 +164,12 @@ then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and pr
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
-the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`,
+the run's `state.env`. Run it after every run, failed ones too.
+
+Limit: if the launcher dies in the moment after the sandbox logs its `XUM_ROOT` and before launch
+records it (up to 0.5 s), and a server process then ignores SIGTERM, cleanup must SIGKILL the
+group. `dev-server-sandbox.ts` then cannot delete its `mux-dev-server-*` folder, and the run never
+recorded it. Delete that folder in TMPDIR by hand. `doctor`, `env`,
 `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
 the newest launch from this checkout.
 
@@ -173,7 +178,9 @@ the newest launch from this checkout.
 - The bash tool's environment carries the live Xum's `PORT`, auth token and provider keys. Launch
   drops them with `env -i`. Never start a server or CLI by hand without the same care.
 - The first open of a lazily loaded panel on a cold Vite cache (Review, for one) reloads the page:
-  `server.log` shows `optimized dependencies changed. reloading`. Repeat the step after the reload.
+  `server.log` shows `optimized dependencies changed. reloading`. The panel and its tab stay open
+  across the reload. Run `idle`, wait for the panel's text, and continue from the open tab (see
+  the Review recipe).
 - Now and then a lazily loaded module request from agent-browser to Vite never completes. The
   page or panel then shows `<name> failed to load.` with a `Reload` button, and the console logs
   `Failed to fetch dynamically imported module`. curl gets the same module at once, so it is not

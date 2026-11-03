@@ -42,8 +42,15 @@ Preconditions:
   URL is `/settings/general`.
 - **Change a setting.** Run
   `agent-browser find role switch click --name "Toggle flat chat list" --exact`. The switch is
-  `checked=true`, and `$VERIFY_XUM_ROOT/config.json` has `"sidebarFlatMode": true` under
-  `userPreferences.ui`. Capture `settings/flat-on`.
+  `checked=true` at once, but the server writes `config.json` a moment later. Wait for the write
+  before you capture or reload:
+
+  ```bash
+  timeout 10 sh -c 'until grep -qF "\"sidebarFlatMode\": true" "$1"; do sleep 0.2; done' sh "$VERIFY_XUM_ROOT/config.json"
+  ```
+
+  `$VERIFY_XUM_ROOT/config.json` has `"sidebarFlatMode": true` under `userPreferences.ui`. Capture
+  `settings/flat-on`.
 - **See the effect.** Run `agent-browser press Escape` and `agent-browser wait --text "RECENT"`.
   The sidebar has a `RECENT` group, and the workspace row is
   `Select workspace Verify playground (demo-app)`.
@@ -52,8 +59,9 @@ Preconditions:
   `agent-browser wait --text "Choose your preferred theme"`. The switch `Toggle flat chat list` is
   still `checked=true`. Capture `settings/persisted`.
 - **Restore.** Run
-  `agent-browser find role switch click --name "Toggle flat chat list" --exact` and
-  `agent-browser press Escape`. `config.json` has `"sidebarFlatMode": false`. The page opened
+  `agent-browser find role switch click --name "Toggle flat chat list" --exact`, wait until
+  `config.json` has `"sidebarFlatMode": false` (the same `timeout 10` loop with `false`), and run
+  `agent-browser press Escape`. The page opened
   Settings by its URL, so Escape lands on `/project?...`. Run
   `agent-browser open "$VERIFY_XUM_URL/workspace/$VERIFY_XUM_WORKSPACE_ID"` and
   `verify-xum.sh idle` to be back on `Verify playground`.

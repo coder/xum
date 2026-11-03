@@ -46,7 +46,8 @@ Preconditions:
 - Wait for the option you want to be selected before you press Enter. The first palette open after
   a page load shows a plain input while the palette's code loads (`LoadingPaletteInput` at
   `src/browser/components/CommandPalette/LazyCommandPalette.tsx:38`), with the same label
-  `Command palette`. agent-browser types and presses Enter in a few milliseconds, before the code
+  `Command palette`. A snapshot shows it as `textbox "Command palette"` until the code loads, then
+  as `combobox "Command palette"`. agent-browser types and presses Enter in a few milliseconds, before the code
   arrives. Since #7897 that input keeps the Enter and runs it on the first option once the code
   loads. Before it, the Enter was lost. The wait proves that the option Enter runs is the one the
   recipe expects.
