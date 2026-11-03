@@ -28,8 +28,8 @@ feature file with the `verify-xum` harness. Update the file in the same change a
   when the button is there and the click fails, so it is safe in an `&&` chain:
 
   ```bash
-  [[ $(agent-browser eval '!!document.querySelector("[aria-label=\"Expand project demo-app\"]")') != true ]] \
-    || agent-browser find role button click --name "Expand project demo-app" --exact
+  { [[ $(agent-browser eval '!!document.querySelector("[aria-label=\"Expand project demo-app\"]")') != true ]] \
+    || agent-browser find role button click --name "Expand project demo-app" --exact; }
   ```
 
 - `$VERIFY_XUM_OPEN_QUERY` (SKILL.md Drive) holds the backend's auth token when it has one. Add

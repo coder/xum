@@ -48,7 +48,7 @@ Preconditions:
   `agent-browser wait --text "math.ts"`. The file tree lists `src` and `math.ts` with `+3`, the
   hunk shows the three added lines of `sub`, and the tab reads `Review 0/1`. Capture
   `review/diff`.
-- **Mark as read.** Run
+- **Mark as read.** Run `verify-xum.sh idle`, then
   `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads
   `Review 1/1`, and the hunk reads `Hunk marked as read`.
   `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has

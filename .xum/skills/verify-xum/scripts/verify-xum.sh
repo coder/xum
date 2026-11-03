@@ -17,9 +17,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHECKOUT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 # make -C runs the sandbox from the checkout, so a relative TMPDIR would resolve there.
 [[ ${TMPDIR:-/tmp} == /* ]] || TMPDIR="$PWD/$TMPDIR"
-# Without XUM_SCRATCH_DIR the default is under the shared TMPDIR, so it carries the user id.
+# Never a shared TMPDIR: another local account could create the folder first and swap a run's
+# state.env, which this script sources (see require_private_dir).
 VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:+$XUM_SCRATCH_DIR/verify-xum}}
-VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${TMPDIR:-/tmp}/verify-xum-$(id -u)}
+VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/verify-xum}}
+VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-$HOME/.cache/verify-xum}
 # The run link in the git dir must point at an absolute path.
 [[ $VERIFY_XUM_HOME == /* ]] || VERIFY_XUM_HOME="$PWD/$VERIFY_XUM_HOME"
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
@@ -63,6 +65,26 @@ group_is_ours() {
   return 1
 }
 
+# A run's state.env is sourced, so the run folder and the home above it must be real folders (no
+# symlinks), owned by this user and writable by nobody else.
+require_private_dir() {
+  local dir=$1 mode
+  [[ -d $dir && ! -L $dir ]] || die "$dir is not a real folder"
+  [[ $(stat -c %u "$dir") == "$(id -u)" ]] || die "$dir is not owned by user $(id -u)"
+  mode=$(stat -c %a "$dir")
+  (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)"
+}
+
+# The run folder of a run argument, or behind the newest-run link (the one symlink allowed),
+# checked before its state.env is read.
+private_run_dir() {
+  local run=${1%/}
+  [[ $run == "$CURRENT_RUN_LINK" ]] && run=$(readlink "$run")
+  require_private_dir "$(dirname "$run")"
+  require_private_dir "$run"
+  echo "$run"
+}
+
 # One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
 # run's process group, which records its own id in that run's state.env before it starts the
 # server. Once that id is written, a moment after the spawn, the guard holds wherever the launcher
@@ -72,9 +94,11 @@ refuse_while_checkout_server_runs() {
   exec 9>"$LAUNCH_GUARD"
   flock -w 30 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
   [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
+  local run
+  run=$(private_run_dir "$CURRENT_RUN_LINK") || exit 1
   (
     # shellcheck source=/dev/null
-    source "$CURRENT_RUN_LINK/state.env"
+    source "$run/state.env"
     ! group_is_ours "$VERIFY_XUM_PGID" "$VERIFY_XUM_RUN_ID"
   ) || die "the verify-xum run $(readlink "$CURRENT_RUN_LINK") still runs from this checkout. Run verify-xum.sh cleanup first."
 }
@@ -82,6 +106,7 @@ refuse_while_checkout_server_runs() {
 load_run() {
   local run=${1:-$CURRENT_RUN_LINK}
   [[ -f $run/state.env ]] || die "no run at $run (run: verify-xum.sh launch)"
+  run=$(private_run_dir "$run") || exit 1
   # shellcheck source=/dev/null
   source "$run/state.env"
   [[ $VERIFY_XUM_CHECKOUT == "$CHECKOUT" ]] \
@@ -238,6 +263,12 @@ cmd_launch() {
   VERIFY_XUM_CHECKOUT=$CHECKOUT
   VERIFY_XUM_COMMIT=$(git -C "$CHECKOUT" rev-parse HEAD)
   AGENT_BROWSER_SESSION="verify-xum-$VERIFY_XUM_RUN_ID"
+  if [[ ! -e $VERIFY_XUM_HOME ]]; then
+    mkdir -p "$(dirname "$VERIFY_XUM_HOME")"
+    mkdir -m 700 "$VERIFY_XUM_HOME"
+  fi
+  require_private_dir "$VERIFY_XUM_HOME"
+  mkdir -m 700 "$VERIFY_XUM_RUN"
   mkdir -p "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/scratch"
   log="$VERIFY_XUM_RUN/server.log"
   t0=$(date +%s)
@@ -358,7 +389,7 @@ cmd_open_query() {
   load_run "${1:-}"
   local token
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  [[ -z $token ]] || printf '?token=%s' "$(node -p 'encodeURIComponent(process.argv[1])' "$token")"
+  [[ -z $token ]] || printf '?token=%s' "$(printf %s "$token" | node -p 'encodeURIComponent(require("fs").readFileSync(0, "utf8"))')"
 }
 
 cmd_capture() {

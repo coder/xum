@@ -101,7 +101,9 @@ agent-browser find role button click --name "Open settings" --exact
 - `VERIFY_XUM_OPEN_QUERY` is `?token=<token>` when the backend has an auth token (`make dev-server`
   with #7904), and empty otherwise. Put it on the first `open` of a browser session: the app
   keeps the token and strips it from the address bar. CAUTION: that URL puts the token in the
-  `agent-browser` command line, which every local account can read while it runs.
+  `agent-browser` command line, which every local account can read while it runs. The variable
+  itself sits in your shell's environment after the `eval`, so every process you start from that
+  shell inherits the token.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
@@ -134,8 +136,11 @@ agent-browser find role button click --name "Open settings" --exact
 ## Evidence
 
 Evidence goes to `$VERIFY_XUM_EVIDENCE`, which is `$VERIFY_XUM_HOME/<run>/evidence`.
-`VERIFY_XUM_HOME` defaults to `$XUM_SCRATCH_DIR/verify-xum`, or without `XUM_SCRATCH_DIR` to
-`${TMPDIR:-/tmp}/verify-xum-<uid>`. Cleanup never
+`VERIFY_XUM_HOME` defaults to `$XUM_SCRATCH_DIR/verify-xum`, else `$XDG_RUNTIME_DIR/verify-xum`,
+else `$HOME/.cache/verify-xum`, and never to a shared TMPDIR. Launch creates it with mode 0700.
+Every command that reads a run's `state.env` first checks that the home and the run folder are
+real folders (no symlinks), owned by you and not writable by group or others, and refuses
+otherwise: the script sources that file. Cleanup never
 deletes the evidence or the server log next to it (`<run>/server.log`).
 
 ```bash
