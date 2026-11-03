@@ -52,13 +52,17 @@ function parseAllowedHosts(raw: string | undefined, host: string): true | string
  * (an IP cannot be DNS-rebound), anything else must be listed, and a "." prefix matches that name
  * and its subdomains. Vite applies its check to HTTP requests and its own HMR socket, but not to
  * WebSocket upgrades that its proxy forwards, so vite.config.ts calls this from the proxy `bypass`.
+ * Stricter than Vite in one case: a missing Host is refused, because every browser sends one.
  */
 export function isDevServerHostAllowed(
   hostHeader: string | undefined,
   allowedHosts: true | string[]
 ): boolean {
-  if (allowedHosts === true || hostHeader === undefined) {
+  if (allowedHosts === true) {
     return true;
+  }
+  if (hostHeader === undefined) {
+    return false;
   }
 
   const host = hostHeader.trim();

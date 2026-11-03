@@ -71,5 +71,10 @@ describe("isDevServerHostAllowed", () => {
 
   test("accepts any host when every host is allowed, as Vite does", () => {
     expect(isDevServerHostAllowed("evil.example", true)).toBe(true);
+    expect(isDevServerHostAllowed(undefined, true)).toBe(true);
+  });
+
+  test("refuses a missing Host header, which Vite itself lets through", () => {
+    expect(isDevServerHostAllowed(undefined, loopbackOnly)).toBe(false);
   });
 });
