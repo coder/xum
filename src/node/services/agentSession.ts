@@ -1646,6 +1646,12 @@ export class AgentSession {
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
   /**
+   * Stops that ended this session's retry loop through abandonAutoRetry (a task Stop, a
+   * workspace-turn interrupt, a hard timeout). Unlike the workspace stop epoch, an interrupt of a
+   * queued workspace turn leaves it alone, so the turn that keeps running still retries.
+   */
+  private autoRetryStops = 0;
+  /**
    * turn.stop continuations queued since the last manual send or the last turn Stop did not
    * continue: the hooks see `stopHookActive`, and the ceiling ends the loop.
    */
@@ -1920,6 +1926,8 @@ export class AgentSession {
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
     /** The Stop epoch at this turn's admission: a Stop since then fences its turn.stop continuation. */
     admissionStopEpoch: number;
+    /** autoRetryStops when this turn's stream started: a Stop since then arms no retry for it. */
+    admissionAutoRetryStops: number;
   };
 
   private activeCompactionRequest?: {
@@ -2483,7 +2491,7 @@ export class AgentSession {
   private async handleStreamFailureForAutoRetry(
     error: RetryFailureError,
     isCurrent = this.retryManager.captureGeneration(),
-    stopEpoch = this.getStopEpoch()
+    autoRetryStops = this.autoRetryStops
   ): Promise<void> {
     assert(
       typeof error.type === "string" && error.type.length > 0,
@@ -2501,9 +2509,9 @@ export class AgentSession {
     if (this.coordinator.closing || !isCurrent() || !this.coordinator.isCurrentTurn(turn)) return;
     // Every Stop abandons a pending retry, but a workspace-turn interrupt drops its latch without
     // waiting for this handler, and a hard timeout of an idle task takes none: a retry armed now
-    // would restart the stopped workspace. A Stop since the failed turn's admission (stopEpoch)
-    // or one still in progress ends the retry loop.
-    if (this.stoppedSince(stopEpoch)) return;
+    // would restart the stopped workspace. A Stop since the failed turn's stream started
+    // (autoRetryStops) or one still in progress ends the retry loop.
+    if (this.isStopInProgress() || this.autoRetryStops !== autoRetryStops) return;
     this.retryManager.handleStreamFailure(error);
   }
 
@@ -2560,6 +2568,7 @@ export class AgentSession {
 
   /** End the auto-retry loop for a Stop that does not run interruptStream (a task Stop). */
   abandonAutoRetry(reason: string): void {
+    this.autoRetryStops += 1;
     this.retryManager.abandon(reason);
   }
 
@@ -8889,6 +8898,7 @@ export class AgentSession {
         ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
         admissionStopEpoch,
+        admissionAutoRetryStops: this.autoRetryStops,
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
@@ -10112,7 +10122,7 @@ export class AgentSession {
       await this.handleStreamFailureForAutoRetry(
         streamErrorRetryFailure(failureType, data),
         undefined,
-        context?.admissionStopEpoch
+        context?.admissionAutoRetryStops
       );
     } catch (error) {
       // Uncertain cancellation forbids this retry, but terminal error cleanup must still finish.

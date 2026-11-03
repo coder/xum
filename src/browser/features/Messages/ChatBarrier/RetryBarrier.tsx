@@ -34,6 +34,7 @@ interface RetryBarrierProps {
 const ABANDON_REASON_LABELS: Record<string, string> = {
   user_interrupt: "you stopped it",
   task_stopped: "the task was stopped",
+  task_failed: "the task failed",
   disabled_by_user: "auto-retry is turned off",
   context_changed: "the conversation changed",
 };
