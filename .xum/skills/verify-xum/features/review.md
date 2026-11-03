@@ -52,8 +52,15 @@ Preconditions:
   `agent-browser wait '[aria-label="Mark as read (M)"]'` (after a reload the hunk's button shows
   late), then `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab
   reads `Review 1/1`, and the hunk reads `Hunk marked as read`.
-  `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has
-  `"isRead": true` for that hunk within a second. Capture `review/read`.
+  The app writes `review-state.json` a moment later. Wait for it:
+
+  ```bash
+  timeout 10 sh -c 'until grep -qsF "\"isRead\": true" "$1"; do sleep 0.2; done' sh "$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json"
+  ```
+
+  `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has `"isRead": true` for
+  that hunk. Capture `review/read`.
+
 - **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
   button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
   button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
