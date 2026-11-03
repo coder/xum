@@ -20,7 +20,7 @@ VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-${XUM_SCRATCH_DIR:-${TMPDIR:-/tmp}}/verify-xu
 # The run link in the git dir must point at an absolute path.
 [[ $VERIFY_XUM_HOME == /* ]] || VERIFY_XUM_HOME="$PWD/$VERIFY_XUM_HOME"
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
-ONE_SERVER_PER_CHECKOUT_LOCK="$CHECKOUT_GIT_DIR/verify-xum.lock"
+LAUNCH_GUARD="$CHECKOUT_GIT_DIR/verify-xum.lock.guard"
 CURRENT_RUN_LINK="$CHECKOUT_GIT_DIR/verify-xum.current"
 READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-300}
 DISCARD_BASE_URL=http://127.0.0.1:9/v1
@@ -60,14 +60,19 @@ group_is_ours() {
   return 1
 }
 
-# The kernel holds this flock while any process keeps fd 9 open: the launcher, and the server's
-# `make` and `dev-server-sandbox.ts`, which inherit it at the spawn and live as long as the server.
-# So the lock is held while a server from this checkout runs, at whatever point the launcher
-# dies. The lock file only names the group, for doctor.
-take_checkout_lock() {
-  exec 9>"$ONE_SERVER_PER_CHECKOUT_LOCK.guard"
-  flock -n 9 \
-    || die "a verify-xum launch or server from this checkout holds $ONE_SERVER_PER_CHECKOUT_LOCK.guard, and two would share dist/ and node_modules/.vite. Run verify-xum.sh cleanup first. If it stays held, lsof that file to find the holder."
+# One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
+# run's process group, which records its own id in that run's state.env before it starts the
+# server, so the guard holds at whatever point the launcher dies. The flock only keeps two
+# launches from passing the check at once. The server does not inherit it.
+refuse_while_checkout_server_runs() {
+  exec 9>"$LAUNCH_GUARD"
+  flock -w 30 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
+  [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
+  (
+    # shellcheck source=/dev/null
+    source "$CURRENT_RUN_LINK/state.env"
+    ! group_is_ours "$VERIFY_XUM_PGID" "$VERIFY_XUM_RUN_ID"
+  ) || die "the verify-xum run $(readlink "$CURRENT_RUN_LINK") still runs from this checkout. Run verify-xum.sh cleanup first."
 }
 
 load_run() {
@@ -122,12 +127,12 @@ backend_ready() {
 
 write_state() {
   local name
-  : >"$VERIFY_XUM_RUN/state.env"
   for name in VERIFY_XUM_RUN_ID VERIFY_XUM_RUN VERIFY_XUM_CHECKOUT VERIFY_XUM_COMMIT VERIFY_XUM_PGID VERIFY_XUM_ROOT \
     VERIFY_XUM_BACKEND VERIFY_XUM_URL VERIFY_XUM_PROJECT VERIFY_XUM_WORKSPACE_ID \
     VERIFY_XUM_WORKTREE VERIFY_XUM_EVIDENCE AGENT_BROWSER_SESSION; do
-    printf 'export %s=%q\n' "$name" "${!name-}" >>"$VERIFY_XUM_RUN/state.env"
-  done
+    printf 'export %s=%q\n' "$name" "${!name-}"
+  done >"$VERIFY_XUM_RUN/state.env.tmp"
+  mv -f "$VERIFY_XUM_RUN/state.env.tmp" "$VERIFY_XUM_RUN/state.env"
 }
 
 check_bun() {
@@ -182,10 +187,10 @@ launch_failed() {
 }
 
 cmd_launch() {
-  local t0 i backend_port vite_port log pidfile
+  local t0 backend_port vite_port log
   need git curl node bun make setsid flock ss agent-browser
   check_bun
-  take_checkout_lock
+  refuse_while_checkout_server_runs
 
   VERIFY_XUM_RUN_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
   VERIFY_XUM_RUN="$VERIFY_XUM_HOME/$VERIFY_XUM_RUN_ID"
@@ -196,29 +201,29 @@ cmd_launch() {
   AGENT_BROWSER_SESSION="verify-xum-$VERIFY_XUM_RUN_ID"
   mkdir -p "$VERIFY_XUM_EVIDENCE" "$VERIFY_XUM_RUN/scratch"
   log="$VERIFY_XUM_RUN/server.log"
-  pidfile="$VERIFY_XUM_RUN/scratch/pgid"
   t0=$(date +%s)
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="${TMPDIR:-/tmp}" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
     VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID")
-  # Saved before the spawn, so cleanup finds a launch killed at any point after it.
   write_state
   ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
   trap launch_failed EXIT
-  # setsid(1) forks when its caller already leads a process group, so $! can miss the new
-  # group. The inner sh records its own pid, which is the new group id.
+  # The new group's leader appends its pid, which is the group id, to state.env before it starts
+  # make. From then on the launch guard and cleanup find the group, whenever the launcher dies.
+  # (setsid(1) forks when its caller already leads a process group, so $! can miss the group.)
   # shellcheck disable=SC2016
-  setsid sh -c 'echo "$$" >"$1"; shift; exec "$@"' sh "$pidfile" "${env_without_live_xum[@]}" \
+  setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; shift; exec "$@"' sh \
+    "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
-    >"$log" 2>&1 </dev/null &
-  for ((i = 0; i < 50; i++)); do
-    [[ -s $pidfile ]] && break
+    >"$log" 2>&1 </dev/null 9>&- &
+  until VERIFY_XUM_PGID=$(sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env")
+    [[ -n $VERIFY_XUM_PGID ]]; do
+    before_launch_deadline
     sleep 0.1
   done
-  VERIFY_XUM_PGID=$(cat "$pidfile")
-  echo "$VERIFY_XUM_PGID" >"$ONE_SERVER_PER_CHECKOUT_LOCK"
+  exec 9>&-
   write_state
 
   while true; do
@@ -270,7 +275,7 @@ cmd_doctor() {
   }
 
   check "process group $VERIFY_XUM_PGID is alive and carries this run's id" group_is_ours "$VERIFY_XUM_PGID" "$VERIFY_XUM_RUN_ID"
-  check "checkout lock $ONE_SERVER_PER_CHECKOUT_LOCK names this run" test "$(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null)" = "$VERIFY_XUM_PGID"
+  check "this checkout's newest run ($CURRENT_RUN_LINK) is this run" test "$(readlink "$CURRENT_RUN_LINK" 2>/dev/null)" = "$VERIFY_XUM_RUN"
   backend_pid=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" pid)
   check "backend pid ${backend_pid:-none} (server.lock in $VERIFY_XUM_ROOT) belongs to this run" \
     pid_in_group "$backend_pid" "$VERIFY_XUM_PGID"
@@ -341,9 +346,6 @@ is_dev_server_sandbox_root() {
 cmd_cleanup() {
   load_run "${1:-}"
   local i
-  # A launch killed before it saved these left them only in the pidfile and the server log.
-  [[ -n $VERIFY_XUM_PGID ]] || VERIFY_XUM_PGID=$(cat "$VERIFY_XUM_RUN/scratch/pgid" 2>/dev/null || true)
-  [[ -n $VERIFY_XUM_ROOT ]] || VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$VERIFY_XUM_RUN/server.log" 2>/dev/null || true)
   # agent-browser `close` on a session that does not exist starts that session first.
   if agent-browser session list 2>/dev/null | grep -qF "$AGENT_BROWSER_SESSION"; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
@@ -364,7 +366,6 @@ cmd_cleanup() {
     rm -rf "$VERIFY_XUM_ROOT"
   fi
   rm -rf "$VERIFY_XUM_RUN/scratch"
-  [[ $(cat "$ONE_SERVER_PER_CHECKOUT_LOCK" 2>/dev/null) == "$VERIFY_XUM_PGID" ]] && rm -f "$ONE_SERVER_PER_CHECKOUT_LOCK"
   [[ $(readlink "$CURRENT_RUN_LINK" 2>/dev/null) == "$VERIFY_XUM_RUN" ]] && rm -f "$CURRENT_RUN_LINK"
   VERIFY_XUM_PGID=
   write_state

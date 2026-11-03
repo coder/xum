@@ -45,10 +45,11 @@ Preconditions:
 
 - Wait for the option you want to be selected before you press Enter. The first palette open after
   a page load shows a plain input while the palette's code loads (`LoadingPaletteInput` at
-  `src/browser/components/CommandPalette/LazyCommandPalette.tsx:37`). It has the same label
-  `Command palette` and keeps typed text, but it ignores Enter (line 60). agent-browser types and
-  presses Enter in a few milliseconds, before the code arrives. A person who pastes a query and
-  presses Enter on a slow connection loses the Enter the same way.
+  `src/browser/components/CommandPalette/LazyCommandPalette.tsx:38`), with the same label
+  `Command palette`. agent-browser types and presses Enter in a few milliseconds, before the code
+  arrives. Since #7897 that input keeps the Enter and runs it on the first option once the code
+  loads. Before it, the Enter was lost. The wait proves that the option Enter runs is the one the
+  recipe expects.
 - Type into the palette with `agent-browser keyboard type`. The combobox has focus as soon as it
   opens.
 - Workspace options show the title only. A leading `•` marks the open workspace.

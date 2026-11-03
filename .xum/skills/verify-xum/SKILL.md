@@ -58,9 +58,11 @@ Ready means all of these hold:
   repo) and the workspace `Verify playground` with its worktree set up.
 
 It prints the run's `export` lines and the URL of the seeded workspace. A failed launch prints the
-server log tail and cleans up. Launch refuses while another verify-xum launch or server runs from
-this checkout: two dev servers in one checkout share `dist/` and `node_modules/.vite`. The server's
-processes hold that lock, so it holds even when the launcher was killed partway.
+server log tail and cleans up. Launch refuses while the process group of this checkout's newest
+run is alive, by the same identity check as cleanup: two dev servers in one checkout share `dist/`
+and `node_modules/.vite`. The group's first process writes the group id into the run's
+`state.env` before it starts the server, so the check and cleanup find the group even when the
+launcher was killed partway.
 
 ## Doctor
 
@@ -70,11 +72,11 @@ Run it first whenever anything looks off. It changes nothing.
 .xum/skills/verify-xum/scripts/verify-xum.sh doctor
 ```
 
-Every check line must read `ok`. A `note` line only informs. It checks that the process group lives and carries the run's id
-(`VERIFY_XUM_SERVER_OF` in its env), the checkout lock names it, the backend pid in the sandbox
-`server.lock` and the app port belong to the group, `/health` answers, `/version` reports the
-launch commit, and the backend env has `XUM_MOCK_AI=1`. Exit 1 means do not drive this instance:
-run cleanup, then launch again.
+Every check line must read `ok`. A `note` line only informs. It checks that the process group
+lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
+names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
+`/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
+Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
 
@@ -162,7 +164,9 @@ then SIGKILL after 20 s), deletes the sandbox XUM_ROOT and the demo repo, and pr
 path and file count. It refuses a run that another checkout launched. It signals the group only
 while one of its processes carries the run's id and a live group leader is still the launch's
 `make dev-server-sandbox`, so it kills nothing it did not start. Then it blanks the group id in
-the run's `state.env`. Run it after every run, failed ones too. `doctor`, `env`,
+the run's `state.env`. A launch killed with SIGKILL before it printed `ready` can leave its
+`mux-dev-server-*` folder in TMPDIR: cleanup stops the group, but the run never recorded that
+folder. Run cleanup after every run, failed ones too. `doctor`, `env`,
 `capture`, `idle`, `send-ready` and `cleanup` take an optional run directory. Without one they use
 the newest launch from this checkout.
 

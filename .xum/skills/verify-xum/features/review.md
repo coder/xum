@@ -40,7 +40,9 @@ Preconditions:
 - **Open Review.** Run `agent-browser find role button click --name "Review" --exact` and
   `agent-browser wait --text "Uncommitted:"`. The tab `Review Close Review` is selected, and the
   panel reads `No changes found` with `Uncommitted:` unchecked. If the page reloads here instead
-  (a cold Vite cache, see Gotchas), run `verify-xum.sh idle` and repeat from **Open the sidebar**.
+  (a cold Vite cache, see Gotchas), the sidebar and the Review tab stay open. Run
+  `verify-xum.sh idle` and `agent-browser wait --text "Uncommitted:"`, then continue at
+  **Include uncommitted edits**.
 - **Include uncommitted edits.** Run
   `agent-browser find role checkbox check --name "Uncommitted:" --exact` and
   `agent-browser wait --text "math.ts"`. The file tree lists `src` and `math.ts` with `+3`, the
@@ -68,8 +70,8 @@ Preconditions:
 - `find role ... --name` matches substrings without `--exact`. The hunk itself is a button whose
   name starts with `Mark as read (M)`, so the call without `--exact` selects the hunk and marks
   nothing.
-- On a cold Vite cache the first open of Review reloads the page (see SKILL.md Gotchas). Open it
-  again after the reload.
+- On a cold Vite cache the first open of Review reloads the page (see SKILL.md Gotchas). The
+  sidebar and the Review tab stay open after the reload, so the recipe goes on from the open tab.
 - A click on `Review` while the sidebar still slides open is lost. Keep the `idle` call before it.
 - Skip a Restore step and a rerun in the same run fails. A hunk's id comes from its content, so
   the same edit comes back already read. With `Uncommitted:` already checked, the panel did not
