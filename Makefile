@@ -49,7 +49,8 @@ XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 # through the Vite proxy as `/?token=<token>` once; the proxy adds nothing, so the Vite port is no
 # way around auth. XUM_DEV_SERVER_AUTH_TOKEN picks the token. The ambient XUM_SERVER_AUTH_TOKEN is
 # never reused: agent shells export the real server's token. XUM_DEV_SERVER_NO_AUTH=1 restores the
-# open backend, for hosts where you are the only account.
+# open backend, for hosts where you are the only account. Keep XUM_ROOT outside the checkout: Vite
+# serves the checkout to anyone who can reach its port, and public/ without any file checks.
 ifeq ($(XUM_DEV_SERVER_NO_AUTH),1)
 DEV_SERVER_AUTH_FLAG := --no-auth
 else

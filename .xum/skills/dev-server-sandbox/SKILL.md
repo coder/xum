@@ -73,6 +73,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$BACKEND_PORT/a
 - Browser: open `http://localhost:$VITE_PORT/?token=$(node -p 'encodeURIComponent(process.argv[1])' "$TOKEN")` once. The app keeps the token and strips it from the address bar. Without it, the app asks for the token.
 - `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
 - The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
+- Keep `XUM_ROOT` outside the checkout. Vite serves the checkout to anyone who can reach its port, and its `public/` folder without any file checks. The sandbox root is under the system temp dir.
 - `XUM_DEV_SERVER_AUTH_TOKEN=<token>` picks the token. `XUM_DEV_SERVER_NO_AUTH=1` starts an open backend, which any local account can control: use it only on a host where you are the only account.
 
 ## Options

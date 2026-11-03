@@ -121,8 +121,8 @@ describe("make dev-server auth", () => {
 });
 
 // Vite serves any file under its root at /@fs/<path> to whoever reaches its port, and its proxy
-// passes the token check on to the backend. So the token on disk must not be servable, wherever
-// XUM_ROOT sits (for example inside the checkout).
+// passes the token check on to the backend. So the token on disk must not be servable there. Its
+// public/ folder is served without file checks, so XUM_ROOT still has to stay outside the checkout.
 describe("vite dev server", () => {
   test("never serves a server.lock or the files Vite denies by default, but serves source", async () => {
     // Vite's config cannot be loaded under Bun (its plugins need Node), so ask Node.
