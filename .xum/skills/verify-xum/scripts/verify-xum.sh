@@ -143,55 +143,19 @@ private_run_dir() {
 }
 
 # Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which another
-# account can write in a shared repository, so the shell never opens that pathname itself: a
-# symlink planted there made `9>` truncate its target, and a FIFO swapped in after a check makes
-# a plain open block before the timed flock. A node helper opens it with O_NOFOLLOW and
-# O_NONBLOCK (creating it with O_EXCL when it is absent), checks the open file with fstat (a
-# regular file of this user), sets its mode to 0600 (another account that can read it can flock
-# it and block every launch, and a guard from an older version is 0644), and keeps it open while
-# the shell opens the same file through /proc/<helper pid>/fd/<fd>. Read only: flock needs no
-# write access.
+# account can write in a shared repository: a symlink planted there made `9>` truncate its target.
+# The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
+# only, which can neither create nor truncate anything (flock needs no write access). Then fd 9
+# must be the regular file of this user that the path names. Its mode is 0600: another account
+# that can read it can flock it and block every launch. A guard from an older version is 0644,
+# so the mode is set on the open file too.
 open_launch_guard() {
-  local line pid fd id from_helper to_helper helper
-  # shellcheck disable=SC2016 # node code
-  coproc GUARD_OPENER {
-    node -e '
-      const fs = require("fs");
-      const { O_RDONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
-      const fail = (why) => {
-        process.stdout.write("error " + why + "\n");
-        process.exit(1);
-      };
-      let fd;
-      try {
-        fd = fs.openSync(process.argv[1], O_RDONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
-      } catch (error) {
-        if (error.code !== "EEXIST") fail(error.code);
-        try {
-          fd = fs.openSync(process.argv[1], O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-        } catch (error) {
-          fail(error.code === "ELOOP" ? "is a symlink" : error.code);
-        }
-      }
-      const st = fs.fstatSync(fd);
-      if (!st.isFile()) fail("is not a regular file");
-      if (st.uid !== process.getuid()) fail("is not owned by user " + process.getuid());
-      fs.fchmodSync(fd, 0o600);
-      process.stdout.write("ok " + process.pid + " " + fd + " " + st.dev + ":" + st.ino + "\n");
-      fs.readFileSync(0);' "$LAUNCH_GUARD" 2>&1
-  }
-  # Bash drops the coproc's names once it ends, so keep the fds and pid.
-  from_helper=${GUARD_OPENER[0]} to_helper=${GUARD_OPENER[1]} helper=$GUARD_OPENER_PID
-  IFS= read -r line <&"$from_helper" || line="error the guard helper ended early"
-  if [[ $line == "ok "* ]]; then
-    read -r _ pid fd id <<<"$line"
-    exec 9<"/proc/$pid/fd/$fd"
-  fi
-  # EOF on its stdin ends the helper.
-  eval "exec $to_helper>&- $from_helper<&-"
-  wait "$helper" 2>/dev/null || true
-  [[ $line == "ok "* ]] || die "$LAUNCH_GUARD ${line#error }. Remove it."
-  [[ $(stat -L -c '%d:%i' /proc/self/fd/9) == "$id" ]] || die "$LAUNCH_GUARD changed while it was opened. Remove it."
+  [[ -e $LAUNCH_GUARD || -L $LAUNCH_GUARD ]] || (umask 077 && set -C && : >"$LAUNCH_GUARD") 2>/dev/null || true
+  [[ -f $LAUNCH_GUARD && ! -L $LAUNCH_GUARD ]] || die "$LAUNCH_GUARD is not a regular file (a symlink?). Remove it."
+  exec 9<"$LAUNCH_GUARD"
+  [[ $(stat -L -c '%d:%i:%u' /proc/self/fd/9) == "$(stat -c '%d:%i' -- "$LAUNCH_GUARD"):$(id -u)" ]] \
+    || die "$LAUNCH_GUARD is not owned by user $(id -u), or it changed while it was opened. Remove it."
+  chmod 600 /proc/self/fd/9
 }
 
 # The rule for the newest-run link: every read-compare-write or unlink of verify-xum.current, in
