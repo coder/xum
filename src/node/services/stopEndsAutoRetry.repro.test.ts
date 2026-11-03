@@ -3,13 +3,16 @@ import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { APICallError } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
-import { Ok } from "@/common/types/result";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import { Err, Ok } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { createConfigStores } from "@/node/config";
 import { AgentSession } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import type { TaskHandleStore } from "@/node/services/taskHandleStore";
+import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type {
   ProviderModelFactory,
   ResolveAndCreateModelResult,
@@ -254,13 +257,18 @@ async function assertBackoffPending(
 }
 
 /** A new workspace turn whose first stream failed and armed a backoff that has not fired. */
-async function startFailedTurn(env: TestEnvironment, ownerId: string) {
+async function startFailedTurn(
+  env: TestEnvironment,
+  ownerId: string,
+  attentionPolicy?: "notify_on_terminal"
+) {
   const retries = watchRetries(env);
   const turn = await env.services.workspaceTurnManager.createWorkspaceTurn({
     ownerWorkspaceId: ownerId,
     prompt: "Survey the repository",
     title: "Stopped turn",
     workspace: { mode: "new" },
+    attentionPolicy,
   });
   if (!turn.success) throw new Error(turn.error);
   await assertBackoffPending(env, retries, turn.data.workspaceId);
@@ -957,6 +965,242 @@ describe("a Stop ends the auto-retry loop", () => {
     });
   }, 90_000);
 
+  test.each([
+    {
+      row: "a mid-stream compaction request",
+      build: (turnMetadata: MuxMessageMetadata) =>
+        createMuxMessage("auto-compaction-request", "user", "Summarize", {
+          synthetic: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            source: "auto-compaction",
+            parsed: {
+              followUpContent: {
+                text: "Continue",
+                model: HAIKU_MODEL,
+                agentId: "exec",
+                muxMetadata: turnMetadata,
+                dispatchOptions: { source: "internal-resume" },
+              },
+            },
+          },
+        }),
+    },
+    {
+      row: "a child's completed report",
+      build: () =>
+        createMuxMessage(
+          "child-report",
+          "user",
+          formatSubagentReportEnvelope({
+            taskId: "child-task",
+            agentType: "explore",
+            status: "completed",
+            title: "Survey",
+            reportMarkdown: "Done.",
+          }),
+          { synthetic: true, uiVisible: true }
+        ),
+    },
+    {
+      row: "a goal-pause boundary",
+      build: () =>
+        createMuxMessage("goal-pause", "user", "Goal paused", {
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: { type: "goal-pause-boundary" },
+        }),
+    },
+    {
+      row: "a file snapshot",
+      build: () =>
+        createMuxMessage("file-snapshot", "user", "README.md contents", {
+          synthetic: true,
+          uiVisible: true,
+          fileAtMentionSnapshot: ["@README.md"],
+        }),
+    },
+    {
+      row: "a hidden synthetic row",
+      build: () => createMuxMessage("hidden-row", "user", "Internal note", { synthetic: true }),
+    },
+    {
+      row: "a context-budget warning",
+      build: () =>
+        createMuxMessage("budget-warning", "user", "Context is almost full", {
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 900,
+            maxTokens: 1_000,
+            budgetTokens: 800,
+          },
+        }),
+    },
+  ])(
+    "interrupting a turn that restart recovery settled stops it after $row",
+    async (args) => {
+      await withWorkspace(async (env, ownerId) => {
+        const model = failsOnceModel();
+        replaceModel(env, model);
+        const turn = await startFailedTurn(env, ownerId);
+        await dropTurnOwnerLock(env.services, turn.taskId);
+        const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+          await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+        });
+        try {
+          const { workspaceService, workspaceTurnManager } = restarted;
+          const { historyService } = restarted as unknown as { historyService: HistoryService };
+          assert(
+            workspaceService.hasPendingAutoRetry(turn.workspaceId),
+            "startup recovery resumes the turn"
+          );
+          const history = await historyService.getHistoryFromLatestBoundary(turn.workspaceId);
+          const turnMetadata = history.success
+            ? history.data.find((row) => row.metadata?.muxMetadata?.type === "workspace-turn-task")
+                ?.metadata?.muxMetadata
+            : undefined;
+          assert(turnMetadata != null, "the turn's prompt is in its history");
+          // Automatic rows after the turn's prompt continue the turn: retry still resumes it.
+          assert(
+            (await historyService.appendToHistory(turn.workspaceId, args.build(turnMetadata)))
+              .success,
+            "the row is in the turn's history"
+          );
+
+          await interruptTurn(restarted, ownerId, turn.taskId);
+
+          const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+          expect({
+            pending: workspaceService.hasPendingAutoRetry(turn.workspaceId),
+            handle: { status: record?.status, error: record?.error },
+          }).toEqual({ pending: false, handle: { status: "interrupted", error: undefined } });
+        } finally {
+          await restarted.dispose();
+          await restarted.shutdown();
+        }
+      });
+    },
+    90_000
+  );
+
+  test("interrupting a turn that restart recovery settled stops it when its history cannot be read", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { workspaceService, workspaceTurnManager } = restarted;
+        const { historyService } = restarted as unknown as { historyService: HistoryService };
+        assert(
+          workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          "startup recovery resumes the turn"
+        );
+        const read = historyService.getHistoryFromLatestBoundary.bind(historyService);
+        let unreadable = true;
+        spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          (workspaceId, ...rest) =>
+            unreadable && workspaceId === turn.workspaceId
+              ? Promise.resolve(Err("history unreadable"))
+              : read(workspaceId, ...rest)
+        );
+
+        await interruptTurn(restarted, ownerId, turn.taskId);
+        unreadable = false;
+
+        const record = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        expect({
+          pending: workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          handle: { status: record?.status, error: record?.error },
+        }).toEqual({ pending: false, handle: { status: "interrupted", error: undefined } });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("interrupting a background turn that restart recovery settled retires the restart's wake", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId, "notify_on_terminal");
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { workspaceTurnManager } = restarted;
+        const attention = (
+          workspaceTurnManager as unknown as { terminalAttentionStore: TerminalAttentionStore }
+        ).terminalAttentionStore;
+        const wakesForTurn = async () =>
+          (await attention.listPending(ownerId)).filter((wake) => wake.sourceId === turn.taskId);
+        const settled = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        assert(
+          settled?.terminalAttentionNotifiedAt != null && (await wakesForTurn()).length > 0,
+          "restart recovery's settlement queued a wake for the owner"
+        );
+
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        const stopped = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        expect({
+          notifiedAt: stopped?.terminalAttentionNotifiedAt,
+          wakes: await wakesForTurn(),
+        }).toEqual({ notifiedAt: undefined, wakes: [] });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("interrupting a superseded turn stays a no-op while its workspace still retries", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { workspaceService, workspaceTurnManager } = restarted;
+        const store = (workspaceTurnManager as unknown as { taskHandleStore: TaskHandleStore })
+          .taskHandleStore;
+        const settled = await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId);
+        assert(
+          settled?.status === "interrupted" &&
+            workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          "restart recovery settled the turn and startup recovery resumes it"
+        );
+        // Only a restart-recovery interrupt is resumable. A supersede says that other input took
+        // the workspace over, so the retry there is not this turn's.
+        const superseded = {
+          ...settled,
+          error:
+            "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        };
+        await store.upsertWorkspaceTurn(superseded);
+
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        expect({
+          pending: workspaceService.hasPendingAutoRetry(turn.workspaceId),
+          handle: await workspaceTurnManager.getWorkspaceTurnRecord(ownerId, turn.taskId),
+        }).toEqual({ pending: true, handle: superseded });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
   test("interrupting a turn that restart recovery settled leaves a newer prompt's stream running", async () => {
     await withWorkspace(async (env, ownerId) => {
       const model = failsOnceThenStreamsModel();
@@ -995,6 +1239,47 @@ describe("a Stop ends the auto-retry loop", () => {
           streaming: true,
           handle: { status: "interrupted", error: "Workspace turn interrupted after restart" },
         });
+      } finally {
+        await restarted.dispose();
+        await restarted.shutdown();
+      }
+    });
+  }, 90_000);
+
+  test("a user's send during a turn interrupt's handle write is refused, not aborted", async () => {
+    await withWorkspace(async (env, ownerId) => {
+      const model = failsOnceThenStreamsModel();
+      replaceModel(env, model);
+      const turn = await startFailedTurn(env, ownerId);
+      await dropTurnOwnerLock(env.services, turn.taskId);
+      const restarted = await restart(env, model, turn.workspaceId, async (services) => {
+        await services.workspaceTurnManager.countActiveWorkspaceTurnsInGlobalScan();
+      });
+      try {
+        const { aiService, workspaceService, workspaceTurnManager } = restarted;
+        const store = (workspaceTurnManager as unknown as { taskHandleStore: TaskHandleStore })
+          .taskHandleStore;
+        const upsert = store.upsertWorkspaceTurn.bind(store);
+        let sent: Awaited<ReturnType<typeof workspaceService.sendMessage>> | undefined;
+        // The interrupt has read the turn's history and decided to stop the turn. A send that
+        // started now and streamed would be aborted by that decision.
+        spyOn(store, "upsertWorkspaceTurn").mockImplementation(async (record) => {
+          if (record.handleId === turn.taskId && sent == null) {
+            sent = await workspaceService.sendMessage(turn.workspaceId, "Do something else", {
+              model: HAIKU_MODEL,
+              agentId: "exec",
+            });
+          }
+          return upsert(record);
+        });
+
+        await interruptTurn(restarted, ownerId, turn.taskId);
+
+        assert(sent != null, "the user's send ran during the handle write");
+        expect({
+          sendAccepted: sent.success,
+          streaming: aiService.isStreaming(turn.workspaceId),
+        }).toEqual({ sendAccepted: false, streaming: false });
       } finally {
         await restarted.dispose();
         await restarted.shutdown();
