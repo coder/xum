@@ -229,29 +229,44 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
   let otherPort: DryRun;
   let chosen: DryRun;
   let windows: DryRun;
+  let windowsAmbient: DryRun;
+  let otherHost: DryRun;
+  let ipv6Host: DryRun;
   let otherGoal: DryRun;
 
   beforeAll(async () => {
-    [socketRun, otherPort, chosen, windows, otherGoal] = await Promise.all([
-      dryRun("dev-server", { XUM_BACKEND_PORT: "3111" }),
-      dryRun("dev-server", { XUM_BACKEND_PORT: "3222" }),
-      dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/custom.sock" }),
-      dryRun("dev-server", {}, ["OS=Windows_NT"]),
-      dryRun("help"),
-    ]);
+    [socketRun, otherPort, chosen, windows, windowsAmbient, otherHost, ipv6Host, otherGoal] =
+      await Promise.all([
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111" }),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3222" }),
+        dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/custom.sock" }),
+        dryRun("dev-server", {}, ["OS=Windows_NT"]),
+        dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/ambient.sock" }, ["OS=Windows_NT"]),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111", XUM_BACKEND_HOST: "192.168.1.5" }),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111", XUM_BACKEND_HOST: "::1" }),
+        dryRun("help"),
+      ]);
   }, 60_000);
 
   test("the backend listens on the exported path, and the path fits sun_path", async () => {
     const socket = exportedSocket(socketRun);
     expect(socket.startsWith("/")).toBe(true);
-    expect(socket).toMatch(/b3111\.sock$/);
+    expect(socket).toMatch(/b3111-127\.0\.0\.1\.sock$/);
     expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);
     expect(await backendSocketArgument(socketRun)).toBe(socket);
   });
 
   test("each backend port gets its own socket", () => {
-    expect(otherPort.socket).toMatch(/b3222\.sock$/);
+    expect(otherPort.socket).toMatch(/b3222-/);
     expect(otherPort.socket).not.toBe(socketRun.socket);
+  });
+
+  // Two backends on one port with different bind addresses can run together, so the socket name
+  // needs the host as well, or the second backend would find the first one's socket in use.
+  test("the same port on another host gets its own socket, and a host has no colons", () => {
+    expect(otherHost.socket).toMatch(/b3111-192\.168\.1\.5\.sock$/);
+    expect(otherHost.socket).not.toBe(socketRun.socket);
+    expect(path.basename(exportedSocket(ipv6Host))).toBe("b3111-__1.sock");
   });
 
   test("XUM_BACKEND_SOCKET picks the path for both sides", async () => {
@@ -270,6 +285,12 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
   test("Windows keeps TCP: no socket for Vite or the backend", () => {
     expect(windows.socket).toBeUndefined();
     expect(backendCommand(windows)).not.toContain("--unix-socket");
+  });
+
+  // The Windows recipe starts the backend on TCP only. An ambient path would still reach Vite, which
+  // would proxy to a socket that nothing listens on.
+  test("Windows ignores an ambient XUM_BACKEND_SOCKET", () => {
+    expect(windowsAmbient.socket ?? "").toBe("");
   });
 
   test("other goals export no socket", () => {
