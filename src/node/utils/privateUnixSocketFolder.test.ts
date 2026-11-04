@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { chooseDevSocketPath } from "./privateUnixSocketFolder";
+import { chooseDevSocketPath, MAX_UNIX_SOCKET_PATH_BYTES } from "./privateUnixSocketFolder";
 
 const posix = process.platform !== "win32";
 
@@ -36,10 +36,15 @@ describe.skipIf(!posix)("chooseDevSocketPath", () => {
     return folder;
   }
 
-  test("a missing folder is the answer, and nothing is created", async () => {
+  // make builds for a while between choosing the path and starting the backend, so a missing folder
+  // is claimed at once: another account cannot take the name in between.
+  test("a missing folder is created private and is the answer", async () => {
     const choice = await chooseDevSocketPath(preferred, "b1.sock", uid);
     expect(choice).toEqual({ socketPath: path.join(preferred, "b1.sock") });
-    expect(await fs.readdir(base)).toEqual([]);
+    const stat = await fs.lstat(preferred);
+    expect(stat.isDirectory()).toBe(true);
+    expect(stat.uid).toBe(uid);
+    expect(stat.mode & 0o777).toBe(0o700);
   });
 
   test("a private folder of ours is the answer", async () => {
@@ -70,6 +75,24 @@ describe.skipIf(!posix)("chooseDevSocketPath", () => {
     expect(choice.fellBackFrom?.reason).toMatch(/not a directory|symlink/);
     await expectFreshPrivateFolder(choice.socketPath);
     expect(await fs.readdir(elsewhere)).toEqual([]);
+  });
+
+  test("a fallback that would not fit a socket path is refused before it creates anything", async () => {
+    await fs.mkdir(preferred, { mode: 0o755 });
+    await fs.chmod(preferred, 0o755);
+    // The folder name gains "." and six characters: pick a file name that fits only without them.
+    const room = MAX_UNIX_SOCKET_PATH_BYTES - Buffer.byteLength(path.join(preferred, "x")) - 3;
+    const fileName = "s".repeat(room + 1);
+    expect(Buffer.byteLength(path.join(preferred, fileName))).toBeLessThanOrEqual(
+      MAX_UNIX_SOCKET_PATH_BYTES
+    );
+    const error = await chooseDevSocketPath(preferred, fileName, uid).then(
+      () => null,
+      (e: unknown) => e
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/too long/);
+    expect(await fs.readdir(base)).toEqual([`xum-dev-${uid}`]);
   });
 
   test("every fallback gets its own folder", async () => {

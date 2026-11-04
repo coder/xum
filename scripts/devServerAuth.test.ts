@@ -303,13 +303,15 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
       await fs.rm(runtimeDir, { recursive: true, force: true });
     });
 
-    test("is $XDG_RUNTIME_DIR/xum-dev-<uid>, and make creates nothing", async () => {
+    // make builds for a while before the backend starts: it claims the folder (mode 0700) at once, so
+    // another account cannot take the name in between.
+    test("is $XDG_RUNTIME_DIR/xum-dev-<uid>, created private by make", async () => {
       const run = await dryRun("dev-server", {
         XDG_RUNTIME_DIR: runtimeDir,
         XUM_BACKEND_PORT: "3111",
       });
       expect(run.socket).toBe(path.join(runtimeDir, `xum-dev-${uid}`, "b3111-127.0.0.1.sock"));
-      expect(await fs.readdir(runtimeDir)).toEqual([]);
+      expect((await fs.stat(path.join(runtimeDir, `xum-dev-${uid}`))).mode & 0o777).toBe(0o700);
     });
 
     test("is kept when it is a private folder of ours", async () => {
