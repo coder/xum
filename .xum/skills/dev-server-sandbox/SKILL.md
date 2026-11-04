@@ -97,7 +97,7 @@ fi
 
 The app keeps the token and strips it from the address bar, so later `agent-browser` commands carry no token. Without it, the app asks for the token. Do not use `agent-browser open "<url with token>"`: it puts the token in the command line. Do not pipe the batch straight to the terminal: its output repeats the URL with the token.
 
-The stream is on again in every new `agent-browser` daemon: after `agent-browser close`, or after the daemon idles out, run the recipe again before you open the app. Check with `agent-browser stream status`.
+The stream is on again in every new `agent-browser` daemon: after `agent-browser close`, or after the daemon idles out, run the recipe again before you open the app. Check with `agent-browser stream status`. A Xum app that attaches the session in its Browser tab also turns the stream on (`ensureSessionAttachable`): do not attach this session.
 
 Limit: Chrome itself listens on a loopback DevTools port (`--remote-debugging-port=0`, set by `agent-browser`, which cannot start Chrome without it). That port has no credential either, so while the authenticated page is open in `agent-browser`, any local account can drive it, read its storage and open a terminal in the sandbox. Turning the stream off removes only one of the two open ports. On a host with other accounts, call the backend with `curl` or `xum api` as above and do not open the authenticated page.
 
