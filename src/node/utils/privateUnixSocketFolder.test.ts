@@ -47,6 +47,20 @@ describe.skipIf(!posix)("chooseDevSocketPath", () => {
     expect(stat.mode & 0o777).toBe(0o700);
   });
 
+  test("a default path that cannot fit is refused before the folder is created", async () => {
+    const error = await chooseDevSocketPath(
+      preferred,
+      "s".repeat(MAX_UNIX_SOCKET_PATH_BYTES),
+      uid
+    ).then(
+      () => null,
+      (e: unknown) => e
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/too long/);
+    expect(await fs.readdir(base)).toEqual([]);
+  });
+
   test("a private folder of ours is the answer", async () => {
     await fs.mkdir(preferred, { mode: 0o700 });
     const choice = await chooseDevSocketPath(preferred, "b1.sock", uid);

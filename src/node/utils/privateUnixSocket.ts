@@ -56,7 +56,7 @@ async function removeStaleSocket(socketPath: string, ownerUid: number): Promise<
 }
 
 /** The lock file must be a regular file of ours: a symlink would send the lock somewhere else. */
-async function assertLockPathUsable(lockPath: string, ownerUid: number): Promise<void> {
+export async function assertLockPathUsable(lockPath: string, ownerUid: number): Promise<void> {
   let entry;
   try {
     entry = await fs.lstat(lockPath);

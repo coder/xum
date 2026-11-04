@@ -1,9 +1,19 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
+
+// make claims the default socket folder at parse time, in `$XDG_RUNTIME_DIR` or /tmp. A dry run must
+// not leave one on the test host, so every make call here gets a runtime dir of its own.
+//
+// The base is under /tmp, not os.tmpdir(): macOS's os.tmpdir() is a long /var/folders/... path, and
+// `<base>/xum-dev-<uid>/b3111-192.168.1.5.sock` must fit the 103 bytes of a macOS socket path.
+const SHORT_TMP = process.platform === "win32" ? os.tmpdir() : "/tmp";
+const RUNTIME_BASE = fsSync.mkdtempSync(path.join(SHORT_TMP, "xum-make-base-"));
+afterAll(() => fsSync.rmSync(RUNTIME_BASE, { recursive: true, force: true }));
 
 interface DryRun {
   /** XUM_BACKEND_SOCKET as make exports it to the recipe's processes (env, not secret). */
@@ -23,7 +33,12 @@ async function dryRun(
 ): Promise<DryRun> {
   const proc = Bun.spawn(["make", "-pn", ...makeFlags, goal], {
     cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", ...env },
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+      XDG_RUNTIME_DIR: RUNTIME_BASE,
+      ...env,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -250,7 +265,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
 
   test("the backend listens on the exported path, and the path fits sun_path", async () => {
     const socket = exportedSocket(socketRun);
-    expect(socket.startsWith("/")).toBe(true);
+    expect(socket.startsWith(`${RUNTIME_BASE}${path.sep}`)).toBe(true);
     expect(socket).toMatch(/b3111-127\.0\.0\.1\.sock$/);
     expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);
     expect(await backendSocketArgument(socketRun)).toBe(socket);
@@ -296,7 +311,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
     let runtimeDir: string;
 
     beforeEach(async () => {
-      runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-make-test-"));
+      runtimeDir = await fs.mkdtemp(path.join(SHORT_TMP, "xum-make-test-"));
     });
 
     afterEach(async () => {
@@ -344,25 +359,43 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
       expect(await backendSocketArgument(run)).toBe(socket);
     });
 
-    test("make stops with a message when the parent cannot be trusted", async () => {
-      const shared = path.join(runtimeDir, "shared");
-      await fs.mkdir(shared);
-      await fs.chmod(shared, 0o777);
+    /** `make -pn dev-server` that is expected to stop: its exit code and stderr. */
+    async function makeStops(xdgRuntimeDir: string) {
       const proc = Bun.spawn(["make", "-pn", "dev-server"], {
         cwd: REPO_ROOT,
         env: {
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
-          XDG_RUNTIME_DIR: shared,
+          XDG_RUNTIME_DIR: xdgRuntimeDir,
         },
         stdout: "pipe",
         stderr: "pipe",
       });
       const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      return { exitCode, stderr };
+    }
+
+    test("make stops with a message when the parent cannot be trusted", async () => {
+      const shared = path.join(runtimeDir, "shared");
+      await fs.mkdir(shared);
+      await fs.chmod(shared, 0o777);
+      const { exitCode, stderr } = await makeStops(shared);
       expect(exitCode).not.toBe(0);
       expect(stderr).toContain("XUM_BACKEND_SOCKET");
       expect(stderr).toContain("XDG_RUNTIME_DIR");
       expect(await fs.readdir(shared)).toEqual([]);
+    });
+
+    // The backend refuses a path that does not fit sun_path, so a folder made for it would be an
+    // empty folder for nothing: make stops first, and creates nothing.
+    test("make stops with a message when the default path is too long, and creates nothing", async () => {
+      const deep = path.join(runtimeDir, "d".repeat(100));
+      await fs.mkdir(deep, { mode: 0o700 });
+      const { exitCode, stderr } = await makeStops(deep);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toMatch(/too long/);
+      expect(stderr).toContain("XUM_BACKEND_SOCKET");
+      expect(await fs.readdir(deep)).toEqual([]);
     });
   });
 
