@@ -455,8 +455,10 @@ cmd_launch() {
   mkdir -m 700 "$VERIFY_XUM_RUN/tmp"
   require_private_dir "$VERIFY_XUM_RUN/tmp"
   log="$VERIFY_XUM_RUN/server.log"
-  # Milliseconds: a stamp from earlier in the launch's own second is a stale build.
-  t0=$(date +%s%3N)
+  # Milliseconds: a stamp from earlier in the launch's own second is a stale build. From node,
+  # like the stamp itself (scripts/build-main-watch.js writes Date.now()): uutils date 0.8 ignores
+  # the width in %3N and prints nanoseconds, so no stamp would ever be newer.
+  t0=$(node -p 'Date.now()')
 
   local env_without_live_xum=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LANG="${LANG:-C.UTF-8}"
     TERM=dumb TMPDIR="$VERIFY_XUM_RUN/tmp" XUM_MOCK_AI=1 XUM_DISABLE_TELEMETRY=1
