@@ -9,7 +9,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import { BROWSER_BRIDGE_WS_PATH, createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
 import {
   FIRST_RUN_EARLY_SCRIPT,
   FIRST_RUN_MODULES_ID,
@@ -2511,3 +2511,109 @@ describe("the static workspace view on a phone's workspace page", () => {
     }
   });
 });
+
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `rejects` as non-thenable */
+describe("createOrpcServer unixSocketPath", () => {
+  type Upgrade = Parameters<
+    NonNullable<Parameters<typeof createOrpcServer>[0]["desktopBridgeServer"]>["handleUpgrade"]
+  >;
+
+  function requestOverSocket(socketPath: string, route: string, upgrade: boolean) {
+    return new Promise<{ status: number; upgraded: boolean }>((resolve, reject) => {
+      const req = http.request({
+        socketPath,
+        path: route,
+        headers: upgrade
+          ? {
+              Connection: "Upgrade",
+              Upgrade: "websocket",
+              "Sec-WebSocket-Version": "13",
+              "Sec-WebSocket-Key": Buffer.from("0123456789abcdef").toString("base64"),
+            }
+          : {},
+      });
+      req.once("response", (res) => {
+        res.resume();
+        resolve({ status: res.statusCode ?? 0, upgraded: false });
+      });
+      req.once("upgrade", (res, socket) => {
+        socket.destroy();
+        resolve({ status: res.statusCode ?? 0, upgraded: true });
+      });
+      req.once("error", reject);
+      req.end();
+    });
+  }
+
+  test("serves HTTP and all three WebSocket routes over a private socket, then removes it", async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "xum-orpc-sock-"));
+    const socketPath = path.join(base, "run", "b.sock");
+    const bridged: string[] = [];
+    const bridge = {
+      handleUpgrade(...[req, socket]: Upgrade) {
+        bridged.push(req.url ?? "");
+        socket.destroy();
+      },
+      stop: () => Promise.resolve(),
+    };
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: orpcContextFromDoubles({}),
+        authToken: "test-token",
+        unixSocketPath: socketPath,
+        desktopBridgeServer: bridge,
+        browserBridgeServer: bridge,
+      });
+
+      expect((await fs.stat(path.dirname(socketPath))).mode & 0o777).toBe(0o700);
+      expect(await requestOverSocket(socketPath, "/version", false)).toEqual({
+        status: 200,
+        upgraded: false,
+      });
+      expect(await requestOverSocket(`${socketPath}`, `${ORPC_WS_PATH}?token=T`, true)).toEqual({
+        status: 101,
+        upgraded: true,
+      });
+      await requestOverSocket(socketPath, `${DESKTOP_WS_PATH}?token=T`, true).catch(() => null);
+      await requestOverSocket(socketPath, `${BROWSER_BRIDGE_WS_PATH}?token=T`, true).catch(
+        () => null
+      );
+      expect(bridged).toEqual([`${DESKTOP_WS_PATH}?token=T`, `${BROWSER_BRIDGE_WS_PATH}?token=T`]);
+
+      // TCP keeps serving: the CLI and scripts use it.
+      expect((await fetch(`${server.baseUrl}/version`)).status).toBe(200);
+    } finally {
+      await server?.close();
+    }
+    await expect(fs.lstat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await fs.rm(base, { recursive: true, force: true });
+  });
+
+  test("a socket path that cannot be used fails startup and leaves no TCP listener", async () => {
+    const probe = net.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as net.AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const tooLong = path.join(os.tmpdir(), "x".repeat(200), "b.sock");
+    await expect(
+      createOrpcServer({
+        host: "127.0.0.1",
+        port,
+        context: orpcContextFromDoubles({}),
+        unixSocketPath: tooLong,
+      })
+    ).rejects.toThrow(/too long/);
+
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+});
+/* eslint-enable @typescript-eslint/await-thenable */

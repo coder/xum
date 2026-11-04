@@ -116,7 +116,7 @@ The stream is on again in every new `agent-browser` daemon: after `agent-browser
 - The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
 - Keep `XUM_ROOT` outside the checkout. Vite serves the checkout to anyone who can reach its port, and its `public/` folder without any file checks. The sandbox root is under the system temp dir.
 - `XUM_DEV_SERVER_AUTH_TOKEN=<token>` picks the token. `XUM_DEV_SERVER_NO_AUTH=1` starts an open backend, which any local account can control: use it only on a host where you are the only account.
-- Scope: while the backend restarts, another local account can bind its port and capture the token that a connected browser sends.
+- Scope: while the backend restarts, another local account can bind its TCP port. The browser never sends it the token, because Vite reaches the backend over a private Unix socket (see Security notes). A client that sends the token to the TCP port in that gap, such as `xum api` or the `curl` example above, can still reach that account.
 
 ## Options
 
@@ -153,3 +153,5 @@ MAKE=gmake make dev-server-sandbox
 - `providers.jsonc` may contain API keys.
 - The sandbox root directory is created on disk (usually under your system temp dir).
 - This flow intentionally **does not** copy `secrets.json`.
+- Vite reaches the backend over a Unix socket in a private folder (`/tmp/xum-dev-<uid>/b<backend port>-<backend host>.sock`, or under `$XDG_RUNTIME_DIR`), so no other account can take the backend's place while its TCP port is free during a restart. The TCP port stays for `xum api`, curl and scripts. Windows keeps TCP for the Vite hop.
+- A socket path over about 100 bytes makes the backend refuse to start, with a message that names the limit. Set `XUM_BACKEND_SOCKET` to a shorter path. Nothing falls back to TCP.

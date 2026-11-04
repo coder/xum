@@ -23,6 +23,20 @@ describe("resolveViteDevServerEnv", () => {
     expect(env.enableTutorialsInSandbox).toBe("1");
   });
 
+  test("uses the backend socket only when one is set", () => {
+    expect(resolveViteDevServerEnv({}).backendSocket).toBeUndefined();
+    // An empty value (a recipe that exports it blank) must not become a socket path.
+    expect(resolveViteDevServerEnv({ XUM_BACKEND_SOCKET: "  " }).backendSocket).toBeUndefined();
+    expect(resolveViteDevServerEnv({ XUM_BACKEND_SOCKET: "/run/x/b.sock" }).backendSocket).toBe(
+      "/run/x/b.sock"
+    );
+    // The backend gets the value byte for byte from make, so a path that ends in a space is a
+    // different path from the one without it.
+    expect(resolveViteDevServerEnv({ XUM_BACKEND_SOCKET: " /run/x/b.sock " }).backendSocket).toBe(
+      " /run/x/b.sock "
+    );
+  });
+
   test("falls back to leftover MUX values when XUM is unset", () => {
     const env = resolveViteDevServerEnv({
       MUX_VITE_HOST: "10.0.0.9",
