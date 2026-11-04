@@ -95,18 +95,18 @@ require_private_dir() {
   (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)"
 }
 
-# Every folder above a run home must be owned by root or this user and writable by nobody else,
-# unless it is sticky like /tmp (as ssh's StrictModes checks): another account could otherwise
-# rename the checked home away and put its own state.env in its place. Takes a physical path.
-require_safe_ancestors() {
-  local dir=$1 owner mode
+# Every folder above a run home (or a git dir) must be owned by root or this user and writable by
+# nobody else, unless it is sticky like /tmp (as ssh's StrictModes checks): another account could
+# otherwise rename the checked folder away and put its own in its place. Takes a physical path.
+require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for messages>]
+  local dir=$1 what=${2:-the run home} owner mode
   while [[ $dir != / ]]; do
     dir=$(dirname "$dir")
     owner=$(stat -c %u "$dir")
     mode=$(stat -c %a "$dir")
-    [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above the run home, is owned by user $owner"
+    [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above $what, is owned by user $owner"
     (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
-      || die "$dir, above the run home, is writable by group or others and not sticky (mode $mode)"
+      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)"
   done
 }
 
@@ -180,17 +180,54 @@ private_run_dir() {
   echo "$run"
 }
 
-# Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which another
-# account can write in a shared repository: a symlink planted there made `9>` truncate its target.
-# The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
+# Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which no other
+# account can write (require_private_git_dirs). These checks are a second line: a symlink there
+# made `9>` truncate its target. The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
 # only, which can neither create nor truncate anything (flock needs no write access). Then fd 9
-# must be the regular file of this user that the path names.
+# must be the regular file of this user that the path names. Its mode is 0600: another account
+# that can read it can flock it and block every launch. A guard from an older version is 0644,
+# so the mode is set on the open file too.
 open_launch_guard() {
-  [[ -e $LAUNCH_GUARD || -L $LAUNCH_GUARD ]] || (set -C && : >"$LAUNCH_GUARD") 2>/dev/null || true
+  [[ -e $LAUNCH_GUARD || -L $LAUNCH_GUARD ]] || (umask 077 && set -C && : >"$LAUNCH_GUARD") 2>/dev/null || true
   [[ -f $LAUNCH_GUARD && ! -L $LAUNCH_GUARD ]] || die "$LAUNCH_GUARD is not a regular file (a symlink?). Remove it."
   exec 9<"$LAUNCH_GUARD"
   [[ $(stat -L -c '%d:%i:%u' /proc/self/fd/9) == "$(stat -c '%d:%i' -- "$LAUNCH_GUARD"):$(id -u)" ]] \
     || die "$LAUNCH_GUARD is not owned by user $(id -u), or it changed while it was opened. Remove it."
+  chmod 600 /proc/self/fd/9
+}
+
+# The rule for the newest-run link: every read-compare-write or unlink of verify-xum.current, in
+# launch, cleanup and the failure cleanup, runs while this process holds the launch guard's flock
+# on fd 9. Only the two helpers below change the link. Launch holds the guard from its stale-run
+# check until the new group has recorded its id, so no cleanup can drop the link of a launch in
+# that window, and no launch can replace the link between a cleanup's compare and its unlink.
+LAUNCH_GUARD_HELD=
+hold_launch_guard() { # hold_launch_guard <seconds to wait>
+  [[ -z $LAUNCH_GUARD_HELD ]] || return 0
+  open_launch_guard
+  flock -w "$1" 9 || return 1
+  LAUNCH_GUARD_HELD=1
+}
+
+release_launch_guard() {
+  exec 9>&-
+  LAUNCH_GUARD_HELD=
+}
+
+point_current_run_link_at() { # point_current_run_link_at <run>
+  [[ -n $LAUNCH_GUARD_HELD ]] || die "internal error: the newest-run link changed without the launch guard"
+  # -T: a folder at the link path fails the launch instead of getting the link inside it.
+  ln -sfnT "$1" "$CURRENT_RUN_LINK"
+}
+
+drop_current_run_link_if() { # drop_current_run_link_if <run>: unlink it when it names <run>
+  if ! hold_launch_guard 60; then
+    echo "verify-xum: a launch from this checkout held $LAUNCH_GUARD for 60 s. Left the newest-run link." >&2
+    return 0
+  fi
+  if [[ $(readlink "$CURRENT_RUN_LINK" 2>/dev/null) == "$1" ]]; then
+    rm -f "$CURRENT_RUN_LINK"
+  fi
 }
 
 # One server per checkout: two would share dist/ and node_modules/.vite. The guard is the newest
@@ -199,9 +236,12 @@ open_launch_guard() {
 # moment between the spawn and that record: the new group holds the flock until it has written
 # its id, wherever the launcher dies. The server does not inherit it.
 refuse_while_checkout_server_runs() {
-  open_launch_guard
   # Part of the launch deadline: a short VERIFY_XUM_READY_TIMEOUT also bounds this wait.
-  flock -w "$(launch_seconds_left)" 9 || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
+  hold_launch_guard "$(launch_seconds_left)" || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
+  # Only a symlink belongs there: with a folder in its place, the next launch would not see this
+  # one's run and would start a second server.
+  [[ ! -e $CURRENT_RUN_LINK || -L $CURRENT_RUN_LINK ]] \
+    || die "$CURRENT_RUN_LINK is not a symlink (a folder?). Remove it, then launch again."
   [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
   local run
   run=$(private_run_dir "$CURRENT_RUN_LINK") || exit 1
@@ -306,15 +346,25 @@ check_bun() {
     || die "bun $have is first on PATH but package.json pins $want. Put Bun $want first on PATH (mise: PATH=\"\$(mise where bun@$want)/bin:\$PATH\")."
 }
 
+# The seed's git commands. The real HOME stays (see SKILL.md), so your global git config applies:
+# an init.templateDir, a core.attributesFile or the system attributes could run a clean filter on
+# `git add`, and a hook or an fsmonitor could run on any command. None of them runs here, and each
+# command stops at the launch deadline.
+demo_git() {
+  GIT_ATTR_NOSYSTEM=1 timeout "$(launch_seconds_left)" git -c core.attributesFile=/dev/null \
+    -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
 create_demo_repo() {
   local repo=$1
   mkdir -p "$repo/src"
   printf '# Demo app\n\nA throwaway project for verify-xum.\n' >"$repo/README.md"
   printf 'export function add(a: number, b: number): number {\n  return a + b;\n}\n' >"$repo/src/math.ts"
-  git -C "$repo" init -q -b main
-  git -C "$repo" add .
-  git -C "$repo" -c user.name=verify-xum -c user.email=verify-xum@example.test \
-    -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm init
+  # --template= copies no template: no hooks and no info/attributes.
+  demo_git -C "$repo" init -q -b main --template=
+  demo_git -C "$repo" add .
+  demo_git -C "$repo" -c user.name=verify-xum -c user.email=verify-xum@example.test \
+    -c commit.gpgsign=false commit -qm init
 }
 
 seed_unreachable_fake_provider() {
@@ -356,23 +406,21 @@ backend_crashed_after_rebuild() {
 launch_failed() {
   echo "verify-xum: launch failed. Server log tail ($VERIFY_XUM_RUN/server.log):" >&2
   tail -n 30 "$VERIFY_XUM_RUN/server.log" >&2 || true
-  if [[ -z $VERIFY_XUM_PGID ]]; then
-    # A signal can stop the launcher after the spawn and before the new group records its id.
-    # That group holds the launch flock until it has written the id or died, so take the flock
-    # anew and let cleanup read the id. Without it cleanup would drop the newest-run link while
-    # the server starts, and the next launch would start a second one.
-    exec 9>&-
-    open_launch_guard
-    if ! flock -w 10 9; then
-      echo "verify-xum: the new process group did not record its id in 10 s. The newest-run link stays: run verify-xum.sh cleanup." >&2
-      return 0
-    fi
+  # Take the guard anew (the link rule above). A signal can stop the launcher after the spawn and
+  # before the new group records its id. That group shares this launcher's guard fd and holds
+  # the flock until it has written the id or died, so cleanup then reads the id. Without the
+  # wait, cleanup would drop the newest-run link while the server starts, and the next launch
+  # would start a second one.
+  release_launch_guard
+  if ! hold_launch_guard 10; then
+    echo "verify-xum: could not take $LAUNCH_GUARD in 10 s (the new group has not recorded its id). The newest-run link stays: run verify-xum.sh cleanup." >&2
+    return 0
   fi
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
 cmd_launch() {
-  local t0 backend_port vite_port log token
+  local t0 backend_port vite_port log existing token
   need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -381,10 +429,14 @@ cmd_launch() {
   # Before any folder is made: a refused home creates nothing.
   require_home_outside_checkout "$VERIFY_XUM_HOME"
   if [[ ! -e $VERIFY_XUM_HOME ]]; then
-    # Parents this creates are private too, whatever the caller's umask.
+    # Check the nearest existing folder above the home, and every folder above it, before any
+    # folder is made: a refused launch creates nothing. The folders it then makes are private,
+    # whatever the caller's umask.
+    existing=$(dirname "$VERIFY_XUM_HOME")
+    while [[ ! -e $existing ]]; do existing=$(dirname "$existing"); done
+    [[ -d $existing ]] || die "$existing, above the run home, is not a folder"
+    require_safe_ancestors "$(cd -P -- "$existing" && pwd -P)/home"
     (umask 077 && mkdir -p "$(dirname "$VERIFY_XUM_HOME")")
-    # Check the folders above before the home is made in them (the home itself does not exist yet).
-    require_safe_ancestors "$(cd -P -- "$(dirname "$VERIFY_XUM_HOME")" && pwd -P)/home"
     mkdir -m 700 "$VERIFY_XUM_HOME"
   fi
   VERIFY_XUM_HOME=$(checked_home "$VERIFY_XUM_HOME") || exit 1
@@ -413,15 +465,18 @@ cmd_launch() {
   VERIFY_XUM_PGID='' VERIFY_XUM_ROOT='' VERIFY_XUM_BACKEND='' VERIFY_XUM_URL=''
   VERIFY_XUM_WORKSPACE_ID='' VERIFY_XUM_WORKTREE=''
   write_state
-  ln -sfn "$VERIFY_XUM_RUN" "$CURRENT_RUN_LINK"
+  point_current_run_link_at "$VERIFY_XUM_RUN"
   trap launch_failed EXIT
   # The new group's leader appends its pid, which is the group id, to state.env before it starts
   # make. From then on the launch guard and cleanup find the group, wherever the launcher dies.
   # The leader carries VERIFY_XUM_SERVER_OF from its start, so group_is_ours matches it as soon
   # as the id is written. It holds the launch flock (fd 9) until then and closes it before make.
+  # A failed write (read-only file, full disk) ends the leader before it closes the flock or starts
+  # make: a server whose group nobody recorded is one that cleanup cannot stop, and once cleanup
+  # drops the newest-run link, the next launch would start a second server next to it.
   # (setsid(1) forks when its caller already leads a process group, so $! can miss the group.)
   # shellcheck disable=SC2016
-  VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID" setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; exec 9>&-; shift; exec "$@"' sh \
+  VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID" setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1" || exit 1; exec 9>&- && shift && exec "$@"' sh \
     "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
     >"$log" 2>&1 </dev/null &
@@ -430,7 +485,7 @@ cmd_launch() {
     before_launch_deadline
     sleep 0.1
   done
-  exec 9>&-
+  release_launch_guard
   write_state
 
   while true; do
@@ -525,7 +580,7 @@ cmd_env() {
 # the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
 # is in no process's argv or environment: every local account can read argv.
 cmd_open() {
-  local path=${1:-} out
+  local path=${1:-} out token
   [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
   load_run "${2:-}"
   # Checked before agent-browser runs. A PATH like //host, /\host or /<tab>/host resolves to
@@ -545,18 +600,18 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
+  # server.lock's token, else the run's copy: a restarting backend deletes server.lock for a
+  # moment. node gets it on fd 3, never in argv.
+  token=$(run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
-    const [serverLock, base, path] = process.argv.slice(1);
-    let token = "";
-    try {
-      token = JSON.parse(fs.readFileSync(serverLock, "utf8")).token ?? "";
-    } catch {}
+    const [base, path] = process.argv.slice(1);
+    const token = fs.readFileSync(3, "utf8");
     const url = new URL(path, base);
     if (token) url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
-    "$VERIFY_XUM_ROOT/server.lock" "$VERIFY_XUM_URL" "$path" \
+    "$VERIFY_XUM_URL" "$path" 3< <(printf %s "$token") \
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
     || die "agent-browser could not open $path: $(sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out")"
   # The success output repeats the URL with the token: it is not printed.
@@ -710,13 +765,29 @@ cmd_cleanup() {
     rm -rf "$VERIFY_XUM_ROOT"
   fi
   rm -rf "$VERIFY_XUM_RUN/scratch" "$VERIFY_XUM_RUN/tmp"
-  [[ $(readlink "$CURRENT_RUN_LINK" 2>/dev/null) == "$VERIFY_XUM_RUN" ]] && rm -f "$CURRENT_RUN_LINK"
+  drop_current_run_link_if "$VERIFY_XUM_RUN"
   VERIFY_XUM_PGID=
   write_state
   # Last: the redaction above used it.
   rm -f "$VERIFY_XUM_RUN/token"
   echo "cleaned up run $VERIFY_XUM_RUN_ID; evidence kept in $VERIFY_XUM_EVIDENCE ($(find "$VERIFY_XUM_EVIDENCE" -type f | wc -l | tr -d ' ') files) and $VERIFY_XUM_RUN/server.log"
 }
+
+# The newest-run link and the launch guard live in the checkout's git dir. Another account that
+# could write there could swap either between a check and its use (a symlink, a FIFO, a folder),
+# so every command refuses a git dir, or a worktree's common git dir, that is not a real folder
+# of this user or that group or others can write: the rule for the run home and the folders
+# above it. A writable folder above would let another account rename the whole git dir away and
+# put its own in its place. The checks on the guard's open fd stay as a second line.
+require_private_git_dirs() {
+  local dir
+  for dir in "$CHECKOUT_GIT_DIR" "$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)"; do
+    dir=$(cd -P -- "$dir" && pwd -P)
+    require_private_dir "$dir"
+    require_safe_ancestors "$dir" "the git dir $dir"
+  done
+}
+require_private_git_dirs
 
 case ${1:-} in
   launch) cmd_launch ;;
