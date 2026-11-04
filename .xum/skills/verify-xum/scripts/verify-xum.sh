@@ -86,9 +86,12 @@ group_is_ours() {
 }
 
 # ": <fix>" with @DIR@ replaced by the folder, quoted so the command can be copied as printed (a
-# folder can hold spaces or glob characters). Nothing without a fix.
+# folder can hold spaces, glob characters, & or \). Nothing without a fix. The fix is split at
+# @DIR@ instead of ${1//@DIR@/...}: bash 5.2's patsub_replacement reads & and \ in that
+# replacement again and undoes the quoting.
 refusal_fix() { # refusal_fix <fix> <folder>
-  if [[ -n $1 ]]; then printf ': %s' "${1//@DIR@/$(printf %q "$2")}"; fi
+  [[ -n $1 ]] || return 0
+  printf ': %s%q%s' "${1%%@DIR@*}" "$2" "${1#*@DIR@}"
 }
 
 # A run's state.env is sourced, so the run folder and the home above it must be real folders (no
