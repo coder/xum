@@ -1042,9 +1042,9 @@ describe("declared model thinkingLevels", () => {
     ]);
   });
 
+  // Expected values differ from both the default ladder and gpt-6-astra's curated one.
   test("drive numeric input and clamping", () => {
-    expect(resolveThinkingInput(0, "local-vllm:qwen", providersConfig)).toBe("off");
-    expect(resolveThinkingInput(9, "local-vllm:qwen", providersConfig)).toBe("high");
-    expect(enforceThinkingPolicy("local-vllm:qwen", "max", null, providersConfig)).toBe("high");
+    expect(resolveThinkingInput(2, "local-vllm:qwen", providersConfig)).toBe("high");
+    expect(enforceThinkingPolicy("local-vllm:astra", "max", null, providersConfig)).toBe("medium");
   });
 });
