@@ -4507,14 +4507,14 @@ describe("BackgroundProcessManager", () => {
       expect(blockers.find((blocker) => blocker.processId === "z-survivor")?.state).toBe("running");
     });
 
-    it("ignores a record after the operating system reuses its PID", async () => {
+    it.each([process.ppid, process.pid])("ignores a record after PID reuse (%s)", async (pid) => {
       if (process.platform !== "linux") return;
       const recordPath = path.join(workspaceDir, "reused-pid");
       await fs.mkdir(recordPath, { recursive: true });
       await fs.writeFile(
         path.join(recordPath, "meta.json"),
         JSON.stringify({
-          pid: process.ppid,
+          pid,
           status: "running",
           identity: { ...getSelfIdentity(), birth: "linux-ticks:0" },
         })
@@ -4552,12 +4552,13 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("reports matching local identity as running", async () => {
+      // This backend owns no orphan command. Use another live process for the running case.
       await writeSpawnRecord(
         "matching-identity",
         JSON.stringify({
-          pid: process.pid,
+          pid: process.ppid,
           status: "running",
-          identity: getSelfIdentity(),
+          identity: { ...getSelfIdentity(), birth: linuxBirth(process.ppid) },
         })
       );
       expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([

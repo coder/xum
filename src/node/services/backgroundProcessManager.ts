@@ -3457,7 +3457,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private inspectOrphanPid(
     meta: SpawnRecordMeta
   ): Pick<WorkspaceBackgroundProcessBlocker, "state" | "reason"> | undefined {
-    const verdict = judgeHolder({ pid: meta.pid, identity: meta.identity }, true);
+    // Orphan records have no live owner token here, even when a restarted backend reuses their PID.
+    const verdict = judgeHolder({ pid: meta.pid, identity: meta.identity }, false);
     if (verdict.dead) return undefined;
     return {
       state: verdict.running ? "running" : "unknown",
