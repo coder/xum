@@ -6,6 +6,8 @@ import {
   type WaitingOnYouEntry,
 } from "@/browser/components/ChatPane/WaitingOnYou";
 import { useLiveAPI } from "@/browser/contexts/API";
+import type { WorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import {
   useConfirmDialog,
   type ConfirmDialogOptions,
@@ -41,7 +43,7 @@ export interface DelegatedCreationInterruptedNoticeProps {
   workspace: RemovableWorkspace;
   confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
   /** The normal user removal: never forced, so a dirty checkout or a busy workspace refuses. */
-  removeWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  removeWorkspace: WorkspaceContext["removeWorkspace"];
 }
 
 /**
@@ -85,7 +87,11 @@ export const DelegatedCreationInterruptedNotice: React.FC<
         removeWorkspaceConfirmOptions("Remove current workspace?", props.workspace)
       );
       if (!confirmed) return null;
-      const result = await props.removeWorkspace(props.workspaceId);
+      const result = await confirmAndRemoveWorkspace({
+        removeWorkspace: props.removeWorkspace,
+        confirm: props.confirm,
+        workspaceId: props.workspaceId,
+      });
       return result.success ? null : (result.error ?? "Failed to remove workspace");
     });
 
@@ -171,7 +177,7 @@ export const DelegatedCreationInterruptedBanner: React.FC<{
         kind: meta?.kind,
       }}
       confirm={confirm}
-      removeWorkspace={(workspaceId) => removeWorkspace(workspaceId)}
+      removeWorkspace={removeWorkspace}
     />
   );
 };

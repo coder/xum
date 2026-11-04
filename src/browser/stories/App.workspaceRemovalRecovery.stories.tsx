@@ -1,8 +1,18 @@
 import { expect, fn, userEvent, waitFor, within } from "storybook/test";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import type { APIClient } from "@/browser/contexts/API";
 import type { WorkspaceBackgroundProcessBlocker } from "@/common/types/workspace";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
-import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
+import {
+  collapseRightSidebar,
+  expandProjects,
+  expandRightSidebar,
+  selectWorkspace,
+} from "./helpers/uiState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { makeSideChatTabType } from "@/browser/types/rightSidebar";
+import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { clickWhenReady } from "./storyPlayHelpers";
@@ -18,6 +28,15 @@ const workspace = createWorkspace({
   projectName: "demo-app",
   title: "Recover damaged process records",
 });
+const sideChat = {
+  ...createWorkspace({
+    id: "side-chat-removal-recovery",
+    name: "side-chat-removal-recovery",
+    projectName: workspace.projectName,
+    title: "Side question",
+  }),
+  sideChatParentWorkspaceId: workspace.id,
+};
 const records: WorkspaceBackgroundProcessBlocker[] = [
   {
     workspaceId: workspace.id,
@@ -38,19 +57,30 @@ const records: WorkspaceBackgroundProcessBlocker[] = [
 
 const remove = fn<APIClient["workspace"]["remove"]>();
 
-function setupRecovery() {
+function setupRecovery(withSideChat = false) {
   selectWorkspace(workspace);
   collapseRightSidebar();
   expandProjects([workspace.projectPath]);
+  if (withSideChat) {
+    expandRightSidebar(workspace.id);
+    updatePersistedState(
+      getRightSidebarLayoutKey(workspace.id),
+      getDefaultRightSidebarLayoutState(makeSideChatTabType(sideChat.id))
+    );
+  }
   remove.mockReset();
   remove.mockResolvedValue({
     success: false,
     error: "Unknown background process activity blocks removal.",
-    backgroundProcesses: records,
+    backgroundProcesses: records.map((record) => ({
+      ...record,
+      workspaceId: withSideChat ? sideChat.id : workspace.id,
+    })),
   });
+  const workspaces = withSideChat ? [workspace, sideChat] : [workspace];
   const client = createMockORPCClient({
-    projects: groupWorkspacesByProject([workspace]),
-    workspaces: [workspace],
+    projects: groupWorkspacesByProject(workspaces),
+    workspaces,
   });
   client.workspace.remove = remove;
   return client;
@@ -120,12 +150,54 @@ export const Desktop: AppStory = {
         },
       },
     },
-    pixel: { matrix: { viewports: ["desktop"] } },
+    // The phone snapshot covers wrapping. Keep desktop interactions without a duplicate capture.
+    pixel: { ...PIXEL_DISABLED, matrix: { viewports: ["desktop"] } },
   },
   render: () => <AppWithMocks setup={setupRecovery} />,
   play: async ({ canvasElement, parameters }) => {
     await expect(parameters.pixel).toMatchObject({ matrix: { viewports: ["desktop"] } });
     await exerciseRecovery(canvasElement);
+  },
+};
+
+export const SideChat: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupRecovery(true)} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const body = within(canvasElement.ownerDocument.body);
+    if (window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX) {
+      await clickWhenReady(await canvas.findByTestId("workspace-more-actions"));
+      await clickWhenReady(await body.findByTestId("workspace-open-sidebar"));
+    }
+    const close = await canvas.findByRole("button", { name: "Close side chat" });
+    await clickWhenReady(close);
+    let dialog = await body.findByRole("dialog");
+    await clickWhenReady(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
+    await expect(remove).toHaveBeenCalledTimes(1);
+    await expect(close).toBeInTheDocument();
+
+    await clickWhenReady(close);
+    dialog = await body.findByRole("dialog");
+    remove.mockResolvedValue({ success: true });
+    await clickWhenReady(
+      within(dialog).getByRole("button", { name: "Accept risk and remove workspace" })
+    );
+    await waitFor(() =>
+      expect(canvas.queryByRole("button", { name: "Close side chat" })).toBeNull()
+    );
+    await expect(remove.mock.calls.map((call) => call[0])).toEqual([
+      { workspaceId: sideChat.id, options: { force: true } },
+      { workspaceId: sideChat.id, options: { force: true } },
+      {
+        workspaceId: sideChat.id,
+        options: {
+          force: true,
+          acknowledgedUnknownProcessRecords: records.map((record) => record.recordPath),
+        },
+      },
+    ]);
   },
 };
 
