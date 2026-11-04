@@ -61,9 +61,11 @@ Preconditions:
   `$VERIFY_XUM_ROOT/sessions/$VERIFY_XUM_WORKSPACE_ID/review-state.json` has `"isRead": true` for
   that hunk. Capture `review/read`.
 
-- **Keyboard toggle.** Run `agent-browser press Control+Shift+B`. The sidebar collapses, and the
-  button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again. The
-  button reads `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
+- **Keyboard toggle.** Run `agent-browser press Control+Shift+B` and
+  `agent-browser wait '[aria-label="Expand right sidebar"]'`. The sidebar collapses, and the
+  button `Expand right sidebar` is back. Run `agent-browser press Control+Shift+B` again and
+  `agent-browser wait '[aria-label="Collapse right sidebar"]'`. The button reads
+  `Collapse right sidebar`, and the tab `Review 1/1 Close Review` is selected.
 - **Restore.** The sidebar slid open again: run `verify-xum.sh idle`, then
   `agent-browser find role button click --name "Mark as read (M)" --exact`. The tab reads
   `Review 0/1` at once, and the app writes `review-state.json` a moment later. Wait for
