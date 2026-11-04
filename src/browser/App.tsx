@@ -105,6 +105,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
@@ -934,13 +935,17 @@ function AppInner() {
   const paletteRemoveWarning = usePopoverError(null);
   const removeWorkspaceFromPalette = useCallback(
     async (workspaceId: string) => {
-      const result = await removeWorkspace(workspaceId);
+      const result = await confirmAndRemoveWorkspace({
+        removeWorkspace,
+        confirm: confirmDialog,
+        workspaceId,
+      });
       if (!result.success) {
         paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
       }
       return result;
     },
-    [removeWorkspace, paletteRemoveError]
+    [removeWorkspace, confirmDialog, paletteRemoveError]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({

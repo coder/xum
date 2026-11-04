@@ -6,13 +6,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { BashToolResult } from "@/common/types/tools";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeClock } from "@/node/utils/hostClock";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
-import * as backgroundProcessExecutor from "./backgroundProcessExecutor";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
 import { HostClockTag } from "./di/hostClockLive";
@@ -431,10 +431,11 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     tag: string,
     holdKill: boolean,
     failMigration = false,
-    rejectExit = false
+    rejectExit = false,
+    hostClock = nodeClock
   ) {
     const ws = uniqueWorkspace(tag);
-    const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)));
+    const manager = new BackgroundProcessManager(path.dirname(localBgWorkspaceDir(ws)), hostClock);
     cleanups.push(() => manager.cleanup(ws));
     const dir = await tempDir(tag);
     const pidFile = path.join(dir, "pid");
@@ -487,11 +488,14 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     expect(pid).toBeGreaterThan(1);
     // The seal a removal or archive holds (workspaceService.ts) while its cleanup() runs.
     using _seal = failMigration ? undefined : manager.sealAdmissions(ws);
+    const outputDir = path.join(localBgWorkspaceDir(ws), "dev");
     if (failMigration) {
-      spyOn(backgroundProcessExecutor, "migrateToBackground").mockResolvedValue({
-        success: false,
-        error: "ENOSPC: no space left on device",
-      });
+      const writeFile = fs.writeFile;
+      spyOn(fs, "writeFile").mockImplementation((file, data, options) =>
+        file === path.join(outputDir, "output.log")
+          ? Promise.reject(new Error("ENOSPC: no space left on device"))
+          : writeFile(file, data, options)
+      );
     }
     expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
     const result = await running;
@@ -501,7 +505,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
     expect(!result.success && result.error).toContain(
       failMigration ? "ENOSPC" : "being cleaned up"
     );
-    return { manager, ws, pid, releaseKill: () => releaseKill.resolve() };
+    return { manager, ws, pid, outputDir, releaseKill: () => releaseKill.resolve() };
   }
 
   test("control: a refused migration's command is stopped once its kill takes effect", async () => {
@@ -532,6 +536,68 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
       expect(isAlive(pid)).toBe(false);
     }, 20_000);
   }
+
+  test("a failed migration settles its record only after confirmed exit", async () => {
+    const deadline = Promise.withResolvers<() => void>();
+    const publicationStarted = Promise.withResolvers<void>();
+    const allowPublication = Promise.withResolvers<void>();
+    const writeFile = fs.writeFile;
+    const { manager, ws, pid, outputDir, releaseKill } = await refuseMigration(
+      "failed-record-settlement",
+      true,
+      true,
+      false,
+      {
+        nowMs: () => nodeClock.nowMs(),
+        setTimer: (onTimeout) => {
+          deadline.resolve(onTimeout);
+          return () => undefined;
+        },
+      }
+    );
+    const marker = path.join(outputDir, "exit_code");
+    expect(await exists(outputDir)).toBe(true);
+    expect(await exists(marker)).toBe(false);
+    expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+    expect(isAlive(pid)).toBe(true);
+    spyOn(fs, "writeFile").mockImplementation(async (file, data, options) => {
+      if (file === marker) {
+        publicationStarted.resolve();
+        await allowPublication.promise;
+      }
+      return writeFile(file, data, options);
+    });
+    releaseKill();
+    await publicationStarted.promise;
+    const removalDrain = manager.cleanup(ws, { failClosedAfterDrainTimeout: true }).then(
+      () => true,
+      () => false
+    );
+    try {
+      // A blocked marker write must keep removal pending, even after the command stops.
+      (await deadline.promise)();
+      expect(await removalDrain).toBe(false);
+    } finally {
+      allowPublication.resolve();
+    }
+    await manager.cleanup(ws, { failClosedAfterDrainTimeout: true });
+    expect(Number((await fs.readFile(marker, "utf8")).trim())).toBe(EXIT_CODE_ABORTED);
+    expect(isAlive(pid)).toBe(false);
+    expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(false);
+  }, 20_000);
+
+  test("a failed migration keeps its record unknown when exit rejects", async () => {
+    const { manager, ws, pid, outputDir, releaseKill } = await refuseMigration(
+      "failed-record-reject",
+      true,
+      true,
+      true
+    );
+    releaseKill();
+    await waitFor(() => Promise.resolve(!isAlive(pid)), "the failed migration's stopped command");
+    expect(await exists(path.join(outputDir, "exit_code"))).toBe(false);
+    expect(await manager.hasOrphanedRunningBackgroundProcesses(ws)).toBe(true);
+  }, 20_000);
 
   test("a migration whose exit is never confirmed blocks removal but not session disposal", async () => {
     const { manager, ws, releaseKill } = await refuseMigration("join-reject", true, false, true);

@@ -529,9 +529,19 @@ export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
     description: z.string(),
   }),
 ]);
+/** A process record that blocks deletion until exit or explicit recovery. */
+export const WorkspaceBackgroundProcessBlockerSchema = z.object({
+  workspaceId: z.string(),
+  processId: z.string(),
+  recordPath: z.string(),
+  state: z.enum(["running", "unknown"]),
+  reason: z.string(),
+});
+
 export const WorkspaceRemoveResultSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
   descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+  backgroundProcesses: z.array(WorkspaceBackgroundProcessBlockerSchema).optional(),
   warnings: z.array(WorkspaceRemoveWarningSchema).optional(),
 });

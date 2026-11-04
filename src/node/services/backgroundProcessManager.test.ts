@@ -13,6 +13,7 @@ import {
   type OutputShownPayload,
 } from "./backgroundProcessManager";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
@@ -326,7 +327,7 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("should write meta.json with process info", async () => {
-      const result = await manager.spawn(runtime, testWorkspaceId, "echo test", {
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
         cwd: process.cwd(),
         displayName: "test",
       });
@@ -339,7 +340,10 @@ describe("BackgroundProcessManager", () => {
 
         expect(meta.id).toBe(result.processId);
         expect(meta.pid).toBeGreaterThan(0);
-        expect(meta.script).toBe("echo test");
+        expect(meta.script).toBe("sleep 60");
+        expect(meta.identity).toEqual({ ...getSelfIdentity(), birth: linuxBirth(meta.pid) });
+        expect((await manager.getProcess(result.processId))?.identity).toEqual(meta.identity);
+        expect(parseSpawnRecordMeta(metaContent)?.identity).toEqual(meta.identity);
         expect(meta.status).toBe("running");
         expect(meta.startTime).toBeGreaterThan(0);
       }
@@ -358,10 +362,16 @@ describe("BackgroundProcessManager", () => {
           displayName: "wall-clock-meta",
         });
         if (!result.success) throw new Error(result.error);
+        const metaPath = path.join(result.outputDir, "meta.json");
+        const initialMeta = parseSpawnRecordMeta(await fs.readFile(metaPath, "utf-8"));
+        expect(initialMeta?.identity).toBeDefined();
         expect(
           await clocked.terminate(result.processId, { monitorDisposition: "discard" })
         ).toEqual({ success: true });
         const proc = await clocked.getProcess(result.processId);
+        expect(parseSpawnRecordMeta(await fs.readFile(metaPath, "utf-8"))?.identity).toEqual(
+          initialMeta?.identity
+        );
         const after = Date.now();
         for (const stamp of [proc?.startTime, proc?.exitTime]) {
           expect(stamp).toBeGreaterThanOrEqual(before);
@@ -4471,6 +4481,95 @@ describe("BackgroundProcessManager", () => {
 
     it("returns false when the workspace has no spawn records", async () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("reports empty records as unknown instead of verified running processes", async () => {
+      const recordPath = path.join(workspaceDir, "empty-record");
+      await fs.mkdir(recordPath, { recursive: true });
+
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        {
+          workspaceId: orphanWorkspaceId,
+          processId: "empty-record",
+          recordPath,
+          state: "unknown",
+        },
+      ]);
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("reports live records even when an unknown record appears first", async () => {
+      await fs.mkdir(path.join(workspaceDir, "a-empty-record"), { recursive: true });
+      await writeSpawnRecord("z-survivor", { pid: process.pid, status: "running" });
+
+      const blockers = await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId);
+      expect(blockers).toHaveLength(2);
+      expect(blockers.find((blocker) => blocker.processId === "z-survivor")?.state).toBe("running");
+    });
+
+    it("ignores a record after the operating system reuses its PID", async () => {
+      if (process.platform !== "linux") return;
+      const recordPath = path.join(workspaceDir, "reused-pid");
+      await fs.mkdir(recordPath, { recursive: true });
+      await fs.writeFile(
+        path.join(recordPath, "meta.json"),
+        JSON.stringify({
+          pid: process.ppid,
+          status: "running",
+          identity: { ...getSelfIdentity(), birth: "linux-ticks:0" },
+        })
+      );
+
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toEqual([]);
+    });
+
+    it("keeps unknown PID-domain evidence unknown even when that host PID exists", async () => {
+      if (process.platform !== "linux") return;
+      await writeSpawnRecord(
+        "unknown-domain",
+        JSON.stringify({
+          pid: process.pid,
+          status: "running",
+          identity: { ...getSelfIdentity(), pidNs: null },
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "unknown-domain", state: "unknown" },
+      ]);
+    });
+
+    it("clears a record from a retired boot without probing an unrelated host PID", async () => {
+      if (process.platform !== "linux") return;
+      await writeSpawnRecord(
+        "retired-boot",
+        JSON.stringify({
+          pid: process.pid,
+          status: "running",
+          identity: { ...getSelfIdentity(), bootId: "previous-boot" },
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toEqual([]);
+    });
+
+    it("reports matching local identity as running", async () => {
+      await writeSpawnRecord(
+        "matching-identity",
+        JSON.stringify({
+          pid: process.pid,
+          status: "running",
+          identity: getSelfIdentity(),
+        })
+      );
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "matching-identity", state: "running" },
+      ]);
+    });
+
+    it("keeps an invalid process status unknown", async () => {
+      await writeSpawnRecord("invalid-status", { pid: process.pid, status: "invalid" });
+      expect(await manager.getOrphanedBackgroundProcessBlockers(orphanWorkspaceId)).toMatchObject([
+        { processId: "invalid-status", state: "unknown" },
+      ]);
     });
 
     it("detects an untracked running record with a live PID", async () => {

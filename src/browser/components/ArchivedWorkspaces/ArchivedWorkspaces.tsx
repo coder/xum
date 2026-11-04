@@ -8,6 +8,8 @@ import type {
 } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
+import { confirmAndRemoveWorkspace } from "@/browser/utils/confirmAndRemoveWorkspace";
 import {
   useOptionalWorkspaceMetadata,
   useWorkspaceContext,
@@ -334,6 +336,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const archivedRegionId = React.useId();
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
+  const { confirm: confirmDialog } = useConfirmDialog();
   // Sub-agents swept into the archive with their parent fold into its row (see the helper).
   // Live (unarchived) metadata only tells which parents are still active.
   const { rows: historyRows, foldedByRowId } = partitionArchivedHistoryRows(
@@ -554,7 +557,12 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setBulkOperation((prev) => (prev ? { ...prev, current: ws?.title ?? ws?.name ?? id } : prev));
 
       try {
-        const result = await removeWorkspace(id, { force: true });
+        const result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId: id,
+          options: { force: true },
+        });
         if (result.success && result.warnings?.length) {
           const line = `${ws?.name ?? id}: ${formatWorkspaceRemoveWarnings(result.warnings)}`;
           setBulkOperation((prev) =>
@@ -734,47 +742,45 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const handleDelete = async (workspaceId: string, options?: { bypassForceConfirm?: boolean }) => {
     setProcessingIds((prev) => new Set(prev).add(workspaceId));
     try {
-      const result = await removeWorkspace(workspaceId);
-      if (result.success) {
-        onWorkspacesChanged?.();
-        return;
+      let result = await confirmAndRemoveWorkspace({
+        removeWorkspace,
+        confirm: confirmDialog,
+        workspaceId,
+      });
+      const initialError = result.error;
+
+      // Shift skips the force dialog, not the unknown-process acknowledgment.
+      // Do not retry after a cancelled acknowledgment or a changed process state.
+      // Shift still acknowledges the descendant scope that the backend reports.
+      if (!result.success && options?.bypassForceConfirm && !result.backgroundProcesses?.length) {
+        result = await confirmAndRemoveWorkspace({
+          removeWorkspace,
+          confirm: confirmDialog,
+          workspaceId,
+          options: {
+            force: true,
+            ...(result.descendants?.length
+              ? {
+                  acknowledgedDescendantIds: result.descendants.map(
+                    (descendant) => descendant.workspaceId
+                  ),
+                }
+              : {}),
+          },
+        });
       }
 
-      // Shift-click: skip every confirmation, auto-force immediately. Shift stands in for the
-      // descendant acknowledgment the modal would otherwise collect, so pass the scope the
-      // backend just reported. The backend still rejects the retry if any descendant is active
-      // or the scope changed, and that failure falls through to the modal below.
-      if (options?.bypassForceConfirm) {
-        const forced = await removeWorkspace(workspaceId, {
-          force: true,
-          ...(result.descendants?.length
-            ? {
-                acknowledgedDescendantIds: result.descendants.map(
-                  (descendant) => descendant.workspaceId
-                ),
-              }
-            : {}),
-        });
-        if (forced.success) {
-          if (forced.warnings?.length) {
-            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
-          }
-          onWorkspacesChanged?.();
-          return;
+      if (result.success) {
+        if (result.warnings?.length) {
+          removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(result.warnings));
         }
-
-        // Force delete also failed — fall through to show modal with the error.
-        setForceDeleteModal({
-          workspaceId,
-          error: forced.error ?? result.error ?? "Failed to remove workspace",
-          descendants: forced.descendants,
-        });
+        onWorkspacesChanged?.();
         return;
       }
 
       setForceDeleteModal({
         workspaceId,
-        error: result.error ?? "Failed to remove workspace",
+        error: result.error ?? initialError ?? "Failed to remove workspace",
         descendants: result.descendants,
       });
     } finally {
@@ -811,9 +817,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
           descendants={forceDeleteModal.descendants}
           onClose={() => setForceDeleteModal(null)}
           onForceDelete={async (workspaceId, acknowledgedDescendantIds) => {
-            const result = await removeWorkspace(workspaceId, {
-              force: true,
-              acknowledgedDescendantIds,
+            const result = await confirmAndRemoveWorkspace({
+              removeWorkspace,
+              confirm: confirmDialog,
+              workspaceId,
+              options: { force: true, acknowledgedDescendantIds },
             });
             if (result.success) {
               // The dialog showed the non-forced error; the forced retry can leave more behind.
