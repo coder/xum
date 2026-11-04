@@ -31,6 +31,7 @@ import {
  */
 
 const LIST_MAGIC = "XUMARTIFACTS1";
+const REAL_DIR_MAGIC = "XUMREALDIR1";
 const READ_MAGIC = "XUMREAD1";
 const WRITE_MAGIC = "XUMWRITE1";
 const EXEC_TIMEOUT_SECONDS = 30;
@@ -150,6 +151,38 @@ export function parseArtifactListOutput(stdout: string): RuntimeArtifactListing 
     if (meta === null || typeof parseArtifactRelativePath(relPath) === "string") continue;
     entries.push({ path: relPath, kind: getArtifactKind(relPath), ...meta });
   }
+}
+
+/**
+ * Real path of a folder on the runtime (symlinks resolved), or null when it is missing or not a
+ * folder. Pins outside the checkout store it: the read script refuses a symlinked root folder.
+ */
+export async function resolveRealDirOnRuntime(
+  runtime: Runtime,
+  dir: string,
+  abortSignal?: AbortSignal
+): Promise<string | null> {
+  const result = await execBuffered(
+    runtime,
+    `cd -P -- "$XUM_DIR" 2>/dev/null || exit 0\nprintf '${REAL_DIR_MAGIC}\\0'\npwd -P\n`,
+    {
+      cwd: "/",
+      pathEnv: { XUM_DIR: dir },
+      timeout: EXEC_TIMEOUT_SECONDS,
+      abortSignal,
+      maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
+    }
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Resolving a folder failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 500)}`
+    );
+  }
+  // A login banner can come first; pwd ends its line with one newline.
+  const start = result.stdout.indexOf(`${REAL_DIR_MAGIC}\0`);
+  if (start < 0) return null;
+  const real = result.stdout.slice(start + REAL_DIR_MAGIC.length + 1).replace(/\n$/, "");
+  return real.startsWith("/") ? real : null;
 }
 
 export async function listArtifactsOnRuntime(

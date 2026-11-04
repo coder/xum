@@ -100,7 +100,7 @@ describe("pinned workspace files", () => {
   test("a file outside the checkout pins by its absolute path and reads live", async () => {
     // File tool cards offer "Open as artifact" for any path the agent read, such as a plan or a
     // skill file under the home folder.
-    const outside = path.join(tempDir, "notes", "plan.md");
+    const outside = path.join(await fs.realpath(tempDir), "notes", "plan.md");
     await fs.mkdir(path.dirname(outside), { recursive: true });
     await fs.writeFile(outside, "# Plan");
     expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
@@ -133,6 +133,42 @@ describe("pinned workspace files", () => {
       success: false,
       error: `File is not pinned: ${outside}`,
     });
+  });
+
+  test("one file reached through a symlinked folder is one pin", async () => {
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(real, "notes"));
+    await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+    await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+    await fs.mkdir(path.join(checkout, "docs"));
+    await fs.writeFile(path.join(checkout, "docs", "x.md"), "x");
+    await fs.symlink(path.join(checkout, "docs"), path.join(real, "docs-link"));
+
+    // An alias of an outside folder stores the real path, so both spellings are one pin.
+    for (const alias of ["notes", "notes-link"]) {
+      expect(
+        await pinFile(context, { workspaceId: "ws", path: path.join(real, alias, "plan.md") })
+      ).toEqual({ success: true, data: { path: path.join(real, "notes", "plan.md") } });
+    }
+    // An alias that leads into the checkout is a checkout pin.
+    expect(
+      await pinFile(context, { workspaceId: "ws", path: path.join(real, "docs-link", "x.md") })
+    ).toEqual({ success: true, data: { path: "docs/x.md" } });
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files.map((f) => f.path)).toEqual(
+      [path.join(real, "notes", "plan.md"), "docs/x.md"]
+    );
+  });
+
+  test("a drive-letter entry on a POSIX host is invalid, not a path below the backend's folder", async () => {
+    if (process.platform === "win32") return;
+    // Only a hand edit of the store can add one. Read as a folder `C:` it would resolve against
+    // the backend's working folder.
+    const sessionDir = path.join(tempDir, "sessions", "ws");
+    await addPinnedPath(sessionDir, "C:/x.md");
+    const read = await readPinnedFile(context, { workspaceId: "ws", path: "C:/x.md" });
+    expect(read.success).toBe(false);
+    expect(read).not.toHaveProperty("missing");
   });
 
   test("refuses outside files that are missing, folders or symlinks", async () => {
