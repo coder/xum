@@ -45,8 +45,9 @@ newest-run link live there. Use a checkout of your own, not a shared repository.
 (the default on Debian and Ubuntu, which give each user a private group), git makes a clone's
 folder, `.git` and `.git/worktrees/<name>` 0775, so every command refuses. Run
 `chmod g-w,o-w` on the folder the message names (it names one at a time), or use a checkout made
-under umask 022. Bun on PATH must be the version in `package.json` `packageManager`. Launch
-refuses another Bun.
+under umask 022. A writable folder you do not own (root's, for example) cannot be fixed that way:
+the message then says to use a checkout under folders you own. Bun on PATH must be the version in
+`package.json` `packageManager`. Launch refuses another Bun.
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh launch
