@@ -8,7 +8,11 @@ const REPO_ROOT = path.resolve(import.meta.dir, "..");
 
 // make claims the default socket folder at parse time, in `$XDG_RUNTIME_DIR` or /tmp. A dry run must
 // not leave one on the test host, so every make call here gets a runtime dir of its own.
-const RUNTIME_BASE = fsSync.mkdtempSync(path.join(os.tmpdir(), "xum-make-base-"));
+//
+// The base is under /tmp, not os.tmpdir(): macOS's os.tmpdir() is a long /var/folders/... path, and
+// `<base>/xum-dev-<uid>/b3111-192.168.1.5.sock` must fit the 103 bytes of a macOS socket path.
+const SHORT_TMP = process.platform === "win32" ? os.tmpdir() : "/tmp";
+const RUNTIME_BASE = fsSync.mkdtempSync(path.join(SHORT_TMP, "xum-make-base-"));
 afterAll(() => fsSync.rmSync(RUNTIME_BASE, { recursive: true, force: true }));
 
 interface DryRun {
@@ -307,7 +311,7 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
     let runtimeDir: string;
 
     beforeEach(async () => {
-      runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-make-test-"));
+      runtimeDir = await fs.mkdtemp(path.join(SHORT_TMP, "xum-make-test-"));
     });
 
     afterEach(async () => {
