@@ -118,6 +118,8 @@ export function isProductionSource(relPath: string): boolean {
   // refinementTestHelpers.ts, fileLockTestHelpers.ts, workspaceStoreTestOverlay.ts,
   // GoogleSearchToolCall.fixtures.ts, DesktopBridgeServer.nodeFixture.ts.
   if (/Test(?:Helpers?|Harness|Utils|Fixtures?|Overlay|Child)\b/.test(base)) return false;
+  // settingsStoryUtils.tsx: helpers only stories import.
+  if (/Story(?:Utils|Helpers?)\b/.test(base)) return false;
   if (/\.(?:\w*[fF]ixtures?)\.[cm]?[jt]sx?$/.test(base)) return false;
   // Generated at build time (see Makefile's version target).
   if (relPath === "src/version.ts") return false;
