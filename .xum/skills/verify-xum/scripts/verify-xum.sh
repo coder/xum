@@ -91,7 +91,7 @@ group_is_ours() {
 # replacement again and undoes the quoting.
 refusal_fix() { # refusal_fix <fix> <folder>
   [[ -n $1 ]] || return 0
-  printf ': %s%q%s' "${1%%@DIR@*}" "$2" "${1#*@DIR@}"
+  if [[ $1 == *@DIR@* ]]; then printf ': %s%q%s' "${1%%@DIR@*}" "$2" "${1#*@DIR@}"; else printf ': %s' "$1"; fi
 }
 
 # A run's state.env is sourced, so the run folder and the home above it must be real folders (no
@@ -114,8 +114,12 @@ require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for mes
     owner=$(stat -c %u "$dir")
     mode=$(stat -c %a "$dir")
     [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above $what, is owned by user $owner"
-    (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
-      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)$(refusal_fix "$fix" "$dir")"
+    if ! (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)); then
+      # Only the owner can chmod it: for a root-owned folder (a group-writable /usr/local, for
+      # example) the fix is to move the checkout.
+      [[ $owner == "$(id -u)" || -z $fix ]] || fix="use a checkout under folders you own"
+      die "$dir, above $what, is writable by group or others and not sticky (mode $mode)$(refusal_fix "$fix" "$dir")"
+    fi
   done
 }
 
