@@ -421,12 +421,22 @@ async function findExistingPin(
   storedPath: string
 ): Promise<string | null> {
   if (pinned.includes(storedPath)) return storedPath;
-  const absolute = pinned.filter((p) => isAbsoluteOn(location, p));
+  // Only an outside pin's folder is resolved, so an alias keeps the file name: resolve just the
+  // entries with that name (usually none). On SSH each resolution is one exec.
+  const paths = location.kind === "runtime" ? path.posix : path;
+  const name = paths.basename(storedPath);
+  const aliases = pinned.filter((p) => isAbsoluteOn(location, p) && paths.basename(p) === name);
   const real = await Promise.all(
-    absolute.map((p) => toStoredPinPath(location, p).catch(() => null))
+    aliases.map((p) =>
+      toStoredPinPath(location, p).catch((error: unknown) => {
+        // A failed resolution only means no match: the pin is added as a new entry.
+        log.debug("Could not resolve a stored pin", { error: getErrorMessage(error) });
+        return null;
+      })
+    )
   );
   const index = real.indexOf(storedPath);
-  return index < 0 ? null : absolute[index];
+  return index < 0 ? null : aliases[index];
 }
 
 export async function pinFile(
