@@ -130,6 +130,7 @@ const MKDTEMP_SUFFIX = ".XXXXXX";
  * caller to tell the user. The Vite hop never falls back to TCP: the squat window that the socket
  * closes would open again.
  *
+ * Throws, before it creates anything, when the default path does not fit a socket path.
  * Throws when a parent of the folder is unsafe: a fresh folder next to it would be just as open to
  * another account, so only the user can fix it (XUM_BACKEND_SOCKET or XDG_RUNTIME_DIR). It also
  * throws, before it creates the fresh folder, when the longer fallback path would not fit.
@@ -140,6 +141,9 @@ export async function chooseDevSocketPath(
   ownerUid: number
 ): Promise<DevSocketChoice> {
   const preferred = path.join(folder, fileName);
+  // Before anything is created: the backend refuses a path that does not fit, and the folder made
+  // for it would stay empty.
+  assertSocketPathFits(preferred);
   await assertParentsTrusted(folder, ownerUid);
   try {
     await fs.mkdir(folder, { mode: 0o700 });
