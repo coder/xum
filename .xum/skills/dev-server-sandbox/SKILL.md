@@ -72,43 +72,44 @@ printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -s -X POST -H @- "http://127
 
 Command lines are readable by every local account. So node gets only the lockfile path, and the header goes to `curl -H @-` on stdin from the `printf` builtin. Never pass the token as an argument.
 
-Open the app in a browser once with the token in the URL. Close the Xum Browser tab of this workspace first: it attaches to the first `agent-browser` session it finds and turns that session's stream on (`ensureSessionAttachable`). Three things keep the token away from other local accounts, and the recipe does all of them:
+Warning: on a host with other local accounts, do not open the authenticated page in `agent-browser`. Chrome's DevTools port (`--remote-debugging-port=0`, set by `agent-browser`, which cannot start Chrome without it) is open from the moment Chrome launches, and it has no credential. Another account can catch the token while the page navigates, or read it from the page's storage afterwards, and it can drive the page and open a terminal in the sandbox. The token works until the sandbox restarts. Turning the stream off (below) does not change that. On Windows the `agent-browser` daemon also takes commands, without a credential, on a loopback TCP port that follows from the session name. On such a host, call the backend with `curl` or `xum api` as above.
+
+On a host where you are the only account, open the app in a browser once with the token in the URL. Close the Xum Browser tab of this workspace first: it attaches to the first `agent-browser` session it finds and turns that session's stream on (`ensureSessionAttachable`). Three things keep the token away from other local accounts, and the recipe does all of them:
 
 - The token goes to the browser on stdin: node builds the URL and pipes it to `agent-browser batch`, so the token is in no command line.
-- `agent-browser` starts a WebSocket stream on a loopback port for every session. It takes mouse and keyboard input with no credential, so any local account could drive the authenticated page. The recipe opens `about:blank`, turns the stream off (this also closes clients that are already connected) and checks that it is off before the token goes in. It checks again after the page loads, and closes the session if the stream came back.
+- `agent-browser` starts a WebSocket stream on a loopback port for every session. It takes mouse and keyboard input with no credential, so any local account could drive the authenticated page. The recipe opens `about:blank`, turns the stream off (this also closes clients that are already connected) and checks that it is off before the token goes in. It checks again after the page loads, and closes the session if the stream came back. Each failure message names the step that failed.
 - The batch prints the URL it opened, with the token. The recipe keeps that output in a variable: it prints nothing when the open works, and prints it with the token removed when it fails.
 
 ```bash
-S=xum-sandbox # the session name goes on every agent-browser command, here and later
-if agent-browser --session "$S" open about:blank >/dev/null &&
-  { agent-browser --session "$S" stream disable >/dev/null 2>&1; agent-browser --session "$S" --json stream status | grep -q '"enabled":false'; }; then
-  if out=$(node -e '
+S=xum-sandbox-$VITE_PORT # one session per sandbox; the name goes on every agent-browser command, here and later
+ab() { agent-browser --session "$S" "$@"; }
+off() { ab --json stream status | node -e 'try { process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).data.enabled === false ? 0 : 1); } catch { process.exit(1); }'; }
+fail() { echo "agent-browser: $1, so the token was not sent" >&2; false; }
+if ! ab open about:blank >/dev/null; then fail "'open about:blank' failed"
+elif ! { ab stream disable >/dev/null 2>&1 || off; }; then fail "'stream disable' failed and the stream is still on"
+elif ! off; then fail "'stream status' does not show the stream off"
+elif out=$(node -e '
 const [lock, port] = process.argv.slice(1);
 const token = JSON.parse(require("fs").readFileSync(lock, "utf8")).token;
 const url = `http://localhost:${port}/?token=${encodeURIComponent(token)}`;
 process.stdout.write(JSON.stringify([["open", url]]));
-' "$XUM_ROOT/server.lock" "$VITE_PORT" | agent-browser --session "$S" batch --bail 2>&1); then
-    agent-browser --session "$S" --json stream status | grep -q '"enabled":false' || {
-      agent-browser --session "$S" close >/dev/null 2>&1 &&
-        echo "agent-browser: its stream came back on, so the session was closed" >&2 ||
-        echo "agent-browser: its stream is on and the session could not be closed: close it yourself" >&2
-      false
-    }
-  else
-    sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out" >&2; false
-  fi
+' "$XUM_ROOT/server.lock" "$VITE_PORT" | ab batch --bail 2>&1); then
+  off || {
+    ab close >/dev/null 2>&1 &&
+      echo "agent-browser: its stream came back on, so the session was closed" >&2 ||
+      echo "agent-browser: its stream is on and the session could not be closed: close it yourself" >&2
+    false
+  }
 else
-  echo "agent-browser: could not turn its stream off, so the token was not sent" >&2; false
+  sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out" >&2; false
 fi
 ```
 
-Pass `--session xum-sandbox` on every later command (`agent-browser --session xum-sandbox snapshot -i`, `... close`). The bash tool does not keep `AGENT_BROWSER_SESSION` between calls: Xum removes it from the environment of the commands it starts, so a command without `--session` reaches the default session, not this page.
+Pass `--session xum-sandbox-<vite port>` on every later command (`agent-browser --session "xum-sandbox-$VITE_PORT" snapshot -i`, `... close`). The bash tool does not keep `AGENT_BROWSER_SESSION` between calls: Xum removes it from the environment of the commands it starts, so a command without `--session` reaches the default session, not this page. The port in the name keeps two sandboxes in one workspace from sharing a session.
 
 The app keeps the token and strips it from the address bar, so later `agent-browser` commands carry no token. Without it, the app asks for the token. Do not use `agent-browser open "<url with token>"`: it puts the token in the command line. Do not pipe the batch straight to the terminal: its output repeats the URL with the token.
 
-The stream is on again in every new `agent-browser` daemon: after `agent-browser --session xum-sandbox close`, or after the daemon idles out, run the recipe again before you open the app. Check with `agent-browser --session xum-sandbox stream status`.
-
-Limit: Chrome itself listens on a loopback DevTools port (`--remote-debugging-port=0`, set by `agent-browser`, which cannot start Chrome without it). That port has no credential either, so while the authenticated page is open in `agent-browser`, any local account can drive it, read its storage and open a terminal in the sandbox. On Windows the `agent-browser` daemon also takes commands, without a credential, on a loopback TCP port that follows from the session name. Turning the stream off removes only one of the open ports. On a host with other accounts, call the backend with `curl` or `xum api` as above and do not open the authenticated page.
+The stream is on again in every new `agent-browser` daemon: after `agent-browser --session "xum-sandbox-$VITE_PORT" close`, or after the daemon idles out, run the recipe again before you open the app. Check with `agent-browser --session "xum-sandbox-$VITE_PORT" stream status`.
 
 - `XUM_ROOT=<sandbox root> xum api ...` reads the token from the lockfile.
 - The Vite proxy adds no credentials, so a request to the Vite port needs the token too.
