@@ -6,6 +6,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
 import {
+  PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
   PINNED_FILES_MULTI_PROJECT_REASON,
   addPinnedPath,
   listPinnedFiles,
@@ -94,6 +95,55 @@ describe("pinned workspace files", () => {
     expect(after.success && after.data.available && after.data.files.map((f) => f.path)).toEqual([
       ".github/ci.yml",
     ]);
+  });
+
+  test("a file outside the checkout pins by its absolute path and reads live", async () => {
+    // File tool cards offer "Open as artifact" for any path the agent read, such as a plan or a
+    // skill file under the home folder.
+    const outside = path.join(tempDir, "notes", "plan.md");
+    await fs.mkdir(path.dirname(outside), { recursive: true });
+    await fs.writeFile(outside, "# Plan");
+    expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
+      success: true,
+      data: { path: outside },
+    });
+    // A tool-cwd path that leaves the checkout names the same file.
+    expect(
+      await pinFile(context, {
+        workspaceId: "ws",
+        path: "../notes/plan.md",
+        relativeTo: "tool-cwd",
+      })
+    ).toEqual({ success: true, data: { path: outside } });
+
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    if (!listed.success || !listed.data.available) throw new Error("expected pinned files");
+    expect(listed.data.files.map(({ path, kind, size }) => ({ path, kind, size }))).toEqual([
+      { path: outside, kind: "markdown", size: 6 },
+    ]);
+
+    await fs.writeFile(outside, "# Changed");
+    expect(await readPinnedFile(context, { workspaceId: "ws", path: outside })).toMatchObject({
+      success: true,
+      data: { status: "ok", content: "# Changed" },
+    });
+
+    await unpinFile(context, { workspaceId: "ws", path: outside });
+    expect(await readPinnedFile(context, { workspaceId: "ws", path: outside })).toEqual({
+      success: false,
+      error: `File is not pinned: ${outside}`,
+    });
+  });
+
+  test("refuses outside files that are missing, folders or symlinks", async () => {
+    const notes = path.join(tempDir, "notes");
+    await fs.mkdir(notes, { recursive: true });
+    await fs.symlink(path.join(checkout, "README.md"), path.join(notes, "link.md"));
+    for (const target of [path.join(notes, "missing.md"), notes, path.join(notes, "link.md")]) {
+      expect((await pinFile(context, { workspaceId: "ws", path: target })).success).toBe(false);
+    }
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files).toEqual([]);
   });
 
   test("a checkout root that is itself a symlink can pin and read files", async () => {
@@ -206,6 +256,13 @@ describe("pinned workspace files", () => {
         for (const call of read.mock.calls) {
           expect(call[3]).toMatchObject({ requireDescriptorPaths: true });
         }
+        // Tool paths outside the checkout name container files, not host files.
+        const outside = path.join(tempDir, "outside.md");
+        await fs.writeFile(outside, "x");
+        expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
+          success: false,
+          error: PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
+        });
       } finally {
         read.mockRestore();
       }

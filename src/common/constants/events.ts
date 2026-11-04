@@ -309,7 +309,7 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
     workspaceId: string;
-    /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+    /** Artifacts-relative path, or the stored pin path (checkout-relative or absolute) when `pinned`. */
     path: string;
     /** Version number to show; absent means "Latest (live)". */
     versionId?: number;

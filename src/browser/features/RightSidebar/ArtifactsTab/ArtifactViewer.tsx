@@ -133,7 +133,7 @@ export function ArtifactViewer(props: {
   mainPaneInterruptKey?: ArtifactFrameInterruptKey;
   /**
    * Resolve relative images/assets through the artifacts folder (default). Off for pinned
-   * checkout files, whose neighbours live in the checkout, not the artifacts folder.
+   * files, whose neighbours live outside the artifacts folder.
    */
   readRelativeAssets?: boolean;
   /** Host side of artifact interactions (M5b); absent where artifacts are read-only. */

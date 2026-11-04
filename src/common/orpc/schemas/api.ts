@@ -1521,9 +1521,9 @@ export const artifacts = {
     output: ResultSchema(PinnedArtifactFilesSchema, z.string()),
   },
   /**
-   * Pin a checkout file; `path` may be absolute inside the checkout. A relative `path` resolves
-   * from the checkout root, or from the tool cwd (a sub-project dir) with `relativeTo:
-   * "tool-cwd"`, as file tools resolve it. Returns the stored checkout-relative path.
+   * Pin a file; `path` may be absolute. A relative `path` resolves from the checkout root, or
+   * from the tool cwd (a sub-project dir) with `relativeTo: "tool-cwd"`, as file tools resolve
+   * it. Returns the stored path: checkout-relative, or absolute for a file outside the checkout.
    */
   pinFile: {
     input: z.object({
@@ -1537,7 +1537,7 @@ export const artifacts = {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
-  /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
+  /** Read a pinned file (same shape and cap as `read`; `path` as `pinFile` returned it). */
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
     output: ArtifactReadOutcomeSchema,
