@@ -26,8 +26,10 @@ Preconditions:
   `agent-browser wait '[aria-label="Command palette"]'` and
   `agent-browser wait '[role="listbox"][aria-label="Suggestions"] [role="option"]'`: on the first
   open of a page the list fills a moment after the combobox shows. The combobox
-  `Command palette` is expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`.
-  The combobox is gone.
+  `Command palette` is expanded, with the listbox `Suggestions`. Run `agent-browser press Escape`
+  and `agent-browser wait --fn '!document.querySelector("[aria-label=\"Command palette\"]")'`.
+  The combobox is gone. The press can return before the palette closes, and the next shortcut
+  would then close the palette that is still open instead of opening it.
 - **Switch workspace.** Press Ctrl+Shift+P, wait for the palette as above, then run
   `agent-browser keyboard type "release"` and
   `agent-browser wait '[role="option"][aria-selected="true"][aria-label="release-notes"]'`.

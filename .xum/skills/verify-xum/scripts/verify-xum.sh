@@ -464,9 +464,12 @@ cmd_launch() {
   # make. From then on the launch guard and cleanup find the group, wherever the launcher dies.
   # The leader carries VERIFY_XUM_SERVER_OF from its start, so group_is_ours matches it as soon
   # as the id is written. It holds the launch flock (fd 9) until then and closes it before make.
+  # A failed write (read-only file, full disk) ends the leader before it closes the flock or starts
+  # make: a server whose group nobody recorded is one that cleanup cannot stop, and once cleanup
+  # drops the newest-run link, the next launch would start a second server next to it.
   # (setsid(1) forks when its caller already leads a process group, so $! can miss the group.)
   # shellcheck disable=SC2016
-  VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID" setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1"; exec 9>&-; shift; exec "$@"' sh \
+  VERIFY_XUM_SERVER_OF="$VERIFY_XUM_RUN_ID" setsid sh -c 'printf "export VERIFY_XUM_PGID=%s\n" "$$" >>"$1" || exit 1; exec 9>&- && shift && exec "$@"' sh \
     "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
     >"$log" 2>&1 </dev/null &
