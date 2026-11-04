@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -289,6 +289,83 @@ describe.skipIf(process.platform === "win32")("make dev-server backend socket", 
 
   // The Windows recipe starts the backend on TCP only. An ambient path would still reach Vite, which
   // would proxy to a socket that nothing listens on.
+  // Another account can create the default folder first (a name in /tmp is open to everyone). The
+  // backend then refuses to put its socket there, so make picks a fresh private folder next to it.
+  describe("the default socket folder", () => {
+    const uid = process.getuid!();
+    let runtimeDir: string;
+
+    beforeEach(async () => {
+      runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-make-test-"));
+    });
+
+    afterEach(async () => {
+      await fs.rm(runtimeDir, { recursive: true, force: true });
+    });
+
+    // make builds for a while before the backend starts: it claims the folder (mode 0700) at once, so
+    // another account cannot take the name in between.
+    test("is $XDG_RUNTIME_DIR/xum-dev-<uid>, created private by make", async () => {
+      const run = await dryRun("dev-server", {
+        XDG_RUNTIME_DIR: runtimeDir,
+        XUM_BACKEND_PORT: "3111",
+      });
+      expect(run.socket).toBe(path.join(runtimeDir, `xum-dev-${uid}`, "b3111-127.0.0.1.sock"));
+      expect((await fs.stat(path.join(runtimeDir, `xum-dev-${uid}`))).mode & 0o777).toBe(0o700);
+    });
+
+    test("is kept when it is a private folder of ours", async () => {
+      await fs.mkdir(path.join(runtimeDir, `xum-dev-${uid}`), { mode: 0o700 });
+      const run = await dryRun("dev-server", {
+        XDG_RUNTIME_DIR: runtimeDir,
+        XUM_BACKEND_PORT: "3111",
+      });
+      expect(run.socket).toBe(path.join(runtimeDir, `xum-dev-${uid}`, "b3111-127.0.0.1.sock"));
+    });
+
+    test("is replaced by a fresh private folder when it is not safely ours", async () => {
+      // A symlink stands in for the other account's folder: only root could make a folder of
+      // another uid. The real nobody-owned case is in the PR's live proof.
+      const elsewhere = path.join(runtimeDir, "elsewhere");
+      await fs.mkdir(elsewhere, { mode: 0o700 });
+      await fs.symlink(elsewhere, path.join(runtimeDir, `xum-dev-${uid}`));
+      const run = await dryRun("dev-server", {
+        XDG_RUNTIME_DIR: runtimeDir,
+        XUM_BACKEND_PORT: "3111",
+      });
+      const socket = exportedSocket(run);
+      const folder = path.dirname(socket);
+      expect(path.dirname(folder)).toBe(runtimeDir);
+      expect(path.basename(folder)).toMatch(new RegExp(`^xum-dev-${uid}\\.`));
+      expect(path.basename(socket)).toBe("b3111-127.0.0.1.sock");
+      expect((await fs.stat(folder)).mode & 0o777).toBe(0o700);
+      expect(await fs.readdir(elsewhere)).toEqual([]);
+      // The backend gets the same path as Vite.
+      expect(await backendSocketArgument(run)).toBe(socket);
+    });
+
+    test("make stops with a message when the parent cannot be trusted", async () => {
+      const shared = path.join(runtimeDir, "shared");
+      await fs.mkdir(shared);
+      await fs.chmod(shared, 0o777);
+      const proc = Bun.spawn(["make", "-pn", "dev-server"], {
+        cwd: REPO_ROOT,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          XDG_RUNTIME_DIR: shared,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain("XUM_BACKEND_SOCKET");
+      expect(stderr).toContain("XDG_RUNTIME_DIR");
+      expect(await fs.readdir(shared)).toEqual([]);
+    });
+  });
+
   test("Windows ignores an ambient XUM_BACKEND_SOCKET", () => {
     expect(windowsAmbient.socket ?? "").toBe("");
   });

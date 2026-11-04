@@ -48,7 +48,7 @@ import {
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
-import { preparePrivateUnixSocketPath } from "@/node/utils/privateUnixSocket";
+import { withPrivateUnixSocketPath } from "@/node/utils/privateUnixSocket";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createHealthProbe } from "@/node/orpc/healthProbe";
 import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
@@ -109,7 +109,7 @@ export interface OrpcServerOptions {
    */
   allowHttpOrigin?: boolean;
   /**
-   * Also listen on this Unix socket, in a private folder (see preparePrivateUnixSocketPath). A
+   * Also listen on this Unix socket, in a private folder (see withPrivateUnixSocketPath). A
    * client that connects there reaches this server or nothing, because no other user can create a
    * name in that folder. The dev server's Vite proxy uses it, since the TCP port is free for any
    * local account to bind while the backend restarts.
@@ -845,15 +845,19 @@ function createForwardingServer(primary: http.Server, name: string): http.Server
 
 /** Listen on `socketPath` (made private first) and serve it with the primary's handlers. */
 async function listenOnUnixSocket(primary: http.Server, socketPath: string): Promise<http.Server> {
-  await preparePrivateUnixSocketPath(socketPath);
   const unixServer = createForwardingServer(primary, "orpc-http-server-unix");
-  await new Promise<void>((resolve, reject) => {
-    unixServer.once("error", reject);
-    unixServer.listen(socketPath, () => {
-      unixServer.removeListener("error", reject);
-      resolve();
-    });
-  });
+  // The lock is held until the socket listens, so a second start on this path sees it as in use.
+  await withPrivateUnixSocketPath(
+    socketPath,
+    () =>
+      new Promise<void>((resolve, reject) => {
+        unixServer.once("error", reject);
+        unixServer.listen(socketPath, () => {
+          unixServer.removeListener("error", reject);
+          resolve();
+        });
+      })
+  );
   return unixServer;
 }
 
