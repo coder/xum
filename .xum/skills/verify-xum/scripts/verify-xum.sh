@@ -85,6 +85,12 @@ group_is_ours() {
   return 1
 }
 
+# ": <fix>" with @DIR@ replaced by the folder, quoted so the command can be copied as printed (a
+# folder can hold spaces or glob characters). Nothing without a fix.
+refusal_fix() { # refusal_fix <fix> <folder>
+  if [[ -n $1 ]]; then printf ': %s' "${1//@DIR@/$(printf %q "$2")}"; fi
+}
+
 # A run's state.env is sourced, so the run folder and the home above it must be real folders (no
 # symlinks), owned by this user and writable by nobody else.
 require_private_dir() { # require_private_dir <dir> [<fix for a writable folder; @DIR@ names it>]
@@ -92,7 +98,7 @@ require_private_dir() { # require_private_dir <dir> [<fix for a writable folder;
   [[ -d $dir && ! -L $dir ]] || die "$dir is not a real folder"
   [[ $(stat -c %u "$dir") == "$(id -u)" ]] || die "$dir is not owned by user $(id -u)"
   mode=$(stat -c %a "$dir")
-  (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)${fix:+: ${fix//@DIR@/$dir}}"
+  (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)$(refusal_fix "$fix" "$dir")"
 }
 
 # Every folder above a run home (or a git dir) must be owned by root or this user and writable by
@@ -106,7 +112,7 @@ require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for mes
     mode=$(stat -c %a "$dir")
     [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above $what, is owned by user $owner"
     (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
-      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)${fix:+: ${fix//@DIR@/$dir}}"
+      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)$(refusal_fix "$fix" "$dir")"
   done
 }
 
