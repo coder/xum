@@ -265,11 +265,12 @@ the base URL string, so a query would swallow the endpoint path. Pass authentica
 
 A `models` entry can be a model ID string or an object with these fields:
 
-| Field                 | Description                                                                                       |
-| --------------------- | ------------------------------------------------------------------------------------------------- |
-| `id`                  | Model ID sent to the endpoint.                                                                    |
-| `contextWindowTokens` | Context window size in tokens, for the context meter and auto-compaction.                         |
-| `thinkingLevels`      | Thinking levels Xum offers for this model: any of `off`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| Field                 | Description                                                                                        |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `id`                  | Model ID sent to the endpoint.                                                                     |
+| `contextWindowTokens` | Context window size in tokens, for the context meter and auto-compaction.                          |
+| `mappedToModel`       | A known model (`provider:model`) whose capabilities, pricing, and tokenizer Xum uses for this one. |
+| `thinkingLevels`      | Thinking levels Xum offers for this model: any of `off`, `low`, `medium`, `high`, `xhigh`, `max`.  |
 
 ```jsonc
 {
