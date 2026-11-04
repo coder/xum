@@ -12,7 +12,7 @@ const posix = process.platform !== "win32";
 
 /** Everything that runs before the bind: folder checks, the lock, and the stale-socket removal. */
 const prepare = (socketPath: string, ownerUid?: number) =>
-  withPrivateUnixSocketPath(socketPath, async () => undefined, ownerUid);
+  withPrivateUnixSocketPath(socketPath, () => Promise.resolve(undefined), ownerUid);
 
 function listenOn(server: net.Server, socketPath: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -249,8 +249,11 @@ describe.skipIf(!posix)("withPrivateUnixSocketPath", () => {
           winners,
           `round ${round}: ${JSON.stringify(results.map((r) => r.status))}`
         ).toHaveLength(1);
-        const loser = results.find((result) => result.status === "rejected");
-        expect(String((loser as PromiseRejectedResult).reason)).toMatch(/in use/);
+        const refusals = results.flatMap((result) =>
+          result.status === "rejected" ? [String(result.reason)] : []
+        );
+        expect(refusals).toHaveLength(1);
+        expect(refusals[0]).toMatch(/in use/);
         expect(await connects(socketPath)).toBe(true);
         await closeServer(servers[winners[0]]);
         await fs.rm(socketPath, { force: true });
@@ -283,7 +286,7 @@ describe.skipIf(!posix)("withPrivateUnixSocketPath", () => {
         expect(lines.find((line) => line !== "bound")).toMatch(/^refused: .*in use/);
         expect(await connects(socketPath)).toBe(true);
         for (const proc of procs) {
-          proc.stdin.end();
+          void proc.stdin.end();
           await proc.exited;
         }
         await fs.rm(socketPath, { force: true });
@@ -317,9 +320,7 @@ describe.skipIf(!posix)("withPrivateUnixSocketPath", () => {
       await prepare(socketPath);
       await expect(fs.lstat(`${socketPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
       await expect(
-        withPrivateUnixSocketPath(socketPath, async () => {
-          throw new Error("bind failed");
-        })
+        withPrivateUnixSocketPath(socketPath, () => Promise.reject(new Error("bind failed")))
       ).rejects.toThrow(/bind failed/);
       await expect(fs.lstat(`${socketPath}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
     });
