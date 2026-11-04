@@ -72,9 +72,9 @@ printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -s -X POST -H @- "http://127
 
 Command lines are readable by every local account. So node gets only the lockfile path, and the header goes to `curl -H @-` on stdin from the `printf` builtin. Never pass the token as an argument.
 
-Warning: on a host with other local accounts, do not open the authenticated page in `agent-browser`. Chrome's DevTools port (`--remote-debugging-port=0`, set by `agent-browser`, which cannot start Chrome without it) is open from the moment Chrome launches, and it has no credential. Another account can catch the token while the page navigates, or read it from the page's storage afterwards, and it can drive the page and open a terminal in the sandbox. The token works until the sandbox restarts. Turning the stream off (below) does not change that. On Windows the `agent-browser` daemon also takes commands, without a credential, on a loopback TCP port that follows from the session name. On such a host, call the backend with `curl` or `xum api` as above.
+Warning: on a host with other local accounts, do not open the authenticated page in `agent-browser`. Chrome's DevTools port (`--remote-debugging-port=0`, set by `agent-browser`, which cannot start Chrome without it) is open from the moment Chrome launches, and it has no credential. Another account can catch the token while the page navigates, or read it from the page's storage afterwards, and it can drive the page and open a terminal in the sandbox. The default token is new for every run and works until the sandbox restarts. A token set with `XUM_DEV_SERVER_AUTH_TOKEN` works for as long as you reuse it. Turning the stream off (below) does not change that. On Windows the `agent-browser` daemon also takes commands, without a credential, on a loopback TCP port that follows from the session name. On such a host, call the backend with `curl` or `xum api` as above.
 
-On a host where you are the only account, open the app in a browser once with the token in the URL. Close the Xum Browser tab of this workspace first: it attaches to the first `agent-browser` session it finds and turns that session's stream on (`ensureSessionAttachable`). Three things keep the token away from other local accounts, and the recipe does all of them:
+On a host where you are the only account, open the app in a browser once with the token in the URL. Set `XUM_ROOT` and `VITE_PORT` to the values the sandbox printed. Close the Xum Browser tab of this workspace first: it attaches to the first `agent-browser` session it finds and turns that session's stream on (`ensureSessionAttachable`). The recipe adds three protections. They help on a host where you are the only account. On a shared host they are not enough, because of the DevTools port in the warning above:
 
 - The token goes to the browser on stdin: node builds the URL and pipes it to `agent-browser batch`, so the token is in no command line.
 - `agent-browser` starts a WebSocket stream on a loopback port for every session. It takes mouse and keyboard input with no credential, so any local account could drive the authenticated page. The recipe opens `about:blank`, turns the stream off (this also closes clients that are already connected) and checks that it is off before the token goes in. It checks again after the page loads, and closes the session if the stream came back. Each failure message names the step that failed.
@@ -85,7 +85,8 @@ S=xum-sandbox-$VITE_PORT # one session per sandbox; the name goes on every agent
 ab() { agent-browser --session "$S" "$@"; }
 off() { ab --json stream status | node -e 'try { process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).data.enabled === false ? 0 : 1); } catch { process.exit(1); }'; }
 fail() { echo "agent-browser: $1, so the token was not sent" >&2; false; }
-if ! ab open about:blank >/dev/null; then fail "'open about:blank' failed"
+if [[ ! $VITE_PORT =~ ^[0-9]+$ || ! -r $XUM_ROOT/server.lock ]]; then fail "set VITE_PORT (digits) and XUM_ROOT (the sandbox root, with a server.lock)"
+elif ! ab open about:blank >/dev/null; then fail "'open about:blank' failed"
 elif ! { ab stream disable >/dev/null 2>&1 || off; }; then fail "'stream disable' failed and the stream is still on"
 elif ! off; then fail "'stream status' does not show the stream off"
 elif out=$(node -e '
