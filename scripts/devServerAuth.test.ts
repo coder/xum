@@ -1,9 +1,13 @@
 import { beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 
 interface DryRun {
+  /** XUM_BACKEND_SOCKET as make exports it to the recipe's processes (env, not secret). */
+  socket: string | undefined;
   /** What make would run. Nothing starts, and it is argv-visible to every local account. */
   commands: string;
   /** XUM_SERVER_AUTH_TOKEN as make exports it to the recipe's processes (env, not argv). */
@@ -36,12 +40,33 @@ async function dryRun(
   const token = /^XUM_SERVER_AUTH_TOKEN := (.*)$/m
     .exec(stdout.slice(databaseStart))?.[1]
     ?.replaceAll("$$", "$");
-  return { commands, token };
+  const socket = /^XUM_BACKEND_SOCKET :?= (.*)$/m.exec(stdout.slice(databaseStart))?.[1];
+  return { commands, token, socket };
 }
 
 function exportedToken(run: DryRun): string {
   if (run.token === undefined) throw new Error("make did not export XUM_SERVER_AUTH_TOKEN");
   return run.token;
+}
+
+function exportedSocket(run: DryRun): string {
+  if (run.socket === undefined) throw new Error("make did not export XUM_BACKEND_SOCKET");
+  return run.socket;
+}
+
+async function shell(script: string, env: Record<string, string>): Promise<string> {
+  const proc = Bun.spawn(["sh", "-c", script], {
+    env: { PATH: process.env.PATH ?? "", ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  expect(exitCode, stderr).toBe(0);
+  return stdout.replace(/\n$/, "");
 }
 
 function backendCommand(run: DryRun): string {
@@ -50,6 +75,34 @@ function backendCommand(run: DryRun): string {
     .filter((line) => line.includes("dist/cli/index.js server"));
   expect(lines, "the dev-server recipe must start the backend").toHaveLength(1);
   return lines[0];
+}
+
+/**
+ * The `--unix-socket` value that `node` receives when the recipe's backend line runs with the
+ * socket that make exports. It runs the real shell layers with a `node` that prints its argv.
+ */
+async function backendSocketArgument(run: DryRun): Promise<string> {
+  const socket = exportedSocket(run);
+  const line = backendCommand(run).trim().replace(/\\$/, "");
+  // What the recipe's shell hands to concurrently as one argument.
+  const handedOn = await shell(`printf '%s' ${line}`, { XUM_BACKEND_SOCKET: socket });
+  const exec = /--exec '(.*)'$/s.exec(handedOn)?.[1];
+  if (exec === undefined) throw new Error(`no --exec in ${handedOn}`);
+  // nodemon runs the exec string in a shell.
+  const bin = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-node-"));
+  try {
+    await fs.writeFile(path.join(bin, "node"), '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', {
+      mode: 0o755,
+    });
+    const argv = (
+      await shell(exec, { XUM_BACKEND_SOCKET: socket, PATH: `${bin}:${process.env.PATH ?? ""}` })
+    ).split("\n");
+    const flag = argv.indexOf("--unix-socket");
+    expect(flag, `no --unix-socket in ${JSON.stringify(argv)}`).toBeGreaterThanOrEqual(0);
+    return argv[flag + 1];
+  } finally {
+    await fs.rm(bin, { recursive: true, force: true });
+  }
 }
 
 // Any other local account can reach a loopback port, and an open backend runs commands as the
@@ -166,4 +219,81 @@ describe("vite dev server", () => {
       source: true,
     });
   }, 60_000);
+});
+
+// Any local account can bind the backend's TCP port while nodemon restarts the backend, and the
+// browser's reconnect URL carries the token. So Vite reaches the backend over a Unix socket in a
+// private folder, and make hands both sides the same path.
+describe.skipIf(process.platform === "win32")("make dev-server backend socket", () => {
+  let socketRun: DryRun;
+  let otherPort: DryRun;
+  let chosen: DryRun;
+  let windows: DryRun;
+  let windowsAmbient: DryRun;
+  let otherHost: DryRun;
+  let ipv6Host: DryRun;
+  let otherGoal: DryRun;
+
+  beforeAll(async () => {
+    [socketRun, otherPort, chosen, windows, windowsAmbient, otherHost, ipv6Host, otherGoal] =
+      await Promise.all([
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111" }),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3222" }),
+        dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/custom.sock" }),
+        dryRun("dev-server", {}, ["OS=Windows_NT"]),
+        dryRun("dev-server", { XUM_BACKEND_SOCKET: "/run/me/ambient.sock" }, ["OS=Windows_NT"]),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111", XUM_BACKEND_HOST: "192.168.1.5" }),
+        dryRun("dev-server", { XUM_BACKEND_PORT: "3111", XUM_BACKEND_HOST: "::1" }),
+        dryRun("help"),
+      ]);
+  }, 60_000);
+
+  test("the backend listens on the exported path, and the path fits sun_path", async () => {
+    const socket = exportedSocket(socketRun);
+    expect(socket.startsWith("/")).toBe(true);
+    expect(socket).toMatch(/b3111-127\.0\.0\.1\.sock$/);
+    expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(100);
+    expect(await backendSocketArgument(socketRun)).toBe(socket);
+  });
+
+  test("each backend port gets its own socket", () => {
+    expect(otherPort.socket).toMatch(/b3222-/);
+    expect(otherPort.socket).not.toBe(socketRun.socket);
+  });
+
+  // Two backends on one port with different bind addresses can run together, so the socket name
+  // needs the host as well, or the second backend would find the first one's socket in use.
+  test("the same port on another host gets its own socket, and a host has no colons", () => {
+    expect(otherHost.socket).toMatch(/b3111-192\.168\.1\.5\.sock$/);
+    expect(otherHost.socket).not.toBe(socketRun.socket);
+    expect(path.basename(exportedSocket(ipv6Host))).toBe("b3111-__1.sock");
+  });
+
+  test("XUM_BACKEND_SOCKET picks the path for both sides", async () => {
+    expect(chosen.socket).toBe("/run/me/custom.sock");
+    expect(await backendSocketArgument(chosen)).toBe("/run/me/custom.sock");
+  });
+
+  // The path reaches the backend through three shells: the recipe's, concurrently's and nodemon's
+  // `--exec`. A path with spaces or quotes must still be one argument.
+  test("a path with spaces and quotes reaches the backend as one argument", async () => {
+    const spaced = `/tmp/xum a'b "c"/b.sock`;
+    const run = await dryRun("dev-server", { XUM_BACKEND_SOCKET: spaced });
+    expect(await backendSocketArgument(run)).toBe(spaced);
+  }, 60_000);
+
+  test("Windows keeps TCP: no socket for Vite or the backend", () => {
+    expect(windows.socket ?? "").toBe("");
+    expect(backendCommand(windows)).not.toContain("--unix-socket");
+  });
+
+  // The Windows recipe starts the backend on TCP only. An ambient path would still reach Vite, which
+  // would proxy to a socket that nothing listens on.
+  test("Windows ignores an ambient XUM_BACKEND_SOCKET", () => {
+    expect(windowsAmbient.socket ?? "").toBe("");
+  });
+
+  test("other goals export no socket", () => {
+    expect(otherGoal.socket).toBeUndefined();
+  });
 });
