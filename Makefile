@@ -80,7 +80,8 @@ ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
 ifndef XUM_BACKEND_SOCKET
 # scripts/devServerSocketPath.ts: another account can create the default folder first, and the
 # backend refuses a folder that is not ours, so a folder that is not safely ours is replaced by a
-# fresh private one next to it (and says so). It creates nothing otherwise, so dry runs are free.
+# fresh private one next to it (and says so). It creates the folder (0700) when it is missing, so
+# that no other account takes the name while make builds, and a dry run does the same.
 shq = '$(subst ','\'',$(1))'
 XUM_BACKEND_SOCKET := $(shell bun scripts/devServerSocketPath.ts $(call shq,$(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)) $(call shq,b$(XUM_BACKEND_PORT)-$(subst /,_,$(subst :,_,$(XUM_BACKEND_HOST))).sock))
 ifeq ($(XUM_BACKEND_SOCKET),)

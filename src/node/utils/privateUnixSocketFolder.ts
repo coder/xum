@@ -115,17 +115,24 @@ export interface DevSocketChoice {
   fellBackFrom?: { folder: string; reason: string };
 }
 
+/** mkdtemp appends this to the folder name: "." and six characters. */
+const MKDTEMP_SUFFIX = ".XXXXXX";
+
 /**
- * Where `make dev-server` puts the backend socket. The answer is `folder/fileName` when that folder
- * is missing (the backend creates it) or is a private folder of ours. Another account can create
- * the default folder first, and the backend then refuses to use it. A folder that is not safely
- * ours is therefore replaced by a fresh one from mkdtemp next to it (mode 0700, a random name that
- * nobody else can have made), and the reason goes back to the caller to tell the user. The Vite hop
- * never falls back to TCP: the squat window that the socket closes would open again.
+ * Where `make dev-server` puts the backend socket. The answer is `folder/fileName`, with `folder`
+ * created here (mode 0700, atomically) when it is missing, or already a private folder of ours.
+ * `make` builds for a while between this choice and the start of the backend, so a missing folder
+ * is claimed at once: another account cannot take the name in between.
+ *
+ * Another account can also create the default folder first, and the backend then refuses to use
+ * it. A folder that is not safely ours is therefore replaced by a fresh one from mkdtemp next to it
+ * (mode 0700, a random name that nobody else can have made), and the reason goes back to the
+ * caller to tell the user. The Vite hop never falls back to TCP: the squat window that the socket
+ * closes would open again.
  *
  * Throws when a parent of the folder is unsafe: a fresh folder next to it would be just as open to
- * another account, so only the user can fix it (XUM_BACKEND_SOCKET or XDG_RUNTIME_DIR). Nothing is
- * created in the normal cases, so a dry run of make has no side effects.
+ * another account, so only the user can fix it (XUM_BACKEND_SOCKET or XDG_RUNTIME_DIR). It also
+ * throws, before it creates the fresh folder, when the longer fallback path would not fit.
  */
 export async function chooseDevSocketPath(
   folder: string,
@@ -134,14 +141,19 @@ export async function chooseDevSocketPath(
 ): Promise<DevSocketChoice> {
   const preferred = path.join(folder, fileName);
   await assertParentsTrusted(folder, ownerUid);
+  try {
+    await fs.mkdir(folder, { mode: 0o700 });
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error;
+  }
   let reason: string;
   try {
     await assertPrivateFolder(folder, ownerUid);
     return { socketPath: preferred };
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return { socketPath: preferred };
     reason = error instanceof Error ? error.message : String(error);
   }
+  assertSocketPathFits(path.join(`${folder}${MKDTEMP_SUFFIX}`, fileName));
   const fresh = await fs.mkdtemp(`${folder}.`);
   await assertPrivateFolder(fresh, ownerUid);
   return { socketPath: path.join(fresh, fileName), fellBackFrom: { folder, reason } };
