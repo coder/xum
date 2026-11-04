@@ -153,5 +153,5 @@ MAKE=gmake make dev-server-sandbox
 - `providers.jsonc` may contain API keys.
 - The sandbox root directory is created on disk (usually under your system temp dir).
 - This flow intentionally **does not** copy `secrets.json`.
-- Vite reaches the backend over a Unix socket in a private folder (`/tmp/xum-dev-<uid>/b<backend port>-<backend host>.sock`, or under `$XDG_RUNTIME_DIR`), so no other account can take the backend's place while its TCP port is free during a restart. The TCP port stays for `xum api`, curl and scripts. Windows keeps TCP for the Vite hop.
+- Vite reaches the backend over a Unix socket in a private folder (`/tmp/xum-dev-<uid>/b<backend port>-<backend host>.sock`, or under `$XDG_RUNTIME_DIR`; when another account made that folder first, `make` prints why and uses a fresh private folder next to it), so no other account can take the backend's place while its TCP port is free during a restart. The TCP port stays for `xum api`, curl and scripts. Windows keeps TCP for the Vite hop.
 - A socket path over about 100 bytes makes the backend refuse to start, with a message that names the limit. Set `XUM_BACKEND_SOCKET` to a shorter path. Nothing falls back to TCP.

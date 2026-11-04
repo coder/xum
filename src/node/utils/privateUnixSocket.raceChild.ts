@@ -5,21 +5,24 @@
 import * as net from "node:net";
 import { withPrivateUnixSocketPath } from "./privateUnixSocket";
 
-const socketPath = process.argv[2];
-const server = net.createServer();
-try {
-  await withPrivateUnixSocketPath(
-    socketPath,
-    () =>
-      new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(socketPath, () => resolve());
-      })
-  );
+async function main(socketPath: string): Promise<void> {
+  const server = net.createServer();
+  try {
+    await withPrivateUnixSocketPath(
+      socketPath,
+      () =>
+        new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(socketPath, () => resolve());
+        })
+    );
+  } catch (error) {
+    console.log(`refused: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
   console.log("bound");
   process.stdin.resume();
   process.stdin.on("end", () => server.close(() => process.exit(0)));
-} catch (error) {
-  console.log(`refused: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(0);
 }
+
+void main(process.argv[2]);
