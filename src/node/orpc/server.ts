@@ -48,6 +48,7 @@ import {
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
+import { withPrivateUnixSocketPath } from "@/node/utils/privateUnixSocket";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createHealthProbe } from "@/node/orpc/healthProbe";
 import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
@@ -107,6 +108,13 @@ export interface OrpcServerOptions {
    * Keep disabled by default and only enable when TLS is terminated before mux.
    */
   allowHttpOrigin?: boolean;
+  /**
+   * Also listen on this Unix socket, in a private folder (see withPrivateUnixSocketPath). A
+   * client that connects there reaches this server or nothing, because no other user can create a
+   * name in that folder. The dev server's Vite proxy uses it, since the TCP port is free for any
+   * local account to bind while the backend restarts.
+   */
+  unixSocketPath?: string;
 }
 
 export interface OrpcServer {
@@ -821,6 +829,48 @@ function listenOnce(server: net.Server, port: number, host: string): Promise<voi
   });
 }
 
+/**
+ * A second HTTP server that re-emits its request, upgrade, and clientError events on `primary`, so
+ * it shares the primary's handlers. (Handing raw sockets over with emit("connection") works in
+ * Node but not in Bun.)
+ */
+function createForwardingServer(primary: http.Server, name: string): http.Server {
+  const secondary = http.createServer();
+  attachStreamErrorHandler(secondary, name, { logger: log });
+  for (const event of ["request", "upgrade", "clientError"] as const) {
+    secondary.on(event, (...args: unknown[]) => primary.emit(event, ...args));
+  }
+  return secondary;
+}
+
+/** Listen on `socketPath` (made private first) and serve it with the primary's handlers. */
+async function listenOnUnixSocket(primary: http.Server, socketPath: string): Promise<http.Server> {
+  const unixServer = createForwardingServer(primary, "orpc-http-server-unix");
+  // The lock is held until the socket listens, so a second start on this path sees it as in use.
+  await withPrivateUnixSocketPath(
+    socketPath,
+    () =>
+      new Promise<void>((resolve, reject) => {
+        unixServer.once("error", reject);
+        unixServer.listen(socketPath, () => {
+          unixServer.removeListener("error", reject);
+          resolve();
+        });
+      })
+  );
+  return unixServer;
+}
+
+/** Drop the connections of a listener that feeds the primary server, then stop it if it listens. */
+async function closeSecondaryListener(server: http.Server | null): Promise<void> {
+  if (!server) return;
+  server.closeIdleConnections?.();
+  server.closeAllConnections?.();
+  if (server.listening) {
+    await closeListener(server);
+  }
+}
+
 function closeListener(server: net.Server): Promise<void> {
   return new Promise<void>((resolve) => server.close(() => resolve()));
 }
@@ -887,11 +937,7 @@ async function listenOnBothLoopbacks(
     };
     httpServer.on("connection", trackSocket);
 
-    const ipv6Server = http.createServer();
-    attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
-    for (const event of ["request", "upgrade", "clientError"] as const) {
-      ipv6Server.on(event, (...args: unknown[]) => httpServer.emit(event, ...args));
-    }
+    const ipv6Server = createForwardingServer(httpServer, "orpc-http-server-ipv6");
     try {
       await listenOnce(ipv6Server, address.port, "::1");
       return ipv6Server;
@@ -935,6 +981,7 @@ export async function createOrpcServer({
   context,
   serveStatic = false,
   allowHttpOrigin = false,
+  unixSocketPath,
   // Default for non-bundled mode: from dist/node/orpc/, go up 2 levels to dist/.
   // In bundled mode (dist/runtime/), serverService computes the static dir.
   staticDir = path.join(__dirname, "../.."),
@@ -1846,12 +1893,16 @@ export async function createOrpcServer({
 
   // Start listening
   let ipv6LoopbackServer: http.Server | null = null;
+  let unixSocketServer: http.Server | null = null;
   try {
     // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
     if (host.trim().toLowerCase() === "localhost") {
       ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
     } else {
       await listenOnce(httpServer, port, host);
+    }
+    if (unixSocketPath != null) {
+      unixSocketServer = await listenOnUnixSocket(httpServer, unixSocketPath);
     }
   } catch (error) {
     // The caller gets no OrpcServer to close, and desktop startup keeps running after a
@@ -1861,6 +1912,9 @@ export async function createOrpcServer({
       ws.terminate();
     }
     wsServer.close();
+    // A failed socket bind comes after the TCP listeners were bound.
+    await closeSecondaryListener(ipv6LoopbackServer);
+    await closeSecondaryListener(httpServer);
     throw error;
   }
 
@@ -1904,14 +1958,9 @@ export async function createOrpcServer({
         await browserBridgeServer.stop();
       }
 
-      // Then close HTTP server (and the IPv6 loopback listener feeding it).
-      if (ipv6LoopbackServer) {
-        ipv6LoopbackServer.closeIdleConnections?.();
-        ipv6LoopbackServer.closeAllConnections?.();
-        if (ipv6LoopbackServer.listening) {
-          await closeListener(ipv6LoopbackServer);
-        }
-      }
+      // Then close HTTP server (and the IPv6 loopback and Unix socket listeners feeding it).
+      await closeSecondaryListener(ipv6LoopbackServer);
+      await closeSecondaryListener(unixSocketServer);
       httpServer.closeIdleConnections?.();
       httpServer.closeAllConnections?.();
       if (httpServer.listening) {

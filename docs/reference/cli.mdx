@@ -236,6 +236,7 @@ Options:
 - `--no-auth` - Disable authentication entirely
 - `--print-auth-token` - Always print the auth token on startup
 - `--allow-http-origin` - Accept HTTPS browser origins when a TLS-terminating proxy forwards `X-Forwarded-Proto=http`
+- `--unix-socket <path>` - Also listen on a Unix socket. The path must be absolute and at most 107 bytes on Linux (103 on macOS). Its folder is created with mode `0700` and must be owned by you, and no other user may be able to rename it (every folder above it must be yours or root's, and not writable by others unless sticky like `/tmp`), so no other user can create the socket's name. A stale socket from a crashed run is removed, under a lock (`<path>.lock` in the same folder), so two servers started at once on one path cannot remove each other's socket. A socket that a running server still holds is not removed: the server refuses to start. `make dev-server` uses it for the Vite proxy
 - `--ssh-host <host>` - SSH hostname/alias used for editor deep links in browser mode
 - `--add-project <path>` - Add and open project at the specified path
 

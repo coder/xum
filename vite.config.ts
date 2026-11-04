@@ -23,6 +23,7 @@ const {
   previewPort,
   backendHost: backendProxyHost,
   backendPort: backendProxyPort,
+  backendSocket,
   enableTutorialsInSandbox,
 } = resolveViteDevServerEnv(process.env);
 
@@ -54,7 +55,15 @@ function formatHostForUrl(host: string): string {
 
 // In dev-server mode we run the backend on a separate local port, but we want the
 // browser UI to talk to it via same-origin paths (single public port).
-const backendProxyTarget = `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
+//
+// With a backend socket (`make dev-server` on Linux and macOS) the proxy never uses that port: it is
+// free for any local account to bind while the backend restarts, and the browser's reconnect URL
+// carries the token. The socket sits in a private folder, so only this user's backend can answer.
+// `host` and `port` are placeholders: Node connects to `socketPath` and ignores them.
+const backendProxyTarget =
+  backendSocket !== undefined
+    ? { socketPath: backendSocket, host: "localhost", port: 0 }
+    : `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
 
 const alias: Record<string, string> = {
   "@": path.resolve(__dirname, "./src"),

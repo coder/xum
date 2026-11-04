@@ -77,6 +77,8 @@ Core workflow:
 3. `agent-browser click @e1` / `fill @e2 "text"` - Interact using refs
 4. Re-snapshot after page changes
 
+Never `open` a URL that carries a token or another credential: it is readable in the command line, and every `agent-browser` session has a loopback WebSocket stream and Chrome has a DevTools port, with no credential on either. To open an authenticated dev-server sandbox, use the recipe in the `dev-server-sandbox` skill.
+
 ## PR Workflow
 
 - When checking PR readiness, audit **all** PR reviews, review comments, and issue comments from every reviewer/bot (including `coder-agents-review`), not just Codex; address or explicitly resolve them before declaring readiness.

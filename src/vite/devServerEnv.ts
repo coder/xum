@@ -15,6 +15,12 @@ export interface ViteDevServerEnv {
   previewPort: number;
   backendHost: string;
   backendPort: number;
+  /**
+   * Unix socket of the backend, when `make dev-server` started it with `--unix-socket`. The proxy
+   * then never uses the backend's TCP port: any local account can bind that port while the backend
+   * restarts, and the browser's reconnect URL carries the token.
+   */
+  backendSocket: string | undefined;
   enableTutorialsInSandbox: string | undefined;
 }
 
@@ -90,6 +96,7 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     resolveXumEnvironmentValue("VITE_PREVIEW_PORT", env),
     DEFAULT_VITE_PREVIEW_PORT
   );
+  const backendSocket = resolveXumEnvironmentValue("BACKEND_SOCKET", env);
   const backendHost = resolveXumEnvironmentValue("BACKEND_HOST", env) ?? DEFAULT_BACKEND_PROXY_HOST;
   const backendPort = parsePort(
     resolveXumEnvironmentValue("BACKEND_PORT", env),
@@ -103,6 +110,9 @@ export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
     previewPort,
     backendHost,
     backendPort,
+    // A blank value (a recipe that exports it empty) is no socket. A path is never trimmed: the
+    // backend listens on the value as make exported it, so Vite must connect to the same bytes.
+    backendSocket: backendSocket?.trim() === "" ? undefined : backendSocket,
     enableTutorialsInSandbox: resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
   };
 }
