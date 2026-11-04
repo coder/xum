@@ -377,7 +377,7 @@ launch_failed() {
 }
 
 cmd_launch() {
-  local t0 backend_port vite_port log existing
+  local t0 backend_port vite_port log existing token
   need git curl node bun make setsid flock ss agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -461,6 +461,10 @@ cmd_launch() {
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
     sleep 1
   done
+  # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
+  # and the file is 0600.
+  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  [[ -z $token ]] || (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
 
   seed
   write_state
@@ -541,6 +545,13 @@ cmd_open() {
       process.stderr.write("verify-xum: open PATH must stay on " + base + " and must not start with // once normalized\n");
       process.exit(1);
     }' "$VERIFY_XUM_URL" "$path" || exit 1
+  # agent-browser serves each session's screen and input as a WebSocket on 127.0.0.1 that every
+  # local account can connect to, and a new daemon starts it on its own (no setting keeps it
+  # off). Turn it off before the token reaches the browser, on every open because a restarted
+  # daemon starts it again. `stream disable` also drops connected clients, and starts the daemon
+  # when none runs: the browser it launches later keeps the stream off.
+  agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
+  stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
@@ -556,6 +567,16 @@ cmd_open() {
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
     || die "agent-browser could not open $path: $(sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out")"
   # The success output repeats the URL with the token: it is not printed.
+  if ! stream_is_off; then
+    agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
+    die "agent-browser's stream for session $AGENT_BROWSER_SESSION came on during the open. Closed the session."
+  fi
+}
+
+# True when the session's agent-browser stream (see cmd_open) is off.
+stream_is_off() {
+  [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" stream status --json 2>/dev/null \
+    | node -e 'try { console.log(JSON.parse(require("fs").readFileSync(0, "utf8")).data.enabled === false) } catch { console.log(false) }') == true ]]
 }
 
 # Prints FIELD (id, archivedAt, ...) of the workspace named NAME in the run's config.json, or
@@ -579,6 +600,15 @@ cmd_workspace_field() {
     "$VERIFY_XUM_ROOT/config.json" "$name" "$field"
 }
 
+# The backend's token: server.lock's, else the copy launch keeps in the private run folder. A
+# restarting backend deletes server.lock for a moment, and a stopped one for good.
+run_token() {
+  local token
+  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  [[ -n $token || ! -f $VERIFY_XUM_RUN/token ]] || token=$(<"$VERIFY_XUM_RUN/token")
+  printf '%s' "$token"
+}
+
 # Evidence is meant to be shared, so no text in it may keep the backend's token: the page keeps
 # ?token= in its URL when the app fails before it strips it. This replaces the token (raw, and
 # URL-encoded as a path part and as a form value) and the value of any token= query parameter
@@ -589,7 +619,7 @@ cmd_workspace_field() {
 REDACT_TOKEN=
 redact_token() { # redact_token [PATH...]
   local token=$REDACT_TOKEN
-  [[ -n $token ]] || token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  [[ -n $token ]] || token=$(run_token)
   # shellcheck disable=SC2016 # $1 is the regex group, for node
   node -e '
     const fs = require("fs");
@@ -663,8 +693,8 @@ is_dev_server_sandbox_root() {
 cmd_cleanup() {
   load_run "${1:-}"
   local i
-  # Read the token while server.lock exists: stopping the group makes the sandbox delete its root.
-  REDACT_TOKEN=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
+  # Read the token before the group stops: the backend then deletes server.lock.
+  REDACT_TOKEN=$(run_token)
   # agent-browser `close` on a session that does not exist starts that session first.
   if [[ $(agent-browser session list 2>/dev/null) == *"$AGENT_BROWSER_SESSION"* ]]; then
     agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
@@ -690,6 +720,8 @@ cmd_cleanup() {
   drop_current_run_link_if "$VERIFY_XUM_RUN"
   VERIFY_XUM_PGID=
   write_state
+  # Last: the redaction above used it.
+  rm -f "$VERIFY_XUM_RUN/token"
   echo "cleaned up run $VERIFY_XUM_RUN_ID; evidence kept in $VERIFY_XUM_EVIDENCE ($(find "$VERIFY_XUM_EVIDENCE" -type f | wc -l | tr -d ' ') files) and $VERIFY_XUM_RUN/server.log"
 }
 

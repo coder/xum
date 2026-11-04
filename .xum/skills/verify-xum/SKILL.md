@@ -112,6 +112,16 @@ agent-browser find role button click --name "Open settings" --exact
   node from `server.lock` and hands it to `agent-browser batch` on stdin, so the token is in no
   command line or environment. CAUTION: never put the token in an `agent-browser` argument. Every
   local account can read a process's command line while it runs.
+- CAUTION: Run this skill only on a host where you are the only local account. agent-browser
+  starts Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which asks for
+  no credentials and which agent-browser cannot turn off. While the signed-in app is open, any
+  local account that finds that port can control the browser, read the page and take the stored
+  token.
+- `open` turns off agent-browser's live stream for the session first, every time, and refuses to
+  open the page while it is on. agent-browser 0.33 serves each session's screen and input as a
+  WebSocket on `127.0.0.1` that any local account can connect to, starts it with each new
+  daemon, and has no setting to keep it off. CAUTION: never run `agent-browser stream enable` in
+  a run's session. Another account could then watch and drive the signed-in app.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
