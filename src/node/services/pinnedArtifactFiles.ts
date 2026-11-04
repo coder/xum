@@ -261,6 +261,18 @@ async function toStoredPinPath(
   if (location.kind === "host" && location.containerWritable === true) {
     return { error: PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON };
   }
+  return await toRealOutsidePinPath(location, absolute);
+}
+
+/**
+ * An outside file's stored path: its name in its folder's real path, or the checkout pin when
+ * that real folder is in the checkout.
+ */
+async function toRealOutsidePinPath(
+  location: AvailableLocation,
+  absolute: string
+): Promise<string | { error: string }> {
+  const paths = location.kind === "runtime" ? path.posix : path;
   const realDir = await realDirOn(location, paths.dirname(absolute));
   if (realDir == null) return { error: `Not a readable file: ${absolute}` };
   const real = paths.join(realDir, paths.basename(absolute));
