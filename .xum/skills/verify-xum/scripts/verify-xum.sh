@@ -118,19 +118,37 @@ without_trailing_slashes() {
   echo "$path"
 }
 
+# The folder Vite allows by default (server.fs.allow): the workspace root it finds at or above the
+# checkout, which can be a parent folder (one whose package.json declares workspaces, for example).
+# The checkout's own vite computes it from the physical checkout, as `vite` started there does, so
+# this check cannot drift from Vite's rules. Fails closed: without an answer, no home is safe.
+vite_workspace_root() {
+  local root
+  root=$(cd -P -- "$CHECKOUT" && node --input-type=module -e '
+    import { createRequire } from "node:module";
+    import { pathToFileURL } from "node:url";
+    const vite = createRequire(process.cwd() + "/package.json").resolve("vite");
+    console.log((await import(pathToFileURL(vite).href)).searchForWorkspaceRoot(process.cwd()));
+  ') && [[ $root == /* && $root != *$'\n'* ]] \
+    || die "the checkout's vite did not report its workspace root, so the run home cannot be checked against the folders Vite serves. Run \`bun install\` in $CHECKOUT."
+  echo "$root"
+}
+
 # Vite serves every file under the checkout to whoever reaches its port (vite.config.ts denies only
 # a few names), so a run home there would publish the run's token copy, its evidence and its
 # sandbox. Refuses a home whose physical path (symlinks and .. resolved, even for parts that do
-# not exist yet) is inside the checkout, or inside the main worktree of a linked one.
+# not exist yet) is inside the checkout, inside the main worktree of a linked one, or inside
+# Vite's workspace root.
 require_home_outside_checkout() { # require_home_outside_checkout <home>
-  local home top common
+  local home top common vite_root
   home=$(realpath -m -- "$1")
   common=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)
-  for top in "$CHECKOUT" "$([[ $(basename "$common") == .git ]] && dirname "$common")"; do
+  vite_root=$(vite_workspace_root) || exit 1
+  for top in "$CHECKOUT" "$([[ $(basename "$common") == .git ]] && dirname "$common")" "$vite_root"; do
     [[ -n $top ]] || continue
     top=$(realpath -m -- "$top")
     if [[ $top == / || $home == "$top" || $home == "$top"/* ]]; then
-      die "the run home $home is inside the checkout $top, where Vite serves every file to anyone who reaches its port (the run's token too). Set VERIFY_XUM_HOME to a folder outside it."
+      die "the run home $home is inside $top (the checkout, its main worktree or Vite's workspace root), where Vite serves every file to anyone who reaches its port (the run's token too). Set VERIFY_XUM_HOME to a folder outside it."
     fi
   done
 }
