@@ -538,6 +538,30 @@ describe("ProviderModelFactory.createModel", () => {
     });
   });
 
+  // Local servers (vLLM, llama.cpp, oMLX) send no usage chunk unless asked, which
+  // records zero tokens and blinds the context meter, compaction and costs.
+  it("asks custom OpenAI-compatible providers for streaming usage", async () => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (config, factory) => {
+      saveLocalVllmConfig(config, { models: [LOCAL_VLLM_MODEL] });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        if (!result.success) throw new Error(result.error.type);
+        await streamText({ model: result.data, prompt: "hello", maxRetries: 0 }).consumeStream({
+          onError: () => undefined,
+        });
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    expect(body?.stream).toBe(true);
+    expect(body?.stream_options).toEqual({ include_usage: true });
+  });
+
   it("returns provider_disabled for disabled custom OpenAI-compatible providers", async () => {
     await withTempConfig(async (config, factory) => {
       saveLocalVllmConfig(config, { enabled: false });

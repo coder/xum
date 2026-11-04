@@ -355,3 +355,16 @@ describe("normalizeProviderModelEntry", () => {
     expect(normalizeProviderModelEntry({ id: "foo", mappedToModel: 42 })).toBe("foo");
   });
 });
+
+describe("normalizeProviderModelEntry thinkingLevels", () => {
+  test("keeps valid levels deduped in canonical order, even as the only override", () => {
+    expect(
+      normalizeProviderModelEntry({ id: "foo", thinkingLevels: ["max", "bogus", "off", "max", 3] })
+    ).toEqual({ id: "foo", thinkingLevels: ["off", "max"] });
+  });
+
+  test("drops a list with no valid level", () => {
+    expect(normalizeProviderModelEntry({ id: "foo", thinkingLevels: ["bogus"] })).toBe("foo");
+    expect(normalizeProviderModelEntry({ id: "foo", thinkingLevels: "high" })).toBe("foo");
+  });
+});

@@ -32,7 +32,10 @@ import {
   type ThinkingLevel,
   type ParsedThinkingInput,
 } from "@/common/types/thinking";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  getModelThinkingLevelsOverride,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import { normalizeSelectedModel, normalizeToCanonical } from "@/common/utils/ai/models";
 
 /**
@@ -113,11 +116,17 @@ function isGeminiLowMediumHighModelName(modelName: string): boolean {
  * `openaiProModeAvailable` detect capabilities. Without it, mapped aliases fall
  * through to the default 4-level policy and clamping strips levels (e.g. native
  * max) the target model actually supports.
+ *
+ * A model entry's `thinkingLevels` wins over both: it is the user's explicit
+ * declaration of what the model's server accepts (custom openai-compatible
+ * models have no curated rule to match).
  */
 export function getThinkingPolicyForModel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingPolicy {
+  const declared = getModelThinkingLevelsOverride(modelString, providersConfig ?? null);
+  if (declared) return declared;
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
   return getExplicitThinkingPolicy(capabilityModel) ?? DEFAULT_THINKING_POLICY;
 }
@@ -255,6 +264,10 @@ export function getDefaultMinimumThinkingLevel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
+  // Declared levels are exactly what the user wants offered, so none are hidden by default.
+  if (getModelThinkingLevelsOverride(modelString, providersConfig ?? null)) {
+    return THINKING_LEVEL_OFF;
+  }
   // A binary model must retain its off option unless the user explicitly raises the floor.
   const policy = getThinkingPolicyForModel(modelString, providersConfig);
   if (policy.length === 2 && policy[0] === "off") return THINKING_LEVEL_OFF;

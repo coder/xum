@@ -9,6 +9,7 @@ import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/opena
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
 import { describe, test, expect, mock } from "bun:test";
 import * as RealLogModule from "@/node/services/log";
@@ -4042,6 +4043,55 @@ describe("custom provider wire origins", () => {
 
     expect("anthropic" in result).toBe(false);
     expect("openai" in result).toBe(false);
+  });
+
+  describe("declared thinkingLevels", () => {
+    const qwenEntry = {
+      id: "qwen",
+      thinkingLevels: ["off", "low", "high"] satisfies ThinkingLevel[],
+    };
+    const build = (modelString: string, level: ThinkingLevel, config: ProvidersConfigMap) =>
+      buildProviderOptions(
+        modelString,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        config
+      );
+    const declaredConfig: ProvidersConfigMap = {
+      zen: { ...customConfig("openai-compatible").zen, models: [qwenEntry] },
+    };
+
+    test.each<[ThinkingLevel, string]>([
+      ["off", "none"],
+      ["low", "low"],
+      ["high", "high"],
+      // Undeclared levels clamp to the declared policy before reaching the wire.
+      ["max", "high"],
+    ])("openai-compatible %s sends reasoningEffort %s", (level, effort) => {
+      expect(build("zen:qwen", level, declaredConfig)).toEqual({
+        openaiCompatible: { reasoningEffort: effort },
+      });
+    });
+
+    test("models without declared levels send no reasoning field", () => {
+      expect(build("zen:other", "high", declaredConfig)).toEqual({});
+    });
+
+    test("declared levels on a built-in provider do not add openaiCompatible options", () => {
+      const builtInConfig: ProvidersConfigMap = {
+        ollama: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          models: [qwenEntry],
+        },
+      };
+      expect(build("ollama:qwen", "high", builtInConfig)).toEqual({});
+    });
   });
 });
 

@@ -1,4 +1,5 @@
 import type { ProviderModelEntry } from "@/common/orpc/types";
+import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 
@@ -45,6 +46,15 @@ export function getProviderModelEntryMappedTo(entry: ProviderModelEntry): string
     return null;
   }
   return entry.mappedToModel ?? null;
+}
+
+export function getProviderModelEntryThinkingLevels(
+  entry: ProviderModelEntry
+): readonly ThinkingLevel[] | null {
+  if (typeof entry === "string") {
+    return null;
+  }
+  return entry.thinkingLevels ?? null;
 }
 
 function parseProviderModelId(fullModelId: string): ParsedProviderModelId | null {
@@ -131,6 +141,14 @@ export function getModelContextWindowOverride(
   return entry ? getProviderModelEntryContextWindowTokens(entry) : null;
 }
 
+export function getModelThinkingLevelsOverride(
+  fullModelId: string,
+  providersConfig: ProviderModelsConfig | null
+): readonly ThinkingLevel[] | null {
+  const entry = findProviderModelEntryScoped(fullModelId, providersConfig);
+  return entry ? getProviderModelEntryThinkingLevels(entry) : null;
+}
+
 export function resolveModelForMetadata(
   fullModelId: string,
   providersConfig: ProviderModelsConfig | null
@@ -199,6 +217,16 @@ function parseContextWindowTokens(rawValue: unknown): number | null {
   return rawValue;
 }
 
+/** Valid levels only, deduped, in canonical order; null when none remain. */
+function parseThinkingLevels(rawValue: unknown): ThinkingLevel[] | null {
+  if (!Array.isArray(rawValue)) {
+    return null;
+  }
+
+  const levels = THINKING_LEVELS.filter((level) => rawValue.includes(level));
+  return levels.length > 0 ? levels : null;
+}
+
 export function normalizeProviderModelEntry(rawEntry: unknown): ProviderModelEntry | null {
   if (typeof rawEntry === "string") {
     const modelId = parseModelId(rawEntry);
@@ -213,6 +241,7 @@ export function normalizeProviderModelEntry(rawEntry: unknown): ProviderModelEnt
     id?: unknown;
     contextWindowTokens?: unknown;
     mappedToModel?: unknown;
+    thinkingLevels?: unknown;
   };
   const modelId = parseModelId(entry.id);
   if (!modelId) {
@@ -221,7 +250,8 @@ export function normalizeProviderModelEntry(rawEntry: unknown): ProviderModelEnt
 
   const contextWindowTokens = parseContextWindowTokens(entry.contextWindowTokens);
   const mappedToModel = parseModelId(entry.mappedToModel);
-  if (contextWindowTokens === null && mappedToModel === null) {
+  const thinkingLevels = parseThinkingLevels(entry.thinkingLevels);
+  if (contextWindowTokens === null && mappedToModel === null && thinkingLevels === null) {
     return modelId;
   }
 
@@ -229,6 +259,7 @@ export function normalizeProviderModelEntry(rawEntry: unknown): ProviderModelEnt
     id: modelId,
     ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
     ...(mappedToModel !== null ? { mappedToModel } : {}),
+    ...(thinkingLevels !== null ? { thinkingLevels } : {}),
   };
 }
 

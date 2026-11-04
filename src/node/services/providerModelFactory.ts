@@ -2251,6 +2251,9 @@ export class ProviderModelFactory {
                 ...(credentials.apiKey != null ? { apiKey: credentials.apiKey } : {}),
                 headers: { ...muxAttributionHeaders },
                 fetch: providerFetch,
+                // Without stream_options.include_usage these servers send no usage chunk,
+                // which zeroes the context meter, auto-compaction and cost tracking.
+                includeUsage: true,
               });
               // These endpoints include old Ollama's /v1 (see withToolTypeArraysAsAnyOf).
               return Ok(withToolTypeArraysAsAnyOf(provider(modelId)));

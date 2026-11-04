@@ -8,6 +8,7 @@
 
 import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
+import type { OpenAICompatibleLanguageModelChatOptions } from "@ai-sdk/openai-compatible";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import type { JSONValue } from "@ai-sdk/provider";
 import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
@@ -48,6 +49,7 @@ import {
   isGeminiFlashMinimalRejectingModelName,
   isGeminiFlashThinkingLevelModelName,
   assistantThinkingLevels,
+  enforceThinkingPolicy,
   resolveBetweenToolsThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import {
@@ -63,7 +65,10 @@ import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
-import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  getModelThinkingLevelsOverride,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -193,6 +198,7 @@ type ProviderOptions =
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
   | { bedrock: BedrockProviderOptions }
+  | { openaiCompatible: OpenAICompatibleLanguageModelChatOptions }
   | Record<string, never>; // Empty object for unsupported providers
 
 // Simple direct providers have self-contained reasoning controls. Keep these
@@ -225,6 +231,31 @@ const DIRECT_REASONING_BUILDERS: Record<
     };
   },
 };
+
+/**
+ * reasoning_effort for a custom openai-compatible model whose entry declares
+ * thinkingLevels; null for every other model, which keeps sending no reasoning
+ * field. The SDK reads the universal `openaiCompatible` namespace for any
+ * provider name, so hyphenated custom ids avoid its raw-name deprecation warning.
+ */
+function buildDeclaredOpenAICompatibleOptions(
+  modelString: string,
+  rawPrefix: string,
+  thinkingLevel: ThinkingLevel,
+  providersConfig: ProvidersConfigMap | null | undefined
+): ProviderOptions | null {
+  const providerConfig = providersConfig?.[rawPrefix];
+  if (
+    !isCustomProviderConfig(providerConfig) ||
+    providerConfig.providerType !== "openai-compatible" ||
+    getModelThinkingLevelsOverride(modelString, providersConfig ?? null) == null
+  ) {
+    return null;
+  }
+  // Headless callers may pass a level the model does not declare.
+  const level = enforceThinkingPolicy(modelString, thinkingLevel, null, providersConfig);
+  return { openaiCompatible: { reasoningEffort: level === "off" ? "none" : level } };
+}
 
 /** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
 interface BedrockProviderOptions {
@@ -1162,6 +1193,20 @@ export function buildProviderOptions(
     );
     log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
+  }
+
+  const declaredOpenAICompatibleOptions = buildDeclaredOpenAICompatibleOptions(
+    modelString,
+    rawPrefixForMetadata,
+    thinkingLevel,
+    providersConfig
+  );
+  if (declaredOpenAICompatibleOptions != null) {
+    log.debug(
+      "buildProviderOptions: Returning declared openai-compatible options",
+      declaredOpenAICompatibleOptions
+    );
+    return declaredOpenAICompatibleOptions;
   }
 
   // No provider-specific options for unsupported providers

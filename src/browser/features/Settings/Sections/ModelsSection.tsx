@@ -29,10 +29,12 @@ import type {
   ProviderModelEntry,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   getProviderModelEntryContextWindowTokens,
   getProviderModelEntryId,
   getProviderModelEntryMappedTo,
+  getProviderModelEntryThinkingLevels,
 } from "@/common/utils/providers/modelEntries";
 import {
   formatProviderDisplayName,
@@ -100,9 +102,10 @@ function parseContextWindowTokensInput(value: string): number | null {
 function buildProviderModelEntry(
   modelId: string,
   contextWindowTokens: number | null,
-  mappedToModel: string | null
+  mappedToModel: string | null,
+  thinkingLevels: readonly ThinkingLevel[] | null
 ): ProviderModelEntry {
-  if (contextWindowTokens === null && mappedToModel === null) {
+  if (contextWindowTokens === null && mappedToModel === null && thinkingLevels === null) {
     return modelId;
   }
 
@@ -113,8 +116,48 @@ function buildProviderModelEntry(
   if (mappedToModel !== null) {
     entry.mappedToModel = mappedToModel;
   }
+  if (thinkingLevels !== null) {
+    entry.thinkingLevels = [...thinkingLevels];
+  }
 
   return entry;
+}
+
+/**
+ * Replace the entry being edited (or append it when it vanished). `thinkingLevels`
+ * has no editor here (it is a config-file field), so the original entry's levels
+ * carry over instead of being dropped.
+ */
+export function replaceEditedModelEntry(
+  models: readonly ProviderModelEntry[],
+  originalModelId: string,
+  edit: { modelId: string; contextWindowTokens: number | null; mappedToModel: string | null }
+): ProviderModelEntry[] {
+  const buildReplacement = (original: ProviderModelEntry | null) =>
+    buildProviderModelEntry(
+      edit.modelId,
+      edit.contextWindowTokens,
+      edit.mappedToModel,
+      original ? getProviderModelEntryThinkingLevels(original) : null
+    );
+  const nextModels: ProviderModelEntry[] = [];
+  let replaced = false;
+
+  for (const modelEntry of models) {
+    if (!replaced && getProviderModelEntryId(modelEntry) === originalModelId) {
+      nextModels.push(buildReplacement(modelEntry));
+      replaced = true;
+      continue;
+    }
+
+    nextModels.push(modelEntry);
+  }
+
+  if (!replaced) {
+    nextModels.push(buildReplacement(null));
+  }
+
+  return nextModels;
 }
 
 export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
@@ -592,33 +635,15 @@ export function ModelsSection() {
     setError(null);
 
     const mappedTo = editing.mappedToModel.trim() || null;
-    const replacementEntry = buildProviderModelEntry(
-      trimmedModelId,
-      parsedContextWindowTokens,
-      mappedTo
-    );
 
     // Optimistic update - returns new models array for API call
-    const updatedModels = updateModelsOptimistically(editing.provider, (models) => {
-      const nextModels: ProviderModelEntry[] = [];
-      let replaced = false;
-
-      for (const modelEntry of models) {
-        if (!replaced && getProviderModelEntryId(modelEntry) === editing.originalModelId) {
-          nextModels.push(replacementEntry);
-          replaced = true;
-          continue;
-        }
-
-        nextModels.push(modelEntry);
-      }
-
-      if (!replaced) {
-        nextModels.push(replacementEntry);
-      }
-
-      return nextModels;
-    });
+    const updatedModels = updateModelsOptimistically(editing.provider, (models) =>
+      replaceEditedModelEntry(models, editing.originalModelId, {
+        modelId: trimmedModelId,
+        contextWindowTokens: parsedContextWindowTokens,
+        mappedToModel: mappedTo,
+      })
+    );
     setEditing(null);
 
     // Save in background

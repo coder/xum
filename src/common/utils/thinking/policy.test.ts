@@ -998,3 +998,53 @@ describe("resolveBetweenToolsThinkingLevel", () => {
     expect(resolveBetweenToolsThinkingLevel(sonnet55, "high", false, ["max"])).toBe("high");
   });
 });
+
+describe("declared model thinkingLevels", () => {
+  const providersConfig: ProvidersConfigMap = {
+    "local-vllm": {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      isCustom: true,
+      providerType: "openai-compatible",
+      models: [
+        { id: "qwen", thinkingLevels: ["off", "low", "high"] },
+        // gpt-6-astra alone would resolve to its curated ladder and a medium floor.
+        {
+          id: "astra",
+          mappedToModel: "openai:gpt-6-astra",
+          thinkingLevels: ["off", "low", "medium"],
+        },
+      ],
+    },
+  };
+
+  test("replace the default policy and win over mappedToModel", () => {
+    expect(getThinkingPolicyForModel("local-vllm:qwen", providersConfig)).toEqual([
+      "off",
+      "low",
+      "high",
+    ]);
+    expect(getThinkingPolicyForModel("local-vllm:astra", providersConfig)).toEqual([
+      "off",
+      "low",
+      "medium",
+    ]);
+  });
+
+  test("keep every declared level available by default", () => {
+    const minimum = getDefaultMinimumThinkingLevel("local-vllm:astra", providersConfig);
+    expect(minimum).toBe("off");
+    expect(getAvailableThinkingLevels("local-vllm:astra", minimum, providersConfig)).toEqual([
+      "off",
+      "low",
+      "medium",
+    ]);
+  });
+
+  test("drive numeric input and clamping", () => {
+    expect(resolveThinkingInput(0, "local-vllm:qwen", providersConfig)).toBe("off");
+    expect(resolveThinkingInput(9, "local-vllm:qwen", providersConfig)).toBe("high");
+    expect(enforceThinkingPolicy("local-vllm:qwen", "max", null, providersConfig)).toBe("high");
+  });
+});
