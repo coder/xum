@@ -5,6 +5,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { getErrorMessage } from "@/common/utils/errors";
+import type { WorkspaceBackgroundProcessBlocker } from "@/common/types/workspace";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -52,7 +53,14 @@ export type WorkspaceUseKind =
 export { WorkspaceMutationInProgressError };
 
 /** Thrown by withMutationGate() when the workspace is in use or already being mutated. */
-export class WorkspaceBusyError extends Error {}
+export class WorkspaceBusyError extends Error {
+  constructor(
+    message: string,
+    readonly backgroundProcesses?: WorkspaceBackgroundProcessBlocker[]
+  ) {
+    super(message);
+  }
+}
 
 export interface WorkspaceMutationGateOptions {
   /**
@@ -67,6 +75,10 @@ export interface WorkspaceMutationGateOptions {
    * instead of leasing: true when any runs in the workspace, in this or any other process.
    */
   hasRunningBackgroundProcesses: (workspaceId: string) => Promise<boolean>;
+  /** Removal reports exact records so the user can acknowledge only unknown activity. */
+  getBackgroundProcessBlockers?: (
+    workspaceId: string
+  ) => Promise<WorkspaceBackgroundProcessBlocker[]>;
 }
 
 export interface WorkspaceUseLease {
@@ -216,8 +228,21 @@ export class WorkspaceUseLeases {
       // files are judged by their counts, read under the transition lock: a hold that published
       // its file and probed the gate before it existed has not counted itself yet, and would
       // otherwise be missed. Once the lock is free, every later transition sees the gate.
+      const backgroundProcesses: WorkspaceBackgroundProcessBlocker[] = [];
       for (const id of ids) {
-        await this.transitions.withLock(id, () => this.assertUnused(id, options));
+        backgroundProcesses.push(
+          ...(await this.transitions.withLock(id, () => this.assertUnused(id, options)))
+        );
+      }
+      // Scan every target before offering recovery. An unknown record must not hide a live process.
+      if (backgroundProcesses.length > 0) {
+        const running = backgroundProcesses.some((record) => record.state === "running");
+        throw new WorkspaceBusyError(
+          running
+            ? "A workspace has a running background process; stop it and try again."
+            : "Xum cannot verify background activity from old process records; review the records before removal.",
+          backgroundProcesses
+        );
       }
     } catch (error) {
       await releaseAll();
@@ -230,7 +255,7 @@ export class WorkspaceUseLeases {
   private async assertUnused(
     workspaceId: string,
     options: WorkspaceMutationGateOptions
-  ): Promise<void> {
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
     // The held entries themselves, so no kind can be left out of the check.
     for (const [kind, file] of this.held.get(workspaceId) ?? []) {
       if (options.ignoreOwnKinds?.get(workspaceId)?.has(kind) === true) continue;
@@ -268,12 +293,23 @@ export class WorkspaceUseLeases {
           `${probe.holder}; try again when it finishes (${probe.why}).`
       );
     }
+    return await this.checkBackgroundProcesses(workspaceId, options);
+  }
+
+  private async checkBackgroundProcesses(
+    workspaceId: string,
+    options: WorkspaceMutationGateOptions
+  ): Promise<WorkspaceBackgroundProcessBlocker[]> {
+    if (options.getBackgroundProcessBlockers != null) {
+      return await options.getBackgroundProcessBlockers(workspaceId);
+    }
     if (await options.hasRunningBackgroundProcesses(workspaceId)) {
       throw new WorkspaceBusyError(
         `Workspace ${workspaceId} has a running background process (in this, another or a ` +
           "crashed Xum process); stop it and try again."
       );
     }
+    return [];
   }
 
   /**

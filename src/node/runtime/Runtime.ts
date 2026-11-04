@@ -1,6 +1,7 @@
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
+import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Runtime abstraction for executing tools in different environments.
@@ -93,6 +94,8 @@ export type BackgroundMonitorProbeResult<T> =
 export interface BackgroundHandle {
   /** Output directory containing output.log, meta.json, exit_code */
   readonly outputDir: string;
+  /** Host-local process evidence retained after exit. */
+  readonly localProcess?: HolderEvidence;
 
   /**
    * Get the exit code if the process has exited.
@@ -165,6 +168,8 @@ export interface BackgroundOutputRead {
  * Streaming result from executing a command
  */
 export interface ExecStream {
+  /** Host-local child identity for later migration and liveness checks. */
+  localProcess?: HolderEvidence;
   /** Standard output stream */
   stdout: ReadableStream<Uint8Array>;
   /** Standard error stream */

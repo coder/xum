@@ -2,6 +2,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, waitFor, within } from "storybook/test";
 import { type ReactNode, useEffect, useMemo } from "react";
 import { APIProvider } from "@/browser/contexts/API";
+import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
@@ -87,7 +88,9 @@ function ArchivedWorkspacesStoryShell(props: {
     <APIProvider client={client}>
       <RouterProvider>
         <ProjectProvider>
-          <WorkspaceProvider>{props.children}</WorkspaceProvider>
+          <WorkspaceProvider>
+            <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
+          </WorkspaceProvider>
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>

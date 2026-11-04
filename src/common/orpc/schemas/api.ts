@@ -1923,6 +1923,8 @@ export const workspace = {
         .object({
           force: z.boolean().optional(),
           acknowledgedDescendantIds: z.array(z.string()).optional(),
+          // A separate user confirmation; force alone never accepts unknown activity.
+          acknowledgedUnknownProcessRecords: z.array(z.string()).optional(),
         })
         .optional(),
     }),

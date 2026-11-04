@@ -1622,6 +1622,7 @@ ${scriptWithEnv}`;
                 : claim?.success === false
                   ? claim.error
                   : "background process manager unavailable";
+            let failedMigrationExit = execStream.exitCode;
             if (config.backgroundProcessManager && config.workspaceId && claimLock) {
               const processId = claimLock.processId;
 
@@ -1633,6 +1634,7 @@ ${scriptWithEnv}`;
                 stdin: execStream.stdin,
                 exitCode: execStream.exitCode,
                 duration: execStream.duration,
+                localProcess: execStream.localProcess,
               };
 
               const migrateResult = await migrateToBackground(
@@ -1675,7 +1677,8 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode
+              failedMigrationExit = migrateResult.exitCode;
+              void failedMigrationExit
                 .catch(() => undefined)
                 .finally(() => claimLock.releaseName());
             }
@@ -1703,11 +1706,12 @@ ${scriptWithEnv}`;
             // disposal, which deletes nothing, does not wait for a stopping migration (#5589).
             migrationHandedToExit = true;
             migration?.markStopping();
-            void execStream.exitCode.then(
+            // Publish confirmed-exit evidence before a removal finishes draining this migration.
+            void failedMigrationExit.then(
               () => migration?.[Symbol.dispose](),
               () => undefined
             );
-            await raceWithAbortAndTimeout(execStream.exitCode, {
+            await raceWithAbortAndTimeout(failedMigrationExit, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
               clock: config.clock,
             }).catch(() => undefined);

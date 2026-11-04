@@ -37,6 +37,7 @@ import {
   BackgroundProcessManager,
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
@@ -2655,6 +2656,16 @@ console.log("ready");
 
     const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     expect(pid).toBeGreaterThan(1);
+    if (!result.success || !("backgroundProcessId" in result)) throw new Error("Migration failed");
+    const migrated = await manager.getProcess(result.backgroundProcessId);
+    expect(migrated?.pid).toBe(pid);
+    const identity = { ...getSelfIdentity(), birth: linuxBirth(pid) };
+    expect(migrated?.identity).toEqual(identity);
+    const meta = JSON.parse(
+      fs.readFileSync(path.join(migrated!.outputDir, "meta.json"), "utf8")
+    ) as { pid: number; identity: unknown };
+    expect(meta.pid).toBe(pid);
+    expect(meta.identity).toEqual(identity);
     await manager.cleanup(config.workspaceId!);
 
     // cleanup() joins the exit, so the process is gone as soon as it returns.

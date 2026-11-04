@@ -3,10 +3,16 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { BackgroundHandle } from "@/node/runtime/Runtime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import type { BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
-import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
+import {
+  BG_EXIT_CODE_FILENAME,
+  migrateToBackground,
+  spawnProcess,
+} from "./backgroundProcessExecutor";
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
@@ -339,6 +345,48 @@ describe("spawnProcess", () => {
     }
   }
 
+  it("keeps the background child identity after exit and disposal", async () => {
+    const { result } = await spawnLive('sleep 30 & : > "$READY_FILE"; wait', "local-identity");
+    const evidence = result.handle.localProcess;
+    expect(evidence).toEqual({
+      pid: result.pid,
+      identity: { ...getSelfIdentity(), birth: linuxBirth(result.pid) },
+    });
+    if (process.platform === "linux") {
+      expect(evidence?.identity?.birth).toStartWith("linux-ticks:");
+    }
+    await result.handle.terminate();
+    expect(await waitForExit(result.handle)).toBe(143);
+    await result.handle.dispose();
+    expect(result.handle.localProcess).toBe(evidence);
+  });
+
+  it.each(["remote", "devcontainer"] as const)(
+    "does not add host identity to a %s background handle",
+    async (kind) => {
+      const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-nonlocal-identity-"));
+      cleanupDirs.push(hostDir);
+      const base = new LocalRuntime(hostDir);
+      // Use real local operations while testing container PID classification.
+      const runtime =
+        kind === "remote"
+          ? createRemoteLikeRuntime(base)
+          : new Proxy(base, { getPrototypeOf: () => DevcontainerRuntime.prototype });
+      const result = await spawnProcess(runtime, "exit 0", {
+        cwd: hostDir,
+        workspaceId: `nonlocal-identity-${kind}-${Date.now()}`,
+        processId: "nonlocal-identity",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      handles.push(result.handle);
+      cleanupDirs.push(path.dirname(result.outputDir));
+      expect(result.handle.localProcess).toBeUndefined();
+      expect(await waitForExit(result.handle)).toBe(0);
+      expect(result.handle.localProcess).toBeUndefined();
+    }
+  );
+
   it("concurrent terminate calls share one kill sequence", async () => {
     const { result, runtime } = await spawnLive(
       'sleep 30 & : > "$READY_FILE"; wait',
@@ -501,4 +549,162 @@ describe("spawnProcess", () => {
       }
     );
   });
+});
+
+describe("failed migration settlement", () => {
+  const cleanupDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      cleanupDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))
+    );
+  });
+
+  async function failMigration(directoryCreationFails = false) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "bg-failed-migration-"));
+    cleanupDirs.push(root);
+    const outputDir = path.join(root, "workspace", "failed");
+    if (directoryCreationFails) {
+      await fs.writeFile(path.join(root, "workspace"), "not a directory");
+    } else {
+      // A directory at output.log fails the initial write after mkdir succeeds.
+      await fs.mkdir(path.join(outputDir, "output.log"), { recursive: true });
+    }
+    const exit = Promise.withResolvers<number>();
+    void exit.promise.catch(() => undefined);
+    const stream: ExecStream = {
+      stdout: new ReadableStream(),
+      stderr: new ReadableStream(),
+      stdin: new WritableStream(),
+      exitCode: exit.promise,
+      duration: Promise.resolve(0),
+    };
+    const result = await migrateToBackground(
+      stream,
+      {
+        cwd: root,
+        workspaceId: "workspace",
+        processId: "failed",
+        script: "unused",
+        existingOutput: [],
+      },
+      root
+    );
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("Migration unexpectedly succeeds");
+    return { result, exit, outputDir, marker: path.join(outputDir, BG_EXIT_CODE_FILENAME) };
+  }
+
+  it("returns failure before exit and joins confirmed marker publication", async () => {
+    const { result, exit, marker } = await failMigration();
+    let settled = false;
+    const settlement = result.exitCode.then((code) => {
+      settled = true;
+      return code;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+    exit.resolve(7);
+    expect(await settlement).toBe(7);
+    expect(await fs.readFile(marker, "utf8")).toBe("7");
+  });
+
+  it("keeps a rejected exit unknown", async () => {
+    const { result, exit, marker } = await failMigration();
+    const error = new Error("transport lost");
+    const rejected = result.exitCode.catch((failure: unknown) => failure);
+    exit.reject(error);
+    expect(await rejected).toBe(error);
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+  });
+
+  it("preserves an existing exit marker", async () => {
+    const { result, exit, marker } = await failMigration();
+    await fs.writeFile(marker, "3");
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+    expect(await fs.readFile(marker, "utf8")).toBe("3");
+  });
+
+  it("does not recreate a removed output directory", async () => {
+    const { result, exit, marker, outputDir } = await failMigration();
+    await fs.rm(outputDir, { recursive: true });
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+    expect(await fs.stat(outputDir).catch(() => null)).toBeNull();
+    expect(await fs.stat(marker).catch(() => null)).toBeNull();
+  });
+
+  it("returns the original exit promise when directory creation fails", async () => {
+    const { result, exit } = await failMigration(true);
+    expect(result.exitCode).toBe(exit.promise);
+    exit.resolve(7);
+    expect(await result.exitCode).toBe(7);
+  });
+});
+
+describe("migrateToBackground process identity", () => {
+  it.each(["local", "remote"] as const)(
+    "keeps %s evidence after the stream finishes",
+    async (kind) => {
+      const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-migrated-identity-"));
+      const controller = new AbortController();
+      const stream = await new LocalRuntime(hostDir).exec('printf "%s" "$$"; read -r _; exit 7', {
+        cwd: hostDir,
+        timeout: 5,
+        abortSignal: controller.signal,
+      });
+      // Remote exec streams do not carry host-local evidence.
+      if (kind === "remote") delete stream.localProcess;
+      const evidence = stream.localProcess;
+      let handle: BackgroundHandle | undefined;
+      try {
+        const result = await migrateToBackground(
+          stream,
+          {
+            cwd: hostDir,
+            workspaceId: "workspace",
+            processId: "migrated",
+            script: "read -r _; exit 7",
+            existingOutput: [],
+            kill: () => controller.abort(),
+          },
+          hostDir
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) throw new Error(result.error);
+        handle = result.handle;
+        expect(handle.localProcess).toBe(evidence);
+        if (kind === "local") {
+          expect(evidence).toBeDefined();
+          if (!evidence) throw new Error("Missing local process identity");
+          expect(evidence.identity).toEqual({
+            ...getSelfIdentity(),
+            birth: linuxBirth(evidence.pid),
+          });
+        }
+        await stream.stdin.close();
+        expect(await stream.exitCode).toBe(7);
+        expect(await waitForExit(handle)).toBe(7);
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const output = await handle.readOutput(0);
+          if (output.content.trim().length > 0 && !stream.stdout.locked && !stream.stderr.locked) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(stream.stdout.locked).toBe(false);
+        expect(stream.stderr.locked).toBe(false);
+        expect((await handle.readOutput(0)).content.trim()).toMatch(/^\d+$/);
+        await handle.dispose();
+        expect(handle.localProcess).toBe(evidence);
+      } finally {
+        controller.abort();
+        await stream.exitCode;
+        await handle?.terminate();
+        await handle?.dispose();
+        await fs.rm(hostDir, { recursive: true, force: true });
+      }
+    }
+  );
 });
