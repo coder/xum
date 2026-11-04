@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { withPrivateUnixSocketPath } from "./privateUnixSocket";
+import { assertLockPathUsable, withPrivateUnixSocketPath } from "./privateUnixSocket";
 import { MAX_UNIX_SOCKET_PATH_BYTES } from "./privateUnixSocketFolder";
 
 const posix = process.platform !== "win32";
@@ -337,12 +337,22 @@ describe.skipIf(!posix)("withPrivateUnixSocketPath", () => {
       expect((await fs.lstat(`${socketPath}.lock`)).isSymbolicLink()).toBe(true);
     });
 
+    // Called on its own: through withPrivateUnixSocketPath a foreign uid fails the folder check first,
+    // and only root could make a file of another user inside our private folder. The file here is
+    // ours, and the expected owner is not.
     test("refuses a lock file that another user owns", async () => {
       await fs.mkdir(dir, { mode: 0o700 });
-      await fs.writeFile(`${socketPath}.lock`, "someone else", { mode: 0o600 });
-      await expect(prepare(socketPath, process.getuid!() + 1)).rejects.toThrow(
+      const lockPath = `${socketPath}.lock`;
+      await fs.writeFile(lockPath, "someone else", { mode: 0o600 });
+      await expect(assertLockPathUsable(lockPath, process.getuid!() + 1)).rejects.toThrow(
         /owned by another user/
       );
+      await assertLockPathUsable(lockPath, process.getuid!());
+    });
+
+    test("accepts a missing lock file", async () => {
+      await fs.mkdir(dir, { mode: 0o700 });
+      await assertLockPathUsable(`${socketPath}.lock`, process.getuid!());
     });
 
     test("refuses a lock path that is a folder", async () => {
