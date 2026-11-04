@@ -231,21 +231,29 @@ d=$XUM_ARTIFACTS_DIR
 if [ -L "$d" ] || [ ! -d "$d" ]; then xum_missing; fi
 cd -- "$d" 2>/dev/null || xum_missing
 xum_root=$(pwd -P) || xum_missing
-xum_parent=$(cd -P -- "$` +
+xum_up=$` +
     "{d%/*}" +
+    String.raw`
+xum_parent=$(cd -P -- "$` +
+    "{xum_up:-/}" +
     String.raw`" 2>/dev/null && pwd -P) || xum_missing
-if [ "$xum_root" != "$xum_parent/${rootName}" ]; then xum_missing; fi
+if [ "$xum_root" != "$` +
+    "{xum_parent%/}" +
+    String.raw`/${rootName}" ]; then xum_missing; fi
+xum_pre=$` +
+    "{xum_root%/}" +
+    String.raw`/
 for xum_seg in ${dirSegments.join(" ")}; do
   if [ -L "$xum_seg" ] || [ ! -d "$xum_seg" ]; then xum_missing; fi
   cd -- "$xum_seg" 2>/dev/null || xum_missing
 done
-case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_missing ;; esac
+case $(pwd -P) in "$xum_pre"*|"$xum_root") ;; *) xum_missing ;; esac
 xum_leaf=${leaf}
 if [ -L "$xum_leaf" ] || [ ! -f "$xum_leaf" ]; then xum_missing; fi
 ${STAT_PRELUDE}
 xum_send() {
   if xum_fd=$(readlink "/proc/$$/fd/3" 2>/dev/null); then
-    case $xum_fd in "$xum_root"/*) ;; *) xum_missing ;; esac
+    case $xum_fd in "$xum_pre"*) ;; *) xum_missing ;; esac
   fi
   if [ -L "$xum_leaf" ]; then xum_missing; fi
   xum_m=$(xum_meta "./$xum_leaf") || xum_missing

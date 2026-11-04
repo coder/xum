@@ -78,6 +78,11 @@ export function getArtifactsDir(scratchDir: string): string {
   return path.join(scratchDir, ARTIFACTS_DIR_NAME);
 }
 
+/** `dir` plus one separator: a pinned file's folder can be the filesystem root (`/`). */
+function dirPrefix(dir: string): string {
+  return dir.endsWith(path.sep) ? dir : dir + path.sep;
+}
+
 function isMissing(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
@@ -365,7 +370,7 @@ export async function readArtifactBytesFromDir(
     throw error;
   }
   // Symlinked parent folders could still point elsewhere: confine by real path.
-  if (!realTarget.startsWith(realDir + path.sep)) return notFound;
+  if (!realTarget.startsWith(dirPrefix(realDir))) return notFound;
 
   let handle: fs.FileHandle;
   try {
@@ -610,7 +615,7 @@ async function verifyOpenedInsideDir(
     fdPath = undefined;
   }
   if (fdPath !== undefined) {
-    return fdPath === realTarget && fdPath.startsWith(realDir + path.sep);
+    return fdPath === realTarget && fdPath.startsWith(dirPrefix(realDir));
   }
   if (requireDescriptorPath) return false;
   try {
