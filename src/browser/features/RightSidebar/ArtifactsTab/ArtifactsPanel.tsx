@@ -426,7 +426,7 @@ export function ArtifactsPanel(props: {
     };
   }, [api, props.workspaceId, refreshTick]);
 
-  // Pinned checkout files are live: re-list them on the same refresh signal as the artifacts,
+  // Pinned files are live: re-list them on the same refresh signal as the artifacts,
   // and their mtimes drive re-reads like an artifact's.
   useEffect(() => {
     if (!api) return;

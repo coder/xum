@@ -14,8 +14,9 @@ import {
 export type ArtifactSelectionScope = "artifact" | "pinned" | "shelf";
 
 /**
- * The Artifacts tab selection of one workspace: an artifacts-relative path, a checkout-relative
- * path when `pinned`, or a shelf entry; `version` null means "Latest (live)".
+ * The Artifacts tab selection of one workspace: an artifacts-relative path, the stored pin path
+ * (checkout-relative or absolute) when `pinned`, or a shelf entry; `version` null means "Latest
+ * (live)".
  */
 export interface ArtifactSelection {
   scope: ArtifactSelectionScope;

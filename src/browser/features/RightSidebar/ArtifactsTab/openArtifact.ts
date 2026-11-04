@@ -6,7 +6,7 @@ import { readArtifactSelection, writeArtifactSelection } from "./artifactSelecti
 
 export interface OpenArtifactTarget {
   workspaceId: string;
-  /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+  /** Artifacts-relative path, or the stored pin path (checkout-relative or absolute) when `pinned`. */
   path: string;
   /** Version to show; null/absent means "Latest (live)". Ignored for pinned files. */
   versionId?: number | null;
@@ -67,8 +67,8 @@ const latestPinRequest = new Map<string, number>();
 let nextPinRequestId = 0;
 
 /**
- * "Open as artifact" for any checkout file: pin it (absolute inside the checkout or relative),
- * then open the stored checkout-relative path. Failures surface as a chat toast, the same
+ * "Open as artifact" for any file: pin it (absolute, or relative to the checkout), then open the
+ * stored pin path. Failures surface as a chat toast, the same
  * channel the command palette uses for feedback. `relativeTo: "tool-cwd"` resolves a relative
  * path like file tools do (a sub-project's cwd), instead of from the checkout root.
  */
