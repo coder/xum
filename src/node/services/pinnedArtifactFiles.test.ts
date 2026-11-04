@@ -169,6 +169,8 @@ describe("pinned workspace files", () => {
     const read = await readPinnedFile(context, { workspaceId: "ws", path: "C:/x.md" });
     expect(read.success).toBe(false);
     expect(read).not.toHaveProperty("missing");
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files).toEqual([]);
   });
 
   test("refuses outside files that are missing, folders or symlinks", async () => {

@@ -323,7 +323,13 @@ export async function listPinnedFiles(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const paths = await readPinnedPaths(sessionDirFor(context, input.workspaceId));
+  // The store keeps any absolute entry; list only those absolute here (a hand-edited `C:/x.md`
+  // on a POSIX host would list as a pin that never reads).
+  const paths = (await readPinnedPaths(sessionDirFor(context, input.workspaceId))).filter(
+    (p) =>
+      isAbsoluteOn(location, p) ||
+      typeof parseArtifactRelativePath(p, { allowHidden: true }) !== "string"
+  );
   const files = await Promise.all(
     paths.map(async (relPath) => {
       const stat = await statPinned(location, relPath);
