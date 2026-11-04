@@ -95,18 +95,18 @@ require_private_dir() {
   (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)"
 }
 
-# Every folder above a run home must be owned by root or this user and writable by nobody else,
-# unless it is sticky like /tmp (as ssh's StrictModes checks): another account could otherwise
-# rename the checked home away and put its own state.env in its place. Takes a physical path.
-require_safe_ancestors() {
-  local dir=$1 owner mode
+# Every folder above a run home (or a git dir) must be owned by root or this user and writable by
+# nobody else, unless it is sticky like /tmp (as ssh's StrictModes checks): another account could
+# otherwise rename the checked folder away and put its own in its place. Takes a physical path.
+require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for messages>]
+  local dir=$1 what=${2:-the run home} owner mode
   while [[ $dir != / ]]; do
     dir=$(dirname "$dir")
     owner=$(stat -c %u "$dir")
     mode=$(stat -c %a "$dir")
-    [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above the run home, is owned by user $owner"
+    [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above $what, is owned by user $owner"
     (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
-      || die "$dir, above the run home, is writable by group or others and not sticky (mode $mode)"
+      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)"
   done
 }
 
@@ -216,7 +216,8 @@ release_launch_guard() {
 
 point_current_run_link_at() { # point_current_run_link_at <run>
   [[ -n $LAUNCH_GUARD_HELD ]] || die "internal error: the newest-run link changed without the launch guard"
-  ln -sfn "$1" "$CURRENT_RUN_LINK"
+  # -T: a folder at the link path fails the launch instead of getting the link inside it.
+  ln -sfnT "$1" "$CURRENT_RUN_LINK"
 }
 
 drop_current_run_link_if() { # drop_current_run_link_if <run>: unlink it when it names <run>
@@ -237,6 +238,10 @@ drop_current_run_link_if() { # drop_current_run_link_if <run>: unlink it when it
 refuse_while_checkout_server_runs() {
   # Part of the launch deadline: a short VERIFY_XUM_READY_TIMEOUT also bounds this wait.
   hold_launch_guard "$(launch_seconds_left)" || die "another verify-xum launch from this checkout holds $LAUNCH_GUARD"
+  # Only a symlink belongs there: with a folder in its place, the next launch would not see this
+  # one's run and would start a second server.
+  [[ ! -e $CURRENT_RUN_LINK || -L $CURRENT_RUN_LINK ]] \
+    || die "$CURRENT_RUN_LINK is not a symlink (a folder?). Remove it, then launch again."
   [[ -f $CURRENT_RUN_LINK/state.env ]] || return 0
   local run
   run=$(private_run_dir "$CURRENT_RUN_LINK") || exit 1
@@ -771,12 +776,15 @@ cmd_cleanup() {
 # The newest-run link and the launch guard live in the checkout's git dir. Another account that
 # could write there could swap either between a check and its use (a symlink, a FIFO, a folder),
 # so every command refuses a git dir, or a worktree's common git dir, that is not a real folder
-# of this user or that group or others can write: the rule for the run home's own folders. The
-# checks on the guard's open fd stay as a second line.
+# of this user or that group or others can write: the rule for the run home and the folders
+# above it. A writable folder above would let another account rename the whole git dir away and
+# put its own in its place. The checks on the guard's open fd stay as a second line.
 require_private_git_dirs() {
   local dir
   for dir in "$CHECKOUT_GIT_DIR" "$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)"; do
-    require_private_dir "$(cd -P -- "$dir" && pwd -P)"
+    dir=$(cd -P -- "$dir" && pwd -P)
+    require_private_dir "$dir"
+    require_safe_ancestors "$dir" "the git dir $dir"
   done
 }
 require_private_git_dirs

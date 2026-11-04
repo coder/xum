@@ -39,8 +39,9 @@ Surfaces:
 
 The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Every command
 refuses a checkout whose git dir (or, for a worktree, its common git dir) is not yours or is
-writable by group or others: the launch lock and the newest-run link live there. Use a checkout
-of your own, not a shared repository. Bun on PATH must be the version in `package.json`
+writable by group or others, and one with a folder above that git dir that is not yours or
+root's, or that group or others can write without the sticky bit: the launch lock and the
+newest-run link live there. Use a checkout of your own, not a shared repository. Bun on PATH must be the version in `package.json`
 `packageManager`. Launch refuses another Bun.
 
 ```bash
@@ -192,8 +193,10 @@ Proof standards:
   `verify-xum.sh idle`, repeat the changed recipe's steps and captures with names that end in
   `-375`, and look for clipped text, content past the right edge
   (`agent-browser eval 'document.documentElement.scrollWidth <= innerWidth'` prints `true`) and
-  controls that cover each other. Run `agent-browser set viewport 1280 720` afterwards. A change
-  with no UI needs no phone pass: say so.
+  controls that cover each other. When the phone layout reaches a step's control another way, or
+  does not show it, follow the phone layout's own path to it or capture that it is absent, and
+  say which. Run `agent-browser set viewport 1280 720` afterwards. A change with no UI needs no
+  phone pass: say so.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.
