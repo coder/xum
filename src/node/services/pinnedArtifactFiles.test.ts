@@ -196,6 +196,38 @@ describe("pinned workspace files", () => {
     }
   });
 
+  test("pinning on an SSH checkout resolves only stored pins with the same file name", async () => {
+    // Each folder resolution is one exec on the SSH host; other outside pins cannot be aliases.
+    const real = await fs.realpath(tempDir);
+    runtimeConfig = { type: "ssh", host: "example", srcBaseDir: real };
+    projectPath = workspaceName = path.join(real, "checkout");
+    const resolved: string[] = [];
+    class CountingRuntime extends LocalRuntime {
+      override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+        if (command.includes("XUMREALDIR1")) resolved.push(options.pathEnv?.XUM_DIR ?? "");
+        return super.exec(command, options);
+      }
+    }
+    const create = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue(
+      new CountingRuntime(real)
+    );
+    try {
+      const sessionDir = path.join(tempDir, "sessions", "ws");
+      for (const name of ["a.md", "b.md", "c.md"]) {
+        await addPinnedPath(sessionDir, path.join(real, "old", name));
+      }
+      await fs.mkdir(path.join(real, "notes"));
+      await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+      expect(
+        await pinFile(context, { workspaceId: "ws", path: path.join(real, "notes", "plan.md") })
+      ).toEqual({ success: true, data: { path: path.join(real, "notes", "plan.md") } });
+      // The new pin's folder and the checkout root, nothing for a.md, b.md or c.md.
+      expect(resolved.filter((dir) => dir.startsWith(path.join(real, "old")))).toEqual([]);
+    } finally {
+      create.mockRestore();
+    }
+  });
+
   test("re-pinning an alias stored before real folder paths keeps the one entry", async () => {
     const real = await fs.realpath(tempDir);
     await fs.mkdir(path.join(real, "notes"));
