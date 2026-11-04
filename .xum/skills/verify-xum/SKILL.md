@@ -41,8 +41,12 @@ The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Eve
 refuses a checkout whose git dir (or, for a worktree, its common git dir) is not yours or is
 writable by group or others, and one with a folder above that git dir that is not yours or
 root's, or that group or others can write without the sticky bit: the launch lock and the
-newest-run link live there. Use a checkout of your own, not a shared repository. Bun on PATH must be the version in `package.json`
-`packageManager`. Launch refuses another Bun.
+newest-run link live there. Use a checkout of your own, not a shared repository. Under umask 002
+(the default on Debian and Ubuntu, which give each user a private group), git makes a clone's
+folder, `.git` and `.git/worktrees/<name>` 0775, so every command refuses. Run
+`chmod g-w,o-w` on the folder the message names (it names one at a time), or use a checkout made
+under umask 022. Bun on PATH must be the version in `package.json` `packageManager`. Launch
+refuses another Bun.
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh launch

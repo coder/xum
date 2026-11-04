@@ -85,28 +85,37 @@ group_is_ours() {
   return 1
 }
 
+# ": <fix>" with @DIR@ replaced by the folder, quoted so the command can be copied as printed (a
+# folder can hold spaces, glob characters, & or \). Nothing without a fix. The fix is split at
+# @DIR@ instead of ${1//@DIR@/...}: bash 5.2's patsub_replacement reads & and \ in that
+# replacement again and undoes the quoting.
+refusal_fix() { # refusal_fix <fix> <folder>
+  [[ -n $1 ]] || return 0
+  printf ': %s%q%s' "${1%%@DIR@*}" "$2" "${1#*@DIR@}"
+}
+
 # A run's state.env is sourced, so the run folder and the home above it must be real folders (no
 # symlinks), owned by this user and writable by nobody else.
-require_private_dir() {
-  local dir=$1 mode
+require_private_dir() { # require_private_dir <dir> [<fix for a writable folder; @DIR@ names it>]
+  local dir=$1 fix=${2:-} mode
   [[ -d $dir && ! -L $dir ]] || die "$dir is not a real folder"
   [[ $(stat -c %u "$dir") == "$(id -u)" ]] || die "$dir is not owned by user $(id -u)"
   mode=$(stat -c %a "$dir")
-  (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)"
+  (((8#$mode & 8#022) == 0)) || die "$dir is writable by group or others (mode $mode)$(refusal_fix "$fix" "$dir")"
 }
 
 # Every folder above a run home (or a git dir) must be owned by root or this user and writable by
 # nobody else, unless it is sticky like /tmp (as ssh's StrictModes checks): another account could
 # otherwise rename the checked folder away and put its own in its place. Takes a physical path.
-require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for messages>]
-  local dir=$1 what=${2:-the run home} owner mode
+require_safe_ancestors() { # require_safe_ancestors <path> [<what it is, for messages>] [<fix>]
+  local dir=$1 what=${2:-the run home} fix=${3:-} owner mode
   while [[ $dir != / ]]; do
     dir=$(dirname "$dir")
     owner=$(stat -c %u "$dir")
     mode=$(stat -c %a "$dir")
     [[ $owner == 0 || $owner == "$(id -u)" ]] || die "$dir, above $what, is owned by user $owner"
     (((8#$mode & 8#022) == 0 || (8#$mode & 8#1000) != 0)) \
-      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)"
+      || die "$dir, above $what, is writable by group or others and not sticky (mode $mode)$(refusal_fix "$fix" "$dir")"
   done
 }
 
@@ -419,8 +428,13 @@ launch_failed() {
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
+# The process group id that the new group's leader appended to state.env, if it has.
+recorded_pgid() {
+  sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1
+}
+
 cmd_launch() {
-  local t0 backend_port vite_port log existing token
+  local t0 backend_port vite_port log existing token leader
   need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -482,9 +496,18 @@ cmd_launch() {
     "$VERIFY_XUM_RUN/state.env" "${env_without_live_xum[@]}" \
     make -C "$CHECKOUT" dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects" \
     >"$log" 2>&1 </dev/null &
-  until VERIFY_XUM_PGID=$(sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1)
-    [[ -n $VERIFY_XUM_PGID ]]; do
+  leader=$!
+  until VERIFY_XUM_PGID=$(recorded_pgid); [[ -n $VERIFY_XUM_PGID ]]; do
     before_launch_deadline
+    # A leader that could not write its id exits before make: stop at once instead of waiting
+    # for the deadline. $! is the leader, or a setsid that forked it and exited. The leader
+    # carries this run's id in its environment from its start. Read the id once more: the leader
+    # can have written it just before it went away.
+    if ! kill -0 "$leader" 2>/dev/null && ! grep -qszx "VERIFY_XUM_SERVER_OF=$VERIFY_XUM_RUN_ID" /proc/[0-9]*/environ; then
+      VERIFY_XUM_PGID=$(recorded_pgid)
+      [[ -n $VERIFY_XUM_PGID ]] && break
+      die "the server's process group exited before it wrote its id to $VERIFY_XUM_RUN/state.env (a read-only file or a full disk?)"
+    fi
     sleep 0.1
   done
   release_launch_guard
@@ -745,9 +768,11 @@ cmd_cleanup() {
   local i
   # Read the token before the group stops: the backend then deletes server.lock.
   REDACT_TOKEN=$(run_token)
-  # agent-browser `close` on a session that does not exist starts that session first.
-  if [[ $(agent-browser session list 2>/dev/null) == *"$AGENT_BROWSER_SESSION"* ]]; then
-    agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 || true
+  # agent-browser `close` on a session that does not exist starts that session first. From
+  # launch_failed this runs with the launch guard on fd 9: an agent-browser daemon started here
+  # must not inherit it, or it holds the flock and blocks every later launch.
+  if [[ $(agent-browser session list 2>/dev/null 9>&-) == *"$AGENT_BROWSER_SESSION"* ]]; then
+    agent-browser --session "$AGENT_BROWSER_SESSION" close >/dev/null 2>&1 9>&- || true
   fi
   if group_is_ours "$VERIFY_XUM_PGID" "$VERIFY_XUM_RUN_ID"; then
     kill -TERM -- "-$VERIFY_XUM_PGID" 2>/dev/null || true
@@ -781,12 +806,15 @@ cmd_cleanup() {
 # of this user or that group or others can write: the rule for the run home and the folders
 # above it. A writable folder above would let another account rename the whole git dir away and
 # put its own in its place. The checks on the guard's open fd stay as a second line.
+# Under umask 002 (the default for Debian's and Ubuntu's per-user groups) git makes a clone's
+# folder, .git and .git/worktrees/<name> 0775, so the refusal says how to fix the folder it names.
+GIT_DIR_FIX="run chmod g-w,o-w @DIR@ (git makes its folders group-writable under umask 002), or use a checkout made under umask 022"
 require_private_git_dirs() {
   local dir
   for dir in "$CHECKOUT_GIT_DIR" "$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)"; do
     dir=$(cd -P -- "$dir" && pwd -P)
-    require_private_dir "$dir"
-    require_safe_ancestors "$dir" "the git dir $dir"
+    require_private_dir "$dir" "$GIT_DIR_FIX"
+    require_safe_ancestors "$dir" "the git dir $dir" "$GIT_DIR_FIX"
   done
 }
 require_private_git_dirs
