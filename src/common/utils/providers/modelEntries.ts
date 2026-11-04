@@ -217,6 +217,14 @@ function parseContextWindowTokens(rawValue: unknown): number | null {
   return rawValue;
 }
 
+type WithoutNullFields<T> = { [K in keyof T]?: Exclude<T[K], null> };
+
+function withoutNullFields<T extends Record<string, unknown>>(fields: T): WithoutNullFields<T> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== null)
+  ) as WithoutNullFields<T>;
+}
+
 /** Valid levels only, deduped, in canonical order; null when none remain. */
 function parseThinkingLevels(rawValue: unknown): ThinkingLevel[] | null {
   if (!Array.isArray(rawValue)) {
@@ -248,19 +256,13 @@ export function normalizeProviderModelEntry(rawEntry: unknown): ProviderModelEnt
     return null;
   }
 
-  const contextWindowTokens = parseContextWindowTokens(entry.contextWindowTokens);
-  const mappedToModel = parseModelId(entry.mappedToModel);
-  const thinkingLevels = parseThinkingLevels(entry.thinkingLevels);
-  if (contextWindowTokens === null && mappedToModel === null && thinkingLevels === null) {
-    return modelId;
-  }
-
-  return {
-    id: modelId,
-    ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
-    ...(mappedToModel !== null ? { mappedToModel } : {}),
-    ...(thinkingLevels !== null ? { thinkingLevels } : {}),
-  };
+  const overrides = withoutNullFields({
+    contextWindowTokens: parseContextWindowTokens(entry.contextWindowTokens),
+    mappedToModel: parseModelId(entry.mappedToModel),
+    thinkingLevels: parseThinkingLevels(entry.thinkingLevels),
+  });
+  // Override-free objects collapse to the plain string form.
+  return Object.keys(overrides).length === 0 ? modelId : { id: modelId, ...overrides };
 }
 
 export function normalizeProviderModelEntries(rawEntries: unknown): ProviderModelEntry[] {

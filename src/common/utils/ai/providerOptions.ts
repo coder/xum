@@ -233,28 +233,36 @@ const DIRECT_REASONING_BUILDERS: Record<
 };
 
 /**
- * reasoning_effort for a custom openai-compatible model whose entry declares
- * thinkingLevels; null for every other model, which keeps sending no reasoning
- * field. The SDK reads the universal `openaiCompatible` namespace for any
- * provider name, so hyphenated custom ids avoid its raw-name deprecation warning.
+ * Options for a route no provider branch handled. A custom openai-compatible
+ * model whose entry declares thinkingLevels gets reasoning_effort; every other
+ * model keeps sending no provider-specific options. The SDK reads the universal
+ * `openaiCompatible` namespace for any provider name, so hyphenated custom ids
+ * avoid its raw-name deprecation warning.
  */
-function buildDeclaredOpenAICompatibleOptions(
+function buildFallbackProviderOptions(
   modelString: string,
   rawPrefix: string,
   thinkingLevel: ThinkingLevel,
-  providersConfig: ProvidersConfigMap | null | undefined
-): ProviderOptions | null {
+  providersConfig: ProvidersConfigMap | null | undefined,
+  unsupportedLogContext: Record<string, unknown>
+): ProviderOptions {
   const providerConfig = providersConfig?.[rawPrefix];
   if (
-    !isCustomProviderConfig(providerConfig) ||
-    providerConfig.providerType !== "openai-compatible" ||
-    getModelThinkingLevelsOverride(modelString, providersConfig ?? null) == null
+    isCustomProviderConfig(providerConfig) &&
+    providerConfig.providerType === "openai-compatible" &&
+    getModelThinkingLevelsOverride(modelString, providersConfig ?? null) != null
   ) {
-    return null;
+    // Headless callers may pass a level the model does not declare.
+    const level = enforceThinkingPolicy(modelString, thinkingLevel, null, providersConfig);
+    const options = {
+      openaiCompatible: { reasoningEffort: level === "off" ? "none" : level },
+    };
+    log.debug("buildProviderOptions: Returning declared openai-compatible options", options);
+    return options;
   }
-  // Headless callers may pass a level the model does not declare.
-  const level = enforceThinkingPolicy(modelString, thinkingLevel, null, providersConfig);
-  return { openaiCompatible: { reasoningEffort: level === "off" ? "none" : level } };
+
+  log.debug("buildProviderOptions: Unsupported format provider", unsupportedLogContext);
+  return {};
 }
 
 /** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
@@ -1195,28 +1203,18 @@ export function buildProviderOptions(
     return options;
   }
 
-  const declaredOpenAICompatibleOptions = buildDeclaredOpenAICompatibleOptions(
+  return buildFallbackProviderOptions(
     modelString,
     rawPrefixForMetadata,
     thinkingLevel,
-    providersConfig
+    providersConfig,
+    {
+      formatProvider,
+      origin,
+      routeProvider,
+      providerOptionsNamespaceKey,
+    }
   );
-  if (declaredOpenAICompatibleOptions != null) {
-    log.debug(
-      "buildProviderOptions: Returning declared openai-compatible options",
-      declaredOpenAICompatibleOptions
-    );
-    return declaredOpenAICompatibleOptions;
-  }
-
-  // No provider-specific options for unsupported providers
-  log.debug("buildProviderOptions: Unsupported format provider", {
-    formatProvider,
-    origin,
-    routeProvider,
-    providerOptionsNamespaceKey,
-  });
-  return {};
 }
 
 // ---------------------------------------------------------------------------
