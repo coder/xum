@@ -89,10 +89,10 @@ Preconditions:
   `agent-browser wait '[aria-label="Restore workspace release-notes"]'`. The region
   `Archived workspaces` lists `release-notes` and `scratch-notes`. Run
   `agent-browser find role button click --name "Restore workspace release-notes" --exact`, then
-  wait for the result with `agent-browser wait --url "**/workspace/$RN_ID"` (`RN_ID` as in
-  **Open from the sidebar**) and
-  `agent-browser wait '[aria-label="Select workspace release-notes"]'`. The app is on
-  `/workspace/$RN_ID`, the sidebar row is back, and `config.json` has an
+  wait for the result in the same bash call with
+  `agent-browser wait --url "**/workspace/$(verify-xum.sh workspace-field release-notes id)"` and
+  `agent-browser wait '[aria-label="Select workspace release-notes"]'`. The app is on the
+  `release-notes` workspace URL, the sidebar row is back, and `config.json` has an
   `unarchivedAt` time for it. Capture `workspaces/restored`.
 - **CLI view.** List the workspaces through the CLI:
 
