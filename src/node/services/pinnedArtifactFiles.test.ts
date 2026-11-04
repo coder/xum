@@ -6,6 +6,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
 import {
+  PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
   PINNED_FILES_MULTI_PROJECT_REASON,
   addPinnedPath,
   listPinnedFiles,
@@ -255,6 +256,13 @@ describe("pinned workspace files", () => {
         for (const call of read.mock.calls) {
           expect(call[3]).toMatchObject({ requireDescriptorPaths: true });
         }
+        // Tool paths outside the checkout name container files, not host files.
+        const outside = path.join(tempDir, "outside.md");
+        await fs.writeFile(outside, "x");
+        expect(await pinFile(context, { workspaceId: "ws", path: outside })).toEqual({
+          success: false,
+          error: PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON,
+        });
       } finally {
         read.mockRestore();
       }
