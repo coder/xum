@@ -532,7 +532,7 @@ cmd_env() {
 # the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
 # is in no process's argv or environment: every local account can read argv.
 cmd_open() {
-  local path=${1:-} out
+  local path=${1:-} out token
   [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
   load_run "${2:-}"
   # Checked before agent-browser runs. A PATH like //host, /\host or /<tab>/host resolves to
@@ -552,18 +552,18 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
+  # server.lock's token, else the run's copy: a restarting backend deletes server.lock for a
+  # moment. node gets it on fd 3, never in argv.
+  token=$(run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
-    const [serverLock, base, path] = process.argv.slice(1);
-    let token = "";
-    try {
-      token = JSON.parse(fs.readFileSync(serverLock, "utf8")).token ?? "";
-    } catch {}
+    const [base, path] = process.argv.slice(1);
+    const token = fs.readFileSync(3, "utf8");
     const url = new URL(path, base);
     if (token) url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
-    "$VERIFY_XUM_ROOT/server.lock" "$VERIFY_XUM_URL" "$path" \
+    "$VERIFY_XUM_URL" "$path" 3< <(printf %s "$token") \
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
     || die "agent-browser could not open $path: $(sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out")"
   # The success output repeats the URL with the token: it is not printed.
