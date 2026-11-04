@@ -11,6 +11,7 @@ import {
   parseArtifactListOutput,
   readArtifactBytesOnRuntime,
   readArtifactOnRuntime,
+  resolveRealDirOnRuntime,
   writeArtifactOnRuntime,
 } from "./artifactRuntimeStore";
 import {
@@ -267,6 +268,31 @@ describe("artifactRuntimeStore", () => {
         error: "Artifact not found: secret.md",
         missing: true,
       });
+    });
+
+    test("a pinned read can use the filesystem root as its folder", async () => {
+      // A pinned file directly under `/` is read from `/`: containment must not require `//`.
+      const checkout = path.join(tempDir, "checkout");
+      await fs.mkdir(checkout);
+      await fs.writeFile(path.join(checkout, "a.txt"), "rooted");
+      const options = { allowHidden: true, requireArtifactsBasename: false };
+      const relPath = path.join(checkout, "a.txt").slice(1);
+      expect(
+        await readArtifactBytesOnRuntime(runtime, "/", relPath, CAP, undefined, options)
+      ).toMatchObject({ status: "ok", bytes: Buffer.from("rooted") });
+      expect(await readArtifactFromDir("/", relPath, CAP, options)).toMatchObject({
+        success: true,
+        data: { status: "ok", content: "rooted" },
+      });
+    });
+
+    test("resolves a folder's real path on the runtime", async () => {
+      const real = path.join(tempDir, "real dir");
+      await fs.mkdir(real);
+      await fs.symlink(real, path.join(tempDir, "link"));
+      expect(await resolveRealDirOnRuntime(runtime, path.join(tempDir, "link"))).toBe(real);
+      expect(await resolveRealDirOnRuntime(runtime, real)).toBe(real);
+      expect(await resolveRealDirOnRuntime(runtime, path.join(tempDir, "missing"))).toBeNull();
     });
 
     test("reads a pinned checkout file only when the artifacts name check is off", async () => {

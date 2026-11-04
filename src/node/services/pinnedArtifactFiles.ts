@@ -17,7 +17,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
-import { readArtifactBytesOnRuntime } from "./artifactRuntimeStore";
+import { readArtifactBytesOnRuntime, resolveRealDirOnRuntime } from "./artifactRuntimeStore";
 import {
   hostSupportsDescriptorPaths,
   parseArtifactRelativePath,
@@ -215,6 +215,17 @@ export async function removePinnedPath(
 
 type AvailableLocation = Exclude<CheckoutLocation, { kind: "unavailable" }>;
 
+/** Absolute by the location's own rules: a drive-letter path is not absolute on a POSIX host. */
+function isAbsoluteOn(location: AvailableLocation, filePath: string): boolean {
+  return location.kind === "runtime" ? filePath.startsWith("/") : path.isAbsolute(filePath);
+}
+
+/** Real path of a folder where the checkout lives, or null when it is missing. */
+async function realDirOn(location: AvailableLocation, dir: string): Promise<string | null> {
+  if (location.kind === "runtime") return resolveRealDirOnRuntime(location.runtime, dir);
+  return fs.realpath(dir).catch(() => null);
+}
+
 /**
  * The folder a stored pin is read from and its path below it: the checkout for a checkout pin,
  * the file's own folder for a pin outside the checkout (so the readers still refuse a symlinked
@@ -224,32 +235,50 @@ function pinTarget(
   location: AvailableLocation,
   storedPath: string
 ): { root: string; relPath: string } {
-  if (!isOutsidePinPath(storedPath)) return { root: location.root, relPath: storedPath };
+  // A hand-edited entry that is not absolute here stays relative, and the readers refuse it.
+  if (!isAbsoluteOn(location, storedPath)) return { root: location.root, relPath: storedPath };
   const paths = location.kind === "runtime" ? path.posix : path;
   return { root: paths.dirname(storedPath), relPath: paths.basename(storedPath) };
 }
 
 /**
- * Map a pin request to the stored path: checkout-relative inside the checkout, else the
- * normalized absolute path. Dev containers refuse outside files: tool paths there name files in
- * the container, while pins are read on this host.
+ * Map a pin request to the stored path: checkout-relative inside the checkout, else the file
+ * name in its folder's real path. The real path makes one file reached through a symlinked
+ * folder one pin (and a checkout pin when the folder is in the checkout), and the runtime
+ * readers refuse a symlinked folder. Dev containers refuse outside files: tool paths there name
+ * files in the container, while pins are read on this host.
  */
-function toStoredPinPath(
+async function toStoredPinPath(
   location: AvailableLocation,
   inputPath: string
-): string | { error: string } {
-  // By its own rules: a drive-letter path is not absolute on a POSIX host.
-  const isAbsolute =
-    location.kind === "runtime" ? inputPath.startsWith("/") : path.isAbsolute(inputPath);
-  if (!isAbsolute) return toPinnedRelativePath(location.root, inputPath);
+): Promise<string | { error: string }> {
+  if (!isAbsoluteOn(location, inputPath)) return toPinnedRelativePath(location.root, inputPath);
+  const paths = location.kind === "runtime" ? path.posix : path;
   const absolute =
-    location.kind === "runtime" ? path.posix.normalize(inputPath) : path.resolve(inputPath);
+    location.kind === "runtime" ? paths.normalize(inputPath) : paths.resolve(inputPath);
   const relPath = toPinnedRelativePath(location.root, absolute);
   if (typeof relPath === "string" || relPath.error !== OUTSIDE_CHECKOUT_ERROR) return relPath;
   if (location.kind === "host" && location.containerWritable === true) {
     return { error: PINNED_FILES_DEVCONTAINER_OUTSIDE_REASON };
   }
-  return absolute;
+  return await toRealOutsidePinPath(location, absolute);
+}
+
+/**
+ * An outside file's stored path: its name in its folder's real path, or the checkout pin when
+ * that real folder is in the checkout.
+ */
+async function toRealOutsidePinPath(
+  location: AvailableLocation,
+  absolute: string
+): Promise<string | { error: string }> {
+  const paths = location.kind === "runtime" ? path.posix : path;
+  const realDir = await realDirOn(location, paths.dirname(absolute));
+  if (realDir == null) return { error: `Not a readable file: ${absolute}` };
+  const real = paths.join(realDir, paths.basename(absolute));
+  const realRoot = await realDirOn(location, location.root);
+  const inCheckout = realRoot == null ? null : toPinnedRelativePath(realRoot, real);
+  return typeof inCheckout === "string" ? inCheckout : real;
 }
 
 async function statPinned(
@@ -294,7 +323,13 @@ export async function listPinnedFiles(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const paths = await readPinnedPaths(sessionDirFor(context, input.workspaceId));
+  // The store keeps any absolute entry; list only those absolute here (a hand-edited `C:/x.md`
+  // on a POSIX host would list as a pin that never reads).
+  const paths = (await readPinnedPaths(sessionDirFor(context, input.workspaceId))).filter(
+    (p) =>
+      isAbsoluteOn(location, p) ||
+      typeof parseArtifactRelativePath(p, { allowHidden: true }) !== "string"
+  );
   const files = await Promise.all(
     paths.map(async (relPath) => {
       const stat = await statPinned(location, relPath);
@@ -375,6 +410,25 @@ async function checkPinnable(
   }
 }
 
+/**
+ * The stored entry that already names the file of `storedPath`, or null. An outside pin stored
+ * before pins used real folder paths can hold an alias of the same file, so absolute entries
+ * are compared by their real form too: re-pinning the alias must not add a second entry.
+ */
+async function findExistingPin(
+  location: AvailableLocation,
+  pinned: readonly string[],
+  storedPath: string
+): Promise<string | null> {
+  if (pinned.includes(storedPath)) return storedPath;
+  const absolute = pinned.filter((p) => isAbsoluteOn(location, p));
+  const real = await Promise.all(
+    absolute.map((p) => toStoredPinPath(location, p).catch(() => null))
+  );
+  const index = real.indexOf(storedPath);
+  return index < 0 ? null : absolute[index];
+}
+
 export async function pinFile(
   context: ArtifactsContext,
   input: { workspaceId: string; path: string; relativeTo?: "tool-cwd" | "checkout" | null }
@@ -383,23 +437,29 @@ export async function pinFile(
   const location = await resolveForPinned(context, input.workspaceId);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") return { success: false, error: location.reason };
-  const relPath = toStoredPinPath(
-    location,
-    resolvePinInput(location, input.path, input.relativeTo)
-  );
+  let relPath: string | { error: string };
+  try {
+    relPath = await toStoredPinPath(
+      location,
+      resolvePinInput(location, input.path, input.relativeTo)
+    );
+  } catch (error) {
+    return unreachableError(error);
+  }
   if (typeof relPath !== "string") return { success: false, error: relPath.error };
   const sessionDir = sessionDirFor(context, input.workspaceId);
+  // Re-pinning an existing pin stays a no-op and opens the stored entry.
+  const existing = await findExistingPin(location, await readPinnedPaths(sessionDir), relPath);
+  if (existing != null) return { success: true, data: { path: existing } };
   // Pins persist until unpinned: refuse missing files, folders and symlinks up front instead of
-  // storing a pin that can never be read. Re-pinning an existing pin stays a no-op.
-  if (!(await readPinnedPaths(sessionDir)).includes(relPath)) {
-    let refusal: string | null;
-    try {
-      refusal = await checkPinnable(location, relPath);
-    } catch (error) {
-      return unreachableError(error);
-    }
-    if (refusal != null) return { success: false, error: refusal };
+  // storing a pin that can never be read.
+  let refusal: string | null;
+  try {
+    refusal = await checkPinnable(location, relPath);
+  } catch (error) {
+    return unreachableError(error);
   }
+  if (refusal != null) return { success: false, error: refusal };
   await addPinnedPath(sessionDir, relPath);
   return { success: true, data: { path: relPath } };
 }
