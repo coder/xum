@@ -37,8 +37,11 @@ Surfaces:
 
 ## Launch
 
-The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Bun on PATH must be
-the version in `package.json` `packageManager`. Launch refuses another Bun.
+The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Every command
+refuses a checkout whose git dir (or, for a worktree, its common git dir) is not yours or is
+writable by group or others: the launch lock and the newest-run link live there. Use a checkout
+of your own, not a shared repository. Bun on PATH must be the version in `package.json`
+`packageManager`. Launch refuses another Bun.
 
 ```bash
 .xum/skills/verify-xum/scripts/verify-xum.sh launch

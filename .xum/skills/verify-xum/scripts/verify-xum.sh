@@ -142,9 +142,9 @@ private_run_dir() {
   echo "$run"
 }
 
-# Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which another
-# account can write in a shared repository: a symlink planted there made `9>` truncate its target.
-# The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
+# Opens the launch guard on fd 9 for flock. It sits in the checkout's git dir, which no other
+# account can write (require_private_git_dirs). These checks are a second line: a symlink there
+# made `9>` truncate its target. The guard is created with O_EXCL (noclobber), which never follows a symlink, and opened read
 # only, which can neither create nor truncate anything (flock needs no write access). Then fd 9
 # must be the regular file of this user that the path names. Its mode is 0600: another account
 # that can read it can flock it and block every launch. A guard from an older version is 0644,
@@ -692,6 +692,19 @@ cmd_cleanup() {
   write_state
   echo "cleaned up run $VERIFY_XUM_RUN_ID; evidence kept in $VERIFY_XUM_EVIDENCE ($(find "$VERIFY_XUM_EVIDENCE" -type f | wc -l | tr -d ' ') files) and $VERIFY_XUM_RUN/server.log"
 }
+
+# The newest-run link and the launch guard live in the checkout's git dir. Another account that
+# could write there could swap either between a check and its use (a symlink, a FIFO, a folder),
+# so every command refuses a git dir, or a worktree's common git dir, that is not a real folder
+# of this user or that group or others can write: the rule for the run home's own folders. The
+# checks on the guard's open fd stay as a second line.
+require_private_git_dirs() {
+  local dir
+  for dir in "$CHECKOUT_GIT_DIR" "$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)"; do
+    require_private_dir "$(cd -P -- "$dir" && pwd -P)"
+  done
+}
+require_private_git_dirs
 
 case ${1:-} in
   launch) cmd_launch ;;
