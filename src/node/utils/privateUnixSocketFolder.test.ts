@@ -50,15 +50,8 @@ describe.skipIf(!posix)("chooseDevSocketPath", () => {
     expect(await fs.readdir(base)).toEqual([`xum-dev-${uid}`]);
   });
 
-  test("a folder that another user owns is replaced by a fresh private one", async () => {
-    await fs.mkdir(preferred, { mode: 0o700 });
-    const choice = await chooseDevSocketPath(preferred, "b1.sock", uid + 1);
-    // Our own fresh folder counts as the other user's here, so only check the shape of the answer.
-    expect(choice.fellBackFrom?.folder).toBe(preferred);
-    expect(choice.fellBackFrom?.reason).toMatch(/owned by another user/);
-    expect(path.basename(choice.socketPath)).toBe("b1.sock");
-  });
-
+  // A folder that another user owns takes the same branch (assertPrivateFolder refuses it); only
+  // root can make one, so the PR's live proof uses a folder that `nobody` created.
   test("a folder that others can enter is replaced by a fresh private one", async () => {
     await fs.mkdir(preferred, { mode: 0o755 });
     await fs.chmod(preferred, 0o755);
