@@ -124,14 +124,16 @@ without_trailing_slashes() {
 # this check cannot drift from Vite's rules. Fails closed: without an answer, no home is safe.
 vite_workspace_root() {
   local root
-  root=$(cd -P -- "$CHECKOUT" && node --input-type=module -e '
+  if root=$(cd -P -- "$CHECKOUT" && node --input-type=module -e '
     import { createRequire } from "node:module";
     import { pathToFileURL } from "node:url";
     const vite = createRequire(process.cwd() + "/package.json").resolve("vite");
     console.log((await import(pathToFileURL(vite).href)).searchForWorkspaceRoot(process.cwd()));
-  ') && [[ $root == /* && $root != *$'\n'* ]] \
-    || die "the checkout's vite did not report its workspace root, so the run home cannot be checked against the folders Vite serves. Run \`bun install\` in $CHECKOUT."
-  echo "$root"
+  ') && [[ $root == /* && $root != *$'\n'* ]]; then
+    echo "$root"
+  else
+    die "the checkout's vite did not report its workspace root, so the run home cannot be checked against the folders Vite serves. Run \`bun install\` in $CHECKOUT."
+  fi
 }
 
 # Vite serves every file under the checkout to whoever reaches its port (vite.config.ts denies only
