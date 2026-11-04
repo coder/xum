@@ -238,7 +238,10 @@ function toStoredPinPath(
   location: AvailableLocation,
   inputPath: string
 ): string | { error: string } {
-  if (!isOutsidePinPath(inputPath)) return toPinnedRelativePath(location.root, inputPath);
+  // By its own rules: a drive-letter path is not absolute on a POSIX host.
+  const isAbsolute =
+    location.kind === "runtime" ? inputPath.startsWith("/") : path.isAbsolute(inputPath);
+  if (!isAbsolute) return toPinnedRelativePath(location.root, inputPath);
   const absolute =
     location.kind === "runtime" ? path.posix.normalize(inputPath) : path.resolve(inputPath);
   const relPath = toPinnedRelativePath(location.root, absolute);
@@ -308,7 +311,7 @@ export async function listPinnedFiles(
 
 /**
  * A relative path from a file tool names a file under the tool cwd (a sub-project dir), not the
- * checkout root: resolve it against `execRoot` so the stored path is still checkout-relative.
+ * checkout root: resolve it against `execRoot` before it is mapped to the stored path.
  */
 function resolvePinInput(
   location: AvailableLocation,

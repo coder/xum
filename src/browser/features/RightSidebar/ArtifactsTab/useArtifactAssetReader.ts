@@ -54,7 +54,7 @@ function createConnectedReader(
 
 /**
  * Reader for files an artifact references, through the same size-capped artifacts.read route.
- * A null workspaceId turns relative assets off (pinned checkout files: their neighbours are not
+ * A null workspaceId turns relative assets off (pinned files: their neighbours are not
  * in the artifacts folder and need not be pinned).
  *
  * The reader must keep its identity across renders: renderers list it in effect dependencies
