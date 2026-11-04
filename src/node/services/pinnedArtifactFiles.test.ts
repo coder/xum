@@ -196,6 +196,26 @@ describe("pinned workspace files", () => {
     }
   });
 
+  test("re-pinning an alias stored before real folder paths keeps the one entry", async () => {
+    const real = await fs.realpath(tempDir);
+    await fs.mkdir(path.join(real, "notes"));
+    await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+    await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+    const alias = path.join(real, "notes-link", "plan.md");
+    // An older build stored the alias as given.
+    await addPinnedPath(path.join(tempDir, "sessions", "ws"), alias);
+    for (const request of [alias, path.join(real, "notes", "plan.md")]) {
+      expect(await pinFile(context, { workspaceId: "ws", path: request })).toEqual({
+        success: true,
+        data: { path: alias },
+      });
+    }
+    const listed = await listPinnedFiles(context, { workspaceId: "ws" });
+    expect(listed.success && listed.data.available && listed.data.files.map((f) => f.path)).toEqual(
+      [alias]
+    );
+  });
+
   test("a drive-letter entry on a POSIX host is invalid, not a path below the backend's folder", async () => {
     if (process.platform === "win32") return;
     // Only a hand edit of the store can add one. Read as a folder `C:` it would resolve against

@@ -410,6 +410,25 @@ async function checkPinnable(
   }
 }
 
+/**
+ * The stored entry that already names the file of `storedPath`, or null. An outside pin stored
+ * before pins used real folder paths can hold an alias of the same file, so absolute entries
+ * are compared by their real form too: re-pinning the alias must not add a second entry.
+ */
+async function findExistingPin(
+  location: AvailableLocation,
+  pinned: readonly string[],
+  storedPath: string
+): Promise<string | null> {
+  if (pinned.includes(storedPath)) return storedPath;
+  const absolute = pinned.filter((p) => isAbsoluteOn(location, p));
+  const real = await Promise.all(
+    absolute.map((p) => toStoredPinPath(location, p).catch(() => null))
+  );
+  const index = real.indexOf(storedPath);
+  return index < 0 ? null : absolute[index];
+}
+
 export async function pinFile(
   context: ArtifactsContext,
   input: { workspaceId: string; path: string; relativeTo?: "tool-cwd" | "checkout" | null }
@@ -429,17 +448,18 @@ export async function pinFile(
   }
   if (typeof relPath !== "string") return { success: false, error: relPath.error };
   const sessionDir = sessionDirFor(context, input.workspaceId);
+  // Re-pinning an existing pin stays a no-op and opens the stored entry.
+  const existing = await findExistingPin(location, await readPinnedPaths(sessionDir), relPath);
+  if (existing != null) return { success: true, data: { path: existing } };
   // Pins persist until unpinned: refuse missing files, folders and symlinks up front instead of
-  // storing a pin that can never be read. Re-pinning an existing pin stays a no-op.
-  if (!(await readPinnedPaths(sessionDir)).includes(relPath)) {
-    let refusal: string | null;
-    try {
-      refusal = await checkPinnable(location, relPath);
-    } catch (error) {
-      return unreachableError(error);
-    }
-    if (refusal != null) return { success: false, error: refusal };
+  // storing a pin that can never be read.
+  let refusal: string | null;
+  try {
+    refusal = await checkPinnable(location, relPath);
+  } catch (error) {
+    return unreachableError(error);
   }
+  if (refusal != null) return { success: false, error: refusal };
   await addPinnedPath(sessionDir, relPath);
   return { success: true, data: { path: relPath } };
 }
