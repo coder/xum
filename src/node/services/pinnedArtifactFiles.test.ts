@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as artifactStoreModule from "./artifactStore";
 import type { ArtifactsContext } from "./artifactsOperations";
@@ -24,6 +26,8 @@ describe("pinned workspace files", () => {
   let projects: Array<{ projectPath: string; projectName: string }> | undefined;
   let subProjectPath: string | undefined;
   let runtimeConfig: Record<string, unknown>;
+  let workspaceName: string;
+  let projectPath: string;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pinned-files-"));
@@ -34,6 +38,8 @@ describe("pinned workspace files", () => {
     projects = undefined;
     subProjectPath = undefined;
     runtimeConfig = { type: "worktree", srcBaseDir: tempDir };
+    workspaceName = "checkout";
+    projectPath = tempDir;
     context = {
       config: { sessionsDir: path.join(tempDir, "sessions") },
       workspaceService: {
@@ -42,8 +48,8 @@ describe("pinned workspace files", () => {
             workspaceId === "ws"
               ? {
                   id: "ws",
-                  name: "checkout",
-                  projectPath: tempDir,
+                  name: workspaceName,
+                  projectPath,
                   projectName: "project",
                   namedWorkspacePath: checkout,
                   runtimeConfig,
@@ -158,6 +164,36 @@ describe("pinned workspace files", () => {
     expect(listed.success && listed.data.available && listed.data.files.map((f) => f.path)).toEqual(
       [path.join(real, "notes", "plan.md"), "docs/x.md"]
     );
+  });
+
+  test("an SSH checkout pins and reads an outside file in a symlinked folder", async () => {
+    // A LocalRuntime stands in for the SSH host: pins and reads run the real runtime scripts.
+    const real = await fs.realpath(tempDir);
+    runtimeConfig = { type: "ssh", host: "example", srcBaseDir: real };
+    // An in-place workspace (name equals project path) roots the checkout at the project path.
+    projectPath = workspaceName = path.join(real, "checkout");
+    const create = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue(
+      new LocalRuntime(real)
+    );
+    try {
+      await fs.mkdir(path.join(real, "notes"));
+      await fs.writeFile(path.join(real, "notes", "plan.md"), "# Plan");
+      await fs.symlink(path.join(real, "notes"), path.join(real, "notes-link"));
+      const stored = path.join(real, "notes", "plan.md");
+      expect(
+        await pinFile(context, {
+          workspaceId: "ws",
+          path: path.join(real, "notes-link", "plan.md"),
+        })
+      ).toEqual({ success: true, data: { path: stored } });
+      expect(await readPinnedFile(context, { workspaceId: "ws", path: stored })).toMatchObject({
+        success: true,
+        data: { status: "ok", content: "# Plan" },
+      });
+      expect(create).toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+    }
   });
 
   test("a drive-letter entry on a POSIX host is invalid, not a path below the backend's folder", async () => {
