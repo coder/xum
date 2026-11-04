@@ -88,8 +88,12 @@ const token = JSON.parse(require("fs").readFileSync(lock, "utf8")).token;
 const url = `http://localhost:${port}/?token=${encodeURIComponent(token)}`;
 process.stdout.write(JSON.stringify([["open", url]]));
 ' "$XUM_ROOT/server.lock" "$VITE_PORT" | agent-browser --session "$S" batch --bail 2>&1); then
-    agent-browser --session "$S" --json stream status | grep -q '"enabled":false' ||
-      { agent-browser --session "$S" close >/dev/null 2>&1; echo "agent-browser: its stream came back on, so the session was closed" >&2; false; }
+    agent-browser --session "$S" --json stream status | grep -q '"enabled":false' || {
+      agent-browser --session "$S" close >/dev/null 2>&1 &&
+        echo "agent-browser: its stream came back on, so the session was closed" >&2 ||
+        echo "agent-browser: its stream is on and the session could not be closed: close it yourself" >&2
+      false
+    }
   else
     sed 's/token=[^&[:space:]]*/token=<redacted>/g' <<<"$out" >&2; false
   fi
