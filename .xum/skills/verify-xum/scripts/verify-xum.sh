@@ -118,6 +118,23 @@ without_trailing_slashes() {
   echo "$path"
 }
 
+# Vite serves every file under the checkout to whoever reaches its port (vite.config.ts denies only
+# a few names), so a run home there would publish the run's token copy, its evidence and its
+# sandbox. Refuses a home whose physical path (symlinks and .. resolved, even for parts that do
+# not exist yet) is inside the checkout, or inside the main worktree of a linked one.
+require_home_outside_checkout() { # require_home_outside_checkout <home>
+  local home top common
+  home=$(realpath -m -- "$1")
+  common=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-common-dir)
+  for top in "$CHECKOUT" "$([[ $(basename "$common") == .git ]] && dirname "$common")"; do
+    [[ -n $top ]] || continue
+    top=$(realpath -m -- "$top")
+    if [[ $top == / || $home == "$top" || $home == "$top"/* ]]; then
+      die "the run home $home is inside the checkout $top, where Vite serves every file to anyone who reaches its port (the run's token too). Set VERIFY_XUM_HOME to a folder outside it."
+    fi
+  done
+}
+
 # The physical path of a run home, after checking it and every folder above it. Later reads use
 # that path, so no symlink above the home is followed again.
 checked_home() {
@@ -125,6 +142,7 @@ checked_home() {
   home=$(without_trailing_slashes "$1")
   [[ -d $home && ! -L $home ]] || die "$home is not a real folder"
   home=$(cd -P -- "$home" && pwd -P)
+  require_home_outside_checkout "$home"
   require_private_dir "$home"
   require_safe_ancestors "$home"
   echo "$home"
@@ -335,11 +353,13 @@ launch_failed() {
 
 cmd_launch() {
   local t0 backend_port vite_port log token
-  need git curl node bun make setsid flock ss agent-browser
+  need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
   refuse_while_checkout_server_runs
 
+  # Before any folder is made: a refused home creates nothing.
+  require_home_outside_checkout "$VERIFY_XUM_HOME"
   if [[ ! -e $VERIFY_XUM_HOME ]]; then
     # Parents this creates are private too, whatever the caller's umask.
     (umask 077 && mkdir -p "$(dirname "$VERIFY_XUM_HOME")")

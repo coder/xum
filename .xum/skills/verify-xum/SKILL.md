@@ -153,6 +153,9 @@ agent-browser find role button click --name "Open settings" --exact
 Evidence goes to `$VERIFY_XUM_EVIDENCE`, which is `$VERIFY_XUM_HOME/<run>/evidence`.
 `VERIFY_XUM_HOME` defaults to `$XUM_SCRATCH_DIR/verify-xum`, else `$XDG_RUNTIME_DIR/verify-xum`,
 else `$HOME/.cache/verify-xum`, and never to a shared TMPDIR. Launch creates it with mode 0700.
+Launch and every command that reads a run refuse a home inside the checkout (or inside the main
+worktree of a linked checkout), symlinks and `..` resolved: Vite serves every file there to
+anyone who reaches its port, the run's token copy and evidence included.
 Every command that reads a run's `state.env` first checks that the home and the run folder are
 real folders (no symlinks), owned by you and not writable by group or others, and refuses
 otherwise: the script sources that file. Cleanup never
