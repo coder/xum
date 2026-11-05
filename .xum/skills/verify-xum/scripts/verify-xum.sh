@@ -617,7 +617,7 @@ require_path_on_run_origin() { # require_path_on_run_origin <path>: after load_r
     const [base, path] = process.argv.slice(1);
     const url = new URL(path, base);
     if (url.origin !== new URL(base).origin || url.pathname.startsWith("//")) {
-      process.stderr.write("verify-xum: open PATH must stay on " + base + " and must not start with // once normalized\n");
+      process.stderr.write("verify-xum: PATH must stay on " + base + " and must not start with // once normalized\n");
       process.exit(1);
     }' "$VERIFY_XUM_URL" "$1" || exit 1
 }
@@ -734,7 +734,7 @@ redact_token() { # redact_token [PATH...]
 }
 
 require_evidence_name() { # require_evidence_name <name>
-  [[ $1 =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "capture NAME must look like <feature>/<step>, lowercase"
+  [[ $1 =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "NAME must look like <feature>/<step>, lowercase"
 }
 
 cmd_capture() {
@@ -824,6 +824,14 @@ webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args..
     WEBKIT_DOCKER_REASON="no Linux Docker daemon answers at $endpoint"
     return 125
   fi
+  # The pull has its own, longer limit: the first one fetches about 2 GB, and the run's limit would
+  # call it a hung capture.
+  if ! "${docker_cli[@]}" image inspect "$WEBKIT_IMAGE" >/dev/null 2>&1 \
+    && { echo "verify-xum: pulling $WEBKIT_IMAGE (about 2 GB, once)." >&2; ! timeout -k 10 1800 "${docker_cli[@]}" pull "$WEBKIT_IMAGE" >&2; }; then
+    rm -rf "$config"
+    WEBKIT_DOCKER_REASON="docker could not pull $WEBKIT_IMAGE"
+    return 125
+  fi
   printf %s "$token" | timeout -k 10 300 "${docker_cli[@]}" run --rm -i --init \
     --name "verify-xum-webkit-$VERIFY_XUM_RUN_ID-$$" --network host --user "$(id -u):$(id -g)" \
     --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,size=512m \
@@ -867,7 +875,7 @@ cmd_webkit_capture() {
       0) webkit_report "$base"; return 0 ;;
       "$WEBKIT_NOT_LAUNCHED") host_reason=${output#webkit-capture: } ;;
       124) die "webkit-capture timed out on the host" ;;
-      *) printf '%s\n' "$output" >&2; exit "$rc" ;;
+      *) printf '%s\n' "$output" | redact_token >&2; exit "$rc" ;;
     esac
   fi
   if [[ $mode != host ]]; then

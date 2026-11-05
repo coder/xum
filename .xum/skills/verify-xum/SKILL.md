@@ -204,7 +204,7 @@ of the page. A failed run leaves no `-webkit` files from an earlier run of the s
 report holds the redacted URL, the engine and its mode, the viewport,
 `document.documentElement.scrollWidth <= innerWidth` with both numbers, and the console and page
 errors. Open the PNG: the width line sees only page-level overflow, not content that paints
-outside its frame inside the page.
+outside its frame inside the page, and the PNG is the 390x844 viewport, not the whole page.
 
 - The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
   that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
