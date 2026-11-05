@@ -269,18 +269,18 @@ in everything it writes, as a second layer.
   folder (the container's tmpfs, or the run's `tmp` folder, which cleanup deletes). The host
   helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so this
   command adds no DevTools port or stream to the one that the Threat model names for
-  agent-browser, except under WSL, where Playwright opens a debugging port
-  (`--remote-debugging-port=0`).
+  agent-browser. Playwright opens a debugging port (`--remote-debugging-port=0`) only for its
+  `webkit-wsl` channel, a Windows option that the helper does not select.
 - CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
   host, the sandbox's backend and its token included. The container gets the token on stdin only,
   runs one file of this repo from the pinned image as your uid with no capabilities and a
   read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
   `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`).
   The command refuses a Docker endpoint that is not a local socket (the token would leave the
-  host), refuses a control character in any path it hands to Docker (Docker can echo a path to your
-  terminal), and runs the docker CLI with an empty private config (its `proxies` would otherwise go
-  into the container's environment). The single-account CAUTION of the Threat model applies to
-  this command too.
+  host), refuses a control character or a byte that is not valid UTF-8 in that endpoint and in any
+  path it hands to Docker (Docker can echo a path to your terminal), and runs the docker CLI with
+  an empty private config (its `proxies` would otherwise go into the container's environment). The
+  single-account CAUTION of the Threat model applies to this command too.
 - Nothing outlives the command except the evidence: the container is removed when it exits and
   stops itself after 180 s at most, and the private Docker config sits in the run's `tmp` folder
   that cleanup deletes. Cleanup redacts the report like every other text file of the evidence.
