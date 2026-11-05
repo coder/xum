@@ -6,11 +6,6 @@
  * src/browser/features/Messages/mermaidDiagramBox.ts). TS and TSX are covered by
  * local/no-css-zoom. The docs site is not renderer code and is not scanned.
  *
- * The files are parsed, not text-scanned: a text scan has to guess where comments, strings,
- * escapes and nesting begin, and each guess missed a spelling. CSS goes through postcss. HTML and
- * SVG go through parse5, which finds each `style` attribute and `<style>` element, and decodes
- * character references the way a browser does. A file that does not parse fails the check.
- *
  * Usage: bun scripts/check-no-css-zoom.ts   (or `make check-no-css-zoom`)
  */
 import assert from "node:assert/strict";
@@ -22,8 +17,7 @@ import postcss from "postcss";
 
 type ParentNode = DefaultTreeAdapterMap["parentNode"];
 
-// One CSS escape: `\` plus 1-6 hex digits and one optional whitespace, or `\` plus any other
-// character, which stands for itself. postcss leaves both in a property name as written.
+// postcss leaves CSS escapes in a property name as written.
 const CSS_ESCAPE = /\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\n\r\f])?|([^\n\r\f]))/gi;
 const VENDOR_PREFIX = /^-[a-z]+-/;
 const REPLACEMENT_CHARACTER = "\ufffd";
@@ -43,7 +37,6 @@ function isZoomProperty(property: string): boolean {
   return decodeCssEscapes(property).toLowerCase().replace(VENDOR_PREFIX, "") === "zoom";
 }
 
-/** The 1-based line of each `zoom` declaration in `css`, whose first line is `firstLine`. */
 function zoomLinesInCss(css: string, firstLine: number): number[] {
   const lines: number[] = [];
   postcss.parse(css).walkDecls((declaration) => {
@@ -80,7 +73,6 @@ function zoomLinesBelow(parent: ParentNode): number[] {
   );
 }
 
-/** The 1-based line of each `zoom` declaration in a `.css`, `.html` or `.svg` source. */
 export function findZoomDeclarations(file: string, source: string): number[] {
   switch (extname(file).toLowerCase()) {
     case ".css":
@@ -97,7 +89,6 @@ export function findZoomDeclarations(file: string, source: string): number[] {
   }
 }
 
-/** Tracked CSS, HTML and SVG files that this check scans. */
 export function trackedStyleFiles(): string[] {
   const listed = execFileSync(
     "git",
