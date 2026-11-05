@@ -640,7 +640,8 @@ const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ce
 /**
  * Compares the strip below a diagram's box in a scrolled view, for a diagram that ends below the
  * viewport. The strip is where iPhone Safari painted over the text, so a diagram that has none
- * to compare fails.
+ * to compare fails. The first screenshot has repaired a stale WebKit layout by now, so this view
+ * catches paint that escapes the box in a settled layout, not the stale state.
  */
 async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
   await scrollBelowDiagram(page, index, true);
@@ -750,8 +751,12 @@ const config: TestRunnerConfig = {
       await page.setViewportSize(restoreViewport);
     }
     // A failed play already reports its own error, which this check would hide. A play can run it
-    // earlier too (see preVisit): this one covers every story tagged webkit at rest.
-    if (!context.hasFailure && (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG)) {
+    // earlier too (see preVisit): this one covers every story tagged webkit that shows a diagram.
+    if (
+      !context.hasFailure &&
+      (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG) &&
+      (await page.locator(PAGE_DIAGRAMS).count()) > 0
+    ) {
       await assertNoDiagramInkOutsideItsBox(page);
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {

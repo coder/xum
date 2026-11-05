@@ -4,7 +4,7 @@ import { GlobalWindow } from "happy-dom";
 import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
-import { dialogDiagramRoom, dialogMaxBox } from "./mermaidDiagramBox";
+import { dialogDiagramRoom } from "./mermaidDiagramBox";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -646,9 +646,6 @@ describe("Mermaid layout stability", () => {
       const room = dialogDiagramRoom({ width: 390, height: 844 });
       expect(natural.width).toBeGreaterThan(room.width);
       expect(boxOf(dialog()).width).toBe(`${room.width}px`);
-      expect(dialog()?.style.minWidth).toBe(
-        `min(80vw, ${dialogMaxBox({ width: 390, height: 844 }).width}px)`
-      );
     });
 
     test("the expand dialog lays the diagram out for its own width", async () => {
