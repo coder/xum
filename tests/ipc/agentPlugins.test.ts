@@ -284,11 +284,11 @@ function unwrap<T>(result: Result<T, string>): T {
       const registry = JSON.parse(
         await fs.readFile(path.join(env.config.rootDir, "plugins.json"), "utf8")
       ) as {
-        plugins: Array<{
+        plugins: {
           name: string;
           installMethod?: string;
           componentConsent?: { agents: Record<string, string> };
-        }>;
+        }[];
       };
       const row = registry.plugins.find((entry) => entry.name === "method-ipc");
       expect(row?.installMethod).toBe("claude-plugin");

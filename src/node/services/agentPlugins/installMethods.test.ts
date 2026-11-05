@@ -591,6 +591,17 @@ describe("chooseStagedMethod update refusals (B5)", () => {
     );
   });
 
+  test("a saved Agent Plugin whose root lost $schema, with no Codex manifest, names the root and the Codex file", async () => {
+    expect(
+      await refusal({
+        saved: "agent-plugin",
+        files: { "plugin.json": manifest, ".claude-plugin/plugin.json": manifest },
+      })
+    ).toBe(
+      `plugin.json has no $schema in this commit, and .codex-plugin/plugin.json is gone. Methods that fit this commit: Claude Code plugin. ${switchHint}`
+    );
+  });
+
   test("a saved manifest that is invalid in this commit: its validation error, and what else fits", async () => {
     const problem =
       "Invalid plugin: Invalid plugin manifest (.claude-plugin/plugin.json): 'name' is required";

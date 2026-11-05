@@ -620,6 +620,64 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect((await rawRow()).source).toMatchObject({ ref: "main", refType: "branch" });
   });
 
+  test("a saved Agent Plugin fits a commit whose root gains $schema, and the update goes through the review", async () => {
+    await installAs("agent-plugin");
+    await write({
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+    });
+    const next = await commit("the root gains $schema");
+    const review = await service.previewUpdate({ name: "egm" });
+    expect(review.refused).toBeUndefined();
+    expect(review.toSha).toBe(next);
+    // Without the review's consent, a change that adds components does not apply.
+    if (review.changes.length > 0) {
+      await expect(service.update({ name: "egm" })).rejects.toThrow("review");
+    }
+    await updateWithReview();
+    const row = await rawRow();
+    expect([row.installMethod, row.lockedSha]).toEqual(["agent-plugin", next]);
+    const { plugins } = await discoverAgentPlugins([
+      { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+    ]);
+    // The root manifest now loads, not the Codex one.
+    expect(plugins[0].codexFallback).toBeUndefined();
+  });
+
+  test("a saved Agent Plugin fits a commit whose root loses $schema while a Codex manifest exists, and is refused without one", async () => {
+    await write({
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+    });
+    await commit("a Xum-native root");
+    await installAs("agent-plugin");
+
+    await write({ "plugin.json": JSON.stringify({ name: "egm" }) });
+    await commit("the root loses $schema");
+    expect((await service.previewUpdate({ name: "egm" })).refused).toBeUndefined();
+    await updateWithReview();
+    const { plugins } = await discoverAgentPlugins([
+      { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins[0].codexFallback).toBe(true);
+    expect((await rawRow()).installMethod).toBe("agent-plugin");
+
+    // No Codex manifest to fall back to: the update is refused and names both files.
+    await git(remoteDir, "rm", "-q", "-r", ".codex-plugin");
+    await commit("the Codex manifest goes");
+    const refused = await service.previewUpdate({ name: "egm" });
+    expect(refused.refused).toBe(
+      "plugin.json has no $schema in this commit, and .codex-plugin/plugin.json is gone. Methods that fit this commit: Claude Code plugin, Cursor plugin. To switch, uninstall the plugin and install it again."
+    );
+    await expect(service.update({ name: "egm" })).rejects.toThrow("has no $schema");
+
+    // The schema-less root alone: Xum reads it as the manifest and reports its validation error.
+    await git(remoteDir, "rm", "-q", "-r", ".claude-plugin", ".cursor-plugin");
+    await commit("only the root is left");
+    const alone = await service.previewUpdate({ name: "egm" });
+    expect(alone.refused).toContain("Agent Plugin: Invalid plugin");
+    expect(alone.refused).toContain("'$schema' is required");
+    expect(alone.refused).toContain("No install method fits this commit.");
+  });
+
   test("an install without a saved method keeps updating with the Codex manifest", async () => {
     await installAs("agent-plugin");
     // An install from before this change has no field.

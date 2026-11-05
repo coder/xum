@@ -2087,6 +2087,31 @@ test("plugin hook review action opens the hooks panel of a present managed insta
   expect(openSettings).toHaveBeenCalledWith("plugins");
 });
 
+test("the plugin update action hands a refused update to the section and applies nothing", async () => {
+  const openSettings = mock(() => undefined);
+  const refused = {
+    name: "egm",
+    fromSha: "a".repeat(40),
+    toSha: "b".repeat(40),
+    changes: [],
+    warnings: [],
+    refused:
+      ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit.",
+  };
+  const api = createMockORPCClient({ agentPlugins: { items: [], updateReview: refused } });
+  const update = mock(() => Promise.resolve({ success: true as const, data: {} }));
+  Object.assign(api.agentPlugins, { update });
+  const action = mk({ api, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((candidate) => candidate.id === CommandIds.pluginsUpdateOne());
+  if (!action?.prompt) throw new Error("Expected the update picker");
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "egm" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "review-update", review: refused });
+  expect(openSettings).toHaveBeenCalledWith("plugins");
+  expect(update).not.toHaveBeenCalled();
+});
+
 describe("Open Server Window palette action", () => {
   const makeBridge = (result: OpenLocalServerResult) =>
     ({

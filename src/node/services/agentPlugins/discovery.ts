@@ -1566,10 +1566,7 @@ function manifestSpecsFor(choice: ManifestChoice): readonly AgentPluginManifestS
  * The manifest files a method can read, as the repository shows them (`shownRoot`: the plugin
  * folder's path inside its repository, see discoverAgentPluginAt).
  */
-export function manifestFilesOf(
-  method: SavedInstallMethod,
-  shownRoot?: string | undefined
-): string[] {
+export function manifestFilesOf(method: SavedInstallMethod, shownRoot?: string): string[] {
   return manifestSpecsFor({ kind: "method", method }).map((spec) =>
     shownManifestPath(shownRoot, spec.relative)
   );
@@ -1578,7 +1575,7 @@ export function manifestFilesOf(
 /** The error of a named method whose manifest does not exist: it names the method and the file. */
 export function missingMethodManifestMessage(
   method: SavedInstallMethod,
-  shownRoot?: string | undefined
+  shownRoot?: string
 ): string {
   const files = manifestFilesOf(method, shownRoot);
   const label = AGENT_PLUGIN_INSTALL_METHOD_LABELS[method];

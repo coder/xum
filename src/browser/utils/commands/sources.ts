@@ -2737,7 +2737,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               showCommandFeedbackToast({ type: "error", message: preview.error });
               return;
             }
-            if (preview.data.changes.length > 0) {
+            // A refused update has no changes: the section shows its message and Remove plugin.
+            if (preview.data.refused !== undefined || preview.data.changes.length > 0) {
               publishPluginsSectionIntent({ type: "review-update", review: preview.data });
               openSettings("plugins");
               return;

@@ -305,6 +305,8 @@ export interface DetectedInstallMethods {
    * read it): rule M1 offers `agent-plugin` alone, and a saved Claude or Cursor method gives way.
    */
   nativeRoot: boolean;
+  /** The root plugin.json exists and has no `$schema`: it is never a method of its own (rule M1). */
+  schemaLessRoot: boolean;
 }
 
 /**
@@ -327,7 +329,10 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   const rootEntry = present.has(PLUGIN_MANIFEST_RELATIVE_PATH);
   const nativeRoot = rootEntry && !(await rootManifestIsSchemaLess(stagedDir));
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
-  if (nativeRoot) return { methods: [{ kind: "agent-plugin" }], skillsRoots, nativeRoot };
+  const schemaLessRoot = rootEntry && !nativeRoot;
+  if (nativeRoot) {
+    return { methods: [{ kind: "agent-plugin" }], skillsRoots, nativeRoot, schemaLessRoot };
+  }
   // The table's order is the fixed order, so the first method is the one discovery loads.
   const manifestKinds: SavedInstallMethod[] = [];
   for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
@@ -344,7 +349,7 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   if (!rootEntry && !present.has(CODEX_PLUGIN_MANIFEST_RELATIVE_PATH) && skillsRoots.length > 0) {
     methods.push({ kind: "skills" });
   }
-  return { methods, skillsRoots, nativeRoot };
+  return { methods, skillsRoots, nativeRoot, schemaLessRoot };
 }
 
 /** A manifest method that validation turned down, with the problem that preview and update show. */
@@ -680,6 +685,10 @@ function savedMethodMisfit(
   if (rejected !== undefined)
     return sentence(`${AGENT_PLUGIN_INSTALL_METHOD_LABELS[saved]}: ${rejected.problem}`);
   const files = manifestFilesOf(saved, subpath);
+  if (saved === "agent-plugin" && checked.schemaLessRoot) {
+    // The commit lost the root's `$schema` and has no Codex manifest to fall back to (B5.2).
+    return `${files[0]} has no $schema in this commit, and ${files[1]} is gone.`;
+  }
   if (checked.nativeRoot) {
     return `This commit has a plugin.json with $schema (a Xum-native package), which takes precedence over ${files.join(" and ")}.`;
   }
