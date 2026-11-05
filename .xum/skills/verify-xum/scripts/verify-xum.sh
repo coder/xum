@@ -433,8 +433,9 @@ launch_failed() {
 # XUM_VITE_HOST=0.0.0.0 makes a server listen on every interface, and Vite then answers
 # http://<this machine's IP>:<port>/ (an IP-address Host passes its check). Launch runs it while
 # it waits for readiness too: a server on one non-loopback address never answers the loopback
-# probes, and launch would otherwise wait for its deadline. With "ready" it also refuses when
-# nothing listens on PORT: the server answered a probe there, so ss cannot see its sockets.
+# probes, and launch would otherwise wait for its deadline. Returns 1 when nothing listens on
+# PORT. With "ready" it refuses then instead: the server answered a probe there, so ss cannot see
+# its sockets.
 refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what listens there> [ready]
   local addr addrs
   addrs=$(ss -Hltn "sport = :$1" 2>/dev/null) || die "ss failed, so launch cannot check which addresses $2 listens on"
@@ -444,6 +445,30 @@ refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what lis
     [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
       || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets its host (XUM_VITE_HOST, MUX_VITE_HOST, VITE_HOST, XUM_BACKEND_HOST, MUX_BACKEND_HOST or BACKEND_HOST): remove that line."
   done <<<"$addrs"
+  [[ -n $addrs ]]
+}
+
+# The checks that need a ready backend: its listeners and the token in its server.lock. Sets
+# token. A nodemon restart kills the backend, and the next one deletes the dead one's server.lock
+# before it binds the port, and writes its own lock after (see run_token). So a missing lock, a
+# lock that changed while the checks ran, or a /health that stopped answering means a restart:
+# return 1, and launch waits for readiness again. Refuse only what one backend showed throughout.
+backend_checks_after_ready() {
+  local before after listening=yes
+  before=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  refuse_off_loopback_listener "$backend_port" "the backend" || listening=no
+  backend_ready "$t0" || return 1
+  after=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  [[ $after == "$before" ]] || return 1
+  [[ $listening == yes ]] \
+    || die "ss shows nothing listening on the backend's port $backend_port, so launch cannot check that only loopback reaches it"
+  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
+  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
+  # a token any local account, and a web page that rebinds its DNS name to this machine, can
+  # call its API.
+  token=$(json_field_or_empty /dev/stdin token <<<"$after")
+  [[ -n $token ]] \
+    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
 }
 
 # The process group id that the new group's leader appended to state.env, if it has.
@@ -552,25 +577,17 @@ cmd_launch() {
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
 
-  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/"; do
+  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/" \
+    && refuse_off_loopback_listener "$vite_port" Vite ready && backend_checks_after_ready; do
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
-    refuse_off_loopback_listener "$vite_port" Vite
-    refuse_off_loopback_listener "$backend_port" "the backend"
+    refuse_off_loopback_listener "$vite_port" Vite || true
+    refuse_off_loopback_listener "$backend_port" "the backend" || true
     sleep 1
   done
-  refuse_off_loopback_listener "$vite_port" Vite ready
-  refuse_off_loopback_listener "$backend_port" "the backend" ready
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
-  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
-  # a token any local account, and a web page that rebinds its DNS name to this machine, can
-  # call its API.
-  [[ -n $token ]] \
-    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
   (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
 
   seed

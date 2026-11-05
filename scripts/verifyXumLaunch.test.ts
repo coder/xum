@@ -20,6 +20,9 @@ interface Fake {
   // The token the fake backend records in server.lock. Empty: none, as with
   // XUM_DEV_SERVER_NO_AUTH=1.
   token: string;
+  // Acts out a nodemon restart right after readiness: the first /health deletes server.lock, and
+  // a new lock (a later startedAt, the same token) appears 3 s later.
+  restartAfterFirstHealth?: boolean;
 }
 
 // Runs as `make -C <checkout> dev-server-sandbox ...` in the launch's own process group, so its
@@ -36,10 +39,22 @@ const listen = (host, handler) =>
   new Promise((resolve) => {
     const server = http.createServer(handler).listen(0, host, () => resolve(server.address().port));
   });
+let lockPath = "";
+const writeLock = (startedAt) => {
+  const lock = { startedAt: startedAt.toISOString() };
+  if (fake.token) lock.token = fake.token;
+  fs.writeFileSync(lockPath, JSON.stringify(lock));
+};
+let restarted = false;
 (async () => {
   // Like the real backend, only /health answers without the token. The fake has no API, so a
   // request with the token gets 404.
   const backendPort = await listen(fake.backendHost, (req, res) => {
+    if (req.url === "/health" && fake.restartAfterFirstHealth && !restarted) {
+      restarted = true;
+      fs.rmSync(lockPath);
+      setTimeout(() => writeLock(new Date()), 3000);
+    }
     const authorized = fake.token !== "" && req.headers.authorization === "Bearer " + fake.token;
     res.statusCode = req.url === "/health" ? 200 : authorized ? 404 : 401;
     res.end();
@@ -49,9 +64,8 @@ const listen = (host, handler) =>
   const stamp = Date.now();
   fs.mkdirSync(path.join(checkout, "dist"), { recursive: true });
   fs.writeFileSync(path.join(checkout, "dist/.main-build-complete"), String(stamp));
-  const lock = { startedAt: new Date(stamp + 1).toISOString() };
-  if (fake.token) lock.token = fake.token;
-  fs.writeFileSync(path.join(root, "server.lock"), JSON.stringify(lock));
+  lockPath = path.join(root, "server.lock");
+  writeLock(new Date(stamp + 1));
   console.log("  XUM_ROOT:       " + root);
   console.log("  Seed config:     (none)");
   console.log("  Backend:         http://127.0.0.1:" + backendPort);
@@ -257,6 +271,19 @@ test.skipIf(!isLinux)(
       "the backend has no auth token, so any local account can control it"
     );
     expect(r.stderr).toContain("XUM_DEV_SERVER_NO_AUTH=1");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// A nodemon restart deletes server.lock for a moment (see run_token in verify-xum.sh). Launch must
+// wait for the new lock, not read the missing one as a backend without a token.
+test.skipIf(!isLinux)(
+  "launch waits for server.lock when a restart deletes it right after readiness",
+  () => {
+    const r = launch({ ...loopback, restartAfterFirstHealth: true });
+    expect(r.stderr).not.toContain("no auth token");
+    expect(r.stderr).toContain("returned error: 404");
     expect(r.left).toBe(0);
   },
   90_000
