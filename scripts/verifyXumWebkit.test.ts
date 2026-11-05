@@ -19,9 +19,11 @@ describe("the Docker image of verify-xum.sh webkit-capture", () => {
   const script = fs.readFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), "utf8");
   const pinned = (name: string) => new RegExp(`^${name}=(\\S+)$`, "m").exec(script)?.[1];
 
-  test("carries the Playwright version of the root playwright-core pin, by digest", () => {
-    // The image's browsers are the revisions that its Playwright version drives. A bump of the
-    // root pin without a new digest makes the in-container launch fail on a missing executable.
+  test("names the Playwright version of the root playwright-core pin, and pins the image by digest", () => {
+    // The image's browsers are the revisions that its Playwright version drives. This catches a
+    // bump of the root pin that leaves the version constant behind. A digest that does not hold
+    // that version's browsers cannot be seen offline: the launch then fails with Playwright's
+    // "Executable doesn't exist" message.
     const rootPin = (
       JSON.parse(fs.readFileSync(path.join(import.meta.dir, "../package.json"), "utf8")) as {
         devDependencies: Record<string, string>;
@@ -52,6 +54,8 @@ async function runHelper(options: {
   launchError?: string;
   /** The page never settles and still shows these placeholders. */
   stuckOn?: string[];
+  /** The page settled on one of AppLoader's startup failures. */
+  startupFailed?: string[];
 }): Promise<FakeRun> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-webkit-test-"));
   tempDirs.push(root);
@@ -88,7 +92,8 @@ exports.webkit = {
               }
             },
             async evaluate(expression) {
-              if (typeof expression === "string" && expression.includes("innerText")) return ${JSON.stringify(options.stuckOn ?? [])};
+              if (typeof expression === "string" && expression.includes("aria-busy")) return ${JSON.stringify(options.stuckOn ?? [])};
+              if (typeof expression === "string" && expression.includes('role="alert"')) return ${JSON.stringify(options.startupFailed ?? [])};
               if (typeof expression === "string") return ${JSON.stringify(options.chunkFailed ?? false)};
               return { scrollWidth: ${options.scrollWidth ?? 390}, innerWidth: 390 };
             },
@@ -176,9 +181,16 @@ describe("webkit-capture.mjs", () => {
   });
 
   test("names the placeholder a page is stuck on instead of capturing it", async () => {
-    const run = await runHelper({ stuckOn: [MERMAID_PENDING_TEXT] });
+    const run = await runHelper({ stuckOn: ["a Mermaid diagram that is still rendering"] });
     expect(run.exitCode).toBe(1);
-    expect(run.stderr).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
+    expect(run.stderr).toContain("still shows a Mermaid diagram that is still rendering");
+    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+  });
+
+  test("exits 1 and keeps no evidence when the page shows a startup failure", async () => {
+    const run = await runHelper({ startupFailed: ["the startup connection error"] });
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("the page shows the startup connection error");
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
   });
 

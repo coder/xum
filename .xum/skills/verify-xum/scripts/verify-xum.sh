@@ -775,9 +775,11 @@ cmd_send_ready() {
 # webkit-capture opens the page in Playwright WebKit, the engine of phone users' Safari. agent-browser
 # drives Chromium, which lays some pages out differently. Playwright is the checkout's locked
 # playwright-core. WebKit needs GTK and GStreamer libraries that many hosts lack, so the helper
-# runs on the host when WebKit launches there, and otherwise in this image. The image's Playwright
-# version must be the one in package.json (scripts/verifyXumWebkit.test.ts checks it): its
-# browsers are the ones that version drives.
+# runs on the host when WebKit launches there, and otherwise in this image. Its browsers are the
+# ones its Playwright version drives, so that version must be the one in package.json: the test
+# scripts/verifyXumWebkit.test.ts and webkit_in_docker check the version. Nothing offline ties a
+# digest to a version. To bump, run `docker pull mcr.microsoft.com/playwright:v<version>-noble`,
+# then `docker image inspect --format '{{index .RepoDigests 0}}'` on it, and set both constants.
 WEBKIT_IMAGE_PLAYWRIGHT_CORE=1.64.1
 WEBKIT_IMAGE=mcr.microsoft.com/playwright@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
 WEBKIT_HELPER=$SCRIPT_DIR/webkit-capture.mjs
@@ -800,7 +802,7 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
 # and the step's evidence folder. Returns 125 with WEBKIT_DOCKER_REASON set (the caller declares
 # it) when Docker cannot run it: the code docker itself uses for that.
 webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args...>
-  local token=$1 out_dir=$2 endpoint config docker_cli rc=0
+  local token=$1 out_dir=$2 endpoint installed config docker_cli rc=0
   shift 2
   command -v docker >/dev/null || { WEBKIT_DOCKER_REASON="docker is not installed"; return 125; }
   # The user's endpoint, resolved once, then an empty private client config: the CLI copies the
@@ -808,7 +810,14 @@ webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args..
   # --network host would name another machine's network and the token would travel to it.
   endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=
   [[ $endpoint == unix:///?* ]] || { WEBKIT_DOCKER_REASON="the Docker endpoint '${endpoint:-unknown}' is not a local socket"; return 125; }
-  config=$(mktemp -d "$VERIFY_XUM_RUN/tmp/docker-config.XXXXXX")
+  installed=$(node -p 'require(process.argv[1]).version' "$CHECKOUT/node_modules/playwright-core/package.json" 2>/dev/null) || installed=
+  if [[ $installed != "$WEBKIT_IMAGE_PLAYWRIGHT_CORE" ]]; then
+    WEBKIT_DOCKER_REASON="node_modules holds playwright-core ${installed:-none}, the image carries ${WEBKIT_IMAGE_PLAYWRIGHT_CORE}: run bun install, or bump WEBKIT_IMAGE in verify-xum.sh"
+    return 125
+  fi
+  # Not a command that can fail quietly: this function runs in a || list, where errexit is off, and
+  # a Docker run without the private config would pass the user's proxies on.
+  config=$(mktemp -d "$VERIFY_XUM_RUN/tmp/docker-config.XXXXXX") || { WEBKIT_DOCKER_REASON="cannot make a folder in $VERIFY_XUM_RUN/tmp"; return 125; }
   docker_cli=(env -i PATH="$PATH" DOCKER_HOST="$endpoint" DOCKER_CONFIG="$config" docker)
   if [[ $("${docker_cli[@]}" version --format '{{.Server.Os}}' 2>/dev/null) != linux ]]; then
     rm -rf "$config"
@@ -845,6 +854,8 @@ cmd_webkit_capture() {
   [[ -d $VERIFY_XUM_RUN/tmp ]] || die "the run was cleaned up ($VERIFY_XUM_RUN/tmp is gone)"
   base="$VERIFY_XUM_EVIDENCE/$name-webkit"
   mkdir -p "$(dirname "$base")"
+  # A failed capture must not leave the last one's files behind as if they were its result.
+  rm -f "$base.png" "$base.txt"
   token=$(run_token)
   local helper_args=(--checkout "$CHECKOUT" --base "$VERIFY_XUM_URL" --path "$path" --out "$base.png"
     --settled-js "$SETTLED_OR_CHUNK_FAILED_JS" --chunk-failed-js "$CHUNK_LOAD_FAILED_JS")

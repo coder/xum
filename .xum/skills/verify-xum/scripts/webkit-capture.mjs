@@ -20,11 +20,30 @@ const EXIT_NO_WEBKIT = 4;
 const WATCHDOG_MS = 180_000;
 const STEP_TIMEOUT_MS = 60_000;
 const MAX_PROBLEM_LINES = 20;
-// Placeholders of content that is still loading. They are no CSS transition and no busy
-// transcript, so `idle`'s test reads a page that shows one as settled. scripts/verifyXumWebkit.test.ts
-// checks that this list holds Mermaid's own placeholder text.
-const PENDING_TEXTS = ["Loading Xum", "Rendering diagram..."];
-const STILL_PENDING_JS = `${JSON.stringify(PENDING_TEXTS)}.filter((text) => document.body.innerText.includes(text))`;
+// States that `idle`'s test reads as settled. Loading: the boot screen (index.html and
+// LoadingScreen, aria-busy) and Mermaid's pending frame, which has no transition and no busy flag.
+// Failed: AppLoader's startup connection error and the token prompt, which show instead of the
+// requested page. They are matched by element, not by text anywhere on the page: a transcript can
+// quote any of these words. scripts/verifyXumWebkit.test.ts checks that Mermaid's text is current.
+const MERMAID_PENDING_TEXT = "Rendering diagram...";
+const STILL_LOADING_JS = `(() => {
+  const loading = [];
+  if (document.querySelector('.boot-loader[aria-busy="true"]')) loading.push("the loading screen");
+  const pending = [...document.querySelectorAll(".mermaid-container")].some(
+    (frame) => frame.textContent.trim() === ${JSON.stringify(MERMAID_PENDING_TEXT)}
+  );
+  if (pending) loading.push("a Mermaid diagram that is still rendering");
+  return loading;
+})()`;
+const STARTUP_FAILED_JS = `(() => {
+  const failed = [];
+  if (document.querySelector('.boot-loader[role="alert"]')) failed.push("the startup connection error");
+  const prompt = [...document.querySelectorAll('[role="dialog"]')].some((dialog) =>
+    dialog.textContent.includes("Authentication Required")
+  );
+  if (prompt) failed.push("the authentication prompt");
+  return failed;
+})()`;
 
 const PHONE = {
   viewport: { width: 390, height: 844 },
@@ -113,7 +132,7 @@ try {
   await page.goto(url.href, { waitUntil: "load", timeout: STEP_TIMEOUT_MS });
   const settled = await page
     .waitForFunction(
-      `(${args["chunk-failed-js"]}) || ((${args["settled-js"]}) && ${STILL_PENDING_JS}.length === 0)`,
+      `(${args["chunk-failed-js"]}) || ${STARTUP_FAILED_JS}.length > 0 || ((${args["settled-js"]}) && ${STILL_LOADING_JS}.length === 0)`,
       undefined,
       { timeout: STEP_TIMEOUT_MS }
     )
@@ -124,13 +143,12 @@ try {
         return false;
       }
     );
+  const startupFailed = settled ? await page.evaluate(STARTUP_FAILED_JS) : [];
   if (!settled) {
-    const stuck = await page.evaluate(STILL_PENDING_JS);
+    const loading = await page.evaluate(STILL_LOADING_JS);
     process.stderr.write(
       `webkit-capture: the page did not settle in ${STEP_TIMEOUT_MS / 1000} s${
-        stuck.length > 0
-          ? `: it still shows ${stuck.map((text) => JSON.stringify(text)).join(", ")}`
-          : ""
+        loading.length > 0 ? `: it still shows ${loading.join(" and ")}` : ""
       }.\n`
     );
     exitCode = 1;
@@ -139,6 +157,9 @@ try {
       "webkit-capture: the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again.\n"
     );
     exitCode = EXIT_CHUNK_FAILED;
+  } else if (startupFailed.length > 0) {
+    process.stderr.write(`webkit-capture: the page shows ${startupFailed.join(" and ")}.\n`);
+    exitCode = 1;
   } else {
     const widths = await page.evaluate(() => ({
       scrollWidth: document.documentElement.scrollWidth,

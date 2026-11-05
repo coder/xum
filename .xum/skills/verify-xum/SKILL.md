@@ -196,10 +196,12 @@ opens a page of the run in Playwright WebKit at a phone viewport:
 
 `webkit-capture <path> <feature>/<step>` loads `<path>` in a new browser (390x844 at 3x, mobile,
 touch), waits as `idle` does, and writes `<step>-webkit.png` and `<step>-webkit.txt` under
-`evidence/<feature>/`. `idle`'s test reads a page as settled while it still shows `Loading Xum` or
-a Mermaid diagram's `Rendering diagram...`, so this command also waits for both to go. After 60 s
-it exits 1 and names the placeholder. It exits 3 on `<name> failed to load.`, as `idle` does.
-The report holds the redacted URL, the engine and its mode, the viewport,
+`evidence/<feature>/`. `idle`'s test reads a page as settled while it still shows the loading
+screen or a Mermaid diagram that is still rendering, so this command also waits for both to go.
+After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed to load.`, as
+`idle` does, and 1 when the page shows the startup connection error or the token prompt instead
+of the page. A failed run leaves no `-webkit` files from an earlier run of the same name. The
+report holds the redacted URL, the engine and its mode, the viewport,
 `document.documentElement.scrollWidth <= innerWidth` with both numbers, and the console and page
 errors. Open the PNG: the width line sees only page-level overflow, not content that paints
 outside its frame inside the page.
@@ -213,9 +215,11 @@ outside its frame inside the page.
   `docker`) it runs on the host when WebKit launches there (`node_modules/.bin/playwright
   install webkit`, and `--with-deps` for the libraries). Otherwise it runs the same helper in
   `mcr.microsoft.com/playwright@sha256:2f05f8a7...` (Playwright 1.64.1, pinned by digest, pulled
-  once). The image's browsers belong to that Playwright version: a Playwright bump needs a new
-  digest in `verify-xum.sh`, and `scripts/verifyXumWebkit.test.ts` fails until it has one. When
-  neither mode works, the command exits 1 and names both fixes.
+  once). The image's browsers belong to that Playwright version: after a Playwright bump, set
+  `WEBKIT_IMAGE` and `WEBKIT_IMAGE_PLAYWRIGHT_CORE` in `verify-xum.sh` (the recipe is in the
+  comment above them). The test fails until the version constant moves, and Docker mode refuses
+  while `node_modules` and the constant differ. When neither mode works, the command exits 1 and
+  names both fixes.
 - The token reaches the helper on stdin, as it reaches curl in `doctor`. It is in no argv and no
   environment, and the helper redacts it from every message and from the report. The browser's
   profile lives in a temporary folder (the container's tmpfs, or the run's `tmp` folder, which
