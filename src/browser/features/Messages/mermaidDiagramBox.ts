@@ -36,6 +36,7 @@ function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
   const { containerWidth, userZoom } = frame;
   // A wide diagram keeps its measured width here and pans inside its frame.
   if (containerWidth > 0 && containerWidth < NARROW_DIAGRAM_WIDTH) return userZoom;
+  // mutation-equivalent: a width in (0, 1] is narrow and returned above, so here it is 0 or 640+
   const fitsWidth = containerWidth > 0 ? containerWidth / measured.width : 1;
   return Math.min(1, INLINE_MAX_HEIGHT / measured.height, fitsWidth) * userZoom;
 }

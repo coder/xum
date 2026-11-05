@@ -388,6 +388,29 @@ describe("Mermaid layout stability", () => {
     });
   });
 
+  test("the zoom buttons stop at 50% and 300%", async () => {
+    const view = renderMermaid();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    const zoomOut = view.getByRole("button", { name: "−" });
+    const zoomIn = view.getByRole("button", { name: "+" });
+    const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+    const natural = viewBoxOf(container);
+
+    for (let step = 0; step < 5; step++) fireEvent.click(zoomOut);
+    await waitFor(() =>
+      expect(boxOf(container).width).toBe(`${Math.round(natural.width * 0.5)}px`)
+    );
+    expect((zoomOut as HTMLButtonElement).disabled).toBe(true);
+    expect((zoomIn as HTMLButtonElement).disabled).toBe(false);
+
+    for (let step = 0; step < 25; step++) fireEvent.click(zoomIn);
+    await waitFor(() => expect(boxOf(container).width).toBe(`${natural.width * 3}px`));
+    expect((zoomIn as HTMLButtonElement).disabled).toBe(true);
+    expect((zoomOut as HTMLButtonElement).disabled).toBe(false);
+  });
+
   test("the diagram's svg carries no inline size of its own", async () => {
     const view = renderMermaid();
     await waitFor(() =>
@@ -401,20 +424,42 @@ describe("Mermaid layout stability", () => {
     );
   });
 
-  test("shows a render error when Pele reports no usable size", async () => {
+  test.each([{ width: 0 }, { height: 0 }, { width: Number.NaN }, { height: Infinity }])(
+    "shows a render error when Pele reports the size %o",
+    async (badSize) => {
+      const real = PeleModule.render;
+      const peleRender = spyOn(PeleModule, "render").mockImplementation((chart, options) => ({
+        ...real(chart, options),
+        ...badSize,
+      }));
+      try {
+        const view = renderMermaid();
+        await waitFor(() =>
+          expect(view.container.textContent).toContain(
+            "Mermaid Error: Diagram renderer returned an invalid size"
+          )
+        );
+        expect(view.container.querySelector("svg")).toBeNull();
+      } finally {
+        peleRender.mockRestore();
+      }
+    }
+  );
+
+  test("draws a diagram that Pele measures at one pixel", async () => {
     const real = PeleModule.render;
     const peleRender = spyOn(PeleModule, "render").mockImplementation((chart, options) => ({
       ...real(chart, options),
-      width: 0,
+      width: 1,
+      height: 1,
     }));
     try {
       const view = renderMermaid();
-      await waitFor(() =>
-        expect(view.container.textContent).toContain(
-          "Mermaid Error: Diagram renderer returned an invalid size"
-        )
-      );
-      expect(view.container.querySelector("svg")).toBeNull();
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+      expect(boxOf(view.container.querySelector(".mermaid-container"))).toEqual({
+        width: "1px",
+        height: "1px",
+      });
     } finally {
       peleRender.mockRestore();
     }
@@ -486,6 +531,24 @@ describe("Mermaid layout stability", () => {
         callback([entry as unknown as ResizeObserverEntry], {} as ResizeObserver);
       }
     }
+
+    test("Pele lays the diagram out at the container's measured width, if it has one", async () => {
+      const peleRender = spyOn(PeleModule, "render");
+      try {
+        const view = renderMermaid({ chart: WIDE_CHART });
+        const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+        await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+        const maxWidthOfLastRender = () => peleRender.mock.calls.at(-1)?.[1]?.maxWidth;
+        expect(maxWidthOfLastRender()).toBeUndefined();
+
+        act(() => resizeContainer(1));
+        await waitFor(() => expect(maxWidthOfLastRender()).toBe(1));
+        act(() => resizeContainer(326));
+        await waitFor(() => expect(maxWidthOfLastRender()).toBe(326));
+      } finally {
+        peleRender.mockRestore();
+      }
+    });
 
     test("an unmeasured container renders the diagram's natural layout", async () => {
       const view = renderMermaid({ chart: WIDE_CHART });

@@ -56,6 +56,13 @@ describe("diagramPixelSize inline", () => {
     });
   });
 
+  test("a container of one pixel is narrow", () => {
+    expect(diagramPixelSize({ width: 2048, height: 1374 }, inline(1))).toEqual({
+      width: 2048,
+      height: 1374,
+    });
+  });
+
   test("a container at the narrow breakpoint is not narrow", () => {
     expect(diagramPixelSize({ width: 2048, height: 1374 }, inline(NARROW_DIAGRAM_WIDTH))).toEqual({
       width: 447,
@@ -100,6 +107,10 @@ describe("diagramPixelSize dialog", () => {
 });
 
 describe("diagramPixelSize input", () => {
+  test("accepts the smallest whole-pixel measured size", () => {
+    expect(diagramPixelSize({ width: 1, height: 1 }, inline(900))).toEqual({ width: 1, height: 1 });
+  });
+
   test.each([
     { width: 0, height: 100 },
     { width: 100, height: 0 },

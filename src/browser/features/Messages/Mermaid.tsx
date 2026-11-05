@@ -675,6 +675,7 @@ function diagramBoxStyle(diagram: RenderedDiagram | null, frame: DiagramFrame): 
 function useDiagramSvg(chart: string, idPrefix: string) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Zero width (hidden, or not laid out yet) means unknown: render the natural layout.
+  // mutation-equivalent: the width is a number when measured, so ?? and || both give 0 otherwise
   const containerWidth = useResizeObserver(containerRef)?.width ?? 0;
   const maxWidth = containerWidth > 0 ? containerWidth : undefined;
   // Keep the source and SVG together while a newer chart is pending or invalid.
