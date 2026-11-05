@@ -9,6 +9,7 @@ import { MOBILE_TOUCH_TARGET_PX, TABLET_TOUCH_TARGET_PX } from "../src/constants
 // Playwright. All other stories run exactly as before.
 const HOVER_STORY_PREFIX = "app-primarybuttoncontrast--";
 const hoverReady = new WeakSet<object>();
+const paintBridgeReady = new WeakSet<object>();
 // The Narrow story's strip scrolls up to 669 px, and the shortest swipe seen moved it 56 px:
 // 16 swipes cover it with room to spare.
 const MAX_TOUCH_SWIPES = 16;
@@ -489,105 +490,123 @@ async function assertSheetTouchTargets(page: StoryPage) {
 }
 
 const WEBKIT_TAG = "webkit";
-// Room for a few lines of text under a frame. A diagram that escapes its frame paints over it.
-const PAINT_STRIP_PX = 120;
-const MIN_PAINT_STRIP_PX = 8;
+const MIN_PAINT_STRIP_PX = 4;
+// The diagrams in the page, not the copy in the expand dialog.
+const PAGE_DIAGRAMS = ".mermaid-container:not(.mermaid-modal) > svg";
+
+interface Box {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
 
 interface PaintStrip {
   name: string;
   clip: { x: number; y: number; width: number; height: number };
 }
 
-/**
- * The frame around each diagram that sits in the page (not the expand dialog) and the room the
- * viewport has below and to the right of it. A strip that would fall outside the viewport is
- * dropped: the caller grows the viewport first.
- */
-async function mermaidFrameStrips(page: StoryPage): Promise<PaintStrip[]> {
-  const viewport = page.viewportSize();
-  assert(viewport, "A paint check needs a page with a viewport");
-  const frames = await page.$$eval(".mermaid-container:not(.mermaid-modal)", (containers) =>
-    containers.map((container) => {
-      const { left, top, right, bottom } = container.parentElement!.getBoundingClientRect();
-      return { left, top, right, bottom };
+/** Where each diagram in the page may paint: its own box, inside the container that clips it. */
+async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
+  const boxes = await page.$$eval(PAGE_DIAGRAMS, (diagrams) =>
+    diagrams.map((diagram) => {
+      const own = diagram.getBoundingClientRect();
+      const container = diagram.parentElement!;
+      const clip = container.getBoundingClientRect();
+      const left = Math.max(own.left, clip.left + container.clientLeft);
+      const top = Math.max(own.top, clip.top + container.clientTop);
+      const right = Math.min(own.right, clip.left + container.clientLeft + container.clientWidth);
+      const bottom = Math.min(own.bottom, clip.top + container.clientTop + container.clientHeight);
+      return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
     })
   );
-  assert(frames.length > 0, "A story tagged webkit must render a Mermaid diagram to paint-check");
-  return frames.flatMap((frame, index) => {
-    // One pixel clear of the frame, so its own antialiased edge is never in the strip.
-    const x = Math.ceil(frame.right) + 1;
-    const y = Math.ceil(frame.bottom) + 1;
-    const below = {
-      name: `below frame ${index}`,
-      clip: {
-        x: Math.max(0, Math.floor(frame.left)),
-        y,
-        width:
-          Math.min(viewport.width, Math.ceil(frame.right)) - Math.max(0, Math.floor(frame.left)),
-        height: Math.min(PAINT_STRIP_PX, viewport.height - y),
-      },
-    };
-    const right = {
-      name: `right of frame ${index}`,
+  assert(boxes.length > 0, "A story tagged webkit must render a Mermaid diagram to paint-check");
+  return boxes;
+}
+
+/**
+ * The four rectangles of the viewport around a box, one pixel clear of it so the box's own
+ * antialiased edge is never in a strip. The strip below comes first: it is where the text a
+ * diagram paints over sits, and the first screenshot WebKit takes is the one that shows a stale
+ * layout (a later one lays the page out again).
+ */
+function stripsAround(box: Box, viewport: { width: number; height: number }): PaintStrip[] {
+  const left = Math.floor(box.left) - 1;
+  const top = Math.floor(box.top) - 1;
+  const right = Math.ceil(box.right) + 1;
+  const bottom = Math.ceil(box.bottom) + 1;
+  const strip = (name: string, x0: number, y0: number, x1: number, y1: number): PaintStrip => {
+    const x = Math.max(0, x0);
+    const y = Math.max(0, y0);
+    return {
+      name,
       clip: {
         x,
-        y: Math.max(0, Math.floor(frame.top)),
-        width: viewport.width - x,
-        height:
-          Math.min(Math.ceil(frame.bottom), viewport.height) - Math.max(0, Math.floor(frame.top)),
+        y,
+        width: Math.min(viewport.width, x1) - x,
+        height: Math.min(viewport.height, y1) - y,
       },
     };
-    return [below, right].filter(
-      ({ clip }) => clip.width >= MIN_PAINT_STRIP_PX && clip.height >= MIN_PAINT_STRIP_PX
-    );
-  });
+  };
+  return [
+    strip("below", 0, bottom, viewport.width, viewport.height),
+    strip("right of", right, top, viewport.width, bottom),
+    strip("left of", 0, top, left, bottom),
+    strip("above", 0, 0, viewport.width, top),
+  ].filter(({ clip }) => clip.width >= MIN_PAINT_STRIP_PX && clip.height >= MIN_PAINT_STRIP_PX);
 }
 
 async function screenshotStrips(page: StoryPage, strips: PaintStrip[]) {
-  return Promise.all(strips.map(({ clip }) => page.screenshot({ clip })));
+  const shots: Buffer[] = [];
+  for (const { clip } of strips)
+    shots.push(await page.screenshot({ clip, animations: "disabled" }));
+  return shots;
+}
+
+function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
+  return page.$$eval(
+    PAGE_DIAGRAMS,
+    (diagrams, [target, hide]) => {
+      // Opacity, because a child can set visibility: visible inside a hidden parent.
+      (diagrams[target as number] as SVGElement).style.opacity = hide ? "0" : "";
+    },
+    [index, hidden]
+  );
 }
 
 /**
- * An engine can lay a diagram out in one box and paint it in another (iPhone Safari painted a
- * state diagram over the paragraphs below its frame), and a play reads layout boxes only. So
- * compare pixels: below and beside each frame, the page must look the same with every diagram
- * in the page hidden as with it shown.
+ * An engine can lay a diagram out in one box and paint it in another. iPhone Safari painted a
+ * state diagram over the paragraphs below its frame. A play reads layout boxes only, so compare
+ * pixels: outside the box a diagram is laid out in, and outside the container that clips it,
+ * the page must look the same with that diagram hidden as with it shown. The page does not
+ * scroll, so only what fits the viewport is compared, and the viewport is left alone: resizing
+ * it makes WebKit lay the page out again, which hides the very state this check looks for.
  */
-async function assertNoDiagramInkOutsideFrames(page: StoryPage) {
+async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   const viewport = page.viewportSize();
   assert(viewport, "A paint check needs a page with a viewport");
-  try {
-    // The page does not scroll, so a frame taller than the viewport needs a taller viewport.
-    const frames = await page.$$eval(".mermaid-container:not(.mermaid-modal)", (containers) =>
-      containers.map((container) => container.parentElement!.getBoundingClientRect().bottom)
-    );
-    const height = Math.ceil(
-      Math.max(viewport.height, ...frames.map((bottom) => bottom + PAINT_STRIP_PX + 2))
-    );
-    await page.setViewportSize({ width: viewport.width, height });
-    await page.evaluate(
-      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-    );
-    const strips = await mermaidFrameStrips(page);
+  // A hovered button shows a tooltip, which fades in and out between two screenshots.
+  await page.mouse.move(0, 0);
+  await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
+    timeout: 5000,
+  });
+  const painted: string[] = [];
+  for (const [index, box] of (await diagramPaintBoxes(page)).entries()) {
+    const strips = stripsAround(box, viewport);
     const shown = await screenshotStrips(page, strips);
-    const hide = await page.addStyleTag({
-      content: ".mermaid-container:not(.mermaid-modal) svg { visibility: hidden !important; }",
-    });
+    await setDiagramHidden(page, index, true);
     let hidden: Buffer[];
     try {
       hidden = await screenshotStrips(page, strips);
     } finally {
-      await hide.evaluate((style) => style.remove());
+      await setDiagramHidden(page, index, false);
     }
-    const painted = strips.filter((_, index) => !shown[index].equals(hidden[index]));
-    assert.equal(
-      painted.map(({ name, clip }) => `${name} at ${JSON.stringify(clip)}`).join("; "),
-      "",
-      "A diagram must not paint outside its frame"
-    );
-  } finally {
-    await page.setViewportSize(viewport);
+    for (const [i, strip] of strips.entries()) {
+      if (!shown[i].equals(hidden[i]))
+        painted.push(`diagram ${index} paints ${strip.name} its box`);
+    }
   }
+  assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");
 }
 
 // Stories that need a phone viewport for their play, as their globals.viewport gives them in
@@ -603,6 +622,15 @@ const viewportsToRestore = new WeakMap<object, { width: number; height: number }
 
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
+    // A play calls this right after a state change. WebKit can keep the page laid out for the old
+    // state, and paint it, until its next screenshot or resize, so postVisit alone sees a page
+    // that has repaired itself.
+    if (!paintBridgeReady.has(page)) {
+      paintBridgeReady.add(page);
+      await page.exposeFunction("__storybookAssertPaint", () =>
+        assertNoDiagramInkOutsideItsBox(page)
+      );
+    }
     const phoneViewport = PHONE_VIEWPORT_STORIES.get(context.id);
     if (phoneViewport) {
       const viewport = page.viewportSize();
@@ -623,9 +651,10 @@ const config: TestRunnerConfig = {
       viewportsToRestore.delete(page);
       await page.setViewportSize(restoreViewport);
     }
-    // A failed play already reports its own error, which this check would hide.
+    // A failed play already reports its own error, which this check would hide. A play can run it
+    // earlier too (see preVisit): this one covers every story tagged webkit at rest.
     if (!context.hasFailure && (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG)) {
-      await assertNoDiagramInkOutsideFrames(page);
+      await assertNoDiagramInkOutsideItsBox(page);
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {

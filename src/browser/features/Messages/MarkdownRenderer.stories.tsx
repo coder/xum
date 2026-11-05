@@ -283,6 +283,23 @@ function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): Diag
 /** The box and the zoom step are whole pixels, so they differ from the exact values by this much. */
 const PIXEL_TOLERANCE = 1.5;
 
+interface PaintHook {
+  __storybookAssertPaint?: () => Promise<void>;
+}
+
+/**
+ * Plays read layout boxes, and WebKit can lay a page out for the old state while it paints the
+ * new one. The test runner (.storybook/test-runner.ts) compares pixels outside each diagram's box
+ * with the diagram hidden, and a play calls it right after a state change.
+ */
+async function expectNoDiagramInkOutsideBox() {
+  const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
+  if (assertPaint) await assertPaint();
+  else if (navigator.userAgent.includes("StorybookTestRunner")) {
+    throw new Error("paint hook missing: .storybook/test-runner.ts did not register it");
+  }
+}
+
 /** The box is the drawing scaled by one factor, up to the rounding of each side to a pixel. */
 async function expectBoxKeepsDrawingProportions({ svg, drawing }: DiagramGeometry) {
   const lowestScale = Math.max(
@@ -328,6 +345,7 @@ async function waitForDiagram(
     },
     { timeout: 10_000 }
   );
+  await expectNoDiagramInkOutsideBox();
   return measureDiagram(canvasElement);
 }
 
@@ -342,6 +360,7 @@ async function expectZoomResizesBox(canvasElement: HTMLElement) {
   const grown = measureDiagram(canvasElement);
   await expect(Math.abs(grown.svg.width - before.width * 1.1)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
   await expectDiagramInsideFrame(grown);
+  await expectNoDiagramInkOutsideBox();
 
   await userEvent.click(controls.getByRole("button", { name: "−" }));
   await waitFor(() =>
@@ -349,6 +368,7 @@ async function expectZoomResizesBox(canvasElement: HTMLElement) {
       PIXEL_TOLERANCE
     )
   );
+  await expectNoDiagramInkOutsideBox();
 }
 
 /** Zoom is shared by every diagram and persists, so each play starts and ends at 100%. */
