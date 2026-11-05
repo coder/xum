@@ -464,12 +464,20 @@ function buildUserDisplayedMessages(options: {
  * `trim()` alone is not enough: it leaves default-ignorables (U+200B zero-width space, U+2060
  * word joiner, U+FEFF) intact, and those paint nothing either, so the gap would survive. Same
  * class the plugin-text guard already recognizes (`agentPluginReviewText.ts`). NBSP is `\s` to
- * `trim`, and a combining mark with no base character is still invisible, so both count as empty.
+ * `trim`, so it needs no extra branch.
+ *
+ * Unicode MARKS are deliberately NOT in here. `\p{M}` looks like the invisible-without-a-base
+ * class, but it also covers spacing marks (`General_Category=Mc`, e.g. U+0903 DEVANAGARI SIGN
+ * VISARGA) and enclosing marks (Me), which are legitimate standalone output in linguistic or
+ * Unicode text; a predicate that swallowed them would silently delete a rendered row instead
+ * of an empty one. Attached marks are safe without any help from this predicate —
+ * `mergeAdjacentParts` above joins a mark to its base before a text part is ever tested, so
+ * the base carries the row.
  *
  * The provider request path drops whitespace-only parts too (`dropEmptyText` in
  * modelMessageTransform); the transcript must not render a gap the model never saw.
  */
-const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}\p{M}]*$/u;
+const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}]*$/u;
 
 function hasDisplayText(text: unknown): boolean {
   return typeof text === "string" && !NO_PAINTABLE_CONTENT.test(text);

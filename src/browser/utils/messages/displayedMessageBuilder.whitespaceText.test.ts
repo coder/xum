@@ -48,6 +48,31 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     }
   });
 
+  test("keeps a standalone mark that paints without a base character", () => {
+    // Spacing marks (Mc) and enclosing marks (Me) render on their own, and a
+    // message about Unicode is legitimate output, so the predicate must not
+    // classify all of \p{M} as unpaintable.
+    for (const mark of ["\u0903", "\u093e", "\u20e2"]) {
+      const displayed = rows([{ type: "text", text: mark }, FAILED_BASH]);
+      expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    }
+  });
+
+  test("does not orphan a mark that arrives in its own delta", () => {
+    // Adjacent text deltas merge before the predicate sees them, so the base
+    // character carries the mark's row instead of it becoming a row of its own.
+    const displayed = rows([
+      { type: "text", text: "e" },
+      { type: "text", text: "\u0301" },
+      FAILED_BASH,
+    ]);
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    // Concatenated, not normalized: the point is the single row, so the mark
+    // travels with its base instead of being judged on its own.
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe("e\u0301");
+  });
+
   test("keeps a text row that carries content", () => {
     const displayed = rows([{ type: "text", text: "Building now\n" }, FAILED_BASH]);
 
