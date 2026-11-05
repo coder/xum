@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { diagramPixelSize, NARROW_DIAGRAM_WIDTH, type DiagramFrame } from "./mermaidDiagramBox";
 
-function inline(containerWidth: number, zoom = 1): DiagramFrame {
-  return { kind: "inline", containerWidth, zoom };
+function inline(containerWidth: number, userZoom = 1): DiagramFrame {
+  return { kind: "inline", containerWidth, userZoom };
 }
 
 describe("diagramPixelSize inline", () => {

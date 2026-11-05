@@ -15,7 +15,7 @@ export interface RenderedDiagram {
 
 /** Where the diagram is drawn. An inline container width of 0 means unknown (not laid out yet). */
 export type DiagramFrame =
-  | { kind: "inline"; containerWidth: number; zoom: number }
+  | { kind: "inline"; containerWidth: number; userZoom: number }
   | { kind: "dialog"; viewportHeight: number };
 
 export interface DiagramBox {
@@ -33,11 +33,11 @@ function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
   if (frame.kind === "dialog") {
     return Math.min(1, (frame.viewportHeight * DIALOG_HEIGHT_FRACTION) / measured.height);
   }
-  const { containerWidth, zoom } = frame;
+  const { containerWidth, userZoom } = frame;
   // A wide diagram keeps its measured width here and pans inside its frame.
-  if (containerWidth > 0 && containerWidth < NARROW_DIAGRAM_WIDTH) return zoom;
+  if (containerWidth > 0 && containerWidth < NARROW_DIAGRAM_WIDTH) return userZoom;
   const fitsWidth = containerWidth > 0 ? containerWidth / measured.width : 1;
-  return Math.min(1, INLINE_MAX_HEIGHT / measured.height, fitsWidth) * zoom;
+  return Math.min(1, INLINE_MAX_HEIGHT / measured.height, fitsWidth) * userZoom;
 }
 
 /**

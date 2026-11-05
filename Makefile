@@ -143,7 +143,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config check-no-css-zoom typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
@@ -596,7 +596,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
 # ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
 # findings that a change surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config check-no-css-zoom lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -678,6 +678,14 @@ check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies
 	@node scripts/check-oxlint-config.mjs
 
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
+# CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
+# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
+check-no-css-zoom: ## Fail when renderer CSS or HTML declares the zoom property
+	@if grep -rnE --include='*.css' --include='*.html' '(^|[{;[:space:]])zoom[[:space:]]*:' src vscode/src *.html; then \
+		echo "Error: do not declare the CSS zoom property. Safari lays out a zoomed element differently from Chromium. Size the element with explicit pixels computed in code (src/browser/features/Messages/mermaidDiagramBox.ts)."; \
+		exit 1; \
+	fi
+
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
 	@bun test ./scripts/check-test-seam-comments.test.ts
 	@bun scripts/check-test-seam-comments.ts

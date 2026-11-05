@@ -1704,6 +1704,60 @@ const localPlugin = {
         };
       },
     },
+    "no-css-zoom": {
+      meta: {
+        type: "problem",
+        docs: {
+          description: "Disallow the CSS zoom property in renderer code",
+        },
+        messages: {
+          zoom: "Do not use `zoom` here. CSS zoom changes layout differently in Safari than in Chromium (iPhone Safari painted a diagram far outside its frame). Size the element with explicit pixels computed in code, as src/browser/features/Messages/mermaidDiagramBox.ts does. If this `zoom` is not a CSS property, rename it.",
+        },
+      },
+      create(context) {
+        // Any object key named zoom is reported, not only keys the rule can prove are styles: a
+        // style object can reach a component through a prop, a helper or a spread, and the
+        // rule cannot see those types. Rename a field that is not CSS.
+        const isZoom = (node, computed) =>
+          (node.type === "Identifier" && node.name === "zoom" && !computed) ||
+          (node.type === "Literal" && node.value === "zoom");
+        const isNamed = (node, name) =>
+          (node.type === "Identifier" && node.name === name) ||
+          (node.type === "Literal" && node.value === name);
+        const report = (node) => context.report({ node, messageId: "zoom" });
+        return {
+          // style={{ zoom: 2 }}, style={{ zoom }}, { "zoom": 2 } and { ["zoom"]: 2 }
+          Property(node) {
+            if (node.parent.type === "ObjectExpression" && isZoom(node.key, node.computed)) {
+              report(node.key);
+            }
+          },
+          // element.style.zoom = 2 and element.style["zoom"] = 2
+          MemberExpression(node) {
+            const owner = node.object;
+            if (
+              isZoom(node.property, node.computed) &&
+              owner.type === "MemberExpression" &&
+              isNamed(owner.property, "style")
+            ) {
+              report(node.property);
+            }
+          },
+          // element.style.setProperty("zoom", "2")
+          CallExpression(node) {
+            const callee = node.callee;
+            if (
+              callee.type === "MemberExpression" &&
+              isNamed(callee.property, "setProperty") &&
+              node.arguments[0]?.type === "Literal" &&
+              node.arguments[0].value === "zoom"
+            ) {
+              report(node.arguments[0]);
+            }
+          },
+        };
+      },
+    },
     "no-native-interactive-tooltips": {
       meta: {
         type: "problem",

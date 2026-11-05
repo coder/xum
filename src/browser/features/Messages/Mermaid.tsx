@@ -937,7 +937,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
             ...diagramBoxStyle(renderedDiagram, {
               kind: "inline",
               containerWidth,
-              zoom: diagramZoom,
+              userZoom: diagramZoom,
             }),
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
