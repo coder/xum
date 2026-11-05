@@ -556,7 +556,7 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null 
   const right = Math.ceil(box.right) + 1;
   const top = Math.floor(box.top) - 1;
   const bottom = Math.ceil(box.bottom) + 1;
-  let found: Box | null = null;
+  let [minX, minY, maxX, maxY] = [Infinity, Infinity, -1, -1];
   for (let y = 0; y < shown.height; y++) {
     for (let x = 0; x < shown.width; x++) {
       if (x >= left && x < right && y >= top && y < bottom) {
@@ -567,15 +567,15 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null 
       if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
         continue;
       }
-      found = {
-        left: Math.min(found?.left ?? x, x),
-        top: Math.min(found?.top ?? y, y),
-        right: Math.max(found?.right ?? x, x),
-        bottom: Math.max(found?.bottom ?? y, y),
-      };
+      [minX, minY, maxX, maxY] = [
+        Math.min(minX, x),
+        Math.min(minY, y),
+        Math.max(maxX, x),
+        Math.max(maxY, y),
+      ];
     }
   }
-  return found;
+  return maxX < 0 ? null : { left: minX, top: minY, right: maxX, bottom: maxY };
 }
 
 /**
