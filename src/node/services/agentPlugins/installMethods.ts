@@ -319,36 +319,44 @@ async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
   return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
 }
 
-/** The install methods that fit a staged tree (rule M1, see the module comment). */
-export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
-  // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
+/** The manifest files of the table that exist in the tree (an entry of any kind counts). */
+async function presentManifests(stagedDir: string): Promise<Set<string>> {
   const present = new Set<string>();
   for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
     if (await entryExists(stagedDir, spec.relative)) present.add(spec.relative);
   }
+  return present;
+}
+
+/**
+ * The manifest methods of the files that exist, in the table's order (the fixed order, so the
+ * first one is the method discovery loads). A schema-less root is never a method of its own
+ * (discovery rejects it): it counts only as the sole manifest, so that its validation error
+ * reaches the user.
+ */
+function manifestMethodKinds(present: Set<string>): SavedInstallMethod[] {
+  const kinds: SavedInstallMethod[] = [];
+  for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
+    if (spec.relative === PLUGIN_MANIFEST_RELATIVE_PATH) continue;
+    if (present.has(spec.relative) && !kinds.includes(spec.method)) kinds.push(spec.method);
+  }
+  if (kinds.length === 0 && present.has(PLUGIN_MANIFEST_RELATIVE_PATH)) kinds.push("agent-plugin");
+  return kinds;
+}
+
+/** The install methods that fit a staged tree (rule M1, see the module comment). */
+export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
+  const present = await presentManifests(stagedDir);
   const rootEntry = present.has(PLUGIN_MANIFEST_RELATIVE_PATH);
   const nativeRoot = rootEntry && !(await rootManifestIsSchemaLess(stagedDir));
-  const skillsRoots = await findSkillsPackageRoots(stagedDir);
   const schemaLessRoot = rootEntry && !nativeRoot;
-  if (nativeRoot) {
-    return { methods: [{ kind: "agent-plugin" }], skillsRoots, nativeRoot, schemaLessRoot };
-  }
-  // The table's order is the fixed order, so the first method is the one discovery loads.
-  const manifestKinds: SavedInstallMethod[] = [];
-  for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
-    // A schema-less root is never a method of its own (discovery rejects it); it counts below
-    // only when it is the sole manifest, so that its validation error reaches the user.
-    if (spec.relative === PLUGIN_MANIFEST_RELATIVE_PATH) continue;
-    if (present.has(spec.relative) && !manifestKinds.includes(spec.method)) {
-      manifestKinds.push(spec.method);
-    }
-  }
-  if (manifestKinds.length === 0 && rootEntry) manifestKinds.push("agent-plugin");
-  const methods: AgentPluginInstallMethod[] = manifestKinds.map((kind) => ({ kind }));
+  const skillsRoots = await findSkillsPackageRoots(stagedDir);
+  const methods: AgentPluginInstallMethod[] = nativeRoot
+    ? [{ kind: "agent-plugin" }]
+    : manifestMethodKinds(present).map((kind) => ({ kind }));
   // A root entry or a Codex manifest blocks the generated plugin.json (Xum never shadows them).
-  if (!rootEntry && !present.has(CODEX_PLUGIN_MANIFEST_RELATIVE_PATH) && skillsRoots.length > 0) {
-    methods.push({ kind: "skills" });
-  }
+  const blocked = rootEntry || present.has(CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+  if (!nativeRoot && !blocked && skillsRoots.length > 0) methods.push({ kind: "skills" });
   return { methods, skillsRoots, nativeRoot, schemaLessRoot };
 }
 
@@ -664,12 +672,7 @@ export interface StagedMethodChoice {
  * is applied: the plugin stays on its commit and keeps tracking its branch. The update review
  * shows the message with a "Remove plugin" button.
  */
-export class UpdateRefusedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "UpdateRefusedError";
-  }
-}
+export class UpdateRefusedError extends Error {}
 
 function sentence(text: string): string {
   return /[.!?]$/.test(text) ? text : `${text}.`;
@@ -739,6 +742,32 @@ function candidateMethods(
 }
 
 /**
+ * The error when no method is chosen. An install with a saved method gets its refusal (R3), also
+ * when nothing fits at all; one without gets the refusal of an update that only fits `skills`,
+ * the problem of a manifest that failed validation, or the message that names every format.
+ */
+function noMethodError(
+  checked: CheckedInstallMethods,
+  fitting: AgentPluginInstallMethod[],
+  request: InstallMethodRequest,
+  subpath: string | undefined
+): Error {
+  const saved = request.mode === "update" ? request.saved : undefined;
+  if (saved !== undefined)
+    return updateRefusal(savedMethodMisfit(saved, checked, subpath), fitting);
+  if (request.mode === "update" && checked.methods.length > 0) {
+    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
+    // into a generated skills install on update (InstallMethodRequest).
+    return updateRefusal(
+      "The repository no longer has the manifest this plugin was installed from.",
+      fitting
+    );
+  }
+  if (checked.rejected.length > 0) return new Error(checked.rejected[0].problem);
+  return new Error(noInstallMethodMessage(subpath));
+}
+
+/**
  * Choose the method of a staged tree (`marketplace`: the tree is that entry's folder). Throws
  * the message that names every format Xum looked for when none fits, the problem of a method that
  * failed validation when it is the one asked for, and an UpdateRefusedError when an update does
@@ -759,23 +788,8 @@ export async function chooseStagedMethod(
     return { method, methods, warnings, skillsCliSkills: [] };
   }
   const fitting = checked.methods.filter((method) => !hasProblem(checked, method));
-  const saved = request.mode === "update" ? request.saved : undefined;
   const method = chooseInstallMethod(candidateMethods(checked, fitting, request), request);
-  if (method === undefined) {
-    if (saved !== undefined) {
-      throw updateRefusal(savedMethodMisfit(saved, checked, source.subpath), fitting);
-    }
-    if (request.mode === "update" && checked.methods.length > 0) {
-      // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
-      // into a generated skills install on update (InstallMethodRequest).
-      throw updateRefusal(
-        "The repository no longer has the manifest this plugin was installed from.",
-        fitting
-      );
-    }
-    if (checked.rejected.length > 0) throw new Error(checked.rejected[0].problem);
-    throw new Error(noInstallMethodMessage(source.subpath));
-  }
+  if (method === undefined) throw noMethodError(checked, fitting, request, source.subpath);
   const problem = checked.rejected.find((entry) =>
     sameInstallMethod(entry.method, method)
   )?.problem;

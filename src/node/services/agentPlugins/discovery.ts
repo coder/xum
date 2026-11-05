@@ -1585,6 +1585,28 @@ export function missingMethodManifestMessage(
 }
 
 /**
+ * A plugin that was installed through a manifest that is not in the folder is gone, and the error
+ * says which file (B2). The fixed order stays silent: a folder with no manifest is not a plugin.
+ */
+function reportMissingMethodManifest(
+  choice: ManifestChoice,
+  rootReal: string,
+  shownRoot: string | undefined,
+  pushError: (targetPath: string, message: string) => void
+): void {
+  if (choice.kind !== "method") return;
+  const [first] = manifestSpecsFor(choice);
+  pushError(
+    path.join(rootReal, first.relative),
+    missingMethodManifestMessage(choice.method, shownRoot)
+  );
+}
+
+function installMethodField(choice: ManifestChoice): { installMethod?: SavedInstallMethod } {
+  return choice.kind === "method" ? { installMethod: choice.method } : {};
+}
+
+/**
  * Pick the manifest of a plugin folder: the first file of the choice's table entries that exists.
  * Each one goes through the same caps and containment. Null when none exists.
  *
@@ -1659,15 +1681,7 @@ async function discoverPluginAt(args: {
 
   const selected = await selectManifest(rootReal, args.shownRoot, choice);
   if (selected === null) {
-    if (choice.kind === "method") {
-      // The plugin was installed through a manifest that is not in the folder: the plugin is
-      // gone, and the error says which file (B2). The fixed order stays silent below.
-      const [first] = manifestSpecsFor(choice);
-      pushError(
-        path.join(rootReal, first.relative),
-        missingMethodManifestMessage(choice.method, args.shownRoot)
-      );
-    }
+    reportMissingMethodManifest(choice, rootReal, args.shownRoot, pushError);
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
@@ -1816,7 +1830,7 @@ async function discoverPluginAt(args: {
     containerPath: args.containerPath,
     dirName: args.dirName,
     manifest,
-    ...(choice.kind === "method" ? { installMethod: choice.method } : {}),
+    ...installMethodField(choice),
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
@@ -2061,6 +2075,14 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
  * plugins also get their reviewed fingerprints (#6498): an install without records gets empty
  * ones, so nothing of it loads until reviewed.
  */
+/** The choice of a container entry: the method its registry row saved, else the fixed order. */
+function managedManifestChoice(
+  imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
+  entryName: string
+): ManifestChoice {
+  return manifestChoiceFor(imports?.methodByName.get(entryName));
+}
+
 function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
@@ -2384,7 +2406,7 @@ export async function discoverAgentPlugins(
           diagnostics,
           // A managed plugin loads the manifest its install saved (B2); anything else, and a
           // registry that cannot be read, read the fixed order.
-          choice: manifestChoiceFor(snapshot.imports?.methodByName.get(entryName)),
+          choice: managedManifestChoice(snapshot.imports, entryName),
         });
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {

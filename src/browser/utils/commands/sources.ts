@@ -35,7 +35,10 @@ import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppC
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { stopStream } from "@/browser/utils/stopStream";
-import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import {
+  publishPluginsSectionIntent,
+  updateNeedsReview,
+} from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import {
   openArtifactsTab,
   pinAndOpenArtifact,
@@ -2738,7 +2741,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               return;
             }
             // A refused update has no changes: the section shows its message and Remove plugin.
-            if (preview.data.refused !== undefined || preview.data.changes.length > 0) {
+            if (updateNeedsReview(preview.data)) {
               publishPluginsSectionIntent({ type: "review-update", review: preview.data });
               openSettings("plugins");
               return;

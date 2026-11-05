@@ -42,6 +42,7 @@ import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations
 import {
   consumePendingPluginsSectionIntent,
   subscribePluginsSectionIntents,
+  updateNeedsReview,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
 import {
@@ -1435,6 +1436,34 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
+/** The update review of a plugin, or the refusal of its update (B5) with a way to remove it. */
+const UpdateReviewOrRefusal: React.FC<{
+  review: AgentPluginUpdateReview;
+  selective: boolean;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRemove: () => void;
+}> = (props) =>
+  props.review.refused !== undefined ? (
+    <UpdateRefusedPanel
+      review={props.review}
+      message={props.review.refused}
+      busy={props.busy}
+      onRemove={props.onRemove}
+      onClose={props.onCancel}
+    />
+  ) : (
+    <UpdateReviewPanel
+      review={props.review}
+      mode="update"
+      selective={props.selective}
+      busy={props.busy}
+      onConfirm={props.onConfirm}
+      onCancel={props.onCancel}
+    />
+  );
+
 /** How often the section re-lists while a pending sign-out record shows (the backend retries every 30 s). */
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
 
@@ -1902,7 +1931,7 @@ export const PluginsSettingsSection: React.FC = () => {
         return;
       }
       // A refused update has no changes either: it shows its message, never an apply.
-      if (preview.data.refused !== undefined || preview.data.changes.length > 0) {
+      if (updateNeedsReview(preview.data)) {
         setUpdateReview(preview.data);
         return;
       }
@@ -2222,29 +2251,19 @@ export const PluginsSettingsSection: React.FC = () => {
                       onClose={() => setHooksTarget(null)}
                     />
                   )}
-                  {item.managed &&
-                    updateReview?.name === item.name &&
-                    (updateReview.refused !== undefined ? (
-                      <UpdateRefusedPanel
-                        review={updateReview}
-                        message={updateReview.refused}
-                        busy={isBusy}
-                        onRemove={() => {
-                          setUpdateReview(null);
-                          setUninstallTarget(item.name);
-                        }}
-                        onClose={() => setUpdateReview(null)}
-                      />
-                    ) : (
-                      <UpdateReviewPanel
-                        review={updateReview}
-                        mode="update"
-                        selective={item.importedComponents !== undefined}
-                        busy={isBusy}
-                        onConfirm={() => void handleConfirmUpdate(updateReview)}
-                        onCancel={() => setUpdateReview(null)}
-                      />
-                    ))}
+                  {item.managed && updateReview?.name === item.name && (
+                    <UpdateReviewOrRefusal
+                      review={updateReview}
+                      selective={item.importedComponents !== undefined}
+                      busy={isBusy}
+                      onConfirm={() => void handleConfirmUpdate(updateReview)}
+                      onCancel={() => setUpdateReview(null)}
+                      onRemove={() => {
+                        setUpdateReview(null);
+                        setUninstallTarget(item.name);
+                      }}
+                    />
+                  )}
                   <ComponentReviewRow
                     item={item}
                     review={componentReview.review}

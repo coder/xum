@@ -1889,6 +1889,14 @@ function shownStagedRoot(
   return marketplace === undefined ? source.subpath : undefined;
 }
 
+/** The registry row of an install: the entry, plus its saved install method (B3) when it has one. */
+function registryRow(
+  entry: AgentPluginInstallEntry,
+  installMethod: SavedInstallMethod | undefined
+): AgentPluginInstallEntry & { installMethod?: SavedInstallMethod } {
+  return installMethod !== undefined ? { ...entry, installMethod } : entry;
+}
+
 /** One staged manifest read: its plugin and the diagnostics discovery gave. */
 interface Discovered {
   plugin: AgentPluginInfo;
@@ -4227,7 +4235,7 @@ export class AgentPluginInstallService {
           const { envelope, rawEntries } = await this.readRegistryDocument("strict");
           await this.writeRegistry(envelope, [
             ...rawEntries.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
-            installMethod !== undefined ? { ...entry, installMethod } : entry,
+            registryRow(entry, installMethod),
           ]);
         } catch (error) {
           // No partial state: a promote without a registry entry would look
