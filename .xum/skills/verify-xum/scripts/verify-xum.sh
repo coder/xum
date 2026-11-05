@@ -796,18 +796,21 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
 }
 
 # True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8),
-# or a raw byte 0x80-0x9F that is not part of a UTF-8 sequence (a terminal that is not in UTF-8 mode
-# reads 0x9B as CSI). Docker echoes a mount path in some errors, and a control character in it could
-# drive your terminal.
+# or is not well-formed UTF-8. Docker echoes a mount path in some errors, and a control character in
+# it could drive your terminal.
 has_control_char() { # has_control_char <string>
   local LC_ALL=C text=$1 cont=[$'\x80'-$'\xbf']
   [[ $text == *[[:cntrl:]]* || $text == *$'\xc2'[$'\x80'-$'\x9f']* ]] && return 0
-  # Each valid sequence becomes an ASCII "x", so its neighbours cannot join into a new sequence.
-  # Overlong forms and surrogates pass: only the 0x80-0x9F bytes that remain matter here.
+  # Each well-formed sequence (RFC 3629: no overlong form, no surrogate, nothing above U+10FFFF)
+  # becomes an ASCII "x", so its neighbours cannot join into a new sequence. A byte left is malformed.
   text=${text//[$'\xc2'-$'\xdf']$cont/x}
-  text=${text//[$'\xe0'-$'\xef']$cont$cont/x}
-  text=${text//[$'\xf0'-$'\xf4']$cont$cont$cont/x}
-  [[ $text == *[$'\x80'-$'\x9f']* ]]
+  text=${text//$'\xe0'[$'\xa0'-$'\xbf']$cont/x}
+  text=${text//[$'\xe1'-$'\xec'$'\xee'$'\xef']$cont$cont/x}
+  text=${text//$'\xed'[$'\x80'-$'\x9f']$cont/x}
+  text=${text//$'\xf0'[$'\x90'-$'\xbf']$cont$cont/x}
+  text=${text//[$'\xf1'-$'\xf3']$cont$cont$cont/x}
+  text=${text//$'\xf4'[$'\x80'-$'\x8f']$cont$cont/x}
+  [[ $text == *[$'\x80'-$'\xff']* ]]
 }
 
 # The helper in the pinned image. Trust boundary: --network host lets the container reach every

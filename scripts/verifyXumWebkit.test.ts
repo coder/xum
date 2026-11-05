@@ -275,12 +275,12 @@ describe("webkit-capture.mjs", () => {
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
   });
 
-  test("reaches the terminal in one place, say(), and nothing else writes to stdout or stderr", () => {
-    // fail() goes through say(). Any other way out (console.*, process.stdout.write, fs.writeSync(2, ...))
-    // would skip safe(). Comments are dropped first: the header names stdout and stderr.
+  test("no writer other than say() reaches stdout or stderr: console, process.std*, fs writes to fd 1 or 2", () => {
+    // fail() goes through say(). Any other way out would skip safe(). Comments are dropped first
+    // (the header names stdout and stderr). The lookbehind skips "console" inside a string.
     const code = fs.readFileSync(HELPER, "utf8").replace(/^\s*\/\/.*$/gm, "");
     const sinks =
-      /\bconsole\s*[.[]|\bstd(?:out|err)\b|\bwriteSync\b|\bwriteFileSync\s*\(\s*[12]\b|\/dev\/(?:std|fd)/g;
+      /(?<![\w$"'`])console\b|\bstd(?:out|err)\b|\bwriteSync\b|\b(?:write|writeFile|writeFileSync|appendFile|appendFileSync)\s*\(\s*[12]\b|\/dev\/(?:std|fd|tty)/g;
     const sayBody = /\nfunction say\(message\) \{[\s\S]*?\n\}\n/.exec(code)?.[0] ?? "";
     expect(sayBody).toContain("process.stderr.write(");
     expect(code.match(sinks)).toEqual(["stderr"]);
@@ -454,15 +454,15 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     return root;
   };
 
-  const quoteBytes = (bytes: Uint8Array) =>
-    `$'${[...bytes]
+  // bash $'...' quoting of the raw UTF-8 bytes, so that a value keeps its control characters.
+  const quote = (value: string) =>
+    `$'${[...Buffer.from(value, "utf8")]
       .map((byte) =>
         byte < 0x20 || byte > 0x7e || byte === 0x5c || byte === 0x27
           ? `\\x${byte.toString(16).padStart(2, "0")}`
           : String.fromCharCode(byte)
       )
       .join("")}'`;
-  const quote = (value: string) => quoteBytes(Buffer.from(value, "utf8"));
 
   /**
    * Runs the script's argument checks. They run before it reads a run, so no sandbox is needed:
@@ -572,7 +572,7 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     expect(controlCharacters(result.stderr)).toEqual([]);
   });
 
-  test("refuses a path with a lone raw 0x9B byte, which a terminal outside UTF-8 mode reads as CSI", () => {
+  test("refuses a path with a lone raw 0x9B byte", () => {
     const root = newRoot();
     const { repo, script } = scratchCheckout(root, "repo");
     // The byte cannot go through a JS string argument, which node encodes as UTF-8: bash builds it.
@@ -591,25 +591,47 @@ describe("verify-xum.sh webkit-capture arguments", () => {
 
   describe("has_control_char", () => {
     const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(scriptSource)?.[0];
-    const refuses = (...bytes: number[]) => {
+    // Each string goes to bash on stdin, split at NUL. The function sets its own locale, so the
+    // caller's must make no difference. A locale that the host lacks falls back to C.
+    const refusals = (cases: number[][]) => {
       expect(body, "has_control_char is not in verify-xum.sh").toBeDefined();
-      const result = spawnSync("bash", [
-        "-c",
-        `${body}\nhas_control_char ${quoteBytes(Buffer.from([0x2f, ...bytes, 0x78]))}`,
-      ]);
-      expect(result.status, strictUtf8(result.stderr)).toBeOneOf([0, 1]);
-      return result.status === 0;
+      const input = Buffer.concat(cases.flatMap((bytes) => [Buffer.from(bytes), Buffer.from([0])]));
+      const loop = `while IFS= read -r -d '' s; do if has_control_char "$s"; then echo 1; else echo 0; fi; done`;
+      const [inC, ...others] = ["C", "C.UTF-8", "en_US.UTF-8"].map((locale) => {
+        const result = spawnSync("bash", ["-c", `${body}\n${loop}`], {
+          input,
+          env: { PATH: process.env.PATH ?? "", LC_ALL: locale },
+          maxBuffer: 1 << 24,
+        });
+        expect(result.status, strictUtf8(result.stderr)).toBe(0);
+        return result.stdout
+          .toString("utf8")
+          .trim()
+          .split("\n")
+          .map((line) => line === "1");
+      });
+      for (const inLocale of others) expect(inLocale).toEqual(inC);
+      return inC;
     };
+    const refuses = (...bytes: number[]) => refusals([bytes])[0];
 
     test.each([
       ["a lone raw 0x9B", [0x9b]],
       ["a lone raw 0x90 (DCS)", [0x90]],
       ["a lone raw 0x9D (OSC)", [0x9d]],
+      ["a lone raw 0xA0, which is not UTF-8", [0xa0]],
       ["a raw 0x9B after a complete two-byte character", [0xc3, 0xa9, 0x9b]],
       [
-        "a raw 0x9B after the start of a three-byte character that another character cut short",
+        "a raw 0x9B after a three-byte character that another character cut short",
         [0xe2, 0xc3, 0x9b, 0x82, 0x9b],
       ],
+      ["an overlong CSI, E0 82 9B", [0xe0, 0x82, 0x9b]],
+      ["an overlong ESC, E0 80 9B", [0xe0, 0x80, 0x9b]],
+      ["a surrogate, ED A0 9B", [0xed, 0xa0, 0x9b]],
+      ["an overlong four-byte form, F0 80 82 9B", [0xf0, 0x80, 0x82, 0x9b]],
+      ["a surrogate with no byte in 0x80-0x9F, ED BF BF", [0xed, 0xbf, 0xbf]],
+      ["an overlong form with no byte in 0x80-0x9F, C1 BF", [0xc1, 0xbf]],
+      ["a value above U+10FFFF, F4 90 80 80", [0xf4, 0x90, 0x80, 0x80]],
       ["a C1 CSI encoded in UTF-8", [0xc2, 0x9b]],
       ["ESC", [0x1b]],
       ["DEL", [0x7f]],
@@ -618,14 +640,50 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     });
 
     test.each([
-      ["a two-byte character whose second byte is 0x9B", [0xc3, 0x9b]],
-      ["a three-byte character whose last byte is 0x9B", [0xe2, 0x82, 0x9b]],
-      ["a four-byte character whose last byte is 0x9B", [0xf0, 0x9f, 0x98, 0x9b]],
-      ["a lone raw 0xA0, which is no control character", [0xa0]],
+      ["e with an acute accent", [0xc3, 0xa9]],
+      ["the euro sign", [0xe2, 0x82, 0xac]],
+      ["U+00DB, whose second byte is 0x9B", [0xc3, 0x9b]],
+      ["U+209B, whose last byte is 0x9B", [0xe2, 0x82, 0x9b]],
+      ["an emoji whose last byte is 0x9B", [0xf0, 0x9f, 0x98, 0x9b]],
+      ["U+00A0", [0xc2, 0xa0]],
+      ["U+0800, the first three-byte character", [0xe0, 0xa0, 0x80]],
+      ["U+D7FF, the last character before the surrogates", [0xed, 0x9f, 0xbf]],
+      ["U+E000, the first character after the surrogates", [0xee, 0x80, 0x80]],
+      ["U+10000, the first four-byte character", [0xf0, 0x90, 0x80, 0x80]],
+      ["U+10FFFF, the last character", [0xf4, 0x8f, 0xbf, 0xbf]],
       ["plain ASCII", [0x61]],
     ])("accepts %s", (_label, bytes) => {
       expect(refuses(...bytes)).toBe(false);
     });
+
+    test("agrees with a strict UTF-8 decoder on every string made of boundary bytes", () => {
+      const product = (...columns: number[][]) =>
+        columns.reduce<number[][]>(
+          (rows, column) => rows.flatMap((row) => column.map((byte) => [...row, byte])),
+          [[]]
+        );
+      const everyByte = Array.from({ length: 255 }, (_, i) => i + 1);
+      const leads = [0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xe1, 0xed, 0xee, 0xf0, 0xf1, 0xf4, 0xf5, 0xff];
+      const edges = [0x41, 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0];
+      const cases = [
+        ...product(everyByte),
+        ...product(leads, edges),
+        ...product(leads, edges, edges),
+        ...product([0xf0, 0xf4], edges, edges, edges),
+      ];
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      const holdsControl = (bytes: number[]) => {
+        try {
+          return [...decoder.decode(Uint8Array.from(bytes))].some((char) => {
+            const code = char.charCodeAt(0);
+            return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+          });
+        } catch {
+          return true;
+        }
+      };
+      expect(refusals(cases)).toEqual(cases.map(holdsControl));
+    }, 20_000);
   });
 
   test.each([

@@ -277,10 +277,10 @@ in everything it writes, as a second layer.
   read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
   `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`).
   The command refuses a Docker endpoint that is not a local socket (the token would leave the
-  host), refuses a control character in that endpoint and in any path it hands to Docker (Docker
-  can echo a path to your terminal), and runs the docker CLI with an empty private config (its
-  `proxies` would otherwise go into the container's environment). The single-account CAUTION of
-  the Threat model applies to this command too.
+  host), refuses a control character or a byte that is not valid UTF-8 in that endpoint and in any
+  path it hands to Docker (Docker can echo a path to your terminal), and runs the docker CLI with
+  an empty private config (its `proxies` would otherwise go into the container's environment). The
+  single-account CAUTION of the Threat model applies to this command too.
 - Nothing outlives the command except the evidence: the container is removed when it exits and
   stops itself after 180 s at most, and the private Docker config sits in the run's `tmp` folder
   that cleanup deletes. Cleanup redacts the report like every other text file of the evidence.
