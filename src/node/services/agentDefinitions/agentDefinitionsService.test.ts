@@ -2067,6 +2067,40 @@ base: a
         ).toBe("Child");
       });
 
+      test("the lookup ends at the first plugin agent that parses, passes review and is unreachable, past earlier skipped ones", async () => {
+        using project = new DisposableTempDir("agent-defs-unreachable-order-project");
+        using home = new DisposableTempDir("agent-defs-unreachable-order-home");
+        const projectContainer = path.join(project.path, ".xum", "plugins");
+        // Skipped: the project plugin's file does not parse. Then a global plugin's file is
+        // unreachable here. The spawn error is the unreachable one, not the first skip.
+        await writePlugin(projectContainer, "broken", { "twin.md": "No frontmatter\n" });
+        await writePlugin(path.join(home.path, "plugins"), "egm", {
+          "twin.md": foreignAgent(PERSONA_BODY),
+        });
+        const local = new LocalRuntime(project.path);
+        const devcontainer = Object.create(local, {
+          location: { value: "devcontainer" },
+        }) as Runtime;
+        const options = {
+          roots: {
+            projectRoots: [],
+            projectPluginRoots: [projectContainer],
+            globalRoot: path.join(home.path, "agents"),
+            globalPluginRoots: [path.join(home.path, "plugins")],
+          },
+          runtimeFactory,
+        };
+
+        const refusal = await refusalOf(
+          readAgentDefinition(devcontainer, project.path, "twin", {
+            ...options,
+            refuseUnreachablePluginFolder: true,
+          })
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
+        expect(refusal.pluginName).toBe("egm");
+      });
+
       test("one request cache keeps the spawn read (opt-in) apart from every other read", async () => {
         using hostHome = new DisposableTempDir("agent-defs-unreachable-cache-home");
         using checkout = new DisposableTempDir("agent-defs-unreachable-cache-checkout");

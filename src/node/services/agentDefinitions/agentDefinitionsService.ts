@@ -577,6 +577,7 @@ function parseAgentFile(
 }
 
 function pluginNameOf(candidate: Pick<AgentDefinitionScanCandidate, "pluginName" | "pluginRoot">) {
+  // mutation-equivalent: a plugin candidate always has a non-empty name and root, so ?? and || agree
   return candidate.pluginName ?? path.basename(candidate.pluginRoot ?? "?");
 }
 
@@ -602,6 +603,7 @@ function pluginFolderRefusal(args: {
     "folder-unreachable",
     args.agentId,
     pluginNameOf(args.candidate),
+    // mutation-equivalent: a runtime's location is never "", so ?? and || agree
     args.workspaceRuntime.location ?? "unknown"
   );
 }

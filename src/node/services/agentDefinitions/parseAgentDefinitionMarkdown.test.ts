@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 import {
   AgentDefinitionParseError,
@@ -116,6 +117,29 @@ Body
       remove: ["task"],
       require: ["propose_plan"],
     });
+  });
+
+  test("keeps the body after the closing delimiter exactly", () => {
+    const content = "---\nname: a\n---\nline one\nline two\n";
+    const result = parseAgentDefinitionMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+    });
+    expect(result.body).toBe("line one\nline two\n");
+  });
+
+  test("accepts a file of exactly the size cap and rejects one byte more", () => {
+    const content = "---\nname: a\n---\nBody\n";
+    const parse = (byteSize: number) => parseAgentDefinitionMarkdown({ content, byteSize });
+    expect(parse(MAX_FILE_SIZE).frontmatter.name).toBe("a");
+    expect(() => parse(MAX_FILE_SIZE + 1)).toThrow(AgentDefinitionParseError);
+  });
+
+  test("a closing delimiter right after the opening one is an empty frontmatter, not a missing one", () => {
+    const content = "---\n---\nBody\n";
+    expect(() =>
+      parseAgentDefinitionMarkdown({ content, byteSize: Buffer.byteLength(content, "utf-8") })
+    ).toThrow("must be a mapping");
   });
 
   describe("plugin source (Claude Code / Cursor format)", () => {
@@ -342,6 +366,18 @@ Body
       test("is false for a file that is not a plugin agent, whatever its keys", () => {
         expect(foreignOf("name: a\nreadonly: true")).toBe(false);
         expect(foreignOf("name: a\nis_background: true")).toBe(false);
+      });
+
+      test("mappedReadonly is false for a file that is not a plugin agent", () => {
+        const content = "---\nname: a\nreadonly: true\n---\nBody\n";
+        const parse = (plugin?: { agentId: string }) =>
+          parseAgentDefinitionMarkdown({
+            content,
+            byteSize: Buffer.byteLength(content, "utf-8"),
+            ...(plugin != null ? { plugin } : {}),
+          }).mappedReadonly;
+        expect(parse()).toBe(false);
+        expect(parse({ agentId: "file-id" })).toBe(true);
       });
     });
   });

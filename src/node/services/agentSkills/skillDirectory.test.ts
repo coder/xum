@@ -48,6 +48,20 @@ describe("resolveSkillDirectory for off-host workspaces", () => {
     expect(bodyFor(skill, remoteRuntime)).toBe("sh /workspace/.xum/skills/demo/scripts/x.sh");
   });
 
+  it("withholds a project skill that was read from another checkout, and keeps a global one", () => {
+    const options = { discoveredOutsideWorkspace: true };
+    const project = resolvedSkill(hostRuntime, "/host/other-checkout/.xum/skills/demo");
+    project.package.scope = "project";
+    const withheld = resolveSkillDirectory(project, hostRuntime, options);
+    expect(withheld.available).toBe(false);
+    if (!withheld.available) expect(withheld.reason).toMatch(/main checkout/);
+
+    const global = resolvedSkill(hostRuntime, "/host/.xum/skills/demo");
+    expect(resolveSkillDirectory(global, hostRuntime, options).available).toBe(true);
+    // The same project skill read from this workspace's own checkout is valid there.
+    expect(resolveSkillDirectory(project, hostRuntime).available).toBe(true);
+  });
+
   for (const [label, sourceRuntime, workspaceRuntime] of [
     ["an SSH/Docker workspace", hostRuntime, remoteRuntime],
     ["a devcontainer workspace", hostRuntime, devcontainerRuntime],
