@@ -32,6 +32,7 @@ import {
 import {
   AgentPluginInstallService,
   describeSignInChanges,
+  signInResetUrls,
   withDiskQuotaWatchdog,
 } from "./installService";
 import {
@@ -4616,7 +4617,6 @@ describe("AgentPluginInstallService", () => {
       await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
       await fsPromises.writeFile(path.join(muxRoot, "mcp-oauth.json"), signedInStore(signedInUrls));
       const oauth = new McpOauthService(config, new MCPConfigService(config));
-      const logout = spyOn(oauth, "logout");
       updater.setMcpOauthService(oauth);
       const update = async (servers: Record<string, unknown> | undefined) => {
         await writeServers(servers);
@@ -4626,9 +4626,11 @@ describe("AgentPluginInstallService", () => {
           consent: { fromSha: review.fromSha, toSha: review.toSha },
         });
       };
-      return { oauth, logout, update };
+      return { oauth, update };
     };
 
+    // The 20 s limits: each test installs and updates a plugin over git, which takes more than the
+    // default 5 s on a loaded runner.
     test("signs out the removed server, so a later server at its URL does not inherit the credentials", async () => {
       const { oauth, update } = await installSignedIn(
         { docs: oauthEntry(docsUrl, "client-a"), keep: oauthEntry(keepUrl, "client-k") },
@@ -4645,7 +4647,7 @@ describe("AgentPluginInstallService", () => {
       });
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
       await oauth.dispose();
-    });
+    }, 20_000);
 
     test("signs out every server when the update drops the plugin's MCP file", async () => {
       const { oauth, update } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
@@ -4654,30 +4656,7 @@ describe("AgentPluginInstallService", () => {
       await update(undefined);
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
       await oauth.dispose();
-    });
-
-    test("keeps the credentials of a server that is renamed with its URL and client unchanged", async () => {
-      const { oauth, logout, update } = await installSignedIn(
-        { docs: oauthEntry(docsUrl, "client-a") },
-        [docsUrl]
-      );
-      await update({ docs2: oauthEntry(`${docsUrl}/`, "client-a") });
-      expect(logout).not.toHaveBeenCalled();
-      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
-      await oauth.dispose();
-    });
-
-    test("does not sign out when the removed server has no sign-in (stdio)", async () => {
-      const stdio = { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/server.js"] };
-      const { oauth, logout, update } = await installSignedIn(
-        { local: stdio, docs: oauthEntry(docsUrl, "client-a") },
-        [docsUrl]
-      );
-      await update({ docs: oauthEntry(docsUrl, "client-a") });
-      expect(logout).not.toHaveBeenCalled();
-      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
-      await oauth.dispose();
-    });
+    }, 20_000);
   });
 
   test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
@@ -8988,6 +8967,60 @@ describe("describeSignInChanges", () => {
       "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
       "Client registration removed (https://id.example.com/register)",
     ]);
+  });
+});
+
+describe("signInResetUrls", () => {
+  // The credential key drops a trailing slash, as McpOauthService.credentialKey does.
+  const key = (url: string): string | null => url.replace(/\/$/, "");
+  const tree = (servers: Record<string, { url: string; identity: string } | null>) =>
+    new Map(
+      Object.entries(servers).map(([name, signIn]) => [name, signIn === null ? {} : { signIn }])
+    );
+  const at = (url: string, identity: string) => ({ url, identity });
+  const mcp = "https://mcp.example.com/mcp";
+
+  test("resets a server whose identity changes, and no server whose identity stays", () => {
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+  });
+
+  test("matches by credential key: a respelled URL with the same identity is not a removal", () => {
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "x") }), key)
+    ).toEqual([]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "y") }), key)
+    ).toEqual([`${mcp}/`]);
+  });
+
+  test("a sibling that already has the new identity does not mask a change", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
+    expect(signInResetUrls(current, tree({ a: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    // A renamed entry has no previous self: any other identity at the key resets it.
+    expect(signInResetUrls(current, tree({ c: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "y"), b: at(mcp, "y") }), tree({ c: at(mcp, "y") }), key)
+    ).toEqual([]);
+  });
+
+  test("resets the URL of each server the update removes, and no other", () => {
+    const other = "https://other.example.com/mcp";
+    const current = tree({ a: at(mcp, "x"), b: at(other, "x"), local: null });
+    expect(signInResetUrls(current, tree({ b: at(other, "x") }), key)).toEqual([mcp]);
+    expect(signInResetUrls(current, tree({}), key)).toEqual([mcp, other]);
+  });
+
+  test("a server added at a new key, a tree with no current servers and an unkeyed URL reset nothing", () => {
+    expect(signInResetUrls(tree({}), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(undefined, tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({}), () => null)).toEqual([]);
   });
 });
 

@@ -1750,6 +1750,73 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   return lines;
 }
 
+/** One tree's sign-ins by credential key: the URL, and the identity of each server name there. */
+interface SignInKeyEntry {
+  url: string;
+  identities: Map<string, string>;
+}
+
+function indexSignIns(
+  servers: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  credentialKey: (url: string) => string | null
+): Map<string, SignInKeyEntry> {
+  const index = new Map<string, SignInKeyEntry>();
+  for (const [serverName, { signIn }] of servers ?? []) {
+    const key = signIn && credentialKey(signIn.url);
+    if (!key || !signIn) continue;
+    const entry = index.get(key) ?? { url: signIn.url, identities: new Map<string, string>() };
+    entry.identities.set(serverName, signIn.identity);
+    index.set(key, entry);
+  }
+  return index;
+}
+
+/**
+ * Compare an entry with its own previous identity (same name, same key): when two servers share
+ * a URL, another entry already using the new identity must not mask the change. A renamed (or
+ * added) entry has no previous self, and the stored credentials cannot be traced to one entry:
+ * it changed whenever any identity at the key differs.
+ */
+function signInIdentityChanged(
+  before: ReadonlyMap<string, string>,
+  serverName: string,
+  identity: string
+): boolean {
+  const previous = before.get(serverName);
+  return previous !== undefined
+    ? previous !== identity
+    : [...before.values()].some((other) => other !== identity);
+}
+
+/**
+ * The server URLs whose stored credentials an update must sign out: a key whose sign-in identity
+ * changes, and a key the update removes. A removed server keeps its credentials under its URL,
+ * and a later update can add a server at that URL under another identity with no current server
+ * left to show the change, so the removal is the only moment to sign out. A needless sign-out is
+ * acceptable; stale credentials offered under a new identity are not.
+ */
+export function signInResetUrls(
+  current: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  staged: ReadonlyMap<string, { signIn?: SurfaceSignIn }>,
+  credentialKey: (url: string) => string | null
+): string[] {
+  const before = indexSignIns(current, credentialKey);
+  const after = indexSignIns(staged, credentialKey);
+  const resets: string[] = [];
+  for (const [key, now] of after) {
+    const was = before.get(key);
+    if (
+      was !== undefined &&
+      [...now.identities].some(([serverName, identity]) =>
+        signInIdentityChanged(was.identities, serverName, identity)
+      )
+    )
+      resets.push(now.url);
+  }
+  for (const [key, was] of before) if (!after.has(key)) resets.push(was.url);
+  return resets;
+}
+
 const LOGO_MAX_BYTES = 512 * 1024;
 // No SVG: a data-URL <img> cannot run script, but raster-only keeps the
 // renderer away from markup altogether. No GIF: OpenAI does not list it, and it
@@ -3251,32 +3318,7 @@ export class AgentPluginInstallService {
     // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
     const credentialKey = (url: string): string | null =>
       this.mcpOauthService?.credentialKey(url) ?? null;
-    // Compare each entry with its own previous identity (same name, same key): when two
-    // servers share a URL, another entry already using the new identity must not mask the
-    // change. A renamed (or added) entry has no previous self, and the stored credentials
-    // cannot be traced to one entry: reset whenever any identity at the key differs. A
-    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
-    const currentIdentities = new Map<string, Set<string>>();
-    const currentEntryIdentity = new Map<string, string>();
-    for (const [serverName, server] of current?.servers ?? []) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const identities = currentIdentities.get(key) ?? new Set<string>();
-      identities.add(server.signIn.identity);
-      currentIdentities.set(key, identities);
-      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
-    }
-    for (const [serverName, server] of staged.servers) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
-      const identity = server.signIn.identity;
-      const changed =
-        previous !== undefined
-          ? previous !== identity
-          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
-      if (changed) signInResets?.push(server.signIn.url);
-    }
+    signInResets?.push(...signInResetUrls(current?.servers, staged.servers, credentialKey));
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
