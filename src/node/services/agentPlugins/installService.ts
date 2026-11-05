@@ -1752,7 +1752,7 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
 
 interface SignInKeyEntry {
   url: string;
-  identities: Map<string, string>;
+  identityByServerName: Map<string, string>;
 }
 
 function indexSignIns(
@@ -1763,8 +1763,11 @@ function indexSignIns(
   for (const [serverName, { signIn }] of servers ?? []) {
     const key = signIn && credentialKey(signIn.url);
     if (!key || !signIn) continue;
-    const entry = index.get(key) ?? { url: signIn.url, identities: new Map<string, string>() };
-    entry.identities.set(serverName, signIn.identity);
+    const entry = index.get(key) ?? {
+      url: signIn.url,
+      identityByServerName: new Map<string, string>(),
+    };
+    entry.identityByServerName.set(serverName, signIn.identity);
     index.set(key, entry);
   }
   return index;
@@ -1806,8 +1809,8 @@ export function signInResetUrls(
     const was = before.get(key);
     if (
       was !== undefined &&
-      [...now.identities].some(([serverName, identity]) =>
-        signInIdentityChanged(was.identities, serverName, identity)
+      [...now.identityByServerName].some(([serverName, identity]) =>
+        signInIdentityChanged(was.identityByServerName, serverName, identity)
       )
     )
       resets.push(now.url);
@@ -5254,8 +5257,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
-   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   * Removes `urls` from the pending sign-outs: they finished, or the update or uninstall rolled
+   * back before it took effect. Best effort: a leftover URL only signs the server out once more.
    */
   private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
     if (urls.length === 0) return;
@@ -5267,7 +5270,7 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  /** Signs out `urls` after an update or an uninstall; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
     // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
@@ -5579,8 +5582,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * A server that fails to load never ran and holds no sign-in, so it is not listed. A tree Xum
-   * cannot read lists none: it must stay removable.
+   * A server that fails to load is not listed. A tree Xum cannot read lists none: it must stay
+   * removable.
    */
   private async installedServerUrls(name: string): Promise<string[]> {
     try {

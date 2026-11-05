@@ -9043,6 +9043,10 @@ describe("signInResetUrls", () => {
     expect(signInResetUrls(current, tree({ a: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
       mcp,
     ]);
+  });
+
+  test("a renamed entry has no previous self: any other identity at the key resets it", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
     expect(signInResetUrls(current, tree({ c: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
       mcp,
     ]);
