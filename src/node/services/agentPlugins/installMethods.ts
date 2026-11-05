@@ -12,7 +12,7 @@
  *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
  *   whose folder has none.
  *
- * Rule M1 (which manifest methods are offered): each manifest file a repository has is one method
+ * Which manifest methods are offered: each manifest file a repository has is one method
  * (the table in discovery.ts, in the fixed order), except that a root plugin.json with `$schema`
  * (a Xum-native package, which can load hooks.js and workflows/) is offered alone, so that no
  * choice can hide code the review never showed. A manifest that fails validation is not offered.
@@ -296,16 +296,16 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 }
 
 export interface DetectedInstallMethods {
-  /** Every method that fits, in order: the manifest methods (rule M1), then skills. */
+  /** Every method that fits, in order: the manifest methods, then skills. */
   methods: AgentPluginInstallMethod[];
   /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
   skillsRoots: SkillsPackageRoot[];
   /**
    * The root plugin.json is the package's own manifest (it has `$schema`, or discovery cannot
-   * read it): rule M1 offers `agent-plugin` alone, and a saved Claude or Cursor method gives way.
+   * read it): only `agent-plugin` is offered, and a saved Claude or Cursor method gives way.
    */
   nativeRoot: boolean;
-  /** The root plugin.json exists and has no `$schema`: it is never a method of its own (rule M1). */
+  /** The root plugin.json exists and has no `$schema`: it is never a method of its own. */
   schemaLessRoot: boolean;
 }
 
@@ -344,7 +344,6 @@ function manifestMethodKinds(present: Set<string>): SavedInstallMethod[] {
   return kinds;
 }
 
-/** The install methods that fit a staged tree (rule M1, see the module comment). */
 export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
   const present = await presentManifests(stagedDir);
   const rootEntry = present.has(PLUGIN_MANIFEST_RELATIVE_PATH);
@@ -360,13 +359,11 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   return { methods, skillsRoots, nativeRoot, schemaLessRoot };
 }
 
-/** A manifest method that validation turned down, with the problem that preview and update show. */
 export interface RejectedInstallMethod {
   method: AgentPluginInstallMethod;
   problem: string;
 }
 
-/** What preview, install and update choose from: the detected methods and those that failed validation. */
 export interface CheckedInstallMethods extends DetectedInstallMethods {
   rejected: RejectedInstallMethod[];
 }
@@ -661,7 +658,6 @@ export function noEntryMethodMessage(
 /** The methods that fit a staged tree, the one to use, and what the preview shows about them. */
 export interface StagedMethodChoice {
   method: AgentPluginInstallMethod;
-  /** The methods the preview offers: those that fit and validate. */
   methods: AgentPluginInstallMethod[];
   warnings: string[];
   skillsCliSkills: string[];
@@ -669,8 +665,7 @@ export interface StagedMethodChoice {
 
 /**
  * An update that Xum will not apply because the commit no longer fits the install (B5). Nothing
- * is applied: the plugin stays on its commit and keeps tracking its branch. The update review
- * shows the message with a "Remove plugin" button.
+ * is applied: the plugin stays on its commit and keeps tracking its branch.
  */
 export class UpdateRefusedError extends Error {}
 
@@ -678,7 +673,6 @@ function sentence(text: string): string {
   return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
-/** Why `saved` does not fit the commit: a missing file, a Xum-native root, or its validation error. */
 function savedMethodMisfit(
   saved: SavedInstallMethod,
   checked: CheckedInstallMethods,
@@ -700,10 +694,6 @@ function savedMethodMisfit(
     : `Neither ${files.join(" nor ")} is in this commit.`;
 }
 
-/**
- * The refusal of an update whose commit does not fit the install; `reason` names the file. With
- * no method that fits there is nothing to switch to, so the message says that and stops.
- */
 function updateRefusal(reason: string, methods: AgentPluginInstallMethod[]): UpdateRefusedError {
   if (methods.length === 0) {
     return new UpdateRefusedError(`${reason} No install method fits this commit.`);
@@ -741,11 +731,6 @@ function candidateMethods(
   }
 }
 
-/**
- * The error when no method is chosen. An install with a saved method gets its refusal, also
- * when nothing fits at all; one without gets the refusal of an update that only fits `skills`,
- * the problem of a manifest that failed validation, or the message that names every format.
- */
 function noMethodError(
   checked: CheckedInstallMethods,
   fitting: AgentPluginInstallMethod[],

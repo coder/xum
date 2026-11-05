@@ -1889,7 +1889,6 @@ function shownStagedRoot(
   return marketplace === undefined ? source.subpath : undefined;
 }
 
-/** The registry row of an install: the entry, plus its saved install method (B3) when it has one. */
 function registryRow(
   entry: AgentPluginInstallEntry,
   installMethod: SavedInstallMethod | undefined
@@ -1897,13 +1896,11 @@ function registryRow(
   return installMethod !== undefined ? { ...entry, installMethod } : entry;
 }
 
-/** One staged manifest read: its plugin and the diagnostics discovery gave. */
 interface Discovered {
   plugin: AgentPluginInfo;
   diagnostics: AgentPluginDiagnostic[];
 }
 
-/** The refusal of a staged tree that discovery did not accept (a preview shows it as a warning). */
 function invalidPluginMessage(read: { diagnostics: AgentPluginDiagnostic[] }): string {
   const reasons = read.diagnostics.map((d) => d.message);
   return reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
@@ -2112,7 +2109,6 @@ export class AgentPluginInstallService {
     return readStoredInstallMethod(rawEntries.find((entry) => this.rawEntryName(entry) === name));
   }
 
-  /** The manifest choice of the installed tree of `name`: its saved method, else the fixed order. */
   private async installedChoice(name: string) {
     return manifestChoiceFor(await this.savedInstallMethod(name));
   }
@@ -2946,12 +2942,12 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Check every manifest method rule M1 offers (installMethods.ts): one read-only
-   * `discoverAgentPluginAt` call each, on the staged tree. A method whose manifest fails
+   * Check every manifest method that installMethods.ts offers, with one read-only
+   * `discoverAgentPluginAt` call each on the staged tree. A method whose manifest fails
    * validation is rejected with its error (the preview shows it as a warning, and install refuses
    * it). The generated `skills` method is not checked here: it writes a plugin.json into the tree,
    * so it runs last. A marketplace entry installs through its folder's manifest in the fixed
-   * order, with no choice (Non-Goal 4), and keeps its own methods.
+   * order, with no choice, and keeps its own methods.
    */
   private async checkManifestMethods(
     stagedDir: string,
@@ -5619,7 +5615,6 @@ export class AgentPluginInstallService {
     const installed = new Set(rawEntries.map((entry) => this.rawEntryName(entry)));
     const urls: string[] = [];
     for (const dirName of dirs) {
-      // Each tree is read the way the plugin loads, through its saved method.
       const choice = manifestChoiceFor(
         readStoredInstallMethod(rawEntries.find((entry) => this.rawEntryName(entry) === dirName))
       );
@@ -6777,8 +6772,6 @@ export class AgentPluginInstallService {
     // marketplace entry is read again from the marketplace file at the new commit: the staged
     // folder holds only the entry.
     const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
-    // An update never changes the method (B5): the saved one decides, and a commit that does not
-    // fit it is refused.
     const saved = await this.savedInstallMethod(entry.name);
     const { stagedDir, marketplace } = await this.cloneWithEntry(
       entry.source,

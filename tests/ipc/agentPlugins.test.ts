@@ -215,8 +215,6 @@ function unwrap<T>(result: Result<T, string>): T {
   }, 60_000);
 });
 
-// A repository that ships a Codex and a Claude manifest: the user picks Claude Code plugin, and
-// the choice survives into the registry and the loaded plugin.
 (shouldRunIntegrationTests() ? describe : describe.skip)(
   "agent plugin install method choice",
   () => {

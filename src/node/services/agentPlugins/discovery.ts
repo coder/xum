@@ -1493,7 +1493,6 @@ export async function isSchemaLessRootManifest(rootReal: string): Promise<boolea
   return read.status === "ok" && isSchemaLessManifest(read.raw);
 }
 
-/** What normalizing one manifest file gives (see discoverPluginAt). */
 interface NormalizedManifest {
   manifest: unknown;
   warnings: string[];
@@ -1504,7 +1503,6 @@ interface NormalizedManifest {
 export interface AgentPluginManifestSpec {
   /** Relative to the plugin root, with the OS separator (as the `*_MANIFEST_RELATIVE_PATH` constants). */
   relative: string;
-  /** The install method that reads this file (B1). */
   method: SavedInstallMethod;
   normalize(raw: unknown): NormalizedManifest;
 }
@@ -1551,7 +1549,6 @@ export type ManifestChoice =
   | { kind: "fixed-order" }
   | { kind: "method"; method: SavedInstallMethod };
 
-/** The choice of a plugin tree whose registry row saved `method` (undefined: no saved method). */
 export function manifestChoiceFor(method: SavedInstallMethod | undefined): ManifestChoice {
   return method === undefined ? { kind: "fixed-order" } : { kind: "method", method };
 }
@@ -1562,17 +1559,12 @@ function manifestSpecsFor(choice: ManifestChoice): readonly AgentPluginManifestS
     : AGENT_PLUGIN_MANIFEST_TABLE.filter((spec) => spec.method === choice.method);
 }
 
-/**
- * The manifest files a method can read, as the repository shows them (`shownRoot`: the plugin
- * folder's path inside its repository, see discoverAgentPluginAt).
- */
 export function manifestFilesOf(method: SavedInstallMethod, shownRoot?: string): string[] {
   return manifestSpecsFor({ kind: "method", method }).map((spec) =>
     shownManifestPath(shownRoot, spec.relative)
   );
 }
 
-/** The error of a named method whose manifest does not exist: it names the method and the file. */
 export function missingMethodManifestMessage(
   method: SavedInstallMethod,
   shownRoot?: string
@@ -1660,7 +1652,6 @@ async function discoverPluginAt(args: {
   diagnostics: AgentPluginDiagnostic[];
   /** See discoverAgentPluginAt. */
   shownRoot?: string;
-  /** See discoverAgentPluginAt. */
   choice: ManifestChoice;
 }): Promise<AgentPluginInfo | null> {
   const { pluginDir, scope, diagnostics, choice } = args;
@@ -2068,14 +2059,6 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
   }
 }
 
-/** Canonical project plugins shadow same-named legacy copies during ordered scans. */
-/**
- * The install-owned fields of one discovered plugin, from its container's registry read. A
- * corrupt registry, or an unidentified row that can own the directory, imports nothing. Managed
- * plugins also get their reviewed fingerprints (#6498): an install without records gets empty
- * ones, so nothing of it loads until reviewed.
- */
-/** The choice of a container entry: the method its registry row saved, else the fixed order. */
 function managedManifestChoice(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   entryName: string
@@ -2083,6 +2066,13 @@ function managedManifestChoice(
   return manifestChoiceFor(imports?.methodByName.get(entryName));
 }
 
+/** Canonical project plugins shadow same-named legacy copies during ordered scans. */
+/**
+ * The install-owned fields of one discovered plugin, from its container's registry read. A
+ * corrupt registry, or an unidentified row that can own the directory, imports nothing. Managed
+ * plugins also get their reviewed fingerprints (#6498): an install without records gets empty
+ * ones, so nothing of it loads until reviewed.
+ */
 function managedPluginFields(
   entryName: string,
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,

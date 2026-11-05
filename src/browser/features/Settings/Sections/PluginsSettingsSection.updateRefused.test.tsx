@@ -66,7 +66,6 @@ test("a refused update shows its message and offers Remove plugin, never an appl
   expect(view.queryByRole("button", { name: "Apply update" })).toBeNull();
   expect(view.queryByText(/This removes the plugin directory/)).toBeNull();
 
-  // Remove plugin opens the usual uninstall confirmation and closes the refusal.
   fireEvent.click(view.getByRole("button", { name: "Remove plugin" }));
   await view.findByText(/This removes the plugin directory/);
   expect(view.queryByText(/is gone in this commit/)).toBeNull();

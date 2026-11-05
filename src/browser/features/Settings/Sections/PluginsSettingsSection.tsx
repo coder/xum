@@ -1339,12 +1339,6 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
-/**
- * An update that Xum refused because the new commit no longer fits the saved install method (B5).
- * The message names the file and says how to switch. Nothing was applied, so the plugin stays on
- * its commit and keeps tracking its branch, and the one way forward is to remove it and install it
- * again, which "Remove plugin" starts through the usual uninstall confirmation.
- */
 const UpdateRefusedPanel: React.FC<{
   review: AgentPluginUpdateReview;
   message: string;
@@ -1436,7 +1430,6 @@ const UpdateReviewPanel: React.FC<{
   );
 };
 
-/** The update review of a plugin, or the refusal of its update (B5) with a way to remove it. */
 const UpdateReviewOrRefusal: React.FC<{
   review: AgentPluginUpdateReview;
   selective: boolean;
@@ -1930,7 +1923,6 @@ export const PluginsSettingsSection: React.FC = () => {
         setError(preview.error);
         return;
       }
-      // A refused update has no changes either: it shows its message, never an apply.
       if (updateNeedsReview(preview.data)) {
         setUpdateReview(preview.data);
         return;

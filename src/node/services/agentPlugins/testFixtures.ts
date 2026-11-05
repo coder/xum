@@ -54,10 +54,6 @@ export function createTestPluginInstallEntry(
   };
 }
 
-/**
- * A registry row as the file holds it: the row plus fields the row schema does not know, such as
- * `installMethod` (a newer build's field). Tests write these to prove such fields are read and kept.
- */
 export function createRawPluginInstallRow(
   entry: AgentPluginInstallEntry,
   extra: Record<string, unknown>
@@ -76,7 +72,6 @@ export async function reviewedComponentConsent(args: {
   scope?: AgentPluginScope;
   /** Xum home of the plugin data directory; defaults to the container's parent. */
   xumHome?: string;
-  /** The saved install method of the registry row; absent: the fixed order. */
   method?: SavedInstallMethod;
 }): Promise<ComponentConsent> {
   const { plugin, diagnostics } = await discoverAgentPluginAt({

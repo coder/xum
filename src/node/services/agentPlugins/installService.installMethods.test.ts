@@ -444,7 +444,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     return review.changes.map((change) => change.summary);
   }
 
-  /** What the install holds, to prove a refused update changed nothing. */
   async function installedState(): Promise<string> {
     const manifest = await fsPromises.readFile(
       path.join(installedDir(), ".claude-plugin", "plugin.json"),
@@ -509,14 +508,12 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     await installAs("claude-plugin");
     expect((await rawRow()).installMethod).toBe("claude-plugin");
 
-    // A restart: the container scan reads the registry row.
     const { plugins } = await discoverAgentPlugins([
       { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
     ]);
     expect(plugins).toHaveLength(1);
     expect(plugins[0].claudeFallback).toBe(true);
     expect(await listPluginAgentFiles(plugins[0].agentsDir)).toHaveLength(9);
-    // Each agent has an accepted consent review.
     const consent = (await rawRow()).componentConsent as { agents: Record<string, string> };
     expect(Object.keys(consent.agents).sort()).toEqual(
       EGM_CLAUDE_AGENTS.map((id) => `${id}`).sort()
@@ -605,7 +602,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(native.refused).toContain("Methods that fit this commit: Agent Plugin.");
     await expect(service.update({ name: "egm" })).rejects.toThrow("takes precedence");
 
-    // Nothing fits: the refusal still names the file, and there is nothing to switch to.
     await git(remoteDir, "rm", "-q", "-r", ".");
     await write({ "README.md": "nothing\n" });
     await commit("no plugin left");
@@ -614,7 +610,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
       ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit."
     );
 
-    // The commit, the branch tracking and the registry row are unchanged, and the tree stays.
     expect(await installedState()).toBe(before);
     expect((await rawRow()).lockedSha).toBe(sha);
     expect((await rawRow()).source).toMatchObject({ ref: "main", refType: "branch" });
@@ -629,7 +624,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     const review = await service.previewUpdate({ name: "egm" });
     expect(review.refused).toBeUndefined();
     expect(review.toSha).toBe(next);
-    // Without the review's consent, a change that adds components does not apply.
     if (review.changes.length > 0) {
       await expect(service.update({ name: "egm" })).rejects.toThrow("review");
     }
@@ -639,7 +633,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     const { plugins } = await discoverAgentPlugins([
       { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
     ]);
-    // The root manifest now loads, not the Codex one.
     expect(plugins[0].codexFallback).toBeUndefined();
   });
 
@@ -660,7 +653,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(plugins[0].codexFallback).toBe(true);
     expect((await rawRow()).installMethod).toBe("agent-plugin");
 
-    // No Codex manifest to fall back to: the update is refused and names both files.
     await git(remoteDir, "rm", "-q", "-r", ".codex-plugin");
     await commit("the Codex manifest goes");
     const refused = await service.previewUpdate({ name: "egm" });
@@ -669,7 +661,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     );
     await expect(service.update({ name: "egm" })).rejects.toThrow("has no $schema");
 
-    // The schema-less root alone: Xum reads it as the manifest and reports its validation error.
     await git(remoteDir, "rm", "-q", "-r", ".claude-plugin", ".cursor-plugin");
     await commit("only the root is left");
     const alone = await service.previewUpdate({ name: "egm" });
@@ -680,7 +671,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
 
   test("an install without a saved method keeps updating with the Codex manifest", async () => {
     await installAs("agent-plugin");
-    // An install from before this change has no field.
     await editRow((row) => {
       delete row.installMethod;
     });
@@ -694,7 +684,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     ]);
     expect(plugins[0].codexFallback).toBe(true);
 
-    // A plugin with only a Codex manifest still updates.
     await git(remoteDir, "rm", "-q", "-r", "plugin.json", ".claude-plugin", ".cursor-plugin");
     await commit("Codex only");
     await updateWithReview();

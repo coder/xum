@@ -99,14 +99,11 @@ let warnedUnknownInstallMethod = false;
 /** A newer build's value is logged, not trusted: a row can hold any text. */
 const MAX_LOGGED_METHOD_LENGTH = 64;
 
-/** Test seam: the warning below is once per process, so a test that counts it resets it first. */
 export function resetUnknownInstallMethodWarning(): void {
   warnedUnknownInstallMethod = false;
 }
 
 /**
- * The install method a raw registry row saved (RFC B3), or undefined for the fixed order.
- *
  * Read from the raw row, never from AgentPluginInstallEntrySchema: that schema strips unknown
  * keys, and a value this build does not know (a newer build's method) must not make the row
  * invalid, because an invalid row turns off all of the plugin's components and a registry read
@@ -142,7 +139,6 @@ export async function readPluginComponentImports(registryFile: string): Promise<
   consentByName: Map<string, ComponentConsent>;
   /** Install time by plugin name: it binds the install's approved copies (approvedCopies.ts). */
   installedAtByName: Map<string, string>;
-  /** The saved install method by plugin name (readStoredInstallMethod); absent: the fixed order. */
   methodByName: Map<string, SavedInstallMethod>;
   hasUnidentifiedEntries: boolean;
 } | null> {

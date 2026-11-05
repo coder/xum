@@ -200,7 +200,6 @@ describe("detectInstallMethods", () => {
       ".codex-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
       ".claude-plugin/plugin.json": claudeManifest,
     });
-    // Rule M1: the Codex and the Claude manifest are both offered.
     expect((await detectInstallMethods(codex)).methods).toEqual([
       { kind: "agent-plugin" },
       { kind: "claude-plugin" },
@@ -300,7 +299,7 @@ describe("detectInstallMethods", () => {
   });
 });
 
-describe("detectInstallMethods rule M1", () => {
+describe("detectInstallMethods manifest methods", () => {
   const manifest = JSON.stringify({ name: "egm" });
   const nativeRoot = JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" });
 
@@ -476,7 +475,6 @@ describe("chooseInstallMethod", () => {
         { kind: saved }
       );
     }
-    // The saved method is the only candidate: another manifest never takes its place.
     expect(
       chooseInstallMethod([{ kind: "agent-plugin" }, { kind: "cursor-plugin" }], {
         mode: "update",
@@ -502,7 +500,6 @@ describe("chooseInstallMethod", () => {
     expect(
       chooseInstallMethod(egm, { mode: "update", generatedFrom: undefined, saved: undefined })
     ).toEqual({ kind: "agent-plugin" });
-    // With no Codex or root manifest, Claude still goes before Cursor.
     expect(
       chooseInstallMethod(egm.slice(1), {
         mode: "update",
@@ -551,7 +548,6 @@ describe("chooseStagedMethod", () => {
     subpath: undefined,
   };
 
-  /** Runs chooseStagedMethod on a tree with these files, as the install service would. */
   async function choose(args: {
     files: Record<string, string>;
     request: Parameters<typeof chooseStagedMethod>[2];
@@ -624,7 +620,6 @@ describe("chooseStagedMethod", () => {
         request: { mode: "exact", method: { kind: "claude-plugin" } },
       })
     ).rejects.toThrow("cannot be installed as Claude Code plugin; it fits: Cursor plugin");
-    // What fits excludes a method that failed validation.
     await expect(
       choose({
         files: { ".claude-plugin/plugin.json": manifest, ".cursor-plugin/plugin.json": manifest },
@@ -674,7 +669,6 @@ describe("chooseStagedMethod update refusals (B5)", () => {
   const manifest = JSON.stringify({ name: "egm" });
   const switchHint = "To switch, uninstall the plugin and install it again.";
 
-  /** The refusal message of an update of a plugin with `saved`, onto the commit `files` make. */
   async function refusal(args: {
     files: Record<string, string>;
     saved: "agent-plugin" | "claude-plugin" | "cursor-plugin" | undefined;
@@ -774,7 +768,6 @@ describe("chooseStagedMethod update refusals (B5)", () => {
     expect(await refusal({ saved: "claude-plugin", skills: ["skills/a"], files: {} })).toContain(
       "Methods that fit this commit: Skills."
     );
-    // The saved method's refusal wins over "No plugin.json found", and no switch is possible.
     expect(await refusal({ saved: "claude-plugin", files: { "README.md": "hi" } })).toBe(
       ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit."
     );

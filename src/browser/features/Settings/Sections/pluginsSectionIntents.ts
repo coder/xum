@@ -30,10 +30,6 @@ export type PluginsSectionIntent =
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" };
 
-/**
- * An update preview the section must show before anything is applied: it lists capability
- * changes to review, or it was refused (B5) and offers Remove plugin. Anything else applies.
- */
 export function updateNeedsReview(review: AgentPluginUpdateReview): boolean {
   return review.refused !== undefined || review.changes.length > 0;
 }

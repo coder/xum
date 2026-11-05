@@ -3083,7 +3083,6 @@ describe("named manifest choice (install methods)", () => {
       "as-claude": ["from claude", "claude-plugin"],
       "as-cursor": ["from cursor", "cursor-plugin"],
       "as-codex": ["from codex", "agent-plugin"],
-      // An unknown value from a newer build, a row with no value and an unmanaged folder.
       "as-unknown": ["from codex", undefined],
       "as-legacy": ["from codex", undefined],
       unmanaged: ["from codex", undefined],
