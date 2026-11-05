@@ -294,16 +294,12 @@ probe_before_launch_deadline() {
   curl -fs --max-time "$(launch_seconds_left)" -o /dev/null "$1"
 }
 
-# A backend started with auth (#7904's `make dev-server`) records its token in server.lock. The
-# header goes to curl on stdin, so the token stays out of every process's argv.
+# The header carries the run's token (run_token) to curl on stdin, so the token stays out of every
+# process's argv. A `|| return` and not set -e: doctor calls this inside `if`.
 backend_curl() {
   local token
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  if [[ -n $token ]]; then
-    printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
-  else
-    curl "$@"
-  fi
+  token=$(required_run_token) || return 1
+  printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
 }
 
 api() {
@@ -638,10 +634,10 @@ cmd_env() {
   echo "unset $GIT_REPO_ENV"
 }
 
-# Opens PATH of the run's UI in the run's browser session. When the backend has an auth token, the
-# URL carries `?token=` (the app keeps the token and strips it from the address bar). node reads
-# the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
-# is in no process's argv or environment: every local account can read argv.
+# Opens PATH of the run's UI in the run's browser session. The URL carries `?token=` (the app keeps
+# the token and strips it from the address bar). node gets the run's token on fd 3 and pipes the
+# command to `agent-browser batch` on stdin, so the token is in no process's argv or environment:
+# every local account can read argv.
 # Checked before a browser gets the token. A PATH like //host, /\host or /<tab>/host resolves to
 # another origin: never send the token there. One that normalizes to //... (/..//host) stays on
 # the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
@@ -667,16 +663,16 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
-  # server.lock's token, else the run's copy: a restarting backend deletes server.lock for a
-  # moment. node gets it on fd 3, never in argv.
-  token=$(run_token)
+  # The run's token (run_token: server.lock is gone for a moment while nodemon restarts the
+  # backend). node gets it on fd 3, never in argv.
+  token=$(required_run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
     const [base, path] = process.argv.slice(1);
     const token = fs.readFileSync(3, "utf8");
     const url = new URL(path, base);
-    if (token) url.searchParams.set("token", token);
+    url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
     "$VERIFY_XUM_URL" "$path" 3< <(printf %s "$token") \
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
@@ -716,11 +712,23 @@ cmd_workspace_field() {
 }
 
 # The backend's token: server.lock's, else the copy launch keeps in the private run folder. A
-# restarting backend deletes server.lock for a moment, and a stopped one for good.
+# stopped backend deletes server.lock for good. A nodemon restart deletes it for a moment: the old
+# backend dies on SIGUSR2 and leaves its lock, the next one deletes that lock at startup because
+# its pid is dead (ServerLockfile.read), and writes its own, with the same token, once it listens.
 run_token() {
   local token
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
   [[ -n $token || ! -f $VERIFY_XUM_RUN/token ]] || token=$(<"$VERIFY_XUM_RUN/token")
+  printf '%s' "$token"
+}
+
+# run_token, or exit 1 when it is empty. Launch refuses a backend without a token and keeps the
+# copy before it seeds, so every run it accepted has one. An empty one means a changed run folder:
+# going on would send requests that fail as unauthenticated, or open the token prompt.
+required_run_token() {
+  local token
+  token=$(run_token)
+  [[ -n $token ]] || die "run $VERIFY_XUM_RUN has no auth token (server.lock and its token copy have none). Run verify-xum.sh cleanup, then launch again."
   printf '%s' "$token"
 }
 

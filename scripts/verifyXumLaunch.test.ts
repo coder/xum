@@ -6,9 +6,10 @@ import * as path from "node:path";
 
 // verify-xum's launch must refuse a sandbox that a checkout's .env file (Bun loads it into
 // scripts/dev-server-sandbox.ts) opened beyond loopback: extra allowed Host headers, Vite or the
-// backend listening on every interface, or a backend without an auth token. Each test runs the real verify-xum.sh in a throwaway
-// git repo. A stub `make` stands in for `make dev-server-sandbox`: it prints the sandbox's banner
-// and serves a fake backend and Vite, so launch gets as far as the checks under test.
+// backend listening on every interface, or a backend without an auth token. Each test runs the
+// real verify-xum.sh in a throwaway git repo. A stub `make` stands in for `make
+// dev-server-sandbox`: it prints the sandbox's banner and serves a fake backend and Vite, so
+// launch gets as far as the checks under test.
 const SKILL_SCRIPT = ".xum/skills/verify-xum/scripts/verify-xum.sh";
 const isLinux = process.platform === "linux";
 
@@ -36,8 +37,11 @@ const listen = (host, handler) =>
     const server = http.createServer(handler).listen(0, host, () => resolve(server.address().port));
   });
 (async () => {
+  // Like the real backend, only /health answers without the token. The fake has no API, so a
+  // request with the token gets 404.
   const backendPort = await listen(fake.backendHost, (req, res) => {
-    res.statusCode = req.url === "/health" ? 200 : 404;
+    const authorized = fake.token !== "" && req.headers.authorization === "Bearer " + fake.token;
+    res.statusCode = req.url === "/health" ? 200 : authorized ? 404 : 401;
     res.end();
   });
   const vitePort = await listen(fake.viteHost, (_req, res) => res.end("ok"));
@@ -259,7 +263,7 @@ test.skipIf(!isLinux)(
 );
 
 test.skipIf(!isLinux)(
-  "a loopback-only sandbox passes both checks",
+  "a loopback-only sandbox with an auth token passes every check",
   () => {
     // The fake backend has no API, so launch fails later, at the seed's first API call.
     const r = launch(loopback);
@@ -267,7 +271,8 @@ test.skipIf(!isLinux)(
     expect(r.stderr).not.toContain("besides loopback");
     expect(r.stderr).not.toContain("not only on loopback");
     expect(r.stderr).not.toContain("no auth token");
-    // curl -f's error for the seed's first API call (readiness asked only for /health).
+    // curl -f's error for the seed's first API call (readiness asked only for /health). 404, not
+    // 401: the call carried the run's token.
     expect(r.stderr).toContain("returned error: 404");
     expect(r.left).toBe(0);
   },
