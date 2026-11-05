@@ -194,11 +194,13 @@ describe("interrupted publish", () => {
     const before = await recordOf("doc.md");
     const controller = new AbortController();
     const mkdirOriginal = fs.mkdir;
+    // The first mkdir is the record lock's; the second prepares the record write.
+    let mkdirCalls = 0;
     const abortingMkdir = (async (...args: Parameters<typeof fs.mkdir>) => {
-      controller.abort();
+      if (++mkdirCalls === 2) controller.abort();
       return mkdirOriginal(...args);
     }) as typeof fs.mkdir;
-    const mkdir = spyOn(fs, "mkdir").mockImplementationOnce(abortingMkdir);
+    const mkdir = spyOn(fs, "mkdir").mockImplementation(abortingMkdir);
     let error: unknown;
     try {
       await recordArtifactPublish({

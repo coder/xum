@@ -129,7 +129,6 @@ export async function recordArtifactPublish(
   return recordLocks.withLock(dir, async () => {
     await using _fileLock = await acquireRecordFileLock(dir, params.abortSignal, params.locks);
     const existing = await readArtifactRecord(params.sessionDir, artifactId);
-    if (params.abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
     const record: ArtifactRecord = {
       path: params.relPath,
       title: params.title,
@@ -138,6 +137,7 @@ export async function recordArtifactPublish(
       publishedAtMs: params.nowMs ?? Date.now(),
     };
     await fs.mkdir(dir, { recursive: true });
+    if (params.abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
     await writeFileAtomic(path.join(dir, RECORD_FILE_NAME), JSON.stringify(record, null, 2));
     return record;
   });
