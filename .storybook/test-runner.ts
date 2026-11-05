@@ -543,11 +543,15 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
   );
 }
 
+// A few pixels differ between any two screenshots (the fringe of a text glyph, a fading glow),
+// more so on a loaded machine. A diagram that escapes its box changes thousands.
+const MIN_INK_PIXELS = 32;
+
 /**
- * The sides of a box on which two screenshots differ outside it. The box is widened by one
- * pixel, so its own antialiased edge never counts.
+ * Where two screenshots differ outside a box: how many pixels, which sides of the box they lie
+ * on, and their bounds. The box is widened by one pixel, so its own antialiased edge never counts.
  */
-function sidesWithDifference(box: Box, shown: Pixels, hidden: Pixels): string[] {
+function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   assert(
     shown.width === hidden.width && shown.height === hidden.height,
     "Both screenshots must have the viewport's size"
@@ -557,23 +561,39 @@ function sidesWithDifference(box: Box, shown: Pixels, hidden: Pixels): string[] 
   const top = Math.floor(box.top) - 1;
   const bottom = Math.ceil(box.bottom) + 1;
   const sides = new Set<string>();
-  for (let y = 0; y < shown.height; y++) {
-    for (let x = 0; x < shown.width; x++) {
-      if (x >= left && x < right && y >= top && y < bottom) {
-        x = right - 1;
+  const bounds = { left: Infinity, top: Infinity, right: -1, bottom: -1 };
+  let count = 0;
+  // Compares one run of a row, and looks at its pixels only when the run differs.
+  const scan = (y: number, from: number, to: number) => {
+    const start = (y * shown.width + from) * shown.channels;
+    const end = (y * shown.width + to) * shown.channels;
+    if (shown.data.subarray(start, end).equals(hidden.data.subarray(start, end))) return;
+    for (let x = from; x < to; x++) {
+      const at = (y * shown.width + x) * shown.channels;
+      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
         continue;
       }
-      const at = (y * shown.width + x) * shown.channels;
-      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) !== 0) {
-        sides.add(y >= bottom ? "below" : y < top ? "above" : x < left ? "left of" : "right of");
-      }
+      count++;
+      sides.add(y >= bottom ? "below" : y < top ? "above" : x < left ? "left of" : "right of");
+      bounds.left = Math.min(bounds.left, x);
+      bounds.top = Math.min(bounds.top, y);
+      bounds.right = Math.max(bounds.right, x);
+      bounds.bottom = Math.max(bounds.bottom, y);
+    }
+  };
+  for (let y = 0; y < shown.height; y++) {
+    if (y >= top && y < bottom) {
+      scan(y, 0, Math.min(Math.max(left, 0), shown.width));
+      scan(y, Math.min(Math.max(right, 0), shown.width), shown.width);
+    } else {
+      scan(y, 0, shown.width);
     }
   }
-  return [...sides].sort();
+  return { count, sides: [...sides].sort(), bounds };
 }
 
-/** Hides one diagram, takes a second picture, and names the sides of its box that changed. */
-async function sidesPaintedOutside(
+/** Hides one diagram, takes a second picture, and says where it differs outside the box. */
+async function paintOutside(
   page: StoryPage,
   index: number,
   box: Box,
@@ -581,7 +601,11 @@ async function sidesPaintedOutside(
 ): Promise<string[]> {
   await setDiagramHidden(page, index, true);
   try {
-    return sidesWithDifference(box, shown, await viewportPixels(page));
+    const { sides, bounds, count } = differenceOutside(box, shown, await viewportPixels(page));
+    const where = `x ${bounds.left}-${bounds.right}, y ${bounds.top}-${bounds.bottom}`;
+    return count >= MIN_INK_PIXELS
+      ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
+      : [];
   } finally {
     await setDiagramHidden(page, index, false);
   }
@@ -618,7 +642,7 @@ const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ce
  * viewport. The strip is where iPhone Safari painted over the text, so a diagram that has none
  * to compare fails.
  */
-async function sidesPaintedBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
+async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
   await scrollBelowDiagram(page, index, true);
   try {
     const box = (await diagramPaintBoxes(page))[index];
@@ -627,7 +651,7 @@ async function sidesPaintedBelowWhenScrolled(page: StoryPage, index: number): Pr
       roomBelow(box, shown.height) >= MIN_BELOW_PX,
       `Diagram ${index} has no content below it to compare: put text after it in the story`
     );
-    return await sidesPaintedOutside(page, index, box, shown);
+    return await paintOutside(page, index, box, shown);
   } finally {
     await scrollBelowDiagram(page, index, false);
   }
@@ -649,16 +673,35 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
     timeout: 5000,
   });
+  // A font or a late render that arrives between two screenshots moves the text around the
+  // diagram, so wait until the page has held still for a few frames. Reading boxes and waiting
+  // for frames do not make WebKit lay the page out again, which a screenshot does.
+  await page.evaluate(async (selector) => {
+    await document.fonts.ready;
+    const layout = () =>
+      Array.from(document.querySelectorAll(selector), (diagram) =>
+        [diagram, diagram.parentElement!.parentElement!]
+          .map((element) => {
+            const { left, top, width, height } = element.getBoundingClientRect();
+            return [left, top, width, height].join(",");
+          })
+          .join("|")
+      ).join(";");
+    let last = layout();
+    for (let still = 0, frames = 0; still < 5 && frames < 300; frames++) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const now = layout();
+      still = now === last ? still + 1 : 0;
+      last = now;
+    }
+  }, PAGE_DIAGRAMS);
   const boxes = await diagramPaintBoxes(page);
   const shown = await viewportPixels(page);
   const painted: string[] = [];
   for (const [index, box] of boxes.entries()) {
-    const sides = await sidesPaintedOutside(page, index, box, shown);
+    painted.push(...(await paintOutside(page, index, box, shown)));
     if (roomBelow(box, shown.height) < MIN_BELOW_PX) {
-      sides.push(...(await sidesPaintedBelowWhenScrolled(page, index)));
-    }
-    if (sides.length > 0) {
-      painted.push(`diagram ${index} paints ${[...new Set(sides)].sort().join(" and ")} its box`);
+      painted.push(...(await paintBelowWhenScrolled(page, index)));
     }
   }
   assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");

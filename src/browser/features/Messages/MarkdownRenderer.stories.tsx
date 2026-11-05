@@ -347,7 +347,6 @@ async function waitForDiagram(
     },
     { timeout: 10_000 }
   );
-  await expectNoDiagramInkOutsideBox();
   return measureDiagram(canvasElement);
 }
 
@@ -370,7 +369,6 @@ async function expectZoomResizesBox(canvasElement: HTMLElement) {
       PIXEL_TOLERANCE
     )
   );
-  await expectNoDiagramInkOutsideBox();
 }
 
 /** Zoom is shared by every diagram and persists, so each play starts and ends at 100%. */
