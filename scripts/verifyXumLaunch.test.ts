@@ -23,6 +23,8 @@ interface Fake {
   // Acts out a nodemon restart right after readiness: the first /health deletes server.lock, and
   // a new lock (a later startedAt, the same token) appears 3 s later.
   restartAfterFirstHealth?: boolean;
+  // The pid that server.lock names. Default: the fake backend's own.
+  lockPid?: number;
 }
 
 // Runs as `make -C <checkout> dev-server-sandbox ...` in the launch's own process group, so its
@@ -41,7 +43,7 @@ const listen = (host, handler) =>
   });
 let lockPath = "";
 const writeLock = (startedAt) => {
-  const lock = { startedAt: startedAt.toISOString() };
+  const lock = { pid: fake.lockPid ?? process.pid, startedAt: startedAt.toISOString() };
   if (fake.token) lock.token = fake.token;
   fs.writeFileSync(lockPath, JSON.stringify(lock));
 };
@@ -271,6 +273,23 @@ test.skipIf(!isLinux)(
       "the backend has no auth token, so any local account can control it"
     );
     expect(r.stderr).toContain("XUM_DEV_SERVER_NO_AUTH=1");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// While server.lock names a dead backend (stopped, or restarting under nodemon), its port is free
+// for another account to bind. The seed must not send the token there.
+test.skipIf(!isLinux)(
+  "launch sends no token while server.lock names a backend that is not running",
+  () => {
+    const dead = spawnSync("true");
+    expect(dead.status).toBe(0);
+    const r = launch({ ...loopback, lockPid: dead.pid });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain(`(pid ${dead.pid}) is not running, so its token is not sent`);
+    // The fake answers 404 only to a request that carries the token.
+    expect(r.stderr).not.toContain("returned error: 404");
     expect(r.left).toBe(0);
   },
   90_000

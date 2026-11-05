@@ -294,11 +294,27 @@ probe_before_launch_deadline() {
   curl -fs --max-time "$(launch_seconds_left)" -o /dev/null "$1"
 }
 
-# The header carries the run's token (run_token) to curl on stdin, so the token stays out of every
-# process's argv. A `|| return` and not set -e: doctor calls this inside `if`.
+# The header carries the token of the backend that server.lock names to curl on stdin, so the
+# token stays out of every process's argv. Only while that backend runs, and never the run's copy:
+# while server.lock is missing or names a dead backend (stopped, or restarting under nodemon), its
+# TCP port is free, and another local account can bind it and take the token. Returns 1 without a
+# request then. A `return` and not die: doctor calls this inside `if` and reports the FAIL.
 backend_curl() {
-  local token
-  token=$(required_run_token) || return 1
+  local lock pid token
+  lock=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || {
+    echo "verify-xum: $VERIFY_XUM_ROOT/server.lock is gone (the backend stopped or is restarting), so its token is not sent" >&2
+    return 1
+  }
+  pid=$(json_field_or_empty /dev/stdin pid <<<"$lock")
+  token=$(json_field_or_empty /dev/stdin token <<<"$lock")
+  if ! [[ $pid =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "verify-xum: the backend that server.lock names (pid ${pid:-none}) is not running, so its token is not sent" >&2
+    return 1
+  fi
+  [[ -n $token ]] || {
+    echo "verify-xum: server.lock has no token" >&2
+    return 1
+  }
   printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
 }
 
@@ -741,7 +757,7 @@ run_token() {
 
 # run_token, or exit 1 when it is empty. Launch refuses a backend without a token and keeps the
 # copy before it seeds, so every run it accepted has one. An empty one means a changed run folder:
-# going on would send requests that fail as unauthenticated, or open the token prompt.
+# going on would open the app's token prompt.
 required_run_token() {
   local token
   token=$(run_token)

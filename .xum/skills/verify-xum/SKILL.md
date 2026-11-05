@@ -148,9 +148,9 @@ The backend always has an auth token: launch refuses a backend whose `server.loc
 Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
 the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
 names that line and says to remove it. (A checkout from before #7904 starts the backend without a
-token, so launch refuses it too.) Doctor and launch read the token from `server.lock`, or from the
-run's copy while that file is gone (a stopped backend, or a nodemon restart), and send it to curl
-on stdin, never in argv.
+token, so launch refuses it too.) Doctor and launch send curl the token from `server.lock` on stdin,
+never in argv, and only while the backend that `server.lock` names runs: while the backend is
+stopped or nodemon restarts it, its TCP port is free for another account to bind.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
