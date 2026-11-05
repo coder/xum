@@ -35,6 +35,40 @@ Surfaces:
 - Model-driven explorers and story tests run only in the bug-bash sandbox. See the
   [bug-bash](../bug-bash/SKILL.md) skill.
 
+## Threat model
+
+CAUTION: Run this skill only on a host where you are the only local account. agent-browser starts
+Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which asks for no
+credentials and which agent-browser cannot turn off. While the signed-in app is open, any local
+account that finds that port can control the browser, read the page and take the stored token.
+
+These protections matter on a host where you are the only local account too:
+
+- No text evidence keeps the token: `capture` replaces it with `<redacted>` in the files it
+  writes, and cleanup in every text file of the evidence and in the server log (see Evidence).
+  Screenshots are not redacted.
+- `env` and `open` keep the token out of your terminal and the agent's transcript: `env` prints
+  none, and `open` does not print agent-browser's output, which repeats the URL with the token
+  (when the open fails, it prints that output redacted).
+- Vite never serves the token: launch and every command that reads a run refuse a run home in a
+  folder that Vite serves (see Evidence), and `vite.config.ts` denies `server.lock` and its
+  temporary copies.
+- A web page that rebinds its DNS name to this machine cannot reach the app. Launch's `env -i`
+  drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy variables, so the sandbox
+  allows only loopback Host headers (`server.log` shows `Allowed hosts: loopback only`). Vite
+  refuses any other Host header, also on its WebSocket proxy to the backend.
+
+These protections matter only when other local accounts exist, and they are not enough there:
+the DevTools port above stays open.
+
+- The token is in no process's command line or environment: `open`, launch, `doctor` and the
+  redaction pass it to node or curl on stdin or fd 3 (see Drive and Doctor).
+- The run home, the run folder (with the run's token copy) and the server tree's TMPDIR are
+  private folders, and every command refuses a git dir, or a folder above it, that is not private
+  (see Launch for the rule and Evidence).
+- `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
+  can connect to (see Drive).
+
 ## Launch
 
 The script runs on Linux only: it needs `setsid`, `flock`, `ss` and `/proc`. Every command
@@ -118,11 +152,6 @@ agent-browser find role button click --name "Open settings" --exact
   node from `server.lock` and hands it to `agent-browser batch` on stdin, so the token is in no
   command line or environment. CAUTION: never put the token in an `agent-browser` argument. Every
   local account can read a process's command line while it runs.
-- CAUTION: Run this skill only on a host where you are the only local account. agent-browser
-  starts Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which asks for
-  no credentials and which agent-browser cannot turn off. While the signed-in app is open, any
-  local account that finds that port can control the browser, read the page and take the stored
-  token.
 - `open` turns off agent-browser's live stream for the session first, every time, and refuses to
   open the page while it is on. agent-browser 0.33 serves each session's screen and input as a
   WebSocket on `127.0.0.1` that any local account can connect to, starts it with each new
