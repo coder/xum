@@ -2,6 +2,7 @@ import { getStoryContext, type TestRunnerConfig } from "@storybook/test-runner";
 // This hook is reloaded between Jest suites in the same worker. Importing @playwright/test
 // initializes a second test runner and fails on reload; use browser waits and Node assertions.
 import assert from "node:assert/strict";
+import sharp from "sharp";
 import { MOBILE_TOUCH_TARGET_PX, TABLET_TOUCH_TARGET_PX } from "../src/constants/layout";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
@@ -490,7 +491,6 @@ async function assertSheetTouchTargets(page: StoryPage) {
 }
 
 const WEBKIT_TAG = "webkit";
-const MIN_PAINT_STRIP_PX = 4;
 // The diagrams in the page, not the copy in the expand dialog.
 const PAGE_DIAGRAMS = ".mermaid-container:not(.mermaid-modal) > svg";
 
@@ -501,9 +501,11 @@ interface Box {
   bottom: number;
 }
 
-interface PaintStrip {
-  name: string;
-  clip: { x: number; y: number; width: number; height: number };
+interface Pixels {
+  data: Buffer;
+  width: number;
+  height: number;
+  channels: number;
 }
 
 /** Where each diagram in the page may paint: its own box, inside the container that clips it. */
@@ -524,44 +526,10 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
   return boxes;
 }
 
-/**
- * The four rectangles of the viewport around a box, one pixel clear of it so the box's own
- * antialiased edge is never in a strip. The strip below comes first: it is where the text a
- * diagram paints over sits, and the first screenshot WebKit takes is the one that shows a stale
- * layout (a later one lays the page out again).
- */
-function stripsAround(box: Box, viewport: { width: number; height: number }): PaintStrip[] {
-  const left = Math.floor(box.left) - 1;
-  const top = Math.floor(box.top) - 1;
-  const right = Math.ceil(box.right) + 1;
-  const bottom = Math.ceil(box.bottom) + 1;
-  const strip = (name: string, x0: number, y0: number, x1: number, y1: number): PaintStrip => {
-    const x = Math.max(0, x0);
-    const y = Math.max(0, y0);
-    return {
-      name,
-      clip: {
-        x,
-        y,
-        width: Math.min(viewport.width, x1) - x,
-        height: Math.min(viewport.height, y1) - y,
-      },
-    };
-  };
-  return [
-    strip("below", 0, bottom, viewport.width, viewport.height),
-    strip("right of", right, top, viewport.width, bottom),
-    strip("left of", 0, top, left, bottom),
-    strip("above", 0, 0, viewport.width, top),
-  ].filter(({ clip }) => clip.width >= MIN_PAINT_STRIP_PX && clip.height >= MIN_PAINT_STRIP_PX);
-}
-
-async function screenshotStrips(page: StoryPage, strips: PaintStrip[]) {
-  const shots: Buffer[] = [];
-  for (const { clip } of strips) {
-    shots.push(await page.screenshot({ clip, animations: "disabled" }));
-  }
-  return shots;
+async function viewportPixels(page: StoryPage): Promise<Pixels> {
+  const png = await page.screenshot({ animations: "disabled", scale: "css" });
+  const { data, info } = await sharp(png).raw().toBuffer({ resolveWithObject: true });
+  return { data, width: info.width, height: info.height, channels: info.channels };
 }
 
 function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
@@ -576,36 +544,72 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
 }
 
 /**
+ * The bounds of the pixels that differ between two screenshots outside a box, or null when
+ * they agree there. The box is widened by one pixel, so its own antialiased edge never counts.
+ */
+function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null {
+  assert(
+    shown.width === hidden.width && shown.height === hidden.height,
+    "Both screenshots must have the viewport's size"
+  );
+  const left = Math.floor(box.left) - 1;
+  const right = Math.ceil(box.right) + 1;
+  const top = Math.floor(box.top) - 1;
+  const bottom = Math.ceil(box.bottom) + 1;
+  let found: Box | null = null;
+  for (let y = 0; y < shown.height; y++) {
+    for (let x = 0; x < shown.width; x++) {
+      if (x >= left && x < right && y >= top && y < bottom) {
+        x = right - 1;
+        continue;
+      }
+      const at = (y * shown.width + x) * shown.channels;
+      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
+        continue;
+      }
+      found = {
+        left: Math.min(found?.left ?? x, x),
+        top: Math.min(found?.top ?? y, y),
+        right: Math.max(found?.right ?? x, x),
+        bottom: Math.max(found?.bottom ?? y, y),
+      };
+    }
+  }
+  return found;
+}
+
+/**
  * An engine can lay a diagram out in one box and paint it in another. iPhone Safari painted a
  * state diagram over the paragraphs below its frame. A play reads layout boxes only, so compare
  * pixels: outside the box a diagram is laid out in, and outside the container that clips it,
- * the page must look the same with that diagram hidden as with it shown. The page does not
- * scroll, so only what fits the viewport is compared, and the viewport is left alone: resizing
- * it makes WebKit lay the page out again, which hides the very state this check looks for.
+ * the page must look the same with that diagram hidden as with it shown. WebKit lays the page
+ * out again at its next screenshot or resize, which repairs the very state this check looks
+ * for. So the page is shown to the camera once, before anything else touches it, and every
+ * diagram is compared against that one picture. The viewport is left alone for the same reason,
+ * and the page does not scroll, so only what fits the viewport is compared.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
-  const viewport = page.viewportSize();
-  assert(viewport, "A paint check needs a page with a viewport");
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
   await page.mouse.move(0, 0);
   await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
     timeout: 5000,
   });
+  const boxes = await diagramPaintBoxes(page);
+  const shown = await viewportPixels(page);
   const painted: string[] = [];
-  for (const [index, box] of (await diagramPaintBoxes(page)).entries()) {
-    const strips = stripsAround(box, viewport);
-    const shown = await screenshotStrips(page, strips);
+  for (const [index, box] of boxes.entries()) {
     await setDiagramHidden(page, index, true);
-    let hidden: Buffer[];
+    let hidden: Pixels;
     try {
-      hidden = await screenshotStrips(page, strips);
+      hidden = await viewportPixels(page);
     } finally {
       await setDiagramHidden(page, index, false);
     }
-    for (const [i, strip] of strips.entries()) {
-      if (!shown[i].equals(hidden[i])) {
-        painted.push(`diagram ${index} paints ${strip.name} its box`);
-      }
+    const ink = differenceOutside(box, shown, hidden);
+    if (ink) {
+      painted.push(
+        `diagram ${index} paints over x ${ink.left}-${ink.right}, y ${ink.top}-${ink.bottom}`
+      );
     }
   }
   assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");

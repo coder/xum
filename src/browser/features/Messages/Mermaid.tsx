@@ -790,8 +790,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         }}
         style={{
           position: "absolute",
-          top: "8px",
-          right: "8px",
+          top: "calc(8px + env(safe-area-inset-top, 0px))",
+          right: "calc(8px + env(safe-area-inset-right, 0px))",
           background: "var(--color-background)",
           border: "1px solid var(--color-border-subtle)",
           color: "var(--color-text)",

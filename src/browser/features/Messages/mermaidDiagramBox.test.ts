@@ -142,6 +142,13 @@ describe("diagramPixelSize dialog", () => {
     expect(lowestScale).toBeLessThanOrEqual(highestScale);
   });
 
+  test("a very wide, short diagram keeps at least one pixel on its short side", () => {
+    expect(diagramPixelSize({ width: 100000, height: 100 }, dialog(PHONE))).toEqual({
+      width: 231,
+      height: 1,
+    });
+  });
+
   test("the tighter axis decides the scale", () => {
     // A phone's room is 231 x 639: the width is tighter for a wide chart.
     expect(diagramPixelSize(STATE_CHART, dialog(PHONE))).toEqual({ width: 231, height: 152 });

@@ -83,8 +83,7 @@ function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
 export function diagramPixelSize(measured: DiagramBox, frame: DiagramFrame): DiagramBox {
   assertFinitePositive(measured, "A diagram needs a finite, positive measured size");
   const scale = diagramScale(measured, frame);
-  return {
-    width: Math.round(measured.width * scale),
-    height: Math.round(measured.height * scale),
-  };
+  // A very wide, short diagram scaled to a narrow room would round to nothing and vanish.
+  const pixels = (side: number) => Math.max(1, Math.round(side * scale));
+  return { width: pixels(measured.width), height: pixels(measured.height) };
 }
