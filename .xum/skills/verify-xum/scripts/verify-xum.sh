@@ -8,6 +8,7 @@
 #   verify-xum.sh open PATH [RUN]  open PATH of the run's UI in its browser session, token in no argv
 #   verify-xum.sh workspace-field NAME FIELD [RUN]  print FIELD of workspace NAME from config.json
 #   verify-xum.sh capture NAME [RUN]  screenshot + ARIA snapshot + URL into the run's evidence
+#   verify-xum.sh webkit-capture PATH NAME [RUN]  phone-width WebKit screenshot + report of PATH
 #   verify-xum.sh idle [RUN]       wait until the page settles, exit 3 if a chunk failed to load
 #   verify-xum.sh send-ready [RUN] wait until the composer's Send button is enabled
 #   verify-xum.sh cleanup [RUN]    stop the run's processes, delete its XUM_ROOT, keep evidence
@@ -608,20 +609,24 @@ cmd_env() {
 # URL carries `?token=` (the app keeps the token and strips it from the address bar). node reads
 # the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
 # is in no process's argv or environment: every local account can read argv.
-cmd_open() {
-  local path=${1:-} out token
-  [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
-  load_run "${2:-}"
-  # Checked before agent-browser runs. A PATH like //host, /\host or /<tab>/host resolves to
-  # another origin: never send the token there. One that normalizes to //... (/..//host) stays on
-  # the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
+# Checked before a browser gets the token. A PATH like //host, /\host or /<tab>/host resolves to
+# another origin: never send the token there. One that normalizes to //... (/..//host) stays on
+# the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
+require_path_on_run_origin() { # require_path_on_run_origin <path>: after load_run
   node -e '
     const [base, path] = process.argv.slice(1);
     const url = new URL(path, base);
     if (url.origin !== new URL(base).origin || url.pathname.startsWith("//")) {
-      process.stderr.write("verify-xum: open PATH must stay on " + base + " and must not start with // once normalized\n");
+      process.stderr.write("verify-xum: PATH must stay on " + base + " and must not start with // once normalized\n");
       process.exit(1);
-    }' "$VERIFY_XUM_URL" "$path" || exit 1
+    }' "$VERIFY_XUM_URL" "$1" || exit 1
+}
+
+cmd_open() {
+  local path=${1:-} out token
+  [[ $path == /* ]] || die "open PATH must start with / (for example /workspace/<id>)"
+  load_run "${2:-}"
+  require_path_on_run_origin "$path"
   # agent-browser serves each session's screen and input as a WebSocket on 127.0.0.1 that every
   # local account can connect to, and a new daemon starts it on its own (no setting keeps it
   # off). Turn it off before the token reaches the browser, on every open because a restarted
@@ -728,9 +733,13 @@ redact_token() { # redact_token [PATH...]
     }' "$@" 3< <(printf %s "$token")
 }
 
+require_evidence_name() { # require_evidence_name <name>
+  [[ $1 =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "NAME must look like <feature>/<step>, lowercase"
+}
+
 cmd_capture() {
   local name=${1:-} base
-  [[ $name =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] || die "capture NAME must look like <feature>/<step>, lowercase"
+  require_evidence_name "$name"
   load_run "${2:-}"
   base="$VERIFY_XUM_EVIDENCE/$name"
   mkdir -p "$(dirname "$base")"
@@ -761,6 +770,148 @@ cmd_send_ready() {
   load_run "${1:-}"
   agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn \
     "document.querySelector('[aria-label=\"Send message\"]')?.disabled === false" >/dev/null
+}
+
+# webkit-capture opens the page in Playwright WebKit, the engine of phone users' Safari. agent-browser
+# drives Chromium, which lays some pages out differently. Playwright is the checkout's locked
+# playwright-core. WebKit needs GTK and GStreamer libraries that many hosts lack, so the helper
+# runs on the host when WebKit launches there, and otherwise in this image. Its browsers are the
+# ones its Playwright version drives, so that version must be the one in package.json: the test
+# scripts/verifyXumWebkit.test.ts and webkit_in_docker check the version. Nothing offline ties a
+# digest to a version. To bump, run `docker pull mcr.microsoft.com/playwright:v<version>-noble`,
+# then `docker image inspect --format '{{index .RepoDigests 0}}'` on it, and set both constants.
+WEBKIT_IMAGE_PLAYWRIGHT_CORE=1.64.1
+WEBKIT_IMAGE=mcr.microsoft.com/playwright@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
+WEBKIT_HELPER=$SCRIPT_DIR/webkit-capture.mjs
+WEBKIT_NOT_LAUNCHED=4 # the helper's exit code when WebKit does not launch
+
+# The helper on the host, with the token on stdin and an allowlisted environment: the bash tool's
+# own carries the live Xum's auth token and provider keys.
+webkit_on_host() { # webkit_on_host <token> <helper args...>
+  local token=$1 host_env
+  shift
+  host_env=(PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" TMPDIR="$VERIFY_XUM_RUN/tmp")
+  [[ -z ${PLAYWRIGHT_BROWSERS_PATH:-} ]] || host_env+=(PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH")
+  printf %s "$token" | timeout -k 10 240 env -i "${host_env[@]}" node "$WEBKIT_HELPER" --mode host "$@"
+}
+
+# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8).
+# Docker echoes a mount path in some errors, and a control character in it could drive your terminal.
+has_control_char() { # has_control_char <string>
+  local LC_ALL=C
+  [[ $1 == *[[:cntrl:]]* || $1 == *$'\xc2'[$'\x80'-$'\x9f']* ]]
+}
+
+# The helper in the pinned image. Trust boundary: --network host lets the container reach every
+# loopback port of this host, the sandbox's backend and its token included. It gets the token on
+# stdin only, runs one file of this repo from a digest-pinned image as your uid with no
+# capabilities and a read-only root, and sees only node_modules (read-only), that file (read-only)
+# and the step's <feature> evidence folder. Returns 125 with WEBKIT_DOCKER_REASON set (the caller declares
+# it) when Docker cannot run it: the code docker itself uses for that.
+webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args...>
+  local token=$1 out_dir=$2 endpoint installed config docker_cli rc=0
+  shift 2
+  local handed_over
+  for handed_over in "$CHECKOUT" "$WEBKIT_HELPER" "$out_dir" "$VERIFY_XUM_RUN"; do
+    if has_control_char "$handed_over"; then
+      WEBKIT_DOCKER_REASON="a folder or file handed to Docker has a control character in its path (not printed: it could drive your terminal)"
+      return 125
+    fi
+  done
+  command -v docker >/dev/null || { WEBKIT_DOCKER_REASON="docker is not installed"; return 125; }
+  # The user's endpoint, resolved once, then an empty private client config: the CLI copies the
+  # `proxies` of its config into every container's environment. A remote endpoint is refused:
+  # --network host would name another machine's network and the token would travel to it.
+  endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=
+  [[ $endpoint == unix:///?* ]] || { WEBKIT_DOCKER_REASON="the Docker endpoint '${endpoint:-unknown}' is not a local socket"; return 125; }
+  installed=$(node -p 'require(process.argv[1]).version' "$CHECKOUT/node_modules/playwright-core/package.json" 2>/dev/null) || installed=
+  if [[ $installed != "$WEBKIT_IMAGE_PLAYWRIGHT_CORE" ]]; then
+    WEBKIT_DOCKER_REASON="node_modules holds playwright-core ${installed:-none}, the image carries ${WEBKIT_IMAGE_PLAYWRIGHT_CORE}: run bun install, or bump WEBKIT_IMAGE in verify-xum.sh"
+    return 125
+  fi
+  # Not a command that can fail quietly: this function runs in a || list, where errexit is off, and
+  # a Docker run without the private config would pass the user's proxies on.
+  config=$(mktemp -d "$VERIFY_XUM_RUN/tmp/docker-config.XXXXXX") || { WEBKIT_DOCKER_REASON="cannot make a folder in $VERIFY_XUM_RUN/tmp"; return 125; }
+  docker_cli=(env -i PATH="$PATH" DOCKER_HOST="$endpoint" DOCKER_CONFIG="$config" docker)
+  if [[ $("${docker_cli[@]}" version --format '{{.Server.Os}}' 2>/dev/null) != linux ]]; then
+    rm -rf "$config"
+    WEBKIT_DOCKER_REASON="no Linux Docker daemon answers at $endpoint"
+    return 125
+  fi
+  # The pull has its own, longer limit: the first one fetches about 2 GB, and the run's limit would
+  # call it a hung capture.
+  if ! "${docker_cli[@]}" image inspect "$WEBKIT_IMAGE" >/dev/null 2>&1 \
+    && { echo "verify-xum: pulling $WEBKIT_IMAGE (about 2 GB, once)." >&2; ! timeout -k 10 1800 "${docker_cli[@]}" pull "$WEBKIT_IMAGE" >&2; }; then
+    rm -rf "$config"
+    WEBKIT_DOCKER_REASON="docker could not pull $WEBKIT_IMAGE"
+    return 125
+  fi
+  printf %s "$token" | timeout -k 10 300 "${docker_cli[@]}" run --rm -i --init \
+    --name "verify-xum-webkit-$VERIFY_XUM_RUN_ID-$$" --network host --user "$(id -u):$(id -g)" \
+    --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,size=512m \
+    -e HOME=/tmp -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    -v "$CHECKOUT/node_modules:$CHECKOUT/node_modules:ro" \
+    -v "$WEBKIT_HELPER:/verify-xum/webkit-capture.mjs:ro" \
+    -v "$out_dir:$out_dir" \
+    "$WEBKIT_IMAGE" node /verify-xum/webkit-capture.mjs --mode docker "$@" || rc=$?
+  rm -rf "$config"
+  return "$rc"
+}
+
+webkit_report() { # webkit_report <evidence base>
+  redact_token "$1.txt"
+  cat "$1.txt"
+  echo "$1.png $1.txt"
+}
+
+cmd_webkit_capture() {
+  local path=${1:-} name=${2:-} mode=${VERIFY_XUM_WEBKIT:-auto} base token output rc=0
+  local host_reason='' WEBKIT_DOCKER_REASON=''
+  [[ $path == /* ]] || die "webkit-capture PATH must start with / (for example /workspace/<id>)"
+  ! has_control_char "$path" || die "webkit-capture PATH must not hold a control character"
+  [[ $mode == auto || $mode == host || $mode == docker ]] || die "VERIFY_XUM_WEBKIT must be auto, host or docker"
+  require_evidence_name "$name"
+  # Docker mounts the folder of the name's last slash, so a name with no folder would mount every file of the evidence.
+  [[ $name == */* ]] || die "webkit-capture NAME must look like <feature>/<step>, lowercase (the container writes into the <feature> folder)"
+  load_run "${3:-}"
+  require_path_on_run_origin "$path"
+  need node timeout
+  [[ -d $VERIFY_XUM_RUN/tmp ]] || die "the run was cleaned up ($VERIFY_XUM_RUN/tmp is gone)"
+  base="$VERIFY_XUM_EVIDENCE/$name-webkit"
+  mkdir -p "$(dirname "$base")"
+  # A failed capture must not leave the last one's files behind as if they were its result. The
+  # .tmp files are the helper's staged names, left only by a helper that was killed.
+  rm -f "$base".{png,txt}{,.tmp}
+  token=$(run_token)
+  local helper_args=(--checkout "$CHECKOUT" --base "$VERIFY_XUM_URL" --path "$path" --out "$base.png"
+    --settled-js "$SETTLED_OR_CHUNK_FAILED_JS" --chunk-failed-js "$CHUNK_LOAD_FAILED_JS")
+
+  if [[ $mode != docker ]]; then
+    output=$(webkit_on_host "$token" "${helper_args[@]}" 2>&1) || rc=$?
+    case $rc in
+      0) webkit_report "$base"; return 0 ;;
+      "$WEBKIT_NOT_LAUNCHED") host_reason=${output#webkit-capture: } ;;
+      124) die "webkit-capture timed out on the host" ;;
+      *) printf '%s\n' "$output" | redact_token >&2; exit "$rc" ;;
+    esac
+  fi
+  if [[ $mode != host ]]; then
+    [[ $mode == docker ]] || echo "verify-xum: WebKit did not launch on this host (${host_reason:0:120}...). Running it in Docker." >&2
+    rc=0
+    webkit_in_docker "$token" "$(dirname "$base")" "${helper_args[@]}" || rc=$?
+    case $rc in
+      0) webkit_report "$base"; return 0 ;;
+      "$WEBKIT_NOT_LAUNCHED" | 125 | 126 | 127) WEBKIT_DOCKER_REASON=${WEBKIT_DOCKER_REASON:-docker run exited $rc (its output is above)} ;;
+      124) die "webkit-capture timed out in Docker" ;;
+      *) exit "$rc" ;;
+    esac
+  fi
+  die "WebKit did not run.
+  Host:   ${host_reason:-not tried (VERIFY_XUM_WEBKIT=docker)}
+  Docker: ${WEBKIT_DOCKER_REASON:-not tried (VERIFY_XUM_WEBKIT=host)}
+Make one of them work:
+  1. Host: run node_modules/.bin/playwright install --with-deps webkit (the locked Playwright; it installs the GTK and GStreamer packages with apt).
+  2. Docker: run a local Docker daemon. It pulls $WEBKIT_IMAGE (Playwright $WEBKIT_IMAGE_PLAYWRIGHT_CORE)."
 }
 
 is_dev_server_sandbox_root() {
@@ -830,8 +981,9 @@ case ${1:-} in
   open) cmd_open "${2:-}" "${3:-}" ;;
   workspace-field) cmd_workspace_field "${2:-}" "${3:-}" "${4:-}" ;;
   capture) cmd_capture "${2:-}" "${3:-}" ;;
+  webkit-capture) cmd_webkit_capture "${2:-}" "${3:-}" "${4:-}" ;;
   idle) cmd_idle "${2:-}" ;;
   send-ready) cmd_send_ready "${2:-}" ;;
   cleanup) cmd_cleanup "${2:-}" ;;
-  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | workspace-field NAME FIELD [RUN] | capture NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
+  *) die "usage: verify-xum.sh launch | doctor [RUN] | env [RUN] | open PATH [RUN] | workspace-field NAME FIELD [RUN] | capture NAME [RUN] | webkit-capture PATH NAME [RUN] | idle [RUN] | send-ready [RUN] | cleanup [RUN]" ;;
 esac

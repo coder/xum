@@ -90,6 +90,8 @@ jobs:
               - '.github/**'
               - 'scripts/**'
               - 'packages/mux-compat/**'
+              # scripts/verifyXumWebkit.test.ts runs the verify-xum skill's helper and reads its script.
+              - '.xum/skills/verify-xum/scripts/**'
               - 'jest.config.js'
               # e2e_tests below lists it too: without it here, `tests` stays false on a
               # Playwright-config-only change and test-e2e never runs.
