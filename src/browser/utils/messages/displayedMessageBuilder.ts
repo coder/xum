@@ -454,10 +454,23 @@ function buildUserDisplayedMessages(options: {
   ];
 }
 
+/**
+ * A text part renders only when it carries non-whitespace content. An interrupted or
+ * stalled stream can persist a whitespace-only delta ("\n"), which is truthy but paints
+ * nothing: it becomes a message block (`mt-4` + `py-1`) with no visible content, i.e. a
+ * blank line above whatever follows it — most visibly above a failed tool call, whose row
+ * auto-expands and draws the eye. The provider request path already drops these parts
+ * (see `dropEmptyText` in modelMessageTransform); the transcript must agree, otherwise the
+ * user sees a gap the model never saw. `trim` also covers a lone zero-width space.
+ */
+function hasDisplayText(text: unknown): boolean {
+  return typeof text === "string" && text.trim().length > 0;
+}
+
 function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
   return (
     part.type === "reasoning" ||
-    (part.type === "text" && Boolean(part.text)) ||
+    (part.type === "text" && hasDisplayText(part.text)) ||
     isDynamicToolPart(part)
   );
 }
@@ -810,7 +823,7 @@ function buildAssistantDisplayedMessages(options: {
       return;
     }
 
-    if (part.type === "text" && part.text) {
+    if (part.type === "text" && hasDisplayText(part.text)) {
       appendAssistantTextRow(displayedMessages, {
         message,
         part,
