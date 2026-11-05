@@ -6,7 +6,7 @@
  * It is refreshed when a goal is set, replaced, edited or completed, when a goal continuation
  * turn starts, and after successful todo_write/propose_plan calls. When the last goal is cleared
  * the board says "No active goal" (a write, not a delete: deletes would need their own
- * containment). It is a live file: no artifact versions are published for it.
+ * containment). It is a live file: the artifact tool does not publish it.
  *
  * Board errors never affect turns: every refresh runs in the background, failures are logged at
  * debug level, and the PR section degrades to "PR status unavailable".

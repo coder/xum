@@ -25,9 +25,8 @@ test(
 
     await screen.getByRole("combobox", "Artifact").focus();
     const stops: string[] = [];
-    // The selected artifact depends on which repros ran before in the shared workspace. One with
-    // stored versions adds the version menu before Annotate, so walk until Reload (or a few
-    // presses past it) and check the stops from Annotate on.
+    // The pin button sits before Annotate, so walk until Reload and check the stops from
+    // Annotate on.
     for (let i = 0; i < 6 && stops.at(-1) !== "Reload artifact"; i++) {
       await browser.keyboard.press("Tab");
       stops.push(

@@ -22,8 +22,6 @@ const WS = "ws-card";
 
 const published = {
   success: true,
-  id: "art-1",
-  version: 3,
   path: "cache-explorer.html",
   bytes: 1200,
   kind: "html",
@@ -51,7 +49,7 @@ describe("artifact chat cards", () => {
     cleanupDom = null;
   });
 
-  test("clicking a published card opens the Artifacts tab at that version", () => {
+  test("clicking a published card opens the Artifacts tab on the file", () => {
     setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const view = render(
       <ArtifactToolCall
@@ -62,8 +60,23 @@ describe("artifact chat cards", () => {
         workspaceId={WS}
       />
     );
-    fireEvent.click(view.getByRole("button", { name: /Open cache-explorer.html version 3/ }));
-    expect(opens).toEqual([{ workspaceId: WS, path: "cache-explorer.html", versionId: 3 }]);
+    fireEvent.click(view.getByRole("button", { name: /Open cache-explorer.html/ }));
+    expect(opens).toEqual([{ workspaceId: WS, path: "cache-explorer.html" }]);
+  });
+
+  test("a result stored before versions were removed still opens the live file", () => {
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    const view = render(
+      <ArtifactToolCall
+        toolName="artifact"
+        args={{ path: "cache-explorer.html" }}
+        result={{ ...published, id: "art-1", version: 3 }}
+        status="completed"
+        workspaceId={WS}
+      />
+    );
+    fireEvent.click(view.getByRole("button", { name: /Open cache-explorer.html/ }));
+    expect(opens).toEqual([{ workspaceId: WS, path: "cache-explorer.html" }]);
   });
 
   test("a failed publish renders as an error card, not a link", () => {
@@ -102,7 +115,7 @@ describe("artifact chat cards", () => {
     );
     live.rerender(completed);
     live.rerender(completed);
-    expect(opens).toEqual([{ workspaceId: WS, path: "cache-explorer.html", versionId: 3 }]);
+    expect(opens).toEqual([{ workspaceId: WS, path: "cache-explorer.html" }]);
     live.unmount();
 
     // History replay: the card mounts with its result already present.
@@ -123,7 +136,7 @@ describe("artifact chat cards", () => {
     const view = render(card());
     view.rerender(card(published));
     // Same as a host without the panel: the card stays, clicking it dispatches nothing.
-    fireEvent.click(view.getByRole("button", { name: /cache-explorer.html version 3/ }));
+    fireEvent.click(view.getByRole("button", { name: /cache-explorer.html/ }));
     expect(opens).toEqual([]);
   });
 
@@ -144,7 +157,7 @@ describe("artifact chat cards", () => {
     );
     const view = render(card());
     view.rerender(card(published));
-    fireEvent.click(view.getByRole("button", { name: /cache-explorer.html version 3/ }));
+    fireEvent.click(view.getByRole("button", { name: /cache-explorer.html/ }));
     expect(opens).toEqual([]);
   });
 

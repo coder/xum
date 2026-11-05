@@ -7,7 +7,7 @@ function refocusIfFallen(element: HTMLElement) {
 
 /**
  * Focuses `element` whenever focus falls to <body> while it is shown, e.g. with a removed node:
- * a control that unmounts while focused (a viewer swapped for a new version, a closing comment
+ * a control that unmounts while focused (a viewer swapped for a rewritten file, a closing comment
  * box), or a portaled menu outside it (#5715). Watches all of <body> for that. Returns the undo.
  *
  * Used by Artifacts fullscreen and App View maximize, which cover the window (or the workspace

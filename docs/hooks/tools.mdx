@@ -308,11 +308,11 @@ If a value is too large for the environment or contains a NUL byte, Xum omits it
 
 | Env var                | JSON path | Type    | Description                                                                                                        |
 | ---------------------- | --------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
-| `XUM_TOOL_INPUT_FOCUS` | `focus`   | boolean | Open the Artifacts tab on this version.                                                                            |
+| `XUM_TOOL_INPUT_FOCUS` | `focus`   | boolean | Open the Artifacts tab on this file.                                                                               |
 | `XUM_TOOL_INPUT_KIND`  | `kind`    | enum    | Viewer; default by file extension.                                                                                 |
 | `XUM_TOOL_INPUT_PATH`  | `path`    | string  | Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it.                                                     |
 | `XUM_TOOL_INPUT_PIN`   | `pin`     | enum    | Also copy it to the project or global shelf for later agents' artifact_read; re-pinning a path replaces its entry. |
-| `XUM_TOOL_INPUT_TITLE` | `title`   | string  | Version label. Default: file name.                                                                                 |
+| `XUM_TOOL_INPUT_TITLE` | `title`   | string  | Card title. Default: file name.                                                                                    |
 
 </details>
 

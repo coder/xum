@@ -17,8 +17,8 @@ test(
     await browser.keyboard.press("Control+Shift+K");
     await expect(screen.getByTestId("artifacts-panel")).toBeFocused();
 
-    // guide.html is seeded by startApp.ts. It has no stored version and the seed's options.html
-    // does, so the picker lists guide.html under the collapsed "Other files" group.
+    // guide.html is seeded by startApp.ts. It is not published and the seed's options.html is,
+    // so the picker lists guide.html under the collapsed "Other files" group.
     await screen.getByRole("combobox", "Artifact").tap();
     await screen.getByRole("option", /^Show \d+ other files?$/).tap();
     await screen.getByRole("option", "guide.html").tap();

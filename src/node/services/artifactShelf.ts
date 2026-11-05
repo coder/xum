@@ -17,7 +17,7 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { parseArtifactRelativePath } from "./artifactStore";
 
 /**
- * Cross-workspace artifact shelf (Artifacts M5c): pinned artifact versions shared by every
+ * Cross-workspace artifact shelf (Artifacts M5c): pinned artifact copies shared by every
  * workspace of a project (project shelf) or by every workspace (global shelf).
  *
  * Layout, host-local like memory (so SSH and Docker workspaces share it with no extra work):
@@ -26,7 +26,7 @@ import { parseArtifactRelativePath } from "./artifactStore";
  *
  * Deliberately NOT under /memories: memory files feed the memory index and the
  * consolidation agent, which may rewrite or delete them. An entry is a byte copy of
- * one published version, so the shelf never changes under a reader; pinning the same artifact
+ * the file at pin time, so the shelf never changes under a reader; pinning the same artifact
  * path from the same workspace again replaces its entry (see chooseShelfEntryName). Agents write the shelf only through the
  * `artifact` tool's pin; everything else is read-only for them.
  */
@@ -55,7 +55,6 @@ const ShelfMetaSchema = z.object({
   sourceWorkspaceId: z.string().max(1024),
   /** POSIX path relative to the source workspace's artifacts dir. */
   sourcePath: z.string().max(4096),
-  version: z.number().int().positive(),
   title: z.string().max(MAX_SHELF_TITLE_LENGTH),
   kind: ArtifactKindSchema,
   // Inside the Date range: listings format it with toISOString, which throws on a finite but
@@ -177,7 +176,7 @@ export interface PinToShelfParams {
 }
 
 /**
- * Copy one version into the shelf. It replaces only its own earlier pin (see
+ * Copy one artifact's bytes into the shelf. It replaces only its own earlier pin (see
  * chooseShelfEntryName); any other entry keeps its bytes.
  */
 export async function pinToShelf(
@@ -394,7 +393,6 @@ export async function listShelfScope(
           title: meta.title,
           kind: meta.kind,
           size: stat.size,
-          version: meta.version,
           sourceWorkspaceId: meta.sourceWorkspaceId,
           sourcePath: meta.sourcePath,
           pinnedAtMs: meta.pinnedAtMs,

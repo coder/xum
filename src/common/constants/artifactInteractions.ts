@@ -13,7 +13,7 @@ export const ARTIFACT_SEND_TEXT_MAX_CHARS = 4000;
 export const ARTIFACT_CLICK_SEND_WINDOW_MS = 5000;
 /** Serialized JSON size cap for `send` data and `setState` state. */
 export const ARTIFACT_JSON_MAX_BYTES = 16 * 1024;
-/** artifact_list shows at most this much of the latest version's state. */
+/** artifact_list shows at most this much of an artifact's state. */
 export const ARTIFACT_STATE_SUMMARY_MAX_CHARS = 2048;
 /** Selected text captured by annotate mode inside a sandboxed frame. */
 export const ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS = 500;

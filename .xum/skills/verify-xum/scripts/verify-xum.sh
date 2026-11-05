@@ -448,13 +448,30 @@ launch_failed() {
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
+# Refuses when a socket that listens on PORT is not on a loopback address. A .env line such as
+# XUM_VITE_HOST=0.0.0.0 makes a server listen on every interface, and Vite then answers
+# http://<this machine's IP>:<port>/ (an IP-address Host passes its check). Launch runs it while
+# it waits for readiness too: a server on one non-loopback address never answers the loopback
+# probes, and launch would otherwise wait for its deadline. With "ready" it also refuses when
+# nothing listens on PORT: the server answered a probe there, so ss cannot see its sockets.
+refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what listens there> [ready]
+  local addr addrs
+  addrs=$(ss -Hltn "sport = :$1" 2>/dev/null) || die "ss failed, so launch cannot check which addresses $2 listens on"
+  addrs=$(awk '{print $4}' <<<"$addrs")
+  [[ -n $addrs || ${3-} != ready ]] || die "ss shows nothing listening on $2's port $1, so launch cannot check that only loopback reaches it"
+  while read -r addr; do
+    [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
+      || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets its host (XUM_VITE_HOST, MUX_VITE_HOST, VITE_HOST, XUM_BACKEND_HOST, MUX_BACKEND_HOST or BACKEND_HOST): remove that line."
+  done <<<"$addrs"
+}
+
 # The process group id that the new group's leader appended to state.env, if it has.
 recorded_pgid() {
   sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1
 }
 
 cmd_launch() {
-  local t0 backend_port vite_port log existing token leader
+  local t0 backend_port vite_port allowed_hosts log existing token leader
   need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -537,13 +554,19 @@ cmd_launch() {
     VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$log")
     backend_port=$(sed -n 's|^  Backend: *http://127.0.0.1:||p' "$log")
     vite_port=$(sed -n 's|^  Frontend: *http://localhost:||p' "$log")
-    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port ]] && break
+    allowed_hosts=$(sed -n 's/^  Allowed hosts: *//p' "$log")
+    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port && -n $allowed_hosts ]] && break
     group_alive "$VERIFY_XUM_PGID" || die "make dev-server-sandbox exited during startup"
     before_launch_deadline
     sleep 0.5
   done
   # The recipes assume default preferences. With both --clean flags the sandbox copies no config.
   grep -q '^  Seed config: *(none)$' "$log" || die "the sandbox copied a config.json, so the run would not start from default preferences"
+  # Vite's Host check is the DNS-rebinding guard. env -i drops VITE_ALLOWED_HOSTS and the
+  # port-forward proxy variables, but Bun loads the checkout's .env files (.env, .env.local,
+  # .env.development, .env.development.local) into the sandbox script, and they can set them again.
+  [[ $allowed_hosts == "loopback only" ]] \
+    || die "the sandbox allows the Host headers '$allowed_hosts' besides loopback, so a web page that rebinds its DNS name to this machine could read the app. A .env file in $CHECKOUT sets VITE_ALLOWED_HOSTS or a proxy URI: remove that line."
   VERIFY_XUM_BACKEND="http://127.0.0.1:$backend_port"
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
@@ -552,12 +575,22 @@ cmd_launch() {
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
+    refuse_off_loopback_listener "$vite_port" Vite
+    refuse_off_loopback_listener "$backend_port" "the backend"
     sleep 1
   done
+  refuse_off_loopback_listener "$vite_port" Vite ready
+  refuse_off_loopback_listener "$backend_port" "the backend" ready
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  [[ -z $token ]] || (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
+  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
+  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
+  # a token any local account, and a web page that rebinds its DNS name to this machine, can
+  # call its API.
+  [[ -n $token ]] \
+    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
+  (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
 
   seed
   warm_vite_modules
@@ -816,11 +849,22 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
   printf %s "$token" | timeout -k 10 240 env -i "${host_env[@]}" node "$WEBKIT_HELPER" --mode host "$@"
 }
 
-# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8).
-# Docker echoes a mount path in some errors, and a control character in it could drive your terminal.
+# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8),
+# or is not well-formed UTF-8. Docker echoes a mount path in some errors, and a control character in
+# it could drive your terminal.
 has_control_char() { # has_control_char <string>
-  local LC_ALL=C
-  [[ $1 == *[[:cntrl:]]* || $1 == *$'\xc2'[$'\x80'-$'\x9f']* ]]
+  local LC_ALL=C text=$1 cont=[$'\x80'-$'\xbf']
+  [[ $text == *[[:cntrl:]]* || $text == *$'\xc2'[$'\x80'-$'\x9f']* ]] && return 0
+  # Each well-formed sequence (RFC 3629: no overlong form, no surrogate, nothing above U+10FFFF)
+  # becomes an ASCII "x", so its neighbours cannot join into a new sequence. A byte left is malformed.
+  text=${text//[$'\xc2'-$'\xdf']$cont/x}
+  text=${text//$'\xe0'[$'\xa0'-$'\xbf']$cont/x}
+  text=${text//[$'\xe1'-$'\xec'$'\xee'$'\xef']$cont$cont/x}
+  text=${text//$'\xed'[$'\x80'-$'\x9f']$cont/x}
+  text=${text//$'\xf0'[$'\x90'-$'\xbf']$cont$cont/x}
+  text=${text//[$'\xf1'-$'\xf3']$cont$cont$cont/x}
+  text=${text//$'\xf4'[$'\x80'-$'\x8f']$cont$cont/x}
+  [[ $text == *[$'\x80'-$'\xff']* ]]
 }
 
 # The helper in the pinned image. Trust boundary: --network host lets the container reach every
@@ -844,8 +888,15 @@ webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args..
   # `proxies` of its config into every container's environment. A remote endpoint is refused:
   # --network host would name another machine's network and the token would travel to it.
   endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=
+  if has_control_char "$endpoint"; then
+    WEBKIT_DOCKER_REASON="the Docker endpoint has a control character (not printed: it could drive your terminal)"
+    return 125
+  fi
   [[ $endpoint == unix:///?* ]] || { WEBKIT_DOCKER_REASON="the Docker endpoint '${endpoint:-unknown}' is not a local socket"; return 125; }
   installed=$(node -p 'require(process.argv[1]).version' "$CHECKOUT/node_modules/playwright-core/package.json" 2>/dev/null) || installed=
+  if has_control_char "$installed"; then
+    installed="a version with a control character (not printed: it could drive your terminal)"
+  fi
   if [[ $installed != "$WEBKIT_IMAGE_PLAYWRIGHT_CORE" ]]; then
     WEBKIT_DOCKER_REASON="node_modules holds playwright-core ${installed:-none}, the image carries ${WEBKIT_IMAGE_PLAYWRIGHT_CORE}: run bun install, or bump WEBKIT_IMAGE in verify-xum.sh"
     return 125

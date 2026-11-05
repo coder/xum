@@ -434,7 +434,6 @@ describe("QueuedMessage banner", () => {
             id: "i-1",
             artifactPath: "form.html",
             title: "Form",
-            version: 2,
             action: "send",
             text: "Ship it",
           },
