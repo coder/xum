@@ -34,25 +34,37 @@ export function showOneLineControls(text: string): string {
   return text.replace(ONE_LINE_CONTROLS, markControl);
 }
 
+/** Tag characters of a string: U+E0000 plus each ASCII code point. */
+const tagCharacters = (ascii: string): string =>
+  [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+/**
+ * The only subdivision flags Unicode defines (CLDR RGI): England, Scotland, Wales. Exposed as a
+ * pattern source so the transcript and the plugin-name guard cannot disagree about which tag
+ * sequences a font actually draws -- any other sequence renders as a plain black flag, so its tags
+ * are a hidden payload rather than an emoji.
+ */
+export const RGI_SUBDIVISION_FLAG_PATTERN = `\u{1f3f4}(?:${["gbeng", "gbsct", "gbwls"]
+  .map(tagCharacters)
+  .join("|")})\u{e007f}`;
+
 /**
  * Unicode tag characters (U+E0020-U+E007F, plus the U+E0000 cancel tag): default-ignorables that
  * stand on their own and map one-to-one onto ASCII, so a run of them spells a message no renderer
  * shows. They are deprecated and no chat or code text holds them legitimately.
  *
- * One legitimate use exists and must survive untouched: a subdivision flag is U+1F3F4 (the black
- * flag) followed by two to five lowercase-letter/digit tags and terminated by U+E007F, e.g. the
- * England flag. Its tags ARE the emoji, so marking them would replace a rendered flag with
- * `<U+E0067><U+E0062>...` — and since copy and Edit consume the displayed text, that would also
- * corrupt what the user copies or re-sends. Listed first so the alternation consumes the whole
- * sequence before the tag branch can reach its members.
+ * The one legitimate use is an RGI subdivision flag, whose tags ARE the emoji. Marking those would
+ * replace a rendered flag with `<U+E0067>...` and, because Copy and Edit consume the displayed
+ * text, corrupt what the user copies or re-sends. The flag branch is listed first so the
+ * alternation consumes the whole flag before the tag branch can reach its members. Any other tag
+ * sequence -- `usca`, say -- is not a flag any font draws, so it stays a payload and is revealed.
  */
-const TAG_OR_SUBDIVISION_FLAG =
-  /[\u{1F3F4}][\u{E0061}-\u{E007A}\u{E0030}-\u{E0039}]{2,5}[\u{E007F}]|[\u{E0000}\u{E0020}-\u{E007F}]/gu;
+const TAG_OR_RGI_SUBDIVISION_FLAG = new RegExp(
+  `(${RGI_SUBDIVISION_FLAG_PATTERN})|[\u{E0000}\u{E0020}-\u{E007F}]`,
+  "gu"
+);
 
-/** A well-formed subdivision flag (black flag + tag sequence + cancel), left as one emoji. */
-const SUBDIVISION_FLAG = /[\u{1F3F4}][\u{E0061}-\u{E007A}\u{E0030}-\u{E0039}]{2,5}[\u{E007F}]/gu;
-
-/** The black-flag base a subdivision flag's tag sequence attaches to. */
+/** The black-flag base an RGI subdivision flag's tag sequence attaches to. */
 const BLACK_FLAG = String.fromCodePoint(0x1f3f4);
 
 /**
@@ -64,17 +76,18 @@ const BLACK_FLAG = String.fromCodePoint(0x1f3f4);
  * and marking those would mangle ordinary text.
  */
 export function revealUnicodeTags(text: string): string {
-  return text.replace(TAG_OR_SUBDIVISION_FLAG, (matched) =>
-    // The flag branch is the only one that can start with the black flag; every other match is a
-    // single tag character, which becomes its mark.
+  return text.replace(TAG_OR_RGI_SUBDIVISION_FLAG, (matched) =>
+    // Only the RGI-flag branch can start with the black flag; every other match is a single tag.
     matched.startsWith(BLACK_FLAG) ? matched : markControl(matched)
   );
 }
 
 /**
- * Whether `text` hides an ASCII payload in tag characters. Well-formed subdivision flags are not a
- * payload: they are the England/Scotland/Wales emoji, which a renderer shows.
+ * Whether `text` hides an ASCII payload in tag characters. RGI subdivision flags are not a payload:
+ * they are the England/Scotland/Wales emoji, which a font draws.
  */
 export function containsUnicodeTags(text: string): boolean {
-  return /[\u{E0000}\u{E0020}-\u{E007F}]/u.test(text.replace(SUBDIVISION_FLAG, ""));
+  return new RegExp("[\u{E0000}\u{E0020}-\u{E007F}]", "u").test(
+    text.replace(new RegExp(RGI_SUBDIVISION_FLAG_PATTERN, "gu"), "")
+  );
 }

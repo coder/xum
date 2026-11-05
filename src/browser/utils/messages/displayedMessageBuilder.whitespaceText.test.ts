@@ -41,6 +41,15 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     }
   });
 
+  test("drops a text row carrying only control characters", () => {
+    // A persisted U+0007 (BEL) is neither whitespace nor default-ignorable, so the class needs
+    // \p{Cc} explicitly -- otherwise the same blank row survives.
+    for (const control of ["\u0007", "\u0000", "\u001b[0m".slice(0, 1), "\n\u0007"]) {
+      const displayed = rows([{ type: "text", text: control }, FAILED_BASH]);
+      expect(displayed.map((row) => row.type)).toEqual(["tool"]);
+    }
+  });
+
   test("keeps content that merely contains invisible characters or emoji", () => {
     // ZWJ, variation selectors and skin-tone modifiers are default-ignorables or
     // marks, so a predicate over classes must not mistake the sequence for one.
@@ -148,6 +157,17 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
       const displayed = rows([{ type: "text", text: `ship ${flag}` }, FAILED_BASH]);
       expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(`ship ${flag}`);
     }
+  });
+
+  test("reveals a non-RGI tag sequence, which no font draws as a flag", () => {
+    // Only gbeng/gbsct/gbwls are RGI. A black flag plus other tags renders as a plain black flag,
+    // so its tags are a hidden payload and must not be exempted as if they were an emoji.
+    const disguised = `\u{1F3F4}${tags("usca")}\u{E007F}`;
+    const displayed = rows([{ type: "text", text: disguised }, FAILED_BASH]);
+
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
+      `\u{1F3F4}<U+E0075><U+E0073><U+E0063><U+E0061><U+E007F>`
+    );
   });
 
   test("reveals a payload hidden alongside a real subdivision flag", () => {

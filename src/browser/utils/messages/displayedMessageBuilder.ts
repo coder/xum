@@ -463,9 +463,11 @@ function buildUserDisplayedMessages(options: {
  * and draws the eye.
  *
  * `trim()` alone is not enough: it leaves default-ignorables (U+200B zero-width space, U+2060
- * word joiner, U+FEFF) intact, and those paint nothing either, so the gap would survive. Same
- * class the plugin-text guard already recognizes (`agentPluginReviewText.ts`). NBSP is `\s` to
- * `trim`, so it needs no extra branch.
+ * word joiner, U+FEFF) intact, and those paint nothing either, so the gap would survive. Control
+ * characters are in for the same reason — a persisted U+0007 (BEL) is neither whitespace nor
+ * default-ignorables but draws no glyph, and the review-text guard already classifies them as
+ * invisible. Same class family as `agentPluginReviewText.ts`. NBSP is `\s` to `trim`, so it needs
+ * no extra branch.
  *
  * Unicode MARKS are deliberately NOT in here. `\p{M}` looks like the invisible-without-a-base
  * class, but it also covers spacing marks (`General_Category=Mc`, e.g. U+0903 DEVANAGARI SIGN
@@ -485,7 +487,7 @@ function buildUserDisplayedMessages(options: {
  * The provider request path drops whitespace-only parts too (`dropEmptyText` in
  * modelMessageTransform); the transcript must not render a gap the model never saw.
  */
-const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}]*$/u;
+const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}\p{Cc}]*$/u;
 
 function hasDisplayText(text: unknown): boolean {
   if (typeof text !== "string") return false;
