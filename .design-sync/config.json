@@ -262,6 +262,7 @@
     "AboutDialog": {
       "cardMode": "single",
       "primaryStory": "BlockedPhone",
+      "viewport": "375x667",
       "skip": [
         "features-about-server-updates--restarting-closes-dialog"
       ]
@@ -335,7 +336,8 @@
         "features-settings-sections-pluginssettingssection--component-review-intent-not-replayed-on-reconnect",
         "features-settings-sections-pluginssettingssection--component-review-intent-waits-for-live-connection",
         "features-settings-sections-pluginssettingssection--cursor-hooks-review",
-        "features-settings-sections-pluginssettingssection--cursor-hooks-review-phone-viewport"
+        "features-settings-sections-pluginssettingssection--cursor-hooks-review-phone-viewport",
+        "features-settings-sections-pluginssettingssection--themed-logo-light"
       ]
     },
     "PromptCacheHealth": {

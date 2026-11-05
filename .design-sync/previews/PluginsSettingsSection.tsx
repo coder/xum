@@ -541,13 +541,9 @@ export const ThemedLogoDark = () => (
   <Section options={{ agentPlugins: { items: THEMED_LOGO_ITEMS } }} />
 );
 
-/**
- * Light theme in the story (globals.theme). The gallery forces the card's theme from outside,
- * so this cell follows the gallery theme (dark by default) rather than forcing light.
- */
-export const ThemedLogoLight = () => (
-  <Section options={{ agentPlugins: { items: THEMED_LOGO_ITEMS } }} />
-);
+// ThemedLogoLight is skipped in config.json: every card renders inside the forced-dark
+// cfg.provider ThemeProvider, and nested ThemeProviders defer to a forced parent, so a
+// light cell cannot be rendered here. It would only duplicate ThemedLogoDark.
 
 const PENDING_SIGN_OUT_URL =
   "https://mcp.example-identity-provider-with-a-long-host-name.com/tenants/acme-production/mcp";

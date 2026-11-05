@@ -90,7 +90,7 @@ per component, in `.design-sync/previews/<RealName>.tsx`:
   the shell; do NOT remove it. (No-op for modals: fixed content floors scrollH at
   the viewport.)
 - `cfg.storyImports.shim: ["/src/browser/"]` routes component/provider imports to
-  `window.Xum` (the prebuilt bundle) so previews stay thin (~3.3 MB) and share
+  `window.Xum` (the prebuilt bundle) so previews stay thin (2.9–3.4 MB) and share
   React-context identity; `cfg.storyImports.bundle: ["/src/browser/stories/"]`
   keeps the mock client compiling from source (it's data).
 - Components export REAL names (no alias); `cfg.titleMap` maps title segments →
@@ -108,9 +108,13 @@ mermaid+cytoscape ~3 MB, recharts, ghostty, the whole app via `<AppWithMocks>`).
 novnc/katex stub trick doesn't generalize.
 
 Per the user's "curate the largest fitting set" decision, the barrel excludes
-**48 of 73** titles (`gen-barrel.mjs` EXCLUDE\_\* lists, mirrored as `titleMap`
-nulls). **25 components** remain — bundle **~4.7 MB**, every preview ~3.3 MB,
-all render cleanly (25/25 render check).
+titles through the `gen-barrel.mjs` EXCLUDE\_\* lists, mirrored as `titleMap` nulls.
+As of the v0.32.1 sync, the 148 storybook titles split into **54 components**, **53
+excluded** titles, and 41 that resolve to no single component (mostly
+`App.*` screens). Bundle **~4.3 MB**; previews 2.9–3.4 MB; all 54 render (54/54 render
+check). These sizes come from an esbuild IIFE build of the barrel with the same
+shims; re-measure through the converter if you are near the cap. (The first sync
+kept 25 of 73 titles; the counts in the list below are the list lengths now.)
 
 - **EXCLUDE_EMPTY (5):** BackgroundProcessesBanner, MemoryTab, ModelSelector,
   MultiProjectGitStatusIndicator, WorkspaceMCPModal — render BLANK in an isolated
@@ -119,16 +123,18 @@ all render cleanly (25/25 render check).
   populate synchronously. Two had per-preview store-wiring attempts that still
   rendered empty (async, not a quick fix). Deferred until the harness can drive
   those stores + await their loads.
-- **EXCLUDE_HEAVY (23):** pull shiki/mermaid/recharts/d3/ghostty/lottie — verify
+- **EXCLUDE_HEAVY (32):** pull shiki/mermaid/recharts/d3/ghostty/lottie — verify
   with the scratch sizing scripts before re-including any.
-- **EXCLUDE_OVERSIZED (15):** light deps but large source closures (sidebars,
+- **EXCLUDE_OVERSIZED (14):** light deps but large source closures (sidebars,
   AgentListItem, Bash, the big settings sections) → previews >5 MB or bundle
   over cap.
-- **EXCLUDE_APP_SCREEN (5):** full-app screens, no single component.
+- **EXCLUDE_PENDING (2):** storied after the last sync and light, but no owned
+  preview yet (see "Re-sync to v0.32.1" below).
+- **EXCLUDE_APP_SCREEN (4):** full-app screens, no single component.
 
 > Re-sync watch: if heavy deps shrink (e.g. shiki lazy-loaded) or components are
-> refactored lighter, re-measure and consider re-including. Headroom is only
-> ~0.5 MB, so adding components needs a fresh union measurement first.
+> refactored lighter, re-measure and consider re-including. Bundle headroom is
+> ~0.7 MB at v0.32.1, so adding components needs a fresh union measurement first.
 
 To re-measure: the sizing scripts used were ad-hoc (component closure + union
 size via esbuild metafile). Re-derive from `gen-barrel.mjs`'s export list if
@@ -160,8 +166,9 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
 - **novnc/katex stubs:** if Mux swaps these libs or the desktop/markdown wiring
   changes, revisit the `tsconfig.ds.json` stubs.
 - **Per-file 5 MB cap** applies to BOTH `_ds_bundle.js` and each `_preview/*.js`.
-  Bundle ~4.7 MB and previews ~3.3 MB leave thin headroom — adding components or
-  providers needs a fresh size measurement. (HeartbeatToolCall added: bundle 4.69 MB,
+  At v0.32.1 the bundle is ~4.3 MB and previews 2.9–3.4 MB — adding components or
+  providers still needs a fresh size measurement. (History, before the v0.32.1 sync:
+  HeartbeatToolCall added: bundle 4.69 MB,
   its preview 3.21 MB. WorkspaceLifecycleToolCall added: bundle **4.71 MB**, its preview
   3.22 MB — both still fit, headroom now **~0.29 MB**. Tool cards share deps
   (ToolPrimitives/toolUtils/lucide/the tool schema), so each new one adds only ~tens of KB
@@ -227,7 +234,7 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
 - **`[TOKENS_MISSING]` (9 vars, e.g. `--color-text-primary`, `--color-card`,
   `--radix-…`):** these are referenced via Tailwind arbitrary-value utilities but
   **never defined in Mux's own source CSS** (radix runtime vars + dangling/
-  runtime-set tokens). Not introduced by the sync. All 25 previews render
+  runtime-set tokens). Not introduced by the sync. All 54 previews render
   correctly (verified in `_screenshots/`), so accepted. If a future component
   visibly mis-colors, ship globals.css's `:root[data-theme]` blocks via cfg.
 - **`[FONT_MISSING]` "Ubuntu Mono":** an unreached fallback in a `'Geist Mono',
@@ -271,4 +278,13 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
   "(project/global AGENTS.md …". A card must then load its story script as
   `project/_preview/<Name>.js`; a card-relative `../../_preview/<Name>.js` never loads, and
   every card shows "no PascalCase exports".
+- **AboutDialog viewport:** its primary story, BlockedPhone, is a fixed, portaled dialog,
+  so an inner wrapper can't make it phone-width. `cfg.overrides.AboutDialog.viewport`
+  captures it at the story's `mobile1` viewport (375x667) instead.
+- **ThemedLogoLight skipped:** every card renders inside the forced-dark
+  `cfg.provider` ThemeProvider, and a nested ThemeProvider defers to a forced parent, so
+  a light-theme cell can't be rendered; it would only duplicate ThemedLogoDark.
+- **ArtifactToolCall client:** the harness's `APIProvider` reconnects `AppConfigStore` to
+  the client it is given, so the preview passes its experiment-enabled client to
+  `MuxPreviewShell` instead of only setting it on the store.
 - **Sizes at this sync:** bundle 4.3 MB; each preview about 2.9–3.4 MB (the cap is 5 MB).

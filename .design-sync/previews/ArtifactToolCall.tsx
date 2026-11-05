@@ -79,16 +79,21 @@ function Gallery() {
   );
 }
 
+// One experiment-enabled client, shared by the store and the shell. The shell's APIProvider
+// reconnects AppConfigStore to whatever client it gets, so handing it a different (empty)
+// mock would turn the experiment back off and disable every card.
+const ARTIFACTS_CLIENT = createMockORPCClient({
+  experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+});
+
 function enableArtifacts() {
-  getAppConfigStore().setClient(
-    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } })
-  );
+  getAppConfigStore().setClient(ARTIFACTS_CLIENT);
 }
 
 export const GalleryLaptop = () => {
   enableArtifacts();
   return (
-    <MuxPreviewShell>
+    <MuxPreviewShell client={ARTIFACTS_CLIENT}>
       <div className="bg-background text-foreground p-4">
         <Gallery />
       </div>
@@ -100,7 +105,7 @@ export const GalleryLaptop = () => {
 export const GalleryPhone = () => {
   enableArtifacts();
   return (
-    <MuxPreviewShell>
+    <MuxPreviewShell client={ARTIFACTS_CLIENT}>
       <div className="bg-background text-foreground p-4" style={{ width: 390 }}>
         <Gallery />
       </div>
