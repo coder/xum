@@ -1,0 +1,179 @@
+import { afterEach, describe, expect, test } from "bun:test";
+
+import { findModuleUrls, warmModuleGraph } from "./warmViteModules";
+
+type Handler = (url: URL) => Response | Promise<Response>;
+
+const servers: { stop: (force?: boolean) => void }[] = [];
+
+afterEach(() => {
+  for (const server of servers.splice(0)) server.stop(true);
+});
+
+function js(source: string): Response {
+  return new Response(source, { headers: { "content-type": "text/javascript" } });
+}
+
+/** A stand-in for Vite: `routes` maps a path (with its query) to a handler. Records each request. */
+function serve(routes: Record<string, Handler>): { origin: string; requests: string[] } {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(request) {
+      const url = new URL(request.url);
+      const key = url.pathname + url.search;
+      requests.push(key);
+      const handler = routes[key];
+      return handler ? await handler(url) : new Response("not found", { status: 404 });
+    },
+  });
+  servers.push(server);
+  return { origin: `http://127.0.0.1:${server.port}`, requests };
+}
+
+const INDEX_HTML = `<!doctype html><html><head>
+<script type="module">import RefreshRuntime from "/@react-refresh"; RefreshRuntime.injectIntoGlobalHook(window);</script>
+<script type="module" src="/@vite/client"></script></head><body>
+<script type="module" src="/src/main.tsx"></script></body></html>`;
+
+describe("findModuleUrls", () => {
+  test("reads the import forms that Vite serves, and only same-origin paths", () => {
+    const urls = findModuleUrls(`
+      import React from "/node_modules/.vite/deps/react.js?v=abc123";
+      import {
+        a,
+        b,
+      } from "/src/multi.ts";
+      import "/src/styles/globals.css";
+      export * from "/src/reexport.ts";
+      export { c } from "/src/named.ts";
+      const lazy = () => import("/src/lazy.tsx");
+      import bare from "react-dom";
+      import cdn from "//cdn.example.com/x.js";
+      import remote from "https://example.com/y.js";
+      const doc = "React.lazy(() => import(...))";
+    `);
+    expect(urls.sort()).toEqual([
+      "/node_modules/.vite/deps/react.js?v=abc123",
+      "/src/lazy.tsx",
+      "/src/multi.ts",
+      "/src/named.ts",
+      "/src/reexport.ts",
+      "/src/styles/globals.css",
+    ]);
+  });
+});
+
+describe("warmModuleGraph", () => {
+  test("serves static and dynamic modules once each, cycles included, and waits for the slowest", async () => {
+    let slowAnswered = false;
+    const { origin, requests } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/@react-refresh": () => js("export default {}"),
+      "/@vite/client": () => js("export {}"),
+      "/src/main.tsx": () =>
+        js(`import "/src/a.ts"; const lazy = () => import("/src/lazy.tsx"); export {}`),
+      // a.ts imports main.tsx back: the walk must end.
+      "/src/a.ts": () =>
+        js(`import "/src/main.tsx"; import "/src/shared.ts"; import "/src/slow.ts"; export {}`),
+      "/src/lazy.tsx": () =>
+        js(`import "/src/shared.ts"; import "/node_modules/.vite/deps/react.js?v=abc"; export {}`),
+      "/src/shared.ts": () => js("export {}"),
+      "/node_modules/.vite/deps/react.js?v=abc": () => js("export {}"),
+      "/src/slow.ts": async () => {
+        // Vite answers a module that it has not transformed yet only after the transform.
+        await Bun.sleep(150);
+        slowAnswered = true;
+        return js(`import "/src/after-slow.ts"; export {}`);
+      },
+      "/src/after-slow.ts": () => js("export {}"),
+    });
+
+    const result = await warmModuleGraph(origin);
+
+    // Done only after the slow module's own imports were fetched too.
+    expect(slowAnswered).toBe(true);
+    expect(requests.sort()).toEqual(
+      [
+        "/",
+        "/@react-refresh",
+        "/@vite/client",
+        "/node_modules/.vite/deps/react.js?v=abc",
+        "/src/a.ts",
+        "/src/after-slow.ts",
+        "/src/lazy.tsx",
+        "/src/main.tsx",
+        "/src/shared.ts",
+        "/src/slow.ts",
+      ].sort()
+    );
+    expect(result).toEqual({ served: 10, notFound: 0 });
+  });
+
+  test("ignores a 404 for a string that only looks like an import", async () => {
+    const { origin } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () =>
+        js(`const s = 'import x from "/not/a/module.js"'; import "/src/ok.ts"`),
+      "/src/ok.ts": () => js("export {}"),
+    });
+
+    const result = await warmModuleGraph(origin);
+
+    expect(result.notFound).toBeGreaterThan(0);
+    expect(result.served).toBe(3);
+  });
+
+  test("fails and names the module when Vite answers a transform error", async () => {
+    const { origin } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () => js(`import "/src/broken.tsx"; import "/src/ok.ts"`),
+      "/src/broken.tsx": () => new Response("transform error", { status: 500 }),
+      "/src/ok.ts": () => js("export {}"),
+    });
+
+    const failure = await warmModuleGraph(origin).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("/src/broken.tsx: HTTP 500");
+    expect((failure as Error).message).not.toContain("/src/ok.ts: HTTP");
+  });
+
+  test("never requests another origin, whatever a module's import strings say", async () => {
+    const other = serve({ "/x.js": () => js("export {}") });
+    const otherHost = other.origin.replace("http://", "");
+    const { origin, requests } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      // `/\\host:port/x.js` is a URL on another host: WHATWG URL reads the backslash as a slash.
+      "/src/main.tsx": () =>
+        js(`import "/\\${otherHost}/x.js"; import "/src/ok.ts"; import "//${otherHost}/x.js"`),
+      "/src/ok.ts": () => js("export {}"),
+    });
+
+    const result = await warmModuleGraph(origin);
+
+    // Nothing reaches the other host, and Vite does not get the other host's path either.
+    expect(other.requests).toEqual([]);
+    expect(requests).not.toContain("/x.js");
+    expect(result.served).toBe(3);
+  });
+
+  test("gives up when the signal aborts while Vite never answers", async () => {
+    const { origin } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () => new Promise<Response>(() => {}),
+    });
+
+    const failure = await warmModuleGraph(origin, { signal: AbortSignal.timeout(300) }).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).toBe("TimeoutError");
+  });
+});
