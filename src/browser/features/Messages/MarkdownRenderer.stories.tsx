@@ -276,41 +276,51 @@ function measureDiagram(canvasElement: HTMLElement): DiagramGeometry {
   };
 }
 
-/** Rounding the pixel size may bend the aspect ratio and the zoom step by this much. */
+/** The box and the zoom step are whole pixels, so they differ from the exact values by this much. */
 const PIXEL_TOLERANCE = 1.5;
 
-/** The boxes a reader sees agree: nothing paints outside the frame that holds the diagram. */
-function expectDiagramInsideFrame(geometry: DiagramGeometry) {
-  const { svg, container, frame, drawing } = geometry;
-  // The box has the drawing's proportions, so the drawing fills it instead of sitting inside
-  // a letterboxed or stretched one.
-  expect(Math.abs(svg.height - (svg.width * drawing.height) / drawing.width)).toBeLessThanOrEqual(
-    PIXEL_TOLERANCE
+/** The box is the drawing scaled by one factor, up to the rounding of each side to a pixel. */
+async function expectBoxKeepsDrawingProportions({ svg, drawing }: DiagramGeometry) {
+  const lowestScale = Math.max(
+    (svg.width - 0.5) / drawing.width,
+    (svg.height - 0.5) / drawing.height
   );
+  const highestScale = Math.min(
+    (svg.width + 0.5) / drawing.width,
+    (svg.height + 0.5) / drawing.height
+  );
+  await expect(lowestScale).toBeLessThanOrEqual(highestScale + 1e-6);
+}
+
+/** The boxes a reader sees agree: nothing paints outside the frame that holds the diagram. */
+async function expectDiagramInsideFrame(geometry: DiagramGeometry) {
+  const { svg, container, frame } = geometry;
+  // The drawing fills its box instead of sitting letterboxed or stretched inside it.
+  await expectBoxKeepsDrawingProportions(geometry);
   // The box lies inside the area the container can scroll, so a wide diagram pans inside its frame.
   const containerBox = container.getBoundingClientRect();
   const left = svg.left - containerBox.left + container.scrollLeft;
   const top = svg.top - containerBox.top + container.scrollTop;
-  expect(left).toBeGreaterThanOrEqual(-0.5);
-  expect(top).toBeGreaterThanOrEqual(-0.5);
-  expect(left + svg.width).toBeLessThanOrEqual(container.scrollWidth + 0.5);
-  expect(top + svg.height).toBeLessThanOrEqual(container.scrollHeight + 0.5);
+  await expect(left).toBeGreaterThanOrEqual(-0.5);
+  await expect(top).toBeGreaterThanOrEqual(-0.5);
+  await expect(left + svg.width).toBeLessThanOrEqual(container.scrollWidth + 0.5);
+  await expect(top + svg.height).toBeLessThanOrEqual(container.scrollHeight + 0.5);
   // The frame is at least as tall as the box, so the text below the frame is not painted over.
-  expect(svg.top).toBeGreaterThanOrEqual(frame.top - 0.5);
-  expect(svg.bottom).toBeLessThanOrEqual(frame.bottom + 0.5);
-  expect(frame.height).toBeGreaterThanOrEqual(svg.height);
+  await expect(svg.top).toBeGreaterThanOrEqual(frame.top - 0.5);
+  await expect(svg.bottom).toBeLessThanOrEqual(frame.bottom + 0.5);
+  await expect(frame.height).toBeGreaterThanOrEqual(svg.height);
 }
 
 /** Waits until the diagram has rendered at the column's width and every box agrees. */
 async function waitForDiagram(
   canvasElement: HTMLElement,
-  expectation: (geometry: DiagramGeometry) => void
+  expectation: (geometry: DiagramGeometry) => Promise<void>
 ) {
   await waitFor(
-    () => {
+    async () => {
       const geometry = measureDiagram(canvasElement);
-      expectDiagramInsideFrame(geometry);
-      expectation(geometry);
+      await expectDiagramInsideFrame(geometry);
+      await expectation(geometry);
     },
     { timeout: 10_000 }
   );
@@ -326,8 +336,8 @@ async function expectZoomResizesBox(canvasElement: HTMLElement) {
     expect(measureDiagram(canvasElement).svg.width).toBeGreaterThan(before.width)
   );
   const grown = measureDiagram(canvasElement);
-  expect(Math.abs(grown.svg.width - before.width * 1.1)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
-  expectDiagramInsideFrame(grown);
+  await expect(Math.abs(grown.svg.width - before.width * 1.1)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
+  await expectDiagramInsideFrame(grown);
 
   await userEvent.click(controls.getByRole("button", { name: "−" }));
   await waitFor(() =>
@@ -362,10 +372,10 @@ export const MermaidPhone: Story = {
     await expect(globals).toMatchObject({ viewport: { value: "phone390" } });
 
     await playAtDefaultZoom(async () => {
-      await waitForDiagram(canvasElement, ({ svg, drawing }) => {
+      await waitForDiagram(canvasElement, async ({ svg, drawing }) => {
         // A tall layout, drawn at its measured size instead of shrunk to the height cap.
-        expect(svg.height).toBeGreaterThan(svg.width);
-        expect(Math.abs(svg.height - drawing.height)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
+        await expect(svg.height).toBeGreaterThan(svg.width);
+        await expect(Math.abs(svg.height - drawing.height)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
       });
       await expectZoomResizesBox(canvasElement);
     });
@@ -380,10 +390,10 @@ export const MermaidLaptop: Story = {
   render: () => <MermaidColumn content={WIDE_FLOWCHART_CONTENT} width={LAPTOP_COLUMN_WIDTH} />,
   play: async ({ canvasElement }) => {
     await playAtDefaultZoom(async () => {
-      await waitForDiagram(canvasElement, ({ svg, container }) => {
-        expect(svg.width).toBeGreaterThan(svg.height);
-        expect(svg.height).toBeLessThanOrEqual(300 + PIXEL_TOLERANCE);
-        expect(svg.width).toBeLessThanOrEqual(container.clientWidth + PIXEL_TOLERANCE);
+      await waitForDiagram(canvasElement, async ({ svg, container }) => {
+        await expect(svg.width).toBeGreaterThan(svg.height);
+        await expect(svg.height).toBeLessThanOrEqual(300 + PIXEL_TOLERANCE);
+        await expect(svg.width).toBeLessThanOrEqual(container.clientWidth + PIXEL_TOLERANCE);
       });
       await expectZoomResizesBox(canvasElement);
     });
@@ -398,9 +408,9 @@ export const MermaidStatePhone: Story = {
   render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={PHONE_COLUMN_WIDTH} />,
   play: async ({ canvasElement }) => {
     await playAtDefaultZoom(async () => {
-      await waitForDiagram(canvasElement, ({ svg, container, drawing }) => {
-        expect(Math.abs(svg.width - drawing.width)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
-        expect(svg.width).toBeGreaterThan(container.clientWidth);
+      await waitForDiagram(canvasElement, async ({ svg, container, drawing }) => {
+        await expect(Math.abs(svg.width - drawing.width)).toBeLessThanOrEqual(PIXEL_TOLERANCE);
+        await expect(svg.width).toBeGreaterThan(container.clientWidth);
       });
       await expectZoomResizesBox(canvasElement);
     });
@@ -415,10 +425,10 @@ export const MermaidStateLaptop: Story = {
   render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={LAPTOP_COLUMN_WIDTH} />,
   play: async ({ canvasElement }) => {
     await playAtDefaultZoom(async () => {
-      await waitForDiagram(canvasElement, ({ svg, container, drawing }) => {
-        expect(svg.height).toBeLessThanOrEqual(300 + PIXEL_TOLERANCE);
-        expect(svg.width).toBeLessThan(drawing.width);
-        expect(svg.width).toBeLessThanOrEqual(container.clientWidth + PIXEL_TOLERANCE);
+      await waitForDiagram(canvasElement, async ({ svg, container, drawing }) => {
+        await expect(svg.height).toBeLessThanOrEqual(300 + PIXEL_TOLERANCE);
+        await expect(svg.width).toBeLessThan(drawing.width);
+        await expect(svg.width).toBeLessThanOrEqual(container.clientWidth + PIXEL_TOLERANCE);
       });
       await expectZoomResizesBox(canvasElement);
     });

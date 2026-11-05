@@ -13,6 +13,29 @@ import { chromiumMathSerializer } from "../../../../tests/ui/chromiumMathSeriali
 
 const INVALID_CHART = "graph TD\nA-->";
 
+/** The size Pele measured: the diagram's viewBox. */
+function viewBoxOf(container: Element | null) {
+  const viewBox = container?.querySelector("svg.pele")?.getAttribute("viewBox") ?? "0 0 0 0";
+  const [, , width, height] = viewBox.split(" ").map(Number);
+  return { width, height };
+}
+
+/** The pixel box the stylesheet gives the diagram's <svg>. */
+function boxOf(container: Element | null) {
+  const style = (container as HTMLElement | null)?.style;
+  return {
+    width: style?.getPropertyValue("--diagram-width"),
+    height: style?.getPropertyValue("--diagram-height"),
+  };
+}
+
+function pixels(size: { width: number; height: number }) {
+  return { width: `${size.width}px`, height: `${size.height}px` };
+}
+
+// A top-to-bottom chain: taller than the inline height cap in every container width.
+const TALL_CHART = "graph TD\n" + "ABCDEFGHIJKL".split("").join("-->");
+
 function renderMermaid(props: { chart?: string; isStreaming?: boolean } = {}) {
   return render(
     <StreamingContext.Provider value={{ isStreaming: props.isStreaming ?? false }}>
@@ -328,7 +351,7 @@ describe("Mermaid layout stability", () => {
     });
   });
 
-  test("zoom controls scale rendered diagrams", async () => {
+  test("zoom controls resize the diagram's pixel box", async () => {
     const view = renderMermaid();
 
     await waitFor(() => {
@@ -337,7 +360,10 @@ describe("Mermaid layout stability", () => {
 
     const container = view.container.querySelector<HTMLElement>(".mermaid-container");
     expect(container).not.toBeNull();
-    expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1");
+    const natural = viewBoxOf(container);
+    // A small diagram sits at the size Pele measured.
+    expect(natural.height).toBeLessThan(300);
+    expect(boxOf(container)).toEqual(pixels(natural));
 
     const buttons = Array.from(view.container.querySelectorAll("button"));
     const zoomOutButton = buttons.find((button) => button.textContent === "−");
@@ -349,15 +375,49 @@ describe("Mermaid layout stability", () => {
     fireEvent.click(zoomInButton);
 
     await waitFor(() => {
-      expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1.1");
+      expect(boxOf(container)).toEqual(
+        pixels({ width: Math.round(natural.width * 1.1), height: Math.round(natural.height * 1.1) })
+      );
     });
     expect(window.localStorage.getItem("mermaid-diagram-zoom")).toBe("1.1");
 
     fireEvent.click(zoomOutButton);
 
     await waitFor(() => {
-      expect(container?.style.getPropertyValue("--diagram-zoom")).toBe("1");
+      expect(boxOf(container)).toEqual(pixels(natural));
     });
+  });
+
+  test("the diagram's svg carries no inline size of its own", async () => {
+    const view = renderMermaid();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg.pele")).not.toBeNull()
+    );
+    // An inline max-width or height would beat the stylesheet's pixel box and hand the box back
+    // to each engine's intrinsic sizing.
+    const style = view.container.querySelector("svg.pele")?.getAttribute("style") ?? "";
+    expect(style).not.toMatch(
+      /(^|;)\s*(max-width|min-width|width|max-height|min-height|height)\s*:/
+    );
+  });
+
+  test("shows a render error when Pele reports no usable size", async () => {
+    const real = PeleModule.render;
+    const peleRender = spyOn(PeleModule, "render").mockImplementation((chart, options) => ({
+      ...real(chart, options),
+      width: 0,
+    }));
+    try {
+      const view = renderMermaid();
+      await waitFor(() =>
+        expect(view.container.textContent).toContain(
+          "Mermaid Error: Diagram renderer returned an invalid size"
+        )
+      );
+      expect(view.container.querySelector("svg")).toBeNull();
+    } finally {
+      peleRender.mockRestore();
+    }
   });
 
   describe("layout width", () => {
@@ -427,12 +487,6 @@ describe("Mermaid layout stability", () => {
       }
     }
 
-    function viewBoxOf(container: Element | null) {
-      const viewBox = container?.querySelector("svg.pele")?.getAttribute("viewBox") ?? "0 0 0 0";
-      const [, , width, height] = viewBox.split(" ").map(Number);
-      return { width, height };
-    }
-
     test("an unmeasured container renders the diagram's natural layout", async () => {
       const view = renderMermaid({ chart: WIDE_CHART });
       const container = view.container.querySelector<HTMLElement>(".mermaid-container");
@@ -441,7 +495,7 @@ describe("Mermaid layout stability", () => {
       const natural = viewBoxOf(container);
       expect(natural.width).toBeGreaterThan(400);
       expect(natural.width).toBeGreaterThan(natural.height);
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+      expect(boxOf(container)).toEqual(pixels(natural));
     });
 
     test("a narrow container gets a vertical layout and reflows when it widens", async () => {
@@ -453,14 +507,53 @@ describe("Mermaid layout stability", () => {
       const narrow = viewBoxOf(container);
       expect(narrow.width).toBeLessThanOrEqual(326);
       expect(narrow.height).toBeGreaterThan(narrow.width);
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("none");
+      expect(boxOf(container)).toEqual(pixels(narrow));
 
       act(() => resizeContainer(1200));
       await waitFor(() => {
         const wide = viewBoxOf(container);
         expect(wide.width).toBeGreaterThan(wide.height);
       });
-      expect(container?.style.getPropertyValue("--diagram-max-height")).toBe("");
+      expect(boxOf(container)).toEqual(pixels(viewBoxOf(container)));
+    });
+
+    test("only a container wider than the narrow breakpoint caps a tall diagram's height", async () => {
+      measuredWidth = 326;
+      const view = renderMermaid({ chart: TALL_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      await waitFor(() => expect(viewBoxOf(container).height).toBeGreaterThan(0));
+      const narrow = viewBoxOf(container);
+      expect(narrow.height).toBeGreaterThan(300);
+      expect(boxOf(container)).toEqual(pixels(narrow));
+
+      act(() => resizeContainer(1200));
+      await waitFor(() => expect(boxOf(container).height).toBe("300px"));
+      const tall = viewBoxOf(container);
+      expect(boxOf(container).width).toBe(`${Math.round((tall.width * 300) / tall.height)}px`);
+    });
+
+    test("the expand dialog fits a tall diagram to 80% of the viewport height", async () => {
+      const setViewportHeight = (height: number) => {
+        Object.defineProperty(window, "innerHeight", { value: height, configurable: true });
+        act(() => {
+          window.dispatchEvent(new window.Event("resize"));
+        });
+      };
+      setViewportHeight(500);
+      const view = renderMermaid({ chart: TALL_CHART });
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      const dialog = () => view.container.querySelector<HTMLElement>(".mermaid-modal");
+      await waitFor(() => expect(viewBoxOf(dialog()).height).toBeGreaterThan(0));
+      const natural = viewBoxOf(dialog());
+      expect(natural.height).toBeGreaterThan(800);
+      expect(boxOf(dialog()).height).toBe("400px");
+      expect(boxOf(dialog()).width).toBe(`${Math.round((natural.width * 400) / natural.height)}px`);
+
+      setViewportHeight(2000);
+      await waitFor(() => expect(boxOf(dialog())).toEqual(pixels(natural)));
     });
 
     test("the expand dialog lays the diagram out for its own width", async () => {
