@@ -40,15 +40,23 @@ export const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 512;
 export const BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS = 1_536;
 
 /**
- * Hard wall-clock bound for the whole summary generation (all candidate
- * models share one deadline). Sized to cover the full output cap at real
- * side-channel throughput: dogfooded haiku streams ~100 tok/s with ~0.6s
- * TTFB, so a worst-case max_tokens stream is ~0.6s + 512/100 ≈ 5.7s and the
- * typical natural stop (~325 tokens) lands around 3.9s. The edit-resend path
- * waits synchronously on this deadline (see maybeAppendAbandonedBranchSummary
- * for why), so it also caps how long that user-facing operation can stall.
+ * Hard wall-clock bound for the whole summary generation (all candidate models share one
+ * deadline). The candidates are STRICTLY the workspace's own configured models (see
+ * `deriveSideChannelModelCandidates`), so the throughput that sizes this is the USER's
+ * model, not a hosted one. The previous 6s came from dogfooded hosted haiku: ~100 tok/s
+ * with ~0.6s TTFB, so a worst-case max_tokens stream is ~0.6s + 512/100 = ~5.7s and the
+ * typical natural stop (~325 tokens) lands around 3.9s. That hosted bound starves a
+ * self-hosted open-weights model, which commonly answers at 20-50 tok/s (512 tokens then
+ * needs ~11-26s) and adds time-to-first-token while it loads.
+ *
+ * The raise costs a fast route nothing: this is a deadline, not a wait, so a summary that
+ * finishes in 4s still finishes in 4s. The cost lands on the slow path — the edit-resend
+ * flow waits synchronously on it (see maybeAppendAbandonedBranchSummary for why), and
+ * `BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS` derives from this value, so the fork's first-send
+ * wait grows with it. Both are traded against the alternative, which is silently dropping
+ * the abandoned branch's context on every fork and edit-resend.
  */
-export const BRANCH_SUMMARY_TIMEOUT_MS = 6_000;
+export const BRANCH_SUMMARY_TIMEOUT_MS = 20_000;
 
 /**
  * Hard cap on characters accumulated from the summary stream. Purely
