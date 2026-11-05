@@ -42,6 +42,11 @@ Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which 
 credentials and which agent-browser cannot turn off. While the signed-in app is open, any local
 account that finds that port can control the browser, read the page and take the stored token.
 
+The skill trusts the checkout. Launch runs the checkout's code, and Bun loads the checkout's
+`.env` files into the processes launch starts, so a line such as `NODE_OPTIONS=--require=<file>`
+there runs code in Vite and the backend. None of the protections below holds against a checkout
+you do not trust.
+
 These protections matter on a host where you are the only local account too:
 
 - No text evidence keeps the token: `capture` replaces it with `<redacted>` in the files it
@@ -53,11 +58,19 @@ These protections matter on a host where you are the only local account too:
 - Vite never serves the token: launch and every command that reads a run refuse a run home in a
   folder that Vite serves (see Evidence), and `vite.config.ts` denies `server.lock` and its
   temporary copies.
-- A web page that rebinds its DNS name to this machine cannot reach the app. Launch's `env -i`
-  drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy variables, so `server.log`
-  shows `Allowed hosts: loopback only`. Vite then accepts only `localhost`, a `*.localhost` name
-  or an IP address as the Host (an IP address cannot be rebound) and refuses every other name,
-  also on its WebSocket proxy to the backend.
+- A web page that rebinds its DNS name to this machine cannot reach the app that Vite serves.
+  Launch's `env -i` drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy
+  variables. Bun still loads the checkout's `.env` files into the sandbox script, so launch
+  refuses unless the `Allowed hosts:` line in `server.log` reads `loopback only`. Vite then
+  accepts only `localhost`, a `*.localhost` name or an IP address as the Host (an IP address
+  cannot be rebound) and refuses every other name, also on its WebSocket proxy to the backend.
+  The backend's own TCP port has no Host check, but its API calls (`/orpc`, and `/api` except
+  its spec and docs) need the token. The `Allowed hosts:` check catches a `.env` line written for
+  remote access, not a hostile checkout.
+- Other machines cannot reach Vite or the backend: launch refuses unless both listen only on a
+  loopback address. A `.env` line such as `XUM_VITE_HOST=0.0.0.0` makes a server listen on every
+  interface, and Vite accepts an IP-address Host. This check too catches a `.env` line written
+  for remote access, not a hostile checkout.
 - `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
   can connect to, and so can a web page on a `localhost`, `127.0.0.1` or `[::1]` origin (see
   Drive).
@@ -68,11 +81,12 @@ the DevTools port above stays open.
 - The token is in no command line: `open`, launch, `doctor` and the redaction pass it to node or
   curl on stdin or fd 3 (see Drive and Doctor). `make dev-server` exports it to the server's own
   processes, whose environment only you and root can read.
-- No other account can replace or write the run's files: launch makes the run folder (with the
-  run's 0600 token copy) and the server tree's TMPDIR with mode 0700, and the run home too when it
-  makes it. Launch and every command that reads a run refuse a run home or run folder that group
-  or others can write, every command refuses such a git dir, and all of them refuse a folder
-  above these that group or others can write without the sticky bit (see Launch and Evidence).
+- No other account except root can replace or write the run's files: launch makes the run
+  folder (with the run's 0600 token copy) and the server tree's TMPDIR with mode 0700, and the
+  run home too when it makes it. Launch and every command that reads a run refuse a run home or
+  run folder that group or others can write, every command refuses such a git dir, and all of
+  them refuse a folder above these that group or others can write without the sticky bit (see
+  Launch and Evidence).
 
 ## Launch
 
@@ -111,9 +125,12 @@ run is alive, by the same identity check as cleanup: two dev servers in one chec
 and `node_modules/.vite`. The group's first process writes the group id into the run's
 `state.env` before it starts the server. From that moment, right after the spawn, the check and
 cleanup find the group even when the launcher was killed. Until then the group holds the launch
-lock, so a second launch waits for it. Launch also stops at once when the
-sandbox copied a `config.json` (the recipes assume default preferences) and when the backend
-crashes after its rebuild (nodemon then waits for a file change that never comes).
+lock, so a second launch waits for it. Launch also stops at once when the sandbox copied a
+`config.json` (the recipes assume default preferences), when the sandbox's `Allowed hosts:` line
+does not read `loopback only`, when Vite or the backend listens on an address that is not
+loopback, `ss` fails or, once it answers, `ss` shows no socket for it (see Threat model), when the
+backend has no auth token (see Doctor), and when the backend crashes after its rebuild (nodemon
+then waits for a file change that never comes).
 
 ## Doctor
 
@@ -127,10 +144,12 @@ Every check line must read `ok`. A `note` line only informs. It checks that the 
 lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
 names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
 `/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
-The backend always has an auth token: launch runs make under `env -i`, which drops
-`XUM_DEV_SERVER_NO_AUTH`. (A checkout from before #7904 starts it without one, and the skill works
-the same.) Doctor and launch read the token from `server.lock` and send it to curl on stdin, never
-in argv.
+The backend always has an auth token: launch refuses a backend whose `server.lock` has none.
+Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
+the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
+names that line and says to remove it. (A checkout from before #7904 starts the backend without a
+token, so launch refuses it too.) Doctor and launch read the token from `server.lock` and send it
+to curl on stdin, never in argv.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
@@ -160,9 +179,10 @@ agent-browser find role button click --name "Open settings" --exact
   line while it runs.
 - `open` turns off agent-browser's live stream for the session first, every time, and refuses to
   open the page while it is on. agent-browser 0.33 serves each session's screen and input as a
-  WebSocket on `127.0.0.1` that any local account can connect to, starts it with each new
-  daemon, and has no setting to keep it off. CAUTION: never run `agent-browser stream enable` in
-  a run's session. Another account could then watch and drive the signed-in app.
+  WebSocket on `127.0.0.1` that any local account can connect to, and so can a web page on a
+  `localhost`, `127.0.0.1` or `[::1]` origin. agent-browser starts the stream with each new
+  daemon and has no setting to keep it off. CAUTION: never run `agent-browser stream enable` in a
+  run's session. Another account could then watch and drive the signed-in app.
 - `idle` waits until the page settles: no CSS transition runs, and on a `/workspace/` page the
   `Conversation transcript` log is neither loading nor streaming (`aria-busy="false"`). A click
   while the right sidebar slides open lands where the target was and is lost. `idle` exits 3
