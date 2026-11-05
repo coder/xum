@@ -1,7 +1,6 @@
 import * as path from "path";
 import type { ArtifactShelfListing, ArtifactShelfScope } from "@/common/orpc/schemas/artifacts";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { getArtifactKind } from "@/common/utils/artifactKind";
 import { resolveMemoryProjectIdentity } from "@/node/services/memoryService";
 import {
   getArtifactShelfRoot,
@@ -16,19 +15,17 @@ import {
   buildArtifactReadResult,
   parseArtifactRelativePath,
   tooLargeArtifactResult,
-  type ArtifactBytesOutcome,
   type ArtifactReadOutcome,
 } from "./artifactStore";
 import {
   assertArtifactsEnabled,
-  MAX_ARTIFACT_READ_BYTES,
-  readArtifactBytesAtLocation,
   resolveForWorkspace,
   unreachableError,
   type ArtifactsContext,
   type AvailableArtifactsLocation,
 } from "./artifactsOperations";
-import { getArtifactId, readArtifactRecord } from "./artifactRecordStore";
+import { probeArtifactFile } from "./artifactPublishOperations";
+import { describeArtifact } from "./artifactRecordStore";
 
 /**
  * Shelf operations shared by the oRPC routes and the agent tools. The shelf is host-local and
@@ -55,40 +52,29 @@ export async function pinArtifactToShelf(params: {
 }): Promise<Outcome<{ name: string }>> {
   const scopeDir = getShelfScopeDir(params.shelfRoot, params.scope, params.projectIdentity);
   if (typeof scopeDir !== "string") return { success: false, error: scopeDir.error };
-  let read: ArtifactBytesOutcome;
+  let probe: Awaited<ReturnType<typeof probeArtifactFile>>;
   try {
-    read = await readArtifactBytesAtLocation(
-      params.location,
-      params.relPath,
-      MAX_ARTIFACT_READ_BYTES,
-      params.abortSignal
-    );
+    probe = await probeArtifactFile(params.location, params.relPath, params.abortSignal);
   } catch (error) {
     return unreachableError(error);
   }
-  switch (read.status) {
-    case "invalid":
-      return { success: false, error: read.error };
-    case "missing":
-      return { success: false, error: `Artifact not found: ${params.relPath}` };
-    case "too_large":
-      return {
-        success: false,
-        error: `Artifact is ${read.size} bytes; shelf files are capped at ${MAX_SHELF_FILE_BYTES} bytes`,
-      };
-    case "ok":
-      break;
+  if (!probe.success) return probe;
+  if (probe.bytes == null) {
+    return {
+      success: false,
+      error: `Artifact is ${probe.size} bytes; shelf files are capped at ${MAX_SHELF_FILE_BYTES} bytes`,
+    };
   }
-  const record = await readArtifactRecord(params.sessionDir, getArtifactId(params.relPath));
+  const { title, kind } = await describeArtifact(params.sessionDir, params.relPath);
   const pinned = await pinToShelf({
     shelfRoot: params.shelfRoot,
     scopeDir,
     relPath: params.relPath,
-    bytes: read.bytes,
+    bytes: probe.bytes,
     meta: {
       sourceWorkspaceId: params.workspaceId,
-      title: record?.title ?? path.posix.basename(params.relPath),
-      kind: record?.kind ?? getArtifactKind(params.relPath),
+      title,
+      kind,
       pinnedAtMs: params.nowMs ?? Date.now(),
       pinnedBy: params.pinnedBy,
     },

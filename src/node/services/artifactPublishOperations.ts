@@ -91,6 +91,35 @@ export function resolveArtifactToolPath(
   return segments.join("/");
 }
 
+/**
+ * What publishing and shelf pins need from a file: its size, and its bytes when it is under the
+ * read cap. Runtime failures throw.
+ */
+export async function probeArtifactFile(
+  location: AvailableArtifactsLocation,
+  relPath: string,
+  abortSignal?: AbortSignal
+): Promise<
+  { success: true; size: number; bytes: Buffer | null } | { success: false; error: string }
+> {
+  const read = await readArtifactBytesAtLocation(
+    location,
+    relPath,
+    MAX_ARTIFACT_READ_BYTES,
+    abortSignal
+  );
+  switch (read.status) {
+    case "invalid":
+      return { success: false, error: read.error };
+    case "missing":
+      return { success: false, error: `Artifact not found: ${relPath}` };
+    case "too_large":
+      return { success: true, size: read.size, bytes: null };
+    case "ok":
+      return { success: true, size: read.bytes.length, bytes: read.bytes };
+  }
+}
+
 export type PublishOutcome =
   | { success: true; record: ArtifactRecord; kind: ArtifactKind; size: number }
   | { success: false; error: string };
@@ -108,31 +137,13 @@ export async function publishArtifact(params: {
   pin?: ArtifactPin;
   abortSignal?: AbortSignal;
 }): Promise<PublishOutcome> {
-  const read = await readArtifactBytesAtLocation(
-    params.location,
-    params.relPath,
-    MAX_ARTIFACT_READ_BYTES,
-    params.abortSignal
-  );
-  let size: number;
-  switch (read.status) {
-    case "invalid":
-      return { success: false, error: read.error };
-    case "missing":
-      return { success: false, error: `Artifact not found: ${params.relPath}` };
-    case "too_large":
-      size = read.size;
-      break;
-    case "ok":
-      size = read.bytes.length;
-      break;
-  }
+  const probe = await probeArtifactFile(params.location, params.relPath, params.abortSignal);
+  if (!probe.success) return probe;
   // The tool call was cancelled while the file was read: record nothing. Re-checked under the
   // record lock, so a cancel that lands while waiting for the lock writes nothing either.
   if (params.abortSignal?.aborted) return { success: false, error: ARTIFACT_PUBLISH_INTERRUPTED };
-  let record: ArtifactRecord;
   try {
-    record = await recordArtifactPublish({
+    const record = await recordArtifactPublish({
       sessionDir: params.sessionDir,
       relPath: params.relPath,
       title: params.title,
@@ -140,16 +151,16 @@ export async function publishArtifact(params: {
       pin: params.pin,
       abortSignal: params.abortSignal,
     });
+    return {
+      success: true,
+      record,
+      kind: record.kind ?? getArtifactKind(params.relPath),
+      size: probe.size,
+    };
   } catch (error) {
     if (params.abortSignal?.aborted) return { success: false, error: ARTIFACT_PUBLISH_INTERRUPTED };
     throw error;
   }
-  return {
-    success: true,
-    record,
-    kind: record.kind ?? getArtifactKind(params.relPath),
-    size,
-  };
 }
 
 /**

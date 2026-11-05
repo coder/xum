@@ -27,7 +27,7 @@ const row: z.ZodType<MuxMessage> = MuxMessageSchema.extend({
     ])
   ),
 }).passthrough();
-const attachment: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("type", [
+export const PostCompactionAttachmentSchema: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("plan_file_reference"),
     planFilePath: z.string(),
@@ -91,7 +91,7 @@ export const ContinuousCompactionJournalSchema = z
       partIndex: z.number().int().nonnegative(),
       metadataTemplate: metadata,
     }),
-    postCompactionAttachments: z.array(attachment),
+    postCompactionAttachments: z.array(PostCompactionAttachmentSchema),
     // JSON wire prefix when representable; otherwise the pinned pipeline inputs below rebuild it.
     prefix: z.array(z.json()).optional(),
     // Preserve the initial request too: a fallback can rebuild system/tool context.

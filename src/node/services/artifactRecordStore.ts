@@ -2,8 +2,12 @@ import { createHash } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
-import { ArtifactKindSchema, ArtifactPinSchema, type ArtifactPin } from "@/common/orpc/schemas/artifacts";
-import type { ArtifactKind } from "@/common/utils/artifactKind";
+import {
+  ArtifactKindSchema,
+  ArtifactPinSchema,
+  type ArtifactPin,
+} from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind, type ArtifactKind } from "@/common/utils/artifactKind";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -95,6 +99,18 @@ export async function readArtifactRecord(
     await fs.rename(recordPath, `${recordPath}.corrupt-${Date.now()}`).catch(() => undefined);
     return null;
   }
+}
+
+/** How the shelf and interactions name an artifact: its record's title and kind, else its file's. */
+export async function describeArtifact(
+  sessionDir: string,
+  relPath: string
+): Promise<{ title: string; kind: ArtifactKind }> {
+  const record = await readArtifactRecord(sessionDir, getArtifactId(relPath));
+  return {
+    title: record?.title ?? path.posix.basename(relPath),
+    kind: record?.kind ?? getArtifactKind(relPath),
+  };
 }
 
 export interface RecordArtifactPublishParams {

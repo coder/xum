@@ -31,8 +31,8 @@ import type { ORPCContext } from "@/node/orpc/context";
 import { assertArtifactsEnabled, type ArtifactsContext } from "./artifactsOperations";
 import { parseArtifactRelativePath } from "./artifactStore";
 import {
+  describeArtifact,
   getArtifactId,
-  readArtifactRecord,
   readArtifactState,
   writeArtifactState,
 } from "./artifactRecordStore";
@@ -171,15 +171,6 @@ export function buildArtifactInteractionMetadata(
   };
 }
 
-/** The artifact's title: its record's, else the file name. */
-async function resolveArtifactInteractionTitle(
-  sessionDir: string,
-  relPath: string
-): Promise<string> {
-  const record = await readArtifactRecord(sessionDir, getArtifactId(relPath));
-  return record?.title ?? path.posix.basename(relPath);
-}
-
 function validateJsonPayload(value: unknown, what: string): string | null {
   if (!isJsonValue(value)) return `${what} must be JSON`;
   const size = jsonByteLength(value) ?? Infinity;
@@ -279,7 +270,7 @@ export async function sendArtifactInteraction(
     id: (deps.newId ?? randomUUID)(),
     workspaceId: input.workspaceId,
     artifactPath: segments.join("/"),
-    artifactTitle: await resolveArtifactInteractionTitle(sessionDir, input.path),
+    artifactTitle: (await describeArtifact(sessionDir, input.path)).title,
     text: input.text,
     ...(input.data !== undefined ? { data: input.data } : {}),
     createdAtMs: (deps.now ?? Date.now)(),
