@@ -19,7 +19,6 @@ import type {
   ArtifactListing,
   ArtifactReadResult,
   ArtifactShelfListing,
-  ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
@@ -238,18 +237,12 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
-  /**
-   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
-   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
-   */
+  /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
   artifacts?: {
     listing: ArtifactListing;
     files: Record<string, ArtifactReadResult>;
     /** artifacts.capabilities answer; omitted means unknown (null). */
     agentBrowserAvailable?: boolean | null;
-    /** Stored versions per artifact path, newest first. */
-    versions?: Record<string, ArtifactVersion[]>;
-    versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
     /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
@@ -2569,24 +2562,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       capabilities: () =>
         Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            artifactId: input.path,
-            path: input.path,
-            pin: null,
-            versions: artifacts.versions?.[input.path] ?? [],
-          },
-        }),
-      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
-        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
-        return Promise.resolve(
-          file
-            ? { success: true as const, data: file }
-            : { success: false as const, error: `Version not found: v${input.version}` }
-        );
-      },
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -2619,8 +2594,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `Shelf entry not found: ${input.name}` }
         );
       },
-      pinToShelf: (input: { artifactId: string }) =>
-        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      pinToShelf: (input: { path: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.path } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
       getState: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({

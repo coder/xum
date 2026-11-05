@@ -19,7 +19,6 @@ const SUBMIT: ArtifactInteractionMetadata = {
   id: "interaction-1",
   artifactPath: "release-checklist.html",
   title: "Release checklist",
-  version: 3,
   action: "send",
   text: "Approved for prod. Ship after the 14:00 freeze ends.",
   data: { env: "prod", approve: true },
@@ -29,7 +28,6 @@ const CHOICE: ArtifactInteractionMetadata = {
   id: "interaction-2",
   artifactPath: "rollout.canary.json",
   title: "Which rollout plan?",
-  version: 1,
   action: "send",
   text: "Canary 10% for 1 hour",
 };
@@ -38,7 +36,7 @@ function tagFor(data: ArtifactInteractionMetadata): string {
   const body = JSON.stringify(
     data.data === undefined ? { text: data.text } : { text: data.text, data: data.data }
   );
-  return `<artifact_interaction artifact="${data.artifactPath}" title="${data.title}" version="${data.version}" action="send">${body}</artifact_interaction>`;
+  return `<artifact_interaction artifact="${data.artifactPath}" title="${data.title}" action="send">${body}</artifact_interaction>`;
 }
 
 function setup(workspaceId: string) {

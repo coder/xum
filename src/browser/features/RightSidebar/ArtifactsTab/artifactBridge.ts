@@ -42,8 +42,7 @@ import {
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) sends at once only
  *   during a live user click or key in this frame, one message per click; any other send fills
  *   the host-owned confirm strip (SandboxedArtifactFrame.tsx); `{ type: "setState", state }`
- *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
- *   are capped.
+ *   (window.xum.setState) is persisted per artifact. Text and JSON sizes are capped.
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
  *   suffix? }`, posted by the shim only while the host has annotate mode on; x/y are fractions of
  *   the frame size. The host also ignores it unless annotate mode is on.
