@@ -236,15 +236,16 @@ describe("Mermaid layout stability", () => {
       const view = renderMermaid();
       fireEvent.click(await view.findByRole("button", { name: "⤢" }));
       const close = await view.findByRole("button", { name: "Close" });
-      expect(topPx(close)).toBeGreaterThanOrEqual(DESKTOP_TITLEBAR_HEIGHT_PX);
+      // An 8 px gutter below the bar.
+      expect(topPx(close)).toBe(DESKTOP_TITLEBAR_HEIGHT_PX + 8);
       expect(close.classList.contains("titlebar-no-drag")).toBe(true);
     });
 
-    test("keeps a small gutter from the top in a browser", async () => {
+    test("keeps an 8 px gutter from the top in a browser", async () => {
       const view = renderMermaid();
       fireEvent.click(await view.findByRole("button", { name: "⤢" }));
       const close = await view.findByRole("button", { name: "Close" });
-      expect(topPx(close)).toBeLessThan(DESKTOP_TITLEBAR_HEIGHT_PX);
+      expect(topPx(close)).toBe(8);
       expect(close.classList.contains("titlebar-no-drag")).toBe(false);
     });
   });
