@@ -54,9 +54,13 @@ These protections matter on a host where you are the only local account too:
   folder that Vite serves (see Evidence), and `vite.config.ts` denies `server.lock` and its
   temporary copies.
 - A web page that rebinds its DNS name to this machine cannot reach the app. Launch's `env -i`
-  drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy variables, so the sandbox
-  allows only loopback Host headers (`server.log` shows `Allowed hosts: loopback only`). Vite
-  refuses any other Host header, also on its WebSocket proxy to the backend.
+  drops every `VITE_ALLOWED_HOSTS` spelling and the port-forward proxy variables, so `server.log`
+  shows `Allowed hosts: loopback only`. Vite then accepts only `localhost`, a `*.localhost` name
+  or an IP address as the Host (an IP address cannot be rebound) and refuses every other name,
+  also on its WebSocket proxy to the backend.
+- `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
+  can connect to, and so can a web page on a `localhost`, `127.0.0.1`, `[::1]` or `file://`
+  origin, such as a local HTML file (see Drive).
 
 These protections matter only when other local accounts exist, and they are not enough there:
 the DevTools port above stays open.
@@ -69,8 +73,6 @@ the DevTools port above stays open.
   makes it. Launch and every command that reads a run refuse a run home or run folder that group
   or others can write, every command refuses such a git dir, and all of them refuse a folder
   above these that group or others can write without the sticky bit (see Launch and Evidence).
-- `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
-  can connect to (see Drive).
 
 ## Launch
 
@@ -152,9 +154,10 @@ agent-browser find role button click --name "Open settings" --exact
 - Open pages with `verify-xum.sh open <path>`, not `agent-browser open`. `make dev-server` starts
   the backend with an auth token, and the first page of a browser session needs it as
   `?token=<token>` (the app keeps it and strips it from the address bar). `open` builds that URL in
-  node from `server.lock` and hands it to `agent-browser batch` on stdin, so the token is in no
-  command line or environment. CAUTION: never put the token in an `agent-browser` argument. Every
-  local account can read a process's command line while it runs.
+  node from `server.lock` (or the run's token copy) and hands it to `agent-browser batch` on
+  stdin, so no command line or environment of `open`'s processes holds the token. CAUTION: never
+  put the token in an `agent-browser` argument. Every local account can read a process's command
+  line while it runs.
 - `open` turns off agent-browser's live stream for the session first, every time, and refuses to
   open the page while it is on. agent-browser 0.33 serves each session's screen and input as a
   WebSocket on `127.0.0.1` that any local account can connect to, starts it with each new
