@@ -64,8 +64,9 @@ function bunVersion(env: NodeJS.ProcessEnv): string {
   return r.stdout.trim();
 }
 
-// Starts one launch against the fake and returns its result.
-function launch(fake: Fake) {
+// Starts one launch against the fake and returns its result. Each stub is an extra command in
+// launch's PATH, ahead of the real one.
+function launch(fake: Fake, stubs: Record<string, string> = {}) {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vx-launch-"));
   const repo = path.join(tmp, "repo");
   const bin = path.join(tmp, "bin");
@@ -87,6 +88,9 @@ function launch(fake: Fake) {
   fs.writeFileSync(path.join(bin, "fake.json"), JSON.stringify(fake));
   // `need` requires agent-browser. Cleanup only lists its sessions, and the stub has none.
   fs.writeFileSync(path.join(bin, "agent-browser"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  for (const [name, script] of Object.entries(stubs)) {
+    fs.writeFileSync(path.join(bin, name), script, { mode: 0o755 });
+  }
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` };
   fs.writeFileSync(
     path.join(repo, "package.json"),
@@ -111,13 +115,19 @@ function launch(fake: Fake) {
   }
   // Every command refuses a git dir that group or others can write (a umask 002 checkout).
   fs.chmodSync(path.join(repo, ".git"), 0o755);
+  const started = Date.now();
   const r = spawnSync("bash", [path.join(repo, SKILL_SCRIPT), "launch"], {
     cwd: repo,
     env: { ...env, VERIFY_XUM_HOME: path.join(tmp, "home"), VERIFY_XUM_READY_TIMEOUT: "30" },
     encoding: "utf8",
     timeout: 60_000,
   });
-  return { status: r.status, stderr: r.stderr, left: serverPids().length };
+  return {
+    status: r.status,
+    stderr: r.stderr,
+    seconds: (Date.now() - started) / 1000,
+    left: serverPids().length,
+  };
 }
 
 // Processes that carry the id of a run under this test's home.
@@ -172,6 +182,37 @@ test.skipIf(!isLinux)(
     expect(backend.left).toBe(0);
   },
   180_000
+);
+
+// A server on one non-loopback address never answers launch's loopback probes. Launch must still
+// refuse at once, not after VERIFY_XUM_READY_TIMEOUT (30 s here).
+const lanAddress = Object.values(os.networkInterfaces())
+  .flat()
+  .find((a) => a?.family === "IPv4" && !a.internal)?.address;
+
+test.skipIf(!isLinux || lanAddress === undefined)(
+  "launch refuses a Vite on a non-loopback address before its deadline",
+  () => {
+    const r = launch({ ...loopback, viteHost: lanAddress ?? "" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`Vite listens on ${lanAddress}:`);
+    expect(r.seconds).toBeLessThan(20);
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// ss can fail to see the sockets (a sandbox that blocks its netlink queries). The listener check
+// must then refuse after readiness, not pass on an empty answer.
+test.skipIf(!isLinux)(
+  "launch refuses when ss shows no listener after readiness",
+  () => {
+    const r = launch(loopback, { ss: "#!/bin/sh\nexit 0\n" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/ss shows nothing listening on Vite's port \d+/);
+    expect(r.left).toBe(0);
+  },
+  90_000
 );
 
 test.skipIf(!isLinux)(
