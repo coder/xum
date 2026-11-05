@@ -238,8 +238,9 @@ After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed t
 of the page. A failed run leaves no `-webkit` files from an earlier run of the same name.
 
 The report holds only fixed text and numbers: the URL you gave (without the token), the engine and
-its mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers, and
-the counts of console errors and page errors. It holds no text from the page, because the page can
+its mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers (or
+`unknown` when the page does not return two numbers), and the counts of console errors and page
+errors. It holds no text from the page, because the page can
 be a hostile branch and its text would reach your terminal and the transcript. Nothing the helper
 prints comes from the page either: the checks that wait for the page return one integer, and the
 helper treats anything else as not settled. A hostile page can still make those numbers lie, as it
@@ -276,7 +277,8 @@ in everything it writes, as a second layer.
   read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
   `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`).
   The command refuses a Docker endpoint that is not a local socket (the token would leave the
-  host), and runs the docker CLI with an empty private config (its `proxies` would otherwise go
+  host), refuses a control character in any path it hands to Docker (Docker can echo a path to your
+  terminal), and runs the docker CLI with an empty private config (its `proxies` would otherwise go
   into the container's environment). The single-account CAUTION of the Threat model applies to
   this command too.
 - Nothing outlives the command except the evidence: the container is removed when it exits and

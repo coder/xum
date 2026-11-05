@@ -134,8 +134,13 @@ function redact(text) {
 
 const safe = (text) => plain(redact(text));
 
-function fail(message, code = 1) {
+// The one place that writes to stderr, so every message goes through redaction and control stripping.
+function say(message) {
   process.stderr.write(`webkit-capture: ${safe(message)}\n`);
+}
+
+function fail(message, code = 1) {
+  say(message);
   process.exit(code);
 }
 
@@ -220,24 +225,22 @@ try {
 
   const has = (bit) => state !== undefined && (state & bit) !== 0;
   if (has(STATE.chunkFailed)) {
-    process.stderr.write(
-      "webkit-capture: the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again.\n"
+    say(
+      "the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again."
     );
     exitCode = EXIT_CHUNK_FAILED;
   } else if (has(STATE.connectionError) || has(STATE.authPrompt)) {
     const shown = has(STATE.connectionError)
       ? "the startup connection error"
       : "the authentication prompt";
-    process.stderr.write(`webkit-capture: the page shows ${shown}.\n`);
+    say(`the page shows ${shown}.`);
     exitCode = 1;
   } else if (!has(STATE.settled) || has(STATE.loadingScreen) || has(STATE.mermaidPending)) {
     const still = [];
     if (has(STATE.loadingScreen)) still.push("the loading screen");
     if (has(STATE.mermaidPending)) still.push("a Mermaid diagram that is still rendering");
     const detail = still.length > 0 ? `: it still shows ${still.join(" and ")}` : "";
-    process.stderr.write(
-      `webkit-capture: the page did not settle in ${settleMs / 1000} s${detail}.\n`
-    );
+    say(`the page did not settle in ${settleMs / 1000} s${detail}.`);
     exitCode = 1;
   } else {
     step = "read the page width";
@@ -267,8 +270,11 @@ try {
     fs.writeFileSync(staged(outputs[1]), `${lines.map(safe).join("\n")}\n`);
   }
 } finally {
+  // An error on its way out of the try block is reported with its own step, unless closing fails too.
+  const stepBeforeClose = step;
   step = "close the browser";
   await browser.close();
+  step = stepBeforeClose;
 }
 if (exitCode === 0) {
   for (const file of outputs) fs.renameSync(staged(file), file);

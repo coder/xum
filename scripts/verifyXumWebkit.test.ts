@@ -61,6 +61,8 @@ async function runHelper(options: {
   launchError?: string;
   /** Closing the browser fails after the screenshot and the report were written. */
   closeError?: string;
+  /** `page.goto` throws this, as it does when the sandbox is gone. */
+  gotoError?: string;
   /** How many console errors and page errors the page emits, each with `errorText`. */
   consoleErrors?: number;
   pageErrors?: number;
@@ -102,6 +104,7 @@ exports.webkit = {
             async goto(url) {
               seen.url = url;
               save();
+              if (options.gotoError) throw new Error(options.gotoError);
               const text = options.errorText ?? "Failed to load resource: " + url;
               for (let i = 0; i < (options.consoleErrors ?? 1); i += 1) handlers.console?.({ type: () => "error", text: () => text });
               handlers.console?.({ type: () => "log", text: () => text });
@@ -251,6 +254,28 @@ describe("webkit-capture.mjs", () => {
     expect(run.stderr).not.toContain("target closed");
   });
 
+  test("names the step that failed, and none of the error's own text", async () => {
+    const run = await runHelper({
+      gotoError: `net::ERR_CONNECTION_REFUSED at ${TOKEN} \u001b]52;c;Zm9v\u0007`,
+    });
+    expect(run.exitCode).toBe(1);
+    // Closing the browser works, so the step of the first failure stays the one that is named.
+    expect(run.stderr).toContain(
+      "failed while trying to open the page (is the sandbox still running?)"
+    );
+    expect(run.stderr).not.toContain("close the browser");
+    expect(run.stderr).not.toContain("ERR_CONNECTION_REFUSED");
+    expect(controlCharacters(run.stderr)).toEqual([]);
+    expectNoToken(run.stderr);
+    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+  });
+
+  test("writes to stderr in one place, which redacts and strips", () => {
+    // fail() and say() are the only writers: a message that skips them would skip `safe()` too.
+    const writes = fs.readFileSync(HELPER, "utf8").match(/process\.stderr\.write\(/g) ?? [];
+    expect(writes).toHaveLength(1);
+  });
+
   test("prints and writes no text that a hostile page controls, and counts its errors", async () => {
     // OSC 52 writes the terminal's clipboard. The page also tries the token, colour codes, a C1 CSI
     // and DEL. Its errors are many (10,000 of each kind) and its answers to the state and width
@@ -360,39 +385,130 @@ describe("the state check that webkit-capture.mjs runs in the browser", () => {
   });
 });
 
-describe("verify-xum.sh webkit-capture NAME", () => {
-  /**
-   * Runs a copy of the real script in a scratch git repo (the script finds its checkout from its own
-   * location). Its argument checks run before it reads a run, so no sandbox is needed: with a valid
-   * name it stops at "no run at".
-   */
-  function runCapture(name: string) {
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-name-test-"));
-    tempDirs.push(repo);
+describe("verify-xum.sh webkit-capture arguments", () => {
+  const ESC = String.fromCharCode(0x1b);
+  const C1_CSI = String.fromCharCode(0x9b);
+
+  /** A scratch git repo that holds a copy of the real script (it finds its checkout from its own location). */
+  function scratchCheckout(root: string, dirName: string) {
+    const repo = path.join(root, dirName);
+    fs.mkdirSync(repo);
     const git = (...args: string[]) =>
-      spawnSync("git", args, { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: repo } });
+      spawnSync("git", args, { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: root } });
     expect(git("init", "-q").status).toBe(0);
     // The script refuses a git dir that group or others can write, whatever the caller's umask.
     fs.chmodSync(path.join(repo, ".git"), 0o755);
     const script = path.join(repo, "verify-xum.sh");
     fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), script);
-    const result = spawnSync("bash", [script, "webkit-capture", "/workspace/x", name], {
+    return { repo, script };
+  }
+
+  const newRoot = () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-args-test-")));
+    tempDirs.push(root);
+    return root;
+  };
+
+  /**
+   * Runs the script's argument checks. They run before it reads a run, so no sandbox is needed:
+   * with valid arguments it stops at "no run at".
+   */
+  function runCapture(...captureArgs: string[]) {
+    const root = newRoot();
+    const { repo, script } = scratchCheckout(root, "repo");
+    const result = spawnSync("bash", [script, "webkit-capture", ...captureArgs], {
       cwd: repo,
-      env: { PATH: process.env.PATH ?? "", HOME: repo, VERIFY_XUM_HOME: path.join(repo, "home") },
+      env: { PATH: process.env.PATH ?? "", HOME: root, VERIFY_XUM_HOME: path.join(root, "home") },
       encoding: "utf8",
     });
     return { status: result.status, stderr: result.stderr };
   }
 
   test("refuses a name with no <feature>/ folder, which Docker would mount as all the evidence", () => {
-    const result = runCapture("reply");
+    const result = runCapture("/workspace/x", "reply");
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("<feature>/<step>");
   });
 
   test("accepts <feature>/<step>, and gets as far as reading the run", () => {
-    const result = runCapture("chat/reply");
+    const result = runCapture("/workspace/x", "chat/reply");
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("no run at");
   });
+
+  test("refuses a path with a control character", () => {
+    const result = runCapture(`/workspace/x${ESC}]52;c;Zm9v`, "chat/reply");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("PATH must not hold a control character");
+    expect(controlCharacters(result.stderr)).toEqual([]);
+  });
+
+  test.each([
+    ["ESC", ESC],
+    ["a C1 CSI", C1_CSI],
+  ])(
+    "does not hand Docker a checkout path with %s in it, and prints no such path",
+    (_label, control) => {
+      const root = newRoot();
+      const { repo, script } = scratchCheckout(root, `repo${control}x`);
+      // A run that load_run accepts, and a docker that would record that it was called.
+      const home = path.join(root, "home");
+      const run = path.join(home, "run1");
+      fs.mkdirSync(path.join(run, "evidence"), { recursive: true, mode: 0o700 });
+      fs.mkdirSync(path.join(run, "tmp"), { mode: 0o700 });
+      fs.chmodSync(home, 0o700);
+      fs.chmodSync(run, 0o700);
+      fs.symlinkSync(
+        path.join(import.meta.dir, "../node_modules"),
+        path.join(repo, "node_modules")
+      );
+      // bash $'...' quoting of the raw UTF-8 bytes, so that the folder name keeps its control character.
+      const quote = (value: string) =>
+        `$'${[...Buffer.from(value, "utf8")]
+          .map((byte) =>
+            byte < 0x20 || byte > 0x7e || byte === 0x5c || byte === 0x27
+              ? `\\x${byte.toString(16).padStart(2, "0")}`
+              : String.fromCharCode(byte)
+          )
+          .join("")}'`;
+      fs.writeFileSync(
+        path.join(run, "state.env"),
+        [
+          ["VERIFY_XUM_RUN_ID", "run1"],
+          ["VERIFY_XUM_RUN", run],
+          ["VERIFY_XUM_CHECKOUT", repo],
+          ["VERIFY_XUM_ROOT", path.join(run, "tmp/root")],
+          ["VERIFY_XUM_BACKEND", "http://127.0.0.1:9"],
+          ["VERIFY_XUM_URL", "http://127.0.0.1:9"],
+          ["VERIFY_XUM_EVIDENCE", path.join(run, "evidence")],
+        ]
+          .map(([name, value]) => `export ${name}=${quote(value)}`)
+          .join("\n")
+      );
+      const bin = path.join(root, "bin");
+      fs.mkdirSync(bin);
+      const called = path.join(root, "docker-called");
+      fs.writeFileSync(path.join(bin, "docker"), `#!/bin/sh\ntouch "${called}"\nexit 1\n`, {
+        mode: 0o755,
+      });
+      const result = spawnSync(
+        "bash",
+        [script, "webkit-capture", "/workspace/x", "chat/reply", run],
+        {
+          cwd: root,
+          env: {
+            PATH: `${bin}:${process.env.PATH ?? ""}`,
+            HOME: root,
+            VERIFY_XUM_HOME: home,
+            VERIFY_XUM_WEBKIT: "docker",
+          },
+          encoding: "utf8",
+        }
+      );
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain("has a control character in its path");
+      expect(controlCharacters(result.stderr)).toEqual([]);
+      expect(fs.existsSync(called)).toBe(false);
+    }
+  );
 });

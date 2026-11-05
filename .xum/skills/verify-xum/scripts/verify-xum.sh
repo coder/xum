@@ -795,6 +795,13 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
   printf %s "$token" | timeout -k 10 240 env -i "${host_env[@]}" node "$WEBKIT_HELPER" --mode host "$@"
 }
 
+# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8).
+# Docker echoes a mount path in some errors, and a control character in it could drive your terminal.
+has_control_char() { # has_control_char <string>
+  local LC_ALL=C
+  [[ $1 == *[[:cntrl:]]* || $1 == *$'\xc2'[$'\x80'-$'\x9f']* ]]
+}
+
 # The helper in the pinned image. Trust boundary: --network host lets the container reach every
 # loopback port of this host, the sandbox's backend and its token included. It gets the token on
 # stdin only, runs one file of this repo from a digest-pinned image as your uid with no
@@ -804,6 +811,13 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
 webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args...>
   local token=$1 out_dir=$2 endpoint installed config docker_cli rc=0
   shift 2
+  local handed_over
+  for handed_over in "$CHECKOUT" "$WEBKIT_HELPER" "$out_dir" "$VERIFY_XUM_RUN"; do
+    if has_control_char "$handed_over"; then
+      WEBKIT_DOCKER_REASON="a folder or file handed to Docker has a control character in its path (not printed: it could drive your terminal)"
+      return 125
+    fi
+  done
   command -v docker >/dev/null || { WEBKIT_DOCKER_REASON="docker is not installed"; return 125; }
   # The user's endpoint, resolved once, then an empty private client config: the CLI copies the
   # `proxies` of its config into every container's environment. A remote endpoint is refused:
@@ -854,6 +868,7 @@ cmd_webkit_capture() {
   local path=${1:-} name=${2:-} mode=${VERIFY_XUM_WEBKIT:-auto} base token output rc=0
   local host_reason='' WEBKIT_DOCKER_REASON=''
   [[ $path == /* ]] || die "webkit-capture PATH must start with / (for example /workspace/<id>)"
+  ! has_control_char "$path" || die "webkit-capture PATH must not hold a control character"
   [[ $mode == auto || $mode == host || $mode == docker ]] || die "VERIFY_XUM_WEBKIT must be auto, host or docker"
   require_evidence_name "$name"
   # Docker mounts the folder of the name's last slash, so a name with no folder would mount every file of the evidence.
