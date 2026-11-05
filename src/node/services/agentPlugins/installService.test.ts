@@ -4569,7 +4569,7 @@ describe("AgentPluginInstallService", () => {
     await oauth.dispose();
   });
 
-  describe("an update that removes a signed-in MCP server", () => {
+  describe("stored sign-ins of plugin MCP servers that an update removes or an uninstall deletes", () => {
     const docsUrl = "https://docs.example.com/mcp";
     const keepUrl = "https://keep.example.com/mcp";
     const oauthEntry = (url: string, clientId: string) => ({
@@ -4626,7 +4626,7 @@ describe("AgentPluginInstallService", () => {
           consent: { fromSha: review.fromSha, toSha: review.toSha },
         });
       };
-      return { oauth, update };
+      return { updater, oauth, update };
     };
 
     // The 20 s limits: each test installs and updates a plugin over git, which takes more than the
@@ -4655,6 +4655,52 @@ describe("AgentPluginInstallService", () => {
       ]);
       await update(undefined);
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall signs out the plugin's servers, so a reinstall under another client does not inherit them", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await writeServers({ docs: oauthEntry(docsUrl, "client-b") });
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall that fails keeps the sign-in and records no sign-out", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+        Promise.reject(new Error("ENOSPC: no space left on device"))
+      );
+      try {
+        await expect(
+          updater.uninstall({ name: "demo-plugin", deletePluginData: false })
+        ).rejects.toThrow(/persist the plugin registry/);
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("a plugin whose MCP file cannot be read can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await fsPromises.writeFile(path.join(pluginsDir(), "demo-plugin", "mcp.json"), "{ not json");
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
       await oauth.dispose();
     }, 20_000);
   });
