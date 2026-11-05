@@ -18,10 +18,10 @@ function blankComments(source: string): string {
   );
 }
 
-// A property name follows `{`, `;` or the quote that opens a style attribute. A selector
-// (`.zoom:hover`, `a.zoom::after`), a custom property (`--diagram-zoom:`), a value
+// A property name follows `{`, `;` or the `=` or quote that opens a style attribute value. A
+// selector (`.zoom:hover`, `a.zoom::after`), a custom property (`--diagram-zoom:`), a value
 // (`touch-action: pinch-zoom`) and another name (`a_zoom:`) never do. `-webkit-zoom` counts.
-const ZOOM_PROPERTY = /[{;"']\s*(?:-[a-z]+-)?zoom\s*:/gi;
+const ZOOM_PROPERTY = /[{;"'=]\s*(?:-[a-z]+-)?zoom\s*:/gi;
 
 /** The 1-based line of each `zoom` declaration in a CSS or HTML source. */
 export function findZoomDeclarations(source: string): number[] {

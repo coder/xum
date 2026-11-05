@@ -1249,7 +1249,7 @@
       }
     },
     {
-      "files": ["src/browser/**/*.{ts,tsx}"],
+      "files": ["src/browser/**/*.{ts,tsx}", "vscode/src/webview/**/*.{ts,tsx}"],
       "jsPlugins": [
         {
           "name": "local",

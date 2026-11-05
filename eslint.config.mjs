@@ -593,7 +593,7 @@ export default defineConfig([
     // CSS zoom lays out differently in Safari than in Chromium (see local/no-css-zoom), so
     // renderer code sizes elements with explicit pixels. CSS files: `make check-no-css-zoom`.
     // Tests and stories keep fixtures that may use the name for other data.
-    files: ["src/browser/**/*.{ts,tsx}"],
+    files: ["src/browser/**/*.{ts,tsx}", "vscode/src/webview/**/*.{ts,tsx}"],
     ignores: [
       "**/*.test.ts",
       "**/*.test.tsx",

@@ -10,6 +10,7 @@ describe("findZoomDeclarations", () => {
     ["a style attribute in double quotes", '<div style="zoom: 2">x</div>'],
     ["a style attribute in single quotes", "<div style='zoom:2'>x</div>"],
     ["a declaration after another one in an attribute", '<div style="width:1px;zoom:2">x</div>'],
+    ["an unquoted style attribute", "<div style=zoom:2>x</div>"],
     ["a compact rule", ".x{zoom:2}"],
     ["upper case with a space before the colon", ".x { ZOOM : 2; }"],
     ["a declaration after a semicolon", ".x { color: red;zoom: 2 }"],
