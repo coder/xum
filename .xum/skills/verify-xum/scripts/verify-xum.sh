@@ -438,7 +438,7 @@ recorded_pgid() {
 }
 
 cmd_launch() {
-  local t0 backend_port vite_port log existing token leader
+  local t0 backend_port vite_port allowed_hosts log existing token leader
   need git curl node bun make setsid flock ss realpath agent-browser
   check_bun
   LAUNCH_DEADLINE=$((SECONDS + READY_TIMEOUT))
@@ -521,13 +521,19 @@ cmd_launch() {
     VERIFY_XUM_ROOT=$(sed -n 's/^  XUM_ROOT: *//p' "$log")
     backend_port=$(sed -n 's|^  Backend: *http://127.0.0.1:||p' "$log")
     vite_port=$(sed -n 's|^  Frontend: *http://localhost:||p' "$log")
-    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port ]] && break
+    allowed_hosts=$(sed -n 's/^  Allowed hosts: *//p' "$log")
+    [[ -n $VERIFY_XUM_ROOT && -n $backend_port && -n $vite_port && -n $allowed_hosts ]] && break
     group_alive "$VERIFY_XUM_PGID" || die "make dev-server-sandbox exited during startup"
     before_launch_deadline
     sleep 0.5
   done
   # The recipes assume default preferences. With both --clean flags the sandbox copies no config.
   grep -q '^  Seed config: *(none)$' "$log" || die "the sandbox copied a config.json, so the run would not start from default preferences"
+  # Vite's Host check is the DNS-rebinding guard. env -i drops VITE_ALLOWED_HOSTS and the
+  # port-forward proxy variables, but Bun loads the checkout's .env files (.env, .env.local,
+  # .env.development, .env.development.local) into the sandbox script, and they can set them again.
+  [[ $allowed_hosts == "loopback only" ]] \
+    || die "the sandbox allows the Host headers '$allowed_hosts' besides loopback, so a web page that rebinds its DNS name to this machine could read the app. A .env file in $CHECKOUT sets VITE_ALLOWED_HOSTS or a proxy URI: remove that line."
   VERIFY_XUM_BACKEND="http://127.0.0.1:$backend_port"
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
