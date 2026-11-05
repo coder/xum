@@ -1,4 +1,5 @@
 import { AgentDefinitionFrontmatterSchema } from "@/common/orpc/schemas";
+import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
@@ -21,8 +22,9 @@ export interface ParsedAgentDefinitionMarkdown {
   body: string;
   /**
    * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true` or a
-   * Claude read-only search list.
-   * The schema strips the key, so the install review reads it here (agentFiles.ts).
+   * Claude read-only search list, and that keeps the bash tools: the install review says its edit
+   * tools are removed and its shell stays. The schema strips the key, so the review reads it here
+   * (agentFiles.ts).
    */
   mappedReadonly: boolean;
 }
@@ -116,6 +118,9 @@ export function parseAgentDefinitionMarkdown(input: {
   return {
     frontmatter: parsed.data,
     body,
-    mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
+    mappedReadonly:
+      input.plugin !== undefined &&
+      isReadonlyForeignPluginAgent(raw) &&
+      isToolEnabledByConfigs("bash", [{ add: [".*"] }, parsed.data.tools ?? {}]),
   };
 }

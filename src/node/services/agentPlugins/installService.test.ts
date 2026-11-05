@@ -2394,6 +2394,21 @@ describe("AgentPluginInstallService", () => {
     expect((await service.list())[0].reviewRequiredCount).toBe(0);
   });
 
+  test("the install preview notes the shell only for read-only agents that keep bash", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const agent = (extra: string) =>
+      `---\nname: a\ndescription: Reviews code\ntools: [Read, Grep, Glob]\n${extra}---\nReview.\n`;
+    await fsPromises.writeFile(path.join(remoteDir, "agents", "searcher.md"), agent(""));
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "no-shell.md"),
+      agent("disallowedTools: [Bash]\n")
+    );
+    await commitAll(remoteDir, "add two read-only search agents");
+    const preview = await service.preview({ input: remoteDir });
+    expect([...preview.agents].sort()).toEqual(["no-shell.md", "searcher.md"]);
+    expect(preview.readonlyAgents).toEqual(["searcher.md"]);
+  });
+
   test("a plugin agent whose ID two files claim does not load (#6629)", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
