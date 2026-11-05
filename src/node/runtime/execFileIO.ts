@@ -77,6 +77,8 @@ export type ClassifyTransportExit = (exitCode: number, stderr: string) => boolea
  * English by LC_ALL=C): OpenSSH can print `Warning: Identity file … not
  * accessible: No such file or directory` on a connection that still works, so
  * a bare substring match would turn a permission error into "missing".
+ * uutils coreutils (the default since Ubuntu 25.10) ends the line with the
+ * errno, e.g. `… No such file or directory (os error 2)`.
  */
 function nonZeroExitError(
   message: string,
@@ -87,7 +89,10 @@ function nonZeroExitError(
   if (classifyExit?.(exitCode, stderr) === true) {
     return new RuntimeError(message, "network");
   }
-  const absence = /^(?:cat|stat): [^\n]*(No such file or directory|Not a directory)$/m.exec(stderr);
+  const absence =
+    /^(?:cat|stat): [^\n]*(No such file or directory|Not a directory)(?: \(os error \d+\))?$/m.exec(
+      stderr
+    );
   if (absence == null) {
     return new RuntimeError(message, "file_io");
   }
