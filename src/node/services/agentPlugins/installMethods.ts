@@ -689,7 +689,7 @@ function savedMethodMisfit(
     return sentence(`${AGENT_PLUGIN_INSTALL_METHOD_LABELS[saved]}: ${rejected.problem}`);
   const files = manifestFilesOf(saved, subpath);
   if (saved === "agent-plugin" && checked.schemaLessRoot) {
-    // The commit lost the root's `$schema` and has no Codex manifest to fall back to (B5.2).
+    // The commit lost the root's `$schema` and has no Codex manifest to fall back to.
     return `${files[0]} has no $schema in this commit, and ${files[1]} is gone.`;
   }
   if (checked.nativeRoot) {
@@ -742,7 +742,7 @@ function candidateMethods(
 }
 
 /**
- * The error when no method is chosen. An install with a saved method gets its refusal (R3), also
+ * The error when no method is chosen. An install with a saved method gets its refusal, also
  * when nothing fits at all; one without gets the refusal of an update that only fits `skills`,
  * the problem of a manifest that failed validation, or the message that names every format.
  */

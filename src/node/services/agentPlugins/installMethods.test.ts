@@ -633,7 +633,7 @@ describe("chooseStagedMethod update refusals (B5)", () => {
     expect(await refusal({ saved: "claude-plugin", skills: ["skills/a"], files: {} })).toContain(
       "Methods that fit this commit: Skills."
     );
-    // R3: the saved method's refusal wins over "No plugin.json found", and no switch is possible.
+    // The saved method's refusal wins over "No plugin.json found", and no switch is possible.
     expect(await refusal({ saved: "claude-plugin", files: { "README.md": "hi" } })).toBe(
       ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit."
     );
