@@ -298,7 +298,8 @@
     },
     "ForceDeleteModal": {
       "cardMode": "single",
-      "primaryStory": "ExplicitScope",
+      "primaryStory": "Phone",
+      "viewport": "390x844",
       "skip": [
         "components-forcedeletemodal--rejected-retry-remains-visible",
         "components-forcedeletemodal--retry-becomes-blocked",

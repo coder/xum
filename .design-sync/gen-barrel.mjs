@@ -302,6 +302,7 @@ const PREVIEW_SUPPORT_LINES = [
   `export { useAboutDialog } from "@/browser/contexts/AboutDialogContext";`,
   `export { getAppConfigStore } from "@/browser/stores/AppConfigStore";`,
   `export { RetryBarrierContent } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";`,
+  `export { createLRUCache } from "@/browser/utils/lruCache";`,
 ];
 
 const barrel =

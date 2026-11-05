@@ -281,6 +281,12 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
 - **AboutDialog viewport:** its primary story, BlockedPhone, is a fixed, portaled dialog,
   so an inner wrapper can't make it phone-width. `cfg.overrides.AboutDialog.viewport`
   captures it at the story's `mobile1` viewport (375x667) instead.
+- **ForceDeleteModal viewport:** same reason as AboutDialog. The capture is the `Phone`
+  story at its `phone390` viewport (390x844), the state that exercises the long descendant
+  id, footer wrapping and hidden shortcut hints.
+- **BranchSelector seeding:** the preview writes the branch through `createLRUCache` with
+  BranchSelector's own options, so the cache index and persisted-state subscribers stay in
+  sync. `createLRUCache` rides `window.Xum` via `PREVIEW_SUPPORT_LINES`.
 - **ThemedLogoLight skipped:** every card renders inside the forced-dark
   `cfg.provider` ThemeProvider, and a nested ThemeProvider defers to a forced parent, so
   a light-theme cell can't be rendered; it would only duplicate ThemedLogoDark.

@@ -2,7 +2,12 @@ import * as React from "react";
 import { MuxPreviewShell } from "../preview-harness";
 import { BranchSelector } from "@/browser/components/BranchSelector/BranchSelector";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { BRANCH_CACHE_ENTRY_PREFIX } from "@/common/constants/storage";
+import { createLRUCache } from "@/browser/utils/lruCache";
+import {
+  BRANCH_CACHE_ENTRY_PREFIX,
+  BRANCH_CACHE_INDEX_KEY,
+  BRANCH_CACHE_MAX_ENTRIES,
+} from "@/common/constants/storage";
 
 // Footer branch chip — isolated version of the CopyBranchNameWithoutHover story (which renders
 // the whole app). The selector seeds its branch from the localStorage branch cache, so the preview
@@ -13,15 +18,17 @@ import { BRANCH_CACHE_ENTRY_PREFIX } from "@/common/constants/storage";
 const WORKSPACE_ID = "branch-copy-1";
 const BRANCH = "feature/copy-branch";
 
+// Same cache options as BranchSelector.tsx. Writing through the LRU cache (persisted-state
+// helpers) keeps its index and subscribers in sync instead of leaving an untracked entry
+// in the gallery's shared storage.
+const branchCache = createLRUCache<string>({
+  entryPrefix: BRANCH_CACHE_ENTRY_PREFIX,
+  indexKey: BRANCH_CACHE_INDEX_KEY,
+  maxEntries: BRANCH_CACHE_MAX_ENTRIES,
+});
+
 function seedBranchCache() {
-  try {
-    localStorage.setItem(
-      `${BRANCH_CACHE_ENTRY_PREFIX}${WORKSPACE_ID}`,
-      JSON.stringify({ data: BRANCH, cachedAt: Date.now() })
-    );
-  } catch {
-    // Storage unavailable: the chip falls back to its loading state.
-  }
+  branchCache.set(WORKSPACE_ID, BRANCH);
 }
 
 // Answers the popover's git probes so opening it lists branches (main + the current one).
