@@ -191,9 +191,8 @@ export const AgentPluginComponentKindSchema = z.enum([
  * order, and install must use the method the user previewed. Each member is an object so a method
  * can carry its own fields (a later Claude marketplace method names its entry).
  *
- * The three manifest methods are offered side by side: one per
- * manifest file the repository has, except that a root plugin.json with `$schema` (a Xum-native
- * package) is offered alone.
+ * The three manifest methods are offered side by side, one per manifest file the repository has,
+ * except that a root plugin.json with `$schema` (a Xum-native package) is offered alone.
  */
 export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
   /** The root plugin.json with `$schema`, or else .codex-plugin/plugin.json. */
