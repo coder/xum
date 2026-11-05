@@ -1268,7 +1268,16 @@ export class ProjectService {
         : undefined;
 
     try {
-      const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
+      // --no-local: for a source on this machine, git's local-clone shortcut hard-links or copies
+      // the source's `objects/` files one by one. A background repack of that repository (git
+      // starts one after a commit or fetch) removes loose objects mid-copy, so the clone fails
+      // ("failed to copy file to ...", "hardlink different from source", or a checkout that
+      // cannot read an object). The transport reads the source through `git upload-pack`, which
+      // git keeps safe against a concurrent repack. It costs a full pack write instead of hard
+      // links, and leaves a clone that does not depend on the source's object store. Git ignores
+      // the flag for a remote URL.
+      const cloneArgs = ["clone", "--progress", "--no-local", "--", cloneUrl, cloneWorkPath];
+      const child = spawn("git", cloneArgs, {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
         // Detached children become process-group leaders on Unix so we can
