@@ -33,7 +33,6 @@ function shelfMetaJson(file: string, title: string): string {
   return JSON.stringify({
     sourceWorkspaceId: "ws-1",
     sourcePath: file,
-    version: 1,
     title,
     kind: "text",
     pinnedAtMs: 1,

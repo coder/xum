@@ -13674,8 +13674,8 @@ export class AgentSession {
     const readFilesAttachment = AttachmentService.generateReadFilesAttachment(
       context.readFilePaths
     );
-    // Artifacts M4: handles of published artifacts (host session dir; empty without versions).
-    // Off with the Artifacts experiment: versions recorded while it was on stay out of context.
+    // Artifacts M4: handles of published artifacts (host session dir; empty without records).
+    // Off with the Artifacts experiment: records made while it was on stay out of context.
     const artifactsIndexAttachment = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
       ? await generateArtifactsIndexAttachment(
           path.join(this.config.sessionsDir, this.workspaceId)
