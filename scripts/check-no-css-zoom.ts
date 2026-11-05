@@ -87,7 +87,8 @@ export function findZoomDeclarations(file: string, source: string): number[] {
       return zoomLinesInCss(source, 1);
     case ".html":
     case ".svg":
-      // scriptingEnabled: false parses <noscript> content as elements, as a browser without scripts does.
+      // scriptingEnabled: false parses <noscript> content as elements, so its style attributes
+      // are scanned too.
       return zoomLinesBelow(
         parse(source, { sourceCodeLocationInfo: true, scriptingEnabled: false })
       );
