@@ -405,6 +405,17 @@ describe("chooseInstallMethod", () => {
     ).toThrow("cannot be installed as Agent Plugin; it fits: Claude Code plugin, Skills");
   });
 
+  test("a method that fits nothing is refused with the list of what fits, or without one", () => {
+    expect(() =>
+      chooseInstallMethod([], { mode: "exact", method: { kind: "agent-plugin" } })
+    ).toThrow("This repository cannot be installed as Agent Plugin. Preview it again.");
+    expect(() =>
+      chooseInstallMethod([{ kind: "skills" }], { mode: "exact", method: { kind: "agent-plugin" } })
+    ).toThrow(
+      "This repository cannot be installed as Agent Plugin; it fits: Skills. Preview it again."
+    );
+  });
+
   test("a Cursor marketplace entry matches only the same entry", () => {
     const pstack = { kind: "cursor-marketplace" as const, entry: "pstack" };
     expect(chooseInstallMethod([pstack], { mode: "exact", method: { ...pstack } })).toEqual(pstack);
@@ -526,6 +537,136 @@ describe("chooseInstallMethod", () => {
         saved: undefined,
       })
     ).toEqual({ kind: "skills" });
+  });
+});
+
+describe("chooseStagedMethod", () => {
+  const manifest = JSON.stringify({ name: "egm" });
+  const invalid = (kind: "claude-plugin" | "cursor-plugin") => ({
+    method: { kind },
+    problem: `Invalid plugin: ${kind} is broken`,
+  });
+  const source = {
+    url: "https://github.com/google/elephant-goldfish-model.git",
+    subpath: undefined,
+  };
+
+  /** Runs chooseStagedMethod on a tree with these files, as the install service would. */
+  async function choose(args: {
+    files: Record<string, string>;
+    request: Parameters<typeof chooseStagedMethod>[2];
+    rejected?: Array<ReturnType<typeof invalid>>;
+    skills?: string[];
+  }) {
+    using tmp = new DisposableTempDir("install-methods-choose");
+    await writeTree(tmp.path, args.skills ?? [], args.files);
+    const detected = await detectInstallMethods(tmp.path);
+    return chooseStagedMethod(
+      tmp.path,
+      { ...detected, rejected: args.rejected ?? [] },
+      args.request,
+      source,
+      undefined
+    );
+  }
+
+  const egm = {
+    "plugin.json": manifest,
+    ".codex-plugin/plugin.json": manifest,
+    ".claude-plugin/plugin.json": manifest,
+    ".cursor-plugin/plugin.json": manifest,
+  };
+
+  test("a preview without a method takes the first manifest in the fixed order", async () => {
+    const choice = await choose({ files: egm, request: { mode: "first" } });
+    expect(choice.method).toEqual({ kind: "agent-plugin" });
+    expect(choice.methods.map((method) => method.kind)).toEqual([
+      "agent-plugin",
+      "claude-plugin",
+      "cursor-plugin",
+    ]);
+    expect(choice.warnings).toEqual([]);
+  });
+
+  test("a manifest that fails validation is not offered: its error is a warning, and the first valid one is chosen", async () => {
+    const choice = await choose({
+      files: egm,
+      rejected: [invalid("claude-plugin")],
+      request: { mode: "first" },
+    });
+    expect(choice.methods.map((method) => method.kind)).toEqual(["agent-plugin", "cursor-plugin"]);
+    expect(choice.warnings).toEqual([
+      "Claude Code plugin: Invalid plugin: claude-plugin is broken",
+    ]);
+
+    // The only manifest is the invalid one: its error is the answer, not "no plugin found".
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "first" },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+  });
+
+  test("install refuses a method that fails validation with its error, and one that is not there by what fits", async () => {
+    const rejected = [invalid("claude-plugin")];
+    await expect(
+      choose({
+        files: egm,
+        rejected,
+        request: { mode: "exact", method: { kind: "claude-plugin" } },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+    await expect(
+      choose({
+        files: { ".cursor-plugin/plugin.json": manifest },
+        request: { mode: "exact", method: { kind: "claude-plugin" } },
+      })
+    ).rejects.toThrow("cannot be installed as Claude Code plugin; it fits: Cursor plugin");
+    // What fits excludes a method that failed validation.
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest, ".cursor-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "exact", method: { kind: "agent-plugin" } },
+      })
+    ).rejects.toThrow("it fits: Cursor plugin. Preview it again.");
+  });
+
+  test("an update with a saved method that fits keeps it; one without a saved method reads today's rules", async () => {
+    const saved = await choose({
+      files: egm,
+      request: { mode: "update", generatedFrom: undefined, saved: "cursor-plugin" },
+    });
+    expect(saved.method).toEqual({ kind: "cursor-plugin" });
+    const legacy = await choose({
+      files: egm,
+      request: { mode: "update", generatedFrom: undefined, saved: undefined },
+    });
+    expect(legacy.method).toEqual({ kind: "agent-plugin" });
+  });
+
+  test("an update of an install without a saved method names the problem of its manifest when it fails validation", async () => {
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "update", generatedFrom: undefined, saved: undefined },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+  });
+
+  test("with nothing to install, the message names every format Xum looked for", async () => {
+    await expect(
+      choose({ files: { "README.md": "hi" }, request: { mode: "first" } })
+    ).rejects.toThrow("found at the repository root");
+    await expect(
+      choose({
+        files: { "README.md": "hi" },
+        request: { mode: "update", generatedFrom: undefined, saved: undefined },
+      })
+    ).rejects.toThrow("found at the repository root");
   });
 });
 

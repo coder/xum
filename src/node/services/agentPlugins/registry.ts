@@ -96,6 +96,8 @@ function registryRowName(raw: unknown): string | undefined {
 }
 
 let warnedUnknownInstallMethod = false;
+/** A newer build's value is logged, not trusted: a row can hold any text. */
+const MAX_LOGGED_METHOD_LENGTH = 64;
 
 /** Test seam: the warning below is once per process, so a test that counts it resets it first. */
 export function resetUnknownInstallMethodWarning(): void {
@@ -112,7 +114,7 @@ export function resetUnknownInstallMethodWarning(): void {
  * warning per process.
  */
 export function readStoredInstallMethod(rawRow: unknown): SavedInstallMethod | undefined {
-  if (rawRow === null || typeof rawRow !== "object" || Array.isArray(rawRow)) return undefined;
+  if (rawRow === null || typeof rawRow !== "object") return undefined;
   const value: unknown = (rawRow as { installMethod?: unknown }).installMethod;
   if (value === undefined) return undefined;
   const parsed = SavedInstallMethodSchema.safeParse(value);
@@ -121,7 +123,10 @@ export function readStoredInstallMethod(rawRow: unknown): SavedInstallMethod | u
     warnedUnknownInstallMethod = true;
     log.warn(
       "A plugin registry row has an install method this version does not know; loading it by the fixed manifest order",
-      { installMethod: typeof value === "string" ? value.slice(0, 64) : typeof value }
+      {
+        installMethod:
+          typeof value === "string" ? value.slice(0, MAX_LOGGED_METHOD_LENGTH) : typeof value,
+      }
     );
   }
   return undefined;

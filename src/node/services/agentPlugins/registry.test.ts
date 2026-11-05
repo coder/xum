@@ -118,6 +118,22 @@ describe("readStoredInstallMethod", () => {
     }
   });
 
+  test("the warning names the unknown value, cut short, or the kind of a value that is no text", () => {
+    const warned = (installMethod: unknown) => {
+      resetUnknownInstallMethodWarning();
+      const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+      try {
+        readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod }));
+        return warn.mock.calls.map(([, detail]) => detail);
+      } finally {
+        warn.mockRestore();
+      }
+    };
+    expect(warned("codex-plugin")).toEqual([{ installMethod: "codex-plugin" }]);
+    expect(warned("x".repeat(100))).toEqual([{ installMethod: "x".repeat(64) }]);
+    expect(warned(7)).toEqual([{ installMethod: "number" }]);
+  });
+
   test("an unknown value (from a newer build) means the fixed order and warns once per process", () => {
     resetUnknownInstallMethodWarning();
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);

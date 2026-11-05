@@ -2989,9 +2989,9 @@ describe("named manifest choice (install methods)", () => {
     expect(plugin).toBeNull();
     const errors = diagnostics.filter((d) => d.severity === "error");
     expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain("Agent Plugin");
-    expect(errors[0].message).toContain(".codex-plugin/plugin.json");
-    expect(errors[0].message).not.toContain(".claude-plugin");
+    expect(errors[0].message).toBe(
+      "Agent Plugin: neither plugin.json nor .codex-plugin/plugin.json exists."
+    );
   });
 
   test("a saved method whose manifest is missing reports an error that names the method and the file", async () => {
@@ -3009,8 +3009,7 @@ describe("named manifest choice (install methods)", () => {
       expect(plugin).toBeNull();
       const errors = diagnostics.filter((d) => d.severity === "error");
       expect(errors).toHaveLength(1);
-      expect(errors[0].message).toContain(label);
-      expect(errors[0].message).toContain(file);
+      expect(errors[0].message).toBe(`${label}: ${file} does not exist.`);
       expect(errors[0].path).toBe(path.join(await fs.realpath(tmp.path), file));
     }
   });
