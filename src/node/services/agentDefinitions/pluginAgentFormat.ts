@@ -31,7 +31,8 @@ type ForeignToolListKey = (typeof FOREIGN_TOOL_LIST_KEYS)[number];
  *   Xum tools do the same job and no more. Every other name grants nothing:
  *   its Xum tools do more than the Claude tool (todo_write replaces the whole
  *   checklist, task_send_message reaches workspaces outside the agent tree).
- *   The one exception is a read-only search list (see READ_ONLY_SEARCH_TOOLS).
+ *   The one exception is a read-only search list (see READ_ONLY_SEARCH_TOOLS):
+ *   Xum has no read-only search tool, so there Grep, Glob and LS grant bash.
  * - `deny` (in `disallowedTools`) removes every Xum tool that can do the job,
  *   so several names share one family: denying Write also removes Edit.
  */
@@ -189,20 +190,24 @@ function splitToolList(value: string): string[] {
 }
 
 /** Claude accepts a comma-separated string or a YAML list. */
-function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): string[] {
-  const value = raw[key];
+function parseToolList(value: unknown): string[] | undefined {
   const entries =
     typeof value === "string"
       ? splitToolList(value)
       : Array.isArray(value) && value.every((entry) => typeof entry === "string")
         ? value
         : undefined;
+  return entries?.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+}
+
+function readToolList(raw: Record<string, unknown>, key: ForeignToolListKey): string[] {
+  const entries = parseToolList(raw[key]);
   if (entries === undefined) {
     throw new ForeignPluginAgentToolsError(
       `Claude Code '${key}' must be a comma-separated string or a list of tool names.`
     );
   }
-  return entries.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return entries;
 }
 
 /** Claude tools whose specifier does not narrow them in a sub-agent's `tools` list. */
@@ -296,15 +301,13 @@ function readDeniedEntries(raw: Record<string, unknown>): string[] {
     : [];
 }
 
+/** Unlike mapToolLists, this does not refuse a list it cannot read: such an agent has no base. */
 function hasReadOnlySearchList(raw: Record<string, unknown>): boolean {
-  if (!foreignToolListKeys(raw).includes("tools")) return false;
-  try {
-    return isReadOnlySearchList(readToolList(raw, "tools"), readDeniedEntries(raw));
-  } catch (err) {
-    // A list that cannot be read makes mapToolLists skip the agent, so no base applies.
-    if (err instanceof ForeignPluginAgentToolsError) return false;
-    throw err;
-  }
+  const keys = foreignToolListKeys(raw);
+  if (!keys.includes("tools")) return false;
+  const entries = parseToolList(raw.tools);
+  const denylist = keys.includes("disallowedTools") ? parseToolList(raw.disallowedTools) : [];
+  return entries !== undefined && denylist !== undefined && isReadOnlySearchList(entries, denylist);
 }
 
 /**
