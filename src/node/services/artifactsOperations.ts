@@ -9,7 +9,11 @@
 import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactCapabilities,
+  ArtifactEntry,
+  ArtifactListing,
+} from "@/common/orpc/schemas/artifacts";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -24,7 +28,12 @@ import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentL
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { log } from "@/node/services/log";
 import { getArtifactCapabilities } from "./artifactCapabilities";
-import { getArtifactId, listArtifactRecords, readArtifactRecord } from "./artifactRecordStore";
+import {
+  getArtifactId,
+  listArtifactRecords,
+  readArtifactRecord,
+  type ArtifactRecord,
+} from "./artifactRecordStore";
 import {
   listArtifactsOnRuntime,
   readArtifactBytesOnRuntime,
@@ -192,11 +201,18 @@ export async function listArtifacts(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const publishedPaths = await listPublishedArtifactPaths(context, input.workspaceId);
+  const records = await listPublishedArtifacts(context, input.workspaceId);
+  const publishedPaths = records.map((record) => record.path);
+  // The tab reads a file as the kind the agent published it as, so a listing that shows that
+  // kind changes the tab's read key when only the kind changes.
+  const kindByPath = new Map(records.flatMap((r) => (r.kind != null ? [[r.path, r.kind]] : [])));
+  const withPublishedKinds = (entries: ArtifactEntry[]) =>
+    entries.map((entry) => ({ ...entry, kind: kindByPath.get(entry.path) ?? entry.kind }));
   if (location.kind === "runtime") {
     try {
       const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      return { success: true, data: { available: true, ...listing, publishedPaths } };
+      const entries = withPublishedKinds(listing.entries);
+      return { success: true, data: { available: true, ...listing, entries, publishedPaths } };
     } catch (error) {
       return unreachableError(error);
     }
@@ -206,21 +222,26 @@ export async function listArtifacts(
   });
   return {
     success: true,
-    data: { available: true, dir: location.dir, entries, truncated, publishedPaths },
+    data: {
+      available: true,
+      dir: location.dir,
+      entries: withPublishedKinds(entries),
+      truncated,
+      publishedPaths,
+    },
   };
 }
 
 /**
- * Paths with a publish record (host session dir), so the tab can list published files first.
- * Unreadable records leave the list short, never fail it.
+ * Records of published artifacts (host session dir): the tab lists published files first and
+ * shows each as its published kind. Unreadable records leave the list short, never fail it.
  */
-async function listPublishedArtifactPaths(
+async function listPublishedArtifacts(
   context: ArtifactsContext,
   workspaceId: string
-): Promise<string[]> {
+): Promise<ArtifactRecord[]> {
   try {
-    const records = await listArtifactRecords(path.join(context.config.sessionsDir, workspaceId));
-    return records.map((record) => record.path);
+    return await listArtifactRecords(path.join(context.config.sessionsDir, workspaceId));
   } catch (error) {
     log.debug("Could not list artifact records", { error: getErrorMessage(error) });
     return [];

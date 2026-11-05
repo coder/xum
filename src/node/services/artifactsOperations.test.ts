@@ -150,6 +150,28 @@ describe("artifacts operations", () => {
     });
   });
 
+  test("the listing shows a published file as the kind it was published as", async () => {
+    await writeArtifact("flow.txt", "graph TD; A-->B");
+    await writeArtifact("plain.txt", "plain");
+    await recordArtifactPublish({
+      sessionDir: path.join(config.sessionsDir, "ws-art"),
+      relPath: "flow.txt",
+      title: "Flow",
+      kind: "mermaid",
+    });
+
+    const listing = await listArtifacts(createContext({ enabled: true }), {
+      workspaceId: "ws-art",
+    });
+
+    expect(listing.success && listing.data.available && listing.data.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "flow.txt", kind: "mermaid" }),
+        expect.objectContaining({ path: "plain.txt", kind: "text" }),
+      ])
+    );
+  });
+
   test("a live read shows the kind the artifact tool published it as", async () => {
     await writeArtifact("flow.txt", "graph TD; A-->B");
     await writeArtifact("plain.txt", "graph TD; A-->B");

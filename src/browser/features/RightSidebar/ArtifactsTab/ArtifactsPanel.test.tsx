@@ -727,6 +727,39 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  test("re-reads an unchanged file that was published as another kind", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "# Title") }
+    );
+    const setIntervalSpy = spyOn(window, "setInterval");
+    try {
+      const view = renderPanel();
+      expect(await view.findByText("# Title")).toBeTruthy();
+      const poll = setIntervalSpy.mock.calls.find((call) => call[1] === 3000)?.[0];
+      if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
+
+      // The agent publishes the same bytes with kind: markdown.
+      fake.state.listing = {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "markdown")],
+        truncated: false,
+      };
+      fake.state.files = { "a.txt": textFile("a.txt", "markdown", "# Title") };
+      act(() => poll());
+      expect(await view.findByRole("heading", { name: "Title" })).toBeTruthy();
+      expect(fake.state.readCalls).toEqual(["a.txt", "a.txt"]);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   test("marks artifacts that changed while the tab was open", async () => {
     fake = createFakeArtifactsApi(
       {

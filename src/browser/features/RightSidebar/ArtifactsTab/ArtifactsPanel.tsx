@@ -466,7 +466,8 @@ export function ArtifactsPanel(props: {
   } else if (selected?.scope === "artifact") {
     readRequest = {
       // Size too: a same-mtime rewrite (`cp -p`, 1 s mtime resolution) still changes the key.
-      key: `live\u0000${selected.path}\u0000${selected.entry.modifiedMs}\u0000${selected.entry.size}`,
+      // Kind too: a publish with another kind changes how the same bytes are shown.
+      key: `live\u0000${selected.path}\u0000${selected.entry.modifiedMs}\u0000${selected.entry.size}\u0000${selected.entry.kind}`,
       kind: "live",
       path: selected.path,
       modifiedMs: selected.entry.modifiedMs,
