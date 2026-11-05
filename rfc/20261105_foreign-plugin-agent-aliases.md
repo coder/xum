@@ -71,7 +71,7 @@ These come from the parent RFC's second review round (`reaudit_report.md`, R1 to
    - `buildAgentAliasTable(candidates: AliasCandidate[]): AliasTable`. The input is the precedence-ordered list of every parsed agent file, each with its ID, plugin name, foreign flag, `name` and refusal reason (if any).
    - `AliasTable.resolve(ref)` returns `{ kind: "alias", id }`, `{ kind: "refused", reason, rule, holder? }` or `{ kind: "unknown" }`.
    - It applies rules 1 to 5 of A1. It asserts that every returned ID exists in the input.
-2. `src/node/services/agentDefinitions/pluginAgentAliases.test.ts` (Create): every rule, criteria 5 to 7, the scoped grammar with a `.` in the plugin name, and that an ID always takes precedence over an alias.
+2. `src/node/services/agentDefinitions/pluginAgentAliases.test.ts` (Create): every rule, that a Xum-format plugin agent gets no aliases, the scoped grammar with a `.` in the plugin name, and that an ID always takes precedence over an alias.
 3. `src/common/orpc/schemas/agentDefinition.ts` (Modify): the descriptor gains `aliases?: string[]` (aliases that are not refused).
 4. `src/node/services/agentDefinitions/agentDefinitionsService.ts` (Modify)
    - A new `discoverAliasCandidates` returns the precedence-ordered candidates before deduplication and sorting (`:775-796`), including files that fail consent, availability or the #6629 check, with their reason.
@@ -85,7 +85,7 @@ These come from the parent RFC's second review round (`reaudit_report.md`, R1 to
    - `agentType` and the desktop owner (`:8958`, `:8961`) get the resolved ID.
    - Best-of group recovery (`:3467-3504`) compares the resolved ID of the tool input.
    - Map each refusal to its `Task.create:` error text.
-9. `src/node/services/taskService.pluginAgents.test.ts` (Modify): criteria 4, 8, 9, 10 and 11 through `TaskService.create` and `createMany`.
+9. `src/node/services/taskService.pluginAgents.test.ts` (Modify): spawns by bare and by scoped alias that store the file-stem ID, the `alias-refused` error and the by-ID refusals that an alias carries, and best-of recovery by alias, through `TaskService.create` and `createMany`.
 10. `src/node/services/tools/task.ts` (Modify): `buildTaskDescription` prints each foreign agent's `aliases`.
 11. `src/node/services/tools/task.test.ts` (Modify): the description shows aliases and leaves refused ones out.
 12. `src/common/orpc/schemas/agentPlugins.ts` (Modify): the preview's `agents` field becomes a list of `{ file, id, aliases, refusedAliases }`. `readonlyAgents` matches on `file`.
