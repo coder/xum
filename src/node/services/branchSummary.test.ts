@@ -361,12 +361,34 @@ describe("branch summary budget invariants", () => {
     expect(targetTokens).toBeLessThanOrEqual(BRANCH_SUMMARY_MAX_OUTPUT_TOKENS * 0.8);
   });
 
-  test("deadline covers a worst-case max_tokens stream at dogfooded throughput", () => {
-    // Measured on the side-channel candidate (haiku): ~102 tok/s, ~550ms TTFB.
-    const measuredTokensPerSecond = 102;
+  test("deadline covers a worst-case max_tokens stream at the slowest candidate route", () => {
+    // The candidate list is strictly the workspace's own models, so the rate
+    // that sizes the deadline is the slow END of what a user can configure —
+    // a self-hosted open-weights server at ~20 tok/s with ~0.6s of first-token
+    // latency — NOT the hosted fast model that the old 6s default was measured
+    // on. Asserting only the hosted route is what let a deadline through that
+    // still could not reach the output cap at the documented floor.
+    const floorTokensPerSecond = 20;
     const measuredTtfbMs = 550;
     const worstCaseStreamMs =
-      measuredTtfbMs + (BRANCH_SUMMARY_MAX_OUTPUT_TOKENS / measuredTokensPerSecond) * 1000;
+      measuredTtfbMs + (BRANCH_SUMMARY_MAX_OUTPUT_TOKENS / floorTokensPerSecond) * 1000;
+    expect(worstCaseStreamMs).toBeLessThanOrEqual(BRANCH_SUMMARY_TIMEOUT_MS);
+
+    // ...and the deadline stays a bound rather than an unbounded wait: it must
+    // not drift arbitrarily far past the slowest route it has to cover.
+    expect(BRANCH_SUMMARY_TIMEOUT_MS).toBeLessThanOrEqual(worstCaseStreamMs * 1.5);
+  });
+
+  test("deadline covers the thinking-headroom cap at the hosted rate", () => {
+    // Candidates that cannot disable thinking run against a cap of
+    // MAX + THINKING_HEADROOM tokens under the SAME deadline, so that larger
+    // stream has to fit too. Those are pinned Anthropic routes, measured at
+    // ~102 tok/s and ~550ms TTFB.
+    const measuredTokensPerSecond = 102;
+    const measuredTtfbMs = 550;
+    const capWithThinking =
+      BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS;
+    const worstCaseStreamMs = measuredTtfbMs + (capWithThinking / measuredTokensPerSecond) * 1000;
     expect(worstCaseStreamMs).toBeLessThanOrEqual(BRANCH_SUMMARY_TIMEOUT_MS);
   });
 });
