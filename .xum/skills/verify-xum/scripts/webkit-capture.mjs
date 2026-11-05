@@ -30,7 +30,9 @@ const STILL_LOADING_JS = `(() => {
   const loading = [];
   if (document.querySelector('.boot-loader[aria-busy="true"]')) loading.push("the loading screen");
   const pending = [...document.querySelectorAll(".mermaid-container")].some(
-    (frame) => frame.textContent.trim() === ${JSON.stringify(MERMAID_PENDING_TEXT)}
+    (frame) =>
+      frame.querySelector("svg") === null &&
+      frame.textContent.trim() === ${JSON.stringify(MERMAID_PENDING_TEXT)}
   );
   if (pending) loading.push("a Mermaid diagram that is still rendering");
   return loading;

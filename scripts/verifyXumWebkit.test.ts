@@ -269,5 +269,11 @@ describe("the page checks that webkit-capture.mjs runs in the browser", () => {
       []
     );
     expect(loading(`<p>Loading Xum</p><p>${MERMAID_PENDING_TEXT}</p>`)).toEqual([]);
+    // A finished diagram can have a node with the placeholder's own words.
+    expect(
+      loading(
+        `<div class="mermaid-container"><svg><text>${MERMAID_PENDING_TEXT}</text></svg></div>`
+      )
+    ).toEqual([]);
   });
 });
