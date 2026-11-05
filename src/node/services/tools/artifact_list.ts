@@ -16,6 +16,7 @@ import {
   getArtifactId,
   listArtifactRecords,
   listStoredArtifactIds,
+  withPublishedKinds,
 } from "@/node/services/artifactRecordStore";
 import { summarizeArtifactState } from "@/node/services/artifactInteractions";
 
@@ -81,12 +82,12 @@ export const createArtifactListTool: ToolFactory = (config) =>
               `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
               abortSignal
             );
-      const titleByPath = new Map<string, string>();
-      if (config.workspaceSessionDir != null) {
-        for (const record of await listArtifactRecords(config.workspaceSessionDir)) {
-          titleByPath.set(record.path, record.title);
-        }
-      }
+      const records =
+        config.workspaceSessionDir != null
+          ? await listArtifactRecords(config.workspaceSessionDir)
+          : [];
+      const titleByPath = new Map(records.map((record) => [record.path, record.title]));
+      const entries = withPublishedKinds(listing.entries, records);
       // window.xum.setState of the artifact (M5b). Only sandboxed HTML/SVG can set state,
       // and only artifacts with a stored directory (record or state) can have any, so the rest
       // skip the read. The reads run a bounded batch at a time instead of one by one.
@@ -94,7 +95,7 @@ export const createArtifactListTool: ToolFactory = (config) =>
       const sessionDir = config.workspaceSessionDir;
       if (sessionDir != null) {
         const storedIds = new Set(await listStoredArtifactIds(sessionDir));
-        const candidates = listing.entries.filter(
+        const candidates = entries.filter(
           (entry) =>
             (entry.kind === "html" || entry.kind === "svg") &&
             storedIds.has(getArtifactId(entry.path))
@@ -110,7 +111,7 @@ export const createArtifactListTool: ToolFactory = (config) =>
           });
         }
       }
-      const artifacts = listing.entries.map((entry) => {
+      const artifacts = entries.map((entry) => {
         const title = titleByPath.get(entry.path);
         const state = stateByPath.get(entry.path);
         return {

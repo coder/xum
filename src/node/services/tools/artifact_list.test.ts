@@ -143,6 +143,31 @@ describe("artifact_list tool", () => {
     expect(byPath.get("notes.md")?.state).toBeUndefined();
   });
 
+  test("lists a published file as the kind it was published as, and reads its saved state", async () => {
+    const scratchDir = path.join(tempDir, "scratch");
+    const sessionDir = path.join(tempDir, "session");
+    await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
+    await fs.writeFile(path.join(scratchDir, "artifacts", "page.txt"), "<p>form</p>");
+    await fs.writeFile(path.join(scratchDir, "artifacts", "plain.txt"), "plain");
+    await recordArtifactPublish({ sessionDir, relPath: "page.txt", title: "Page", kind: "html" });
+    await setArtifactInteractionState(path.dirname(sessionDir), {
+      workspaceId: path.basename(sessionDir),
+      path: "page.txt",
+      state: { step: 3 },
+    });
+    const tool = createArtifactListTool({
+      ...createTestToolConfig(tempDir),
+      workspaceSessionDir: sessionDir,
+      xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
+    });
+    const result = (await tool.execute!({}, options)) as {
+      artifacts: Array<{ path: string; kind: string; state?: string }>;
+    };
+    const byPath = new Map(result.artifacts.map((entry) => [entry.path, entry]));
+    expect(byPath.get("page.txt")).toMatchObject({ kind: "html", state: '{"step":3}' });
+    expect(byPath.get("plain.txt")?.kind).toBe("text");
+  });
+
   test("reads saved state only for HTML/SVG artifacts that have stored data", async () => {
     const scratchDir = path.join(tempDir, "scratch");
     const sessionDir = path.join(tempDir, "session");

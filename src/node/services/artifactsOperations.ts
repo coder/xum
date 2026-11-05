@@ -9,11 +9,7 @@
 import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type {
-  ArtifactCapabilities,
-  ArtifactEntry,
-  ArtifactListing,
-} from "@/common/orpc/schemas/artifacts";
+import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -32,6 +28,7 @@ import {
   getArtifactId,
   listArtifactRecords,
   readArtifactRecord,
+  withPublishedKinds,
   type ArtifactRecord,
 } from "./artifactRecordStore";
 import {
@@ -203,14 +200,10 @@ export async function listArtifacts(
   }
   const records = await listPublishedArtifacts(context, input.workspaceId);
   const publishedPaths = records.map((record) => record.path);
-  // The tab's read key includes the kind, so a kind-only republish must change the listing.
-  const kindByPath = new Map(records.flatMap((r) => (r.kind != null ? [[r.path, r.kind]] : [])));
-  const withPublishedKinds = (entries: ArtifactEntry[]) =>
-    entries.map((entry) => ({ ...entry, kind: kindByPath.get(entry.path) ?? entry.kind }));
   if (location.kind === "runtime") {
     try {
       const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      const entries = withPublishedKinds(listing.entries);
+      const entries = withPublishedKinds(listing.entries, records);
       return { success: true, data: { available: true, ...listing, entries, publishedPaths } };
     } catch (error) {
       return unreachableError(error);
@@ -224,7 +217,7 @@ export async function listArtifacts(
     data: {
       available: true,
       dir: location.dir,
-      entries: withPublishedKinds(entries),
+      entries: withPublishedKinds(entries, records),
       truncated,
       publishedPaths,
     },

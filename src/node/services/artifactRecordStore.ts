@@ -185,6 +185,15 @@ export async function listStoredArtifactIds(sessionDir: string): Promise<string[
   return names.filter(isValidArtifactId);
 }
 
+/** Listing entries as the tab shows them: a published kind replaces the extension's. */
+export function withPublishedKinds<T extends { path: string; kind: ArtifactKind }>(
+  entries: T[],
+  records: ArtifactRecord[]
+): T[] {
+  const kindByPath = new Map(records.flatMap((r) => (r.kind != null ? [[r.path, r.kind]] : [])));
+  return entries.map((entry) => ({ ...entry, kind: kindByPath.get(entry.path) ?? entry.kind }));
+}
+
 export async function listArtifactRecords(sessionDir: string): Promise<ArtifactRecord[]> {
   const ids = await listStoredArtifactIds(sessionDir);
   const records = await Promise.all(ids.map((id) => readArtifactRecord(sessionDir, id)));
