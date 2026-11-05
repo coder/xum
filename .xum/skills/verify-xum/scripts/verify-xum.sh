@@ -853,13 +853,13 @@ cmd_webkit_capture() {
     output=$(webkit_on_host "$token" "${helper_args[@]}" 2>&1) || rc=$?
     case $rc in
       0) webkit_report "$base"; return 0 ;;
-      "$WEBKIT_NOT_LAUNCHED") host_reason=$output ;;
+      "$WEBKIT_NOT_LAUNCHED") host_reason=${output#webkit-capture: } ;;
       124) die "webkit-capture timed out on the host" ;;
       *) printf '%s\n' "$output" >&2; exit "$rc" ;;
     esac
   fi
   if [[ $mode != host ]]; then
-    [[ $mode == docker ]] || echo "verify-xum: WebKit did not launch on this host ($host_reason). Running it in Docker." >&2
+    [[ $mode == docker ]] || echo "verify-xum: WebKit did not launch on this host (${host_reason:0:120}...). Running it in Docker." >&2
     rc=0
     webkit_in_docker "$token" "$(dirname "$base")" "${helper_args[@]}" || rc=$?
     case $rc in

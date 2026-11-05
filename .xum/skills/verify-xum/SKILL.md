@@ -195,12 +195,14 @@ opens a page of the run in Playwright WebKit at a phone viewport:
 ```
 
 `webkit-capture <path> <feature>/<step>` loads `<path>` in a new browser (390x844 at 3x, mobile,
-touch), waits as `idle` does and until the `Loading Xum` screen is gone, and writes
-`<step>-webkit.png` and `<step>-webkit.txt` under `evidence/<feature>/`. It exits 3 on
-`<name> failed to load.`, as `idle` does. The report holds the redacted URL, the engine and its
-mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers, and
-the console and page errors. Open the PNG: the width line sees only page-level overflow, not
-content that paints outside its frame inside the page.
+touch), waits as `idle` does, and writes `<step>-webkit.png` and `<step>-webkit.txt` under
+`evidence/<feature>/`. `idle`'s test reads a page as settled while it still shows `Loading Xum` or
+a Mermaid diagram's `Rendering diagram...`, so this command also waits for both to go. After 60 s
+it exits 1 and names the placeholder. It exits 3 on `<name> failed to load.`, as `idle` does.
+The report holds the redacted URL, the engine and its mode, the viewport,
+`document.documentElement.scrollWidth <= innerWidth` with both numbers, and the console and page
+errors. Open the PNG: the width line sees only page-level overflow, not content that paints
+outside its frame inside the page.
 
 - The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
   that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
@@ -214,10 +216,12 @@ content that paints outside its frame inside the page.
   once). The image's browsers belong to that Playwright version: a Playwright bump needs a new
   digest in `verify-xum.sh`, and `scripts/verifyXumWebkit.test.ts` fails until it has one. When
   neither mode works, the command exits 1 and names both fixes.
-- The token reaches the helper on stdin, as it reaches curl in `doctor`. It is in no argv, no
-  environment and no file, and the helper redacts it from every message and from the report. The
-  host helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so
-  unlike agent-browser no DevTools port and no stream listens.
+- The token reaches the helper on stdin, as it reaches curl in `doctor`. It is in no argv and no
+  environment, and the helper redacts it from every message and from the report. The browser's
+  profile lives in a temporary folder (the container's tmpfs, or the run's `tmp` folder, which
+  cleanup deletes). The host helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so
+  unlike agent-browser no DevTools port and no stream listens, except under WSL, where
+  Playwright opens a debugging port (`--remote-debugging-port=0`).
 - CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
   host, the sandbox's backend and its token included. The container gets the token on stdin only,
   runs one file of this repo from the pinned image as your uid with no capabilities and a
@@ -251,9 +255,8 @@ Proof standards:
 - For every UI change to layout, CSS, SVG or scrolling, add a WebKit capture
   (`verify-xum.sh webkit-capture`, above) of each page the change reaches, and read the
   `-webkit` PNG next to the `-375` one. Phone users run Safari, which is WebKit, and agent-browser
-  is Chromium: a page that fits in the `-375` capture can still break in WebKit (Mermaid diagrams
-  paint outside their frame on an iPhone). Say which captures you could not make in WebKit, and
-  why.
+  is Chromium: a page that fits in the `-375` capture can still break in WebKit, as Mermaid
+  diagrams did on an iPhone. Say which captures you could not make in WebKit, and why.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.

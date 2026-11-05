@@ -3,6 +3,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { MERMAID_PENDING_TEXT } from "../src/browser/features/Messages/MermaidPendingFrame";
+
 const SKILL_SCRIPTS = path.join(import.meta.dir, "../.xum/skills/verify-xum/scripts");
 const HELPER = path.join(SKILL_SCRIPTS, "webkit-capture.mjs");
 const TOKEN = "tok-3f9a/+=secret value";
@@ -48,6 +50,8 @@ async function runHelper(options: {
   scrollWidth?: number;
   chunkFailed?: boolean;
   launchError?: string;
+  /** The page never settles and still shows these placeholders. */
+  stuckOn?: string[];
 }): Promise<FakeRun> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-webkit-test-"));
   tempDirs.push(root);
@@ -78,8 +82,13 @@ exports.webkit = {
               save();
               handlers.console?.({ type: () => "error", text: () => "Failed to load resource: " + url });
             },
-            async waitForFunction() {},
+            async waitForFunction() {
+              if (${JSON.stringify(options.stuckOn !== undefined)}) {
+                throw Object.assign(new Error("timed out"), { name: "TimeoutError" });
+              }
+            },
             async evaluate(expression) {
+              if (typeof expression === "string" && expression.includes("innerText")) return ${JSON.stringify(options.stuckOn ?? [])};
               if (typeof expression === "string") return ${JSON.stringify(options.chunkFailed ?? false)};
               return { scrollWidth: ${options.scrollWidth ?? 390}, innerWidth: 390 };
             },
@@ -164,6 +173,18 @@ describe("webkit-capture.mjs", () => {
     expect(run.exitCode).toBe(3);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
     expectNoToken(run.stdout + run.stderr);
+  });
+
+  test("names the placeholder a page is stuck on instead of capturing it", async () => {
+    const run = await runHelper({ stuckOn: [MERMAID_PENDING_TEXT] });
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
+    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+  });
+
+  test("waits for Mermaid's own placeholder, which no CSS transition or busy flag shows", () => {
+    // `idle`'s test reads a page that still says "Rendering diagram..." as settled.
+    expect(fs.readFileSync(HELPER, "utf8")).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
   });
 
   test("exits 4 with one line when WebKit does not launch, so the caller can try Docker", async () => {

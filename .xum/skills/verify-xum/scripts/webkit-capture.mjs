@@ -1,7 +1,7 @@
 // Opens one page of a verify-xum run in Playwright WebKit at a phone viewport and writes a
 // screenshot and a short report. Run by `verify-xum.sh webkit-capture` (see ../SKILL.md), on the
-// host or in the pinned Playwright image. Playwright talks to WebKit over a pipe: no DevTools port
-// listens.
+// host or in the pinned Playwright image. Playwright talks to WebKit over a pipe, so no DevTools port
+// listens (under WSL it opens one).
 //
 // The backend's auth token arrives on stdin, never in argv or the environment, and every message
 // this process prints or writes is redacted with the same rules as `redact_token` in
@@ -20,6 +20,11 @@ const EXIT_NO_WEBKIT = 4;
 const WATCHDOG_MS = 180_000;
 const STEP_TIMEOUT_MS = 60_000;
 const MAX_PROBLEM_LINES = 20;
+// Placeholders of content that is still loading. They are no CSS transition and no busy
+// transcript, so `idle`'s test reads a page that shows one as settled. scripts/verifyXumWebkit.test.ts
+// checks that this list holds Mermaid's own placeholder text.
+const PENDING_TEXTS = ["Loading Xum", "Rendering diagram..."];
+const STILL_PENDING_JS = `${JSON.stringify(PENDING_TEXTS)}.filter((text) => document.body.innerText.includes(text))`;
 
 const PHONE = {
   viewport: { width: 390, height: 844 },
@@ -78,7 +83,7 @@ const { webkit } = require("playwright-core");
 const playwrightVersion = require("playwright-core/package.json").version;
 
 // Playwright's launch failure for missing host libraries is a boxed, multi-line table.
-function oneLine(text, max = 300) {
+function oneLine(text, max = 200) {
   return redact(text)
     .replace(/[╔╗╚╝║═]/g, " ")
     .replace(/\s+/g, " ")
@@ -106,14 +111,30 @@ try {
   const url = new URL(args.path, args.base);
   if (token) url.searchParams.set("token", token);
   await page.goto(url.href, { waitUntil: "load", timeout: STEP_TIMEOUT_MS });
-  // `idle`'s test, plus the startup screen: it has no transition and no transcript, so on a page
-  // that is not a workspace the page would read as settled while it still shows "Loading Xum".
-  await page.waitForFunction(
-    `(${args["chunk-failed-js"]}) || ((${args["settled-js"]}) && !document.body.innerText.includes("Loading Xum"))`,
-    undefined,
-    { timeout: STEP_TIMEOUT_MS }
-  );
-  if ((await page.evaluate(args["chunk-failed-js"])) === true) {
+  const settled = await page
+    .waitForFunction(
+      `(${args["chunk-failed-js"]}) || ((${args["settled-js"]}) && ${STILL_PENDING_JS}.length === 0)`,
+      undefined,
+      { timeout: STEP_TIMEOUT_MS }
+    )
+    .then(
+      () => true,
+      (error) => {
+        if (error?.name !== "TimeoutError") throw error;
+        return false;
+      }
+    );
+  if (!settled) {
+    const stuck = await page.evaluate(STILL_PENDING_JS);
+    process.stderr.write(
+      `webkit-capture: the page did not settle in ${STEP_TIMEOUT_MS / 1000} s${
+        stuck.length > 0
+          ? `: it still shows ${stuck.map((text) => JSON.stringify(text)).join(", ")}`
+          : ""
+      }.\n`
+    );
+    exitCode = 1;
+  } else if ((await page.evaluate(args["chunk-failed-js"])) === true) {
     process.stderr.write(
       "webkit-capture: the page shows '<name> failed to load.': a module fetch from Vite failed. Run the command again.\n"
     );
@@ -129,7 +150,7 @@ try {
     const lines = [
       `url: ${page.url()}`,
       `engine: WebKit ${browser.version()}, playwright-core ${playwrightVersion}, ${args.mode}`,
-      `viewport: ${PHONE.viewport.width}x${PHONE.viewport.height} @${PHONE.deviceScaleFactor}x, isMobile, hasTouch`,
+      `viewport: ${JSON.stringify(PHONE)}`,
       `document.documentElement.scrollWidth <= innerWidth: ${fits} (${widths.scrollWidth} <= ${widths.innerWidth})`,
       `console and page errors: ${problems.length}`,
       ...problems.slice(0, MAX_PROBLEM_LINES).map((problem) => oneLine(problem)),
