@@ -42,6 +42,11 @@ Chrome with a DevTools port on `127.0.0.1` (`--remote-debugging-port=0`), which 
 credentials and which agent-browser cannot turn off. While the signed-in app is open, any local
 account that finds that port can control the browser, read the page and take the stored token.
 
+The skill trusts the checkout. Launch runs the checkout's code, and Bun loads the checkout's
+`.env` files into the processes launch starts, so a line such as `NODE_OPTIONS=--require=<file>`
+there runs code in Vite and the backend. None of the protections below holds against a checkout
+you do not trust.
+
 These protections matter on a host where you are the only local account too:
 
 - No text evidence keeps the token: `capture` replaces it with `<redacted>` in the files it
