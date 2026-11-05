@@ -751,12 +751,9 @@ const config: TestRunnerConfig = {
       await page.setViewportSize(restoreViewport);
     }
     // A failed play already reports its own error, which this check would hide. A play can run it
-    // earlier too (see preVisit): this one covers every story tagged webkit that shows a diagram.
-    if (
-      !context.hasFailure &&
-      (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG) &&
-      (await page.locator(PAGE_DIAGRAMS).count()) > 0
-    ) {
+    // earlier too (see preVisit): this one covers every story tagged webkit at rest. Such a story
+    // must show a rendered diagram, so a chart that failed to render or is still rendering fails.
+    if (!context.hasFailure && (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG)) {
       await assertNoDiagramInkOutsideItsBox(page);
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
