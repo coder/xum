@@ -1720,7 +1720,11 @@ const localPlugin = {
         // rule cannot see those types. Rename a field that is not CSS.
         const isZoom = (node, computed) =>
           (node.type === "Identifier" && node.name === "zoom" && !computed) ||
-          (node.type === "Literal" && node.value === "zoom");
+          (node.type === "Literal" && node.value === "zoom") ||
+          // [`zoom`]: a template literal with no expressions has exactly one quasi.
+          (node.type === "TemplateLiteral" &&
+            node.expressions.length === 0 &&
+            node.quasis[0].value.cooked === "zoom");
         const isNamed = (node, name) =>
           (node.type === "Identifier" && node.name === name) ||
           (node.type === "Literal" && node.value === name);
@@ -1747,13 +1751,13 @@ const localPlugin = {
         };
         const report = (node) => context.report({ node, messageId: "zoom" });
         return {
-          // style={{ zoom: 2 }}, style={{ zoom }}, { "zoom": 2 } and { ["zoom"]: 2 }
+          // style={{ zoom: 2 }}, style={{ zoom }}, { "zoom": 2 }, { ["zoom"]: 2 } and { [`zoom`]: 2 }
           Property(node) {
             if (node.parent.type === "ObjectExpression" && isZoom(node.key, node.computed)) {
               report(node.key);
             }
           },
-          // element.style.zoom = 2 and element.style["zoom"] = 2
+          // element.style.zoom = 2, element.style["zoom"] = 2 and element.style[`zoom`] = 2
           MemberExpression(node) {
             const owner = node.object;
             if (
