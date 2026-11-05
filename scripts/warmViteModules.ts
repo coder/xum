@@ -13,9 +13,10 @@
  *
  * The walk reads Vite's own output: Vite rewrites every import it serves to an absolute path, so a
  * regex over the served JavaScript finds the static and the `import("...")` edges. A 4xx answer is
- * ignored (a string that only looks like an import). A 5xx answer or a network failure fails the
- * walk, because the browser would fail on that module too. The walk never leaves Vite's origin:
- * the strings come from source files, and `/\\host` is a URL on another host.
+ * ignored (a string that only looks like an import). A 5xx answer, a 3xx answer or a network
+ * failure fails the walk, because the browser would fail on that module too. The walk never
+ * leaves Vite's origin: the strings come from source files, `/\\host` is a URL on another host,
+ * and a redirect can name another host, so no request follows one.
  *
  * Worker scripts (`new Worker(new URL("...", import.meta.url))`) are left out on purpose. Vite's
  * dependency scan does not see the highlight worker's `@pierre/highlights`, so the first request
@@ -117,10 +118,17 @@ export async function warmModuleGraph(
     await acquire();
     try {
       options.signal?.throwIfAborted();
-      const response = await fetch(requestUrl(url), { signal: options.signal });
+      // `fetch` follows a redirect by default, and a `Location` header can name another origin.
+      const response = await fetch(requestUrl(url), {
+        signal: options.signal,
+        redirect: "manual",
+      });
       const type = response.headers.get("content-type") ?? "";
-      if (response.status >= 500) {
-        failures.push(`${url}: HTTP ${response.status}`);
+      // Vite does not redirect a module, so a 3xx is a module that it could not serve.
+      const redirected = response.status >= 300 && response.status < 400;
+      if (redirected || response.status >= 500) {
+        const note = redirected ? " (a redirect: the walk does not follow redirects)" : "";
+        failures.push(`${url}: HTTP ${response.status}${note}`);
         await response.arrayBuffer();
         return;
       }

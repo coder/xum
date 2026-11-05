@@ -195,6 +195,32 @@ describe("warmModuleGraph", () => {
     expect(result.served).toBe(3);
   });
 
+  // `fetch` follows a redirect unless told not to, and the walk must not leave Vite's origin. Vite
+  // does not redirect a module, so a 3xx is a module that Vite could not serve.
+  test.each([
+    ["another origin", (otherOrigin: string) => `${otherOrigin}/x.js`],
+    ["the same origin", () => "/src/ok.ts"],
+  ])("fails on a redirect to %s and does not follow it", async (_name, location) => {
+    const other = serve({ "/x.js": () => js("export {}") });
+    const { origin, requests } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () =>
+        new Response(null, { status: 302, headers: { location: location(other.origin) } }),
+      "/src/ok.ts": () => js("export {}"),
+    });
+
+    const failure = await warmModuleGraph(origin).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("/src/main.tsx: HTTP 302");
+    expect(other.requests).toEqual([]);
+    // The redirect target is not requested either: a redirect is a failure, not a hop.
+    expect(requests).not.toContain("/src/ok.ts");
+  });
+
   test("keeps at most `concurrency` requests in flight", async () => {
     let inFlight = 0;
     let mostInFlight = 0;

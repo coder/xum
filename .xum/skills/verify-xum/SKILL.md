@@ -368,6 +368,8 @@ after their other arguments. Without one they use the newest launch from this ch
   the Review recipe). Vite's scan does not see the dependencies of the highlight worker
   (`@pierre/highlights`), and a request for that worker on a cache without them logs the same
   lines. Launch's module walk leaves workers out, so a cold cache still reloads at that request.
+  Vite then invalidates every module it had transformed, so the page load after the reload is as
+  slow as a cold one.
 - Now and then Chrome fails every module request that is still queued (a dozen to over a hundred
   while the page loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of
   the host changed. A Docker container that starts on a shared host adds one: `ip monitor link`
@@ -381,9 +383,11 @@ after their other arguments. Without one they use the newest launch from this ch
   Launch warms Vite, so a page load takes a few seconds and the window for such a change is
   short. Under heavy host load a warm load can still take 20 s.
 - A page that stays on `Loading Xum` after `idle` timed out has lost a module request (see the
-  previous item): run `agent-browser reload`. A slow transform is not the cause after a launch:
-  Vite has already transformed every module, and it transforms one again only after a source edit
-  changes it.
+  previous item): run `agent-browser reload`. A slow transform is not the usual cause after a
+  launch, because Vite has already transformed every module. Vite transforms a module again after a
+  source edit, and every module again after a dependency re-optimization (the first item above).
+  Then the page can stay on `Loading Xum` for as long as a cold load takes, which is longer than
+  one `idle`: run `idle` again.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press
