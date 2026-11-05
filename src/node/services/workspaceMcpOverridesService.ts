@@ -687,6 +687,7 @@ function lockedSubset(
     if (missing === undefined) {
       keys.set(workspaceId, workspaceKeys);
     } else {
+      // mutation-equivalent: an Error is never falsy, so ?? and || agree
       busy.push({ workspaceId, error: busyKeys.get(missing) ?? new CheckoutKeysChangedError() });
     }
   }
@@ -3956,12 +3957,16 @@ export class WorkspaceMcpOverridesService {
           !acquiredAll &&
           !lastPass &&
           isRetryableLockError(error) &&
+          // mutation-equivalent: < and <= differ only in the deadline's own millisecond
           (partialAtDeadline || Date.now() < deadlineAt);
         if (!retry) {
           throw error;
         }
       } finally {
-        await this.releaseCheckoutLocks([...held.values()]);
+        // A release retries its unlink and never rejects (see crossProcessLock).
+        await mapWithConcurrency([...held.values()], CHECKOUT_IO_CONCURRENCY, (release) =>
+          release()
+        );
       }
       await new Promise((resolve) =>
         setTimeout(resolve, WORKSPACE_LOCK_RETRY_BACKOFF_MS + Math.random() * 100)
@@ -3991,6 +3996,7 @@ export class WorkspaceMcpOverridesService {
       CHECKOUT_IO_CONCURRENCY,
       async (key) => {
         try {
+          // mutation-equivalent: a 1 ms try-lock also fails a busy key, one sleep later
           held.set(key, await this.acquireCheckoutLock(key, 0));
         } catch (error) {
           if (error instanceof CrossProcessLockTimeoutError) busy.set(key, error);
@@ -4002,19 +4008,6 @@ export class WorkspaceMcpOverridesService {
       throw unexpected[0];
     }
     return busy;
-  }
-
-  /** Release every lock, many at once; rethrows the first failure after all settled. */
-  private async releaseCheckoutLocks(releases: ReadonlyArray<() => Promise<void>>): Promise<void> {
-    const failures: unknown[] = [];
-    await mapWithConcurrency(releases, CHECKOUT_IO_CONCURRENCY, (release) =>
-      release().catch((error: unknown) => {
-        failures.push(error);
-      })
-    );
-    if (failures.length > 0) {
-      throw failures[0];
-    }
   }
 
   /**
