@@ -12,7 +12,10 @@ export interface PluginAgentFile {
   id: string;
   /** The parsed frontmatter (plugin format mapping applied), as the runtime parses it. */
   frontmatter: unknown;
-  /** Cursor `readonly: true`: the agent runs on Explore's tools (no file edits, shell stays). */
+  /**
+   * Cursor `readonly: true` or a Claude read-only search list: the agent runs on Explore's tools
+   * (no file edits, shell stays).
+   */
   readonly: boolean;
 }
 

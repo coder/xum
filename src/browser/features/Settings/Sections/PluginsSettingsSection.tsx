@@ -1126,8 +1126,9 @@ const PreviewDisclosures: React.FC<{
             — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
             such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
             Claude Code tools or disallowedTools list. Unless that list removes Bash, it can run
-            shell commands, which can change any file. readonly: true removes only the file edit and
-            task tools.
+            shell commands, which can change any file. A list of only Read, Grep, Glob and LS that
+            names Grep, Glob or LS also gets the shell, for search. readonly: true removes only the
+            file edit and task tools.
           </span>
         </p>
       </div>
