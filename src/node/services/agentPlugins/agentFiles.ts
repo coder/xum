@@ -122,6 +122,7 @@ async function readAgentDefinition(
       plugin: { agentId },
     });
     // A `disallowedTools: Bash` list leaves a read-only agent no shell to disclose.
+    // mutation-equivalent: `tools` is an object or undefined, never another falsy value
     const keepsShell = isToolEnabledByConfigs("bash", [
       { add: [".*"] },
       parsed.frontmatter.tools ?? {},
