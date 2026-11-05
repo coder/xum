@@ -287,16 +287,14 @@ describe("webkit-capture.mjs", () => {
   });
 
   test("say() redacts the token and strips control characters from any text it is given", () => {
-    // The helper only passes say() fixed text, so no run of the helper reaches this with hostile
-    // input. This runs say() and the functions it calls, cut out of the helper's source.
+    // The helper only passes say() fixed text, so no run of the helper reaches it with hostile input.
     const source = fs.readFileSync(HELPER, "utf8");
     const part =
       /const token = fs\.readFileSync\(0[\s\S]*?\nfunction say\(message\) \{[\s\S]*?\n\}\n/.exec(
         source
       )?.[0];
     expect(part, "say() is not in the helper").toBeDefined();
-    // OSC 52 writes the terminal's clipboard. BEL ends it. C1 CSI, DEL and the token in all three of
-    // its forms (and a token= query) must not reach stderr either.
+    // OSC 52 writes the terminal's clipboard.
     const hostile = [
       "boom \u001b]52;c;Zm9v\u0007 \u009b31m del\u007f end",
       `${TOKEN} ${encodeURIComponent(TOKEN)} ${new URLSearchParams({ t: TOKEN }).toString().slice(2)}`,
@@ -456,7 +454,6 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     return root;
   };
 
-  // bash $'...' quoting of raw bytes, so that a value keeps its control characters.
   const quoteBytes = (bytes: Uint8Array) =>
     `$'${[...bytes]
       .map((byte) =>
@@ -482,12 +479,6 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     return { status: result.status, stderr: result.stderr };
   }
 
-  /**
-   * Runs `webkit-capture` in Docker mode in a scratch checkout and a run that load_run accepts. A
-   * stub `docker` records the subcommands it is called with, and prints `endpoint` for
-   * `docker context inspect`. `playwrightVersion` replaces the checkout's node_modules with a fake
-   * playwright-core of that version.
-   */
   function runDockerMode(options: {
     checkoutName?: string;
     endpoint?: string;
