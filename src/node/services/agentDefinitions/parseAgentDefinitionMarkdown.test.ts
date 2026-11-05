@@ -317,5 +317,32 @@ Body
         description: "d",
       });
     });
+
+    describe("foreign flag", () => {
+      const foreignOf = (frontmatter: string, source?: "plugin") => {
+        const content = `---\n${frontmatter}\n---\nBody\n`;
+        return parseAgentDefinitionMarkdown({
+          content,
+          byteSize: Buffer.byteLength(content, "utf-8"),
+          ...(source != null ? { plugin: { agentId: "file-id" } } : {}),
+        }).foreign;
+      };
+
+      test("is true for a Claude Code or Cursor format plugin agent", () => {
+        expect(foreignOf("name: a\ntools: Read, Grep", "plugin")).toBe(true);
+        expect(foreignOf("name: a\nreadonly: true", "plugin")).toBe(true);
+        expect(foreignOf("description: only foreign keys", "plugin")).toBe(true);
+      });
+
+      test("is false for a Xum-format plugin agent", () => {
+        expect(foreignOf("name: a\nbase: exec", "plugin")).toBe(false);
+        expect(foreignOf("name: a\ntools:\n  add: [file_read]", "plugin")).toBe(false);
+      });
+
+      test("is false for a file that is not a plugin agent, whatever its keys", () => {
+        expect(foreignOf("name: a\nreadonly: true")).toBe(false);
+        expect(foreignOf("name: a\nis_background: true")).toBe(false);
+      });
+    });
   });
 });

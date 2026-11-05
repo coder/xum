@@ -1652,8 +1652,11 @@ export async function discoverAvailableSubagentsForToolContext(args: {
     return await desktopAvailablePromise;
   };
 
+  // Before resolveAgentFrontmatter: its catch below keeps the descriptor of an agent it cannot
+  // read, which would put an agent that refuses to spawn back into the list (RFC A2).
+  const spawnable = discovered.filter((descriptor) => descriptor.unavailableReason === undefined);
   const resolved = await Promise.all(
-    discovered.map(async (descriptor) => {
+    spawnable.map(async (descriptor) => {
       try {
         const resolvedFrontmatter = await resolveAgentFrontmatter(
           args.runtime,

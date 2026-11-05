@@ -23,8 +23,15 @@ export interface PluginPlaceholderValues {
 // exactly once, so replacement output is never rescanned (single-pass §9.2).
 const PLUGIN_PLACEHOLDER_PATTERN = /\$\{((?:CLAUDE_|CURSOR_)?PLUGIN_(?:ROOT|DATA))\}/g;
 
-/** Expand `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` (and supplied aliases) in a config string (single-pass). */
-export function expandPluginPlaceholders(value: string, vars: PluginPlaceholderValues): string {
+/**
+ * Expand `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` (and supplied aliases) in a config string (single-pass).
+ * A name the caller leaves out stays literal, so a caller can supply just one: an agent body sets
+ * only `CLAUDE_PLUGIN_ROOT`, while MCP config (which builds a full PluginPlaceholderValues) sets all.
+ */
+export function expandPluginPlaceholders(
+  value: string,
+  vars: Partial<PluginPlaceholderValues>
+): string {
   return value.replace(
     PLUGIN_PLACEHOLDER_PATTERN,
     (match, name: keyof PluginPlaceholderValues) => vars[name] ?? match

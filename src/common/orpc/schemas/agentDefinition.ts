@@ -131,6 +131,11 @@ export const AgentDefinitionDescriptorSchema = z
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)
     pluginName: z.string().min(1).optional(),
+    // Set on a plugin agent that this workspace cannot run (its plugin folder is unreachable
+    // here): why, and the agent file. The `task` tool list leaves it out and the composition
+    // inspector reports it as a diagnostic.
+    unavailableReason: z.string().min(1).optional(),
+    unavailablePath: z.string().min(1).optional(),
   })
   .strict();
 

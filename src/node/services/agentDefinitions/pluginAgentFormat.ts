@@ -147,6 +147,11 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
+/** A plugin agent file in Claude Code or Cursor format: the mapping below applies to it. */
+export function isForeignPluginAgentFormat(raw: Record<string, unknown>): boolean {
+  return !isXumFormat(raw);
+}
+
 /**
  * Cursor `readonly: true` in a Claude Code or Cursor format file: the mapping runs it on Explore,
  * and a mapped tool list only removes tools, so file edits stay off. A Xum-format file keeps its

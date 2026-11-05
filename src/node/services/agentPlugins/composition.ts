@@ -1,4 +1,5 @@
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import assert from "@/common/utils/assert";
 import type {
   WorkspaceComposition,
   WorkspaceCompositionEntry,
@@ -244,13 +245,29 @@ export async function buildWorkspaceComposition(
     projectPluginsTrusted: args.projectTrusted,
     runtimeFactory,
   });
+  // An agent that cannot run in this workspace is not part of what a turn loads: it shows as a
+  // diagnostic, with the refusal a spawn would return.
   const agents = markShadowed(
-    agentDescriptors.map((agent) => ({
-      name: agent.id,
-      source: sourceLabel(agent.scope, agent.pluginName),
-      ...(agent.description !== undefined ? { description: agent.description } : {}),
-    }))
+    agentDescriptors
+      .filter((agent) => agent.unavailableReason === undefined)
+      .map((agent) => ({
+        name: agent.id,
+        source: sourceLabel(agent.scope, agent.pluginName),
+        ...(agent.description !== undefined ? { description: agent.description } : {}),
+      }))
   );
+  const unavailableAgentDiagnostics = agentDescriptors.flatMap((agent) => {
+    if (agent.unavailableReason === undefined) return [];
+    assert(agent.unavailablePath !== undefined, "an unavailable agent names its file");
+    return [
+      {
+        path: agent.unavailablePath,
+        scope: agent.scope === "global" ? ("global" as const) : ("project" as const),
+        severity: "warning" as const,
+        message: agent.unavailableReason,
+      },
+    ];
+  });
 
   // Workflow discovery already dedupes by skill name and plugin identity, so
   // these are effective entries only (skill shadowing shows up under skills).
@@ -321,12 +338,15 @@ export async function buildWorkspaceComposition(
 
   return {
     plugins: plugins.map(summarizePlugin),
-    diagnostics: diagnostics.map((diagnostic) => ({
-      path: diagnostic.path,
-      scope: diagnostic.scope,
-      severity: diagnostic.severity,
-      message: diagnostic.message,
-    })),
+    diagnostics: [
+      ...diagnostics.map((diagnostic) => ({
+        path: diagnostic.path,
+        scope: diagnostic.scope,
+        severity: diagnostic.severity,
+        message: diagnostic.message,
+      })),
+      ...unavailableAgentDiagnostics,
+    ],
     skills,
     agents,
     workflows,

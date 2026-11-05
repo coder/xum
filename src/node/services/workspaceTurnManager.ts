@@ -48,6 +48,10 @@ import {
   readAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import {
+  formatPluginAgentRefusal,
+  PluginAgentRefusalError,
+} from "@/node/services/agentDefinitions/pluginAgentRefusal";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
@@ -1293,6 +1297,10 @@ export class WorkspaceTurnManager {
           )
         );
       }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
@@ -1311,6 +1319,10 @@ export class WorkspaceTurnManager {
             error
           )
         );
+      }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
       }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
@@ -1439,6 +1451,10 @@ export class WorkspaceTurnManager {
             error
           )
         );
+      }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
       }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }

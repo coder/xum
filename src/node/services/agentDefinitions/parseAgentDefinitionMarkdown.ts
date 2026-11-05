@@ -5,6 +5,7 @@ import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/m
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  isForeignPluginAgentFormat,
   isReadonlyForeignPluginAgent,
   mapForeignPluginAgentFrontmatter,
 } from "./pluginAgentFormat";
@@ -24,6 +25,12 @@ export interface ParsedAgentDefinitionMarkdown {
    * The schema strips the key, so the install review reads it here (agentFiles.ts).
    */
   mappedReadonly: boolean;
+  /**
+   * A plugin agent in Claude Code or Cursor format (the mapping ran). The body of such an agent
+   * names its plugin folder with `${CLAUDE_PLUGIN_ROOT}`; a Xum-format plugin agent body is
+   * never rewritten.
+   */
+  foreign: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -116,5 +123,6 @@ export function parseAgentDefinitionMarkdown(input: {
     frontmatter: parsed.data,
     body,
     mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
+    foreign: input.plugin !== undefined && isForeignPluginAgentFormat(raw),
   };
 }
