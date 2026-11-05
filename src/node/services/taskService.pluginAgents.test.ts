@@ -153,6 +153,33 @@ describe("TaskService spawn refusals of plugin agents", () => {
         });
       }
 
+      test("keeps an unavailable plugin agent out of the runnable agentIds of an error hint", async () => {
+        const { parentId, taskService } = await setup();
+        const listed = {
+          scope: "global" as const,
+          uiSelectable: false,
+          subagentRunnable: true,
+          name: "Listed",
+        };
+        // `explore` is runnable on its own: only its unavailability keeps it out of the hint.
+        spyOn(agentDefinitionsService, "discoverAgentDefinitions").mockResolvedValue([
+          {
+            ...listed,
+            id: "explore",
+            unavailableReason: "folder-unreachable: needs its folder",
+            unavailablePath: "/plugins/egm/agents/explore.md",
+          },
+          { ...listed, id: "exec" },
+        ]);
+
+        const created = await spawn(taskService, parentId, "nosuchagent");
+
+        expect(created.success).toBe(false);
+        if (created.success) return;
+        expect(created.error).toContain("unknown agentId (nosuchagent). Runnable agentIds: exec");
+        expect(created.error).not.toContain("explore");
+      });
+
       test("still says unknown agentId for an agent no scope has", async () => {
         const { parentId, projectPath, taskService } = await setup();
         await writeProjectPlugin(projectPath, {
