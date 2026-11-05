@@ -1796,7 +1796,6 @@ base: a
         return error;
       }
 
-      /** A project plugin container on a local workspace, read with explicit roots. */
       function localRoots(project: string, global: string, container: string) {
         return {
           projectRoots: [path.join(project, ".xum", "agents")],
@@ -1832,7 +1831,6 @@ base: a
         });
         expect(native.body).toContain(PERSONA_BODY);
 
-        // The text that reaches the model is the replaced body.
         const inherited = await resolveAgentBody(runtime, project.path, "persona", {
           roots,
           runtimeFactory,
@@ -1840,7 +1838,6 @@ base: a
         expect(inherited).toContain(`${pluginRoot}/agents/persona.md`);
         expect(inherited).not.toContain(ROOT);
 
-        // The agent is listed as runnable here.
         const listed = await discoverAgentDefinitions(runtime, project.path, {
           roots,
           runtimeFactory,
@@ -1940,7 +1937,6 @@ base: a
           expect(
             (await readAgentDefinition(runtime, checkout.path, "plain", options)).body
           ).toContain("No folder needed.");
-          // The Xum-format body keeps the text as written.
           expect(
             (await readAgentDefinition(runtime, checkout.path, "native", options)).body
           ).toContain(ROOT);
@@ -1975,11 +1971,10 @@ base: a
           })
         );
         expect(refusal.reason).toBe("folder-unreachable");
-        // Without the opt-in the read loads the plugin's agent, as before: never the built-in one.
+        // Without the opt-in the read loads the plugin's agent: never the built-in one.
         expect((await readAgentDefinition(runtime, checkout.path, "explore", options)).scope).toBe(
           "global"
         );
-        // Other built-in agents are not affected.
         expect((await readAgentDefinition(runtime, checkout.path, "exec", options)).scope).toBe(
           "built-in"
         );
@@ -2019,7 +2014,6 @@ base: a
         expect(listed.filter((agent) => agent.id === "twin")).toHaveLength(1);
         expect(listed.find((agent) => agent.id === "twin")?.unavailableReason).toBeDefined();
 
-        // The same plugin on a local workspace runs, and still outranks the global agent.
         const pkg = await readAgentDefinition(local, project.path, "twin", options);
         expect(pkg.scope).toBe("project");
         expect(pkg.body).toContain("persona.md");
@@ -2047,7 +2041,7 @@ base: a
           runtimeFactory,
         };
 
-        // The main chat and settings read `exec` with no opt-in: it resolves, as before.
+        // The main chat and settings read `exec` with no opt-in: it resolves.
         expect((await resolveAgentFrontmatter(runtime, checkout.path, "exec", options)).name).toBe(
           "Reviewer"
         );
@@ -2149,7 +2143,6 @@ base: a
       });
 
       describe("spawn refusals by reason", () => {
-        /** A global managed-or-unmanaged plugin `egm` on a local workspace, and a reader by agent ID. */
         function localHome(home: DisposableTempDir) {
           const roots = {
             projectRoots: [],
@@ -2188,7 +2181,6 @@ base: a
           const refusal = await refusalOf(run("persona"));
           expect(refusal.reason).toBe("not-reviewed");
           expect(refusal.message).toContain("plugin agent persona of egm has not been reviewed");
-          // The list leaves the unreviewed agent out, as before.
           const runtime = new LocalRuntime(home.path);
           const listed = await discoverAgentDefinitions(runtime, home.path, {
             roots,
@@ -2456,7 +2448,6 @@ describe("resolvePluginAgentFile", () => {
     isSymbolicLink: () => false,
   });
   const unused = () => Promise.reject(new Error("not used by resolvePluginAgentFile"));
-  /** A plugin filesystem that lists `files` and answers every containment check with `contained`. */
   function pluginFsOf(files: string[], contained: () => Promise<string>): PluginFs {
     return {
       realpath: unused,

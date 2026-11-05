@@ -373,7 +373,6 @@ describe("buildWorkspaceComposition", () => {
       });
       expect(diagnostic?.message).toStartWith("folder-unreachable:");
 
-      // A local workspace reads the same folder: the agent is listed and nothing is reported.
       const local = await compose(new LocalRuntime(workspace.path));
       expect(
         local.agents.filter((entry) => entry.source === "plugin:egm").map((entry) => entry.name)

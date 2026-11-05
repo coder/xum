@@ -1411,8 +1411,8 @@ describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin
     const previousRoot = process.env.XUM_ROOT;
     process.env.XUM_ROOT = hostHome.path;
     try {
-      // The main chat resolves the plugin's `exec`, as it does without this change: with the
-      // placeholder as written, because only a `task` spawn refuses an unreachable folder.
+      // The main chat resolves the plugin's `exec` with the placeholder as written, because only
+      // a `task` spawn refuses an unreachable folder.
       const exec = await resolve("exec");
       expect(exec.success).toBe(true);
       if (!exec.success) return;
@@ -1420,12 +1420,10 @@ describe("resolveAgentForStream with an unreachable foreign plugin agent (plugin
       expect(exec.data.agentDefinition.scope).toBe("global");
       expect(exec.data.agentDefinition.body).toContain("${CLAUDE_PLUGIN_ROOT}/agents/exec.md");
 
-      // A base chain through `exec` resolves too.
       const child = await resolve("child");
       expect(child.success).toBe(true);
       if (!child.success) return;
       expect(child.data.effectiveAgentId).toBe("child");
-      // child, then the plugin's exec (global), whose own base is the built-in exec.
       expect(child.data.agentInheritanceChain.map((entry) => `${entry.id}:${entry.scope}`)).toEqual(
         ["child:project", "exec:global", "exec:built-in"]
       );

@@ -68,7 +68,6 @@ describe("TaskService spawn refusals of plugin agents", () => {
     return { ...parent, taskService };
   }
 
-  /** A trusted project's own plugin (`.xum/plugins/egm`), which the parent workspace loads. */
   async function writeProjectPlugin(
     projectPath: string,
     agents: Record<string, string>

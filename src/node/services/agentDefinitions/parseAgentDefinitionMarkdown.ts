@@ -51,7 +51,6 @@ function mapFrontmatterForSource(
   }
 }
 
-/** What the plugin mapping says about a raw agent file. Both are false for any other file. */
 function pluginFileFlags(
   raw: Record<string, unknown>,
   plugin: { agentId: string } | undefined

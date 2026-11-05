@@ -774,8 +774,7 @@ function remoteBoxDeletionRefusal(
 }
 
 /**
- * Why `createWorkspaceTurn` found no usable agent for an ID. A plugin agent that Xum loads but
- * refuses is not an unknown agent (RFC A4): its reason is named.
+ * A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4): its reason is named.
  */
 function agentLookupFailure(error: unknown, agentId: string): string {
   return error instanceof PluginAgentRefusalError

@@ -147,7 +147,6 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
-/** A plugin agent file in Claude Code or Cursor format: the mapping below applies to it. */
 export function isForeignPluginAgentFormat(raw: Record<string, unknown>): boolean {
   return !isXumFormat(raw);
 }

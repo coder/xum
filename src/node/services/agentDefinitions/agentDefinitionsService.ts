@@ -379,7 +379,6 @@ function withoutAmbiguousPluginAgents(
   return fileNames.filter((name) => !ambiguous.has(pluginAgentIdOf(name) ?? ""));
 }
 
-/** What the definition read of a plugin agent finds in one plugin's agents dir. */
 type PluginAgentFileLookup =
   | { kind: "file"; path: string }
   /** No file of this plugin claims the ID: the read goes on to the next candidate. */
@@ -636,7 +635,6 @@ function pluginAgentBody(args: {
   });
 }
 
-/** The descriptor fields of an agent that is listed but not runnable here (none when it is). */
 function unavailableFields(
   refusal: PluginAgentRefusalError | undefined,
   filePath: string
@@ -1164,8 +1162,7 @@ async function loadAgentDefinition(
 }
 
 /**
- * Read the definition of `agentId` from one scan candidate. Undefined when the candidate has no
- * such agent. Throws when it has one that cannot load: loadAgentDefinition skips that candidate.
+ * Undefined when the candidate has no such agent. Throws when it has one that cannot load.
  */
 async function readCandidateDefinition(args: {
   candidate: AgentDefinitionScanCandidate;

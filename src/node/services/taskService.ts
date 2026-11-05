@@ -6876,7 +6876,6 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
-            // A spawn of an unavailable plugin agent is refused: it is not a runnable ID.
             if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
@@ -9243,7 +9242,6 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
-            // A spawn of an unavailable plugin agent is refused: it is not a runnable ID.
             if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
