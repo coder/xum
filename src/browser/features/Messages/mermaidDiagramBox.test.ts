@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { diagramPixelSize, NARROW_DIAGRAM_WIDTH, type DiagramFrame } from "./mermaidDiagramBox";
+import {
+  dialogDiagramRoom,
+  dialogMaxBox,
+  diagramPixelSize,
+  NARROW_DIAGRAM_WIDTH,
+  type DiagramBox,
+  type DiagramFrame,
+} from "./mermaidDiagramBox";
 
 function inline(containerWidth: number, userZoom = 1): DiagramFrame {
   return { kind: "inline", containerWidth, userZoom };
@@ -87,22 +94,82 @@ describe("diagramPixelSize inline", () => {
 });
 
 describe("diagramPixelSize dialog", () => {
-  test("keeps a diagram that fits 80% of the viewport height at its measured size", () => {
-    expect(
-      diagramPixelSize({ width: 900, height: 640 }, { kind: "dialog", viewportHeight: 800 })
-    ).toEqual({ width: 900, height: 640 });
+  const PHONE = { width: 390, height: 844 };
+  const LAPTOP = { width: 1280, height: 720 };
+  const STATE_CHART = { width: 2089, height: 1372 };
+
+  function dialog(viewport: DiagramBox): DiagramFrame {
+    return { kind: "dialog", viewport };
+  }
+
+  test("leaves 90% of the viewport inside the overlay's padding, less the dialog's own padding", () => {
+    expect(dialogMaxBox(PHONE)).toEqual({ width: 279, height: 687 });
+    expect(dialogDiagramRoom(PHONE)).toEqual({ width: 231, height: 639 });
+    expect(dialogDiagramRoom(LAPTOP)).toEqual({ width: 1032, height: 528 });
   });
 
-  test("scales a taller diagram to 80% of the viewport height", () => {
-    expect(
-      diagramPixelSize({ width: 2048, height: 1374 }, { kind: "dialog", viewportHeight: 800 })
-    ).toEqual({ width: 954, height: 640 });
+  test("a viewport smaller than the paddings still leaves one pixel", () => {
+    expect(dialogDiagramRoom({ width: 60, height: 70 })).toEqual({ width: 1, height: 1 });
   });
 
-  test("ignores the inline width fit", () => {
-    expect(
-      diagramPixelSize({ width: 3000, height: 500 }, { kind: "dialog", viewportHeight: 800 })
-    ).toEqual({ width: 3000, height: 500 });
+  test.each([
+    { name: "a wide chart on a phone", measured: STATE_CHART, viewport: PHONE },
+    { name: "a wide chart on a laptop", measured: STATE_CHART, viewport: LAPTOP },
+    { name: "a tall chart on a phone", measured: { width: 300, height: 3000 }, viewport: PHONE },
+    { name: "a tall chart on a laptop", measured: { width: 300, height: 3000 }, viewport: LAPTOP },
+    { name: "a very wide chart", measured: { width: 9000, height: 400 }, viewport: LAPTOP },
+  ])("shows the whole of $name", ({ measured, viewport }) => {
+    const room = dialogDiagramRoom(viewport);
+    const box = diagramPixelSize(measured, dialog(viewport));
+    expect(box.width).toBeLessThanOrEqual(room.width);
+    expect(box.height).toBeLessThanOrEqual(room.height);
+    // One scale gives both sides, up to the rounding of each side to a pixel.
+    const lowestScale = Math.max(
+      (box.width - 0.5) / measured.width,
+      (box.height - 0.5) / measured.height
+    );
+    const highestScale = Math.min(
+      (box.width + 0.5) / measured.width,
+      (box.height + 0.5) / measured.height
+    );
+    expect(lowestScale).toBeLessThanOrEqual(highestScale);
+  });
+
+  test("the tighter axis decides the scale", () => {
+    // A phone's room is 231 x 639: the width is tighter for a wide chart.
+    expect(diagramPixelSize(STATE_CHART, dialog(PHONE))).toEqual({ width: 231, height: 152 });
+    expect(diagramPixelSize({ width: 300, height: 3000 }, dialog(PHONE))).toEqual({
+      width: 64,
+      height: 639,
+    });
+  });
+
+  test("a diagram that fits the room keeps its measured size", () => {
+    expect(diagramPixelSize({ width: 1032, height: 528 }, dialog(LAPTOP))).toEqual({
+      width: 1032,
+      height: 528,
+    });
+    expect(diagramPixelSize({ width: 200, height: 100 }, dialog(LAPTOP))).toEqual({
+      width: 200,
+      height: 100,
+    });
+  });
+
+  test("a diagram one pixel too large for the room shrinks", () => {
+    expect(diagramPixelSize({ width: 1033, height: 528 }, dialog(LAPTOP)).width).toBe(1032);
+    expect(diagramPixelSize({ width: 1032, height: 529 }, dialog(LAPTOP)).height).toBe(528);
+  });
+
+  test.each([
+    { width: 0, height: 800 },
+    { width: 390, height: 0 },
+    { width: -1, height: 800 },
+    { width: Number.NaN, height: 800 },
+    { width: 390, height: Number.POSITIVE_INFINITY },
+  ])("refuses the viewport $width x $height", (viewport) => {
+    expect(() => diagramPixelSize(STATE_CHART, dialog(viewport))).toThrow(
+      "The expand dialog needs a finite, positive viewport"
+    );
   });
 });
 

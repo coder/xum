@@ -3,6 +3,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import { dialogDiagramRoom } from "./mermaidDiagramBox";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { UserMessageContent } from "./UserMessageContent";
 
@@ -262,8 +263,11 @@ interface DiagramGeometry {
   drawing: { width: number; height: number };
 }
 
-function measureDiagram(canvasElement: HTMLElement): DiagramGeometry {
-  const svg = canvasElement.querySelector<SVGSVGElement>(".mermaid-container > svg.pele");
+const INLINE_SVG = ".mermaid-container:not(.mermaid-modal) > svg.pele";
+const DIALOG_SVG = ".mermaid-modal > svg.pele";
+
+function measureDiagram(canvasElement: HTMLElement, selector = INLINE_SVG): DiagramGeometry {
+  const svg = canvasElement.querySelector<SVGSVGElement>(selector);
   if (!svg) throw new Error("The diagram has not rendered yet");
   const container = svg.parentElement!;
   const [, , width, height] = (svg.getAttribute("viewBox") ?? "").split(" ").map(Number);
@@ -431,6 +435,71 @@ export const MermaidStateLaptop: Story = {
         await expect(svg.width).toBeLessThanOrEqual(container.clientWidth + PIXEL_TOLERANCE);
       });
       await expectZoomResizesBox(canvasElement);
+    });
+  },
+};
+
+const PHONE_VIEWPORT = { width: 390, height: 844 };
+
+/** The part of the page an element shows: the intersection of every box that clips it. */
+function visibleAreaOf(element: Element) {
+  let area = { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+  for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (getComputedStyle(ancestor).overflow === "visible") continue;
+    const box = ancestor.getBoundingClientRect();
+    const left = box.left + ancestor.clientLeft;
+    const top = box.top + ancestor.clientTop;
+    area = {
+      left: Math.max(area.left, left),
+      top: Math.max(area.top, top),
+      right: Math.min(area.right, left + ancestor.clientWidth),
+      bottom: Math.min(area.bottom, top + ancestor.clientHeight),
+    };
+  }
+  return area;
+}
+
+/**
+ * The expand dialog shows the whole diagram: it lies inside what the dialog shows, and it is
+ * as large as the room allows on its tighter axis, so it is not shrunk more than it must be.
+ */
+async function expectDialogShowsWholeDiagram(canvasElement: HTMLElement) {
+  const room = dialogDiagramRoom({ width: window.innerWidth, height: window.innerHeight });
+  await waitFor(
+    async () => {
+      const geometry = measureDiagram(canvasElement, DIALOG_SVG);
+      const { svg: box, drawing } = geometry;
+      const area = visibleAreaOf(canvasElement.querySelector(DIALOG_SVG)!);
+      await expect(box.left).toBeGreaterThanOrEqual(area.left - 0.5);
+      await expect(box.top).toBeGreaterThanOrEqual(area.top - 0.5);
+      await expect(box.right).toBeLessThanOrEqual(area.right + 0.5);
+      await expect(box.bottom).toBeLessThanOrEqual(area.bottom + 0.5);
+      await expectBoxKeepsDrawingProportions(geometry);
+      await expect(box.width).toBeLessThan(drawing.width);
+      const fillsWidth = Math.abs(box.width - room.width) <= PIXEL_TOLERANCE;
+      const fillsHeight = Math.abs(box.height - room.height) <= PIXEL_TOLERANCE;
+      await expect(fillsWidth || fillsHeight).toBe(true);
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/** On a phone, far narrower than the diagram, the expand dialog still shows all of it. */
+export const MermaidStateDialogPhone: Story = {
+  tags: ["webkit"],
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { viewport: MERMAID_VIEWPORTS, pixel: PIXEL_DISABLED },
+  render: () => <MermaidColumn content={STATE_DIAGRAM_CONTENT} width={PHONE_COLUMN_WIDTH} />,
+  play: async ({ canvasElement }) => {
+    // The test runner pins this size before it plays the story (.storybook/test-runner.ts).
+    await expect({ width: window.innerWidth, height: window.innerHeight }).toEqual(PHONE_VIEWPORT);
+    await playAtDefaultZoom(async () => {
+      await waitForDiagram(canvasElement, async () => {});
+      const controls = within(canvasElement);
+      await userEvent.click(controls.getByRole("button", { name: "⤢" }));
+      await expectDialogShowsWholeDiagram(canvasElement);
+      await userEvent.click(controls.getByRole("button", { name: "Close" }));
+      await waitFor(() => expect(canvasElement.querySelector(".mermaid-modal")).toBeNull());
     });
   },
 };

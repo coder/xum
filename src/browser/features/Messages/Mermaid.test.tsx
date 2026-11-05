@@ -4,6 +4,7 @@ import { GlobalWindow } from "happy-dom";
 import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
+import { dialogDiagramRoom, dialogMaxBox } from "./mermaidDiagramBox";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -475,8 +476,10 @@ describe("Mermaid layout stability", () => {
     let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
     let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
     let measure: { mockRestore(): void };
+    let originalViewport: { width: number; height: number };
 
     beforeEach(() => {
+      originalViewport = { width: window.innerWidth, height: window.innerHeight };
       observers = [];
       measuredWidth = 0;
       dialogWidth = 0;
@@ -521,6 +524,14 @@ describe("Mermaid layout stability", () => {
       globalThis.requestAnimationFrame = originalRequestAnimationFrame;
       globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
       measure.mockRestore();
+      Object.defineProperty(window, "innerWidth", {
+        value: originalViewport.width,
+        configurable: true,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        value: originalViewport.height,
+        configurable: true,
+      });
     });
 
     function resizeContainer(width: number) {
@@ -596,7 +607,7 @@ describe("Mermaid layout stability", () => {
       expect(boxOf(container).width).toBe(`${Math.round((tall.width * 300) / tall.height)}px`);
     });
 
-    test("the expand dialog fits a tall diagram to 80% of the viewport height", async () => {
+    test("the expand dialog fits a tall diagram into the room its viewport leaves", async () => {
       const setViewportHeight = (height: number) => {
         Object.defineProperty(window, "innerHeight", { value: height, configurable: true });
         act(() => {
@@ -612,11 +623,32 @@ describe("Mermaid layout stability", () => {
       await waitFor(() => expect(viewBoxOf(dialog()).height).toBeGreaterThan(0));
       const natural = viewBoxOf(dialog());
       expect(natural.height).toBeGreaterThan(800);
-      expect(boxOf(dialog()).height).toBe("400px");
-      expect(boxOf(dialog()).width).toBe(`${Math.round((natural.width * 400) / natural.height)}px`);
+      const room = dialogDiagramRoom({ width: window.innerWidth, height: 500 });
+      expect(boxOf(dialog()).height).toBe(`${room.height}px`);
+      expect(boxOf(dialog()).width).toBe(
+        `${Math.round((natural.width * room.height) / natural.height)}px`
+      );
 
       setViewportHeight(2000);
       await waitFor(() => expect(boxOf(dialog())).toEqual(pixels(natural)));
+    });
+
+    test("the expand dialog fits a wide diagram into the room its viewport leaves", async () => {
+      Object.defineProperty(window, "innerWidth", { value: 390, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: 844, configurable: true });
+      const view = renderMermaid({ chart: WIDE_CHART });
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      const dialog = () => view.container.querySelector<HTMLElement>(".mermaid-modal");
+      await waitFor(() => expect(viewBoxOf(dialog()).width).toBeGreaterThan(0));
+      const natural = viewBoxOf(dialog());
+      const room = dialogDiagramRoom({ width: 390, height: 844 });
+      expect(natural.width).toBeGreaterThan(room.width);
+      expect(boxOf(dialog()).width).toBe(`${room.width}px`);
+      expect(dialog()?.style.minWidth).toBe(
+        `min(80vw, ${dialogMaxBox({ width: 390, height: 844 }).width}px)`
+      );
     });
 
     test("the expand dialog lays the diagram out for its own width", async () => {

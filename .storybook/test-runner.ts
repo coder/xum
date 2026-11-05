@@ -1,4 +1,4 @@
-import type { TestRunnerConfig } from "@storybook/test-runner";
+import { getStoryContext, type TestRunnerConfig } from "@storybook/test-runner";
 // This hook is reloaded between Jest suites in the same worker. Importing @playwright/test
 // initializes a second test runner and fails on reload; use browser waits and Node assertions.
 import assert from "node:assert/strict";
@@ -488,6 +488,108 @@ async function assertSheetTouchTargets(page: StoryPage) {
   }
 }
 
+const WEBKIT_TAG = "webkit";
+// Room for a few lines of text under a frame. A diagram that escapes its frame paints over it.
+const PAINT_STRIP_PX = 120;
+const MIN_PAINT_STRIP_PX = 8;
+
+interface PaintStrip {
+  name: string;
+  clip: { x: number; y: number; width: number; height: number };
+}
+
+/**
+ * The frame around each diagram that sits in the page (not the expand dialog) and the room the
+ * viewport has below and to the right of it. A strip that would fall outside the viewport is
+ * dropped: the caller grows the viewport first.
+ */
+async function mermaidFrameStrips(page: StoryPage): Promise<PaintStrip[]> {
+  const viewport = page.viewportSize();
+  assert(viewport, "A paint check needs a page with a viewport");
+  const frames = await page.$$eval(".mermaid-container:not(.mermaid-modal)", (containers) =>
+    containers.map((container) => {
+      const { left, top, right, bottom } = container.parentElement!.getBoundingClientRect();
+      return { left, top, right, bottom };
+    })
+  );
+  assert(frames.length > 0, "A story tagged webkit must render a Mermaid diagram to paint-check");
+  return frames.flatMap((frame, index) => {
+    // One pixel clear of the frame, so its own antialiased edge is never in the strip.
+    const x = Math.ceil(frame.right) + 1;
+    const y = Math.ceil(frame.bottom) + 1;
+    const below = {
+      name: `below frame ${index}`,
+      clip: {
+        x: Math.max(0, Math.floor(frame.left)),
+        y,
+        width:
+          Math.min(viewport.width, Math.ceil(frame.right)) - Math.max(0, Math.floor(frame.left)),
+        height: Math.min(PAINT_STRIP_PX, viewport.height - y),
+      },
+    };
+    const right = {
+      name: `right of frame ${index}`,
+      clip: {
+        x,
+        y: Math.max(0, Math.floor(frame.top)),
+        width: viewport.width - x,
+        height:
+          Math.min(Math.ceil(frame.bottom), viewport.height) - Math.max(0, Math.floor(frame.top)),
+      },
+    };
+    return [below, right].filter(
+      ({ clip }) => clip.width >= MIN_PAINT_STRIP_PX && clip.height >= MIN_PAINT_STRIP_PX
+    );
+  });
+}
+
+async function screenshotStrips(page: StoryPage, strips: PaintStrip[]) {
+  return Promise.all(strips.map(({ clip }) => page.screenshot({ clip })));
+}
+
+/**
+ * An engine can lay a diagram out in one box and paint it in another (iPhone Safari painted a
+ * state diagram over the paragraphs below its frame), and a play reads layout boxes only. So
+ * compare pixels: below and beside each frame, the page must look the same with every diagram
+ * in the page hidden as with it shown.
+ */
+async function assertNoDiagramInkOutsideFrames(page: StoryPage) {
+  const viewport = page.viewportSize();
+  assert(viewport, "A paint check needs a page with a viewport");
+  try {
+    // The page does not scroll, so a frame taller than the viewport needs a taller viewport.
+    const frames = await page.$$eval(".mermaid-container:not(.mermaid-modal)", (containers) =>
+      containers.map((container) => container.parentElement!.getBoundingClientRect().bottom)
+    );
+    const height = Math.ceil(
+      Math.max(viewport.height, ...frames.map((bottom) => bottom + PAINT_STRIP_PX + 2))
+    );
+    await page.setViewportSize({ width: viewport.width, height });
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+    const strips = await mermaidFrameStrips(page);
+    const shown = await screenshotStrips(page, strips);
+    const hide = await page.addStyleTag({
+      content: ".mermaid-container:not(.mermaid-modal) svg { visibility: hidden !important; }",
+    });
+    let hidden: Buffer[];
+    try {
+      hidden = await screenshotStrips(page, strips);
+    } finally {
+      await hide.evaluate((style) => style.remove());
+    }
+    const painted = strips.filter((_, index) => !shown[index].equals(hidden[index]));
+    assert.equal(
+      painted.map(({ name, clip }) => `${name} at ${JSON.stringify(clip)}`).join("; "),
+      "",
+      "A diagram must not paint outside its frame"
+    );
+  } finally {
+    await page.setViewportSize(viewport);
+  }
+}
+
 // Stories that need a phone viewport for their play, as their globals.viewport gives them in
 // Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
 // its panels (the phone sheet or a popover), still sees the desktop window.
@@ -495,6 +597,7 @@ const PHONE_VIEWPORT_STORIES = new Map([
   ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
   ["app-waitingonyou--phone", { width: 390, height: 844 }],
   ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
+  ["app-chat-messages-markdownrenderer--mermaid-state-dialog-phone", { width: 390, height: 844 }],
 ]);
 const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
 
@@ -519,6 +622,10 @@ const config: TestRunnerConfig = {
     if (restoreViewport) {
       viewportsToRestore.delete(page);
       await page.setViewportSize(restoreViewport);
+    }
+    // A failed play already reports its own error, which this check would hide.
+    if (!context.hasFailure && (await getStoryContext(page, context)).tags?.includes(WEBKIT_TAG)) {
+      await assertNoDiagramInkOutsideFrames(page);
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {

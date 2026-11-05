@@ -12,8 +12,13 @@ import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuo
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
+  DIALOG_MAX_FRACTION,
+  DIALOG_OVERLAY_PADDING,
+  DIALOG_PADDING,
+  dialogMaxBox,
   diagramPixelSize,
   NARROW_DIAGRAM_WIDTH,
+  type DiagramBox,
   type DiagramFrame,
   type RenderedDiagram,
 } from "./mermaidDiagramBox";
@@ -762,39 +767,43 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        padding: "40px",
+        padding: `${DIALOG_OVERLAY_PADDING}px`,
       }}
       onClick={onClose}
     >
       <div
         style={{
           position: "relative",
-          maxWidth: "90%",
-          maxHeight: "90%",
+          maxWidth: `${DIALOG_MAX_FRACTION * 100}%`,
+          maxHeight: `${DIALOG_MAX_FRACTION * 100}%`,
           overflow: "auto",
         }}
         onClick={(e) => e.stopPropagation()}
       >
         {children}
-        <button
-          onClick={onClose}
-          style={{
-            position: "absolute",
-            top: "16px",
-            right: "16px",
-            background: "var(--color-background)",
-            border: "1px solid var(--color-border-subtle)",
-            color: "var(--color-text)",
-            padding: "8px 16px",
-            cursor: "pointer",
-            borderRadius: "4px",
-            fontSize: "14px",
-            fontFamily: "var(--font-primary)",
-          }}
-        >
-          Close
-        </button>
       </div>
+      {/* Outside the dialog's box, so it never covers the drawing the dialog fits to its room. */}
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        style={{
+          position: "absolute",
+          top: "8px",
+          right: "8px",
+          background: "var(--color-background)",
+          border: "1px solid var(--color-border-subtle)",
+          color: "var(--color-text)",
+          padding: "8px 16px",
+          cursor: "pointer",
+          borderRadius: "4px",
+          fontSize: "14px",
+          fontFamily: "var(--font-primary)",
+        }}
+      >
+        Close
+      </button>
     </div>
   );
 };
@@ -804,25 +813,29 @@ function subscribeToViewportResize(onChange: () => void): () => void {
   return () => window.removeEventListener("resize", onChange);
 }
 
-function useViewportHeight(): number {
-  return useSyncExternalStore(subscribeToViewportResize, () => window.innerHeight);
+function useViewportSize(): DiagramBox {
+  const width = useSyncExternalStore(subscribeToViewportResize, () => window.innerWidth);
+  const height = useSyncExternalStore(subscribeToViewportResize, () => window.innerHeight);
+  return { width, height };
 }
 
 /** The expand dialog renders its own copy of an already valid chart, at the dialog's width. */
 const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
   const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
-  const viewportHeight = useViewportHeight();
+  const viewport = useViewportSize();
+  const max = dialogMaxBox(viewport);
   return (
     <div
       ref={containerRef}
       className="mermaid-container mermaid-modal"
       style={{
         background: "var(--color-code-bg)",
-        padding: "24px",
+        padding: `${DIALOG_PADDING}px`,
         borderRadius: "8px",
-        minWidth: "80vw",
-        minHeight: "60vh",
-        ...diagramBoxStyle(rendered, { kind: "dialog", viewportHeight }),
+        // Never wider or taller than the dialog's box, or a phone would scroll an empty dialog.
+        minWidth: `min(80vw, ${max.width}px)`,
+        minHeight: `min(60vh, ${max.height}px)`,
+        ...diagramBoxStyle(rendered, { kind: "dialog", viewport }),
       }}
       // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
       dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
