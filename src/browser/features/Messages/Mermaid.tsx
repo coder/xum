@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
-import React, { useContext, useEffect, useId, useRef, useState } from "react";
+import React, { useContext, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import katex from "katex";
 import { render as renderPele, type MathMarkup, type RenderOptions } from "pele";
 import assert from "@/common/utils/assert";
@@ -11,6 +11,12 @@ import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
+import {
+  diagramPixelSize,
+  NARROW_DIAGRAM_WIDTH,
+  type DiagramFrame,
+  type RenderedDiagram,
+} from "./mermaidDiagramBox";
 import {
   MERMAID_BUTTON_HEIGHT,
   MERMAID_BUTTON_INSET,
@@ -24,9 +30,6 @@ const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
-// Below this container width Pele may turn wide layouts vertical, so the diagram also drops
-// the height clamp that would shrink a tall layout until its labels are unreadable.
-const NARROW_DIAGRAM_WIDTH = 640;
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
@@ -604,6 +607,9 @@ export function peleRenderOptions(
     ...diagram,
     fontSize: DIAGRAM_FONT_SIZE,
     directionBreakpoint: NARROW_DIAGRAM_WIDTH,
+    // The responsive style (max-width:100%, height:auto) would beat the explicit pixel size that
+    // mermaidDiagramBox.ts computes, and hand the box back to each engine's intrinsic sizing.
+    responsive: false,
     // Diagram text is untrusted model output: no clickable links, and no images,
     // which would fetch from the network as soon as the SVG is inserted.
     links: false,
@@ -617,7 +623,7 @@ async function renderMermaidSvg(
   chart: string,
   idPrefix: string,
   maxWidth: number | undefined
-): Promise<string> {
+): Promise<Pick<RenderedDiagram, "svg" | "width" | "height">> {
   const rootStyle = window.getComputedStyle(document.documentElement);
   // Measure with the same fonts the .mermaid-container CSS draws with.
   const fontFamily = rootStyle.getPropertyValue("--font-primary").trim() || undefined;
@@ -635,24 +641,30 @@ async function renderMermaidSvg(
     await document.fonts.ready;
   }
 
-  const { svg } = renderPele(
+  const { svg, width, height } = renderPele(
     chart,
     peleRenderOptions({ idPrefix, maxWidth, fontFamily, fontFamilyMono })
+  );
+  assert(
+    Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0,
+    "Diagram renderer returned an invalid size"
   );
 
   const sanitizedSvg = sanitizeMermaidSvg(svg, idPrefix);
   if (!sanitizedSvg) {
     throw new Error("Diagram renderer returned invalid SVG output");
   }
-  return sanitizedSvg;
+  return { svg: sanitizedSvg, width, height };
 }
 
-/** Zero width (hidden, or not laid out yet) means unknown: render the natural layout. */
-function diagramLayout(containerSize: { width: number } | null) {
-  const width = containerSize?.width ?? 0;
-  const isNarrow = width > 0 && width < NARROW_DIAGRAM_WIDTH;
-  const style: CSSProperties = isNarrow ? { ["--diagram-max-height" as string]: "none" } : {};
-  return { maxWidth: width > 0 ? width : undefined, style };
+/** The stylesheet sizes the <svg> from these two variables (transcript-content.css). */
+function diagramBoxStyle(diagram: RenderedDiagram | null, frame: DiagramFrame): CSSProperties {
+  if (!diagram) return {};
+  const box = diagramPixelSize(diagram, frame);
+  return {
+    ["--diagram-width" as string]: `${box.width}px`,
+    ["--diagram-height" as string]: `${box.height}px`,
+  };
 }
 
 /**
@@ -662,9 +674,12 @@ function diagramLayout(containerSize: { width: number } | null) {
  */
 function useDiagramSvg(chart: string, idPrefix: string) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const layout = diagramLayout(useResizeObserver(containerRef));
+  // Zero width (hidden, or not laid out yet) means unknown: render the natural layout.
+  // mutation-equivalent: the width is a number when measured, so ?? and || both give 0 otherwise
+  const containerWidth = useResizeObserver(containerRef)?.width ?? 0;
+  const maxWidth = containerWidth > 0 ? containerWidth : undefined;
   // Keep the source and SVG together while a newer chart is pending or invalid.
-  const [rendered, setRendered] = useState<{ svg: string; chart: string } | null>(null);
+  const [rendered, setRendered] = useState<RenderedDiagram | null>(null);
   const [error, setError] = useState<{ chart: string; message: string } | null>(null);
 
   useEffect(() => {
@@ -672,10 +687,10 @@ function useDiagramSvg(chart: string, idPrefix: string) {
 
     const renderDiagram = async () => {
       try {
-        const svg = await renderMermaidSvg(chart, idPrefix, layout.maxWidth);
+        const laidOut = await renderMermaidSvg(chart, idPrefix, maxWidth);
         if (cancelled) return;
 
-        setRendered({ svg, chart });
+        setRendered({ ...laidOut, chart });
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -689,9 +704,9 @@ function useDiagramSvg(chart: string, idPrefix: string) {
     return () => {
       cancelled = true;
     };
-  }, [chart, idPrefix, layout.maxWidth]);
+  }, [chart, idPrefix, maxWidth]);
 
-  return { containerRef, layoutStyle: layout.style, rendered, error };
+  return { containerRef, containerWidth, rendered, error };
 }
 
 function normalizeDiagramZoom(value: number): number {
@@ -784,9 +799,19 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
   );
 };
 
+function subscribeToViewportResize(onChange: () => void): () => void {
+  window.addEventListener("resize", onChange);
+  return () => window.removeEventListener("resize", onChange);
+}
+
+function useViewportHeight(): number {
+  return useSyncExternalStore(subscribeToViewportResize, () => window.innerHeight);
+}
+
 /** The expand dialog renders its own copy of an already valid chart, at the dialog's width. */
 const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
   const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
+  const viewportHeight = useViewportHeight();
   return (
     <div
       ref={containerRef}
@@ -797,6 +822,7 @@ const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => 
         borderRadius: "8px",
         minWidth: "80vw",
         minHeight: "60vh",
+        ...diagramBoxStyle(rendered, { kind: "dialog", viewportHeight }),
       }}
       // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
       dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
@@ -815,7 +841,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const [debouncedChart, setDebouncedChart] = useState(chart);
   const {
     containerRef,
-    layoutStyle,
+    containerWidth,
     rendered: renderedDiagram,
     error: renderError,
   } = useDiagramSvg(debouncedChart, idPrefix);
@@ -833,8 +859,8 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
     DEFAULT_ZOOM,
     { listener: true }
   );
-  // The +/- controls are shown as zoom affordances, so scale the rendered SVG
-  // itself; changing only max-height is a no-op for diagrams already below the cap.
+  // The +/- controls scale the diagram's explicit pixel size, so the box, the scrollable area
+  // and the frame all grow with it.
   const diagramZoom = normalizeDiagramZoom(storedDiagramZoom);
   const atMinZoom = diagramZoom <= MIN_ZOOM;
   const atMaxZoom = diagramZoom >= MAX_ZOOM;
@@ -909,8 +935,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           }}
           style={{
             ...MERMAID_CONTAINER_STYLE,
-            ["--diagram-zoom" as string]: `${diagramZoom}`,
-            ...layoutStyle,
+            ...diagramBoxStyle(renderedDiagram, {
+              kind: "inline",
+              containerWidth,
+              userZoom: diagramZoom,
+            }),
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips

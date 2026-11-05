@@ -590,6 +590,26 @@ export default defineConfig([
     },
   },
   {
+    // CSS zoom lays out differently in Safari than in Chromium (see local/no-css-zoom), so
+    // renderer code sizes elements with explicit pixels. CSS files: `make check-no-css-zoom`.
+    // Tests and stories keep fixtures that may use the name for other data.
+    files: ["src/browser/**/*.{ts,tsx}", "vscode/src/webview/**/*.{ts,tsx}"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.stories.ts",
+      "**/*.stories.tsx",
+      "src/browser/stories/**",
+      "src/**/*StoryUtils.tsx",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "src/**/test[A-Z]*.ts",
+    ],
+    rules: {
+      "local/no-css-zoom": "error",
+    },
+  },
+  {
     // Agent-loop files get host access from Effect services, not by an import (agent loop
     // refactor, phase 1). The allow map is today's debt: later phases only remove entries, and
     // scripts/noHostImports.test.ts freezes it.

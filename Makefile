@@ -143,7 +143,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config check-no-css-zoom typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
@@ -151,7 +151,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
@@ -596,7 +596,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
 # ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
 # findings that a change surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config check-no-css-zoom lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -676,6 +676,12 @@ check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is 
 
 check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
 	@node scripts/check-oxlint-config.mjs
+
+# CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
+# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
+check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS or HTML file declares the zoom property
+	@bun test ./scripts/check-no-css-zoom.test.ts
+	@bun scripts/check-no-css-zoom.ts
 
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
@@ -1000,6 +1006,15 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	$(check_node_version)
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
+
+# The runner opens the Storybook page once for every story file it is given, so only the files
+# that name the tag are visited.
+WEBKIT_STORY_FILES = $(shell grep -rlF '"webkit"' src/browser --include='*.stories.tsx')
+
+test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
+	$(check_node_version)
+	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit tag"; exit 1; }
+	@bun x test-storybook --browsers webkit --includeTags webkit --testTimeout 30000 $(WEBKIT_STORY_FILES)
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
