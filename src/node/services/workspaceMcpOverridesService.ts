@@ -693,6 +693,47 @@ function lockedSubset(
   return { ...verification, keys, busy };
 }
 /**
+ * The lock a batch waits for, holding nothing else: the one that was busy last
+ * time (so a retry waits instead of retaking every lock), else the first.
+ */
+function awaitedLockKey(
+  keys: readonly string[],
+  lastBusyKey: string | undefined
+): string | undefined {
+  return lastBusyKey !== undefined && keys.includes(lastBusyKey) ? lastBusyKey : keys[0];
+}
+function lockKeysFingerprint(derived: CheckoutLockKeys): string {
+  return JSON.stringify([
+    [...new Set([...derived.keys.values()].flat())].sort(),
+    derived.unresolvable.map((entry) => entry.workspaceId).sort(),
+  ]);
+}
+/**
+ * Why a full (not last) batch pass must release and retry: the first busy key
+ * with its lock error, or a checkout that moved between the two derivations.
+ */
+function passBlocker(
+  busy: ReadonlyMap<string, Error>,
+  derived: CheckoutLockKeys,
+  verification: CheckoutLockKeys
+): { key?: string; error: Error } | undefined {
+  const [firstBusy] = [...busy.entries()].sort(([a], [b]) => a.localeCompare(b));
+  if (firstBusy !== undefined) {
+    return { key: firstBusy[0], error: firstBusy[1] };
+  }
+  return lockKeysFingerprint(verification) === lockKeysFingerprint(derived)
+    ? undefined
+    : { error: new CheckoutKeysChangedError() };
+}
+function isRetryableLockError(error: unknown): boolean {
+  return (
+    error instanceof CheckoutKeysChangedError ||
+    // The lock's timeout message appends holder details to ours.
+    error instanceof CrossProcessLockTimeoutError ||
+    (error instanceof Error && error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE)
+  );
+}
+/**
  * Lock files and checkouts touched at once by a batch (see withWorkspaceLocks).
  * Measured on Node: 7,550 lock files took 70 s one at a time, 4.6 s 16 at a time.
  */
@@ -3876,10 +3917,10 @@ export class WorkspaceMcpOverridesService {
     workspaceIds: readonly string[],
     fn: (locked: LockedCheckouts) => Promise<T>,
     budgetMs = WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
-    options?: { partialAtDeadline?: boolean }
+    options: { partialAtDeadline?: boolean } = {}
   ): Promise<T> {
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
-    const partialAtDeadline = options?.partialAtDeadline === true;
+    const partialAtDeadline = options.partialAtDeadline === true;
     const deadlineAt = Date.now() + budgetMs;
     const remaining = () => Math.max(0, deadlineAt - Date.now());
     // Key derivation probes checkouts (bounded realpaths, but hundreds of
@@ -3892,11 +3933,6 @@ export class WorkspaceMcpOverridesService {
         partialAtDeadline ? budgetMs : remaining(),
         WORKSPACE_LOCK_TIMEOUT_MESSAGE
       );
-    const fingerprint = (derived: CheckoutLockKeys) =>
-      JSON.stringify([
-        [...new Set([...derived.keys.values()].flat())].sort(),
-        derived.unresolvable.map((entry) => entry.workspaceId).sort(),
-      ]);
     let lastBusyKey: string | undefined;
     for (;;) {
       const lastPass = partialAtDeadline && remaining() === 0;
@@ -3905,19 +3941,13 @@ export class WorkspaceMcpOverridesService {
       try {
         const derived = await derive();
         const keys = [...new Set([...derived.keys.values()].flat())].sort();
-        let awaited: string | undefined;
-        if (!lastPass) {
-          awaited = lastBusyKey !== undefined && keys.includes(lastBusyKey) ? lastBusyKey : keys[0];
-        }
+        const awaited = lastPass ? undefined : awaitedLockKey(keys, lastBusyKey);
         const busy = await this.takeCheckoutLocks(keys, held, awaited, remaining());
-        const [firstBusy] = [...busy.entries()].sort(([a], [b]) => a.localeCompare(b));
-        if (!lastPass && firstBusy !== undefined) {
-          lastBusyKey = firstBusy[0];
-          throw firstBusy[1];
-        }
         const verification = await derive();
-        if (!lastPass && fingerprint(verification) !== fingerprint(derived)) {
-          throw new CheckoutKeysChangedError();
+        const blocker = lastPass ? undefined : passBlocker(busy, derived, verification);
+        if (blocker !== undefined) {
+          lastBusyKey = blocker.key;
+          throw blocker.error;
         }
         acquiredAll = true;
         return await fn(lockedSubset(verification, held, busy));
@@ -3925,11 +3955,7 @@ export class WorkspaceMcpOverridesService {
         const retry =
           !acquiredAll &&
           !lastPass &&
-          error instanceof Error &&
-          (error instanceof CheckoutKeysChangedError ||
-            // The lock's timeout message appends holder details to ours.
-            error instanceof CrossProcessLockTimeoutError ||
-            error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE) &&
+          isRetryableLockError(error) &&
           (partialAtDeadline || Date.now() < deadlineAt);
         if (!retry) {
           throw error;
