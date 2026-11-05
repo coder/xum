@@ -109,7 +109,14 @@ describe("diagramPixelSize dialog", () => {
   });
 
   test("a viewport smaller than the paddings still leaves one pixel", () => {
+    expect(dialogMaxBox({ width: 60, height: 70 })).toEqual({ width: 1, height: 1 });
     expect(dialogDiagramRoom({ width: 60, height: 70 })).toEqual({ width: 1, height: 1 });
+  });
+
+  test("a dialog box too small for its padding leaves one pixel of room", () => {
+    // The box is 18 x 45 px: less than the 48 px that the dialog's padding takes on each axis.
+    expect(dialogMaxBox({ width: 100, height: 130 })).toEqual({ width: 18, height: 45 });
+    expect(dialogDiagramRoom({ width: 100, height: 130 })).toEqual({ width: 1, height: 1 });
   });
 
   test.each([

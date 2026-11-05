@@ -28,11 +28,11 @@ export interface DiagramBox {
 export const NARROW_DIAGRAM_WIDTH = 640;
 const INLINE_MAX_HEIGHT = 300;
 
-// The expand dialog is at most DIALOG_MAX_FRACTION of an overlay that pads the viewport by
+// The expand dialog is at most DIALOG_MAX_PERCENT of an overlay that pads the viewport by
 // DIALOG_OVERLAY_PADDING, and its drawing sits inside DIALOG_PADDING. Mermaid.tsx styles the
 // dialog with these same numbers, so the room computed here is the room the dialog has.
 export const DIALOG_OVERLAY_PADDING = 40;
-export const DIALOG_MAX_FRACTION = 0.9;
+export const DIALOG_MAX_PERCENT = 90;
 export const DIALOG_PADDING = 24;
 
 function assertFinitePositive(box: DiagramBox, message: string) {
@@ -46,7 +46,7 @@ function assertFinitePositive(box: DiagramBox, message: string) {
 export function dialogMaxBox(viewport: DiagramBox): DiagramBox {
   assertFinitePositive(viewport, "The expand dialog needs a finite, positive viewport");
   const max = (side: number) =>
-    Math.max(1, Math.floor((side - 2 * DIALOG_OVERLAY_PADDING) * DIALOG_MAX_FRACTION));
+    Math.max(1, Math.floor(((side - 2 * DIALOG_OVERLAY_PADDING) * DIALOG_MAX_PERCENT) / 100));
   return { width: max(viewport.width), height: max(viewport.height) };
 }
 

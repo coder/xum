@@ -12,7 +12,7 @@ import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuo
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
 import {
-  DIALOG_MAX_FRACTION,
+  DIALOG_MAX_PERCENT,
   DIALOG_OVERLAY_PADDING,
   DIALOG_PADDING,
   dialogMaxBox,
@@ -774,8 +774,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
       <div
         style={{
           position: "relative",
-          maxWidth: `${DIALOG_MAX_FRACTION * 100}%`,
-          maxHeight: `${DIALOG_MAX_FRACTION * 100}%`,
+          maxWidth: `${DIALOG_MAX_PERCENT}%`,
+          maxHeight: `${DIALOG_MAX_PERCENT}%`,
           overflow: "auto",
         }}
         onClick={(e) => e.stopPropagation()}
