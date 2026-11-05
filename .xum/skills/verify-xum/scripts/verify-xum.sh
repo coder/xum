@@ -432,6 +432,19 @@ launch_failed() {
   cmd_cleanup "$VERIFY_XUM_RUN" >&2 || true
 }
 
+# Refuses unless every socket that listens on PORT is on a loopback address. A .env line such as
+# XUM_VITE_HOST=0.0.0.0 makes a server listen on every interface, and Vite then answers
+# http://<this machine's IP>:<port>/ (an IP-address Host passes its check).
+require_loopback_listeners() { # require_loopback_listeners <port> <what listens there>
+  local addr addrs
+  addrs=$(ss -Hltn "sport = :$1" 2>/dev/null | awk '{print $4}')
+  [[ -n $addrs ]] || die "nothing listens on $2's port $1"
+  while read -r addr; do
+    [[ $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
+      || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets XUM_VITE_HOST or XUM_BACKEND_HOST: remove that line."
+  done <<<"$addrs"
+}
+
 # The process group id that the new group's leader appended to state.env, if it has.
 recorded_pgid() {
   sed -n 's/^export VERIFY_XUM_PGID=\([0-9][0-9]*\)$/\1/p' "$VERIFY_XUM_RUN/state.env" | tail -n 1
@@ -544,6 +557,8 @@ cmd_launch() {
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
     sleep 1
   done
+  require_loopback_listeners "$vite_port" Vite
+  require_loopback_listeners "$backend_port" "the backend"
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)

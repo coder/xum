@@ -65,7 +65,12 @@ These protections matter on a host where you are the only local account too:
   accepts only `localhost`, a `*.localhost` name or an IP address as the Host (an IP address
   cannot be rebound) and refuses every other name, also on its WebSocket proxy to the backend.
   The backend's own TCP port has no Host check, but its API calls (`/orpc`, and `/api` except
-  its spec and docs) need the token.
+  its spec and docs) need the token. The `Allowed hosts:` check catches a `.env` line written for
+  remote access, not a hostile checkout.
+- Other machines cannot reach Vite or the backend: launch refuses unless both listen only on a
+  loopback address. A `.env` line such as `XUM_VITE_HOST=0.0.0.0` makes a server listen on every
+  interface, and Vite accepts an IP-address Host. This check too catches a `.env` line written
+  for remote access, not a hostile checkout.
 - `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
   can connect to, and so can a web page on a `localhost`, `127.0.0.1` or `[::1]` origin (see
   Drive).
@@ -120,9 +125,11 @@ run is alive, by the same identity check as cleanup: two dev servers in one chec
 and `node_modules/.vite`. The group's first process writes the group id into the run's
 `state.env` before it starts the server. From that moment, right after the spawn, the check and
 cleanup find the group even when the launcher was killed. Until then the group holds the launch
-lock, so a second launch waits for it. Launch also stops at once when the
-sandbox copied a `config.json` (the recipes assume default preferences) and when the backend
-crashes after its rebuild (nodemon then waits for a file change that never comes).
+lock, so a second launch waits for it. Launch also stops at once when the sandbox copied a
+`config.json` (the recipes assume default preferences), when the sandbox's `Allowed hosts:` line
+does not read `loopback only`, when Vite or the backend listens on more than a loopback address
+(see Threat model), and when the backend crashes after its rebuild (nodemon then waits for a
+file change that never comes).
 
 ## Doctor
 
