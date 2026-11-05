@@ -235,13 +235,18 @@ touch), waits as `idle` does, and writes `<step>-webkit.png` and `<step>-webkit.
 screen or a Mermaid diagram that is still rendering, so this command also waits for both to go.
 After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed to load.`, as
 `idle` does, and 1 when the page shows the startup connection error or the token prompt instead
-of the page. A failed run leaves no `-webkit` files from an earlier run of the same name. The
-report holds the redacted URL, the engine and its mode, the viewport,
-`document.documentElement.scrollWidth <= innerWidth` with both numbers, and the console and page
-errors. The helper replaces every control character (ESC and DEL included) in the report and in
-its messages with a space, because the page's console text is printed to your terminal. Open the
-PNG: the width line sees only page-level overflow, not content that paints outside its frame
-inside the page, and the PNG is the 390x844 viewport, not the whole page.
+of the page. A failed run leaves no `-webkit` files from an earlier run of the same name.
+
+The report holds only fixed text and numbers: the URL you gave (without the token), the engine and
+its mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers, and
+the counts of console errors and page errors. It holds no text from the page, because the page can
+be a hostile branch and its text would reach your terminal and the transcript. Nothing the helper
+prints comes from the page either: the checks that wait for the page return one integer, and the
+helper treats anything else as not settled. A hostile page can still make those numbers lie, as it
+can change what it paints, so the PNG is the evidence. Open it: the width line sees only page-level
+overflow, not content that paints outside its frame inside the page, and the PNG is the 390x844
+viewport, not the whole page. The helper still redacts the token and replaces control characters
+in everything it writes, as a second layer.
 
 - The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
   that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
@@ -258,8 +263,8 @@ inside the page, and the PNG is the 390x844 viewport, not the whole page.
   while `node_modules` and the constant differ. When neither mode works, the command exits 1 and
   names both fixes.
 - The token reaches the helper on stdin, as it reaches curl in `doctor`, so it is in no command
-  line (see Threat model). It is in no environment either, and the helper redacts it from every
-  message and from the report, as `capture` does. The browser's profile lives in a temporary
+  line (see Threat model). It is in no environment either, and the helper's redaction runs over
+  everything it writes, as `capture`'s does. The browser's profile lives in a temporary
   folder (the container's tmpfs, or the run's `tmp` folder, which cleanup deletes). The host
   helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so this
   command adds no DevTools port or stream to the one that the Threat model names for

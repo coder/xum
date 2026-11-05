@@ -43,26 +43,28 @@ interface FakeRun {
   stderr: string;
   evidenceDir: string;
   /** What the fake Playwright saw. */
-  seen: { contextOptions?: Record<string, unknown>; url?: string };
+  seen: { contextOptions?: Record<string, unknown>; url?: string; stateCalls?: number };
 }
+
+/** A value that the fake page returns from `page.evaluate`: a number, or a hostile one. */
+type PageValue = number | { kind: "string" | "object" | "nan" | "infinity"; text?: string };
 
 /**
  * Runs the real helper with a fake `playwright-core` in a scratch checkout, so no browser is
- * needed. The fake page reports `scrollWidth`, a failed-chunk flag and one console error that
- * echoes the URL it was given (the token included), like a Vite failure would.
+ * needed. The fake page answers the state check with `states` in order (the last one repeats), the
+ * width check with `widths`, and emits console and page errors when it is opened.
  */
 async function runHelper(options: {
-  scrollWidth?: number;
-  chunkFailed?: boolean;
+  states?: PageValue[];
+  widths?: PageValue[];
+  settleMs?: number;
   launchError?: string;
-  /** The page never settles and still shows these placeholders. */
-  stuckOn?: string[];
-  /** The page settled on one of AppLoader's startup failures. */
-  startupFailed?: string[];
   /** Closing the browser fails after the screenshot and the report were written. */
   closeError?: string;
-  /** Text of a console error and of a page error that the page under test emits. */
-  pageText?: string;
+  /** How many console errors and page errors the page emits, each with `errorText`. */
+  consoleErrors?: number;
+  pageErrors?: number;
+  errorText?: string;
 }): Promise<FakeRun> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-webkit-test-"));
   tempDirs.push(root);
@@ -73,15 +75,22 @@ async function runHelper(options: {
     path.join(pw, "index.js"),
     `
 const fs = require("fs");
-const seen = {};
+const options = ${JSON.stringify(options)};
+const seen = { stateCalls: 0 };
 const save = () => fs.writeFileSync(process.env.FAKE_SEEN, JSON.stringify(seen));
+const value = (v) => {
+  if (typeof v === "number") return v;
+  if (v.kind === "string") return v.text;
+  if (v.kind === "object") return { toString: () => v.text };
+  return v.kind === "nan" ? NaN : Infinity;
+};
 exports.webkit = {
   async launch() {
-    if (${JSON.stringify(options.launchError ?? null)}) throw new Error(${JSON.stringify(options.launchError ?? "")});
+    if (options.launchError) throw new Error(options.launchError);
     return {
       version: () => "27.2",
       close: async () => {
-        if (${JSON.stringify(options.closeError ?? null)}) throw new Error(${JSON.stringify(options.closeError ?? "")});
+        if (options.closeError) throw new Error(options.closeError);
       },
       async newContext(contextOptions) {
         seen.contextOptions = contextOptions;
@@ -93,25 +102,21 @@ exports.webkit = {
             async goto(url) {
               seen.url = url;
               save();
-              handlers.console?.({ type: () => "error", text: () => "Failed to load resource: " + url });
-              if (${JSON.stringify(options.pageText !== undefined)}) {
-                handlers.console?.({ type: () => "error", text: () => ${JSON.stringify(options.pageText ?? "")} });
-                handlers.pageerror?.({ message: ${JSON.stringify(options.pageText ?? "")} });
-              }
-            },
-            async waitForFunction() {
-              if (${JSON.stringify(options.stuckOn !== undefined)}) {
-                throw Object.assign(new Error("timed out"), { name: "TimeoutError" });
-              }
+              const text = options.errorText ?? "Failed to load resource: " + url;
+              for (let i = 0; i < (options.consoleErrors ?? 1); i += 1) handlers.console?.({ type: () => "error", text: () => text });
+              handlers.console?.({ type: () => "log", text: () => text });
+              for (let i = 0; i < (options.pageErrors ?? 0); i += 1) handlers.pageerror?.({ message: text });
             },
             async evaluate(expression) {
-              if (typeof expression === "string" && expression.includes("aria-busy")) return ${JSON.stringify(options.stuckOn ?? [])};
-              if (typeof expression === "string" && expression.includes('role="alert"')) return ${JSON.stringify(options.startupFailed ?? [])};
-              if (typeof expression === "string") return ${JSON.stringify(options.chunkFailed ?? false)};
-              return { scrollWidth: ${options.scrollWidth ?? 390}, innerWidth: 390 };
+              if (typeof expression === "string") {
+                const states = options.states ?? [32];
+                seen.stateCalls += 1;
+                save();
+                return value(states[Math.min(seen.stateCalls - 1, states.length - 1)]);
+              }
+              return (options.widths ?? [390, 390]).map(value);
             },
             async screenshot({ path }) { fs.writeFileSync(path, "png"); },
-            url: () => seen.url,
           };
         } };
       },
@@ -134,6 +139,7 @@ exports.webkit = {
       ...["--mode", "host"],
       ...["--settled-js", "true"],
       ...["--chunk-failed-js", "false"],
+      ...["--settle-ms", String(options.settleMs ?? 5000)],
     ],
     {
       env: { PATH: process.env.PATH ?? "", FAKE_SEEN: seenPath },
@@ -163,12 +169,26 @@ function expectNoToken(text: string) {
   }
 }
 
+/** Characters that start a terminal escape sequence or act on the terminal: C0 (but not a newline), DEL, C1. */
+function controlCharacters(text: string): string[] {
+  return [...text].filter((char) => {
+    const code = char.charCodeAt(0);
+    return (code < 0x20 && char !== "\n") || (code >= 0x7f && code <= 0x9f);
+  });
+}
+
+const readReport = (run: FakeRun) =>
+  fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
+
+// The state bits of webkit-capture.mjs, written out here so a change of a bit fails a test.
+const SETTLED = 32;
+
 describe("webkit-capture.mjs", () => {
-  test("opens the page as a phone with the token, and writes a report without it", async () => {
+  test("opens the page as a phone with the token, and writes a report of fixed text", async () => {
     const run = await runHelper({});
     expect(run.exitCode, run.stderr).toBe(0);
 
-    // The page got the token, so the app signs in; the evidence never holds it.
+    // The page got the token, so the app signs in. The evidence holds the URL without it.
     expect(new URL(run.seen.url ?? "").searchParams.get("token")).toBe(TOKEN);
     expect(run.seen.contextOptions).toMatchObject({ isMobile: true, hasTouch: true });
     expect(fs.readdirSync(run.evidenceDir).sort()).toEqual([
@@ -176,130 +196,167 @@ describe("webkit-capture.mjs", () => {
       "reply-webkit.txt",
     ]);
     expect(fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.png"), "utf8")).toBe("png");
-    const report = fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
-    expect(report).toContain("console and page errors: 1");
-    expect(report).toContain("token=<redacted>");
+    const report = readReport(run);
+    expect(report).toContain("url: http://127.0.0.1:9/workspace/abc\n");
+    expect(report).toContain("console errors: 1\n");
+    expect(report).toContain("page errors: 0\n");
     expect(report).toContain("scrollWidth <= innerWidth: true (390 <= 390)");
+    // The fake page's console error echoes its URL, token included. None of its text is kept.
+    expect(report).not.toContain("Failed to load resource");
     expectNoToken(report + run.stdout + run.stderr);
   });
 
   test("says when the page is wider than the viewport", async () => {
-    const run = await runHelper({ scrollWidth: 800 });
+    const run = await runHelper({ widths: [800, 390] });
     expect(run.exitCode, run.stderr).toBe(0);
-    const report = fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
-    expect(report).toContain("scrollWidth <= innerWidth: false (800 <= 390)");
-  });
-
-  test("writes a report without control characters, even from a hostile page", async () => {
-    // ESC and BEL start terminal escape sequences, and the report is printed to the terminal.
-    const hostile = "boom \u001b]52;c;Zm9v\u0007 \u001b[31mred\u001b[0m \u009b31m del\u007f end";
-    const run = await runHelper({ pageText: hostile });
-    expect(run.exitCode, run.stderr).toBe(0);
-    const report = fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
-    expect(report).toContain("console and page errors: 3");
-    expect(report).toContain("boom");
-    expect(report).toContain("end");
-    const controls = [...report].filter((char) => {
-      const code = char.charCodeAt(0);
-      return (code < 0x20 && char !== "\n") || (code >= 0x7f && code <= 0x9f);
-    });
-    expect(controls).toEqual([]);
+    expect(readReport(run)).toContain("scrollWidth <= innerWidth: false (800 <= 390)");
   });
 
   test("exits 3 and keeps no evidence when the page shows a failed chunk, as idle does", async () => {
-    const run = await runHelper({ chunkFailed: true });
+    const run = await runHelper({ states: [1 | SETTLED] });
     expect(run.exitCode).toBe(3);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
     expectNoToken(run.stdout + run.stderr);
   });
 
-  test("names the placeholder a page is stuck on instead of capturing it", async () => {
-    const run = await runHelper({ stuckOn: ["a Mermaid diagram that is still rendering"] });
+  test.each([
+    [8 | SETTLED, "the loading screen"],
+    [16 | SETTLED, "a Mermaid diagram that is still rendering"],
+    [8, "the loading screen"],
+  ])("names what a page that never settles still shows (state %d)", async (state, shown) => {
+    const run = await runHelper({ states: [state], settleMs: 400 });
     expect(run.exitCode).toBe(1);
-    expect(run.stderr).toContain("still shows a Mermaid diagram that is still rendering");
+    expect(run.stderr).toContain(`did not settle in 0.4 s: it still shows ${shown}.`);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
   });
 
-  test("exits 1 and keeps no evidence when the page shows a startup failure", async () => {
-    const run = await runHelper({ startupFailed: ["the startup connection error"] });
-    expect(run.exitCode).toBe(1);
-    expect(run.stderr).toContain("the page shows the startup connection error");
-    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
-  });
+  test.each([
+    [2 | SETTLED, "the startup connection error"],
+    [4 | SETTLED, "the authentication prompt"],
+  ])(
+    "exits 1 and keeps no evidence when the page shows a startup failure (state %d)",
+    async (state, shown) => {
+      const run = await runHelper({ states: [state] });
+      expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain(`the page shows ${shown}.`);
+      expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+    }
+  );
 
   test("keeps no evidence when closing the browser fails after the files were written", async () => {
     const run = await runHelper({ closeError: "browser.close: target closed" });
     expect(run.exitCode).not.toBe(0);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+    expect(run.stderr).toContain("failed while trying to close the browser");
+    expect(run.stderr).not.toContain("target closed");
   });
 
-  test("waits for Mermaid's own placeholder, which no CSS transition or busy flag shows", () => {
-    // `idle`'s test reads a page that still says "Rendering diagram..." as settled.
-    expect(fs.readFileSync(HELPER, "utf8")).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
+  test("prints and writes no text that a hostile page controls, and counts its errors", async () => {
+    // OSC 52 writes the terminal's clipboard. The page also tries the token, colour codes, a C1 CSI
+    // and DEL. Its errors are many (10,000 of each kind) and its answers to the state and width
+    // checks are not integers or finite numbers, or are objects with a toString.
+    const hostile = `boom \u001b]52;c;Zm9v\u0007 ${TOKEN} \u001b[31mred\u001b[0m \u009b31m del\u007f end`;
+    const answers: PageValue[] = [
+      { kind: "string", text: hostile },
+      { kind: "object", text: hostile },
+      { kind: "nan" },
+      { kind: "infinity" },
+      -1,
+      64,
+      1.5,
+      SETTLED,
+    ];
+    const run = await runHelper({
+      states: answers,
+      widths: [
+        { kind: "string", text: hostile },
+        { kind: "object", text: hostile },
+      ],
+      consoleErrors: 10_000,
+      pageErrors: 10_000,
+      errorText: hostile,
+    });
+    expect(run.exitCode, run.stderr).toBe(0);
+    // Each bad answer counted as "not settled": the helper kept asking until the good one.
+    expect(run.seen.stateCalls).toBe(answers.length);
+    const report = readReport(run);
+    expect(report).toContain("console errors: 10000\n");
+    expect(report).toContain("page errors: 10000\n");
+    expect(report).toContain("scrollWidth <= innerWidth: unknown");
+    const everything = report + run.stdout + run.stderr;
+    expect(controlCharacters(everything)).toEqual([]);
+    expectNoToken(everything);
+    for (const word of ["boom", "end", "red", "del", "Zm9v"])
+      expect(everything).not.toContain(word);
+    expect(report.split("\n")).toHaveLength(7);
   });
 
-  test("exits 4 with one line when WebKit does not launch, so the caller can try Docker", async () => {
+  test("exits 4 with one fixed line when WebKit does not launch, so the caller can try Docker", async () => {
     const run = await runHelper({
       launchError: `browserType.launch: \n╔═══╗\n║ Host system is missing dependencies to run browsers. ║\n╚═══╝ ${TOKEN} \u001b]52;c;Zm9v\u0007`,
     });
     expect(run.exitCode).toBe(4);
     expect(run.stderr.trim().split("\n")).toHaveLength(1);
     expect(run.stderr).toContain("Host system is missing dependencies");
-    expect(run.stderr).not.toContain("\u001b");
-    expect(run.stderr).not.toContain("\u0007");
+    expect(controlCharacters(run.stderr)).toEqual([]);
+    expect(run.stderr).not.toContain("Zm9v");
     expectNoToken(run.stderr);
+  });
+
+  test("waits for Mermaid's own placeholder, which no CSS transition or busy flag shows", () => {
+    // `idle`'s test reads a page that still says "Rendering diagram..." as settled.
+    expect(fs.readFileSync(HELPER, "utf8")).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
   });
 });
 
-describe("the page checks that webkit-capture.mjs runs in the browser", () => {
+describe("the state check that webkit-capture.mjs runs in the browser", () => {
   const source = fs.readFileSync(HELPER, "utf8");
-  /** The in-page expression behind `const <name> = \`...\`;`, with its one interpolation filled in. */
-  function pageCheck(name: string): (html: string) => string[] {
-    const match = new RegExp(`const ${name} = \`([\\s\\S]*?)\`;\\n`).exec(source);
-    expect(match, `${name} is not in the helper`).not.toBeNull();
-    const expression = (match?.[1] ?? "").replace(
-      "${JSON.stringify(MERMAID_PENDING_TEXT)}",
-      JSON.stringify(MERMAID_PENDING_TEXT)
-    );
-    return (html) => {
-      const window = new Window();
-      window.document.body.innerHTML = html;
-      return window.eval(expression) as string[];
-    };
+  const match = /const STATE_JS = `([\s\S]*?)`;\n/.exec(source);
+  /** Its in-page expression, with the two expressions that verify-xum.sh passes in filled in. */
+  function stateOf(html: string, chunkFailed = "false"): unknown {
+    expect(match, "STATE_JS is not in the helper").not.toBeNull();
+    const expression = (match?.[1] ?? "")
+      .replace('${args["chunk-failed-js"]}', chunkFailed)
+      .replace('${args["settled-js"]}', "true")
+      .replace("${JSON.stringify(MERMAID_PENDING_TEXT)}", JSON.stringify(MERMAID_PENDING_TEXT));
+    const window = new Window();
+    window.document.body.innerHTML = html;
+    return window.eval(expression);
   }
   const dialog = (id: string, title: string) =>
     `<div role="dialog" aria-labelledby="${id}"><h2 id="${id}">${title}</h2></div>`;
 
-  test("see the startup failures by element, and not the SSH prompt or a transcript's words", () => {
-    const failed = pageCheck("STARTUP_FAILED_JS");
-    expect(failed('<div class="boot-loader" role="alert"></div>')).toEqual([
-      "the startup connection error",
-    ]);
-    expect(failed(dialog("t", "Authentication Required"))).toEqual(["the authentication prompt"]);
-    expect(failed(dialog("t", "SSH Authentication Required"))).toEqual([]);
-    expect(failed("<p>Authentication Required, Unable to connect to the Xum backend.</p>")).toEqual(
-      []
+  test("sees the startup failures by element, and not the SSH prompt or a transcript's words", () => {
+    expect(stateOf('<div class="boot-loader" role="alert"></div>')).toBe(2 | SETTLED);
+    expect(stateOf(dialog("t", "Authentication Required"))).toBe(4 | SETTLED);
+    expect(stateOf(dialog("t", "SSH Authentication Required"))).toBe(SETTLED);
+    expect(stateOf("<p>Authentication Required, Unable to connect to the Xum backend.</p>")).toBe(
+      SETTLED
     );
   });
 
-  test("see content that is still loading by element, and not a transcript's words", () => {
-    const loading = pageCheck("STILL_LOADING_JS");
-    expect(loading('<div class="boot-loader" role="status" aria-busy="true"></div>')).toEqual([
-      "the loading screen",
-    ]);
-    expect(loading(`<div class="mermaid-container"> ${MERMAID_PENDING_TEXT} </div>`)).toEqual([
-      "a Mermaid diagram that is still rendering",
-    ]);
-    expect(loading('<div class="mermaid-container"><svg><text>Done</text></svg></div>')).toEqual(
-      []
+  test("sees content that is still loading by element, and not a transcript's words", () => {
+    expect(stateOf('<div class="boot-loader" role="status" aria-busy="true"></div>')).toBe(
+      8 | SETTLED
     );
-    expect(loading(`<p>Loading Xum</p><p>${MERMAID_PENDING_TEXT}</p>`)).toEqual([]);
+    expect(stateOf(`<div class="mermaid-container"> ${MERMAID_PENDING_TEXT} </div>`)).toBe(
+      16 | SETTLED
+    );
+    expect(stateOf('<div class="mermaid-container"><svg><text>Done</text></svg></div>')).toBe(
+      SETTLED
+    );
+    expect(stateOf(`<p>Loading Xum</p><p>${MERMAID_PENDING_TEXT}</p>`)).toBe(SETTLED);
     // A finished diagram can have a node with the placeholder's own words.
     expect(
-      loading(
+      stateOf(
         `<div class="mermaid-container"><svg><text>${MERMAID_PENDING_TEXT}</text></svg></div>`
       )
-    ).toEqual([]);
+    ).toBe(SETTLED);
+  });
+
+  test("reports a failed chunk only when verify-xum.sh's own check says true", () => {
+    expect(stateOf("<p>x</p>", "true")).toBe(1 | SETTLED);
+    expect(stateOf("<p>x</p>", '"true"')).toBe(SETTLED);
   });
 });
 
