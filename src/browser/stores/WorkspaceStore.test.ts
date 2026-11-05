@@ -4929,6 +4929,76 @@ describe("WorkspaceStore", () => {
       unsubscribeWorkspace();
     });
 
+    it("keeps a whitespace-only streaming tail mounted so later deltas reach its row", async () => {
+      // A stream that opens with a whitespace delta creates the trailing text part
+      // without a paintable row. Later deltas land in that same part, so the part
+      // count is unchanged and only the row-local channel fires. If the projection
+      // omitted the row, nothing would be subscribed at that row's key and the
+      // visible text would never render.
+      const workspaceId = "whitespace-streaming-tail";
+      const messageId = "whitespace-tail-message";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      await send(caughtUpEvent());
+      await send({
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: {},
+        tokens: 0,
+        timestamp: 1,
+      });
+      await send({
+        type: "stream-delta",
+        workspaceId,
+        messageId,
+        delta: " ",
+        tokens: 1,
+        timestamp: 2,
+      });
+
+      const textRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((row) => row.type === "assistant" && row.historyId === messageId);
+      expect(textRow).toBeDefined();
+
+      const bump = mock(() => undefined);
+      const unsubscribeWorkspace = store.subscribeKey(workspaceId, bump);
+      const listener = mock(() => undefined);
+      const unsubscribeRow = store.subscribeStreamingMessage(workspaceId, textRow!.id, listener);
+
+      await send({
+        type: "stream-delta",
+        workspaceId,
+        messageId,
+        delta: "done",
+        tokens: 1,
+        timestamp: 3,
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(store.getStreamingMessage(workspaceId, textRow!.id, messageId)?.type).toBe(
+        "assistant"
+      );
+      // The same text part grew, so no new row appeared: the workspace stays quiet.
+      expect(bump).not.toHaveBeenCalled();
+
+      unsubscribeRow();
+      unsubscribeWorkspace();
+    });
+
     it("mounts rows created by a second concurrent stream's deltas", async () => {
       const workspaceId = "concurrent-stream-deltas";
       const firstMessageId = "stream-message-1";
