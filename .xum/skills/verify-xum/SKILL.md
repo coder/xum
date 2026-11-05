@@ -61,11 +61,14 @@ These protections matter on a host where you are the only local account too:
 These protections matter only when other local accounts exist, and they are not enough there:
 the DevTools port above stays open.
 
-- The token is in no process's command line or environment: `open`, launch, `doctor` and the
-  redaction pass it to node or curl on stdin or fd 3 (see Drive and Doctor).
-- The run home, the run folder (with the run's token copy) and the server tree's TMPDIR are
-  private folders, and every command refuses a git dir, or a folder above it, that is not private
-  (see Launch for the rule and Evidence).
+- The token is in no command line: `open`, launch, `doctor` and the redaction pass it to node or
+  curl on stdin or fd 3 (see Drive and Doctor). `make dev-server` exports it to the server's own
+  processes, whose environment only you and root can read.
+- No other account can replace or write the run's files: launch makes the run folder (with the
+  run's 0600 token copy) and the server tree's TMPDIR with mode 0700, and the run home too when it
+  makes it. Launch and every command that reads a run refuse a run home or run folder that group
+  or others can write, every command refuses such a git dir, and all of them refuse a folder
+  above these that group or others can write without the sticky bit (see Launch and Evidence).
 - `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
   can connect to (see Drive).
 
