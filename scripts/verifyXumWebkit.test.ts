@@ -180,7 +180,7 @@ function controlCharacters(text: string): string[] {
   });
 }
 
-/** Text of a process's output, which must be valid UTF-8: a raw 0x80-0x9F byte would be a C1 control that `controlCharacters` cannot see once it is decoded. */
+/** Decodes output that must be valid UTF-8: `controlCharacters` cannot see a raw C1 byte once it is decoded. */
 function strictUtf8(bytes: Uint8Array): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
@@ -434,7 +434,7 @@ describe("verify-xum.sh webkit-capture arguments", () => {
   const ESC = String.fromCharCode(0x1b);
   const BEL = String.fromCharCode(0x07);
   const C1_CSI = String.fromCharCode(0x9b);
-  const script = fs.readFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), "utf8");
+  const scriptSource = fs.readFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), "utf8");
 
   /** A scratch git repo that holds a copy of the real script (it finds its checkout from its own location). */
   function scratchCheckout(root: string, dirName: string) {
@@ -445,9 +445,9 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     expect(git("init", "-q").status).toBe(0);
     // The script refuses a git dir that group or others can write, whatever the caller's umask.
     fs.chmodSync(path.join(repo, ".git"), 0o755);
-    const scriptCopy = path.join(repo, "verify-xum.sh");
-    fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), scriptCopy);
-    return { repo, script: scriptCopy };
+    const script = path.join(repo, "verify-xum.sh");
+    fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), script);
+    return { repo, script };
   }
 
   const newRoot = () => {
@@ -599,7 +599,7 @@ describe("verify-xum.sh webkit-capture arguments", () => {
   });
 
   describe("has_control_char", () => {
-    const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(script)?.[0];
+    const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(scriptSource)?.[0];
     const refuses = (...bytes: number[]) => {
       expect(body, "has_control_char is not in verify-xum.sh").toBeDefined();
       const result = spawnSync("bash", [
