@@ -71,9 +71,8 @@ const attachment: z.ZodType<PostCompactionAttachment> = z.discriminatedUnion("ty
   z.object({ type: z.literal("read_files_reference"), paths: z.array(z.string()) }),
   z.object({
     type: z.literal("artifacts_index"),
-    artifacts: z.array(
-      z.object({ path: z.string(), latestVersion: z.number(), label: z.string().nullable() })
-    ),
+    // Old journals name the title `label` and add `latestVersion`; neither is read.
+    artifacts: z.array(z.object({ path: z.string(), title: z.string().optional() })),
   }),
 ]);
 

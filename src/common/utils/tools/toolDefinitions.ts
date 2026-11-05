@@ -2077,22 +2077,18 @@ const AttachFileToolSuccessResultSchema = z
 
 /**
  * Result of the `artifact` tool (Artifacts M4). Deliberately tiny: the chat card renders from it
- * alone, so it survives compaction and older-history paging.
+ * alone, so it survives compaction and older-history paging. Not strict: results stored before
+ * versions were removed also carry `id` and `version`, and their card must still render.
  */
-export const ArtifactToolSuccessResultSchema = z
-  .object({
-    success: z.literal(true),
-    /** Stable artifact id (versions key), see getArtifactId. */
-    id: z.string(),
-    version: z.number().int().positive(),
-    /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
-    path: z.string(),
-    bytes: z.number(),
-    kind: ArtifactKindSchema,
-    title: z.string(),
-    pin: z.enum(["project", "global"]).nullable(),
-  })
-  .strict();
+export const ArtifactToolSuccessResultSchema = z.object({
+  success: z.literal(true),
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  path: z.string(),
+  bytes: z.number(),
+  kind: ArtifactKindSchema,
+  title: z.string(),
+  pin: z.enum(["project", "global"]).nullable(),
+});
 export type ArtifactToolSuccessResult = z.infer<typeof ArtifactToolSuccessResultSchema>;
 
 export const ArtifactToolResultSchema = z.union([
@@ -3108,14 +3104,14 @@ export const TOOL_DEFINITIONS = {
   artifact: {
     resultSchema: ArtifactToolResultSchema,
     description:
-      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ as a labeled version in the user's Artifacts tab, shown as a chat card. " +
-      "Republishing a path adds a version (identical bytes add none); unpublished changes add no version.",
+      "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ in the user's Artifacts tab, shown as a chat card. " +
+      "The tab shows the file as it is now, so edit it in place; publish again to show a new card or to change its title, kind or pin.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),
-        title: z.string().nullish().describe("Version label. Default: file name."),
+        title: z.string().nullish().describe("Card title. Default: file name."),
         kind: ArtifactKindSchema.nullish().describe("Viewer; default by file extension."),
-        focus: z.boolean().nullish().describe("Open the Artifacts tab on this version."),
+        focus: z.boolean().nullish().describe("Open the Artifacts tab on this file."),
         pin: z
           .enum(["project", "global"])
           .nullish()
