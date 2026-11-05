@@ -97,16 +97,42 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
   });
 
-  test("hands last-part bookkeeping back to the tool row after a trailing whitespace part", () => {
-    const withWhitespace = rows([FAILED_BASH, { type: "text", text: " " }], true);
-
-    // The whitespace row is gone, so the tool row is the message's last rendered part again:
-    // it keeps the streaming/anchor flags the empty row had taken.
-    expect(withWhitespace.map((row) => row.type)).toEqual(["tool"]);
-    const toolRow = withWhitespace[0];
+  test("hands last-part bookkeeping back to the tool row once the stream settles", () => {
+    // Settled (no active stream): the trailing whitespace part renders no row, so
+    // the tool row is the message's last rendered part and keeps the anchor flags
+    // the empty row had taken.
+    const settled = rows([FAILED_BASH, { type: "text", text: " " }]);
+    expect(settled.map((row) => row.type)).toEqual(["tool"]);
+    const toolRow = settled[0];
     expect(toolRow?.type).toBe("tool");
     if (toolRow?.type !== "tool") return;
     expect(toolRow.isLastPartOfMessage).toBe(true);
+  });
+
+  test("keeps the streaming trailing row mounted so deltas can reach it", () => {
+    // While the stream is active the trailing part is what incoming deltas append
+    // to. Omitting its row would leave no subscriber for WorkspaceStore's
+    // row-local bump, so the visible text that arrives later would never render.
+    const streaming = rows([FAILED_BASH, { type: "text", text: " " }], true);
+    expect(streaming.map((row) => row.type)).toEqual(["tool", "assistant"]);
+    const trailing = streaming[1];
+    expect(trailing?.type).toBe("assistant");
+    if (trailing?.type !== "assistant") return;
+    expect(trailing.isLastPartOfMessage).toBe(true);
+    expect(trailing.isStreaming).toBe(true);
+
+    // Same parts once the stream ends: the invisible row goes away again, which is
+    // the blank-line gap this change removes.
+    expect(rows([FAILED_BASH, { type: "text", text: " " }]).map((row) => row.type)).toEqual([
+      "tool",
+    ]);
+  });
+
+  test("does not keep a paintable-empty row that is not the streaming tail", () => {
+    // The whitespace part is followed by a tool part, so deltas append to the tool
+    // part and nothing needs the empty row mounted.
+    const streaming = rows([{ type: "text", text: "\n" }, FAILED_BASH], true);
+    expect(streaming.map((row) => row.type)).toEqual(["tool"]);
   });
 });
 

@@ -503,15 +503,35 @@ function revealRowText(text: string): string {
   return revealUnicodeTags(text);
 }
 
-function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
-  return (
-    part.type === "reasoning" ||
-    (part.type === "text" && hasDisplayText(part.text)) ||
-    isDynamicToolPart(part)
-  );
+/**
+ * Whether a part earns a transcript row.
+ *
+ * A paintable-empty text part earns none (see NO_PAINTABLE_CONTENT) — UNLESS the
+ * message is still streaming and it is the trailing part. That part is what
+ * incoming deltas append to, and a row that does not exist has no mounted
+ * subscriber: WorkspaceStore coalesces within-part deltas into a row-local bump,
+ * so the delta that finally carries visible text would wake nobody and the whole
+ * response would stay hidden until an unrelated workspace-level update or the
+ * stream settled. Keeping the row costs nothing visible while streaming (it
+ * paints nothing, exactly as it did before this predicate existed) and the part is
+ * dropped again the moment the stream ends, which is when the blank block would
+ * actually be seen.
+ */
+function hasDisplayRow(
+  part: MuxMessage["parts"][number],
+  partIndex: number,
+  partCount: number,
+  hasActiveStream: boolean
+): boolean {
+  if (part.type === "reasoning" || isDynamicToolPart(part)) return true;
+  if (part.type !== "text") return false;
+  return hasDisplayText(part.text) || (hasActiveStream && partIndex === partCount - 1);
 }
 
-function getRenderablePartStats(parts: MuxMessage["parts"]): {
+function getRenderablePartStats(
+  parts: MuxMessage["parts"],
+  hasActiveStream: boolean
+): {
   lastPartIndex: number;
   isReasoningOnlyMessage: boolean;
 } {
@@ -521,7 +541,7 @@ function getRenderablePartStats(parts: MuxMessage["parts"]): {
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    if (!isRenderableDisplayPart(part)) continue;
+    if (!hasDisplayRow(part, i, parts.length, hasActiveStream)) continue;
     lastPartIndex = i;
     renderableCount++;
     if (part.type === "reasoning") renderableReasoningCount++;
@@ -835,7 +855,10 @@ function buildAssistantDisplayedMessages(options: {
   const displayedMessages: DisplayedMessage[] = [];
   const isPartial = message.metadata?.partial === true;
   const mergedParts = mergeAdjacentParts(message.parts);
-  const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(mergedParts);
+  const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(
+    mergedParts,
+    hasActiveStream
+  );
 
   if (isContextBoundaryMessage(message)) {
     displayedMessages.push(createCompactionBoundaryRow(message, historySequence));
@@ -861,7 +884,10 @@ function buildAssistantDisplayedMessages(options: {
       return;
     }
 
-    if (part.type === "text" && hasDisplayText(part.text)) {
+    if (
+      part.type === "text" &&
+      hasDisplayRow(part, partIndex, mergedParts.length, hasActiveStream)
+    ) {
       appendAssistantTextRow(displayedMessages, {
         message,
         part,
