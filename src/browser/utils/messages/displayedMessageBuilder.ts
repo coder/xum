@@ -35,6 +35,7 @@ import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReas
 import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import { parseAskUserQuestionAnswerMetadata } from "@/common/utils/tools/askUserQuestionSummary";
+import { containsUnicodeTags, revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -404,7 +405,7 @@ function buildUserDisplayedMessages(options: {
       type: "user",
       id: message.id,
       historyId: message.id,
-      content: rawCommand ?? partsContent,
+      content: revealRowText(rawCommand ?? partsContent),
       commandPrefix: muxMeta?.commandPrefix,
       fileParts: fileParts.length > 0 ? fileParts : undefined,
       historySequence,
@@ -474,13 +475,30 @@ function buildUserDisplayedMessages(options: {
  * `mergeAdjacentParts` above joins a mark to its base before a text part is ever tested, so
  * the base carries the row.
  *
+ * Unicode TAG characters are the one unpaintable class that must NOT be dropped: they are
+ * default-ignorables, so they paint nothing, yet they map onto ASCII and the provider request path
+ * keeps them (`dropEmptyText` is `trim()`-based, and OpenAI/Google skip that filter entirely).
+ * Deleting such a row would hide instructions the model still received — the transcript would show
+ * nothing where the provider saw a payload. Those rows stay and are rendered escaped by
+ * `revealRowText`; the provider path is left to its own filter.
+ *
  * The provider request path drops whitespace-only parts too (`dropEmptyText` in
  * modelMessageTransform); the transcript must not render a gap the model never saw.
  */
 const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}]*$/u;
 
 function hasDisplayText(text: unknown): boolean {
-  return typeof text === "string" && !NO_PAINTABLE_CONTENT.test(text);
+  if (typeof text !== "string") return false;
+  return !NO_PAINTABLE_CONTENT.test(text) || containsUnicodeTags(text);
+}
+
+/**
+ * Row text as displayed: tag characters become visible marks. Applied at the row boundary rather
+ * than in the predicate so history, provider requests and copy targets keep their bytes; only the
+ * rendered projection is escaped, which is what makes an otherwise-invisible payload auditable.
+ */
+function revealRowText(text: string): string {
+  return revealUnicodeTags(text);
 }
 
 function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {
@@ -564,7 +582,9 @@ function appendAssistantTextRow(
     type: "assistant",
     id: `${message.id}-${options.partIndex}`,
     historyId: message.id,
-    content: getGoalClearedSummaryDisplayText(part.text, message.metadata?.muxMetadata),
+    content: revealRowText(
+      getGoalClearedSummaryDisplayText(part.text, message.metadata?.muxMetadata)
+    ),
     historySequence: options.historySequence,
     isStreaming: options.isStreaming,
     isPartial: options.isPartial,

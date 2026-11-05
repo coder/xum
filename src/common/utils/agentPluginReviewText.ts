@@ -33,3 +33,27 @@ export function showInvisibleControls(text: string): string {
 export function showOneLineControls(text: string): string {
   return text.replace(ONE_LINE_CONTROLS, markControl);
 }
+
+/**
+ * Unicode tag characters (U+E0020-U+E007F, plus the U+E0000 cancel tag): default-ignorables that
+ * stand on their own and map one-to-one onto ASCII, so a run of them spells a message no renderer
+ * shows. They are deprecated and no chat or code text holds them legitimately.
+ */
+const UNICODE_TAG_CHARACTERS = /[\u{E0000}\u{E0020}-\u{E007F}]/gu;
+
+/**
+ * Each tag character in `text` becomes its visible `<U+XXXX>` mark, leaving everything else
+ * byte-identical. Needed wherever text is shown but still travels to a model provider: the tags
+ * are invisible in the transcript yet provider-visible, so a smuggled instruction would be sent
+ * and read by the model while the user could neither see nor copy it. Scoped to tags rather than
+ * to all default-ignorables on purpose - variation selectors and joiners sit inside everyday emoji
+ * and marking those would mangle ordinary text.
+ */
+export function revealUnicodeTags(text: string): string {
+  return text.replace(UNICODE_TAG_CHARACTERS, markControl);
+}
+
+/** Whether `text` hides an ASCII payload in tag characters. */
+export function containsUnicodeTags(text: string): boolean {
+  return /[\u{E0000}\u{E0020}-\u{E007F}]/u.test(text);
+}

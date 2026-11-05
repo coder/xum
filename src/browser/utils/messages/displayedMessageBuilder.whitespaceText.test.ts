@@ -100,3 +100,41 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     expect(toolRow.isLastPartOfMessage).toBe(true);
   });
 });
+
+describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
+  // Tag characters (U+E0020-U+E007F) are default-ignorables, so they paint nothing -- but they map
+  // onto ASCII and the provider request path keeps them (`dropEmptyText` is trim()-based, and
+  // OpenAI/Google skip that filter entirely). Dropping the row would hide instructions the model
+  // still received, so the row stays and the tags render as visible marks.
+  const tags = (ascii: string) =>
+    [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+  test("keeps a tag-only row and renders its hidden payload", () => {
+    const displayed = rows([{ type: "text", text: tags("AB") }, FAILED_BASH]);
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
+      "<U+E0041><U+E0042>"
+    );
+  });
+
+  test("marks only the tags inside otherwise-visible text", () => {
+    const displayed = rows([{ type: "text", text: `continue${tags("XY")}` }, FAILED_BASH]);
+
+    // Everything but the tag code points is untouched.
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
+      "continue<U+E0058><U+E0059>"
+    );
+  });
+
+  test("user rows reveal tags the same way", () => {
+    const displayed = buildDisplayedMessagesForMessage({
+      message: createMuxMessage("u1", "user", "", undefined, [{ type: "text", text: tags("AB") }]),
+      hasActiveStream: false,
+      isContextBoundaryMessage: () => false,
+    });
+
+    expect(displayed[0]?.type).toBe("user");
+    expect(displayed[0]?.type === "user" ? displayed[0].content : null).toBe("<U+E0041><U+E0042>");
+  });
+});
