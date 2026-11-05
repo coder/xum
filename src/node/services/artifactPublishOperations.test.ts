@@ -105,6 +105,13 @@ describe("publishArtifact", () => {
     );
     await fs.writeFile(recordPath, "{not json");
     expect(await recordOf("a.md")).toBeNull();
+    const aside = (await fs.readdir(path.dirname(recordPath))).filter((name) =>
+      name.startsWith("record.json.corrupt-")
+    );
+    expect(aside).toHaveLength(1);
+    expect(await fs.readFile(path.join(path.dirname(recordPath), aside[0]), "utf8")).toBe(
+      "{not json"
+    );
     await publish("a.md", { title: "Second" });
     expect((await recordOf("a.md"))?.title).toBe("Second");
   });

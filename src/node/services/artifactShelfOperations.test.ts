@@ -2,14 +2,14 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import type { ArtifactsContext } from "./artifactsOperations";
+import { MAX_ARTIFACT_READ_BYTES, type ArtifactsContext } from "./artifactsOperations";
 import {
   listShelfRoute,
   pinToShelfRoute,
   readShelfRoute,
   unpinShelfRoute,
 } from "./artifactShelfOperations";
-import { PROJECT_SHELF_MULTI_PROJECT_ERROR } from "./artifactShelf";
+import { MAX_SHELF_FILE_BYTES, PROJECT_SHELF_MULTI_PROJECT_ERROR } from "./artifactShelf";
 import { recordArtifactPublish } from "./artifactRecordStore";
 
 describe("shelf routes", () => {
@@ -90,6 +90,36 @@ describe("shelf routes", () => {
     });
     const after = await listShelfRoute(context, { workspaceId: "a" });
     expect(after.success && after.data.project).toEqual({ available: true, entries: [] });
+  });
+
+  test("a pin keeps the kind the artifact was published as", async () => {
+    const dir = path.join(root, "sessions", "a", "scratch", "artifacts");
+    await fs.writeFile(path.join(dir, "notes.txt"), "# Notes");
+    await recordArtifactPublish({
+      sessionDir: path.join(root, "sessions", "a"),
+      relPath: "notes.txt",
+      title: "Notes",
+      kind: "markdown",
+    });
+    await pinToShelfRoute(context, { workspaceId: "a", path: "notes.txt", scope: "global" });
+    const listed = await listShelfRoute(context, { workspaceId: "a" });
+    expect(listed.success && listed.data.global).toMatchObject([
+      { name: "notes.txt", title: "Notes", kind: "markdown" },
+    ]);
+  });
+
+  test("a pin of a file over the read cap fails with its size and leaves the shelf empty", async () => {
+    const dir = path.join(root, "sessions", "a", "scratch", "artifacts");
+    const size = MAX_ARTIFACT_READ_BYTES + 1;
+    await fs.writeFile(path.join(dir, "huge.bin.md"), Buffer.alloc(size, "x"));
+    expect(
+      await pinToShelfRoute(context, { workspaceId: "a", path: "huge.bin.md", scope: "global" })
+    ).toEqual({
+      success: false,
+      error: `Artifact is ${size} bytes; shelf files are capped at ${MAX_SHELF_FILE_BYTES} bytes`,
+    });
+    const listed = await listShelfRoute(context, { workspaceId: "a" });
+    expect(listed.success && listed.data.global).toEqual([]);
   });
 
   test("a pin of a file that is gone fails and leaves the shelf empty", async () => {

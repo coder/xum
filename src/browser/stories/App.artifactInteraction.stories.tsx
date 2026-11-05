@@ -57,7 +57,7 @@ function setup(workspaceId: string) {
       }),
       createAssistantMessage(
         "m2",
-        "I wrote **Release checklist** (v3) in the Artifacts tab. Fill it in when you are ready.",
+        "I wrote **Release checklist** in the Artifacts tab. Fill it in when you are ready.",
         { historySequence: 2, timestamp: t - 290_000 }
       ),
       fromArtifact("m3", 3, SUBMIT),

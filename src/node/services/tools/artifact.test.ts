@@ -6,6 +6,7 @@ import * as path from "path";
 import type { ArtifactToolResult } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel } from "@/common/utils/tools/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as artifactsOperationsModule from "@/node/services/artifactsOperations";
 import { getArtifactId, readArtifactRecord } from "@/node/services/artifactRecordStore";
 import { createArtifactTool } from "./artifact";
 import { createArtifactListTool } from "./artifact_list";
@@ -190,6 +191,42 @@ describe("artifact tool shelf pin (M5c)", () => {
     expect(
       await createArtifactReadTool(other).execute!({ scope: "project", path: "plan.md" }, options)
     ).toMatchObject({ success: true, content: "# Plan v1", title: "migration plan" });
+  });
+
+  test("a cancelled publish pins nothing, and the cancel signal reaches both reads", async () => {
+    await fs.writeFile(path.join(scratchDir, "artifacts", "plan.md"), "# Plan");
+    const config = configFor();
+    const controller = new AbortController();
+    const readOriginal = artifactsOperationsModule.readArtifactBytesAtLocation;
+    const signals: Array<AbortSignal | undefined> = [];
+    const read = spyOn(artifactsOperationsModule, "readArtifactBytesAtLocation");
+    read.mockImplementation((...args) => {
+      signals.push(args[3]);
+      return readOriginal(...args);
+    });
+    try {
+      expect(
+        await createArtifactTool(config).execute!(
+          { path: "plan.md", pin: "global" },
+          { ...options, abortSignal: controller.signal }
+        )
+      ).toMatchObject({ success: true, pin: "global" });
+      controller.abort();
+      expect(
+        await createArtifactTool(config).execute!(
+          { path: "plan.md", title: "again", pin: "project" },
+          { ...options, abortSignal: controller.signal }
+        )
+      ).toEqual({ success: false, error: "Publish was interrupted" });
+    } finally {
+      read.mockRestore();
+    }
+    // The first call read the file twice (publish, then pin), each with the tool's signal.
+    expect(signals.slice(0, 2)).toEqual([controller.signal, controller.signal]);
+    const shelf = (await createArtifactListTool(config).execute!({ scope: "shelf" }, options)) as {
+      shelf: Array<{ scope: string }>;
+    };
+    expect(shelf.shelf.map((entry) => entry.scope)).toEqual(["global"]);
   });
 
   test("a project pin from a multi-project workspace is refused before publishing", async () => {

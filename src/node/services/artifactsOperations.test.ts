@@ -44,6 +44,19 @@ class FakeRemoteRuntime extends LocalRuntime {
   }
 }
 
+/** Runs real commands against a local folder that stands in for a remote Xum home. */
+class LocalHomeRuntime extends LocalRuntime {
+  constructor(
+    cwd: string,
+    private readonly home: string
+  ) {
+    super(cwd);
+  }
+  override getXumHome(): string {
+    return this.home;
+  }
+}
+
 describe("artifacts operations", () => {
   let tempDir: string;
   let config: Config;
@@ -169,6 +182,58 @@ describe("artifacts operations", () => {
       "flow.txt": "mermaid",
       "plain.txt": "text",
     });
+  });
+
+  test("a live read of a file over the cap still carries the published kind", async () => {
+    await writeArtifact("big.txt", "x".repeat(20));
+    await recordArtifactPublish({
+      sessionDir: path.join(config.sessionsDir, "ws-art"),
+      relPath: "big.txt",
+      title: "Big",
+      kind: "markdown",
+    });
+
+    const read = await readArtifact(createContext({ enabled: true }), {
+      workspaceId: "ws-art",
+      path: "big.txt",
+      maxBytes: 10,
+    });
+
+    expect(read).toMatchObject({ success: true, data: { status: "too_large", kind: "markdown" } });
+  });
+
+  test("an SSH or Docker runtime lists and reads a file as the kind it was published as", async () => {
+    const home = path.join(tempDir, "remote-home");
+    const dir = path.join(home, "workspace-scratch", "ws-art", "artifacts");
+    await fsPromises.mkdir(dir, { recursive: true });
+    await fsPromises.writeFile(path.join(dir, "flow.txt"), "graph TD; A-->B");
+    await recordArtifactPublish({
+      sessionDir: path.join(config.sessionsDir, "ws-art"),
+      relPath: "flow.txt",
+      title: "Flow",
+      kind: "mermaid",
+    });
+    const createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue(
+      new LocalHomeRuntime(tempDir, home)
+    );
+    const context = createContext({
+      enabled: true,
+      runtimeConfig: { type: "ssh", host: "box", srcBaseDir: "~/src" },
+    });
+    try {
+      const listing = await listArtifacts(context, { workspaceId: "ws-art" });
+      const read = await readArtifact(context, { workspaceId: "ws-art", path: "flow.txt" });
+      expect(listing.success && listing.data.available && listing.data.entries[0]).toMatchObject({
+        path: "flow.txt",
+        kind: "mermaid",
+      });
+      expect(read).toMatchObject({
+        success: true,
+        data: { status: "ok", kind: "mermaid", content: "graph TD; A-->B" },
+      });
+    } finally {
+      createRuntime.mockRestore();
+    }
   });
 
   test("a live read shows the kind the artifact tool published it as", async () => {
