@@ -455,16 +455,24 @@ function buildUserDisplayedMessages(options: {
 }
 
 /**
- * A text part renders only when it carries non-whitespace content. An interrupted or
- * stalled stream can persist a whitespace-only delta ("\n"), which is truthy but paints
- * nothing: it becomes a message block (`mt-4` + `py-1`) with no visible content, i.e. a
- * blank line above whatever follows it — most visibly above a failed tool call, whose row
- * auto-expands and draws the eye. The provider request path already drops these parts
- * (see `dropEmptyText` in modelMessageTransform); the transcript must agree, otherwise the
- * user sees a gap the model never saw. `trim` also covers a lone zero-width space.
+ * Content a text part can actually paint: at least one non-whitespace, non-default-ignorable
+ * character. An interrupted or stalled stream can persist a delta of only a newline, which is
+ * truthy but paints nothing — it still becomes a message block (`mt-4` + `py-1`), i.e. a blank
+ * line above whatever follows, most visibly above a failed tool call whose row auto-expands
+ * and draws the eye.
+ *
+ * `trim()` alone is not enough: it leaves default-ignorables (U+200B zero-width space, U+2060
+ * word joiner, U+FEFF) intact, and those paint nothing either, so the gap would survive. Same
+ * class the plugin-text guard already recognizes (`agentPluginReviewText.ts`). NBSP is `\s` to
+ * `trim`, and a combining mark with no base character is still invisible, so both count as empty.
+ *
+ * The provider request path drops whitespace-only parts too (`dropEmptyText` in
+ * modelMessageTransform); the transcript must not render a gap the model never saw.
  */
+const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}\p{M}]*$/u;
+
 function hasDisplayText(text: unknown): boolean {
-  return typeof text === "string" && text.trim().length > 0;
+  return typeof text === "string" && !NO_PAINTABLE_CONTENT.test(text);
 }
 
 function isRenderableDisplayPart(part: MuxMessage["parts"][number]): boolean {

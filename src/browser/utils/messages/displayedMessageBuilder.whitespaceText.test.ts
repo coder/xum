@@ -33,6 +33,21 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     expect(displayed[0]?.type).toBe("tool");
   });
 
+  test("drops a text row that carries only invisible characters", () => {
+    // trim() keeps these, so a whitespace test alone would pass while the gap survived.
+    for (const invisible of ["\u200b", "\u2060", "\ufeff", "\n\u200b"]) {
+      const displayed = rows([{ type: "text", text: invisible }, FAILED_BASH]);
+      expect(displayed.map((row) => row.type)).toEqual(["tool"]);
+    }
+  });
+
+  test("keeps content that merely contains invisible characters or emoji", () => {
+    for (const visible of ["a\u200b", "\u2764\ufe0f", "\u00e9"]) {
+      const displayed = rows([{ type: "text", text: visible }, FAILED_BASH]);
+      expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    }
+  });
+
   test("keeps a text row that carries content", () => {
     const displayed = rows([{ type: "text", text: "Building now\n" }, FAILED_BASH]);
 
