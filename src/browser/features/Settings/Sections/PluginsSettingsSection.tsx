@@ -1338,6 +1338,41 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
+/**
+ * An update that Xum refused because the new commit no longer fits the saved install method (B5).
+ * The message names the file and says how to switch. Nothing was applied, so the plugin stays on
+ * its commit and keeps tracking its branch, and the one way forward is to remove it and install it
+ * again, which "Remove plugin" starts through the usual uninstall confirmation.
+ */
+const UpdateRefusedPanel: React.FC<{
+  review: AgentPluginUpdateReview;
+  message: string;
+  busy: boolean;
+  onRemove: () => void;
+  onClose: () => void;
+}> = (props) => (
+  <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
+    <div className="bg-warning/10 text-warning flex items-start gap-2 rounded-md px-3 py-2 text-xs">
+      <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      {/* The message quotes plugin text (validation errors): controls are marked, as in warnings. */}
+      <span className="min-w-0 break-words">{showOneLineControls(props.message)}</span>
+    </div>
+    <p className="text-muted text-xs">
+      Nothing was changed. The plugin stays on {props.review.fromSha.slice(0, 12)} and keeps
+      tracking its branch.
+    </p>
+    <div className="flex flex-wrap gap-2">
+      <Button variant="outline" size="sm" onClick={props.onRemove} disabled={props.busy}>
+        <Trash2 className="h-3.5 w-3.5" />
+        Remove plugin
+      </Button>
+      <Button variant="ghost" size="sm" onClick={props.onClose} disabled={props.busy}>
+        Close
+      </Button>
+    </div>
+  </div>
+);
+
 const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
@@ -1866,7 +1901,8 @@ export const PluginsSettingsSection: React.FC = () => {
         setError(preview.error);
         return;
       }
-      if (preview.data.changes.length > 0) {
+      // A refused update has no changes either: it shows its message, never an apply.
+      if (preview.data.refused !== undefined || preview.data.changes.length > 0) {
         setUpdateReview(preview.data);
         return;
       }
@@ -2186,16 +2222,29 @@ export const PluginsSettingsSection: React.FC = () => {
                       onClose={() => setHooksTarget(null)}
                     />
                   )}
-                  {item.managed && updateReview?.name === item.name && (
-                    <UpdateReviewPanel
-                      review={updateReview}
-                      mode="update"
-                      selective={item.importedComponents !== undefined}
-                      busy={isBusy}
-                      onConfirm={() => void handleConfirmUpdate(updateReview)}
-                      onCancel={() => setUpdateReview(null)}
-                    />
-                  )}
+                  {item.managed &&
+                    updateReview?.name === item.name &&
+                    (updateReview.refused !== undefined ? (
+                      <UpdateRefusedPanel
+                        review={updateReview}
+                        message={updateReview.refused}
+                        busy={isBusy}
+                        onRemove={() => {
+                          setUpdateReview(null);
+                          setUninstallTarget(item.name);
+                        }}
+                        onClose={() => setUpdateReview(null)}
+                      />
+                    ) : (
+                      <UpdateReviewPanel
+                        review={updateReview}
+                        mode="update"
+                        selective={item.importedComponents !== undefined}
+                        busy={isBusy}
+                        onConfirm={() => void handleConfirmUpdate(updateReview)}
+                        onCancel={() => setUpdateReview(null)}
+                      />
+                    ))}
                   <ComponentReviewRow
                     item={item}
                     review={componentReview.review}

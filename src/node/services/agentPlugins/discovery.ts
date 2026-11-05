@@ -7,7 +7,8 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
-import type { AgentPluginNotApplied } from "@/common/orpc/schemas/agentPlugins";
+import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
+import type { AgentPluginNotApplied, SavedInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
@@ -392,6 +393,11 @@ export interface AgentPluginInfo {
   /** Directory entry name under the container (lexical, pre-realpath). */
   dirName: string;
   manifest: AgentPluginManifest;
+  /**
+   * The install method the registry row saved, when the plugin was read through it (B3). Absent:
+   * the fixed order read it. The hook gate reads the plugin again with the same choice.
+   */
+  installMethod?: SavedInstallMethod;
   /**
    * Found through `.codex-plugin/plugin.json`: only skills, MCP and the
    * com.openai fields are honored (no hooks, agents, workflows, slash
@@ -1487,28 +1493,119 @@ export async function isSchemaLessRootManifest(rootReal: string): Promise<boolea
   return read.status === "ok" && isSchemaLessManifest(read.raw);
 }
 
+/** What normalizing one manifest file gives (see discoverPluginAt). */
+interface NormalizedManifest {
+  manifest: unknown;
+  warnings: string[];
+  claude: ClaudePluginComponents | undefined;
+  cursor?: CursorManifestResult;
+}
+
+export interface AgentPluginManifestSpec {
+  /** Relative to the plugin root, with the OS separator (as the `*_MANIFEST_RELATIVE_PATH` constants). */
+  relative: string;
+  /** The install method that reads this file (B1). */
+  method: SavedInstallMethod;
+  normalize(raw: unknown): NormalizedManifest;
+}
+
 /**
- * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex, the Claude Code and
- * the Cursor manifests. Each one goes through the same caps and containment. Null when none exists.
+ * The manifest files of a plugin folder, in the FIXED ORDER. selectManifest reads them in this
+ * order and detectInstallMethods (installMethods.ts) lists the same files, so what Xum offers is
+ * what it loads. A new manifest file may only be added at the END: a new position changes which
+ * manifest an install without a saved method loads.
+ */
+export const AGENT_PLUGIN_MANIFEST_TABLE: readonly AgentPluginManifestSpec[] = [
+  {
+    relative: PLUGIN_MANIFEST_RELATIVE_PATH,
+    method: "agent-plugin",
+    normalize: (raw) => ({ manifest: raw, warnings: [], claude: undefined }),
+  },
+  {
+    relative: CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    method: "agent-plugin",
+    normalize: (raw) => ({ ...normalizeCodexManifest(raw), claude: undefined }),
+  },
+  {
+    relative: CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    method: "claude-plugin",
+    normalize: (raw) => normalizeClaudeManifest(raw),
+  },
+  {
+    relative: CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
+    method: "cursor-plugin",
+    normalize: (raw) => {
+      const cursor = normalizeCursorManifest(raw);
+      return { manifest: cursor.manifest, warnings: cursor.warnings, claude: undefined, cursor };
+    },
+  },
+];
+
+/**
+ * Which manifest a plugin folder loads. `fixed-order` is today's behavior: the first manifest of
+ * AGENT_PLUGIN_MANIFEST_TABLE that exists. It covers the generated methods and every plugin
+ * without a saved method. `method` reads only that method's manifest and never falls back to
+ * another one (B2).
+ */
+export type ManifestChoice =
+  | { kind: "fixed-order" }
+  | { kind: "method"; method: SavedInstallMethod };
+
+/** The choice of a plugin tree whose registry row saved `method` (undefined: no saved method). */
+export function manifestChoiceFor(method: SavedInstallMethod | undefined): ManifestChoice {
+  return method === undefined ? { kind: "fixed-order" } : { kind: "method", method };
+}
+
+function manifestSpecsFor(choice: ManifestChoice): readonly AgentPluginManifestSpec[] {
+  return choice.kind === "fixed-order"
+    ? AGENT_PLUGIN_MANIFEST_TABLE
+    : AGENT_PLUGIN_MANIFEST_TABLE.filter((spec) => spec.method === choice.method);
+}
+
+/**
+ * The manifest files a method can read, as the repository shows them (`shownRoot`: the plugin
+ * folder's path inside its repository, see discoverAgentPluginAt).
+ */
+export function manifestFilesOf(
+  method: SavedInstallMethod,
+  shownRoot?: string | undefined
+): string[] {
+  return manifestSpecsFor({ kind: "method", method }).map((spec) =>
+    shownManifestPath(shownRoot, spec.relative)
+  );
+}
+
+/** The error of a named method whose manifest does not exist: it names the method and the file. */
+export function missingMethodManifestMessage(
+  method: SavedInstallMethod,
+  shownRoot?: string | undefined
+): string {
+  const files = manifestFilesOf(method, shownRoot);
+  const label = AGENT_PLUGIN_INSTALL_METHOD_LABELS[method];
+  return files.length === 1
+    ? `${label}: ${files[0]} does not exist.`
+    : `${label}: neither ${files.join(" nor ")} exists.`;
+}
+
+/**
+ * Pick the manifest of a plugin folder: the first file of the choice's table entries that exists.
+ * Each one goes through the same caps and containment. Null when none exists.
  *
  * A root plugin.json with no `$schema` is not an Agent Plugins manifest: other harnesses use the
  * same file name (DietrichGebert/ponytail ships `{"name":"ponytail"}` next to its Codex and Claude
  * manifests). It yields to a later candidate, and is returned (so validation reports it) only
- * when no other manifest exists. The fallback gets the narrower Codex, Claude or Cursor component
- * set.
+ * when no other candidate exists. The fallback gets the narrower Codex, Claude or Cursor component
+ * set. A named method yields to nothing outside its own files, so for `agent-plugin` a schema-less
+ * root is reported the same way when the Codex manifest is missing.
  */
 async function selectManifest(
   rootReal: string,
   /** See discoverAgentPluginAt: read errors name the file from here, like validation errors. */
-  shownRoot: string | undefined
+  shownRoot: string | undefined,
+  choice: ManifestChoice
 ): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
   let schemaLessRoot: { relative: string; raw: unknown } | null = null;
-  for (const relative of [
-    PLUGIN_MANIFEST_RELATIVE_PATH,
-    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-    CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
-  ]) {
+  for (const { relative } of manifestSpecsFor(choice)) {
     const read = await readManifestCandidate(
       rootReal,
       relative,
@@ -1525,27 +1622,10 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
-function normalizeSelectedManifest(
-  manifestRelative: string,
-  raw: unknown
-): {
-  manifest: unknown;
-  warnings: string[];
-  claude: ClaudePluginComponents | undefined;
-  cursor?: CursorManifestResult;
-} {
-  switch (manifestRelative) {
-    case CODEX_PLUGIN_MANIFEST_RELATIVE_PATH:
-      return { ...normalizeCodexManifest(raw), claude: undefined };
-    case CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH:
-      return normalizeClaudeManifest(raw);
-    case CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH: {
-      const cursor = normalizeCursorManifest(raw);
-      return { manifest: cursor.manifest, warnings: cursor.warnings, claude: undefined, cursor };
-    }
-    default:
-      return { manifest: raw, warnings: [], claude: undefined };
-  }
+function normalizeSelectedManifest(manifestRelative: string, raw: unknown): NormalizedManifest {
+  const spec = AGENT_PLUGIN_MANIFEST_TABLE.find((entry) => entry.relative === manifestRelative);
+  assert(spec !== undefined, `normalizeSelectedManifest: unknown manifest ${manifestRelative}`);
+  return spec.normalize(raw);
 }
 
 /** The manifest path an error shows: from `shownRoot` (default the plugin root), `/` on every OS. */
@@ -1561,8 +1641,10 @@ async function discoverPluginAt(args: {
   diagnostics: AgentPluginDiagnostic[];
   /** See discoverAgentPluginAt. */
   shownRoot?: string;
+  /** See discoverAgentPluginAt. */
+  choice: ManifestChoice;
 }): Promise<AgentPluginInfo | null> {
-  const { pluginDir, scope, diagnostics } = args;
+  const { pluginDir, scope, diagnostics, choice } = args;
 
   const pushError = (targetPath: string, message: string): void => {
     log.warn(`Agent plugin ${pluginDir}: ${message}`);
@@ -1578,8 +1660,17 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  const selected = await selectManifest(rootReal, args.shownRoot);
+  const selected = await selectManifest(rootReal, args.shownRoot, choice);
   if (selected === null) {
+    if (choice.kind === "method") {
+      // The plugin was installed through a manifest that is not in the folder: the plugin is
+      // gone, and the error says which file (B2). The fixed order stays silent below.
+      const [first] = manifestSpecsFor(choice);
+      pushError(
+        path.join(rootReal, first.relative),
+        missingMethodManifestMessage(choice.method, args.shownRoot)
+      );
+    }
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
@@ -1728,6 +1819,7 @@ async function discoverPluginAt(args: {
     containerPath: args.containerPath,
     dirName: args.dirName,
     manifest,
+    ...(choice.kind === "method" ? { installMethod: choice.method } : {}),
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
@@ -1840,6 +1932,12 @@ export async function discoverAgentPluginAt(args: {
    * a bare `plugin.json`. Display only.
    */
   shownRoot?: string;
+  /**
+   * Which manifest the folder loads. Required, so the compiler lists every caller: each one passes
+   * the choice of the tree it reads (the staged method during preview and install, the saved
+   * method of an installed plugin, `fixed-order` for a tree with no saved method).
+   */
+  choice: ManifestChoice;
 }): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
   if (!path.isAbsolute(args.pluginDir)) {
     throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
@@ -1853,6 +1951,7 @@ export async function discoverAgentPluginAt(args: {
     scope: args.scope,
     diagnostics,
     shownRoot: args.shownRoot,
+    choice: args.choice,
   });
   return { plugin, diagnostics };
 }
@@ -2286,6 +2385,9 @@ export async function discoverAgentPlugins(
           dirName: entryName,
           scope: container.scope,
           diagnostics,
+          // A managed plugin loads the manifest its install saved (B2); anything else, and a
+          // registry that cannot be read, read the fixed order.
+          choice: manifestChoiceFor(snapshot.imports?.methodByName.get(entryName)),
         });
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {

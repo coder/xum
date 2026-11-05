@@ -4,6 +4,10 @@ import {
   AgentPluginInstallEntrySchema,
   type AgentPluginImportedComponents,
 } from "@/common/config/schemas/agentPluginInstalls";
+import {
+  SavedInstallMethodSchema,
+  type SavedInstallMethod,
+} from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
 import { log } from "@/node/services/log";
@@ -91,6 +95,38 @@ function registryRowName(raw: unknown): string | undefined {
   return name.success ? name.data : undefined;
 }
 
+let warnedUnknownInstallMethod = false;
+
+/** Test seam: the warning below is once per process, so a test that counts it resets it first. */
+export function resetUnknownInstallMethodWarning(): void {
+  warnedUnknownInstallMethod = false;
+}
+
+/**
+ * The install method a raw registry row saved (RFC B3), or undefined for the fixed order.
+ *
+ * Read from the raw row, never from AgentPluginInstallEntrySchema: that schema strips unknown
+ * keys, and a value this build does not know (a newer build's method) must not make the row
+ * invalid, because an invalid row turns off all of the plugin's components and a registry read
+ * error blocks every plugin operation. An unknown value loads by the fixed order and logs one
+ * warning per process.
+ */
+export function readStoredInstallMethod(rawRow: unknown): SavedInstallMethod | undefined {
+  if (rawRow === null || typeof rawRow !== "object" || Array.isArray(rawRow)) return undefined;
+  const value: unknown = (rawRow as { installMethod?: unknown }).installMethod;
+  if (value === undefined) return undefined;
+  const parsed = SavedInstallMethodSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  if (!warnedUnknownInstallMethod) {
+    warnedUnknownInstallMethod = true;
+    log.warn(
+      "A plugin registry row has an install method this version does not know; loading it by the fixed manifest order",
+      { installMethod: typeof value === "string" ? value.slice(0, 64) : typeof value }
+    );
+  }
+  return undefined;
+}
+
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(registryFile: string): Promise<{
   byName: Map<string, AgentPluginImportedComponents | undefined>;
@@ -101,6 +137,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
   consentByName: Map<string, ComponentConsent>;
   /** Install time by plugin name: it binds the install's approved copies (approvedCopies.ts). */
   installedAtByName: Map<string, string>;
+  /** The saved install method by plugin name (readStoredInstallMethod); absent: the fixed order. */
+  methodByName: Map<string, SavedInstallMethod>;
   hasUnidentifiedEntries: boolean;
 } | null> {
   try {
@@ -108,6 +146,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
     const byName = new Map<string, AgentPluginImportedComponents | undefined>();
     const consentByName = new Map<string, ComponentConsent>();
     const installedAtByName = new Map<string, string>();
+    const methodByName = new Map<string, SavedInstallMethod>();
     let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
       const name = registryRowName(raw);
@@ -130,6 +169,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         byName.set(name, parsed.data.importedComponents);
         consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
         installedAtByName.set(name, parsed.data.installedAt);
+        const method = readStoredInstallMethod(raw);
+        if (method !== undefined) methodByName.set(name, method);
       }
     }
     if (hasUnidentifiedEntries) {
@@ -140,7 +181,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         }
       );
     }
-    return { byName, consentByName, installedAtByName, hasUnidentifiedEntries };
+    return { byName, consentByName, installedAtByName, methodByName, hasUnidentifiedEntries };
   } catch (error) {
     log.warn("Plugin component imports unavailable; suppressing skills and MCP servers", {
       registryFile,

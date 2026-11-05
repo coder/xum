@@ -3,12 +3,15 @@ import * as path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { MCPServerPluginProvenance } from "@/common/types/mcp";
+import { log } from "@/node/services/log";
 import {
   isPluginMcpServerAllowed,
   readPluginComponentImports,
   readPluginMcpPolicy,
+  readStoredInstallMethod,
+  resetUnknownInstallMethodWarning,
 } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import { createRawPluginInstallRow, createTestPluginInstallEntry } from "./testFixtures";
 
 const legacy = createTestPluginInstallEntry("demo");
 const selective = createTestPluginInstallEntry("demo", { skills: ["selected"], mcpServers: [] });
@@ -89,6 +92,86 @@ describe("readPluginComponentImports", () => {
     const recovered = await readRows(registryPath, [selective]);
     expect(recovered.hasUnidentifiedEntries).toBe(false);
     expect(recovered.byName.get("demo")).toEqual(selective.importedComponents);
+  });
+});
+
+describe("readStoredInstallMethod", () => {
+  test("reads each saved manifest method from a raw row", () => {
+    for (const method of ["agent-plugin", "claude-plugin", "cursor-plugin"] as const) {
+      expect(
+        readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod: method }))
+      ).toBe(method);
+    }
+  });
+
+  test("a row without the field, or a value that is no row, has no method and no warning", () => {
+    resetUnknownInstallMethodWarning();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      expect(readStoredInstallMethod(createRawPluginInstallRow(legacy, {}))).toBeUndefined();
+      expect(readStoredInstallMethod(null)).toBeUndefined();
+      expect(readStoredInstallMethod("claude-plugin")).toBeUndefined();
+      expect(readStoredInstallMethod([])).toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("an unknown value (from a newer build) means the fixed order and warns once per process", () => {
+    resetUnknownInstallMethodWarning();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      for (const installMethod of ["codex-plugin", 7, null, { kind: "claude-plugin" }, ""]) {
+        expect(
+          readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod }))
+        ).toBeUndefined();
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("readPluginComponentImports saved install methods", () => {
+  test("methodByName holds each row's saved method, by plugin name", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-install-method");
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(createTestPluginInstallEntry("claude"), {
+        installMethod: "claude-plugin",
+      }),
+      createRawPluginInstallRow(createTestPluginInstallEntry("cursor"), {
+        installMethod: "cursor-plugin",
+      }),
+      createTestPluginInstallEntry("legacy"),
+    ]);
+    expect(result.methodByName.get("claude")).toBe("claude-plugin");
+    expect(result.methodByName.get("cursor")).toBe("cursor-plugin");
+    expect(result.methodByName.has("legacy")).toBe(false);
+  });
+
+  test("an unknown installMethod never invalidates the row: imports and consent stay as saved", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-unknown-install-method");
+    const consent = {
+      skills: { greet: "fp" },
+      mcpServers: {},
+      workflows: {},
+      agents: {},
+      slashCommands: {},
+    };
+    const entry = createTestPluginInstallEntry(
+      "demo",
+      { skills: ["greet"], mcpServers: [] },
+      consent
+    );
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(entry, { installMethod: "windsurf-plugin" }),
+    ]);
+    expect(result.byName.get("demo")).toEqual({ skills: ["greet"], mcpServers: [] });
+    expect(result.consentByName.get("demo")).toEqual(consent);
+    expect(result.installedAtByName.get("demo")).toBe(entry.installedAt);
+    expect(result.methodByName.has("demo")).toBe(false);
   });
 });
 

@@ -190,9 +190,13 @@ export const AgentPluginComponentKindSchema = z.enum([
  * How Xum reads a repository as a managed plugin. Preview lists every method that fits, in this
  * order, and install must use the method the user previewed. Each member is an object so a method
  * can carry its own fields (a later Claude marketplace method names its entry).
+ *
+ * The three manifest methods (rule M1, installMethods.ts) are offered side by side: one per
+ * manifest file the repository has, except that a root plugin.json with `$schema` (a Xum-native
+ * package) is offered alone.
  */
 export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
-  /** plugin.json, or .codex-plugin/plugin.json. */
+  /** The root plugin.json with `$schema`, or else .codex-plugin/plugin.json. */
   z.object({ kind: z.literal("agent-plugin") }),
   /** .claude-plugin/plugin.json. */
   z.object({ kind: z.literal("claude-plugin") }),
@@ -209,11 +213,19 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
   /**
    * One entry of a Cursor marketplace (`.cursor-plugin/marketplace.json`). A preview selector
    * only: the entry installs through its folder's own manifest, so install never gets it back.
-   * No install record stores a method (agentPluginInstalls.ts).
+   * Only a manifest method is saved (SavedInstallMethodSchema), never an entry.
    */
   z.object({ kind: z.literal("cursor-marketplace"), entry: z.string().min(1) }),
 ]);
 export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
+
+/**
+ * The install methods a registry row can save (`installMethod`): the manifest methods. Generated
+ * methods keep their `generatedFrom` marker instead, and marketplace entries install through
+ * their folder's manifest with no saved method.
+ */
+export const SavedInstallMethodSchema = z.enum(["agent-plugin", "claude-plugin", "cursor-plugin"]);
+export type SavedInstallMethod = z.infer<typeof SavedInstallMethodSchema>;
 
 /**
  * One consent-relevant difference between the installed tree and a staged
@@ -258,7 +270,10 @@ export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
   /** The method this preview used. Install gets it back. */
   method: AgentPluginInstallMethodSchema,
-  /** Every method that fits the repository, in order: agent-plugin, claude-plugin, skills. */
+  /**
+   * Every method that fits the repository, in order: agent-plugin, claude-plugin, cursor-plugin,
+   * skills. A manifest that fails validation is not listed (its error is a warning).
+   */
   methods: z.array(AgentPluginInstallMethodSchema),
   /**
    * Skill folder names found with the skills CLI rules, for the "Skills CLI" choice (empty when
@@ -476,6 +491,12 @@ export const AgentPluginUpdateReviewSchema = z.object({
    * no plugin (no new commit, or a component review).
    */
   notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
+  /**
+   * Set when the commit no longer fits the install's saved method (B5). The message names the
+   * missing or invalid file, lists the methods that fit and says how to switch. Nothing is applied,
+   * and the review offers "Remove plugin" instead of a confirmation. `changes` is empty.
+   */
+  refused: z.string().optional(),
 });
 
 export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;

@@ -17,7 +17,10 @@ import {
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import { getOwn } from "@/common/utils/getOwn";
-import { AgentPluginRuleTypeSchema } from "@/common/orpc/schemas/agentPlugins";
+import {
+  AgentPluginRuleTypeSchema,
+  type SavedInstallMethod,
+} from "@/common/orpc/schemas/agentPlugins";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
@@ -83,29 +86,35 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  manifestChoiceFor,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginDiagnostic,
   type AgentPluginInfo,
+  type ManifestChoice,
   listPluginSkillFolders,
   resolveDeclaredSkillsRoots,
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import {
+  UpdateRefusedError,
   chooseStagedMethod,
   detectInstallMethods,
   generatesManifest,
   isOwnManifestMethod,
-  methodLabel,
   installMethodRequest,
+  methodLabel,
   marketplaceManifest,
   readInstalledGeneratedFrom,
   relativeEntryContext,
+  savedMethodOf,
   writeGeneratedManifest,
+  type CheckedInstallMethods,
   type InstallMethodRequest,
   type MarketplaceEntryContext,
+  type RejectedInstallMethod,
   type SkillsPackageRoot,
 } from "./installMethods";
 import {
@@ -160,7 +169,11 @@ import {
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
-import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
+import {
+  PLUGIN_REGISTRY_FILE_NAME,
+  readPluginRegistryDocument,
+  readStoredInstallMethod,
+} from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import {
   hashPluginTree,
@@ -1876,6 +1889,18 @@ function shownStagedRoot(
   return marketplace === undefined ? source.subpath : undefined;
 }
 
+/** One staged manifest read: its plugin and the diagnostics discovery gave. */
+interface Discovered {
+  plugin: AgentPluginInfo;
+  diagnostics: AgentPluginDiagnostic[];
+}
+
+/** The refusal of a staged tree that discovery did not accept (a preview shows it as a warning). */
+function invalidPluginMessage(read: { diagnostics: AgentPluginDiagnostic[] }): string {
+  const reasons = read.diagnostics.map((d) => d.message);
+  return reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
+}
+
 export class AgentPluginInstallService {
   private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
@@ -2067,6 +2092,21 @@ export class AgentPluginInstallService {
    */
   private readRegistryDocument(mode: "lenient" | "strict") {
     return readPluginRegistryDocument(this.registryFile, mode);
+  }
+
+  /**
+   * The install method that the registry row of `name` saved (B3), or undefined for the fixed
+   * order. Read from the raw row: the row schema strips the field. A registry that cannot be read
+   * has no row to honor, and the callers that mutate it read it strictly themselves.
+   */
+  private async savedInstallMethod(name: string): Promise<SavedInstallMethod | undefined> {
+    const { rawEntries } = await this.readRegistryDocument("lenient");
+    return readStoredInstallMethod(rawEntries.find((entry) => this.rawEntryName(entry) === name));
+  }
+
+  /** The manifest choice of the installed tree of `name`: its saved method, else the fixed order. */
+  private async installedChoice(name: string) {
+    return manifestChoiceFor(await this.savedInstallMethod(name));
   }
 
   /**
@@ -2898,6 +2938,36 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
+   * Check every manifest method rule M1 offers (installMethods.ts): one read-only
+   * `discoverAgentPluginAt` call each, on the staged tree. A method whose manifest fails
+   * validation is rejected with its error (the preview shows it as a warning, and install refuses
+   * it). The generated `skills` method is not checked here: it writes a plugin.json into the tree,
+   * so it runs last. A marketplace entry installs through its folder's manifest in the fixed
+   * order, with no choice (Non-Goal 4), and keeps its own methods.
+   */
+  private async checkManifestMethods(
+    stagedDir: string,
+    source: Pick<AgentPluginGitSource, "url" | "subpath">
+  ): Promise<{ checked: CheckedInstallMethods; discovered: Map<SavedInstallMethod, Discovered> }> {
+    const detected = await detectInstallMethods(stagedDir);
+    const rejected: RejectedInstallMethod[] = [];
+    const discovered = new Map<SavedInstallMethod, Discovered>();
+    for (const method of detected.methods) {
+      const saved = savedMethodOf(method);
+      if (saved === undefined) continue;
+      const read = await discoverAgentPluginAt({
+        pluginDir: stagedDir,
+        scope: "global",
+        shownRoot: shownStagedRoot(source, undefined),
+        choice: { kind: "method", method: saved },
+      });
+      if (read.plugin === null) rejected.push({ method, problem: invalidPluginMessage(read) });
+      else discovered.set(saved, { plugin: read.plugin, diagnostics: read.diagnostics });
+    }
+    return { checked: { ...detected, rejected }, discovered };
+  }
+
+  /**
    * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
    * or marketplace-entry install, then run the exact runtime validation (manifest + component
    * discovery) against the staged clone. Throws user-facing errors for non-plugins. `marketplace`:
@@ -2917,8 +2987,14 @@ export class AgentPluginInstallService {
   }> {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
     // consent receipt hashes.
-    const detected = await detectInstallMethods(stagedDir);
-    const choice = await chooseStagedMethod(stagedDir, detected, request, source, marketplace);
+    const { checked, discovered } =
+      marketplace === undefined
+        ? await this.checkManifestMethods(stagedDir, source)
+        : {
+            checked: { ...(await detectInstallMethods(stagedDir)), rejected: [] },
+            discovered: new Map<SavedInstallMethod, Discovered>(),
+          };
+    const choice = await chooseStagedMethod(stagedDir, checked, request, source, marketplace);
     const method = choice.method;
 
     // The crash-recovery marker name is RESERVED: install/update write a
@@ -2948,43 +3024,30 @@ export class AgentPluginInstallService {
     const generatedWarnings = generatesManifest(method)
       ? await writeGeneratedManifest(stagedDir, method, source, marketplace)
       : [];
-    const { plugin, diagnostics } = await discoverAgentPluginAt({
-      pluginDir: stagedDir,
-      scope: "global",
-      shownRoot: shownStagedRoot(source, marketplace),
-    });
-    if (!plugin) {
-      const reasons = diagnostics.map((d) => d.message);
-      const problem =
-        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
-      // A preview without a method must still reach the "Install as" choice: when the first
-      // method's manifest is invalid (a broken .claude-plugin/plugin.json next to valid skill
-      // folders), preview the next method and name the problem. No file was written: of a
-      // repository's methods only `skills` generates one, and it is always the last method.
-      // A marketplace entry has its own methods (entryInstallMethods) and gets no fallback.
-      const next =
-        marketplace === undefined ? choice.methods[choice.methods.indexOf(method) + 1] : undefined;
-      if (request.mode === "first" && next !== undefined) {
-        assert(!generatesManifest(method), "validateStagedClone: a generated manifest is last");
-        const fallback = await this.validateStagedClone(stagedDir, source, {
-          mode: "exact",
-          method: next,
-        });
-        return {
-          ...fallback,
-          warnings: [`${methodLabel(method)}: ${problem}`, ...fallback.warnings],
-        };
-      }
-      throw new Error(problem);
-    }
+    // A manifest method was read when it was checked. The others (generated, marketplace entry)
+    // read the fixed order, which finds the file that Xum wrote or the entry folder's own manifest.
+    const saved = savedMethodOf(method);
+    const read =
+      (saved !== undefined ? discovered.get(saved) : undefined) ??
+      (await discoverAgentPluginAt({
+        pluginDir: stagedDir,
+        scope: "global",
+        shownRoot: shownStagedRoot(source, marketplace),
+        choice: { kind: "fixed-order" },
+      }));
+    if (read.plugin === null) throw new Error(invalidPluginMessage(read));
     return {
-      plugin,
-      warnings: [...choice.warnings, ...generatedWarnings, ...diagnostics.map((d) => d.message)],
+      plugin: read.plugin,
+      warnings: [
+        ...choice.warnings,
+        ...generatedWarnings,
+        ...read.diagnostics.map((d) => d.message),
+      ],
       method,
       methods: choice.methods,
       skillsCliSkills: await this.acceptedSkillsCliNames(
         stagedDir,
-        detected.skillsRoots,
+        checked.skillsRoots,
         choice.skillsCliSkills
       ),
     };
@@ -3173,9 +3236,12 @@ export class AgentPluginInstallService {
     signInResets?: string[]
   ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
+    // The installed tree is read the way the staged one was (the saved method), so the diff
+    // compares one manifest's components with the same manifest's components.
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
       pluginDir: installedPath,
       scope: "global",
+      choice: await this.installedChoice(name),
     });
     const staged = await this.capabilitySurface(
       stagedPlugin,
@@ -4074,13 +4140,17 @@ export class AgentPluginInstallService {
         marketplaceEntryOf(args.method)
       );
       try {
-        const { plugin } = await this.validateStagedClone(
+        const { plugin, method } = await this.validateStagedClone(
           stagedDir,
           args.source,
           installMethodRequest(args.method),
           marketplace
         );
         const name = plugin.name;
+        // A manifest method is saved, so every later read of this tree loads the manifest the
+        // user reviewed (B3). A generated method (skills, a marketplace entry without a manifest)
+        // is fixed by the plugin.json that Xum wrote, and saves nothing.
+        const installMethod = savedMethodOf(method);
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         // Install records consent for every directive command, so it bounds them like the
         // preview does. A direct API call without the preview's digest would skip that (#6816).
@@ -4157,7 +4227,7 @@ export class AgentPluginInstallService {
           const { envelope, rawEntries } = await this.readRegistryDocument("strict");
           await this.writeRegistry(envelope, [
             ...rawEntries.filter((rawEntry) => this.rawEntryName(rawEntry) !== name),
-            entry,
+            installMethod !== undefined ? { ...entry, installMethod } : entry,
           ]);
         } catch (error) {
           // No partial state: a promote without a registry entry would look
@@ -4252,7 +4322,9 @@ export class AgentPluginInstallService {
           .rm(path.join(targetPath, PROMOTION_MARKER_FILE), { force: true })
           .catch(() => undefined);
         await this.sweepApprovedCopies(entry);
-        log.info(`Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)}`);
+        log.info(
+          `Installed agent plugin '${name}' at ${args.expectedSha.slice(0, 12)} (${methodLabel(method)})`
+        );
         return entry;
       } finally {
         await this.removeDir(stagedDir);
@@ -4682,7 +4754,11 @@ export class AgentPluginInstallService {
     if (currentSha === newSha) {
       return true;
     }
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: targetPath, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: targetPath,
+      scope: "global",
+      choice: manifestChoiceFor(readStoredInstallMethod(rawEntry)),
+    });
     if (!plugin) {
       log.warn("Promoted update tree has an unreadable manifest; keeping the journal", { name });
       return false;
@@ -4884,6 +4960,7 @@ export class AgentPluginInstallService {
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: canonicalPluginDir,
       scope: "global",
+      choice: await this.installedChoice(entry.name),
     });
     if (plugin === null || plugin.name !== entry.name || plugin.rootPath !== canonicalPluginDir)
       throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
@@ -5053,6 +5130,7 @@ export class AgentPluginInstallService {
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
+      choice: await this.installedChoice(name),
     });
     if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
     return { entry, plugin, ...(await loadPluginHooks(plugin)) };
@@ -5532,13 +5610,22 @@ export class AgentPluginInstallService {
     const { rawEntries } = await this.readRegistryDocument("strict");
     const installed = new Set(rawEntries.map((entry) => this.rawEntryName(entry)));
     const urls: string[] = [];
-    for (const dirName of dirs)
-      urls.push(...(await this.pluginTreeServerUrls(dirName, installed.has(dirName))));
+    for (const dirName of dirs) {
+      // Each tree is read the way the plugin loads, through its saved method.
+      const choice = manifestChoiceFor(
+        readStoredInstallMethod(rawEntries.find((entry) => this.rawEntryName(entry) === dirName))
+      );
+      urls.push(...(await this.pluginTreeServerUrls(dirName, installed.has(dirName), choice)));
+    }
     return urls;
   }
 
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
-  private async pluginTreeServerUrls(dirName: string, installed: boolean): Promise<string[]> {
+  private async pluginTreeServerUrls(
+    dirName: string,
+    installed: boolean,
+    choice: ManifestChoice
+  ): Promise<string[]> {
     // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
     // scans them. Skip stray files such as .DS_Store and dangling links: neither loads. Any other
     // stat failure (EACCES, EIO) can hide a tree that loads after a repair: it keeps the record.
@@ -5550,7 +5637,7 @@ export class AgentPluginInstallService {
     if (stat?.isDirectory() !== true) return [];
     // A server this scan cannot read can load later, after a repair, with its old sign-in:
     // the list must be complete before the record goes.
-    const scan = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const scan = await discoverAgentPluginAt({ pluginDir, scope: "global", choice });
     const { diagnostics } = scan;
     const plugin = pluginWithReadableMcp(dirName, scan, installed);
     if (plugin === null) return [];
@@ -6669,7 +6756,12 @@ export class AgentPluginInstallService {
   private async stageUpdate(
     entry: AgentPluginInstallEntry,
     sha: string
-  ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
+  ): Promise<{
+    stagedDir: string;
+    plugin: AgentPluginInfo;
+    warnings: string[];
+    method: AgentPluginInstallMethod;
+  }> {
     // A subpath install tracks the same folder at the new commit; a folder
     // that disappeared upstream fails here, before any swap.
     // A plugin.json that Xum generated is regenerated from the new commit, unless the
@@ -6677,6 +6769,9 @@ export class AgentPluginInstallService {
     // marketplace entry is read again from the marketplace file at the new commit: the staged
     // folder holds only the entry.
     const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
+    // An update never changes the method (B5): the saved one decides, and a commit that does not
+    // fit it is refused.
+    const saved = await this.savedInstallMethod(entry.name);
     const { stagedDir, marketplace } = await this.cloneWithEntry(
       entry.source,
       sha,
@@ -6685,10 +6780,10 @@ export class AgentPluginInstallService {
         : undefined
     );
     try {
-      const { plugin, warnings } = await this.validateStagedClone(
+      const { plugin, warnings, method } = await this.validateStagedClone(
         stagedDir,
         entry.source,
-        { mode: "update", generatedFrom },
+        { mode: "update", generatedFrom, saved },
         marketplace
       );
       if (plugin.name !== entry.name) {
@@ -6698,7 +6793,7 @@ export class AgentPluginInstallService {
           `The plugin renamed itself upstream ('${entry.name}' → '${plugin.name}'). Uninstall and reinstall to adopt the new name.`
         );
       }
-      return { stagedDir, plugin, warnings };
+      return { stagedDir, plugin, warnings, method };
     } catch (error) {
       await this.removeDir(stagedDir);
       throw error;
@@ -6782,7 +6877,11 @@ export class AgentPluginInstallService {
     entry: AgentPluginInstallEntry
   ): Promise<{ changes: AgentPluginCapabilityChange[]; warnings: string[] }> {
     const targetPath = this.targetPathFor(entry.name);
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: targetPath, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: targetPath,
+      scope: "global",
+      choice: await this.installedChoice(entry.name),
+    });
     if (plugin === null || plugin.name !== entry.name)
       throw new Error(`Installed plugin '${entry.name}' is missing or invalid.`);
     const warnings: string[] = [];
@@ -6850,6 +6949,7 @@ export class AgentPluginInstallService {
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: this.targetPathFor(name),
       scope: "global",
+      choice: await this.installedChoice(name),
     });
     if (plugin?.name !== name) return noApprovedCopies();
     const warnings: string[] = [];
@@ -6911,7 +7011,23 @@ export class AgentPluginInstallService {
           warnings: [],
         };
       }
-      const { stagedDir, plugin, warnings } = await this.stageUpdate(entry, resolved.sha);
+      const staged = await this.stageUpdate(entry, resolved.sha).catch((error: unknown) => {
+        // A commit that does not fit the install is an answer, not a failure: the review shows
+        // it with a way out (B5), and nothing is applied.
+        if (!(error instanceof UpdateRefusedError)) throw error;
+        return error;
+      });
+      if (staged instanceof UpdateRefusedError) {
+        return {
+          name: entry.name,
+          fromSha: entry.lockedSha,
+          toSha: resolved.sha,
+          changes: [],
+          warnings: [],
+          refused: staged.message,
+        };
+      }
+      const { stagedDir, plugin, warnings } = staged;
       try {
         const changes = await this.collectCapabilityChanges(
           entry.name,
@@ -6969,7 +7085,7 @@ export class AgentPluginInstallService {
         return entry; // Already current.
       }
 
-      const { stagedDir, plugin } = await this.stageUpdate(entry, targetSha);
+      const { stagedDir, plugin, method } = await this.stageUpdate(entry, targetSha);
       // Sign-outs this update recorded, and whether its tree went live (see the catch below).
       let recordedSignOuts: string[] = [];
       let promoted = false;
@@ -7223,7 +7339,7 @@ export class AgentPluginInstallService {
         });
         await this.sweepApprovedCopies(updated);
         log.info(
-          `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
+          `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)} (${methodLabel(method)})`
         );
         return updated;
       } catch (error) {

@@ -10,7 +10,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { discoverAgentPluginAt } from "./discovery";
+import { discoverAgentPluginAt, discoverAgentPlugins } from "./discovery";
+import { listPluginAgentFiles } from "./agentFiles";
+import { reviewedComponentConsent } from "./testFixtures";
 import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 
@@ -212,18 +214,36 @@ describe("AgentPluginInstallService install methods", () => {
     expect(own.skillsCliSkills).toEqual(["alpha", "beta"]);
   });
 
-  test("a preview without a method skips an invalid Claude manifest and names it", async () => {
+  test("an invalid Claude manifest is not offered: the preview names it, and install refuses it", async () => {
     await write({ ".claude-plugin/plugin.json": "{ not json" });
     await commit("broken claude manifest");
     const preview = await service.preview({ input: remoteDir });
     expect(preview.method).toEqual({ kind: "skills" });
-    expect(preview.methods).toEqual([{ kind: "claude-plugin" }, { kind: "skills" }]);
+    expect(preview.methods).toEqual([{ kind: "skills" }]);
     expect(preview.warnings.some((warning) => warning.startsWith("Claude Code plugin:"))).toBe(
       true
     );
     await expect(
       service.preview({ input: remoteDir, method: { kind: "claude-plugin" } })
     ).rejects.toThrow("Invalid plugin");
+    await expect(
+      service.install({
+        source: preview.source,
+        method: { kind: "claude-plugin" },
+        expectedSha: preview.lockedSha,
+      })
+    ).rejects.toThrow("Invalid plugin");
+    expect(await fsPromises.lstat(installedDir()).catch(() => null)).toBeNull();
+  });
+
+  test("a tree whose only manifest is a schema-less root plugin.json keeps the $schema error", async () => {
+    await fsPromises.rm(path.join(remoteDir, "skills"), { recursive: true });
+    await write({ "plugin.json": JSON.stringify({ name: "acme-skills" }) });
+    await commit("schema-less root only");
+    const failure = await service.preview({ input: remoteDir }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("'$schema' is required");
+    expect((failure as Error).message).not.toContain("No plugin.json");
   });
 
   test("an update regenerates the manifest and reviews a new skill", async () => {
@@ -252,7 +272,11 @@ describe("AgentPluginInstallService install methods", () => {
     expect(await installedManifest()).toMatchObject({
       extensions: { mux: { generatedFrom: { kind: "skills" } } },
     });
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: installedDir(), scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: installedDir(),
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.claudeFallback).toBeUndefined();
     expect(plugin?.agentsDir).toBeUndefined();
   });
@@ -268,15 +292,24 @@ describe("AgentPluginInstallService install methods", () => {
     expect(changes.length).toBeGreaterThan(0);
     const manifest = await installedManifest();
     expect(manifest.extensions).toBeUndefined();
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: installedDir(), scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: installedDir(),
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.hooksPath).toBeDefined();
 
     // Without that plugin.json again, the update names the way out instead of claiming that
-    // the repository has no SKILL.md files.
+    // the repository has no SKILL.md files: the review carries the refusal, with nothing applied.
     await fsPromises.rm(path.join(remoteDir, "plugin.json"));
     await commit("drop own manifest");
-    await expect(service.previewUpdate({ name: "acme-skills" })).rejects.toThrow(
-      "it fits: Skills. Uninstall the plugin and install it again"
+    const refused = await service.previewUpdate({ name: "acme-skills" });
+    expect(refused.changes).toEqual([]);
+    expect(refused.refused).toContain(
+      "Methods that fit this commit: Skills. To switch, uninstall the plugin and install it again."
+    );
+    await expect(service.update({ name: "acme-skills" })).rejects.toThrow(
+      "Methods that fit this commit: Skills."
     );
   });
 
@@ -287,5 +320,326 @@ describe("AgentPluginInstallService install methods", () => {
     await expect(service.preview({ input: remoteDir })).rejects.toThrow(
       "cannot make a plugin name from 'con'"
     );
+  });
+});
+
+/**
+ * egm's layout (google/elephant-goldfish-model at 113a3afc): a schema-less root plugin.json beside
+ * a Codex, a Claude and a Cursor manifest. Every manifest resolves the same 7 skills. The Claude
+ * manifest lists 9 agents and the Cursor one 7.
+ */
+const EGM_SKILLS = [
+  "egm-bootstrap",
+  "egm-brainstorm",
+  "egm-draft",
+  "egm-drift-report",
+  "egm-resolve",
+  "egm-review-loop",
+  "egm-review",
+];
+const EGM_CLAUDE_AGENTS = [
+  "bootstrap_orchestrator",
+  "codebase_details",
+  "comprehension",
+  "design_critic",
+  "implementation_readiness",
+  "structural",
+  "style",
+  "synthesizer",
+  "zoom_out",
+];
+const EGM_CURSOR_AGENTS = EGM_CLAUDE_AGENTS.filter(
+  (id) => id !== "bootstrap_orchestrator" && id !== "synthesizer"
+);
+const egmAgent = (id: string) =>
+  `---\nname: egm-${id}\ndescription: The ${id} reviewer\ntools: [Read, Grep, Glob]\n---\nRead \`\${CLAUDE_PLUGIN_ROOT}/agents/${id}.md\` before reviewing.\n`;
+
+function egmFiles(): Record<string, string> {
+  const base = { name: "egm", version: "0.1.0", description: "Draft specs and review designs." };
+  return {
+    "plugin.json": JSON.stringify(base),
+    ".codex-plugin/plugin.json": JSON.stringify({ ...base, skills: "./skills/" }),
+    ".claude-plugin/plugin.json": JSON.stringify({
+      ...base,
+      agents: EGM_CLAUDE_AGENTS.map((id) => `./.claude-plugin/agents/${id}.md`),
+    }),
+    ".cursor-plugin/plugin.json": JSON.stringify({
+      ...base,
+      skills: "./skills/",
+      agents: "./.cursor-plugin/agents/",
+      rules: "./.cursor-plugin/rules/",
+    }),
+    ".cursor-plugin/rules/egm.mdc": "---\ndescription: egm rule\n---\nBody\n",
+    ...Object.fromEntries(EGM_SKILLS.map((id) => [`skills/${id}/SKILL.md`, skillMd(id)])),
+    ...Object.fromEntries(
+      EGM_CLAUDE_AGENTS.map((id) => [`.claude-plugin/agents/${id}.md`, egmAgent(id)])
+    ),
+    ...Object.fromEntries(
+      EGM_CURSOR_AGENTS.map((id) => [`.cursor-plugin/agents/${id}.md`, egmAgent(id)])
+    ),
+    ...Object.fromEntries(EGM_CLAUDE_AGENTS.map((id) => [`agents/${id}.md`, `Persona ${id}\n`])),
+  };
+}
+
+describe("AgentPluginInstallService method choice (egm layout)", () => {
+  let tmpRoot: string;
+  let xumRoot: string;
+  let remoteDir: string;
+  let service: AgentPluginInstallService;
+  const installedDir = () => path.join(xumRoot, "plugins", "egm");
+  const registryFile = () => path.join(xumRoot, "plugins.json");
+
+  async function write(files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      await fsPromises.mkdir(path.dirname(path.join(remoteDir, relative)), { recursive: true });
+      await fsPromises.writeFile(path.join(remoteDir, relative), content);
+    }
+  }
+
+  async function commit(message: string): Promise<string> {
+    await git(remoteDir, "add", "-A");
+    await git(remoteDir, "commit", "-q", "-m", message);
+    return (await git(remoteDir, "rev-parse", "HEAD")).trim();
+  }
+
+  async function registryRows(): Promise<Array<Record<string, unknown>>> {
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    return doc.plugins;
+  }
+
+  async function rawRow(): Promise<Record<string, unknown>> {
+    const row = (await registryRows()).find((entry) => entry.name === "egm");
+    if (row === undefined) throw new Error("egm has no registry row");
+    return row;
+  }
+
+  async function editRow(change: (row: Record<string, unknown>) => void): Promise<void> {
+    const rows = await registryRows();
+    for (const row of rows) change(row);
+    await fsPromises.writeFile(registryFile(), JSON.stringify({ plugins: rows }));
+  }
+
+  async function installAs(kind: "agent-plugin" | "claude-plugin" | "cursor-plugin") {
+    const preview = await service.preview({ input: remoteDir, method: { kind } });
+    return service.install({
+      source: preview.source,
+      method: preview.method,
+      expectedSha: preview.lockedSha,
+      expectedConsentDigest: preview.consentDigest,
+    });
+  }
+
+  async function updateWithReview(): Promise<string[]> {
+    const review = await service.previewUpdate({ name: "egm" });
+    await service.update({
+      name: "egm",
+      consent: {
+        fromSha: review.fromSha,
+        toSha: review.toSha,
+        reviewed: review.changes.flatMap((change) => change.component ?? []),
+      },
+    });
+    return review.changes.map((change) => change.summary);
+  }
+
+  /** What the install holds, to prove a refused update changed nothing. */
+  async function installedState(): Promise<string> {
+    const manifest = await fsPromises.readFile(
+      path.join(installedDir(), ".claude-plugin", "plugin.json"),
+      "utf8"
+    );
+    return JSON.stringify([await registryRows(), manifest]);
+  }
+
+  beforeEach(async () => {
+    tmpRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-install-egm-"));
+    xumRoot = path.join(tmpRoot, "xum");
+    remoteDir = path.join(tmpRoot, "egm");
+    await fsPromises.mkdir(remoteDir);
+    service = new AgentPluginInstallService(new Config(xumRoot), {});
+    await git(remoteDir, "init", "-q", "-b", "main");
+    await git(remoteDir, "config", "user.email", "test@example.com");
+    await git(remoteDir, "config", "user.name", "Test");
+    await write(egmFiles());
+    await commit("egm layout");
+  });
+
+  afterEach(async () => {
+    await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("the preview offers each manifest, and preselects the first in the fixed order", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methods).toEqual([
+      { kind: "agent-plugin" },
+      { kind: "claude-plugin" },
+      { kind: "cursor-plugin" },
+    ]);
+    // One click keeps installing what Xum installs today: the Codex manifest, with no agents.
+    expect(preview.method).toEqual({ kind: "agent-plugin" });
+    expect(preview.agents).toEqual([]);
+    expect(preview.skills.map((skill) => skill.name)).toEqual([...EGM_SKILLS].sort());
+
+    const claude = await service.preview({ input: remoteDir, method: { kind: "claude-plugin" } });
+    expect(claude.agents).toHaveLength(9);
+    expect(claude.skills).toHaveLength(7);
+    const cursor = await service.preview({ input: remoteDir, method: { kind: "cursor-plugin" } });
+    expect(cursor.agents).toHaveLength(7);
+  });
+
+  test("a root plugin.json with $schema is offered alone, and install refuses another method", async () => {
+    await write({
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+    });
+    await commit("native root");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methods).toEqual([{ kind: "agent-plugin" }]);
+    await expect(
+      service.install({
+        source: preview.source,
+        method: { kind: "claude-plugin" },
+        expectedSha: preview.lockedSha,
+      })
+    ).rejects.toThrow("cannot be installed as Claude Code plugin; it fits: Agent Plugin");
+  });
+
+  test("installing as claude-plugin saves the method, and the plugin loads its manifest and 9 agents", async () => {
+    await installAs("claude-plugin");
+    expect((await rawRow()).installMethod).toBe("claude-plugin");
+
+    // A restart: the container scan reads the registry row.
+    const { plugins } = await discoverAgentPlugins([
+      { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins).toHaveLength(1);
+    expect(plugins[0].claudeFallback).toBe(true);
+    expect(await listPluginAgentFiles(plugins[0].agentsDir)).toHaveLength(9);
+    // Each agent has an accepted consent review.
+    const consent = (await rawRow()).componentConsent as { agents: Record<string, string> };
+    expect(Object.keys(consent.agents).sort()).toEqual(
+      EGM_CLAUDE_AGENTS.map((id) => `${id}`).sort()
+    );
+  });
+
+  test("component review, capability diff, runtime load and hook gate agree on one method's fingerprints", async () => {
+    await installAs("claude-plugin");
+    const consentAtInstall = (await rawRow()).componentConsent as {
+      agents: Record<string, string>;
+      skills: Record<string, string>;
+    };
+    const runtime = await reviewedComponentConsent({
+      pluginDir: installedDir(),
+      method: "claude-plugin",
+    });
+    expect(runtime.agents).toEqual(consentAtInstall.agents);
+    expect(runtime.skills).toEqual(consentAtInstall.skills);
+
+    // The component review reads the installed tree through the saved method: with the agent
+    // records gone it lists the 9 agents, at the fingerprints that the install and the load use.
+    await editRow((row) => {
+      (row.componentConsent as { agents: Record<string, string> }).agents = {};
+    });
+    const review = await service.previewComponentReview({ name: "egm" });
+    const agentRows = review.changes.flatMap((change) =>
+      change.component?.kind === "agents" ? [change.component] : []
+    );
+    expect(Object.fromEntries(agentRows.map((ref) => [ref.name, ref.fingerprint]))).toEqual(
+      runtime.agents
+    );
+    await editRow((row) => {
+      (row.componentConsent as { agents: Record<string, string> }).agents = consentAtInstall.agents;
+    });
+
+    // The update capability diff compares the installed Claude manifest with the staged one: an
+    // unrelated commit shows no change. Read as Codex, the installed tree would lack 9 agents.
+    await write({ "README.md": "more\n" });
+    await commit("readme");
+    expect((await service.previewUpdate({ name: "egm" })).changes).toEqual([]);
+  });
+
+  test("an update whose commit fits the saved method keeps it", async () => {
+    await installAs("claude-plugin");
+    await write({ "README.md": "more\n" });
+    const next = await commit("readme");
+    await updateWithReview();
+    const row = await rawRow();
+    expect(row.installMethod).toBe("claude-plugin");
+    expect(row.lockedSha).toBe(next);
+    const { plugins } = await discoverAgentPlugins([
+      { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins[0].claudeFallback).toBe(true);
+  });
+
+  test("an update is refused, and nothing applied, when the commit lacks or breaks the saved manifest", async () => {
+    await installAs("claude-plugin");
+    const before = await installedState();
+    const sha = (await rawRow()).lockedSha;
+    const switchHint = "To switch, uninstall the plugin and install it again.";
+
+    await fsPromises.rm(path.join(remoteDir, ".claude-plugin"), { recursive: true });
+    await commit("drop the Claude manifest");
+    const gone = await service.previewUpdate({ name: "egm" });
+    expect(gone.changes).toEqual([]);
+    expect(gone.refused).toBe(
+      `.claude-plugin/plugin.json is gone in this commit. Methods that fit this commit: Agent Plugin, Cursor plugin. ${switchHint}`
+    );
+    await expect(service.update({ name: "egm" })).rejects.toThrow(gone.refused);
+
+    await write({ ".claude-plugin/plugin.json": "{ not json" });
+    await commit("break the Claude manifest");
+    const invalid = await service.previewUpdate({ name: "egm" });
+    expect(invalid.refused).toContain("Claude Code plugin: Invalid plugin");
+    expect(invalid.refused).toContain(".claude-plugin/plugin.json");
+    expect(invalid.refused).toContain("Methods that fit this commit: Agent Plugin, Cursor plugin.");
+
+    await write({
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "egm" }),
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+    });
+    await commit("a Xum-native root");
+    const native = await service.previewUpdate({ name: "egm" });
+    expect(native.refused).toContain("takes precedence over .claude-plugin/plugin.json");
+    expect(native.refused).toContain("Methods that fit this commit: Agent Plugin.");
+    await expect(service.update({ name: "egm" })).rejects.toThrow("takes precedence");
+
+    // Nothing fits: the refusal still names the file, and there is nothing to switch to.
+    await git(remoteDir, "rm", "-q", "-r", ".");
+    await write({ "README.md": "nothing\n" });
+    await commit("no plugin left");
+    const nothing = await service.previewUpdate({ name: "egm" });
+    expect(nothing.refused).toBe(
+      ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit."
+    );
+
+    // The commit, the branch tracking and the registry row are unchanged, and the tree stays.
+    expect(await installedState()).toBe(before);
+    expect((await rawRow()).lockedSha).toBe(sha);
+    expect((await rawRow()).source).toMatchObject({ ref: "main", refType: "branch" });
+  });
+
+  test("an install without a saved method keeps updating with the Codex manifest", async () => {
+    await installAs("agent-plugin");
+    // An install from before this change has no field.
+    await editRow((row) => {
+      delete row.installMethod;
+    });
+    await write({ "README.md": "more\n" });
+    await commit("readme");
+    await updateWithReview();
+    const row = await rawRow();
+    expect(row.installMethod).toBeUndefined();
+    const { plugins } = await discoverAgentPlugins([
+      { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins[0].codexFallback).toBe(true);
+
+    // A plugin with only a Codex manifest still updates.
+    await git(remoteDir, "rm", "-q", "-r", "plugin.json", ".claude-plugin", ".cursor-plugin");
+    await commit("Codex only");
+    await updateWithReview();
+    expect((await rawRow()).lockedSha).toBe((await git(remoteDir, "rev-parse", "HEAD")).trim());
   });
 });
