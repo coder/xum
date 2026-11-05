@@ -61,6 +61,8 @@ async function runHelper(options: {
   startupFailed?: string[];
   /** Closing the browser fails after the screenshot and the report were written. */
   closeError?: string;
+  /** Text of a console error and of a page error that the page under test emits. */
+  pageText?: string;
 }): Promise<FakeRun> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-webkit-test-"));
   tempDirs.push(root);
@@ -92,6 +94,10 @@ exports.webkit = {
               seen.url = url;
               save();
               handlers.console?.({ type: () => "error", text: () => "Failed to load resource: " + url });
+              if (${JSON.stringify(options.pageText !== undefined)}) {
+                handlers.console?.({ type: () => "error", text: () => ${JSON.stringify(options.pageText ?? "")} });
+                handlers.pageerror?.({ message: ${JSON.stringify(options.pageText ?? "")} });
+              }
             },
             async waitForFunction() {
               if (${JSON.stringify(options.stuckOn !== undefined)}) {
@@ -184,6 +190,22 @@ describe("webkit-capture.mjs", () => {
     expect(report).toContain("scrollWidth <= innerWidth: false (800 <= 390)");
   });
 
+  test("writes a report without control characters, even from a hostile page", async () => {
+    // ESC and BEL start terminal escape sequences, and the report is printed to the terminal.
+    const hostile = "boom \u001b]52;c;Zm9v\u0007 \u001b[31mred\u001b[0m \u009b31m del\u007f end";
+    const run = await runHelper({ pageText: hostile });
+    expect(run.exitCode, run.stderr).toBe(0);
+    const report = fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
+    expect(report).toContain("console and page errors: 3");
+    expect(report).toContain("boom");
+    expect(report).toContain("end");
+    const controls = [...report].filter((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 0x20 && char !== "\n") || (code >= 0x7f && code <= 0x9f);
+    });
+    expect(controls).toEqual([]);
+  });
+
   test("exits 3 and keeps no evidence when the page shows a failed chunk, as idle does", async () => {
     const run = await runHelper({ chunkFailed: true });
     expect(run.exitCode).toBe(3);
@@ -218,11 +240,13 @@ describe("webkit-capture.mjs", () => {
 
   test("exits 4 with one line when WebKit does not launch, so the caller can try Docker", async () => {
     const run = await runHelper({
-      launchError: `browserType.launch: \n╔═══╗\n║ Host system is missing dependencies to run browsers. ║\n╚═══╝ ${TOKEN}`,
+      launchError: `browserType.launch: \n╔═══╗\n║ Host system is missing dependencies to run browsers. ║\n╚═══╝ ${TOKEN} \u001b]52;c;Zm9v\u0007`,
     });
     expect(run.exitCode).toBe(4);
     expect(run.stderr.trim().split("\n")).toHaveLength(1);
     expect(run.stderr).toContain("Host system is missing dependencies");
+    expect(run.stderr).not.toContain("\u001b");
+    expect(run.stderr).not.toContain("\u0007");
     expectNoToken(run.stderr);
   });
 });

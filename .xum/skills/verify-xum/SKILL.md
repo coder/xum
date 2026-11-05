@@ -238,8 +238,10 @@ After 60 s it exits 1 and names what still shows. It exits 3 on `<name> failed t
 of the page. A failed run leaves no `-webkit` files from an earlier run of the same name. The
 report holds the redacted URL, the engine and its mode, the viewport,
 `document.documentElement.scrollWidth <= innerWidth` with both numbers, and the console and page
-errors. Open the PNG: the width line sees only page-level overflow, not content that paints
-outside its frame inside the page, and the PNG is the 390x844 viewport, not the whole page.
+errors. The helper replaces every control character (ESC and DEL included) in the report and in
+its messages with a space, because the page's console text is printed to your terminal. Open the
+PNG: the width line sees only page-level overflow, not content that paints outside its frame
+inside the page, and the PNG is the 390x844 viewport, not the whole page.
 
 - The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
   that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
@@ -255,20 +257,23 @@ outside its frame inside the page, and the PNG is the 390x844 viewport, not the 
   comment above them). The test fails until the version constant moves, and Docker mode refuses
   while `node_modules` and the constant differ. When neither mode works, the command exits 1 and
   names both fixes.
-- The token reaches the helper on stdin, as it reaches curl in `doctor`. It is in no argv and no
-  environment, and the helper redacts it from every message and from the report. The browser's
-  profile lives in a temporary folder (the container's tmpfs, or the run's `tmp` folder, which
-  cleanup deletes). The host helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so
-  unlike agent-browser no DevTools port and no stream listens, except under WSL, where
-  Playwright opens a debugging port (`--remote-debugging-port=0`).
+- The token reaches the helper on stdin, as it reaches curl in `doctor`, so it is in no command
+  line (see Threat model). It is in no environment either, and the helper redacts it from every
+  message and from the report, as `capture` does. The browser's profile lives in a temporary
+  folder (the container's tmpfs, or the run's `tmp` folder, which cleanup deletes). The host
+  helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so this
+  command adds no DevTools port or stream to the one that the Threat model names for
+  agent-browser, except under WSL, where Playwright opens a debugging port
+  (`--remote-debugging-port=0`).
 - CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
   host, the sandbox's backend and its token included. The container gets the token on stdin only,
   runs one file of this repo from the pinned image as your uid with no capabilities and a
   read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
-  `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`). The command refuses a Docker endpoint that is not a local socket (the token
-  would leave the host), and runs the docker CLI with an empty private config (its `proxies` would
-  otherwise go into the container's environment). Run it only on a host where you are the only
-  local account.
+  `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`).
+  The command refuses a Docker endpoint that is not a local socket (the token would leave the
+  host), and runs the docker CLI with an empty private config (its `proxies` would otherwise go
+  into the container's environment). The single-account CAUTION of the Threat model applies to
+  this command too.
 - Nothing outlives the command except the evidence: the container is removed when it exits and
   stops itself after 180 s at most, and the private Docker config sits in the run's `tmp` folder
   that cleanup deletes. Cleanup redacts the report like every other text file of the evidence.

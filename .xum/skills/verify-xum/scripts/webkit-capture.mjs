@@ -96,6 +96,16 @@ const tokenForms = [
   ]),
 ].filter(Boolean);
 
+// The report is printed to the reader's terminal and its text comes from the page under test. A
+// control character (ESC and BEL start terminal escape sequences, such as an OSC 52 clipboard
+// write) becomes a space: C0, DEL and C1. A loop, not a regex: lint bans control characters there.
+function plain(text) {
+  return Array.from(String(text), (char) => {
+    const code = char.charCodeAt(0);
+    return code < 0x20 || (code >= 0x7f && code <= 0x9f) ? " " : char;
+  }).join("");
+}
+
 function redact(text) {
   let clean = String(text);
   for (const form of tokenForms) clean = clean.split(form).join("<redacted>");
@@ -103,7 +113,8 @@ function redact(text) {
 }
 
 function fail(message, code = 1) {
-  process.stderr.write(`webkit-capture: ${redact(message)}\n`);
+  const lines = redact(message).split("\n").map(plain).join("\n");
+  process.stderr.write(`webkit-capture: ${lines}\n`);
   process.exit(code);
 }
 
@@ -196,7 +207,10 @@ try {
     if (problems.length > MAX_PROBLEM_LINES) {
       lines.push(`... ${problems.length - MAX_PROBLEM_LINES} more`);
     }
-    fs.writeFileSync(staged(outputs[1]), `${redact(lines.join("\n"))}\n`);
+    fs.writeFileSync(
+      staged(outputs[1]),
+      `${lines.map((line) => plain(redact(line))).join("\n")}\n`
+    );
   }
 } finally {
   await browser.close();
