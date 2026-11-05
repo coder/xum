@@ -18,10 +18,13 @@ function blankComments(source: string): string {
   );
 }
 
-// A property name follows `{`, `;` or the `=` or quote that opens a style attribute value. A
-// selector (`.zoom:hover`, `a.zoom::after`), a custom property (`--diagram-zoom:`), a value
-// (`touch-action: pinch-zoom`) and another name (`a_zoom:`) never do. `-webkit-zoom` counts.
-const ZOOM_PROPERTY = /[{;"'=]\s*(?:-[a-z]+-)?zoom\s*:/gi;
+// `zoom` as a whole property name, with an optional vendor prefix (`-webkit-zoom`). The scan lists
+// what a name is NOT: the tail of a longer name (`--diagram-zoom:`, `pinch-zoom`, `a_zoom:`), a
+// class or id selector (`.zoom:hover`, `#zoom:hover`), or text after `(` or `>` (`@media (zoom:`,
+// `<p>zoom: 2</p>`). Everything else counts, so a declaration after `{`, `;`, `}` (CSS nesting), a
+// quote, `=` (an unquoted style attribute) or whitespace is found without listing each boundary.
+// The price is a false match on a tag selector named zoom: no element has that name.
+const ZOOM_PROPERTY = /(?<![-\w.#:(>])(?:-[a-z]+-)?zoom\s*:/gi;
 
 /** The 1-based line of each `zoom` declaration in a CSS or HTML source. */
 export function findZoomDeclarations(source: string): number[] {

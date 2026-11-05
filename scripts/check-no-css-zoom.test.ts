@@ -16,6 +16,12 @@ describe("findZoomDeclarations", () => {
     ["a declaration after a semicolon", ".x { color: red;zoom: 2 }"],
     ["a vendor prefix", ".x { -webkit-zoom: 2; }"],
     ["a nested rule", ".x { .y { zoom: 1 } }"],
+    ["a declaration after a nested rule", ".card { &.compact { color: red } zoom: 2; }"],
+    ["a declaration after a rule in a rule", ".a { .b { color: red }\n  zoom: 2 }"],
+    [
+      "a tag selector named zoom, which no element has",
+      ".a { color: red; }\nzoom:hover { color: blue; }",
+    ],
   ])("finds %s", (_name, source) => {
     expect(findZoomDeclarations(source)).toHaveLength(1);
   });
@@ -27,7 +33,6 @@ describe("findZoomDeclarations", () => {
     ["a class selector", ".zoom:hover { color: red; }"],
     ["a pseudo-element selector", "a.zoom::after { content: ''; }"],
     ["a selector after a rule", ".a { color: red; }\n.zoom:hover { color: blue; }"],
-    ["a tag selector after a rule", ".a { color: red; }\nzoom:hover { color: blue; }"],
     ["a CSS comment", "/* zoom: 1 */ .x { color: red; }"],
     ["a multi-line CSS comment", ".x {\n  /*\n   zoom: 2;\n  */\n  color: red;\n}"],
     ["an HTML comment", '<!-- style="zoom: 2" -->'],
