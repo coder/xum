@@ -59,8 +59,8 @@ These protections matter on a host where you are the only local account too:
   or an IP address as the Host (an IP address cannot be rebound) and refuses every other name,
   also on its WebSocket proxy to the backend.
 - `open` turns off agent-browser's live stream, a WebSocket on `127.0.0.1` that any local account
-  can connect to, and so can a web page on a `localhost`, `127.0.0.1`, `[::1]` or `file://`
-  origin, such as a local HTML file (see Drive).
+  can connect to, and so can a web page on a `localhost`, `127.0.0.1` or `[::1]` origin (see
+  Drive).
 
 These protections matter only when other local accounts exist, and they are not enough there:
 the DevTools port above stays open.
