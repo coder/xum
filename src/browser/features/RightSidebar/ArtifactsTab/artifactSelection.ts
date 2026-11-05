@@ -30,8 +30,8 @@ const EMPTY_MAP: ArtifactSelectionMap = {};
 
 // One global most-recently-used map instead of three keys per workspace: per-workspace keys
 // multiply by every workspace the user ever opened and overflowed the localStorage budget
-// (persistedStateBudget.test.ts). Values written before versions were removed also carry a
-// `version`; it is dropped here and so from storage on the next write.
+// (persistedStateBudget.test.ts). Values from older builds also carry a `version`, which
+// sanitize drops.
 function sanitize(raw: unknown): ArtifactSelection {
   if (typeof raw !== "object" || raw === null) return DEFAULT_SELECTION;
   const value = raw as Partial<Record<keyof ArtifactSelection, unknown>>;

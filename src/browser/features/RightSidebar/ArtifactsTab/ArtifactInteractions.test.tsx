@@ -445,9 +445,6 @@ describe("artifact interactions in the Artifacts panel", () => {
   });
 
   test("a rewritten file waits for the tab's pending write, then loads the saved state", async () => {
-    // The state is per artifact, so the rebuilt frame must start with what the user picked in the
-    // old one. The rebuild reads the server only after this tab's write has landed, so it never
-    // gets a pre-write state.
     let settleWrite: () => void = () => undefined;
     setStateImpl = (state) =>
       new Promise<SetStateResult>((resolve) => {

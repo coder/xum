@@ -53,7 +53,6 @@ describe("shelf routes", () => {
   });
 
   test("a user pin is visible to every workspace of the project, not other projects", async () => {
-    // The pin copies the file as it is now, not as it was when published.
     await fs.writeFile(
       path.join(root, "sessions", "a", "scratch", "artifacts", "chart.html"),
       "<p>v2</p>"

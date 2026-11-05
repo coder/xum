@@ -203,8 +203,7 @@ export async function listArtifacts(
   }
   const records = await listPublishedArtifacts(context, input.workspaceId);
   const publishedPaths = records.map((record) => record.path);
-  // The tab reads a file as the kind the agent published it as, so a listing that shows that
-  // kind changes the tab's read key when only the kind changes.
+  // The tab's read key includes the kind, so a kind-only republish must change the listing.
   const kindByPath = new Map(records.flatMap((r) => (r.kind != null ? [[r.path, r.kind]] : [])));
   const withPublishedKinds = (entries: ArtifactEntry[]) =>
     entries.map((entry) => ({ ...entry, kind: kindByPath.get(entry.path) ?? entry.kind }));
@@ -248,7 +247,6 @@ async function listPublishedArtifacts(
   }
 }
 
-/** The `artifact` tool's kind override for a path; an unreadable record means no override. */
 async function readKindOverride(
   context: ArtifactsContext,
   workspaceId: string,

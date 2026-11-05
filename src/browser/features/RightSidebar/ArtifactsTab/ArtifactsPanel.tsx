@@ -86,7 +86,6 @@ function keepReadResult(prev: ReadState | null, key: string, error: string): Rea
     : { key, result: null, error };
 }
 
-/** What the toolbar points at. */
 type Selection =
   | { scope: "pinned"; path: string; file: PinnedArtifactFile }
   | { scope: "shelf"; path: string; entry: ArtifactShelfEntry }
@@ -443,7 +442,6 @@ export function ArtifactsPanel(props: {
         shelfEntries,
       });
 
-  // What to read and how.
   let readRequest:
     | { key: string; kind: "live"; path: string; modifiedMs: number }
     | { key: string; kind: "pinned"; path: string }
@@ -510,7 +508,7 @@ export function ArtifactsPanel(props: {
         setReadState((prev) => keepReadResult(prev, request.key, getErrorMessage(error)));
       });
     return () => controller.abort();
-    // readKey identifies the request (scope, path, mtime and size): re-read when it changes.
+    // readKey identifies the request: re-read when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, props.workspaceId, readKey, reloadTick, retryTick]);
 
@@ -602,9 +600,8 @@ export function ArtifactsPanel(props: {
     };
   }, [showFullscreen, coversWindow, setAnnotationPick]);
 
-  // Picker order: pinned files first, then artifacts. With groups, other files come after the
-  // artifacts. While the group is collapsed only the selected one stays listed: Radix needs the
-  // selected item mounted to name it in the trigger, and the user must see what is selected.
+  // While "Other files" is collapsed only the selected one stays listed: Radix needs the selected
+  // item mounted to name it in the trigger, and the user must see what is selected.
   const artifactGroupEntries = entryGroups?.published ?? entries;
   const otherFiles = entryGroups?.other ?? [];
   const visibleOtherFiles = otherFilesExpanded
@@ -668,7 +665,6 @@ export function ArtifactsPanel(props: {
       .catch((error: unknown) => setActionError(getErrorMessage(error)));
   };
 
-  // User pin from the pin menu: copies the artifact's current bytes to the shelf.
   const pinToShelf = (scope: ArtifactShelfScope) => {
     if (!api || selected?.scope !== "artifact") return;
     api.artifacts

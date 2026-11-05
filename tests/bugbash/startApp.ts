@@ -534,8 +534,8 @@ lru.onchange = save; ttl.onchange = save; show();
 
 /**
  * A published HTML artifact, so explorers can use window.xum.setState without a model
- * publishing anything (real mode has no agent tools). The record is what the artifact tool
- * writes; its directory keeps the name it had when it held version blobs.
+ * publishing anything (real mode has no agent tools). `artifact-versions` is
+ * ARTIFACT_STORE_DIR_NAME, kept from older builds.
  */
 async function seedPublishedArtifact(
   base: string,

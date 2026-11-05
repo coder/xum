@@ -47,6 +47,7 @@ export const ARTIFACT_INTERACTION_DEDUPE_PREFIX = "artifact-interaction:";
 /** History rows scanned on replay for already-delivered ids (pending records are recent). */
 const REPLAY_HISTORY_SCAN_MESSAGES = 200;
 
+// Records from older builds also hold a `version`, which this schema drops.
 const PendingRecordSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -62,7 +63,6 @@ export type PendingArtifactInteraction = z.infer<typeof PendingRecordSchema>;
 
 // Records are validated one by one (below), so one record this version cannot read (corrupt,
 // or written by another app version) does not discard the user's other confirmed sends.
-// Records written before artifact versions were removed also hold a `version`: the schema drops it.
 const PendingFileSchema = z.object({
   version: z.literal(1),
   pending: z.array(z.unknown()),
@@ -359,7 +359,6 @@ export async function listWorkspacesWithPendingInteractions(
   return found;
 }
 
-// window.xum.setState belongs to the artifact: a republish keeps what the user picked.
 export async function getArtifactInteractionState(
   sessionsDir: string,
   input: { workspaceId: string; path: string }

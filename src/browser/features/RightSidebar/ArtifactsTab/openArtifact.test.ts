@@ -164,7 +164,6 @@ describe("artifact selection storage", () => {
       JSON.stringify({ [WS]: { scope: "artifact", path: "a.md", version: 3 } })
     );
     expect(readArtifactSelection(WS)).toEqual({ scope: "artifact", path: "a.md" });
-    // The next write drops it from storage too.
     writeArtifactSelection(WS, { path: "b.md" });
     expect(readPersistedState<Record<string, unknown>>(ARTIFACTS_SELECTION_KEY, {})[WS]).toEqual({
       scope: "artifact",

@@ -81,7 +81,6 @@ export const createArtifactListTool: ToolFactory = (config) =>
               `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
               abortSignal
             );
-      // Titles of published artifacts (M4).
       const titleByPath = new Map<string, string>();
       if (config.workspaceSessionDir != null) {
         for (const record of await listArtifactRecords(config.workspaceSessionDir)) {

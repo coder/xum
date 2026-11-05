@@ -34,10 +34,7 @@ import { describeArtifact } from "./artifactRecordStore";
 
 type Outcome<T> = { success: true; data: T } | { success: false; error: string };
 
-/**
- * Copy the artifact's current bytes to a shelf scope (agent pin from the artifact tool, or a
- * user pin). Title and kind come from the artifact's record, when it has one.
- */
+/** Copy the artifact's current bytes to a shelf scope (an agent pin or a user pin). */
 export async function pinArtifactToShelf(params: {
   shelfRoot: string;
   projectIdentity: string;

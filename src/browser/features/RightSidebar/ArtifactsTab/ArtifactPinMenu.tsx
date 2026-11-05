@@ -6,9 +6,8 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { ArtifactShelfScope } from "@/common/orpc/schemas/artifacts";
 
 /**
- * Toolbar pin menu (M5c): copies the artifact's current bytes to a shelf. Rendered inline (not
- * through a Radix portal) so it opens in happy-dom tests and inside the panel's fullscreen
- * overlay alike.
+ * Rendered inline (not through a Radix portal) so it opens in happy-dom tests and inside the
+ * panel's fullscreen overlay alike.
  */
 export function ArtifactPinMenu(props: {
   onPin: (scope: ArtifactShelfScope) => void;
@@ -31,7 +30,6 @@ export function ArtifactPinMenu(props: {
     return () => document.removeEventListener("mousedown", handleMouseDown);
   }, [open]);
 
-  // Keyboard users land on the first entry when the list opens.
   useEffect(() => {
     if (!open) return;
     listRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();

@@ -58,7 +58,6 @@ describe("publishArtifact", () => {
     await write("report.md", "two");
     const again = await publish("report.md", { title: "Report 2" });
     expect(again).toMatchObject({ success: true, kind: "markdown", size: 3 });
-    // The title and kind follow the latest publish; an omitted pin keeps the earlier one.
     expect(await recordOf("report.md")).toMatchObject({
       path: "report.md",
       title: "Report 2",
@@ -195,7 +194,6 @@ describe("interrupted publish", () => {
     const before = await recordOf("doc.md");
     const controller = new AbortController();
     const mkdirOriginal = fs.mkdir;
-    // The write path creates the artifact dir right before writing the record.
     const abortingMkdir = (async (...args: Parameters<typeof fs.mkdir>) => {
       controller.abort();
       return mkdirOriginal(...args);

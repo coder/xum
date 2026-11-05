@@ -23,11 +23,6 @@ import {
 } from "./artifactRecordStore";
 
 /**
- * Publish operations over the artifacts location abstraction: the artifact tool's path
- * resolution, the publish itself, and the post-compaction index.
- */
-
-/**
  * The artifacts location a tool sees, from its exported env: XUM_SCRATCH_DIR is set exactly where
  * the workspace has a scratch dir; host-visible runtimes read the host fs, SSH/Docker the Runtime.
  * A devcontainer writes its host-mounted dir from inside the container, so the host reads it only
@@ -91,10 +86,7 @@ export function resolveArtifactToolPath(
   return segments.join("/");
 }
 
-/**
- * What publishing and shelf pins need from a file: its size, and its bytes when it is under the
- * read cap. Runtime failures throw.
- */
+/** `bytes` is null when the file is over the read cap. Runtime failures throw. */
 export async function probeArtifactFile(
   location: AvailableArtifactsLocation,
   relPath: string,
@@ -124,10 +116,6 @@ export type PublishOutcome =
   | { success: true; record: ArtifactRecord; kind: ArtifactKind; size: number }
   | { success: false; error: string };
 
-/**
- * Record that the file was published. The file stays where it is: this only confirms it exists
- * (and reports its size) before the record is written or updated.
- */
 export async function publishArtifact(params: {
   sessionDir: string;
   location: AvailableArtifactsLocation;

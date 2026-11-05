@@ -16,16 +16,8 @@ import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks"
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
-/**
- * Host store of per-artifact records (Artifacts M4): `<sessionDir>/<ARTIFACT_STORE_DIR_NAME>/
- * <artifactId>/{record.json, state.json}`. A record exists once the `artifact` tool published
- * the path. The file itself stays where the agent wrote it: the record holds only what the file
- * cannot (title, kind override, shelf pin, publish time).
- *
- * The directory keeps the name it had when it held version blobs: renaming it would orphan every
- * saved `window.xum.setState`. An `index.json` and `v<N>` blobs from those builds are not read.
- */
-
+// Named for the version blobs older builds kept here: renaming it would orphan every saved
+// `window.xum.setState`. Their `index.json` and `v<N>` blobs are not read.
 export const ARTIFACT_STORE_DIR_NAME = "artifact-versions";
 const RECORD_FILE_NAME = "record.json";
 const RECORD_LOCK_FILE_NAME = "record.lock";
@@ -101,7 +93,6 @@ export async function readArtifactRecord(
   }
 }
 
-/** How the shelf and interactions name an artifact: its record's title and kind, else its file's. */
 export async function describeArtifact(
   sessionDir: string,
   relPath: string
@@ -130,7 +121,6 @@ export interface RecordArtifactPublishParams {
 
 export const ARTIFACT_PUBLISH_INTERRUPTED = "Publish was interrupted";
 
-/** Create the path's record, or replace it with this publish's title, kind and time. */
 export async function recordArtifactPublish(
   params: RecordArtifactPublishParams
 ): Promise<ArtifactRecord> {
@@ -201,11 +191,7 @@ export async function listArtifactRecords(sessionDir: string): Promise<ArtifactR
   return records.filter((record): record is ArtifactRecord => record != null);
 }
 
-/**
- * `window.xum.setState` storage: one `state.json` per artifact, latest write wins, so a
- * republish keeps what the user picked (like Claude's per-artifact storage). Older builds wrote
- * `v<N>.state.json` per version; those files are left on disk and not read.
- */
+/** Older builds also wrote `v<N>.state.json` per version: those files stay on disk, unread. */
 function artifactStatePath(sessionDir: string, artifactId: string): string {
   return path.join(artifactDir(sessionDir, artifactId), "state.json");
 }

@@ -744,7 +744,6 @@ describe("ArtifactsPanel", () => {
       const poll = setIntervalSpy.mock.calls.find((call) => call[1] === 3000)?.[0];
       if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
 
-      // The agent publishes the same bytes with kind: markdown.
       fake.state.listing = {
         available: true,
         dir: "/scratch/artifacts",
@@ -974,7 +973,6 @@ describe("ArtifactsPanel", () => {
         dir: "/scratch/artifacts",
         entries: [entry("a.txt", 2, "text")],
         truncated: false,
-        // A publish record outlives its file, but the tab lists live files only.
         publishedPaths: ["gone.md"],
       },
       { "a.txt": textFile("a.txt", "text", "alpha") }
@@ -1540,7 +1538,6 @@ describe("ArtifactsPanel", () => {
     );
     const view = renderPanel();
     expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
-    // img/a.png waits under the collapsed group, so K has nowhere to go.
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
     expect(readArtifactSelection("ws-artifacts").path).toBe("report.md");
   });

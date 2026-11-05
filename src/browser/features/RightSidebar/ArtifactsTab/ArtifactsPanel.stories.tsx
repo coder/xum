@@ -564,7 +564,6 @@ export const SendStripAndAnnotate: Story = {
   },
 };
 
-/** Toolbar pin menu, open: the shelves the shown artifact can be copied to. */
 function renderPinMenu() {
   const workspaceId = `${WORKSPACE_ID}-pin-menu`;
   writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md" });

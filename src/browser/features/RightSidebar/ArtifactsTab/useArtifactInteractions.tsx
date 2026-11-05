@@ -32,10 +32,8 @@ let connectedClient: APIClient | null = null;
 
 const OFFLINE_SEND_ERROR = "Xum is reconnecting. Send again once it is back.";
 
-/** The artifact on screen. */
 export interface ArtifactInteractionTarget {
   path: string;
-  /** The panel's read key: a rewrite of the file rebuilds the frame, which needs the newest state. */
   readKey?: string | null;
   /** Bumped when the panel remounts the viewer (Reload): the new frame needs the newest state. */
   reloadTick?: number;

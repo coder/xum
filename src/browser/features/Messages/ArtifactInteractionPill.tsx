@@ -7,7 +7,7 @@ const pillClassName =
 
 /**
  * "from artifact" label on a user message sent from an artifact (M5b design C). Shown only for
- * backend-written metadata. Clicking opens the artifact's live file.
+ * backend-written metadata. Clicking opens the artifact.
  */
 export function ArtifactInteractionPill(props: {
   interaction: ArtifactInteractionMetadata;

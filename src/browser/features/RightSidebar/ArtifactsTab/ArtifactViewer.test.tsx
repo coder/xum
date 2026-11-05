@@ -46,7 +46,6 @@ let readRequests: string[] = [];
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
-      // No pinned files: these tests cover the live renderers.
       getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
