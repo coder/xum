@@ -42,7 +42,16 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
   });
 
   test("keeps content that merely contains invisible characters or emoji", () => {
-    for (const visible of ["a\u200b", "\u2764\ufe0f", "\u00e9"]) {
+    // ZWJ, variation selectors and skin-tone modifiers are default-ignorables or
+    // marks, so a predicate over classes must not mistake the sequence for one.
+    for (const visible of [
+      "a\u200b",
+      "\u2764\ufe0f",
+      "\u00e9",
+      "\ud83d\udc4d\udffb",
+      "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc66",
+      "\ud83c\udde6\ud83c\uddfa",
+    ]) {
       const displayed = rows([{ type: "text", text: visible }, FAILED_BASH]);
       expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
     }
