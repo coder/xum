@@ -1,7 +1,7 @@
 // Opens one page of a verify-xum run in Playwright WebKit at a phone viewport and writes a
 // screenshot and a short report. Run by `verify-xum.sh webkit-capture` (see ../SKILL.md), on the
 // host or in the pinned Playwright image. Playwright talks to WebKit over a pipe, so no DevTools
-// port listens (under WSL it opens one).
+// port listens (only its `webkit-wsl` channel opens one, which this helper never selects).
 //
 // The page under test is untrusted: it can be a hostile branch, and what this process prints lands
 // in a terminal and a transcript. So nothing the page controls is read back as text. The checks

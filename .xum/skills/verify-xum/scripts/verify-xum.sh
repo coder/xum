@@ -795,11 +795,19 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
   printf %s "$token" | timeout -k 10 240 env -i "${host_env[@]}" node "$WEBKIT_HELPER" --mode host "$@"
 }
 
-# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8).
-# Docker echoes a mount path in some errors, and a control character in it could drive your terminal.
+# True when $1 holds a C0 or C1 control character or DEL (a C1 character is 0xC2 0x80-0x9F in UTF-8),
+# or a raw byte 0x80-0x9F that is not part of a UTF-8 sequence (a terminal that is not in UTF-8 mode
+# reads 0x9B as CSI). Docker echoes a mount path in some errors, and a control character in it could
+# drive your terminal.
 has_control_char() { # has_control_char <string>
-  local LC_ALL=C
-  [[ $1 == *[[:cntrl:]]* || $1 == *$'\xc2'[$'\x80'-$'\x9f']* ]]
+  local LC_ALL=C text=$1 cont=[$'\x80'-$'\xbf']
+  [[ $text == *[[:cntrl:]]* || $text == *$'\xc2'[$'\x80'-$'\x9f']* ]] && return 0
+  # Each valid sequence becomes an ASCII "x", so its neighbours cannot join into a new sequence.
+  # Overlong forms and surrogates pass: only the 0x80-0x9F bytes that remain matter here.
+  text=${text//[$'\xc2'-$'\xdf']$cont/x}
+  text=${text//[$'\xe0'-$'\xef']$cont$cont/x}
+  text=${text//[$'\xf0'-$'\xf4']$cont$cont$cont/x}
+  [[ $text == *[$'\x80'-$'\x9f']* ]]
 }
 
 # The helper in the pinned image. Trust boundary: --network host lets the container reach every
@@ -823,8 +831,15 @@ webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args..
   # `proxies` of its config into every container's environment. A remote endpoint is refused:
   # --network host would name another machine's network and the token would travel to it.
   endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) || endpoint=
+  if has_control_char "$endpoint"; then
+    WEBKIT_DOCKER_REASON="the Docker endpoint has a control character (not printed: it could drive your terminal)"
+    return 125
+  fi
   [[ $endpoint == unix:///?* ]] || { WEBKIT_DOCKER_REASON="the Docker endpoint '${endpoint:-unknown}' is not a local socket"; return 125; }
   installed=$(node -p 'require(process.argv[1]).version' "$CHECKOUT/node_modules/playwright-core/package.json" 2>/dev/null) || installed=
+  if has_control_char "$installed"; then
+    installed="a version with a control character (not printed: it could drive your terminal)"
+  fi
   if [[ $installed != "$WEBKIT_IMAGE_PLAYWRIGHT_CORE" ]]; then
     WEBKIT_DOCKER_REASON="node_modules holds playwright-core ${installed:-none}, the image carries ${WEBKIT_IMAGE_PLAYWRIGHT_CORE}: run bun install, or bump WEBKIT_IMAGE in verify-xum.sh"
     return 125

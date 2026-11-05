@@ -180,6 +180,11 @@ function controlCharacters(text: string): string[] {
   });
 }
 
+/** Text of a process's output, which must be valid UTF-8: a raw 0x80-0x9F byte would be a C1 control that `controlCharacters` cannot see once it is decoded. */
+function strictUtf8(bytes: Uint8Array): string {
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
 const readReport = (run: FakeRun) =>
   fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
 
@@ -270,10 +275,50 @@ describe("webkit-capture.mjs", () => {
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
   });
 
-  test("writes to stderr in one place, which redacts and strips", () => {
-    // fail() and say() are the only writers: a message that skips them would skip `safe()` too.
-    const writes = fs.readFileSync(HELPER, "utf8").match(/process\.stderr\.write\(/g) ?? [];
-    expect(writes).toHaveLength(1);
+  test("reaches the terminal in one place, say(), and nothing else writes to stdout or stderr", () => {
+    // fail() goes through say(). Any other way out (console.*, process.stdout.write, fs.writeSync(2, ...))
+    // would skip safe(). Comments are dropped first: the header names stdout and stderr.
+    const code = fs.readFileSync(HELPER, "utf8").replace(/^\s*\/\/.*$/gm, "");
+    const sinks =
+      /\bconsole\s*[.[]|\bstd(?:out|err)\b|\bwriteSync\b|\bwriteFileSync\s*\(\s*[12]\b|\/dev\/(?:std|fd)/g;
+    const sayBody = /\nfunction say\(message\) \{[\s\S]*?\n\}\n/.exec(code)?.[0] ?? "";
+    expect(sayBody).toContain("process.stderr.write(");
+    expect(code.match(sinks)).toEqual(["stderr"]);
+  });
+
+  test("say() redacts the token and strips control characters from any text it is given", () => {
+    // The helper only passes say() fixed text, so no run of the helper reaches this with hostile
+    // input. This runs say() and the functions it calls, cut out of the helper's source.
+    const source = fs.readFileSync(HELPER, "utf8");
+    const part =
+      /const token = fs\.readFileSync\(0[\s\S]*?\nfunction say\(message\) \{[\s\S]*?\n\}\n/.exec(
+        source
+      )?.[0];
+    expect(part, "say() is not in the helper").toBeDefined();
+    // OSC 52 writes the terminal's clipboard. BEL ends it. C1 CSI, DEL and the token in all three of
+    // its forms (and a token= query) must not reach stderr either.
+    const hostile = [
+      "boom \u001b]52;c;Zm9v\u0007 \u009b31m del\u007f end",
+      `${TOKEN} ${encodeURIComponent(TOKEN)} ${new URLSearchParams({ t: TOKEN }).toString().slice(2)}`,
+      "?token=other-secret",
+    ].join(" ");
+    const result = spawnSync(
+      "node",
+      [
+        "--input-type=module",
+        "-e",
+        `import * as fs from "node:fs";\n${part}\nsay(${JSON.stringify(hostile)});`,
+      ],
+      { input: TOKEN, env: { PATH: process.env.PATH ?? "" } }
+    );
+    const stderr = strictUtf8(result.stderr);
+    expect(result.status, stderr).toBe(0);
+    expect(stderr).toContain("boom ");
+    expect(stderr).toContain("?token=<redacted>");
+    expect(controlCharacters(stderr)).toEqual([]);
+    expect(stderr.trimEnd().split("\n")).toHaveLength(1);
+    expectNoToken(stderr);
+    expect(stderr).not.toContain("other-secret");
   });
 
   test("prints and writes no text that a hostile page controls, and counts its errors", async () => {
@@ -387,7 +432,9 @@ describe("the state check that webkit-capture.mjs runs in the browser", () => {
 
 describe("verify-xum.sh webkit-capture arguments", () => {
   const ESC = String.fromCharCode(0x1b);
+  const BEL = String.fromCharCode(0x07);
   const C1_CSI = String.fromCharCode(0x9b);
+  const script = fs.readFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), "utf8");
 
   /** A scratch git repo that holds a copy of the real script (it finds its checkout from its own location). */
   function scratchCheckout(root: string, dirName: string) {
@@ -398,9 +445,9 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     expect(git("init", "-q").status).toBe(0);
     // The script refuses a git dir that group or others can write, whatever the caller's umask.
     fs.chmodSync(path.join(repo, ".git"), 0o755);
-    const script = path.join(repo, "verify-xum.sh");
-    fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), script);
-    return { repo, script };
+    const scriptCopy = path.join(repo, "verify-xum.sh");
+    fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), scriptCopy);
+    return { repo, script: scriptCopy };
   }
 
   const newRoot = () => {
@@ -408,6 +455,17 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     tempDirs.push(root);
     return root;
   };
+
+  // bash $'...' quoting of raw bytes, so that a value keeps its control characters.
+  const quoteBytes = (bytes: Uint8Array) =>
+    `$'${[...bytes]
+      .map((byte) =>
+        byte < 0x20 || byte > 0x7e || byte === 0x5c || byte === 0x27
+          ? `\\x${byte.toString(16).padStart(2, "0")}`
+          : String.fromCharCode(byte)
+      )
+      .join("")}'`;
+  const quote = (value: string) => quoteBytes(Buffer.from(value, "utf8"));
 
   /**
    * Runs the script's argument checks. They run before it reads a run, so no sandbox is needed:
@@ -422,6 +480,86 @@ describe("verify-xum.sh webkit-capture arguments", () => {
       encoding: "utf8",
     });
     return { status: result.status, stderr: result.stderr };
+  }
+
+  /**
+   * Runs `webkit-capture` in Docker mode in a scratch checkout and a run that load_run accepts. A
+   * stub `docker` records the subcommands it is called with, and prints `endpoint` for
+   * `docker context inspect`. `playwrightVersion` replaces the checkout's node_modules with a fake
+   * playwright-core of that version.
+   */
+  function runDockerMode(options: {
+    checkoutName?: string;
+    endpoint?: string;
+    playwrightVersion?: string;
+  }) {
+    const root = newRoot();
+    const { repo, script } = scratchCheckout(root, options.checkoutName ?? "repo");
+    const home = path.join(root, "home");
+    const run = path.join(home, "run1");
+    fs.mkdirSync(path.join(run, "evidence"), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(run, "tmp"), { mode: 0o700 });
+    fs.chmodSync(home, 0o700);
+    fs.chmodSync(run, 0o700);
+    if (options.playwrightVersion === undefined) {
+      fs.symlinkSync(
+        path.join(import.meta.dir, "../node_modules"),
+        path.join(repo, "node_modules")
+      );
+    } else {
+      // The script asks the checkout's vite for the folder it serves, so the fake keeps that one.
+      const playwright = path.join(repo, "node_modules/playwright-core");
+      fs.mkdirSync(playwright, { recursive: true });
+      fs.symlinkSync(
+        path.join(import.meta.dir, "../node_modules/vite"),
+        path.join(repo, "node_modules/vite")
+      );
+      fs.writeFileSync(
+        path.join(playwright, "package.json"),
+        JSON.stringify({ name: "playwright-core", version: options.playwrightVersion })
+      );
+    }
+    fs.writeFileSync(
+      path.join(run, "state.env"),
+      [
+        ["VERIFY_XUM_RUN_ID", "run1"],
+        ["VERIFY_XUM_RUN", run],
+        ["VERIFY_XUM_CHECKOUT", repo],
+        ["VERIFY_XUM_ROOT", path.join(run, "tmp/root")],
+        ["VERIFY_XUM_BACKEND", "http://127.0.0.1:9"],
+        ["VERIFY_XUM_URL", "http://127.0.0.1:9"],
+        ["VERIFY_XUM_EVIDENCE", path.join(run, "evidence")],
+      ]
+        .map(([name, value]) => `export ${name}=${quote(value)}`)
+        .join("\n")
+    );
+    const bin = path.join(root, "bin");
+    fs.mkdirSync(bin);
+    const calls = path.join(root, "docker-calls");
+    const endpoint = quote(options.endpoint ?? "unix:///var/run/docker.sock");
+    fs.writeFileSync(
+      path.join(bin, "docker"),
+      `#!/bin/bash\necho "$1 $2" >> "${calls}"\nif [ "$1 $2" = "context inspect" ]; then printf %s ${endpoint}; exit 0; fi\nexit 1\n`,
+      { mode: 0o755 }
+    );
+    const result = spawnSync(
+      "bash",
+      [script, "webkit-capture", "/workspace/x", "chat/reply", run],
+      {
+        cwd: root,
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          HOME: root,
+          VERIFY_XUM_HOME: home,
+          VERIFY_XUM_WEBKIT: "docker",
+        },
+      }
+    );
+    const stderr = strictUtf8(result.stderr);
+    const dockerCalls = fs.existsSync(calls)
+      ? fs.readFileSync(calls, "utf8").trimEnd().split("\n")
+      : [];
+    return { status: result.status, stderr, dockerCalls };
   }
 
   test("refuses a name with no <feature>/ folder, which Docker would mount as all the evidence", () => {
@@ -443,72 +581,103 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     expect(controlCharacters(result.stderr)).toEqual([]);
   });
 
+  test("refuses a path with a lone raw 0x9B byte, which a terminal outside UTF-8 mode reads as CSI", () => {
+    const root = newRoot();
+    const { repo, script } = scratchCheckout(root, "repo");
+    // The byte cannot go through a JS string argument, which node encodes as UTF-8: bash builds it.
+    const result = spawnSync(
+      "bash",
+      ["-c", String.raw`exec bash "$0" webkit-capture $'/workspace/x\x9b' chat/reply`, script],
+      {
+        cwd: repo,
+        env: { PATH: process.env.PATH ?? "", HOME: root, VERIFY_XUM_HOME: path.join(root, "home") },
+      }
+    );
+    const stderr = strictUtf8(result.stderr);
+    expect(result.status, stderr).toBe(1);
+    expect(stderr).toContain("PATH must not hold a control character");
+  });
+
+  describe("has_control_char", () => {
+    const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(script)?.[0];
+    const refuses = (...bytes: number[]) => {
+      expect(body, "has_control_char is not in verify-xum.sh").toBeDefined();
+      const result = spawnSync("bash", [
+        "-c",
+        `${body}\nhas_control_char ${quoteBytes(Buffer.from([0x2f, ...bytes, 0x78]))}`,
+      ]);
+      expect(result.status, strictUtf8(result.stderr)).toBeOneOf([0, 1]);
+      return result.status === 0;
+    };
+
+    test.each([
+      ["a lone raw 0x9B", [0x9b]],
+      ["a lone raw 0x90 (DCS)", [0x90]],
+      ["a lone raw 0x9D (OSC)", [0x9d]],
+      ["a raw 0x9B after a complete two-byte character", [0xc3, 0xa9, 0x9b]],
+      [
+        "a raw 0x9B after the start of a three-byte character that another character cut short",
+        [0xe2, 0xc3, 0x9b, 0x82, 0x9b],
+      ],
+      ["a C1 CSI encoded in UTF-8", [0xc2, 0x9b]],
+      ["ESC", [0x1b]],
+      ["DEL", [0x7f]],
+    ])("refuses %s", (_label, bytes) => {
+      expect(refuses(...bytes)).toBe(true);
+    });
+
+    test.each([
+      ["a two-byte character whose second byte is 0x9B", [0xc3, 0x9b]],
+      ["a three-byte character whose last byte is 0x9B", [0xe2, 0x82, 0x9b]],
+      ["a four-byte character whose last byte is 0x9B", [0xf0, 0x9f, 0x98, 0x9b]],
+      ["a lone raw 0xA0, which is no control character", [0xa0]],
+      ["plain ASCII", [0x61]],
+    ])("accepts %s", (_label, bytes) => {
+      expect(refuses(...bytes)).toBe(false);
+    });
+  });
+
   test.each([
     ["ESC", ESC],
     ["a C1 CSI", C1_CSI],
   ])(
     "does not hand Docker a checkout path with %s in it, and prints no such path",
     (_label, control) => {
-      const root = newRoot();
-      const { repo, script } = scratchCheckout(root, `repo${control}x`);
-      // A run that load_run accepts, and a docker that would record that it was called.
-      const home = path.join(root, "home");
-      const run = path.join(home, "run1");
-      fs.mkdirSync(path.join(run, "evidence"), { recursive: true, mode: 0o700 });
-      fs.mkdirSync(path.join(run, "tmp"), { mode: 0o700 });
-      fs.chmodSync(home, 0o700);
-      fs.chmodSync(run, 0o700);
-      fs.symlinkSync(
-        path.join(import.meta.dir, "../node_modules"),
-        path.join(repo, "node_modules")
-      );
-      // bash $'...' quoting of the raw UTF-8 bytes, so that the folder name keeps its control character.
-      const quote = (value: string) =>
-        `$'${[...Buffer.from(value, "utf8")]
-          .map((byte) =>
-            byte < 0x20 || byte > 0x7e || byte === 0x5c || byte === 0x27
-              ? `\\x${byte.toString(16).padStart(2, "0")}`
-              : String.fromCharCode(byte)
-          )
-          .join("")}'`;
-      fs.writeFileSync(
-        path.join(run, "state.env"),
-        [
-          ["VERIFY_XUM_RUN_ID", "run1"],
-          ["VERIFY_XUM_RUN", run],
-          ["VERIFY_XUM_CHECKOUT", repo],
-          ["VERIFY_XUM_ROOT", path.join(run, "tmp/root")],
-          ["VERIFY_XUM_BACKEND", "http://127.0.0.1:9"],
-          ["VERIFY_XUM_URL", "http://127.0.0.1:9"],
-          ["VERIFY_XUM_EVIDENCE", path.join(run, "evidence")],
-        ]
-          .map(([name, value]) => `export ${name}=${quote(value)}`)
-          .join("\n")
-      );
-      const bin = path.join(root, "bin");
-      fs.mkdirSync(bin);
-      const called = path.join(root, "docker-called");
-      fs.writeFileSync(path.join(bin, "docker"), `#!/bin/sh\ntouch "${called}"\nexit 1\n`, {
-        mode: 0o755,
-      });
-      const result = spawnSync(
-        "bash",
-        [script, "webkit-capture", "/workspace/x", "chat/reply", run],
-        {
-          cwd: root,
-          env: {
-            PATH: `${bin}:${process.env.PATH ?? ""}`,
-            HOME: root,
-            VERIFY_XUM_HOME: home,
-            VERIFY_XUM_WEBKIT: "docker",
-          },
-          encoding: "utf8",
-        }
-      );
+      const result = runDockerMode({ checkoutName: `repo${control}x` });
       expect(result.status, result.stderr).toBe(1);
       expect(result.stderr).toContain("has a control character in its path");
       expect(controlCharacters(result.stderr)).toEqual([]);
-      expect(fs.existsSync(called)).toBe(false);
+      expect(result.dockerCalls).toEqual([]);
     }
   );
+
+  test.each([
+    ["a local socket with ESC", `unix:///var/run/docker.sock${ESC}]52;c;Zm9v${BEL}`],
+    ["a remote host with ESC", `tcp://docker.example:2375${ESC}]52;c;Zm9v${BEL}`],
+    ["a local socket with a C1 CSI", `unix:///var/run/docker.sock${C1_CSI}31m`],
+  ])("prints no control character of a Docker endpoint that is %s", (_label, endpoint) => {
+    const result = runDockerMode({ endpoint });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("the Docker endpoint has a control character");
+    expect(controlCharacters(result.stderr)).toEqual([]);
+    expect(result.stderr).not.toContain("Zm9v");
+    expect(result.dockerCalls).toEqual(["context inspect"]);
+  });
+
+  test("names the playwright-core version of node_modules when it is not the image's", () => {
+    const result = runDockerMode({ playwrightVersion: "1.0.0" });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain("node_modules holds playwright-core 1.0.0,");
+  });
+
+  test("prints no control character of that version", () => {
+    const result = runDockerMode({ playwrightVersion: `1.0.0${ESC}]52;c;Zm9v${BEL}` });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain(
+      "node_modules holds playwright-core a version with a control character"
+    );
+    expect(controlCharacters(result.stderr)).toEqual([]);
+    expect(result.stderr).not.toContain("Zm9v");
+    expect(result.dockerCalls).toEqual(["context inspect"]);
+  });
 });
