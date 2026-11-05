@@ -18,7 +18,7 @@ afterEach(() => {
   cleanupDom?.();
 });
 
-function previewOf(agents: string[], readonlyAgents: string[]): AgentPluginInstallPreview {
+function previewOf(overrides: Partial<AgentPluginInstallPreview>): AgentPluginInstallPreview {
   return {
     source: {
       type: "git",
@@ -33,8 +33,8 @@ function previewOf(agents: string[], readonlyAgents: string[]): AgentPluginInsta
     manifest: { name: "egm" },
     skills: [],
     mcpServers: [],
-    agents,
-    readonlyAgents,
+    agents: [],
+    readonlyAgents: [],
     workflows: [],
     slashCommands: [],
     reviewedComponents: [],
@@ -44,6 +44,7 @@ function previewOf(agents: string[], readonlyAgents: string[]): AgentPluginInsta
     warnings: [],
     targetPath: "~/.mux/plugins/egm",
     consentDigest: "c".repeat(64),
+    ...overrides,
   };
 }
 
@@ -65,17 +66,61 @@ async function openPreview(preview: AgentPluginInstallPreview) {
 
 test("the install preview marks only read-only agents with the shell note", async () => {
   const view = await openPreview(
-    previewOf(["design_critic.md", "synthesizer.md"], ["design_critic.md"])
+    previewOf({
+      agents: ["design_critic.md", "synthesizer.md"],
+      readonlyAgents: ["design_critic.md"],
+    })
   );
 
   view.getByText("Agents (2)");
   const notes = view.getAllByText(/edit tools removed, shell still available/);
   expect(notes).toHaveLength(1);
   expect(notes[0]?.previousElementSibling?.textContent).toBe("design_critic.md");
+  // The names are separated, and the note stays with its agent.
+  expect(notes[0]?.parentElement?.textContent).toStartWith(
+    "design_critic.md (edit tools removed, shell still available), synthesizer.md"
+  );
 });
 
-test("a preview without agents shows no agent section", async () => {
-  const view = await openPreview(previewOf([], []));
+test("a preview with nothing to activate shows no component section", async () => {
+  const view = await openPreview(previewOf({}));
 
-  expect(view.queryByText(/^Agents \(/)).toBeNull();
+  for (const heading of [
+    /^Agents \(/,
+    /^Workflows \(/,
+    /^Slash commands \(/,
+    /^Files \(/,
+    /^Hooks$/,
+  ]) {
+    expect(view.queryByText(heading)).toBeNull();
+  }
+});
+
+test("a preview with one of each component discloses each one", async () => {
+  const view = await openPreview(
+    previewOf({
+      agents: ["reviewer.md"],
+      workflows: ["run.js"],
+      slashCommands: [{ name: "ship", description: "Ship it" }, { name: "plain" }],
+      hook: { path: "hooks.js", toolGrants: ["bash"] },
+      fileChanges: [{ summary: "file hooks/stop.sh added", after: "echo stop\n" }],
+    })
+  );
+
+  view.getByText("Agents (1)");
+  view.getByText("Workflows (1)");
+  view.getByText("Slash commands (2)");
+  view.getByText("Files (1)");
+  view.getByText("Hooks");
+  // A command with a description shows it, and one without shows only its name.
+  expect(view.getByText("/ship").parentElement?.textContent).toBe("/ship — Ship it");
+  expect(view.getByText("/plain").parentElement?.textContent).toBe("/plain");
+  view.getByText(/for: bash/);
+});
+
+test("a hook that sees no tools says so", async () => {
+  const view = await openPreview(previewOf({ hook: { path: "hooks.js", toolGrants: [] } }));
+
+  view.getByText(/\(no tool visibility granted\)/);
+  expect(view.queryByText(/for: /)).toBeNull();
 });
