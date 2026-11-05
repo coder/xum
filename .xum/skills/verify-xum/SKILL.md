@@ -229,8 +229,8 @@ outside its frame inside the page, and the PNG is the 390x844 viewport, not the 
 - CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
   host, the sandbox's backend and its token included. The container gets the token on stdin only,
   runs one file of this repo from the pinned image as your uid with no capabilities and a
-  read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the step's
-  evidence folder. The command refuses a Docker endpoint that is not a local socket (the token
+  read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the
+  `<feature>` evidence folder of the step (the command refuses a name without a `<feature>/`). The command refuses a Docker endpoint that is not a local socket (the token
   would leave the host), and runs the docker CLI with an empty private config (its `proxies` would
   otherwise go into the container's environment). Run it only on a host where you are the only
   local account.

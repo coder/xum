@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { spawnSync } from "child_process";
 
 import { Window } from "happy-dom";
 
@@ -275,5 +276,42 @@ describe("the page checks that webkit-capture.mjs runs in the browser", () => {
         `<div class="mermaid-container"><svg><text>${MERMAID_PENDING_TEXT}</text></svg></div>`
       )
     ).toEqual([]);
+  });
+});
+
+describe("verify-xum.sh webkit-capture NAME", () => {
+  /**
+   * Runs a copy of the real script in a scratch git repo (the script finds its checkout from its own
+   * location). Its argument checks run before it reads a run, so no sandbox is needed: with a valid
+   * name it stops at "no run at".
+   */
+  function runCapture(name: string) {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-name-test-"));
+    tempDirs.push(repo);
+    const git = (...args: string[]) =>
+      spawnSync("git", args, { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: repo } });
+    expect(git("init", "-q").status).toBe(0);
+    // The script refuses a git dir that group or others can write, whatever the caller's umask.
+    fs.chmodSync(path.join(repo, ".git"), 0o755);
+    const script = path.join(repo, "verify-xum.sh");
+    fs.copyFileSync(path.join(SKILL_SCRIPTS, "verify-xum.sh"), script);
+    const result = spawnSync("bash", [script, "webkit-capture", "/workspace/x", name], {
+      cwd: repo,
+      env: { PATH: process.env.PATH ?? "", HOME: repo, VERIFY_XUM_HOME: path.join(repo, "home") },
+      encoding: "utf8",
+    });
+    return { status: result.status, stderr: result.stderr };
+  }
+
+  test("refuses a name with no <feature>/ folder, which Docker would mount as all the evidence", () => {
+    const result = runCapture("reply");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("<feature>/<step>");
+  });
+
+  test("accepts <feature>/<step>, and gets as far as reading the run", () => {
+    const result = runCapture("chat/reply");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("no run at");
   });
 });

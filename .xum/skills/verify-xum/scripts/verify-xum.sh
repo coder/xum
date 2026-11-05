@@ -799,7 +799,7 @@ webkit_on_host() { # webkit_on_host <token> <helper args...>
 # loopback port of this host, the sandbox's backend and its token included. It gets the token on
 # stdin only, runs one file of this repo from a digest-pinned image as your uid with no
 # capabilities and a read-only root, and sees only node_modules (read-only), that file (read-only)
-# and the step's evidence folder. Returns 125 with WEBKIT_DOCKER_REASON set (the caller declares
+# and the step's <feature> evidence folder. Returns 125 with WEBKIT_DOCKER_REASON set (the caller declares
 # it) when Docker cannot run it: the code docker itself uses for that.
 webkit_in_docker() { # webkit_in_docker <token> <evidence folder> <helper args...>
   local token=$1 out_dir=$2 endpoint installed config docker_cli rc=0
@@ -856,6 +856,8 @@ cmd_webkit_capture() {
   [[ $path == /* ]] || die "webkit-capture PATH must start with / (for example /workspace/<id>)"
   [[ $mode == auto || $mode == host || $mode == docker ]] || die "VERIFY_XUM_WEBKIT must be auto, host or docker"
   require_evidence_name "$name"
+  # Docker mounts the folder of the name's last slash, so a name with no folder would mount every file of the evidence.
+  [[ $name == */* ]] || die "webkit-capture NAME must look like <feature>/<step>, lowercase (the container writes into the <feature> folder)"
   load_run "${3:-}"
   require_path_on_run_origin "$path"
   need node timeout
