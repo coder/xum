@@ -128,8 +128,9 @@ cleanup find the group even when the launcher was killed. Until then the group h
 lock, so a second launch waits for it. Launch also stops at once when the sandbox copied a
 `config.json` (the recipes assume default preferences), when the sandbox's `Allowed hosts:` line
 does not read `loopback only`, when Vite or the backend listens on an address that is not
-loopback, `ss` fails or, once it answers, `ss` shows no socket for it (see Threat model), and when
-the backend crashes after its rebuild (nodemon then waits for a file change that never comes).
+loopback, `ss` fails or, once it answers, `ss` shows no socket for it (see Threat model), when the
+backend has no auth token (see Doctor), and when the backend crashes after its rebuild (nodemon
+then waits for a file change that never comes).
 
 ## Doctor
 
@@ -143,10 +144,12 @@ Every check line must read `ok`. A `note` line only informs. It checks that the 
 lives and carries the run's id (`VERIFY_XUM_SERVER_OF` in its env), the checkout's newest-run link
 names the run, the backend pid in the sandbox `server.lock` and the app port belong to the group,
 `/health` answers, `/version` reports the launch commit, and the backend env has `XUM_MOCK_AI=1`.
-The backend always has an auth token: launch runs make under `env -i`, which drops
-`XUM_DEV_SERVER_NO_AUTH`. (A checkout from before #7904 starts it without one, and the skill works
-the same.) Doctor and launch read the token from `server.lock` and send it to curl on stdin, never
-in argv.
+The backend always has an auth token: launch refuses a backend whose `server.lock` has none.
+Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
+the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
+names that line and says to remove it. (A checkout from before #7904 starts the backend without a
+token, so launch refuses it too.) Doctor and launch read the token from `server.lock` and send it
+to curl on stdin, never in argv.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive

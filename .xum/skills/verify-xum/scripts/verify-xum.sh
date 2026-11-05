@@ -445,7 +445,7 @@ refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what lis
   [[ -n $addrs || ${3-} != ready ]] || die "ss shows nothing listening on $2's port $1, so launch cannot check that only loopback reaches it"
   while read -r addr; do
     [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
-      || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets XUM_VITE_HOST or XUM_BACKEND_HOST: remove that line."
+      || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets its host (XUM_VITE_HOST, MUX_VITE_HOST, VITE_HOST, XUM_BACKEND_HOST, MUX_BACKEND_HOST or BACKEND_HOST): remove that line."
   done <<<"$addrs"
 }
 
@@ -568,7 +568,13 @@ cmd_launch() {
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  [[ -z $token ]] || (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
+  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
+  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
+  # a token any local account, and a web page that rebinds its DNS name to this machine, can
+  # call its API.
+  [[ -n $token ]] \
+    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
+  (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
 
   seed
   write_state

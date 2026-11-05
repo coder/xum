@@ -5,8 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 // verify-xum's launch must refuse a sandbox that a checkout's .env file (Bun loads it into
-// scripts/dev-server-sandbox.ts) opened beyond loopback: extra allowed Host headers, or Vite or
-// the backend listening on every interface. Each test runs the real verify-xum.sh in a throwaway
+// scripts/dev-server-sandbox.ts) opened beyond loopback: extra allowed Host headers, Vite or the
+// backend listening on every interface, or a backend without an auth token. Each test runs the real verify-xum.sh in a throwaway
 // git repo. A stub `make` stands in for `make dev-server-sandbox`: it prints the sandbox's banner
 // and serves a fake backend and Vite, so launch gets as far as the checks under test.
 const SKILL_SCRIPT = ".xum/skills/verify-xum/scripts/verify-xum.sh";
@@ -16,6 +16,9 @@ interface Fake {
   allowedHosts: string;
   viteHost: string;
   backendHost: string;
+  // The token the fake backend records in server.lock. Empty: none, as with
+  // XUM_DEV_SERVER_NO_AUTH=1.
+  token: string;
 }
 
 // Runs as `make -C <checkout> dev-server-sandbox ...` in the launch's own process group, so its
@@ -42,7 +45,9 @@ const listen = (host, handler) =>
   const stamp = Date.now();
   fs.mkdirSync(path.join(checkout, "dist"), { recursive: true });
   fs.writeFileSync(path.join(checkout, "dist/.main-build-complete"), String(stamp));
-  fs.writeFileSync(path.join(root, "server.lock"), JSON.stringify({ startedAt: new Date(stamp + 1).toISOString() }));
+  const lock = { startedAt: new Date(stamp + 1).toISOString() };
+  if (fake.token) lock.token = fake.token;
+  fs.writeFileSync(path.join(root, "server.lock"), JSON.stringify(lock));
   console.log("  XUM_ROOT:       " + root);
   console.log("  Seed config:     (none)");
   console.log("  Backend:         http://127.0.0.1:" + backendPort);
@@ -152,6 +157,7 @@ const loopback: Fake = {
   allowedHosts: "loopback only",
   viteHost: "127.0.0.1",
   backendHost: "127.0.0.1",
+  token: "fake-token",
 };
 
 test.skipIf(!isLinux)(
@@ -239,6 +245,20 @@ test.skipIf(!isLinux)(
 );
 
 test.skipIf(!isLinux)(
+  "launch refuses a backend without an auth token",
+  () => {
+    const r = launch({ ...loopback, token: "" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(
+      "the backend has no auth token, so any local account can control it"
+    );
+    expect(r.stderr).toContain("XUM_DEV_SERVER_NO_AUTH=1");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+test.skipIf(!isLinux)(
   "a loopback-only sandbox passes both checks",
   () => {
     // The fake backend has no API, so launch fails later, at the seed's first API call.
@@ -246,6 +266,7 @@ test.skipIf(!isLinux)(
     expect(r.status).not.toBe(0);
     expect(r.stderr).not.toContain("besides loopback");
     expect(r.stderr).not.toContain("not only on loopback");
+    expect(r.stderr).not.toContain("no auth token");
     // curl -f's error for the seed's first API call (readiness asked only for /health).
     expect(r.stderr).toContain("returned error: 404");
     expect(r.left).toBe(0);
