@@ -4482,12 +4482,29 @@ describe("WorkspaceMcpOverridesService", () => {
     const realNow = Date.now;
     const realLink = fsPromisesModule.link;
     let skewMs = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
     const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
-    const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation((existing, target) => {
-      if (String(target).includes(lockDir)) {
-        skewMs += 2_000;
+    // Key derivation also takes real time; deriving again under the locks must
+    // not be cut short because acquiring them used up the waiting budget.
+    const realRealpath = fsPromisesModule.realpath;
+    const realpathSpy = spyOn(fsPromisesModule, "realpath").mockImplementation((async (
+      target: string
+    ) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return realRealpath(target);
+    }) as typeof fsPromisesModule.realpath);
+    const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation(async (existing, target) => {
+      if (!String(target).includes(lockDir)) {
+        return realLink(existing, target);
       }
-      return realLink(existing, target);
+      skewMs += 2_000;
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        return await realLink(existing, target);
+      } finally {
+        inFlight--;
+      }
     });
     let failures: Array<{ workspaceId: string; error: unknown }>;
     try {
@@ -4497,10 +4514,13 @@ describe("WorkspaceMcpOverridesService", () => {
       );
     } finally {
       nowSpy.mockRestore();
+      realpathSpy.mockRestore();
       linkSpy.mockRestore();
     }
 
     expect(failures.map((failure) => String(failure.error))).toEqual([]);
+    // One at a time, 7,550 lock files took 70 s on Node; many at once, 4.6 s.
+    expect(maxInFlight).toBeGreaterThan(1);
     const after = jsoncParse(
       await fs.readFile(path.join(holder.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
     ) as Record<string, unknown>;
