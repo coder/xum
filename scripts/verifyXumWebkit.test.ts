@@ -3,6 +3,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { Window } from "happy-dom";
+
 import { MERMAID_PENDING_TEXT } from "../src/browser/features/Messages/MermaidPendingFrame";
 
 const SKILL_SCRIPTS = path.join(import.meta.dir, "../.xum/skills/verify-xum/scripts");
@@ -56,6 +58,8 @@ async function runHelper(options: {
   stuckOn?: string[];
   /** The page settled on one of AppLoader's startup failures. */
   startupFailed?: string[];
+  /** Closing the browser fails after the screenshot and the report were written. */
+  closeError?: string;
 }): Promise<FakeRun> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "verify-xum-webkit-test-"));
   tempDirs.push(root);
@@ -73,7 +77,9 @@ exports.webkit = {
     if (${JSON.stringify(options.launchError ?? null)}) throw new Error(${JSON.stringify(options.launchError ?? "")});
     return {
       version: () => "27.2",
-      close: async () => {},
+      close: async () => {
+        if (${JSON.stringify(options.closeError ?? null)}) throw new Error(${JSON.stringify(options.closeError ?? "")});
+      },
       async newContext(contextOptions) {
         seen.contextOptions = contextOptions;
         save();
@@ -158,6 +164,10 @@ describe("webkit-capture.mjs", () => {
     // The page got the token, so the app signs in; the evidence never holds it.
     expect(new URL(run.seen.url ?? "").searchParams.get("token")).toBe(TOKEN);
     expect(run.seen.contextOptions).toMatchObject({ isMobile: true, hasTouch: true });
+    expect(fs.readdirSync(run.evidenceDir).sort()).toEqual([
+      "reply-webkit.png",
+      "reply-webkit.txt",
+    ]);
     expect(fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.png"), "utf8")).toBe("png");
     const report = fs.readFileSync(path.join(run.evidenceDir, "reply-webkit.txt"), "utf8");
     expect(report).toContain("console and page errors: 1");
@@ -194,6 +204,12 @@ describe("webkit-capture.mjs", () => {
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
   });
 
+  test("keeps no evidence when closing the browser fails after the files were written", async () => {
+    const run = await runHelper({ closeError: "browser.close: target closed" });
+    expect(run.exitCode).not.toBe(0);
+    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+  });
+
   test("waits for Mermaid's own placeholder, which no CSS transition or busy flag shows", () => {
     // `idle`'s test reads a page that still says "Rendering diagram..." as settled.
     expect(fs.readFileSync(HELPER, "utf8")).toContain(JSON.stringify(MERMAID_PENDING_TEXT));
@@ -207,5 +223,51 @@ describe("webkit-capture.mjs", () => {
     expect(run.stderr.trim().split("\n")).toHaveLength(1);
     expect(run.stderr).toContain("Host system is missing dependencies");
     expectNoToken(run.stderr);
+  });
+});
+
+describe("the page checks that webkit-capture.mjs runs in the browser", () => {
+  const source = fs.readFileSync(HELPER, "utf8");
+  /** The in-page expression behind `const <name> = \`...\`;`, with its one interpolation filled in. */
+  function pageCheck(name: string): (html: string) => string[] {
+    const match = new RegExp(`const ${name} = \`([\\s\\S]*?)\`;\\n`).exec(source);
+    expect(match, `${name} is not in the helper`).not.toBeNull();
+    const expression = (match?.[1] ?? "").replace(
+      "${JSON.stringify(MERMAID_PENDING_TEXT)}",
+      JSON.stringify(MERMAID_PENDING_TEXT)
+    );
+    return (html) => {
+      const window = new Window();
+      window.document.body.innerHTML = html;
+      return window.eval(expression) as string[];
+    };
+  }
+  const dialog = (id: string, title: string) =>
+    `<div role="dialog" aria-labelledby="${id}"><h2 id="${id}">${title}</h2></div>`;
+
+  test("see the startup failures by element, and not the SSH prompt or a transcript's words", () => {
+    const failed = pageCheck("STARTUP_FAILED_JS");
+    expect(failed('<div class="boot-loader" role="alert"></div>')).toEqual([
+      "the startup connection error",
+    ]);
+    expect(failed(dialog("t", "Authentication Required"))).toEqual(["the authentication prompt"]);
+    expect(failed(dialog("t", "SSH Authentication Required"))).toEqual([]);
+    expect(failed("<p>Authentication Required, Unable to connect to the Xum backend.</p>")).toEqual(
+      []
+    );
+  });
+
+  test("see content that is still loading by element, and not a transcript's words", () => {
+    const loading = pageCheck("STILL_LOADING_JS");
+    expect(loading('<div class="boot-loader" role="status" aria-busy="true"></div>')).toEqual([
+      "the loading screen",
+    ]);
+    expect(loading(`<div class="mermaid-container"> ${MERMAID_PENDING_TEXT} </div>`)).toEqual([
+      "a Mermaid diagram that is still rendering",
+    ]);
+    expect(loading('<div class="mermaid-container"><svg><text>Done</text></svg></div>')).toEqual(
+      []
+    );
+    expect(loading(`<p>Loading Xum</p><p>${MERMAID_PENDING_TEXT}</p>`)).toEqual([]);
   });
 });

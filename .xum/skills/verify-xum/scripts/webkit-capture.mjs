@@ -38,8 +38,11 @@ const STILL_LOADING_JS = `(() => {
 const STARTUP_FAILED_JS = `(() => {
   const failed = [];
   if (document.querySelector('.boot-loader[role="alert"]')) failed.push("the startup connection error");
-  const prompt = [...document.querySelectorAll('[role="dialog"]')].some((dialog) =>
-    dialog.textContent.includes("Authentication Required")
+  // Exact, through aria-labelledby: SshPromptDialog's "SSH Authentication Required" is another dialog.
+  const prompt = [...document.querySelectorAll('[role="dialog"]')].some(
+    (dialog) =>
+      document.getElementById(dialog.getAttribute("aria-labelledby") ?? "")?.textContent.trim() ===
+      "Authentication Required"
   );
   if (prompt) failed.push("the authentication prompt");
   return failed;
@@ -69,6 +72,18 @@ for (const name of ["checkout", "base", "path", "out", "mode", "settled-js", "ch
 }
 // The report goes next to the screenshot: a name that does not end in .png would overwrite it.
 if (!args.out.endsWith(".png")) throw new Error("--out must end in .png");
+const outputs = [args.out, args.out.replace(/\.png$/, ".txt")];
+const staged = (file) => `${file}.tmp`;
+// Both files are written under staged names and renamed together once everything has worked. Any
+// earlier exit removes them, so a failed run never leaves a file that reads as its result.
+let committed = false;
+process.on("exit", () => {
+  if (committed) return;
+  for (const file of outputs) {
+    fs.rmSync(file, { force: true });
+    fs.rmSync(staged(file), { force: true });
+  }
+});
 
 const token = fs.readFileSync(0, "utf8").replace(/\r?\n$/, "");
 const tokenForms = [
@@ -165,7 +180,7 @@ try {
       scrollWidth: document.documentElement.scrollWidth,
       innerWidth: window.innerWidth,
     }));
-    await page.screenshot({ path: args.out });
+    await page.screenshot({ path: staged(outputs[0]), type: "png" });
 
     const fits = widths.scrollWidth <= widths.innerWidth;
     const lines = [
@@ -179,9 +194,13 @@ try {
     if (problems.length > MAX_PROBLEM_LINES) {
       lines.push(`... ${problems.length - MAX_PROBLEM_LINES} more`);
     }
-    fs.writeFileSync(args.out.replace(/\.png$/, ".txt"), `${redact(lines.join("\n"))}\n`);
+    fs.writeFileSync(staged(outputs[1]), `${redact(lines.join("\n"))}\n`);
   }
 } finally {
   await browser.close();
+}
+if (exitCode === 0) {
+  for (const file of outputs) fs.renameSync(staged(file), file);
+  committed = true;
 }
 process.exit(exitCode);

@@ -854,8 +854,9 @@ cmd_webkit_capture() {
   [[ -d $VERIFY_XUM_RUN/tmp ]] || die "the run was cleaned up ($VERIFY_XUM_RUN/tmp is gone)"
   base="$VERIFY_XUM_EVIDENCE/$name-webkit"
   mkdir -p "$(dirname "$base")"
-  # A failed capture must not leave the last one's files behind as if they were its result.
-  rm -f "$base.png" "$base.txt"
+  # A failed capture must not leave the last one's files behind as if they were its result. The
+  # .tmp files are the helper's staged names, left only by a helper that was killed.
+  rm -f "$base".{png,txt}{,.tmp}
   token=$(run_token)
   local helper_args=(--checkout "$CHECKOUT" --base "$VERIFY_XUM_URL" --path "$path" --out "$base.png"
     --settled-js "$SETTLED_OR_CHUNK_FAILED_JS" --chunk-failed-js "$CHUNK_LOAD_FAILED_JS")
