@@ -591,24 +591,28 @@ describe("verify-xum.sh webkit-capture arguments", () => {
 
   describe("has_control_char", () => {
     const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(scriptSource)?.[0];
-    // Each string goes to bash on stdin, split at NUL. The function sets its own locale, so the
-    // caller's must make no difference. A locale that the host lacks falls back to C.
+    // Each string goes to bash on stdin, split at NUL. Bash reads them in the C locale: in a UTF-8
+    // locale, bash 5.2's `read` drops some malformed records. Only the call to the function runs in
+    // each locale, because the caller's locale must make no difference. A locale that the host lacks
+    // falls back to C.
     const refusals = (cases: number[][]) => {
       expect(body, "has_control_char is not in verify-xum.sh").toBeDefined();
       const input = Buffer.concat(cases.flatMap((bytes) => [Buffer.from(bytes), Buffer.from([0])]));
-      const loop = `while IFS= read -r -d '' s; do if has_control_char "$s"; then echo 1; else echo 0; fi; done`;
+      const loop = `while IFS= read -r -d '' s; do if LC_ALL="$CALLER_LOCALE" has_control_char "$s"; then echo 1; else echo 0; fi; done`;
       const [inC, ...others] = ["C", "C.UTF-8", "en_US.UTF-8"].map((locale) => {
         const result = spawnSync("bash", ["-c", `${body}\n${loop}`], {
           input,
-          env: { PATH: process.env.PATH ?? "", LC_ALL: locale },
+          env: { PATH: process.env.PATH ?? "", LC_ALL: "C", CALLER_LOCALE: locale },
           maxBuffer: 1 << 24,
         });
         expect(result.status, strictUtf8(result.stderr)).toBe(0);
-        return result.stdout
+        const answers = result.stdout
           .toString("utf8")
           .trim()
           .split("\n")
           .map((line) => line === "1");
+        expect(answers).toHaveLength(cases.length);
+        return answers;
       });
       for (const inLocale of others) expect(inLocale).toEqual(inC);
       return inC;
