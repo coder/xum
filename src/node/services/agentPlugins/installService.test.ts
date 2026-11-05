@@ -4667,6 +4667,21 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     }, 20_000);
 
+    test("an uninstall whose sign-out fails leaves the URL pending for the next pass", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      spyOn(oauth, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      const record = await fsPromises.readFile(
+        path.join(muxRoot, "plugin-sign-outs-pending.json"),
+        "utf8"
+      );
+      expect(JSON.parse(record)).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
     test("an uninstall that fails keeps the sign-in and records no sign-out", async () => {
       const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
         docsUrl,
