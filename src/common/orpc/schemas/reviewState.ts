@@ -11,8 +11,8 @@ const ArtifactAnnotationAnchorSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+// Not strict: notes saved before versions were removed also carry `version`; it is dropped on load.
 const ArtifactAnnotationRefSchema = z.object({
-  version: z.number(),
   anchor: ArtifactAnnotationAnchorSchema,
 });
 
