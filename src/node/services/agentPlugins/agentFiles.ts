@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { AgentIdSchema } from "@/common/schemas/ids";
+import { isToolEnabledByConfigs } from "@/common/utils/agentTools";
 import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
@@ -120,7 +121,12 @@ async function readAgentDefinition(
       byteSize: stat.size,
       plugin: { agentId },
     });
-    return { frontmatter: parsed.frontmatter, readonly: parsed.mappedReadonly };
+    // A `disallowedTools: Bash` list leaves a read-only agent no shell to disclose.
+    const keepsShell = isToolEnabledByConfigs("bash", [
+      { add: [".*"] },
+      parsed.frontmatter.tools ?? {},
+    ]);
+    return { frontmatter: parsed.frontmatter, readonly: parsed.mappedReadonly && keepsShell };
   } catch {
     return undefined;
   }

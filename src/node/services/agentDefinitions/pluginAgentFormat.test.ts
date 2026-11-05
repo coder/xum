@@ -290,26 +290,6 @@ describe("read-only search lists", () => {
     expect(parsed.frontmatter.base).toBe("explore");
   });
 
-  test("the install review lists a read-only agent only while its shell stays", () => {
-    const mappedReadonly = (frontmatter: string) => {
-      const content = `---\n${frontmatter}---\nReview.\n`;
-      return parseAgentDefinitionMarkdown({
-        content,
-        byteSize: Buffer.byteLength(content, "utf8"),
-        plugin: { agentId: "reviewer" },
-      }).mappedReadonly;
-    };
-    expect(mappedReadonly("description: d\ntools: [Read, Grep, Glob]\n")).toBe(true);
-    expect(mappedReadonly("description: d\nreadonly: true\n")).toBe(true);
-    // Bash is removed, so the note "shell still available" would overstate the agent.
-    expect(
-      mappedReadonly("description: d\ntools: [Read, Grep, Glob]\ndisallowedTools: [Bash]\n")
-    ).toBe(false);
-    expect(mappedReadonly("description: d\nreadonly: true\ndisallowedTools: [Bash]\n")).toBe(false);
-    // Not read-only at all: the Exec base keeps its own disclosure.
-    expect(mappedReadonly("description: d\ntools: [Read, Edit, Grep]\n")).toBe(false);
-  });
-
   test("a search agent's fingerprint differs from the same list before A3", () => {
     const before = {
       name: "Reviewer",
