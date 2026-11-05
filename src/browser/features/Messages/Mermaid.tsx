@@ -11,7 +11,12 @@ import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
 import { MERMAID_MAX_ATTRIBUTE_NESTING } from "@/constants/mermaid";
-import { diagramPixelSize, NARROW_DIAGRAM_WIDTH, type RenderedDiagram } from "./mermaidDiagramBox";
+import {
+  diagramPixelSize,
+  NARROW_DIAGRAM_WIDTH,
+  type DiagramFrame,
+  type RenderedDiagram,
+} from "./mermaidDiagramBox";
 import {
   MERMAID_BUTTON_HEIGHT,
   MERMAID_BUTTON_INSET,
@@ -653,8 +658,9 @@ async function renderMermaidSvg(
 }
 
 /** The stylesheet sizes the <svg> from these two variables (transcript-content.css). */
-function diagramBoxStyle(box: { width: number; height: number } | null): CSSProperties {
-  if (!box) return {};
+function diagramBoxStyle(diagram: RenderedDiagram | null, frame: DiagramFrame): CSSProperties {
+  if (!diagram) return {};
+  const box = diagramPixelSize(diagram, frame);
   return {
     ["--diagram-width" as string]: `${box.width}px`,
     ["--diagram-height" as string]: `${box.height}px`,
@@ -805,7 +811,6 @@ function useViewportHeight(): number {
 const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => {
   const { containerRef, rendered } = useDiagramSvg(props.chart, props.idPrefix);
   const viewportHeight = useViewportHeight();
-  const box = rendered ? diagramPixelSize(rendered, { kind: "dialog", viewportHeight }) : null;
   return (
     <div
       ref={containerRef}
@@ -816,7 +821,7 @@ const DialogDiagram: React.FC<{ chart: string; idPrefix: string }> = (props) => 
         borderRadius: "8px",
         minWidth: "80vw",
         minHeight: "60vh",
-        ...diagramBoxStyle(box),
+        ...diagramBoxStyle(rendered, { kind: "dialog", viewportHeight }),
       }}
       // SECURITY AUDIT: rendered.svg only holds sanitizeMermaidSvg() output.
       dangerouslySetInnerHTML={{ __html: rendered?.svg ?? "" }}
@@ -890,9 +895,6 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   // doesn't expand from a short placeholder to a full diagram after debounce/parse/render.
   const displaySvg = svg;
   const showPendingPlaceholder = !displaySvg;
-  const box = renderedDiagram
-    ? diagramPixelSize(renderedDiagram, { kind: "inline", containerWidth, zoom: diagramZoom })
-    : null;
 
   return (
     <>
@@ -932,7 +934,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           }}
           style={{
             ...MERMAID_CONTAINER_STYLE,
-            ...diagramBoxStyle(box),
+            ...diagramBoxStyle(renderedDiagram, {
+              kind: "inline",
+              containerWidth,
+              zoom: diagramZoom,
+            }),
             ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
