@@ -67,7 +67,7 @@ The motivating plugin is egm ([google/elephant-goldfish-model](https://github.co
 1. **Changing egm.** This design changes only Xum.
 2. **Running Claude-format hooks.** Xum lists them and runs none today. The preview says so. Running them needs a mapping from Claude tool names to Xum tools, which is a separate design.
 3. **`${CURSOR_PLUGIN_ROOT}` in agent bodies.** egm's Cursor agents take their root from the task text, so egm does not need it.
-4. **Method choice outside managed git installs.** Marketplace entries install through the manifest of their entry folder, as today, with no choice. A marketplace-entry install writes no `installMethod` and keeps the fixed order. Unmanaged plugins in `~/.agents/plugins` and project plugins keep the fixed order.
+4. **Method choice outside managed git installs.** Marketplace entries install through their entry folder, as today. A `claude-marketplace` install, which writes a generated `plugin.json` for an entry folder without a manifest, writes no `installMethod` and keeps the fixed order. An entry folder with its own manifest, which includes every Cursor marketplace entry (`installMethods.ts:11-13`), installs like a subfolder install and saves that manifest's method. Unmanaged plugins in `~/.agents/plugins` and project plugins keep the fixed order.
 5. **Changing the method in place.** There is no "change method" action on an installed plugin, and updates never change the method (Alternative K).
 6. **Honoring `omitClaudeMd`.** Xum does not honor `omitClaudeMd` and still sends project instructions to these agents.
 7. **Native read-only search tools.** Goal 7 uses bash. Adding grep and glob tools to Xum is a separate design.
@@ -205,7 +205,7 @@ The container scan already reads the registry before it discovers each plugin (`
 
 #### B3. The saved method
 
-- **Field.** The registry row gains an optional `installMethod`: `agent-plugin`, `claude-plugin` or `cursor-plugin`. Xum writes it when the user installs a repository with a manifest method. A marketplace-entry install writes no `installMethod` and keeps the fixed order (Non-Goal 4). Generated methods keep `generatedFrom`: their method is fixed by the file Xum wrote, and older builds already read that marker.
+- **Field.** The registry row gains an optional `installMethod`: `agent-plugin`, `claude-plugin` or `cursor-plugin`. Xum writes it when the user installs a repository or a subfolder with a manifest method. An entry folder with its own manifest, which includes every Cursor marketplace entry (`installMethods.ts:11-13`), installs like a subfolder install and saves that manifest's method. A `claude-marketplace` install, which writes a generated `plugin.json` for an entry folder without a manifest, writes no `installMethod` and keeps the fixed order (Non-Goal 4). Generated methods keep `generatedFrom`: their method is fixed by the file Xum wrote, and older builds already read that marker.
 - **Tolerant parse.** Xum reads the field from the raw row with its own parser, `readStoredInstallMethod`, not with the row schema. The row schema strips unknown keys (`agentPluginInstalls.ts:81-122`). Discovery reads the raw row in `readPluginComponentImports` (`src/node/services/agentPlugins/registry.ts:95-151`). InstallService reads it from the raw rows that it already keeps to preserve unknown fields (`src/node/services/agentPlugins/installService.ts:2167-2175`). An unknown value (from a newer build) means `fixed-order` and logs one warning per process. It never makes the row invalid. Today an invalid row turns off all of the plugin's components (`registry.ts:120-128`). A row that this build cannot parse also makes `checkUpdates`, `getComponents` and `previewComponentReview` refuse (`installService.ts:2134-2148`). Install, update, uninstall and review skip that row and keep it on disk (`installService.ts:2072-2112`).
 - **Why `fixed-order` is safe for an unknown value.** It loads what a build from before this change loads for the same row. Rule M1's first clause binds every build that writes the field: no build saves a method other than `agent-plugin` for a tree whose root `plugin.json` has `$schema`. So a saved method never hides a Xum-native root from a build that falls back to the fixed order, and each component that the fallback loads still needs a matching consent record. Failing closed would instead turn the plugin off whenever a newer build saved a method kind that this build does not know.
 - **Missing field.** Every install from before this change has no field. It loads by the fixed order and updates by today's `chooseUpdateMethod` (`installMethods.ts:388-403`), which keeps a Codex install on Codex. Xum does not write a field for it.
@@ -432,7 +432,7 @@ Each criterion is a behavior and names the PR that must pass it.
 9. (PR 3) For a staged tree with egm's layout (schema-less root `plugin.json`, Codex, Claude and Cursor manifests), the preview offers `agent-plugin` (.codex-plugin/plugin.json), `claude-plugin` and `cursor-plugin`. It preselects `agent-plugin`, the first offered method in the fixed order.
 10. (PR 3) For a staged tree with a `$schema` root `plugin.json` and any other manifests, the preview offers only `agent-plugin`.
 11. (PR 3) A manifest that fails validation is not offered. The preview shows its validation error as a warning, and install refuses it. For a tree whose only manifest is a schema-less root `plugin.json`, the preview shows that root's `$schema` validation error, not the "No plugin.json ... found" error.
-12. (PR 3) Installing egm with `claude-plugin` writes `installMethod: "claude-plugin"` to the registry row. After a restart, discovery loads `.claude-plugin/plugin.json` and its 9 agents (once reviewed). A marketplace-entry install writes no `installMethod` and keeps the fixed order.
+12. (PR 3) Installing egm with `claude-plugin` writes `installMethod: "claude-plugin"` to the registry row. After a restart, discovery loads `.claude-plugin/plugin.json` and its 9 agents (once reviewed). A `claude-marketplace` install, which writes a generated `plugin.json` for an entry folder without a manifest, writes no `installMethod` and keeps the fixed order. An entry folder with its own manifest, which includes every Cursor marketplace entry (`installMethods.ts:11-13`), installs like a subfolder install and saves that manifest's method.
 13. (PR 3) A saved `agent-plugin` on a tree that has only a Claude manifest loads no plugin. It does not load the Claude manifest.
 14. (PR 3) A registry row whose `installMethod` is an unknown string loads its plugin by the fixed order, with its imported components and consent records unchanged.
 15. (PR 3) A registry row without `installMethod` loads and updates as before this change. An egm install without the field keeps updating with the Codex manifest. A plugin with only a Codex manifest updates.
@@ -503,6 +503,7 @@ Grouped by delivery PR. Paths are relative to the repository root.
    - `ManifestChoice = { kind: "fixed-order" } | { kind: "method"; method: SavedInstallMethod }` for `selectManifest` and `discoverPluginAt`, and as a required argument of `discoverAgentPluginAt`.
    - A named method whose manifest is missing or invalid returns null with a diagnostic that names the method and the file.
    - The container scan passes `methodByName.get(entryName)` into `discoverPluginAt`.
+   - `AgentPluginInfo` gains `installMethod` in this PR, because the hook gate (item 8) reaches the saved method through it. `manifestPath` lands in PR 4.
    - The container scan loads no component of a plugin that fails closed (B3): a saved method whose manifest is not the fixed-order manifest of the installed tree, with an `installMethodSha` that differs from `lockedSha`.
 4. `src/node/services/agentPlugins/registry.ts` (Modify): `readStoredInstallMethod(raw: unknown): SavedInstallMethod | undefined`, which logs one warning per process for an unknown value, and a reader for `installMethodSha` that returns undefined for a malformed value. `readPluginComponentImports` returns `methodByName`.
 5. `src/common/config/schemas/agentPluginInstalls.ts` (Modify): document `installMethod` as an optional raw field outside the row schema. Update the header comment on the source of truth (B3).
@@ -513,12 +514,12 @@ Grouped by delivery PR. Paths are relative to the repository root.
    - The module comment describes rule M1 and the saved method.
 7. `src/node/services/agentPlugins/installService.ts` (Modify)
    - A helper `savedInstallMethod(name)` reads the method from the raw registry row.
-   - Install writes `installMethod` for manifest methods, and never for a marketplace-entry install.
+   - Install writes `installMethod` for manifest methods, also for an entry folder with its own manifest, which installs like a subfolder install. A `claude-marketplace` install with a generated `plugin.json` writes none.
    - Install and every update write `installMethodSha` in the same registry write as `lockedSha`, only for a row with a saved method. `reconcilePromotedUpdateProvenance` leaves it unchanged. An update of a plugin that fails closed (B3) refuses with the B3 message, and the list API reports that state for the Settings row.
    - `validateStagedClone` validates each offered manifest method with one `discoverAgentPluginAt` call and removes invalid ones from the offered list, keeping their errors as warnings. The fallback at `:2956-2978` stays.
    - Every `discoverAgentPluginAt` call passes a choice: the staged method in preview and install, the saved method for installed plugins (lines 2951, 3176, 4685, 4884, 5053, 5553, 6785 and 6850).
    - Install, update and recovery log lines include the method.
-8. `src/node/services/agentPlugins/codexHookService.ts` (Modify): the hook gate's re-read (`:371`) passes the saved method.
+8. `src/node/services/agentPlugins/codexHookService.ts` (Modify): the hook gate's re-read (`:371`) passes the saved method, read from `AgentPluginInfo.installMethod`.
 9. `src/node/services/agentPlugins/testFixtures.ts` (Modify): `reviewedComponentConsent` passes a choice and accepts a saved method. Add `createRawPluginInstallRow(entry, extra)`, which returns a raw row with extra fields such as `installMethod`.
 10. `src/node/services/agentPlugins/cursorHooks.test.ts`, `codexHooks.test.ts`, `codexHookService.test.ts`, `installService.marketplace.test.ts`, `discovery.test.ts`, `installMethods.test.ts` and `installService.installMethods.test.ts`, all in `src/node/services/agentPlugins/` (Modify): pass `{ kind: "fixed-order" }` at their existing `discoverAgentPluginAt` calls.
 11. `src/node/services/agentPlugins/discovery.test.ts` (Modify): the table order is pinned. Each named method loads only its manifest (criteria 13 and 17). The container scan uses the saved method.
@@ -548,7 +549,7 @@ Grouped by delivery PR. Paths are relative to the repository root.
 9. `src/node/services/agentPlugins/composition.test.ts` (Modify): the composition entry fields of criterion 21.
 10. `tests/ipc/agentPlugins.test.ts` (Modify): the preview's `methodSummaries` and the list item fields.
 11. `docs/agents/agent-skills.mdx` (Modify): the counts and the "Installed as" row. Then regenerate the built-in skill content.
-12. `src/node/services/agentPlugins/discovery.ts` (Modify): `AgentPluginInfo` gains `manifestPath` and `installMethod` (B6).
+12. `src/node/services/agentPlugins/discovery.ts` (Modify): `AgentPluginInfo` gains `manifestPath` (B6). Its `installMethod` lands in PR 3 (PR 3 item 3).
 
 ### Verification Plan (binding)
 
