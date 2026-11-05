@@ -1215,11 +1215,9 @@ async function runGit(
  * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
 function sparseCloneFlags(subpath: string | undefined, url: string): string[] {
-  // --no-local: for a plain local-path source, git's local-clone shortcut
-  // ignores --depth and --filter and copies the whole repository history.
   return subpath === undefined
     ? []
-    : ["--filter=blob:none", "--no-checkout", "--no-local", ...localUploadPackFlags(url)];
+    : ["--filter=blob:none", "--no-checkout", ...localUploadPackFlags(url)];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
@@ -2781,6 +2779,14 @@ export class AgentPluginInstallService {
         "--depth",
         "1",
         "--single-branch",
+        // --no-local, always: for a plain local-path source, git's local-clone shortcut
+        // (1) ignores --depth and --filter and copies the whole repository history, and
+        // (2) copies or hard-links the source's `objects/` files one by one, so a background
+        // `git repack` of that repository (git runs one detached after a commit) that removes
+        // a loose object between the directory listing and the copy fails the clone with
+        // "failed to copy file to ...: No such file or directory". The transport reads the
+        // source through `git upload-pack`, which git keeps safe against a concurrent repack.
+        "--no-local",
         ...sparseCloneFlags(subpath, url),
         "--branch",
         ref,
