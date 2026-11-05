@@ -283,6 +283,7 @@ function lowercaseToolName(entry: string): string | undefined {
  * case, and with no specifier or `mcp__` entry, as in `mapAllowedEntry`.
  */
 function isReadOnlySearchList(entries: readonly string[], denylist: readonly string[]): boolean {
+  // mutation-equivalent: a tool name matches \w+, so it is never "" and ?? agrees with ||
   const deniedNames = new Set(denylist.flatMap((entry) => lowercaseToolName(entry) ?? []));
   const left = entries.filter((entry) => {
     const name = lowercaseToolName(entry);

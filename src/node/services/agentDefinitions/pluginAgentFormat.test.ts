@@ -240,6 +240,16 @@ describe("read-only search lists", () => {
     expect(toolsOf(mapped)).toEqual(FILE_AND_BASH);
   });
 
+  test("an entry Xum cannot read keeps a list out of the rule and grants nothing", () => {
+    const mapped = map({ tools: ["Read", "Grep", "Bash (npm test)"] });
+    expect(mapped.base).toBe("exec");
+    expect(toolsOf(mapped)).toEqual(["file_read", "attach_file"]);
+  });
+
+  test("an empty list names itself in the error", () => {
+    expect(() => map({ tools: [] })).toThrow(/\(empty\)/);
+  });
+
   test("a list with no tools left after the denylist still skips the agent", () => {
     expect(() => map({ tools: ["Grep"], disallowedTools: ["Bash"] })).toThrow(
       ForeignPluginAgentToolsError
@@ -293,5 +303,27 @@ describe("read-only search lists", () => {
     };
     const after = parsePluginAgent("description: Reviews\ntools: [Read, Grep, Glob]\n");
     expect(fingerprint(after)).not.toBe(fingerprint(before));
+  });
+});
+
+describe("mapForeignPluginAgentFrontmatter shape", () => {
+  test("an agent with no list or model is hidden, runnable and has no AI defaults", () => {
+    const mapped = mapForeignPluginAgentFrontmatter({ description: "Reviews" }, "reviewer");
+    expect(mapped).toEqual({
+      description: "Reviews",
+      name: "reviewer",
+      base: "exec",
+      ui: { hidden: true },
+      subagent: { runnable: true },
+      prompt: { append: false },
+    });
+  });
+
+  test("a Xum-format file passes through, and refuses a Claude list next to its fields", () => {
+    const xum = { name: "a", base: "exec", description: "d" };
+    expect(mapForeignPluginAgentFrontmatter(xum, "a")).toBe(xum);
+    expect(() =>
+      mapForeignPluginAgentFrontmatter({ ...xum, disallowedTools: ["Bash"] }, "a")
+    ).toThrow(ForeignPluginAgentToolsError);
   });
 });
