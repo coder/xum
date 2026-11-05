@@ -128,8 +128,8 @@ cleanup find the group even when the launcher was killed. Until then the group h
 lock, so a second launch waits for it. Launch also stops at once when the sandbox copied a
 `config.json` (the recipes assume default preferences), when the sandbox's `Allowed hosts:` line
 does not read `loopback only`, when Vite or the backend listens on an address that is not
-loopback or, once it answers, `ss` shows no socket for it (see Threat model), and when the backend
-crashes after its rebuild (nodemon then waits for a file change that never comes).
+loopback, `ss` fails or, once it answers, `ss` shows no socket for it (see Threat model), and when
+the backend crashes after its rebuild (nodemon then waits for a file change that never comes).
 
 ## Doctor
 

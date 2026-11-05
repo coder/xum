@@ -202,6 +202,29 @@ test.skipIf(!isLinux || lanAddress === undefined)(
   90_000
 );
 
+test.skipIf(!isLinux || lanAddress === undefined)(
+  "launch refuses a backend on a non-loopback address before its deadline",
+  () => {
+    const r = launch({ ...loopback, backendHost: lanAddress ?? "" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(`the backend listens on ${lanAddress}:`);
+    expect(r.seconds).toBeLessThan(20);
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+test.skipIf(!isLinux)(
+  "launch names the cause when ss fails",
+  () => {
+    const r = launch(loopback, { ss: "#!/bin/sh\nexit 1\n" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("ss failed, so launch cannot check which addresses Vite listens on");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
 // ss can fail to see the sockets (a sandbox that blocks its netlink queries). The listener check
 // must then refuse after readiness, not pass on an empty answer.
 test.skipIf(!isLinux)(

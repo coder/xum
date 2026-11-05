@@ -440,7 +440,8 @@ launch_failed() {
 # nothing listens on PORT: the server answered a probe there, so ss cannot see its sockets.
 refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what listens there> [ready]
   local addr addrs
-  addrs=$(ss -Hltn "sport = :$1" 2>/dev/null | awk '{print $4}')
+  addrs=$(ss -Hltn "sport = :$1" 2>/dev/null) || die "ss failed, so launch cannot check which addresses $2 listens on"
+  addrs=$(awk '{print $4}' <<<"$addrs")
   [[ -n $addrs || ${3-} != ready ]] || die "ss shows nothing listening on $2's port $1, so launch cannot check that only loopback reaches it"
   while read -r addr; do
     [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
