@@ -137,4 +137,35 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
     expect(displayed[0]?.type).toBe("user");
     expect(displayed[0]?.type === "user" ? displayed[0].content : null).toBe("<U+E0041><U+E0042>");
   });
+
+  test("leaves a subdivision-flag emoji intact", () => {
+    // A subdivision flag IS black flag + a tag sequence + cancel: its tags are the emoji, and
+    // copy/Edit read the displayed content, so marking them would drop the flag AND corrupt what
+    // the user copies or re-sends.
+    const subdivisionFlag = (region: string) => `\u{1F3F4}${tags(region)}\u{E007F}`;
+    for (const region of ["gbeng", "gbsct", "gbwls"]) {
+      const flag = subdivisionFlag(region);
+      const displayed = rows([{ type: "text", text: `ship ${flag}` }, FAILED_BASH]);
+      expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(`ship ${flag}`);
+    }
+  });
+
+  test("reveals a payload hidden alongside a real subdivision flag", () => {
+    const flag = `\u{1F3F4}${tags("gbeng")}\u{E007F}`;
+    const displayed = rows([{ type: "text", text: `${flag}${tags("AB")}` }, FAILED_BASH]);
+
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
+      `${flag}<U+E0041><U+E0042>`
+    );
+  });
+
+  test("keeps a message that is nothing but a subdivision flag", () => {
+    // The black-flag base is not default-ignorable, so the flag paints and the row must survive
+    // even when nothing else in the message does.
+    const flag = `\u{1F3F4}${tags("gbwls")}\u{E007F}`;
+    const displayed = rows([{ type: "text", text: flag }, FAILED_BASH]);
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(flag);
+  });
 });
