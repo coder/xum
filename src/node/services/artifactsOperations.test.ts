@@ -164,12 +164,11 @@ describe("artifacts operations", () => {
       workspaceId: "ws-art",
     });
 
-    expect(listing.success && listing.data.available && listing.data.entries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: "flow.txt", kind: "mermaid" }),
-        expect.objectContaining({ path: "plain.txt", kind: "text" }),
-      ])
-    );
+    const entries = listing.success && listing.data.available ? listing.data.entries : [];
+    expect(Object.fromEntries(entries.map((e) => [e.path, e.kind]))).toMatchObject({
+      "flow.txt": "mermaid",
+      "plain.txt": "text",
+    });
   });
 
   test("a live read shows the kind the artifact tool published it as", async () => {
