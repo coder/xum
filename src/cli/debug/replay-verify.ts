@@ -55,6 +55,10 @@ export function printStepPrefixAudit(audit: StepPrefixAudit): void {
   );
 }
 
+function withReason(line: string, reason: string | undefined): string {
+  return reason ? `${line}: ${reason}` : line;
+}
+
 /**
  * Debug command: rebuild every turn's provider request from durable session
  * logs (chat.jsonl + turn-envelope rows + blob store) and byte-compare it
@@ -104,11 +108,11 @@ export async function replayVerifyCommand(workspaceId: string): Promise<void> {
   for (const turn of result.turns) {
     const label = `turn ${turn.turnIndex} (envelope seq ${turn.envelopeSeq}, run ${turn.runId || "n/a"})`;
     if (turn.status === "SKIPPED") {
-      console.log(`SKIP  ${label}: ${turn.reason ?? ""}`);
+      console.log(withReason(`SKIP  ${label}`, turn.reason));
       continue;
     }
     if (turn.status === "PASS") {
-      console.log(`PASS  ${label}`);
+      console.log(withReason(`PASS  ${label}`, turn.reason));
       continue;
     }
     failures++;

@@ -147,10 +147,14 @@ export class TokenBudgetStrategy {
     private readonly isActive: (options?: SendMessageOptions) => boolean
   ) {}
 
-  discardFailedCarryover(
+  async discardFailedCarryover(
     pendingState: Parameters<CompactionHandler["discardPendingState"]>[1]
   ): Promise<void> {
-    return this.compaction.discardPendingState("context_exceeded", pendingState);
+    // Every request of the window carries the header. After its first successful turn, the
+    // header's snapshot is acknowledged carryover, not pending: the next compaction must not
+    // carry it forward either.
+    const snapshot = pendingState ?? (await this.compaction.peekCarryoverState());
+    await this.compaction.discardPendingState("context_exceeded", snapshot);
   }
 
   capturePreparation(): PreparationReceipt {

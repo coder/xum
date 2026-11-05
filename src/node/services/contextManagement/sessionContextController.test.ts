@@ -139,7 +139,6 @@ test("durable completion records the tail summary before notifying the external 
         text: "The investigation and fix are complete",
         model: "openai:gpt-4o",
         systemMessageTokens: 0,
-        attachmentTokens: 0,
         attachmentMessages: [],
         preparation: handler.beginPreparation(() => true),
         publication: {

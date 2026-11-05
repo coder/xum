@@ -75,7 +75,6 @@ describe("compaction partial recovery", () => {
       text: "Summary",
       model: "openai:gpt-4o",
       systemMessageTokens: 0,
-      attachmentTokens: 0,
       shouldPersist: () => true,
     });
   }

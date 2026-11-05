@@ -14,9 +14,15 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type PostCompactionContext,
 } from "@/common/types/message";
+import {
+  estimatePostCompactionContextTokens,
+  type PostCompactionContextInput,
+} from "./postCompactionContext";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import assert from "@/common/utils/assert";
 import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
@@ -2258,6 +2264,209 @@ describe("CompactionHandler", () => {
     });
   });
 
+  describe("post-compaction context header", () => {
+    const header: PostCompactionContext = { text: "Edited files: /src/app.ts", skillNames: ["ui"] };
+
+    function installBuilder(
+      build: (input: PostCompactionContextInput) => Promise<PostCompactionContext | null>
+    ) {
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        buildPostCompactionContext: build,
+      });
+    }
+
+    async function latestBoundary() {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const boundary = history.data[0];
+      expect(boundary?.metadata?.compactionBoundary).toBe(true);
+      return boundary;
+    }
+
+    it("stores the builder's header once on the new boundary", async () => {
+      const build = mock((_input: PostCompactionContextInput) => Promise.resolve(header));
+      installBuilder(build);
+      await seedHistory(
+        createMuxMessage("u0", "user", "fix the app"),
+        createSuccessfulFileEditMessage("edit-1", "/src/app.ts", "@@ -1 +1 @@\n-a\n+b"),
+        createCompactionRequest("compact-req")
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const boundary = await latestBoundary();
+      expect(boundary?.metadata?.postCompactionContext).toEqual(header);
+      expect(build).toHaveBeenCalledTimes(1);
+      const input = build.mock.calls[0]?.[0];
+      expect(input?.diffs.map((diff) => diff.path)).toEqual(["/src/app.ts"]);
+    });
+
+    // #3517: idle compaction dates the summary at the last activity, but reports that finished
+    // after that activity are in the summary too, so the report index must list them.
+    it("lists reports up to the compaction time, not the idle summary timestamp", async () => {
+      const build = mock((_input: PostCompactionContextInput) => Promise.resolve(header));
+      installBuilder(build);
+      const lastActivity = Date.now() - 3600 * 1000;
+      await seedHistory(
+        createMuxMessage("u0", "user", "hello", { timestamp: lastActivity }),
+        createMuxMessage("idle-req", "user", "Summarize", {
+          muxMetadata: {
+            type: "compaction-request",
+            source: "idle-compaction",
+            rawCommand: "/compact",
+            parsed: {},
+          },
+        })
+      );
+      const compactedAt = Date.now();
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      expect((await latestBoundary())?.metadata?.timestamp).toBe(lastActivity);
+      expect(build.mock.calls[0]?.[0].reportsCompletedBeforeMs).toBeGreaterThanOrEqual(compactedAt);
+    });
+
+    it("publishes the boundary without a header when the builder fails", async () => {
+      installBuilder(() => Promise.reject(new Error("artifact index unavailable")));
+      await seedHistory(createMuxMessage("u0", "user", "hello"), createCompactionRequest());
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const boundary = await latestBoundary();
+      expect(boundary?.metadata?.postCompactionContext).toBeUndefined();
+    });
+
+    // The context meter and the compaction check of the next send read the boundary's estimate.
+    it("counts the header in the boundary's context estimate", async () => {
+      installBuilder(() => Promise.resolve(header));
+      await seedHistory(createMuxMessage("u0", "user", "hello"), createCompactionRequest());
+
+      expect(
+        await handler.handleCompletion(createStreamEndEvent("Summary", { systemMessageTokens: 10 }))
+      ).toBe(true);
+
+      // System prompt (10) plus the summary's output tokens (50), plus the header.
+      const inputTokens = 60 + estimatePostCompactionContextTokens(header);
+      const expected = { inputTokens, outputTokens: 0, totalTokens: inputTokens };
+      expect((await latestBoundary())?.metadata?.contextUsage).toEqual(expected);
+      expect(getEmittedStreamEndEvent(emittedEvents)?.metadata.contextUsage).toEqual(expected);
+    });
+
+    // A header too big for the continuous boundary row is dropped, so the row must not count it.
+    it.each([
+      ["counts the header that a continuous boundary keeps", "Rolling summary", true],
+      [
+        "does not count a header that the continuous boundary row drops",
+        "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES - 64 * 1024),
+        false,
+      ],
+    ])("%s", async (_name, text, kept) => {
+      const built: PostCompactionContext = { text: "h".repeat(64 * 1024), skillNames: [] };
+      installBuilder(() => Promise.resolve(built));
+      const source = createMuxMessage("source", "assistant", "Fixed the bug");
+      await seedHistory(source);
+
+      expect(
+        await handler.persistContinuousCompaction({
+          messages: [source],
+          text,
+          model: "anthropic:test",
+          tail: [],
+          systemMessageTokens: 10,
+          preparation: handler.beginPreparation(() => true),
+          attachmentMessages: [source],
+          publication: {
+            generation: await historyService
+              .getContinuousCompactionJournal(workspaceId)
+              .captureGeneration(),
+          },
+          shouldPersist: () => true,
+        })
+      ).toBe(true);
+
+      const boundary = await latestBoundary();
+      expect(boundary.metadata?.postCompactionContext).toEqual(kept ? built : undefined);
+      const headerTokens = kept ? estimatePostCompactionContextTokens(built) : 0;
+      expect(boundary.metadata?.contextUsage?.inputTokens).toBe(
+        10 + estimateMuxMessageTokens(boundary) + headerTokens
+      );
+    });
+
+    async function persistJournaledBoundary(
+      text: string,
+      journaledHeader: PostCompactionContext | null
+    ) {
+      const build = mock((_input: PostCompactionContextInput) =>
+        Promise.resolve({ text: "rebuilt", skillNames: [] })
+      );
+      installBuilder(build);
+      const source = createMuxMessage("source", "assistant", "Fixed the bug");
+      await seedHistory(source);
+      const rows = {
+        messages: [source],
+        text,
+        model: "anthropic:test",
+        tail: [],
+        systemMessageTokens: 0,
+      };
+      const prepared = handler.buildContinuousCompactionRows(rows);
+      if (journaledHeader) {
+        prepared.boundary.metadata = {
+          ...prepared.boundary.metadata,
+          postCompactionContext: journaledHeader,
+        };
+      }
+
+      expect(
+        await handler.persistContinuousCompaction({
+          ...rows,
+          prepared,
+          preparation: handler.beginPreparation(() => true),
+          attachmentMessages: [source],
+          publication: {
+            generation: await historyService
+              .getContinuousCompactionJournal(workspaceId)
+              .captureGeneration(),
+          },
+          shouldPersist: () => true,
+        })
+      ).toBe(true);
+
+      // The live stream already sent the journaled prefix; a rebuilt header would change it.
+      expect(build).not.toHaveBeenCalled();
+      return latestBoundary();
+    }
+
+    it.each([
+      ["keeps the header that a journaled continuous boundary brings", header],
+      ["builds no header for a journaled continuous boundary without one", null],
+    ])("%s", async (_name, journaledHeader) => {
+      const boundary = await persistJournaledBoundary("Rolling summary", journaledHeader);
+
+      expect(boundary?.metadata?.postCompactionContext).toEqual(journaledHeader ?? undefined);
+      expect(boundary?.metadata?.contextUsage?.inputTokens).toBe(
+        estimateMuxMessageTokens(boundary) + estimatePostCompactionContextTokens(journaledHeader)
+      );
+    });
+
+    // The swapped prefix already sent this summary and header, so the row keeps both even
+    // when it is too big for the history line limit.
+    it("persists a journaled boundary as the swap built it, even when oversized", async () => {
+      const summary = "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES - 64 * 1024);
+      const journaledHeader = { text: "h".repeat(64 * 1024), skillNames: [] };
+
+      const boundary = await persistJournaledBoundary(summary, journaledHeader);
+
+      expect(boundary?.metadata?.postCompactionContext).toEqual(journaledHeader);
+      expect(boundary?.parts[0]).toMatchObject({ type: "text", text: summary });
+    });
+  });
+
   // #4551: history scanners skip rows over SESSION_HISTORY_MAX_LINE_BYTES, so an oversized
   // boundary stops being a boundary and provider history falls back to the previous epoch.
   describe("boundary row size", () => {
@@ -2355,6 +2564,26 @@ describe("CompactionHandler", () => {
 
       expect(text.length).toBeLessThan(summary.length);
       expect(summary.startsWith(text.slice(0, text.lastIndexOf("\n\n[")))).toBe(true);
+    });
+
+    it("drops a header that does not fit and keeps the fitted summary", async () => {
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        buildPostCompactionContext: () =>
+          Promise.resolve({ text: "h".repeat(64 * 1024), skillNames: [] }),
+      });
+      const summary = "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 64 * 1024);
+      const followUp = { text: "Continue", model: "openai:gpt-4o", agentId: "exec" };
+
+      const { boundary, text } = await compactWith(summary, followUp);
+
+      expect(boundary?.metadata?.postCompactionContext).toBeUndefined();
+      const kept = text.lastIndexOf("\n\n[");
+      expect(text.slice(kept)).toBe(formatCompactionSummaryTruncationMarker(kept, summary.length));
     });
   });
 });

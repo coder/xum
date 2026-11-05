@@ -2,9 +2,6 @@
  * Constants for the post-compaction attachment system.
  */
 
-/** Number of turns between post-compaction attachment injections after the first immediate injection */
-export const TURNS_BETWEEN_ATTACHMENTS = 5;
-
 /** Maximum size of file content before truncation (50KB) */
 export const MAX_FILE_CONTENT_SIZE = 50_000;
 

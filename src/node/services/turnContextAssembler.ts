@@ -1,6 +1,7 @@
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import type { ContextWindowIds } from "./contextWindowRollover";
+import { insertPostCompactionContext } from "./postCompactionContext";
 /**
  * Owns provider prompt synthesis plus the plan and system context it consumes.
  * All functions are independent of mutable service state.
@@ -10,6 +11,7 @@ import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
 import {
+  isPostCompactionContextMessage,
   isTokenBudgetInternalMessage,
   type MuxMessage,
   type SystemSectionRecords,
@@ -20,7 +22,6 @@ import {
   isHiddenFromSessionHistory,
 } from "@/common/utils/messages/contextWindows";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import {
   addInterruptedSentinel,
   filterEmptyAssistantMessages,
@@ -338,7 +339,6 @@ export interface AssemblePromptPayloadOptions {
   toolNamesForSentinel: string[];
   planContentForTransition?: string;
   planFilePath?: string;
-  postCompactionAttachments?: PostCompactionAttachment[] | null;
   providersConfig?: ProvidersConfigMap | null;
   anthropicCacheTtl?: AnthropicCacheTtl | null;
   workspaceId: string;
@@ -377,7 +377,8 @@ export interface AssemblePromptPayloadOptions {
  * the refused output), `context` goes before the user request that partial answers: placed
  * after the partial, it would read as a new context-only user turn, and the model would answer
  * it instead of continuing the partial. Runs before addInterruptedSentinel, so the partial
- * still gets its continuation sentinel.
+ * still gets its continuation sentinel. The post-compaction context row is never the request:
+ * `context` must not go between it and its boundary.
  */
 export function insertRequestContextMessage(
   history: MuxMessage[],
@@ -385,12 +386,14 @@ export function insertRequestContextMessage(
 ): MuxMessage[] {
   if (context === undefined) return history;
   assert(context.role === "user", "request context must be a user-role message");
+  const isRequest = (message: MuxMessage) =>
+    message.role === "user" && !isPostCompactionContextMessage(message);
   const last = history.at(-1);
   let index = history.length;
-  if (last?.role === "user") {
+  if (last && isRequest(last)) {
     index = history.length - 1;
   } else if (last?.role === "assistant" && last.metadata?.partial === true) {
-    const request = history.findLastIndex((message) => message.role === "user");
+    const request = history.findLastIndex(isRequest);
     index = request === -1 ? history.length - 1 : request;
   }
   return [...history.slice(0, index), context, ...history.slice(index)];
@@ -763,6 +766,11 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // The boundary's header is fixed for the life of the boundary, so it can sit early in the
+  // prefix: every turn, step and compaction request of this window sends the same bytes there,
+  // which keeps the prompt cache and Anthropic thinking replay valid. It goes in before the
+  // compaction trim, so the trim counts it.
+  const historyWithHeader = insertPostCompactionContext(prepared.providerRequestMessages);
   // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
   // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
   // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
@@ -772,8 +780,8 @@ export async function assemblePromptPayload(
     options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
   const providerRequestMessages = await trimToCompactionInputBudget(
     renderHookContextFirst
-      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
-      : prepared.providerRequestMessages,
+      ? renderPluginHookContextForProvider(historyWithHeader)
+      : historyWithHeader,
     options.compactionInputBudgetTokens,
     options.modelString,
     options.requestContextMessage
@@ -795,7 +803,6 @@ export async function assemblePromptPayload(
     toolNamesForSentinel: options.toolNamesForSentinel,
     planContentForTransition: options.planContentForTransition,
     planFilePath: options.planFilePath,
-    postCompactionAttachments: options.postCompactionAttachments,
     providerForMessages: options.providerForMessages,
     effectiveThinkingLevel: options.effectiveThinkingLevel,
     modelString: options.modelString,

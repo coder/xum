@@ -126,6 +126,7 @@ import {
 } from "@/node/services/agentSkills/pathSkillActivation";
 import { isPtcBridgedExecution } from "@/node/services/ptc/toolBridge";
 import type { GoalDefaults } from "@/constants/goals";
+import { readStringArray } from "@/common/utils/readStringArray";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
 export type WorkspaceHeartbeatSettings = NonNullable<WorkspaceMetadata["heartbeat"]>;
@@ -807,12 +808,6 @@ function getXaiSearchSources(
     const type = (source as { type?: unknown }).type;
     return type === "web" || type === "x" || type === "news" || type === "rss";
   });
-}
-
-function readStringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === "string")
-    : [];
 }
 
 function readIsoDate(value: unknown): string | undefined {

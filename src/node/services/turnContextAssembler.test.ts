@@ -28,7 +28,6 @@ import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
-import { createFileChangeNotificationMessage } from "./utils/fileChangeTracker";
 import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
@@ -1533,133 +1532,95 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
   });
 
-  test("post-compaction attachments leave every row before the newest request unchanged", async () => {
-    // F34: the attachments are request-only and come back every few turns for the segment.
-    // After the compaction summary they rewrote the cached history on the turn they appeared
-    // and again on the next turn, when they were gone.
+  describe("post-compaction header", () => {
     const opus = {
       modelString: "anthropic:claude-opus-5-5",
       providerForMessages: "anthropic",
       routeProvider: "anthropic",
+      systemMessage: "stable instructions",
     };
-    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
-      compacted: "user",
-      compactionBoundary: true,
-      compactionEpoch: 1,
-    });
-    const [u1, a1, u2, a2, u3] = [
-      createMuxMessage("u1", "user", "first"),
-      createMuxMessage("a1", "assistant", "answer 1"),
-      createMuxMessage("u2", "user", "second"),
-      createMuxMessage("a2", "assistant", "answer 2"),
-      createMuxMessage("u3", "user", "third"),
-    ];
-    const attachments = [
-      {
-        type: "plan_file_reference" as const,
-        planFilePath: "/tmp/plan.md",
-        planContent: "ATTACHED PLAN",
-      },
-    ];
-    const send = (history: MuxMessage[], withAttachments: boolean) =>
-      assemble({
-        ...opus,
-        history,
-        systemMessage: "stable instructions",
-        postCompactionAttachments: withAttachments ? attachments : null,
+    const HEADER_ID = "post-compaction-context-summary";
+    const boundary = (text?: string) =>
+      createMuxMessage("summary", "assistant", "Compacted summary", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        ...(text ? { postCompactionContext: { text, skillNames: [] } } : {}),
       });
-    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
+    const ids = (payload: Awaited<ReturnType<typeof assemble>>) =>
+      payload.providerRequestMessages.map((message) => message.id);
+    const rows = (payload: Awaited<ReturnType<typeof assemble>>, count: number) =>
       JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
         key === "providerOptions" ? undefined : value
       );
 
-    const plain = await send([summary, u1, a1, u2], false);
-    const attached = await send([summary, u1, a1, u2], true);
-    const next = await send([summary, u1, a1, u2, a2, u3], false);
-    // The cached system row, the summary, u1 and a1 come before the newest request (u2).
-    const before = plain.messages.length - 1;
-    expect(JSON.stringify(plain.messages.at(-1))).toContain("second");
-    expect(rows(attached, before)).toBe(rows(plain, before));
-    expect(rows(next, before)).toBe(rows(attached, before));
-    // The newest request carries the attachments, first.
-    expect(attached.messages).toHaveLength(plain.messages.length);
-    const request = JSON.stringify(attached.messages.at(-1));
-    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("second"));
-  });
+    test("sits right after the boundary and keeps earlier rows byte-stable across turns", async () => {
+      const summary = boundary("HEADER CONTEXT");
+      const [u1, a1, u2, a2, u3] = [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer 1"),
+        createMuxMessage("u2", "user", "second"),
+        createMuxMessage("a2", "assistant", "answer 2"),
+        createMuxMessage("u3", "user", "third"),
+      ];
+      const first = await assemble({ ...opus, history: [summary, u1, a1, u2] });
+      const next = await assemble({ ...opus, history: [summary, u1, a1, u2, a2, u3] });
 
-  test("post-compaction attachments keep their place when a file-change row is the newest", async () => {
-    // F37: AgentSession appends the durable <system-file-update> row before it reads the
-    // history, so it is the newest user row. Every rebuild of the turn (a retry after the
-    // committed assistant row, a budget warning appended mid-turn) and the plain request
-    // keep the rows before the turn's request, and the retry extends the first request.
-    const opus = {
-      modelString: "anthropic:claude-opus-5-5",
-      providerForMessages: "anthropic",
-      routeProvider: "anthropic",
-    };
-    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
-      compacted: "user",
-      compactionBoundary: true,
-      compactionEpoch: 1,
+      expect(ids(first)).toEqual(["summary", HEADER_ID, "u1", "a1", "u2"]);
+      const wire = JSON.stringify(first.messages);
+      expect(wire.indexOf("Compacted summary")).toBeLessThan(wire.indexOf("HEADER CONTEXT"));
+      expect(wire.indexOf("HEADER CONTEXT")).toBeLessThan(wire.indexOf("first"));
+      const before = first.messages.length - 1;
+      expect(rows(next, before)).toBe(rows(first, before));
     });
-    const notification = createFileChangeNotificationMessage([
-      { type: "edited_text_file", filename: "src/a.ts", snippet: "@@ -1 +1 @@" },
-    ]);
-    const turn = [
-      summary,
-      createMuxMessage("u1", "user", "first"),
-      createMuxMessage("a1", "assistant", "answer 1"),
-      createMuxMessage("u2", "user", "second"),
-      notification,
-    ];
-    const attachments = [
-      { type: "plan_file_reference" as const, planFilePath: "/p.md", planContent: "ATTACHED PLAN" },
-    ];
-    const send = (history: MuxMessage[], withAttachments = true) =>
-      assemble({
+
+    test("is absent when the boundary has no header", async () => {
+      const payload = await assemble({
         ...opus,
-        history,
-        systemMessage: "stable instructions",
-        postCompactionAttachments: withAttachments ? attachments : null,
+        history: [boundary(), createMuxMessage("u1", "user", "first")],
       });
-    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
-      JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
-        key === "providerOptions" ? undefined : value
-      );
+      expect(ids(payload)).toEqual(["summary", "u1"]);
+    });
 
-    const first = await send(turn);
-    const before = first.messages.length - 1;
-    const request = JSON.stringify(first.messages.at(-1));
-    expect(request.indexOf("second")).toBeLessThan(request.indexOf("ATTACHED PLAN"));
-    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("system-file-update"));
+    test("counts toward the compaction trim", async () => {
+      const history = (text?: string) => [
+        boundary(text),
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer 1"),
+        createMuxMessage("u2", "user", "second"),
+        createMuxMessage("a2", "assistant", "answer 2"),
+        createMuxMessage("request", "user", "summarize"),
+      ];
+      const header = "HEADER ".repeat(8_000);
+      const send = (text: string | undefined, compactionInputBudgetTokens: number) =>
+        assemble({ ...opus, history: history(text), compactionInputBudgetTokens });
 
-    const retry = await send([...turn, createMuxMessage("a2", "assistant", "partial answer")]);
-    expect(rows(retry, first.messages.length)).toBe(rows(first, first.messages.length));
-    const warned = await send([
-      ...turn,
-      createContextBudgetWarning({
-        contextTokens: 80_000,
-        maxTokens: 128_000,
-        budgetTokens: 96_000,
-        sessionHistoryAvailable: true,
-        handoff: true,
-      }),
-    ]);
-    expect(rows(warned, before)).toBe(rows(first, before));
-    expect(JSON.stringify(warned.messages.at(-1))).toContain("ATTACHED PLAN");
-    for (const plain of [
-      await send(turn, false),
-      await send(
-        [
-          ...turn,
-          createMuxMessage("a2", "assistant", "answer 2"),
-          createMuxMessage("u3", "user", "third"),
-        ],
-        false
-      ),
-    ]) {
-      expect(rows(plain, before)).toBe(rows(first, before));
-    }
+      expect(ids(await send(header, 100_000))).toContain(HEADER_ID);
+      expect(ids(await send(undefined, 2_000))).toContain("u1");
+      // Only the header puts the request over the budget, so the trim drops the oldest turn,
+      // which the header starts.
+      expect(ids(await send(header, 2_000))).toEqual(["summary", "u2", "a2", "request"]);
+    });
+
+    // A continuous cut can leave no user row after the boundary. The header is still not the
+    // request, so request context must not go between the boundary and the header.
+    test.each([
+      [
+        "a trailing partial reply",
+        [createMuxMessage("a1", "assistant", "PARTIAL", { partial: true })],
+      ],
+      ["no later row", []],
+    ])("keeps request context after the header with %s", async (_name, later) => {
+      const payload = await assemble({
+        ...opus,
+        history: [boundary("HEADER CONTEXT"), ...later],
+        requestContextMessage: createMuxMessage("ctx", "user", "VIEW-CONTEXT"),
+      });
+
+      const wire = JSON.stringify(payload.messages);
+      expect(wire.indexOf("HEADER CONTEXT")).toBeGreaterThan(-1);
+      expect(wire.indexOf("HEADER CONTEXT")).toBeLessThan(wire.indexOf("VIEW-CONTEXT"));
+    });
   });
 
   test("token budget tags persisted user rows with their session_history item ID", async () => {

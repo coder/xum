@@ -99,7 +99,6 @@ const journal: ContinuousCompactionJournal = {
     partIndex: 1,
     metadataTemplate: {},
   },
-  postCompactionAttachments: [],
   prefixSourceRows: [boundary],
   systemPrefix: [],
   cacheEnabled: true,

@@ -82,7 +82,6 @@ function journalFixture(): ContinuousCompactionJournal {
       partIndex: 1,
       metadataTemplate: { synthetic: true, rlmPreservedTailCopy: true },
     },
-    postCompactionAttachments: [],
     prefixSourceRows: [boundary, createMuxMessage("user-copy", "user", "current prompt")],
     systemPrefix: [{ role: "system", content: "system", providerOptions: cache }],
     cacheEnabled: true,
@@ -978,7 +977,6 @@ describe("continuous prefix prepareStep and journal", () => {
         workspaceId,
         history: journal.prefixSourceRows,
         systemMessage: "",
-        postCompactionAttachments: journal.postCompactionAttachments,
       });
       const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
         (message) => message.role !== "system"
@@ -1000,6 +998,11 @@ describe("continuous prefix prepareStep and journal", () => {
       },
       { type: "text", text: "kept answer" },
     ]);
+    // The boundary's header renders in both builds, right after the boundary.
+    journal.boundary.metadata = {
+      ...journal.boundary.metadata,
+      postCompactionContext: { text: "post-compaction header", skillNames: [] },
+    };
     // A repaired turn that failed before output: commitPartial kept only its receipt.
     const receiptOnly: MuxMessage = {
       id: "repaired-no-output",
@@ -1021,7 +1024,6 @@ describe("continuous prefix prepareStep and journal", () => {
       workspaceId,
       history: journal.prefixSourceRows,
       systemMessage: "",
-      postCompactionAttachments: journal.postCompactionAttachments,
     });
     const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
       (message) => message.role !== "system"
@@ -1030,6 +1032,7 @@ describe("continuous prefix prepareStep and journal", () => {
     const serialized = JSON.stringify(actual);
     expect(serialized).toContain("kept answer");
     expect(serialized).not.toContain("removed thinking");
+    expect(serialized).toContain("post-compaction header");
   });
 
   it("prefix replay keeps the thinking after a server tool out, tool pairs intact (#5887)", async () => {
@@ -1092,7 +1095,6 @@ describe("continuous prefix prepareStep and journal", () => {
       workspaceId,
       history: journal.prefixSourceRows,
       systemMessage: "",
-      postCompactionAttachments: journal.postCompactionAttachments,
     });
     const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
       (message) => message.role !== "system"

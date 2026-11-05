@@ -70,7 +70,10 @@ export const TurnEnvelopeDataSchema = z.object({
   planTransitionContentHash: BlobRefSchema.optional(),
   /** Plan file path referenced by the plan→exec handoff injection. */
   planTransitionFilePath: z.string().optional(),
-  /** JSON-serialized PostCompactionAttachment[] injected this turn (blob-stored). */
+  /**
+   * JSON-serialized PostCompactionAttachment[] that older builds injected per turn (blob-stored).
+   * Not written now: the boundary row in chat.jsonl carries the post-compaction context.
+   */
   postCompactionAttachmentsHash: BlobRefSchema.optional(),
   /**
    * JSON-serialized MuxMessage: the partial-output continuation a refusal

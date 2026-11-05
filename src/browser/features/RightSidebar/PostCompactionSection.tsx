@@ -25,7 +25,7 @@ function getFileName(filePath: string): string {
 }
 
 /**
- * Displays what context will be injected after compaction.
+ * Displays the context that compaction saves with its summary.
  * Collapsible section in the right sidebar below the context usage bar.
  */
 export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (props) => {
@@ -70,7 +70,7 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
   // Count how many items are included (not excluded)
   const includedFilesCount = formattedFiles.filter((f) => !f.isExcluded).length;
 
-  // Don't render if nothing will be injected
+  // Don't render if there is nothing to save
   if (!planExists && trackedFilesCount === 0) {
     return null;
   }
@@ -91,8 +91,8 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
               </span>
             </TooltipTrigger>
             <TooltipContent side="top" showArrow={false}>
-              After compaction, included artifacts in this list (plan + selected file diffs) are
-              attached to your next message so the agent keeps important earlier context.
+              Compaction saves the included artifacts in this list (plan + selected file diffs) with
+              its summary so the agent keeps important earlier context.
             </TooltipContent>
           </Tooltip>
         </div>

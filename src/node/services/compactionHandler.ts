@@ -12,8 +12,15 @@ import { exactJson } from "./continuousCompactionJournal";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import {
   CompactionPendingState,
+  type CompactionPendingAttachments,
   type CompactionPendingBoundaryWrite,
 } from "./compactionPendingState";
+import {
+  estimatePostCompactionContextTokens,
+  shiftContextUsageByHeader,
+  withPostCompactionContext,
+  type PostCompactionContextInput,
+} from "./postCompactionContext";
 import {
   CompactionPreparationLifecycle,
   type CompactionPreparation,
@@ -31,12 +38,14 @@ import {
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
   type MuxMessage,
+  type PostCompactionContext,
 } from "@/common/types/message";
 import { createCompactionSummaryMessageId } from "@/node/services/utils/messageIds";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { log } from "@/node/services/log";
+import { nodeClock } from "@/node/utils/hostClock";
 import { fitCompactionSummaryToHistoryRow, type FittedCompactionSummary } from "./historyRowBudget";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -210,6 +219,13 @@ interface CompactionHandlerOptions {
    * workspace whose compaction keeps failing even though the provider stream ended cleanly.
    */
   onIdleCompactionOutcome?: (success: boolean) => void;
+  /**
+   * Builds the post-compaction context header that each new boundary row stores. It settles in
+   * bounded time, so a slow read cannot hold the paid summary unpublished.
+   */
+  buildPostCompactionContext?: (
+    input: PostCompactionContextInput
+  ) => Promise<PostCompactionContext | null>;
 }
 
 /**
@@ -258,6 +274,11 @@ function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetad
   ) as Partial<RowMetadata>;
 }
 
+/** Whether a boundary publication builds the header. A header it builds counts in contextUsage. */
+interface HeaderOptions {
+  buildHeader: boolean;
+}
+
 export class CompactionHandler {
   private readonly workspaceId: string;
   private readonly historyService: HistoryService;
@@ -268,6 +289,7 @@ export class CompactionHandler {
 
   private readonly onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   private readonly onIdleCompactionOutcome?: (success: boolean) => void;
+  private readonly buildPostCompactionContext?: CompactionHandlerOptions["buildPostCompactionContext"];
 
   constructor(options: CompactionHandlerOptions) {
     assert(options, "CompactionHandler requires options");
@@ -288,6 +310,7 @@ export class CompactionHandler {
     this.emitter = options.emitter;
     this.onCompactionComplete = options.onCompactionComplete;
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
+    this.buildPostCompactionContext = options.buildPostCompactionContext;
   }
 
   beginPreparation(isCurrent: () => boolean): CompactionPreparation {
@@ -331,7 +354,8 @@ export class CompactionHandler {
   private async publishPreparedBoundary(
     preparation: CompactionPreparation,
     messages: MuxMessage[],
-    boundary: CompactionPendingBoundaryWrite
+    boundary: CompactionPendingBoundaryWrite,
+    options: HeaderOptions = { buildHeader: true }
   ) {
     messages = structuredClone(messages);
     boundary = {
@@ -351,21 +375,55 @@ export class CompactionHandler {
     const pending = await this.peekPendingState();
     const warm = await this.peekCarryoverState();
     const epoch = sliceMessagesFromLatestCompactionBoundary(messages);
+    const attachments = {
+      diffs: mergeFileEditDiffs(pending?.diffs ?? [], extractEditedFileDiffs(epoch)),
+      loadedSkills: mergeLoadedSkillSnapshots([
+        ...(warm?.loadedSkills ?? []),
+        ...(pending?.loadedSkills ?? []),
+        ...extractLoadedSkillSnapshotsFromMessages(epoch),
+      ]),
+      readFiles: mergeReadFilePaths(
+        mergeReadFilePaths(warm?.readFiles ?? [], pending?.readFiles ?? []),
+        extractReadFilePaths(epoch)
+      ),
+    };
     return this.pendingLifecycle.publish(preparation, {
       ...boundary,
-      attachments: {
-        diffs: mergeFileEditDiffs(pending?.diffs ?? [], extractEditedFileDiffs(epoch)),
-        loadedSkills: mergeLoadedSkillSnapshots([
-          ...(warm?.loadedSkills ?? []),
-          ...(pending?.loadedSkills ?? []),
-          ...extractLoadedSkillSnapshotsFromMessages(epoch),
-        ]),
-        readFiles: mergeReadFilePaths(
-          mergeReadFilePaths(warm?.readFiles ?? [], pending?.readFiles ?? []),
-          extractReadFilePaths(epoch)
-        ),
-      },
+      summaryMessage: await this.addPostCompactionContext(
+        boundary.summaryMessage,
+        attachments,
+        options
+      ),
+      attachments,
     });
+  }
+
+  private async addPostCompactionContext(
+    summary: MuxMessage,
+    attachments: CompactionPendingAttachments,
+    options: HeaderOptions
+  ): Promise<MuxMessage> {
+    if (!options.buildHeader || !this.buildPostCompactionContext) return summary;
+    try {
+      const built = await this.buildPostCompactionContext({
+        diffs: attachments.diffs,
+        loadedSkills: attachments.loadedSkills,
+        readFilePaths: attachments.readFiles,
+        // Not the summary timestamp: idle compaction dates the summary at the last activity,
+        // but reports that finished after it are summarized too (#3517). Wall clock: report
+        // times come from Date.now() (#7282).
+        reportsCompletedBeforeMs: nodeClock.nowMs(),
+      });
+      const withContext = withPostCompactionContext(summary, built, this.workspaceId);
+      return withContext === summary ? summary : shiftContextUsageByHeader(withContext, 1);
+    } catch (error) {
+      // The header only restores context; it must never block the compaction itself.
+      log.warn("Failed to build post-compaction context; publishing the boundary without it", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return summary;
+    }
   }
 
   private async retirePartial(
@@ -715,13 +773,13 @@ export class CompactionHandler {
           }
         : event
     );
-    if (truncated) {
-      const { contextUsage: _fullSummaryEstimate, ...rest } = streamEnd.metadata;
-      streamEnd.metadata = {
-        ...rest,
-        ...(result.data.summaryContextUsage && { contextUsage: result.data.summaryContextUsage }),
-      };
-    }
+    // The renderer merges this metadata over the persisted row's, so carry the row's estimate: it
+    // counts only the kept summary text, plus the header.
+    const { contextUsage: _summaryEstimate, ...rest } = streamEnd.metadata;
+    streamEnd.metadata = {
+      ...rest,
+      ...(result.data.summaryContextUsage && { contextUsage: result.data.summaryContextUsage }),
+    };
     this.emitChatEvent(streamEnd);
     return true;
   }
@@ -878,7 +936,11 @@ export class CompactionHandler {
     return fitted;
   }
 
-  /** The rolling summarizer already paid for this text; applying it must not start another turn. */
+  /**
+   * The rolling summarizer already paid for this text; applying it must not start another turn.
+   * The boundary comes back fitted to the history row with its header, so its model-visible
+   * bytes are final: a prefix swap sends them before the row is persisted.
+   */
   buildContinuousCompactionRows(params: {
     boundaryMessageId?: string;
     messages: MuxMessage[];
@@ -886,11 +948,11 @@ export class CompactionHandler {
     model: string;
     tail: MuxMessage[];
     systemMessageTokens: number;
-    attachmentTokens: number;
     pendingFollowUp?: CompactionFollowUpRequest;
+    postCompactionContext?: PostCompactionContext | null;
   }): { boundary: MuxMessage; copies: MuxMessage[] } {
     assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
-    const boundary = createMuxMessage(
+    const summary = createMuxMessage(
       params.boundaryMessageId ?? createCompactionSummaryMessageId(),
       "assistant",
       params.text,
@@ -907,6 +969,11 @@ export class CompactionHandler {
           pendingFollowUp: params.pendingFollowUp,
         },
       }
+    );
+    const boundary = withPostCompactionContext(
+      this.fitBoundarySummary(summary).message,
+      params.postCompactionContext ?? null,
+      this.workspaceId
     );
     const copies = this.buildTailCopies(params.tail).map((copy) => {
       // Continuous compaction prunes the just-finished answer too. Keep recent pages
@@ -931,16 +998,17 @@ export class CompactionHandler {
   ): Promise<boolean> {
     const shouldPersist = params.shouldPersist;
     const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(params.messages);
-    const built = params.prepared
+    // A journaled boundary is persisted as the swap built it, because the swapped prefix sent
+    // its summary and header. Its pending follow-up came later and the model never sees it,
+    // so a follow-up too big for the row leaves the row oversized; the history scanner
+    // recovers oversized compaction boundaries.
+    const { boundary, copies } = params.prepared
       ? structuredClone(params.prepared)
       : this.buildContinuousCompactionRows(params);
-    // Bound here, not in the builder: a journaled boundary gets its pending follow-up only
-    // after it was built, and the follow-up counts toward the row size.
-    const boundary = this.fitBoundarySummary(built.boundary).message;
-    const copies = built.copies;
+    // A header too big for the row is dropped, so count only the header the row keeps.
     const inputTokens =
       params.systemMessageTokens +
-      params.attachmentTokens +
+      estimatePostCompactionContextTokens(boundary.metadata?.postCompactionContext) +
       estimateMuxMessageTokens(boundary) +
       copies.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
     assert(boundary.metadata !== undefined, "Continuous boundary requires metadata");
@@ -960,7 +1028,10 @@ export class CompactionHandler {
         updateExisting: false,
         publication: params.publication,
         shouldPersist: (messages, partial) => !partial && shouldPersist(messages),
-      }
+      },
+      // The swapped prefix already rendered the journaled header, or none. A new header here
+      // would change that prefix after the stream sent it.
+      { buildHeader: !params.prepared }
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

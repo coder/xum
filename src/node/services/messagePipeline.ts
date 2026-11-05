@@ -22,7 +22,6 @@ import { prepareMcpReplay } from "@/node/services/mcpModelOutput";
 import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
 import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { anthropicBindsThinkingToPrefix, type ThinkingLevel } from "@/common/types/thinking";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -30,7 +29,6 @@ import {
   transformModelMessages,
   validateAnthropicCompliance,
   injectAgentTransition,
-  injectPostCompactionAttachments,
 } from "@/browser/utils/messages/modelMessageTransform";
 import {
   applyNativeToolSearchReplay,
@@ -52,8 +50,6 @@ export interface PrepareMessagesOptions {
   planContentForTransition?: string;
   /** Plan file path for transition context. */
   planFilePath?: string;
-  /** Post-compaction attachments (plan file, loaded skills, edited files). */
-  postCompactionAttachments?: PostCompactionAttachment[] | null;
   /** Canonical provider name for provider-specific transforms. */
   providerForMessages: string;
   /** Thinking level for provider-specific behavior. */
@@ -90,19 +86,18 @@ export interface PrepareMessagesOptions {
  *
  * Transforms pre-filtered `XumMessage[]` into provider-ready `ModelMessage[]` by:
  * 1. Injecting agent-transition context (plan→exec handoff)
- * 2. Injecting post-compaction attachments
- * 3. Redacting heavy tool outputs
- * 4. Sanitizing tool inputs
- * 5. Inlining SVG attachments as text
- * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
- * 7. Sanitizing PDF filenames for Anthropic
- * 8. Extracting tool-result media as user message attachments
- * 9. Rewriting data-URI file parts to SDK-safe inline base64
- * 10. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
- * 11. Self-healing: filtering empty/whitespace assistant messages
- * 12. Applying provider-specific message transforms
- * 13. Applying cache control headers
- * 14. Validating Anthropic compliance (logs warnings only)
+ * 2. Redacting heavy tool outputs
+ * 3. Sanitizing tool inputs
+ * 4. Inlining SVG attachments as text
+ * 5. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 6. Sanitizing PDF filenames for Anthropic
+ * 7. Extracting tool-result media as user message attachments
+ * 8. Rewriting data-URI file parts to SDK-safe inline base64
+ * 9. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
+ * 10. Self-healing: filtering empty/whitespace assistant messages
+ * 11. Applying provider-specific message transforms
+ * 12. Applying cache control headers
+ * 13. Validating Anthropic compliance (logs warnings only)
  *
  * Log purity: this pipeline never reads live workspace state (disk, file
  * trackers). File-change notifications and @file mention snapshots are
@@ -120,7 +115,6 @@ export async function prepareMessagesForProvider(
     toolNamesForSentinel,
     planContentForTransition,
     planFilePath,
-    postCompactionAttachments,
     providerForMessages,
     effectiveThinkingLevel,
     modelString,
@@ -142,15 +136,9 @@ export async function prepareMessagesForProvider(
     planContentForTransition ? planFilePath : undefined
   );
 
-  // Inject post-compaction attachments (plan file, loaded skills, edited files) after compaction summary
-  const messagesWithPostCompaction = injectPostCompactionAttachments(
-    messagesWithAgentContext,
-    postCompactionAttachments
-  );
-
   // Apply centralized tool-output redaction BEFORE converting to provider ModelMessages.
   // Keeps the persisted/UI history intact while trimming heavy fields for the request.
-  const redactedForProvider = applyToolOutputRedaction(messagesWithPostCompaction);
+  const redactedForProvider = applyToolOutputRedaction(messagesWithAgentContext);
   log.debug_obj(`${workspaceId}/2a_redacted_messages.json`, redactedForProvider);
 
   // Sanitize tool inputs to ensure they are valid objects (not strings or arrays).

@@ -6,13 +6,11 @@
 import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMessage } from "ai";
 import {
   isContextBudgetWarningMessage,
+  isPostCompactionContextMessage,
   type MuxMessage,
   type MuxReasoningPart,
 } from "@/common/types/message";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
-import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
-import { renderAttachmentsToContentWithBudget } from "./attachmentRenderer";
 
 /**
  * Filter out assistant messages that are empty or only contain reasoning parts.
@@ -94,6 +92,18 @@ export function addInterruptedSentinel(messages: MuxMessage[]): MuxMessage[] {
 }
 
 /**
+ * The user request that a transition goes before. Token Budget warnings and the post-compaction
+ * context row are not requests.
+ */
+function isTransitionAnchor(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    !isContextBudgetWarningMessage(message) &&
+    !isPostCompactionContextMessage(message)
+  );
+}
+
+/**
  * Inject agent transition context when the active agent changes mid-conversation.
  * Inserts a synthetic user message before the final user message to signal the agent switch.
  * This provides temporal context that helps models understand they should follow new agent instructions.
@@ -137,14 +147,7 @@ export function injectAgentTransition(
   // Agent transition detected! Inject a synthetic user message before the last user message
   // This provides temporal context: user says "switch agents" before their actual request
 
-  // Find the index of the last user message
-  let lastUserIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && !isContextBudgetWarningMessage(messages[i])) {
-      lastUserIndex = i;
-      break;
-    }
-  }
+  const lastUserIndex = messages.findLastIndex(isTransitionAnchor);
 
   // If there's no user message, can't inject transition (nothing to inject before)
   if (lastUserIndex === -1) {
@@ -212,56 +215,6 @@ ${planContent}
 // AgentSession appends the <system-file-update> row durably to chat.jsonl at
 // turn start (see createFileChangeNotificationMessage in fileChangeTracker.ts),
 // keeping the provider request a pure function of the session log.
-
-/**
- * Inject post-compaction attachments as a synthetic user message.
- * When compaction occurs, this injects a message containing plan file content
- * and/or edited files to preserve context that would otherwise be lost.
- *
- * The message goes right before the newest user message (Token Budget warning rows
- * excepted, as in injectAgentTransition), or last without one. It is request-only and comes
- * back every TURNS_BETWEEN_ATTACHMENTS turns for the whole segment, so it must not sit
- * early in the history: placed after the compaction summary, it rewrote the cached history
- * after the summary on the turn it appeared and again on the next turn, when it was gone.
- * Here every row before the current turn's request stays byte-identical, and every step of
- * the turn rebuilds the same position (the tool loop appends after the request). The model
- * sees the same shape as before: the attachments, then the user's request (provider
- * transforms merge the two user messages, attachments first).
- *
- * @param messages The conversation history
- * @param attachments Post-compaction attachments (plan file, loaded skills, edited files)
- * @returns Messages with the attachments injected before the newest user message
- */
-export function injectPostCompactionAttachments(
-  messages: MuxMessage[],
-  attachments?: PostCompactionAttachment[] | null
-): MuxMessage[] {
-  if (!attachments || attachments.length === 0) {
-    return messages;
-  }
-
-  const newestUserIndex = messages.findLastIndex(
-    (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
-  );
-  const index = newestUserIndex === -1 ? messages.length : newestUserIndex;
-  const syntheticMessage: MuxMessage = {
-    id: `post-compaction-${Date.now()}`,
-    role: "user",
-    parts: [
-      {
-        type: "text",
-        text: renderAttachmentsToContentWithBudget(attachments, {
-          maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
-        }),
-      },
-    ],
-    metadata: {
-      timestamp: messages[index]?.metadata?.timestamp ?? Date.now(),
-      synthetic: true,
-    },
-  };
-  return [...messages.slice(0, index), syntheticMessage, ...messages.slice(index)];
-}
 
 /**
  * Filter out assistant messages that only contain reasoning parts (no text or tool parts).

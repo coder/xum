@@ -6,11 +6,13 @@ import {
   addInterruptedSentinel,
   injectAgentTransition,
   filterEmptyAssistantMessages,
-  injectPostCompactionAttachments,
   stripOrphanedToolCalls,
 } from "./modelMessageTransform";
-import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
-import type { MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  postCompactionContextMessageId,
+  type MuxMessage,
+} from "@/common/types/message";
 
 describe("modelMessageTransform", () => {
   describe("transformModelMessages", () => {
@@ -1431,6 +1433,23 @@ describe("injectAgentTransition", () => {
     expect(result[1].metadata?.synthetic).toBe(true);
   });
 
+  // The header is context for the whole window, not a user request: a transition in front of
+  // it would change the bytes right after the boundary.
+  it("does not inject the transition before a post-compaction context row", () => {
+    const messages: MuxMessage[] = [
+      createMuxMessage("summary", "assistant", "Compacted summary", {
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      }),
+      createMuxMessage(postCompactionContextMessageId("summary"), "user", "Edited files", {
+        synthetic: true,
+      }),
+      createMuxMessage("assistant-1", "assistant", "Here's the plan...", { agentId: "plan" }),
+    ];
+
+    expect(injectAgentTransition(messages, "exec")).toEqual(messages);
+  });
+
   it("should not inject transition when agent is the same", () => {
     const messages: MuxMessage[] = [
       {
@@ -1994,144 +2013,5 @@ describe("filterEmptyAssistantMessages", () => {
     expect(result2.length).toBe(2);
     expect(result2[1].id).toBe("assistant-1");
     expect(result2[1].metadata?.partial).toBe(true);
-  });
-});
-
-describe("injectPostCompactionAttachments", () => {
-  it("inserts before the request after a compaction summary and enforces a size budget", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "compaction-summary",
-        role: "assistant",
-        parts: [{ type: "text", text: "Compacted summary" }],
-        metadata: {
-          timestamp: 1000,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 1,
-        },
-      },
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Continue" }],
-        metadata: { timestamp: 1100 },
-      },
-    ];
-
-    const attachments = [
-      {
-        type: "edited_files_reference" as const,
-        files: [
-          {
-            path: "src/huge.ts",
-            diff: "x".repeat(MAX_POST_COMPACTION_INJECTION_CHARS + 10_000),
-            truncated: false,
-          },
-        ],
-      },
-    ];
-
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(3);
-    expect(result[0].id).toBe("compaction-summary");
-    expect(result[2].id).toBe("user-1");
-
-    const injected = result[1];
-    expect(injected.role).toBe("user");
-    expect(injected.metadata?.synthetic).toBe(true);
-
-    const text = (injected.parts[0] as { type: "text"; text: string }).text;
-    expect(text.length).toBeLessThanOrEqual(MAX_POST_COMPACTION_INJECTION_CHARS);
-    expect(text).toContain("post-compaction context truncated");
-  });
-
-  it("goes before the newest user message, past Token Budget warnings, or last without one", () => {
-    const row = (id: string, role: "user" | "assistant", extra = {}): MuxMessage => ({
-      id,
-      role,
-      parts: [{ type: "text", text: id }],
-      metadata: { timestamp: 1000, ...extra },
-    });
-    const warning = row("warning", "user", { muxMetadata: { type: "context-budget-warning" } });
-    const attachments = [
-      {
-        type: "plan_file_reference" as const,
-        planFilePath: "PLAN.md",
-        planContent: "Plan",
-      },
-    ];
-    const ids = (messages: MuxMessage[]) =>
-      injectPostCompactionAttachments(messages, attachments).map((message) =>
-        message.metadata?.synthetic === true ? "attachments" : message.id
-      );
-
-    // Request-only and re-injected every few turns: the rows before the current request stay.
-    expect(
-      ids([row("user-1", "user"), row("assistant-1", "assistant"), row("user-2", "user"), warning])
-    ).toEqual(["user-1", "assistant-1", "attachments", "user-2", "warning"]);
-    expect(ids([row("assistant-1", "assistant")])).toEqual(["assistant-1", "attachments"]);
-  });
-
-  it("inserts before the newest request when multiple summaries exist", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "summary-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "Older summary" }],
-        metadata: {
-          timestamp: 1000,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 1,
-        },
-      },
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Between summaries" }],
-        metadata: { timestamp: 1100 },
-      },
-      {
-        id: "summary-2",
-        role: "assistant",
-        parts: [{ type: "text", text: "Latest summary" }],
-        metadata: {
-          timestamp: 2000,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 2,
-        },
-      },
-      {
-        id: "user-2",
-        role: "user",
-        parts: [{ type: "text", text: "Continue" }],
-        metadata: { timestamp: 2100 },
-      },
-    ];
-
-    const attachments = [
-      {
-        type: "plan_file_reference" as const,
-        planFilePath: "PLAN.md",
-        planContent: "Latest plan",
-      },
-    ];
-
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(5);
-    expect(result[0].id).toBe("summary-1");
-    expect(result[1].id).toBe("user-1");
-    expect(result[2].id).toBe("summary-2");
-
-    const injected = result[3];
-    expect(injected.metadata?.synthetic).toBe(true);
-    const text = (injected.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-update>");
-
-    expect(result[4].id).toBe("user-2");
   });
 });

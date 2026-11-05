@@ -10,7 +10,6 @@
 import crypto from "node:crypto";
 import type { Tool } from "ai";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { BlobRef } from "@/common/types/durableEvent";
 import type { MuxMessage } from "@/common/types/message";
 import { stableStringify } from "@/common/utils/stableStringify";
@@ -114,8 +113,6 @@ export async function emitTurnEnvelope(params: {
   /** Plan content injected on a plan→exec handoff this turn (model-visible). */
   planContentForTransition?: string;
   planFilePath?: string;
-  /** Post-compaction attachments injected this turn (model-visible). */
-  postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Partial-output continuation a refusal fallback appended to its request
    * (model-visible but never persisted to chat.jsonl at this sequence).
@@ -152,20 +149,11 @@ export async function emitTurnEnvelope(params: {
         const ref = await putTracked(params.systemMessage);
 
         // Request-time inputs that reach the provider request must be logged too
-        // ("model-visible ⟹ logged"): blob-store the injected plan content and
-        // post-compaction attachments so replay can rebuild those turns.
+        // ("model-visible ⟹ logged"): blob-store the injected plan content so replay can
+        // rebuild those turns. The post-compaction header is in chat.jsonl already.
         let planTransitionContentHash: BlobRef | undefined;
         if (params.planContentForTransition != null && params.planContentForTransition.length > 0) {
           planTransitionContentHash = await putTracked(params.planContentForTransition);
-        }
-        let postCompactionAttachmentsHash: BlobRef | undefined;
-        if (
-          params.postCompactionAttachments != null &&
-          params.postCompactionAttachments.length > 0
-        ) {
-          postCompactionAttachmentsHash = await putTracked(
-            JSON.stringify(params.postCompactionAttachments)
-          );
         }
         let partialContinuationHash: BlobRef | undefined;
         if (params.partialContinuationMessage != null) {
@@ -218,9 +206,6 @@ export async function emitTurnEnvelope(params: {
                     ? { planTransitionFilePath: params.planFilePath }
                     : {}),
                 }
-              : {}),
-            ...(postCompactionAttachmentsHash !== undefined
-              ? { postCompactionAttachmentsHash }
               : {}),
             ...(partialContinuationHash !== undefined ? { partialContinuationHash } : {}),
             ...(mcpAppModelContextHash !== undefined ? { mcpAppModelContextHash } : {}),

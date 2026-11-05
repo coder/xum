@@ -252,7 +252,6 @@ describe("exact pending snapshot consumption", () => {
           text: "B",
           model: followUp.model,
           systemMessageTokens: 0,
-          attachmentTokens: 0,
           shouldPersist: () => false,
         })
       ).toBe(false);

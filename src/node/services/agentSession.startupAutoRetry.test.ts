@@ -2925,7 +2925,6 @@ describe("AgentSession startup auto-retry recovery", () => {
         modelString: string,
         options?: SendMessageOptions,
         openaiTruncationModeOverride?: "auto" | "disabled",
-        disablePostCompactionAttachments?: boolean,
         agentInitiated?: boolean
       ) => Promise<
         | { success: true; data: undefined }
