@@ -1,4 +1,4 @@
-# design-sync notes — Mux
+# design-sync notes — Xum (formerly Mux)
 
 Mux is an **Electron + React app**, not a component-library package: there is no
 `dist/` and no shipped `.d.ts` tree. The sync treats `src/browser`'s **storied**
@@ -21,16 +21,16 @@ There is no library entry, so we generate one:
   `features/Tools/*ToolCall.tsx`). Run it from the repo root after stories
   change: `node .design-sync/gen-barrel.mjs`, then rebuild.
 - `cfg.entry` AND `cfg.extraEntries` both point at the barrel: `entry` builds
-  `window.Mux`; `extraEntries` is **source-scanned to seed the converter's
+  `window.Xum`; `extraEntries` is **source-scanned to seed the converter's
   `exported` set** (there is no `.d.ts` to derive it from, so without this every
   storybook title drops as `[TITLE_UNMAPPED]`).
 - The barrel also exports the providers the preview harness needs
   (PROVIDER_LINES: Theme, Tooltip, API, Experiments, Settings, Router,
-  Project, AboutDialog) so they live on `window.Mux` and previews can shim to
-  them. `cfg.provider` references `window.Mux.ThemeProvider`.
+  Project, AboutDialog) so they live on `window.Xum` and previews can shim to
+  them. `cfg.provider` references `window.Xum.ThemeProvider`.
 
 (See "Preview model — ISOLATED previews" below for how previews resolve against
-`window.Mux`.)
+`window.Xum`.)
 
 ## Theme / provider
 
@@ -90,11 +90,11 @@ per component, in `.design-sync/previews/<RealName>.tsx`:
   the shell; do NOT remove it. (No-op for modals: fixed content floors scrollH at
   the viewport.)
 - `cfg.storyImports.shim: ["/src/browser/"]` routes component/provider imports to
-  `window.Mux` (the prebuilt bundle) so previews stay thin (~3.3 MB) and share
+  `window.Xum` (the prebuilt bundle) so previews stay thin (~3.3 MB) and share
   React-context identity; `cfg.storyImports.bundle: ["/src/browser/stories/"]`
   keeps the mock client compiling from source (it's data).
 - Components export REAL names (no alias); `cfg.titleMap` maps title segments →
-  real names. So `import { TodoToolCall }` resolves to `window.Mux.TodoToolCall`.
+  real names. So `import { TodoToolCall }` resolves to `window.Xum.TodoToolCall`.
 - Validate each preview with the scratch `check-preview.mjs` (compiles + <5 MB +
   no heavy deps) before building. Re-authoring after story changes is manual.
 
@@ -151,7 +151,7 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
   ChatInput gains stories they resurface as `unpaired` under Input; add them to
   that skip. (2) Compound primitives export only their Root from the title-segment
   resolution; their parts (`DialogContent`/`TooltipContent`/`PopoverContent`/…)
-  ride `window.Mux` via `gen-barrel.mjs`'s `PRIMITIVE_PART_LINES`. (3) Overlays
+  ride `window.Xum` via `gen-barrel.mjs`'s `PRIMITIVE_PART_LINES`. (3) Overlays
   (Dialog/Tooltip/Popover) use `cardMode: "single"`; previews render them
   `defaultOpen`. (4) Select's play-driven `Open` story is skipped (static preview
   can't reproduce the click).
@@ -232,3 +232,43 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
   visibly mis-colors, ship globals.css's `:root[data-theme]` blocks via cfg.
 - **`[FONT_MISSING]` "Ubuntu Mono":** an unreached fallback in a `'Geist Mono',
 'Ubuntu Mono', monospace` stack — Geist Mono ships and wins. Accepted.
+
+## Re-sync to v0.32.1 (Mux → Xum)
+
+- **Global renamed:** `cfg.globalName` is `Xum`, so the bundle assigns `window.Xum` and
+  previews shim `src/browser` imports to it. The harness export keeps its old name,
+  `MuxPreviewShell`, so the existing previews didn't all need editing.
+- **Set:** 54 components. Kept 34 of the 35 from v0.27.0. Added 20 storied since then,
+  each with an owned preview in `previews/` and a `cfg.overrides` entry: AboutDialog,
+  ActiveGoalsWarningToast, ArtifactToolCall, BackupSection, BranchSelector,
+  ChatInputToast, DelegatedCreationInterruptedNotice, ForceDeleteModal,
+  InstructionsSection, LegacyPlanImportNotice, PRStackBadge, PluginsSettingsSection,
+  PromptCacheHealth, SkillIndicator, StreamErrorMessage, TerminalBadgeOverlay,
+  TimelineEventToolCall, TimelinePanelView, UpdateRestartOverlay, WorkflowPhaseFlow.
+- **MemorySection removed:** `MemoryBrowser → MemoryFileEditor` now imports `AIView`, which
+  pulls the whole app (shiki, mermaid, ghostty, lottie, recharts, katex): about 18 MB.
+  Excluded in `EXCLUDE_HEAVY` with SessionHistory, ArtifactsPanel, NewTabLauncher,
+  Stable tab controls (RightSidebarTabStrip) and ScratchPage for the same reason.
+- **Pending:** AgentSkillList and ToolSearch were storied after v0.32.1. They are light
+  but have no owned preview yet, so they sit in `EXCLUDE_PENDING`. The 6 Cursor plugin
+  stories added to PluginsSettingsSection after v0.32.1 are in its `skip` list until its
+  preview grows cells for them.
+- **Wrapper vs presentational:** DelegatedCreationInterruptedBanner, LegacyPlanImportBanner and
+  TimelinePanel are store-connected wrappers. `MANUAL` pins the presentational component
+  each one delegates to (`…Notice`, `TimelinePanelView`), which is what the previews render.
+- **EXCLUDE_IMPORT narrowed** to `ChatInput.stories`: the folder match also dropped
+  ChatInputToast, a separate light component.
+- **Preview support exports:** `PREVIEW_SUPPORT_LINES` puts `useAboutDialog`,
+  `getAppConfigStore` and `RetryBarrierContent` on `window.Xum`. Previews import them from
+  `src/browser`, so they must come from the bundle to share state with the components.
+- **`*.svg?react` imports** (the xum logo in AboutDialog and LoadingScreen, so also
+  UpdateRestartOverlay) need the bundler to turn them into a React component. A bundler
+  that loads `.svg` as a data URL hands React a string, and those cards crash with
+  "'data:image/svg+xml,…' is not a valid name".
+- **Kept-in-files Design System artifacts:** the page runs a card from its own address
+  (not the card's) whenever the bundle's text contains something shaped like a
+  `project/…` path. This bundle always does, because a prompt string reads
+  "(project/global AGENTS.md …". A card must then load its story script as
+  `project/_preview/<Name>.js`; a card-relative `../../_preview/<Name>.js` never loads, and
+  every card shows "no PascalCase exports".
+- **Sizes at this sync:** bundle 4.3 MB; each preview about 2.9–3.4 MB (the cap is 5 MB).

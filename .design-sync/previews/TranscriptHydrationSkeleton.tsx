@@ -8,7 +8,7 @@ export const Default = () => (
   <MuxPreviewShell>
     <div className="bg-background min-h-screen overflow-y-auto p-6">
       <div className="mx-auto max-w-4xl">
-        <TranscriptHydrationSkeleton />
+        <TranscriptHydrationSkeleton workspaceId="preview" />
       </div>
     </div>
   </MuxPreviewShell>

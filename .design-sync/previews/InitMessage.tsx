@@ -21,6 +21,7 @@ const INIT_SUCCESS_MESSAGE: WorkspaceInitMessage = {
   exitCode: 0,
   timestamp: 1_699_999_894_000,
   durationMs: 3000,
+  progress: null,
 };
 
 const INIT_ERROR_MESSAGE: WorkspaceInitMessage = {
@@ -37,6 +38,7 @@ const INIT_ERROR_MESSAGE: WorkspaceInitMessage = {
   exitCode: 1,
   timestamp: 1_699_999_893_000,
   durationMs: 3000,
+  progress: null,
 };
 
 export const InitHookSuccess = () => (

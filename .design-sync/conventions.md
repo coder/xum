@@ -1,9 +1,9 @@
-# Mux design system — how to build with it
+# Xum design system — how to build with it
 
-These components are Mux's real, compiled React components (the desktop app's UI:
+These components are Xum's real, compiled React components (the desktop app's UI:
 chat tool-call cards, message states, settings sections, banners, modals, small
 widgets). Build with them as-is; style your own layout glue with Tailwind using
-Mux's token vocabulary below.
+Xum's token vocabulary below.
 
 ## Wrapping & theme (required)
 
@@ -19,15 +19,15 @@ import { ThemeProvider } from "<this design system>";
 ```
 
 Data-driven components (anything that reads workspaces, settings, providers, etc.)
-also expect Mux's context providers — `APIProvider`, `SettingsProvider`,
+also expect Xum's context providers — `APIProvider`, `SettingsProvider`,
 `ProjectProvider`, `RouterProvider` (all bundle exports). Wrap
 once near the root; leaf/presentational components (banners, tool-call cards,
 badges) need only `ThemeProvider`.
 
-## Styling idiom — Tailwind v4 with Mux's semantic tokens
+## Styling idiom — Tailwind v4 with Xum's semantic tokens
 
 There are **no CSS-module class maps**; style layout with Tailwind utility classes
-built from Mux's semantic color tokens (NOT raw hex). Real families (all in the
+built from Xum's semantic color tokens (NOT raw hex). Real families (all in the
 shipped stylesheet):
 
 | Purpose     | Utilities                                                                                    |
@@ -62,7 +62,7 @@ export function Example() {
       <div className="bg-background text-foreground min-h-screen p-6">
         <div className="mx-auto max-w-2xl rounded-md border border-border bg-surface-primary p-4">
           <h2 className="text-content-primary text-lg font-semibold">Settings</h2>
-          <p className="text-muted-foreground mt-1">Compose Mux components here.</p>
+          <p className="text-muted-foreground mt-1">Compose Xum components here.</p>
           <RosettaBanner />
         </div>
       </div>
