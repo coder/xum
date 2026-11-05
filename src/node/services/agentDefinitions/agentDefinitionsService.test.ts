@@ -1781,22 +1781,15 @@ base: a
         return pluginDir;
       }
 
-      async function withXumRoot<T>(home: string, run: () => Promise<T>): Promise<T> {
-        const previousRoot = process.env.XUM_ROOT;
-        process.env.XUM_ROOT = home;
-        try {
-          return await run();
-        } finally {
-          if (previousRoot === undefined) delete process.env.XUM_ROOT;
-          else process.env.XUM_ROOT = previousRoot;
-        }
-      }
-
-      async function refusalOf(read: Promise<unknown>): Promise<PluginAgentRefusalError> {
-        const error = await read.then(
+      async function errorOf(read: Promise<unknown>): Promise<unknown> {
+        return await read.then(
           () => undefined,
           (e: unknown) => e
         );
+      }
+
+      async function refusalOf(read: Promise<unknown>): Promise<PluginAgentRefusalError> {
+        const error = await errorOf(read);
         if (!(error instanceof PluginAgentRefusalError)) {
           throw new Error(`expected a PluginAgentRefusalError, got ${String(error)}`);
         }
@@ -1947,13 +1940,12 @@ base: a
         });
       }
 
-      test("a refused plugin agent does not hide the next scope's agent of that ID", async () => {
+      test("an unreachable plugin agent keeps its ID: the list hides the built-in agent and a spawn does not start it", async () => {
         using hostHome = new DisposableTempDir("agent-defs-unreachable-shadow-home");
         using checkout = new DisposableTempDir("agent-defs-unreachable-shadow-checkout");
         // `explore` is a built-in ID: the plugin's copy cannot run on the remote workspace.
         await writePlugin(path.join(hostHome.path, "plugins"), "egm", {
           "explore.md": foreignAgent(PERSONA_BODY),
-          "persona.md": foreignAgent(PERSONA_BODY),
         });
         const roots = {
           projectRoots: [],
@@ -1966,16 +1958,19 @@ base: a
         const listed = await discoverAgentDefinitions(runtime, checkout.path, options);
         const explore = listed.filter((agent) => agent.id === "explore");
         expect(explore).toHaveLength(1);
-        expect(explore[0]?.scope).toBe("built-in");
-        expect(explore[0]?.unavailableReason).toBeUndefined();
-        expect((await readAgentDefinition(runtime, checkout.path, "explore", options)).scope).toBe(
+        expect(explore[0]).toMatchObject({ scope: "global", pluginName: "egm" });
+        expect(explore[0]?.unavailableReason).toContain("folder-unreachable");
+
+        const refusal = await refusalOf(
+          readAgentDefinition(runtime, checkout.path, "explore", options)
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
+        // Other built-in agents are not affected.
+        expect((await readAgentDefinition(runtime, checkout.path, "exec", options)).scope).toBe(
           "built-in"
         );
 
-        // With no other agent of the ID, the unavailable one is still listed, with its reason.
-        expect(listed.find((agent) => agent.id === "persona")?.unavailableReason).toBeDefined();
-
-        // The inspector's view lists every candidate in precedence order, the refused one included.
+        // The inspector's view lists every candidate in precedence order.
         const everything = await discoverAgentDefinitions(runtime, checkout.path, {
           ...options,
           dedupeById: false,
@@ -1983,6 +1978,34 @@ base: a
         expect(
           everything.filter((agent) => agent.id === "explore").map((agent) => agent.scope)
         ).toEqual(["global", "built-in"]);
+      });
+
+      test("an unreachable project plugin agent does not hand its ID to a global agent either", async () => {
+        using project = new DisposableTempDir("agent-defs-unreachable-global-project");
+        using global = new DisposableTempDir("agent-defs-unreachable-global-home");
+        const container = path.join(project.path, ".xum", "plugins");
+        await writePlugin(container, "egm", { "twin.md": foreignAgent(PERSONA_BODY) });
+        await writeAgent(global.path, "twin", "Global twin");
+        const local = new LocalRuntime(project.path);
+        // A host runtime that reports itself as a devcontainer: it reads the host files, but bash
+        // runs in a container, so the host plugin folder is not a valid path there.
+        const devcontainer = Object.create(local, {
+          location: { value: "devcontainer" },
+        }) as Runtime;
+        const options = { roots: localRoots(project.path, global.path, container), runtimeFactory };
+
+        const refusal = await refusalOf(
+          readAgentDefinition(devcontainer, project.path, "twin", options)
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
+        const listed = await discoverAgentDefinitions(devcontainer, project.path, options);
+        expect(listed.filter((agent) => agent.id === "twin")).toHaveLength(1);
+        expect(listed.find((agent) => agent.id === "twin")?.unavailableReason).toBeDefined();
+
+        // The same plugin on a local workspace runs, and still outranks the global agent.
+        const pkg = await readAgentDefinition(local, project.path, "twin", options);
+        expect(pkg.scope).toBe("project");
+        expect(pkg.body).toContain("persona.md");
       });
 
       test("a remote project plugin agent on the remote host that holds its folder is listed and spawns", async () => {
@@ -2033,7 +2056,7 @@ base: a
             })
           );
           const { run, roots } = localHome(home);
-          await expect(run("persona")).resolves.toMatchObject({ id: "persona" });
+          expect(await run("persona")).toMatchObject({ id: "persona" });
 
           await fs.writeFile(
             path.join(pluginDir, "agents", "persona.md"),
@@ -2084,22 +2107,56 @@ base: a
           await fs.writeFile(path.join(outside.path, "leak.md"), foreignAgent("Leaked."));
           await fs.rm(path.join(pluginDir, "agents"), { recursive: true });
           await fs.symlink(outside.path, path.join(pluginDir, "agents"));
-          await expect(localHome(home).run("leak")).rejects.toThrow(
-            "Agent definition not found: leak"
-          );
+          expect(await errorOf(localHome(home).run("leak"))).toMatchObject({
+            message: "Agent definition not found: leak",
+          });
         });
 
-        test("a refused plugin agent gives way to a lower scope's agent, and a missing ID stays unknown", async () => {
-          using home = new DisposableTempDir("agent-defs-refusal-lower");
+        test("a missing ID stays unknown agent", async () => {
+          using home = new DisposableTempDir("agent-defs-refusal-unknown");
           await writePlugin(path.join(home.path, "plugins"), "egm", {
             "broken.md": "No frontmatter\n",
           });
-          await writeAgent(path.join(home.path, "agents"), "broken", "Global agent");
-          const { run } = localHome(home);
-          // The global agents root outranks global plugins, so it wins before the plugin is read.
-          await expect(run("broken")).resolves.toMatchObject({ scope: "global" });
-          await expect(run("nosuch")).rejects.toThrow("Agent definition not found: nosuch");
+          expect(await errorOf(localHome(home).run("nosuch"))).toMatchObject({
+            message: "Agent definition not found: nosuch",
+          });
         });
+
+        for (const reason of ["not-reviewed", "ambiguous-file", "invalid-definition"] as const) {
+          test(`${reason}: the plugin agent is skipped and the built-in agent of that ID starts`, async () => {
+            using home = new DisposableTempDir(`agent-defs-skip-${reason}`);
+            const agents: Record<string, string> =
+              reason === "ambiguous-file"
+                ? { "Explore.md": foreignAgent("One."), "explore.md": foreignAgent("Two.") }
+                : reason === "invalid-definition"
+                  ? { "explore.md": "No frontmatter\n" }
+                  : { "explore.md": foreignAgent("Reviewed.") };
+            const pluginDir = await writePlugin(path.join(home.path, "plugins"), "egm", agents);
+            if (reason === "not-reviewed") {
+              const consent = await reviewedComponentConsent({ pluginDir });
+              await fs.writeFile(
+                path.join(home.path, "plugins.json"),
+                JSON.stringify({
+                  plugins: [
+                    createTestPluginInstallEntry("egm", { skills: [], mcpServers: [] }, consent),
+                  ],
+                })
+              );
+              await fs.writeFile(
+                path.join(pluginDir, "agents", "explore.md"),
+                foreignAgent("Reviewed.", "model: opus\n")
+              );
+            }
+            const { run, roots } = localHome(home);
+            // The spawn starts the agent that the list shows for the ID.
+            expect(await run("explore")).toMatchObject({ scope: "built-in" });
+            const listed = await discoverAgentDefinitions(new LocalRuntime(home.path), home.path, {
+              roots,
+              runtimeFactory,
+            });
+            expect(listed.find((agent) => agent.id === "explore")?.scope).toBe("built-in");
+          });
+        }
 
         test("a refused plugin agent that outranks a global agent does not hide it", async () => {
           using project = new DisposableTempDir("agent-defs-refusal-project");

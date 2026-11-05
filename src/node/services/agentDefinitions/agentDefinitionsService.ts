@@ -793,7 +793,6 @@ export async function discoverAgentDefinitions(
   const dedupeById = options.dedupeById ?? true;
 
   const byId = new Map<AgentId, AgentDefinitionDescriptor>();
-  const unavailableById = new Map<AgentId, AgentDefinitionDescriptor>();
   const discovered: AgentDefinitionDescriptor[] = [];
 
   // Scan order encodes precedence: earlier roots win when ids collide.
@@ -850,15 +849,13 @@ export async function discoverAgentDefinitions(
       );
       if (!descriptor) continue;
 
-      if (!dedupeById) {
-        discovered.push(descriptor);
-      } else if (descriptor.unavailableReason !== undefined) {
-        // A spawn skips an agent that is not runnable here and reads the next scope's agent of
-        // that ID (loadAgentDefinition), so the list must not let it hide that agent.
-        if (!unavailableById.has(agentId)) unavailableById.set(agentId, descriptor);
-      } else {
-        // First discovered descriptor wins because duplicates are skipped above.
+      if (dedupeById) {
+        // First discovered descriptor wins because duplicates are skipped above. An unavailable
+        // plugin agent keeps its place: it hides a lower scope's agent of that ID from the list,
+        // and a spawn of that ID is refused instead of starting the lower agent (A2, A4).
         byId.set(agentId, descriptor);
+      } else {
+        discovered.push(descriptor);
       }
     }
   }
@@ -873,10 +870,6 @@ export async function discoverAgentDefinitions(
     }
 
     discovered.push(buildAgentDescriptor(pkg));
-  }
-  // An unavailable plugin agent is listed only when no scope or built-in has the ID.
-  for (const [agentId, descriptor] of unavailableById) {
-    if (!byId.has(agentId)) byId.set(agentId, descriptor);
   }
 
   // Return all discovered agents (including those disabled by front-matter).
@@ -1087,8 +1080,9 @@ async function loadAgentDefinition(
   );
 
   const abortSignal = options.abortSignal;
-  // A plugin candidate that claims the ID but Xum refuses does not hide a lower scope's agent. It
-  // is the spawn error only when no scope has the ID (A4).
+  // A plugin candidate that fails to load (not-reviewed, ambiguous-file, invalid-definition) is
+  // skipped, as discovery skips it: a lower scope's agent of that ID starts. Its refusal is the
+  // spawn error only when no scope has the ID (A4).
   const refusals: PluginAgentRefusalError[] = [];
   for (const candidate of candidates) {
     abortSignal?.throwIfAborted();
@@ -1121,6 +1115,8 @@ async function loadAgentDefinition(
       // (#4438, #4827). Parse and validation errors still skip the candidate.
       if (abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
       const refusal = pluginAgentRefusalOf(error, candidate, agentId);
+      // The agent is listed here, so it must not hand its ID to a lower scope (A2, A4).
+      if (refusal?.reason === "folder-unreachable") throw refusal;
       if (refusal !== undefined) refusals.push(refusal);
     }
   }

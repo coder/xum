@@ -246,16 +246,15 @@ export async function buildWorkspaceComposition(
     runtimeFactory,
   });
   // An agent that cannot run in this workspace is not part of what a turn loads: it shows as a
-  // diagnostic, with the refusal a spawn would return.
+  // diagnostic, with the refusal a spawn would return. It still holds its ID, so a lower
+  // agent of that ID shows as shadowed by it (the `task` list hides that agent too).
   const agents = markShadowed(
-    agentDescriptors
-      .filter((agent) => agent.unavailableReason === undefined)
-      .map((agent) => ({
-        name: agent.id,
-        source: sourceLabel(agent.scope, agent.pluginName),
-        ...(agent.description !== undefined ? { description: agent.description } : {}),
-      }))
-  );
+    agentDescriptors.map((agent) => ({
+      name: agent.id,
+      source: sourceLabel(agent.scope, agent.pluginName),
+      ...(agent.description !== undefined ? { description: agent.description } : {}),
+    }))
+  ).filter((_, index) => agentDescriptors[index].unavailableReason === undefined);
   const unavailableAgentDiagnostics = agentDescriptors.flatMap((agent) => {
     if (agent.unavailableReason === undefined) return [];
     assert(agent.unavailablePath !== undefined, "an unavailable agent names its file");
