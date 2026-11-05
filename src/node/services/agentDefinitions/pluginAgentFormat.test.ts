@@ -241,6 +241,11 @@ describe("read-only search lists", () => {
     expect(toolsOf(mapped)).toEqual(["file_read", "attach_file"]);
   });
 
+  test("a one-letter entry is an unknown tool, and an empty entry is dropped", () => {
+    expect(map({ tools: "Read, Grep, X" }).base).toBe("exec");
+    expect(map({ tools: "Read, Grep, " }).base).toBe("explore");
+  });
+
   test("an empty list names itself in the error", () => {
     expect(() => map({ tools: [] })).toThrow(/\(empty\)/);
   });
@@ -311,6 +316,12 @@ describe("mapForeignPluginAgentFrontmatter shape", () => {
       subagent: { runnable: true },
       prompt: { append: false },
     });
+  });
+
+  test("a name that is set stays, even when empty, so the schema refuses it", () => {
+    expect(mapForeignPluginAgentFrontmatter({ name: "", description: "d" }, "reviewer").name).toBe(
+      ""
+    );
   });
 
   test("a Xum-format file passes through, and refuses a Claude list next to its fields", () => {

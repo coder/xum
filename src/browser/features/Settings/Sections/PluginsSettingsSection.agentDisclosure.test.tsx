@@ -100,7 +100,7 @@ test("a preview with one of each component discloses each one", async () => {
     previewOf({
       agents: ["reviewer.md"],
       workflows: ["run.js"],
-      slashCommands: [{ name: "ship", description: "Ship it" }, { name: "plain" }],
+      slashCommands: [{ name: "ship", description: "Ship it" }],
       hook: { path: "hooks.js", toolGrants: ["bash"] },
       fileChanges: [{ summary: "file hooks/stop.sh added", after: "echo stop\n" }],
     })
@@ -108,11 +108,10 @@ test("a preview with one of each component discloses each one", async () => {
 
   view.getByText("Agents (1)");
   view.getByText("Workflows (1)");
-  view.getByText("Slash commands (2)");
+  view.getByText("Slash commands (1)");
   view.getByText("Files (1)");
   view.getByText("Hooks");
   expect(view.getByText("/ship").parentElement?.textContent).toBe("/ship — Ship it");
-  expect(view.getByText("/plain").parentElement?.textContent).toBe("/plain");
   view.getByText(/for: bash/);
 });
 
@@ -121,4 +120,13 @@ test("a hook that sees no tools says so", async () => {
 
   view.getByText(/\(no tool visibility granted\)/);
   expect(view.queryByText(/for: /)).toBeNull();
+});
+
+test("a slash command without a description shows only its name", async () => {
+  const view = await openPreview(
+    previewOf({ slashCommands: [{ name: "plain" }, { name: "ship" }] })
+  );
+
+  view.getByText("Slash commands (2)");
+  expect(view.getByText("/plain").parentElement?.textContent).toBe("/plain");
 });
