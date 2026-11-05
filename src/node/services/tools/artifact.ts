@@ -6,17 +6,17 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { assert } from "@/common/utils/assert";
 import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
 import { PROJECT_SHELF_MULTI_PROJECT_ERROR } from "@/node/services/artifactShelf";
-import { pinVersionToShelf } from "@/node/services/artifactShelfOperations";
+import { pinArtifactToShelf } from "@/node/services/artifactShelfOperations";
 import {
   getToolArtifactsLocation,
-  publishArtifactVersion,
+  publishArtifact,
   resolveArtifactToolPath,
-} from "@/node/services/artifactVersionsOperations";
+} from "@/node/services/artifactPublishOperations";
 
 /**
- * `artifact` tool (Artifacts M4): publish a file from $XUM_SCRATCH_DIR/artifacts as a labeled
- * version. The result stays tiny on purpose: the chat card renders from it alone (it must
- * survive compaction and older-history paging), and the model gains nothing from content.
+ * `artifact` tool (Artifacts M4): publish a file from $XUM_SCRATCH_DIR/artifacts. The result
+ * stays tiny on purpose: the chat card renders from it alone (it must survive compaction and
+ * older-history paging), and the model gains nothing from content.
  */
 export const createArtifactTool: ToolFactory = (config) =>
   tool({
@@ -38,51 +38,49 @@ export const createArtifactTool: ToolFactory = (config) =>
         return { success: false, error: PROJECT_SHELF_MULTI_PROJECT_ERROR };
       }
       try {
-        const published = await publishArtifactVersion({
+        const published = await publishArtifact({
           sessionDir,
           location,
           relPath,
-          label: title,
+          title,
           kind: input.kind ?? undefined,
-          // Persisted for M5's shelf; omitted pin keeps a previously requested one.
+          // Persisted for the shelf; an omitted pin keeps a previously requested one.
           pin: input.pin ?? undefined,
           abortSignal,
         });
         if (!published.success) return { success: false, error: published.error };
         if (input.pin != null) {
-          // M5c: the pin copies this exact version to the shelf (no user approval needed; the
-          // shelf labels it "pinned by agent" and the user can unpin it in one click).
+          // M5c: the pin copies the file's current bytes to the shelf (no user approval needed;
+          // the shelf labels it "pinned by agent" and the user can unpin it in one click).
           const shelfRoot = config.artifactShelfRoot;
           if (shelfRoot == null) {
             return { success: false, error: "The artifact shelf is not available here" };
           }
-          const pinned = await pinVersionToShelf({
+          const pinned = await pinArtifactToShelf({
             shelfRoot,
             projectIdentity,
             scope: input.pin,
             sessionDir,
+            location,
             workspaceId: config.workspaceId ?? "",
-            artifactId: published.result.artifactId,
-            version: published.result.version.version,
+            relPath,
             pinnedBy: "agent",
+            abortSignal,
           });
           if (!pinned.success) {
             return {
               success: false,
-              error: `Published v${published.result.version.version}, but pinning failed: ${pinned.error}`,
+              error: `Published ${relPath}, but pinning failed: ${pinned.error}`,
             };
           }
         }
         return {
           success: true,
-          id: published.result.artifactId,
-          version: published.result.version.version,
           path: relPath,
-          bytes: published.result.version.size,
+          bytes: published.size,
           kind: published.kind,
-          // A republish of identical bytes reuses the latest version (and its label).
-          title: published.result.version.label ?? title,
-          pin: published.result.pin,
+          title: published.record.title,
+          pin: published.record.pin,
         };
       } catch (error) {
         return { success: false, error: `Publishing failed: ${getErrorMessage(error)}` };

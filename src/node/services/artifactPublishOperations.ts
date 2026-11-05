@@ -1,38 +1,26 @@
 import * as path from "path";
-import type { ArtifactPin, ArtifactVersionList } from "@/common/orpc/schemas/artifacts";
+import type { ArtifactPin } from "@/common/orpc/schemas/artifacts";
 import type { ArtifactsIndexAttachment } from "@/common/types/attachment";
 import { getArtifactKind, type ArtifactKind } from "@/common/utils/artifactKind";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { isScratchDirOnHost } from "@/node/runtime/runtimeScratchDir";
 import {
   ARTIFACTS_DIR_NAME,
-  buildArtifactReadResult,
   getArtifactsDir,
   hostSupportsDescriptorPaths,
   parseArtifactRelativePath,
-  type ArtifactReadOutcome,
 } from "./artifactStore";
 import {
-  assertArtifactsEnabled,
   MAX_ARTIFACT_READ_BYTES,
   readArtifactBytesAtLocation,
-  type ArtifactsContext,
   type AvailableArtifactsLocation,
 } from "./artifactsOperations";
 import {
   ARTIFACT_PUBLISH_INTERRUPTED,
-  getArtifactId,
-  listArtifactIndexes,
-  readArtifactIndex,
-  readArtifactVersionBytes,
-  recordArtifactVersion,
-  type RecordArtifactVersionResult,
-} from "./artifactVersionStore";
-
-/**
- * Version operations over the artifacts location abstraction: publishing (the artifact tool,
- * the only source of new versions) and the listVersions/readVersion routes.
- */
+  listArtifactRecords,
+  recordArtifactPublish,
+  type ArtifactRecord,
+} from "./artifactRecordStore";
 
 /**
  * The artifacts location a tool sees, from its exported env: XUM_SCRATCH_DIR is set exactly where
@@ -98,143 +86,82 @@ export function resolveArtifactToolPath(
   return segments.join("/");
 }
 
-export type PublishOutcome =
-  | { success: true; result: RecordArtifactVersionResult; kind: ArtifactKind }
-  | { success: false; error: string };
-
-/** Copy the file's current bytes into the version store (deduped against the latest version). */
-export async function publishArtifactVersion(params: {
-  sessionDir: string;
-  location: AvailableArtifactsLocation;
-  relPath: string;
-  label: string | null;
-  kind?: ArtifactKind;
-  pin?: ArtifactPin | null;
-  abortSignal?: AbortSignal;
-}): Promise<PublishOutcome> {
+/** `bytes` is null when the file is over the read cap. Runtime failures throw. */
+export async function probeArtifactFile(
+  location: AvailableArtifactsLocation,
+  relPath: string,
+  abortSignal?: AbortSignal
+): Promise<
+  { success: true; size: number; bytes: Buffer | null } | { success: false; error: string }
+> {
   const read = await readArtifactBytesAtLocation(
-    params.location,
-    params.relPath,
+    location,
+    relPath,
     MAX_ARTIFACT_READ_BYTES,
-    params.abortSignal
+    abortSignal
   );
   switch (read.status) {
     case "invalid":
       return { success: false, error: read.error };
     case "missing":
-      return { success: false, error: `Artifact not found: ${params.relPath}` };
+      return { success: false, error: `Artifact not found: ${relPath}` };
     case "too_large":
-      return {
-        success: false,
-        error: `Artifact is ${read.size} bytes; versions are capped at ${MAX_ARTIFACT_READ_BYTES} bytes`,
-      };
+      return { success: true, size: read.size, bytes: null };
     case "ok":
-      break;
+      return { success: true, size: read.bytes.length, bytes: read.bytes };
   }
+}
+
+export type PublishOutcome =
+  | { success: true; record: ArtifactRecord; kind: ArtifactKind; size: number }
+  | { success: false; error: string };
+
+export async function publishArtifact(params: {
+  sessionDir: string;
+  location: AvailableArtifactsLocation;
+  relPath: string;
+  title: string;
+  kind?: ArtifactKind;
+  pin?: ArtifactPin;
+  abortSignal?: AbortSignal;
+}): Promise<PublishOutcome> {
+  const probe = await probeArtifactFile(params.location, params.relPath, params.abortSignal);
+  if (!probe.success) return probe;
   // The tool call was cancelled while the file was read: record nothing. Re-checked under the
-  // index lock, so a cancel that lands while waiting for the lock writes nothing either.
+  // record lock, so a cancel that lands while waiting for the lock writes nothing either.
   if (params.abortSignal?.aborted) return { success: false, error: ARTIFACT_PUBLISH_INTERRUPTED };
-  let result: RecordArtifactVersionResult;
   try {
-    result = await recordArtifactVersion({
+    const record = await recordArtifactPublish({
       sessionDir: params.sessionDir,
       relPath: params.relPath,
-      bytes: read.bytes,
-      label: params.label,
+      title: params.title,
       kind: params.kind,
       pin: params.pin,
       abortSignal: params.abortSignal,
     });
+    return {
+      success: true,
+      record,
+      kind: record.kind ?? getArtifactKind(params.relPath),
+      size: probe.size,
+    };
   } catch (error) {
     if (params.abortSignal?.aborted) return { success: false, error: ARTIFACT_PUBLISH_INTERRUPTED };
     throw error;
   }
-  return {
-    success: true,
-    result,
-    kind: result.version.kind ?? params.kind ?? getArtifactKind(params.relPath),
-  };
 }
 
 /**
- * Post-compaction artifacts index: every artifact with a version, newest publish first. Null when
+ * Post-compaction artifacts index: every published artifact, newest publish first. Null when
  * there are none, so workspaces without artifacts add nothing to context.
  */
 export async function generateArtifactsIndexAttachment(
   sessionDir: string
 ): Promise<ArtifactsIndexAttachment | null> {
-  const indexes = await listArtifactIndexes(sessionDir);
-  const artifacts = indexes
-    .flatMap((index) => {
-      const latest = index.versions.at(-1);
-      return latest
-        ? [
-            {
-              path: index.path,
-              latestVersion: latest.version,
-              label: latest.label,
-              at: latest.createdAtMs,
-            },
-          ]
-        : [];
-    })
-    // Stable order (newest first, path tiebreak) keeps the injected note cache-friendly.
-    .sort((a, b) => b.at - a.at || a.path.localeCompare(b.path))
-    .map(({ at: _at, ...rest }) => rest);
+  const records = await listArtifactRecords(sessionDir);
+  // Stable order (newest first, path tiebreak) keeps the injected note cache-friendly.
+  const artifacts = records
+    .sort((a, b) => b.publishedAtMs - a.publishedAtMs || a.path.localeCompare(b.path))
+    .map((record) => ({ path: record.path, title: record.title }));
   return artifacts.length > 0 ? { type: "artifacts_index", artifacts } : null;
-}
-
-function sessionDirFor(context: ArtifactsContext, workspaceId: string): string {
-  return path.join(context.config.sessionsDir, workspaceId);
-}
-
-export async function listArtifactVersions(
-  context: ArtifactsContext,
-  input: { workspaceId: string; path: string }
-): Promise<{ success: true; data: ArtifactVersionList } | { success: false; error: string }> {
-  assertArtifactsEnabled(context);
-  if (!(await context.workspaceService.getInfo(input.workspaceId))) {
-    return { success: false, error: `Workspace not found: ${input.workspaceId}` };
-  }
-  const segments = parseArtifactRelativePath(input.path);
-  if (typeof segments === "string") return { success: false, error: segments };
-  const artifactId = getArtifactId(input.path);
-  const index = await readArtifactIndex(sessionDirFor(context, input.workspaceId), artifactId);
-  return {
-    success: true,
-    data: {
-      artifactId,
-      path: input.path,
-      pin: index?.pin ?? null,
-      versions: [...(index?.versions ?? [])].reverse(),
-    },
-  };
-}
-
-export async function readArtifactVersion(
-  context: ArtifactsContext,
-  input: { workspaceId: string; artifactId: string; version: number }
-): Promise<ArtifactReadOutcome> {
-  assertArtifactsEnabled(context);
-  if (!(await context.workspaceService.getInfo(input.workspaceId))) {
-    return { success: false, error: `Workspace not found: ${input.workspaceId}` };
-  }
-  const stored = await readArtifactVersionBytes(
-    sessionDirFor(context, input.workspaceId),
-    input.artifactId,
-    input.version
-  );
-  if (!stored) {
-    return { success: false, error: `Artifact version not found: v${input.version}` };
-  }
-  return {
-    success: true,
-    data: buildArtifactReadResult(
-      stored.version.path,
-      stored.bytes,
-      stored.version.createdAtMs,
-      MAX_ARTIFACT_READ_BYTES,
-      stored.version.kind ?? getArtifactKind(stored.version.path)
-    ),
-  };
 }

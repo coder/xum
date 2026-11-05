@@ -108,11 +108,6 @@ function Wrapper(props: { children: ReactNode }) {
           success: true as const,
           data: { project: { available: true as const, entries: [] }, global: [] },
         }),
-      listVersions: (input: { workspaceId: string; path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: { artifactId: input.path, path: input.path, pin: null, versions: [] },
-        }),
       capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
     },
   };

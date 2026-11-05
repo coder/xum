@@ -25,12 +25,9 @@ export function formatLineRangeCompact(lineRange: string): string {
   return lineRange;
 }
 
-/** Header label for a review card: `path:L10-12`, or `path · v3` for an artifact comment. */
+/** Header label for a review card: `path:L10-12`, or the artifact path for an artifact comment. */
 export function formatReviewLocationLabel(data: ReviewNoteData, compact = false): string {
-  if (data.artifact != null) {
-    const version = data.artifact.version > 0 ? `v${data.artifact.version}` : "live";
-    return compact ? version : `${data.filePath} · ${version}`;
-  }
+  if (data.artifact != null) return data.filePath;
   const range = `L${formatLineRangeCompact(data.lineRange)}`;
   return compact ? range : `${data.filePath}:${range}`;
 }

@@ -648,9 +648,9 @@ export const KEYBINDS = {
   FIT_ARTIFACT_IMAGE: { key: "0" },
   /** Show an image artifact at actual size (100%) */
   ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
-  /** Pin the shown artifact version to the project shelf */
+  /** Pin the shown artifact to the project shelf */
   PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
-  /** Pin the shown artifact version to the global shelf */
+  /** Pin the shown artifact to the global shelf */
   PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
   /** Unpin the selected shelf entry */
   UNPIN_SHELF_ENTRY: { key: "u" },

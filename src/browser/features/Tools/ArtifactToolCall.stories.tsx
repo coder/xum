@@ -19,11 +19,9 @@ type Story = StoryObj<typeof meta>;
 
 const WORKSPACE_ID = "ws-story-artifact-cards";
 
-function published(path: string, kind: ArtifactKind, version: number, title: string) {
+function published(path: string, kind: ArtifactKind, title: string) {
   return {
     success: true,
-    id: `id-${path}`,
-    version,
     path,
     bytes: 2048,
     kind,
@@ -32,18 +30,17 @@ function published(path: string, kind: ArtifactKind, version: number, title: str
   } as const;
 }
 
-// Titles equal to the file name are omitted on the card ("findings.md · v1").
+// Titles equal to the file name are omitted on the card ("findings.md").
 const CARDS = [
-  published("cache-explorer.html", "html", 3, "interactive chart"),
-  published("findings.md", "markdown", 1, "findings.md"),
-  published("bench-results.json", "json", 2, "p95 by strategy"),
-  published("architecture.svg", "svg", 1, "architecture.svg"),
-  published("revenue.csv", "csv", 4, "Q1 revenue"),
-  published("flows/checkout.mmd", "mermaid", 2, "checkout flow"),
+  published("cache-explorer.html", "html", "interactive chart"),
+  published("findings.md", "markdown", "findings.md"),
+  published("bench-results.json", "json", "p95 by strategy"),
+  published("architecture.svg", "svg", "architecture.svg"),
+  published("revenue.csv", "csv", "Q1 revenue"),
+  published("flows/checkout.mmd", "mermaid", "checkout flow"),
   published(
     "reports/2026/q3/very-long-folder-name/service-latency-breakdown.md",
     "markdown",
-    12,
     "latency breakdown with a long title"
   ),
 ] as const;

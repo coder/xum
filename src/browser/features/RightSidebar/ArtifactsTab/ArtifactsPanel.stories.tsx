@@ -210,7 +210,7 @@ function renderPanel(
   options: { allowCdn?: boolean; workspaceId?: string; sendInteractionError?: string } = {}
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath });
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -358,7 +358,6 @@ function renderGallery() {
     writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, {
       scope: "artifact",
       path: renderer.path,
-      version: null,
     });
   }
   return (
@@ -565,40 +564,12 @@ export const SendStripAndAnnotate: Story = {
   },
 };
 
-/** Toolbar version menu, open: "Latest (live)" plus stored versions, newest first. */
-function renderVersionMenu() {
-  const workspaceId = `${WORKSPACE_ID}-versions`;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
-  const now = Date.now();
-  const at = (minutesAgo: number) => now - minutesAgo * 60_000;
-  const base = { sha256: "sha", size: MARKDOWN.length, path: "report.md" } as const;
+function renderPinMenu() {
+  const workspaceId = `${WORKSPACE_ID}-pin-menu`;
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md" });
   return (
     <APIProvider
-      client={createMockORPCClient({
-        artifacts: {
-          listing: listingFor(FILES),
-          files: FILES,
-          versions: {
-            "report.md": [
-              {
-                ...base,
-                version: 3,
-                label: "Weekly report, final",
-                source: "publish",
-                createdAtMs: at(4),
-              },
-              { ...base, version: 2, label: null, source: "turn-end", createdAtMs: at(95) },
-              {
-                ...base,
-                version: 1,
-                label: "First draft",
-                source: "publish",
-                createdAtMs: at(60 * 26),
-              },
-            ],
-          },
-        },
-      })}
+      client={createMockORPCClient({ artifacts: { listing: listingFor(FILES), files: FILES } })}
     >
       <div className="bg-background flex h-screen justify-end">
         <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
@@ -609,22 +580,22 @@ function renderVersionMenu() {
   );
 }
 
-export const VersionMenuOpen: Story = {
+export const PinMenuOpen: Story = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
-  render: renderVersionMenu,
+  render: renderPinMenu,
   play: async ({ canvasElement }) => {
     await waitForMarkdown(canvasElement);
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("button", { name: "Version: Latest (live)" }));
-    const menu = await canvas.findByRole("menu", { name: "Artifact versions" });
-    await within(menu).findByText("Turn snapshot");
+    await userEvent.click(await canvas.findByRole("button", { name: "Pin to shelf" }));
+    const menu = await canvas.findByRole("menu", { name: "Pin to shelf" });
+    await within(menu).findByRole("menuitem", { name: "Pin to global shelf" });
   },
 };
 
 /** Picker open on the Shelf group (M5c): project then global entries, with who pinned them. */
 function renderShelfPicker() {
   const workspaceId = `${WORKSPACE_ID}-shelf`;
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md" });
   const now = Date.now();
   const entry = (
     scope: "project" | "global",
@@ -639,7 +610,6 @@ function renderShelfPicker() {
     title,
     kind: getArtifactKind(file),
     size: 2048,
-    version: 2,
     sourceWorkspaceId: "ws-other",
     sourcePath: file,
     pinnedAtMs: now - minutesAgo * 60_000,
@@ -698,13 +668,13 @@ export const ShelfPickerLaptop: Story = {
 
 /**
  * Picker with one published report and 12 screenshots the agent kept next to it (only the
- * report has stored versions). The screenshots are newer, yet the report leads and they wait
+ * report was published). The screenshots are newer, yet the report leads and they wait
  * under a collapsed "Other files" group.
  */
 function renderOtherFilesPicker() {
   const workspaceId = `${WORKSPACE_ID}-other-files`;
   // No stored selection, so the story also shows the default pick.
-  writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: null });
   const files: Record<string, ArtifactReadResult> = {};
   for (let n = 1; n <= 11; n++) {
     const path = `img/step-${String(n).padStart(2, "0")}.png`;
@@ -713,7 +683,7 @@ function renderOtherFilesPicker() {
   files["img/chart.png"] = FILES["img/chart.png"];
   files["report.md"] = FILES["report.md"];
   const listing = listingFor(files);
-  if (listing.available) listing.versionedPaths = ["report.md"];
+  if (listing.available) listing.publishedPaths = ["report.md"];
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -960,7 +930,7 @@ export const BridgeEscapeExitsFullscreen: Story = {
 };
 
 // Fullscreen has no focus trap, so when the viewer is swapped out from under a focused control
-// (here a selection change; in the app also a poll that finds a new version), focus would fall
+// (here a selection change; in the app also a poll that finds a rewritten file), focus would fall
 // to <body> and Escape would miss the panel. A real browser is needed: happy-dom holds
 // MutationObserver callbacks through a WeakRef, so long-lived observers die on GC there.
 const SWAP_WORKSPACE_ID = `${WORKSPACE_ID}-fullscreen-swap`;

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { ReviewStateDelta, ReviewStateSections } from "@/common/orpc/schemas/reviewState";
-import { applyReviewStateDelta, mergeReviewStateDeltas } from "./reviewState";
+import {
+  applyReviewStateDelta,
+  mergeReviewStateDeltas,
+  sanitizeReviewStateSnapshot,
+} from "./reviewState";
 
 describe("mergeReviewStateDeltas", () => {
   // The frontend store flushes all pending deltas as one merged request; the backend
@@ -45,5 +49,22 @@ describe("mergeReviewStateDeltas", () => {
         expected
       );
     }
+  });
+});
+
+describe("sanitizeReviewStateSnapshot", () => {
+  it("keeps an artifact note saved with a version, without the version", () => {
+    const anchor = { kind: "point" as const, x: 0.4, y: 0.2 };
+    const note = (artifact: { anchor: typeof anchor; version?: number }) => ({
+      id: "r1",
+      status: "pending" as const,
+      createdAt: 1,
+      data: { filePath: "report.md", lineRange: "", selectedCode: "", userNote: "Why?", artifact },
+    });
+    const { snapshot, droppedEntries } = sanitizeReviewStateSnapshot({
+      sections: { reviews: { r1: note({ version: 3, anchor }) } },
+    });
+    expect(droppedEntries).toBe(0);
+    expect(snapshot.sections.reviews?.r1).toEqual(note({ anchor }));
   });
 });
