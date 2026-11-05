@@ -544,10 +544,10 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
 }
 
 /**
- * The bounds of the pixels that differ between two screenshots outside a box, or null when
- * they agree there. The box is widened by one pixel, so its own antialiased edge never counts.
+ * The sides of a box on which two screenshots differ outside it. The box is widened by one
+ * pixel, so its own antialiased edge never counts.
  */
-function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null {
+function sidesWithDifference(box: Box, shown: Pixels, hidden: Pixels): string[] {
   assert(
     shown.width === hidden.width && shown.height === hidden.height,
     "Both screenshots must have the viewport's size"
@@ -556,7 +556,7 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null 
   const right = Math.ceil(box.right) + 1;
   const top = Math.floor(box.top) - 1;
   const bottom = Math.ceil(box.bottom) + 1;
-  let [minX, minY, maxX, maxY] = [Infinity, Infinity, -1, -1];
+  const sides = new Set<string>();
   for (let y = 0; y < shown.height; y++) {
     for (let x = 0; x < shown.width; x++) {
       if (x >= left && x < right && y >= top && y < bottom) {
@@ -564,18 +564,73 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null 
         continue;
       }
       const at = (y * shown.width + x) * shown.channels;
-      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
-        continue;
+      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) !== 0) {
+        sides.add(y >= bottom ? "below" : y < top ? "above" : x < left ? "left of" : "right of");
       }
-      [minX, minY, maxX, maxY] = [
-        Math.min(minX, x),
-        Math.min(minY, y),
-        Math.max(maxX, x),
-        Math.max(maxY, y),
-      ];
     }
   }
-  return maxX < 0 ? null : { left: minX, top: minY, right: maxX, bottom: maxY };
+  return [...sides].sort();
+}
+
+/** Hides one diagram, takes a second picture, and names the sides of its box that changed. */
+async function sidesPaintedOutside(
+  page: StoryPage,
+  index: number,
+  box: Box,
+  shown: Pixels
+): Promise<string[]> {
+  await setDiagramHidden(page, index, true);
+  try {
+    return sidesWithDifference(box, shown, await viewportPixels(page));
+  } finally {
+    await setDiagramHidden(page, index, false);
+  }
+}
+
+/**
+ * Scrolls what follows a diagram's frame into view, or puts the page back. A tall diagram ends
+ * below the viewport, and the page does not scroll by itself.
+ */
+function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
+  return page.$$eval(
+    PAGE_DIAGRAMS,
+    (diagrams, [target, down]) => {
+      const frame = diagrams[target as number].parentElement!.parentElement!;
+      if (down) {
+        (frame.nextElementSibling ?? frame).scrollIntoView({ block: "end" });
+        return;
+      }
+      for (let el = frame.parentElement; el; el = el.parentElement) {
+        el.scrollTop = 0;
+        el.scrollLeft = 0;
+      }
+    },
+    [index, scroll]
+  );
+}
+
+/** Room for a few lines of text below a box, which is where a diagram that escapes paints. */
+const MIN_BELOW_PX = 8;
+const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ceil(box.bottom) - 1;
+
+/**
+ * Compares the strip below a diagram's box in a scrolled view, for a diagram that ends below the
+ * viewport. The strip is where iPhone Safari painted over the text, so a diagram that has none
+ * to compare fails.
+ */
+async function sidesPaintedBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
+  await scrollBelowDiagram(page, index, true);
+  try {
+    const box = (await diagramPaintBoxes(page))[index];
+    const shown = await viewportPixels(page);
+    assert(
+      roomBelow(box, shown.height) >= MIN_BELOW_PX,
+      `Diagram ${index} has no content below it to compare: put text after it in the story`
+    );
+    return await sidesPaintedOutside(page, index, box, shown);
+  } finally {
+    await scrollBelowDiagram(page, index, false);
+  }
 }
 
 /**
@@ -585,8 +640,8 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels): Box | null 
  * the page must look the same with that diagram hidden as with it shown. WebKit lays the page
  * out again at its next screenshot or resize, which repairs the very state this check looks
  * for. So the page is shown to the camera once, before anything else touches it, and every
- * diagram is compared against that one picture. The viewport is left alone for the same reason,
- * and the page does not scroll, so only what fits the viewport is compared.
+ * diagram is compared against that one picture. The viewport is left alone for the same reason.
+ * Only a diagram that ends below the viewport is scrolled into view afterwards.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
@@ -598,18 +653,12 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   const shown = await viewportPixels(page);
   const painted: string[] = [];
   for (const [index, box] of boxes.entries()) {
-    await setDiagramHidden(page, index, true);
-    let hidden: Pixels;
-    try {
-      hidden = await viewportPixels(page);
-    } finally {
-      await setDiagramHidden(page, index, false);
+    const sides = await sidesPaintedOutside(page, index, box, shown);
+    if (roomBelow(box, shown.height) < MIN_BELOW_PX) {
+      sides.push(...(await sidesPaintedBelowWhenScrolled(page, index)));
     }
-    const ink = differenceOutside(box, shown, hidden);
-    if (ink) {
-      painted.push(
-        `diagram ${index} paints over x ${ink.left}-${ink.right}, y ${ink.top}-${ink.bottom}`
-      );
+    if (sides.length > 0) {
+      painted.push(`diagram ${index} paints ${[...new Set(sides)].sort().join(" and ")} its box`);
     }
   }
   assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");
