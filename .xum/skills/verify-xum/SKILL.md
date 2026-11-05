@@ -345,17 +345,21 @@ after their other arguments. Without one they use the newest launch from this ch
   `server.log` shows `optimized dependencies changed. reloading`. The panel and its tab stay open
   across the reload. Run `idle`, wait for the panel's text, and continue from the open tab (see
   the Review recipe).
-- Now and then Chrome fails every module request that is still queued (about 60 while the page
-  loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of the host
-  changed. A Docker container that starts on a shared host adds an interface. The page or panel
-  then shows `<name> failed to load.` with a `Reload` button, and the console logs
-  `Failed to fetch dynamically imported module`. Vite is not at fault: curl gets the same module at
-  once. `React.lazy` keeps the failure, so only a reload recovers. `verify-xum.sh idle` exits 3 on
-  it. Run `agent-browser reload`, then repeat the step, and note the reload in your report. Launch
-  warms Vite, so a page load takes a few seconds and the window for such a change is short.
-- A page that stays on `Loading Xum` is still loading: Vite is transforming modules that no one
-  requested before. After a launch this happens only for modules that a source edit made Vite
-  transform again. Run `idle` once more. `agent-browser reload` does not make it faster.
+- Now and then Chrome fails every module request that is still queued (a dozen to 60 while the
+  page loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of the host
+  changed. A Docker container that starts on a shared host adds one: `ip monitor link` shows its
+  `veth` links at that instant. Vite is not at fault: curl gets the same module at once. What the
+  page shows depends on the failed modules. A lazily loaded one shows `<name> failed to load.` with
+  a `Reload` button, the console logs `Failed to fetch dynamically imported module`, and
+  `verify-xum.sh idle` exits 3. A module of the first-load graph shows nothing: the page stays on
+  `Loading Xum` and `idle` exits 1 after 25 s. `React.lazy` keeps a failure and the boot screen has
+  no failure state, so only a reload recovers. Run `agent-browser reload`, then repeat the step,
+  and note the reload in your report. Launch warms Vite, so a page load takes a few seconds and
+  the window for such a change is short.
+- A page that stays on `Loading Xum` is still loading while Vite transforms modules that no one
+  requested before. After a launch that is only a module that a source edit made Vite transform
+  again. Run `idle` once more. When the page stays on `Loading Xum` after that, a module request
+  failed (see the previous item): run `agent-browser reload`.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press

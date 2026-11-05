@@ -774,7 +774,12 @@ SETTLED_OR_CHUNK_FAILED_JS="(() => {
 
 cmd_idle() {
   load_run "${1:-}"
-  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null
+  # A failed module of the first-load graph leaves the boot screen up with no message, so the wait
+  # times out. Say what to try, because the bare "Wait timed out" does not.
+  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null || {
+    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', run idle once more, then agent-browser reload (SKILL.md Gotchas)." >&2
+    exit 1
+  }
   if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then
     echo "verify-xum: the page shows '<name> failed to load.': a module fetch failed (usually a host network change). Run agent-browser reload, then repeat the step." >&2
     exit 3
