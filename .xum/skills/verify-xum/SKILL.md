@@ -105,10 +105,10 @@ Ready means all of these hold:
 - the seed is done: onboarding marked seen, a fake Anthropic provider on a dead loopback port (the
   composer refuses to send without a provider), the trusted project `demo-app` (a throwaway git
   repo) and the workspace `Verify playground` with its worktree set up,
-- Vite has transformed every module that the renderer imports, the lazily loaded ones too (about
-  1,600). Worker scripts are left out (see Gotchas).
-  Vite transforms a module on its first request, on one thread, and React Compiler makes that cost
-  about 45 CPU seconds for the first page load. A cold Vite makes the first `open` plus `idle` take
+- Vite has transformed every module that the renderer's served code imports, statically or with
+  `import()` (about 1,600). Worker scripts are left out (see Gotchas). Vite transforms a module on
+  its first request, on one thread. For the first page load that is about 45 CPU seconds, most of
+  it in Babel, where React Compiler runs. A cold Vite makes the first `open` plus `idle` take
   longer than agent-browser's 25 s wait. `scripts/warmViteModules.ts` requests the whole graph over
   HTTP, so the first `open` gets modules from Vite's cache. It fails the launch on a module that
   Vite cannot serve.
@@ -264,7 +264,7 @@ in everything it writes, as a second layer.
 - It uses the repo's locked `playwright-core`. WebKit needs GTK and GStreamer libraries that many
   hosts lack. On `auto` (the default of `VERIFY_XUM_WEBKIT`, which can also be `host` or
   `docker`) it runs on the host when WebKit launches there (`node_modules/.bin/playwright
-install webkit`, and `--with-deps` for the libraries). Otherwise it runs the same helper in
+  install webkit`, and `--with-deps` for the libraries). Otherwise it runs the same helper in
   `mcr.microsoft.com/playwright@sha256:2f05f8a7...` (Playwright 1.64.1, pinned by digest, pulled
   once). The image's browsers belong to that Playwright version: after a Playwright bump, set
   `WEBKIT_IMAGE` and `WEBKIT_IMAGE_PLAYWRIGHT_CORE` in `verify-xum.sh` (the recipe is in the
@@ -352,18 +352,18 @@ after their other arguments. Without one they use the newest launch from this ch
   while the page loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of
   the host changed. A Docker container that starts on a shared host adds one: `ip monitor link`
   shows its `veth` links at that instant. Vite is not at fault: curl gets the same module at once.
-  What the page shows depends on the failed modules. A lazily loaded one shows `<name> failed to
-load.` with a `Reload` button, the console logs `Failed to fetch dynamically imported module`,
-  and `verify-xum.sh idle` exits 3. A module of the first-load graph shows nothing: the page stays
-  on `Loading Xum` and `idle` exits 1 after 25 s. `React.lazy` keeps a failure and the boot screen
-  has no failure state, so only a reload recovers. Run `agent-browser reload`, then repeat the
-  step, and note the reload in your report. Launch warms Vite, so a page load takes a few seconds
-  and the window for such a change is short. Under heavy host load a warm load can still take
-  20 s.
-- A page that stays on `Loading Xum` after `idle` timed out lost a module request (see the previous
-  item): run `agent-browser reload`. It can also be slow while Vite transforms modules that no one
-  requested before. After a launch that is only a module that a source edit made Vite transform
-  again, and a reload costs nothing then.
+  What the page shows depends on the failed modules. A lazily loaded one shows
+  `<name> failed to load.` with a `Reload` button, the console logs
+  `Failed to fetch dynamically imported module`, and `verify-xum.sh idle` exits 3. A module of the
+  first-load graph shows nothing: the page stays on `Loading Xum` and `idle` exits 1 after 25 s.
+  `React.lazy` keeps a failure and the boot screen has no failure state, so only a reload
+  recovers. Run `agent-browser reload`, then repeat the step, and note the reload in your report.
+  Launch warms Vite, so a page load takes a few seconds and the window for such a change is
+  short. Under heavy host load a warm load can still take 20 s.
+- A page that stays on `Loading Xum` after `idle` timed out has lost a module request (see the
+  previous item): run `agent-browser reload`. A slow transform is not the cause after a launch:
+  Vite has already transformed every module, and it transforms one again only after a source edit
+  changes it.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press

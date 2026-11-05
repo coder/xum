@@ -86,7 +86,9 @@ export async function warmModuleGraph(
     else active--;
   };
 
-  // The path and query of `candidate` on Vite's origin, or null when it names another origin.
+  // The path and query of `candidate` on Vite's origin, or null when it names another origin. The
+  // key can still start with `//` (`/.//host/x.js` parses to the path `//host/x.js`), so a key is
+  // never resolved against the origin again: `requestUrl` joins them as text.
   const toKey = (candidate: string): string | null => {
     try {
       const target = new URL(candidate, base);
@@ -94,6 +96,11 @@ export async function warmModuleGraph(
     } catch {
       return null;
     }
+  };
+
+  const requestUrl = (key: string): URL => {
+    if (!key.startsWith("/")) throw new Error(`a module key must be a path, got ${key}`);
+    return new URL(base.origin + key);
   };
 
   const claim = (url: string): boolean => {
@@ -110,7 +117,7 @@ export async function warmModuleGraph(
     await acquire();
     try {
       options.signal?.throwIfAborted();
-      const response = await fetch(new URL(url, base), { signal: options.signal });
+      const response = await fetch(requestUrl(url), { signal: options.signal });
       const type = response.headers.get("content-type") ?? "";
       if (response.status >= 500) {
         failures.push(`${url}: HTTP ${response.status}`);

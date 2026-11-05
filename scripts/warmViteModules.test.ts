@@ -158,10 +158,105 @@ describe("warmModuleGraph", () => {
 
     const result = await warmModuleGraph(origin);
 
-    // Nothing reaches the other host, and Vite does not get the other host's path either.
+    // Nothing reaches the other host, and Vite gets no request that names it either.
     expect(other.requests).toEqual([]);
+    expect(requests.filter((path) => path.includes(otherHost))).toEqual([]);
     expect(requests).not.toContain("/x.js");
     expect(result.served).toBe(3);
+  });
+
+  // `new URL(path, base)` turns a path that starts with `//` into another host. URL parsing keeps
+  // such a path after it removes dot segments from `/.//host/x.js`, so the walk must never resolve
+  // a path against the origin a second time.
+  test.each([
+    ["a dot segment before the slashes", (host: string) => `/.//${host}/x.js`, "/x.js"],
+    [
+      "a parent segment before the slashes, with a query",
+      (host: string) => `/a/..//${host}/y.js?q=1`,
+      "/y.js",
+    ],
+    ["an encoded dot segment before the slashes", (host: string) => `/%2e//${host}/z.js`, "/z.js"],
+  ])("never requests another origin through %s", async (_name, importPath, otherPath) => {
+    const other = serve({
+      "/x.js": () => js("export {}"),
+      "/y.js?q=1": () => js("export {}"),
+      "/z.js": () => js("export {}"),
+    });
+    const otherHost = other.origin.replace("http://", "");
+    const { origin } = serve({
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () => js(`import "${importPath(otherHost)}"; import "/src/ok.ts"`),
+      "/src/ok.ts": () => js("export {}"),
+    });
+
+    const result = await warmModuleGraph(origin);
+
+    expect(other.requests, `the other host got a request for ${otherPath}`).toEqual([]);
+    expect(result.served).toBe(3);
+  });
+
+  test("keeps at most `concurrency` requests in flight", async () => {
+    let inFlight = 0;
+    let mostInFlight = 0;
+    const leaves = Array.from({ length: 12 }, (_, index) => `/src/leaf${index}.ts`);
+    const routes: Record<string, Handler> = {
+      "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/src/main.tsx": () => js(leaves.map((leaf) => `import "${leaf}";`).join("\n")),
+    };
+    for (const leaf of leaves) {
+      routes[leaf] = async () => {
+        inFlight++;
+        mostInFlight = Math.max(mostInFlight, inFlight);
+        // Long enough that the walk has queued every other leaf while this one is open.
+        await Bun.sleep(60);
+        inFlight--;
+        return js("export {}");
+      };
+    }
+    const { origin } = serve(routes);
+
+    await warmModuleGraph(origin, { concurrency: 3 });
+
+    expect(mostInFlight).toBe(3);
+  });
+
+  test("rejects a concurrency below 1", async () => {
+    const { origin } = serve({});
+
+    const failure = await warmModuleGraph(origin, { concurrency: 0 }).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect((failure as Error).message).toContain("concurrency must be at least 1");
+  });
+
+  test("stops a walk whose graph never ends", async () => {
+    // Every module /m/<n> imports 50 modules that no one has asked for yet.
+    const runaway = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === "/") {
+          return new Response(INDEX_HTML, { headers: { "content-type": "text/html" } });
+        }
+        if (path === "/src/main.tsx") return js(`import "/m/0";`);
+        const id = Number(path.replace("/m/", ""));
+        if (!Number.isInteger(id)) return new Response("not found", { status: 404 });
+        return js(
+          Array.from({ length: 50 }, (_, i) => `import "/m/${id * 50 + i + 1}";`).join("\n")
+        );
+      },
+    });
+    servers.push(runaway);
+
+    const failure = await warmModuleGraph(`http://127.0.0.1:${runaway.port}`).then(
+      () => null,
+      (error: unknown) => error
+    );
+
+    expect((failure as Error).message).toMatch(/more than \d+ URLs/);
   });
 
   test("gives up when the signal aborts while Vite never answers", async () => {
