@@ -96,10 +96,10 @@ function JsonNode(props: {
 
 type JsonMode = "table" | "tree" | "raw";
 
-// The chosen mode and tree expansion per shown file version (ArtifactViewer's viewKey).
+// The chosen mode and tree expansion per shown file (ArtifactViewer's viewKey).
 // Fullscreen, sidebar tab switches and Raw -> Tree remount the viewer or the tree, and component
-// state alone fell back to the defaults (N7). A new version has a new key, so it starts at the
-// defaults again. Shared by every mounted viewer of the version and capped, oldest first
+// state alone fell back to the defaults (N7). A rewrite of the file has a new key, so it starts at
+// the defaults again. Shared by every mounted viewer of the file and capped, oldest first
 // (cappedMemory.ts).
 const REMEMBERED_VIEWS_MAX = 64;
 const REMEMBERED_TOGGLES_MAX = 1_000;

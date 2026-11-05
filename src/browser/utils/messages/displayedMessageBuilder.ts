@@ -316,10 +316,7 @@ function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetada
     typeof meta.artifactPath !== "string" ||
     typeof meta.title !== "string" ||
     typeof meta.text !== "string" ||
-    meta.action !== "send" ||
-    typeof meta.version !== "number" ||
-    !Number.isInteger(meta.version) ||
-    meta.version < 0
+    meta.action !== "send"
   ) {
     return undefined;
   }
@@ -327,7 +324,6 @@ function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetada
     id: meta.id,
     artifactPath: meta.artifactPath,
     title: meta.title,
-    version: meta.version,
     action: "send",
     text: meta.text,
     ...(meta.data !== undefined ? { data: meta.data } : {}),

@@ -679,7 +679,7 @@ check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies
 
 # CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
 # diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
-check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS or HTML file declares the zoom property
+check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS, HTML or SVG file declares the zoom property
 	@bun test ./scripts/check-no-css-zoom.test.ts
 	@bun scripts/check-no-css-zoom.ts
 

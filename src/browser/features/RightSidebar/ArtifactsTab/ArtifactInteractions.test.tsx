@@ -38,7 +38,7 @@ const HTML: ArtifactReadResult = {
 const PINNED: ArtifactReadResult = { ...HTML, path: "docs/pinned.html" };
 let pinnedHtml = false;
 
-let sends: Array<{ path: string; text: string; data?: unknown; version: number | null }> = [];
+let sends: Array<{ path: string; text: string; data?: unknown }> = [];
 let savedStates: unknown[] = [];
 interface SetStateResult {
   success: true;
@@ -70,11 +70,6 @@ function Wrapper(props: { children: ReactNode }) {
           },
         }),
       read: () => Promise.resolve({ success: true as const, data: HTML }),
-      listVersions: (input: { path: string }) =>
-        Promise.resolve({
-          success: true as const,
-          data: { artifactId: "id", path: input.path, pin: null, versions: [] },
-        }),
       listPinned: () =>
         Promise.resolve({
           success: true as const,
@@ -97,12 +92,7 @@ function Wrapper(props: { children: ReactNode }) {
         return { success: true as const, data: { state: persistedState } };
       },
       setState: (input: { state: unknown }) => setStateImpl(input.state),
-      sendInteraction: (input: {
-        path: string;
-        text: string;
-        data?: unknown;
-        version: number | null;
-      }) => {
+      sendInteraction: (input: { path: string; text: string; data?: unknown }) => {
         sends.push(input);
         return (sendGate ?? Promise.resolve()).then(() =>
           sendFailure != null
@@ -204,7 +194,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(strip.textContent).not.toContain("Swapped");
     fireEvent.click(sendButton);
     await waitFor(() => expect(sends).toHaveLength(1));
-    expect(sends[0]).toMatchObject({ path: "form.html", text: "First", version: null });
+    expect(sends[0]).toMatchObject({ path: "form.html", text: "First" });
     await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
 
     // After Send the artifact can ask again.
@@ -297,10 +287,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   });
 
   test("clicked sends from the host (canvas buttons) each go out at once", async () => {
-    const view = render(
-      <InteractionsHarness target={{ path: HTML.path, version: 1, latestVersion: 1 }} />,
-      { wrapper: Wrapper }
-    );
+    const view = render(<InteractionsHarness target={{ path: HTML.path }} />, { wrapper: Wrapper });
     act(() => hookHandlers?.requestSend("Ship A", undefined, "click"));
     await waitFor(() => expect(sends).toHaveLength(1));
     // Once the first one is delivered, the next click sends too: no per-click window here.
@@ -436,43 +423,8 @@ describe("artifact interactions in the Artifacts panel", () => {
     await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
   });
 
-  test("Send delivers the version shown when the artifact asked, not the one selected later", async () => {
-    const target = (version: number) => ({ path: HTML.path, version, latestVersion: 2 });
-    const view = render(<InteractionsHarness target={target(1)} />, { wrapper: Wrapper });
-    act(() => hookHandlers?.requestSend("Ship v1", undefined, "ask"));
-    await view.findByTestId("artifact-send-strip");
-    view.rerender(<InteractionsHarness target={target(2)} />);
-    // Send arms after a short delay (confirmArming.ts).
-    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
-    await waitFor(() => expect(sendButton.disabled).toBe(false), {
-      timeout: CONFIRM_ARM_DELAY_MS + 1000,
-    });
-    fireEvent.click(sendButton);
-    await waitFor(() => expect(sends).toHaveLength(1));
-    expect(sends[0]).toMatchObject({ text: "Ship v1", version: 1 });
-  });
-
-  test("a live view's send keeps the newest version from when the artifact asked", async () => {
-    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
-    const view = render(<InteractionsHarness target={live(2)} />, { wrapper: Wrapper });
-    act(() => hookHandlers?.requestSend("Ship it", undefined, "ask"));
-    await view.findByTestId("artifact-send-strip");
-    // A snapshot lands while the strip is open.
-    view.rerender(<InteractionsHarness target={live(3)} />);
-    const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
-    await waitFor(() => expect(sendButton.disabled).toBe(false), {
-      timeout: CONFIRM_ARM_DELAY_MS + 1000,
-    });
-    fireEvent.click(sendButton);
-    await waitFor(() => expect(sends).toHaveLength(1));
-    expect(sends[0]).toMatchObject({ text: "Ship it", version: 2 });
-  });
-
   test("Send needs a press that started after it armed (or keyboard activation)", async () => {
-    const view = render(
-      <InteractionsHarness target={{ path: HTML.path, version: 1, latestVersion: 1 }} />,
-      { wrapper: Wrapper }
-    );
+    const view = render(<InteractionsHarness target={{ path: HTML.path }} />, { wrapper: Wrapper });
     act(() => hookHandlers?.requestSend("Held", undefined, "ask"));
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     // A press held from before the strip armed does not confirm it on release.
@@ -492,9 +444,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(sends[0]).toMatchObject({ text: "Held" });
   });
 
-  test("a new version waits for the tab's pending write, then loads the saved state", async () => {
-    // The state is per artifact, so v2 must start with what the user picked on v1. The rebuild
-    // reads the server only after this tab's write has landed, so it never gets a pre-write state.
+  test("a rewritten file waits for the tab's pending write, then loads the saved state", async () => {
     let settleWrite: () => void = () => undefined;
     setStateImpl = (state) =>
       new Promise<SetStateResult>((resolve) => {
@@ -503,11 +453,11 @@ describe("artifact interactions in the Artifacts panel", () => {
           resolve({ success: true as const, data: undefined });
         };
       });
-    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
-    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    const read = (readKey: string) => ({ path: HTML.path, readKey });
+    const view = render(<InteractionsHarness target={read("first")} />, { wrapper: Wrapper });
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
     act(() => hookHandlers?.setState?.({ step: 4 }));
-    view.rerender(<InteractionsHarness target={live(2)} />);
+    view.rerender(<InteractionsHarness target={read("rewritten")} />);
     await act(() => Promise.resolve());
     // Still waiting: the frame is not rebuilt with a state the write may change.
     expect(hookHandlers?.initialState).toBeUndefined();
@@ -521,12 +471,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("Reload hands the remounted frame the newest state", async () => {
     // Bug bash: Reload remounts the viewer but not this hook, so the frame got the last load's
     // state and lost the picks made since.
-    const shown = (reloadTick: number) => ({
-      path: HTML.path,
-      version: 2,
-      latestVersion: 2,
-      reloadTick,
-    });
+    const shown = (reloadTick: number) => ({ path: HTML.path, reloadTick });
     const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
     act(() => hookHandlers?.setState?.({ step: 5 }));
@@ -539,12 +484,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("once its write settles, a rebuild takes the server's state, not the tab's", async () => {
     // The tab's own state overrides a server read only while its write is queued or in flight:
     // afterwards another window's newer save (or a failed write) must not be hidden.
-    const shown = (reloadTick: number) => ({
-      path: HTML.path,
-      version: 2,
-      latestVersion: 2,
-      reloadTick,
-    });
+    const shown = (reloadTick: number) => ({ path: HTML.path, reloadTick });
     const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
     act(() => hookHandlers?.setState?.({ step: 5 }));
@@ -573,7 +513,7 @@ describe("artifact interactions in the Artifacts panel", () => {
         inFlight.push(request);
         maxInFlight = Math.max(maxInFlight, inFlight.length);
       });
-    render(<InteractionsHarness target={{ path: HTML.path, version: 0, latestVersion: 0 }} />, {
+    render(<InteractionsHarness target={{ path: HTML.path }} />, {
       wrapper: Wrapper,
     });
     act(() => {

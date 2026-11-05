@@ -70,7 +70,6 @@ import {
   ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
-  ArtifactVersionListSchema,
   PinnedArtifactFilesSchema,
 } from "./artifacts";
 import { ResultSchema } from "./result";
@@ -1501,20 +1500,6 @@ export const artifacts = {
     input: z.object({ workspaceId: z.string() }),
     output: ArtifactCapabilitiesSchema,
   },
-  /** Versions of the artifact at `path` (relative to the artifacts dir), newest first. */
-  listVersions: {
-    input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactVersionListSchema, z.string()),
-  },
-  /** One stored version, in the same shape as `read` (modifiedMs = version creation time). */
-  readVersion: {
-    input: z.object({
-      workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
-    }),
-    output: ArtifactReadOutcomeSchema,
-  },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
     input: z.object({ workspaceId: z.string() }),
@@ -1556,12 +1541,11 @@ export const artifacts = {
     }),
     output: ArtifactReadOutcomeSchema,
   },
-  /** User pin: copy one stored version to the project or global shelf. */
+  /** User pin: copy the artifact's current bytes to the project or global shelf. */
   pinToShelf: {
     input: z.object({
       workspaceId: z.string(),
-      artifactId: z.string(),
-      version: z.number().int().positive(),
+      path: z.string(),
       scope: ArtifactShelfScopeSchema,
     }),
     output: ResultSchema(z.object({ name: z.string() }), z.string()),
@@ -1579,19 +1563,17 @@ export const artifacts = {
   /**
    * A send the user clicked or confirmed in the Artifacts tab (window.xum.send or a canvas button). The
    * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
-   * `version: null` targets the live file (latest stored version).
    */
   sendInteraction: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
       text: z.string(),
       data: z.unknown().optional(),
     }),
     output: ResultSchema(z.object({ id: z.string() }), z.string()),
   },
-  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
+  /** Persisted window.xum.state of an artifact (null when none). */
   getState: {
     input: z.object({
       workspaceId: z.string(),

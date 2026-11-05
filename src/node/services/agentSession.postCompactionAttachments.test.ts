@@ -21,7 +21,7 @@ import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createLoadedSkillSnapshot } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
-import { recordArtifactVersion } from "./artifactVersionStore";
+import { recordArtifactPublish } from "./artifactRecordStore";
 import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { EffectRunner } from "./di/effectRunner";
@@ -529,12 +529,7 @@ describe("AgentSession post-compaction attachments", () => {
     historyCleanup = cleanup;
     const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
     await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "chart.html",
-      bytes: Buffer.from("<p>v1</p>"),
-      label: "chart",
-    });
+    await recordArtifactPublish({ sessionDir, relPath: "chart.html", title: "chart" });
 
     for (const enabled of [true, false]) {
       const { session } = await createAgentSessionHarness({

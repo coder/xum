@@ -1147,7 +1147,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 title: "Open Artifacts",
                 section: section.navigation,
                 shortcutHint: formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB),
-                keywords: ["artifacts", "preview", "versions"],
+                keywords: ["artifacts", "preview"],
                 run: () => openArtifactsTab(wsId),
               },
               {

@@ -712,7 +712,6 @@ export const ArtifactInteractionMetadataSchema = z.object({
   id: z.string(),
   artifactPath: z.string(),
   title: z.string(),
-  version: z.number().int().nonnegative(),
   action: z.literal("send"),
   text: z.string(),
   data: z.unknown().optional(),
