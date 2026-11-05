@@ -708,14 +708,18 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");
 }
 
-// Stories that need a phone viewport for their play, as their globals.viewport gives them in
-// Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
+// Stories that need a pinned viewport (a phone, or a laptop window) for their play, as their
+// globals.viewport gives them in Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
 // its panels (the phone sheet or a popover), still sees the desktop window.
-const PHONE_VIEWPORT_STORIES = new Map([
+const PINNED_VIEWPORT_STORIES = new Map([
   ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
   ["app-waitingonyou--phone", { width: 390, height: 844 }],
   ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
   ["app-chat-messages-markdownrenderer--mermaid-state-dialog-phone", { width: 390, height: 844 }],
+  [
+    "app-chat-messages-markdownrenderer--mermaid-state-dialog-desktop",
+    { width: 1200, height: 900 },
+  ],
 ]);
 const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
 
@@ -730,7 +734,7 @@ const config: TestRunnerConfig = {
         assertNoDiagramInkOutsideItsBox(page)
       );
     }
-    const phoneViewport = PHONE_VIEWPORT_STORIES.get(context.id);
+    const phoneViewport = PINNED_VIEWPORT_STORIES.get(context.id);
     if (phoneViewport) {
       const viewport = page.viewportSize();
       if (viewport) viewportsToRestore.set(page, viewport);

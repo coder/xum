@@ -4,6 +4,7 @@ import { GlobalWindow } from "happy-dom";
 import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
+import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
 import { dialogDiagramRoom } from "./mermaidDiagramBox";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
 import MarkdownIt from "markdown-it";
@@ -65,6 +66,14 @@ describe("Mermaid layout stability", () => {
     globalThis.DOMParser = domWindow.DOMParser;
     globalThis.HTMLElement = domWindow.HTMLElement;
     globalThis.XMLSerializer = chromiumMathSerializer(domWindow.XMLSerializer);
+    // happy-dom has no layout: the root element's client size follows the window's, as in a
+    // browser without pinch zoom, until a test sets it apart.
+    for (const side of ["Width", "Height"] as const) {
+      Object.defineProperty(domWindow.document.documentElement, `client${side}`, {
+        configurable: true,
+        get: () => domWindow[`inner${side}`],
+      });
+    }
   });
 
   afterEach(() => {
@@ -217,6 +226,27 @@ describe("Mermaid layout stability", () => {
     await waitFor(() =>
       expect(pasted.container.querySelector(".mermaid-container svg")).not.toBeNull()
     );
+  });
+
+  describe("the Close button of the expand dialog", () => {
+    const topPx = (button: HTMLElement) => Number(/calc\((\d+)px/.exec(button.style.top)?.[1]);
+
+    test("starts below the desktop title bar, which holds the native window controls", async () => {
+      Object.assign(window, { api: { getIsRosetta: () => Promise.resolve(false) } });
+      const view = renderMermaid();
+      fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+      const close = await view.findByRole("button", { name: "Close" });
+      expect(topPx(close)).toBeGreaterThanOrEqual(DESKTOP_TITLEBAR_HEIGHT_PX);
+      expect(close.classList.contains("titlebar-no-drag")).toBe(true);
+    });
+
+    test("keeps a small gutter from the top in a browser", async () => {
+      const view = renderMermaid();
+      fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+      const close = await view.findByRole("button", { name: "Close" });
+      expect(topPx(close)).toBeLessThan(DESKTOP_TITLEBAR_HEIGHT_PX);
+      expect(close.classList.contains("titlebar-no-drag")).toBe(false);
+    });
   });
 
   test("guest Escape cannot close an expanded host diagram", async () => {
@@ -646,6 +676,59 @@ describe("Mermaid layout stability", () => {
       const room = dialogDiagramRoom({ width: 390, height: 844 });
       expect(natural.width).toBeGreaterThan(room.width);
       expect(boxOf(dialog()).width).toBe(`${room.width}px`);
+    });
+
+    test("the expand dialog takes its room from the layout viewport, not the visual one", async () => {
+      // A pinch-zoomed page has a smaller window.innerWidth than the fixed overlay it shows.
+      Object.defineProperty(window, "innerWidth", { value: 390, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: 844, configurable: true });
+      Object.defineProperty(document.documentElement, "clientWidth", {
+        value: 1024,
+        configurable: true,
+      });
+      Object.defineProperty(document.documentElement, "clientHeight", {
+        value: 768,
+        configurable: true,
+      });
+      const view = renderMermaid({ chart: WIDE_CHART });
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      const dialog = () => view.container.querySelector<HTMLElement>(".mermaid-modal");
+      await waitFor(() => expect(viewBoxOf(dialog()).width).toBeGreaterThan(0));
+      const natural = viewBoxOf(dialog());
+      expect(natural.width).toBeGreaterThan(dialogDiagramRoom({ width: 390, height: 844 }).width);
+      expect(natural.width).toBeLessThanOrEqual(
+        dialogDiagramRoom({ width: 1024, height: 768 }).width
+      );
+      expect(boxOf(dialog())).toEqual(pixels(natural));
+    });
+
+    test("the expand dialog follows a resize of the layout viewport", async () => {
+      Object.defineProperty(document.documentElement, "clientWidth", {
+        value: 1024,
+        configurable: true,
+      });
+      const view = renderMermaid({ chart: WIDE_CHART });
+      await waitFor(() => expect(view.container.querySelector("svg.pele")).not.toBeNull());
+      fireEvent.click(view.getByRole("button", { name: "⤢" }));
+      const dialog = () => view.container.querySelector<HTMLElement>(".mermaid-modal");
+      await waitFor(() => expect(viewBoxOf(dialog()).width).toBeGreaterThan(0));
+      const natural = viewBoxOf(dialog());
+      expect(boxOf(dialog())).toEqual(pixels(natural));
+
+      Object.defineProperty(document.documentElement, "clientWidth", {
+        value: 390,
+        configurable: true,
+      });
+      act(() => {
+        window.dispatchEvent(new window.Event("resize"));
+      });
+      await waitFor(() =>
+        expect(boxOf(dialog()).width).toBe(
+          `${dialogDiagramRoom({ width: 390, height: window.innerHeight }).width}px`
+        )
+      );
     });
 
     test("the expand dialog lays the diagram out for its own width", async () => {

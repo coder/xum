@@ -7,6 +7,7 @@ import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { DESKTOP_TITLEBAR_HEIGHT_PX, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
@@ -737,6 +738,8 @@ const getButtonStyle = (disabled = false): CSSProperties => ({
   opacity: disabled ? 0.5 : 1,
 });
 
+const CLOSE_BUTTON_INSET_PX = 8;
+
 // Modal component for fullscreen diagram view
 const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
   children,
@@ -753,6 +756,8 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
     window.addEventListener("keydown", handleEscape, { capture: true });
     return () => window.removeEventListener("keydown", handleEscape, { capture: true });
   }, [onClose]);
+
+  const desktop = isDesktopMode();
 
   return (
     <div
@@ -782,16 +787,19 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
       >
         {children}
       </div>
-      {/* Outside the dialog's box, so it never covers the drawing the dialog fits to its room. */}
+      {/* Outside the dialog's box, so it never covers the drawing the dialog fits to its room.
+          The desktop title bar holds the native window controls and moves the window, so the
+          button starts below it. */}
       <button
+        className={desktop ? "titlebar-no-drag" : undefined}
         onClick={(e) => {
           e.stopPropagation();
           onClose();
         }}
         style={{
           position: "absolute",
-          top: "calc(8px + env(safe-area-inset-top, 0px))",
-          right: "calc(8px + env(safe-area-inset-right, 0px))",
+          top: `calc(${CLOSE_BUTTON_INSET_PX + (desktop ? DESKTOP_TITLEBAR_HEIGHT_PX : 0)}px + env(safe-area-inset-top, 0px))`,
+          right: `calc(${CLOSE_BUTTON_INSET_PX}px + env(safe-area-inset-right, 0px))`,
           background: "var(--color-background)",
           border: "1px solid var(--color-border-subtle)",
           color: "var(--color-text)",
@@ -813,9 +821,20 @@ function subscribeToViewportResize(onChange: () => void): () => void {
   return () => window.removeEventListener("resize", onChange);
 }
 
+/**
+ * The size of the fixed overlay the dialog sits in: the layout viewport, which the root element
+ * reports. window.innerWidth is the visual viewport, which pinch zoom shrinks and, on iOS, the
+ * toolbar changes.
+ */
 function useViewportSize(): DiagramBox {
-  const width = useSyncExternalStore(subscribeToViewportResize, () => window.innerWidth);
-  const height = useSyncExternalStore(subscribeToViewportResize, () => window.innerHeight);
+  const width = useSyncExternalStore(
+    subscribeToViewportResize,
+    () => document.documentElement.clientWidth
+  );
+  const height = useSyncExternalStore(
+    subscribeToViewportResize,
+    () => document.documentElement.clientHeight
+  );
   return { width, height };
 }
 
