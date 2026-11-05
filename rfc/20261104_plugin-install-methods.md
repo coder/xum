@@ -55,7 +55,7 @@ The motivating plugin is egm ([google/elephant-goldfish-model](https://github.co
 1. **Each loadable manifest is a choice.** For a repository that ships more than one manifest Xum can load, the install preview offers each one as its own method. One exception: when the root `plugin.json` has `$schema` (a Xum-native package), Xum offers only that manifest (rule M1). Each method shows its component counts: skills, agents, hooks that can run, hooks that are listed and never run, and MCP servers. A manifest that fails validation is not offered, and the preview shows its validation error as a warning.
 2. **The choice holds.** After the user installs with a manifest method, every part of Xum that discovers, reviews or loads that plugin uses the chosen manifest. Restarts and updates keep the method.
 3. **Changing the method is a new install.** The user picks another method by uninstalling and installing again. Xum runs a full consent review for it.
-4. **A method that no longer fits refuses the update.** When the commit an update would install no longer fits the saved method, Xum refuses the update. The message names the missing or invalid file, lists the methods that fit the new commit, and says how to switch: uninstall and install again. The update review also offers "Remove plugin". Not updating keeps the plugin on its current commit, still tracking its branch.
+4. **A method that does not fit the new commit refuses the update.** When the commit an update would install does not fit the saved method, Xum refuses the update. The message names the missing or invalid file, lists the methods that fit the new commit, and says how to switch: uninstall and install again. The update review also offers "Remove plugin". Not updating keeps the plugin on its current commit, still tracking its branch.
 5. **Users and maintainers can see the method.** The Settings plugin row, the composition inspector, `bun run debug plugins` and the install and update log lines show the method and the manifest path that loaded. The Settings row also lists the other manifest methods that the installed copy offers, with their agent counts.
 6. **Plugin agents find their plugin's files.** Xum replaces `${CLAUDE_PLUGIN_ROOT}` in foreign plugin agent bodies. A foreign plugin agent whose body contains `${CLAUDE_PLUGIN_ROOT}`, on a workspace that cannot read its plugin folder, is left out of that workspace's `task` list. The spawn error and the composition inspector give the reason.
 7. **Read-only Claude agents can search code.** A Claude-format plugin agent whose tool list holds only `Read`, `Grep`, `Glob` or `LS`, and names at least one of the last three, gets the `explore` base, Explore's prompt and the bash tools. `disallowedTools: Bash` still removes bash.
@@ -139,7 +139,7 @@ Aliases moved to [`20261105_foreign-plugin-agent-aliases.md`](./20261105_foreign
 - `folder-unreachable`: A2.
 - `invalid-definition`: the file does not parse or map, for example a `ForeignPluginAgentToolsError` (`pluginAgentFormat.ts:133-140`), or it is a link that leads out of the plugin folder (`agentDefinitionsService.ts:381-394`).
 
-Today `loadAgentDefinition` catches parse and consent errors and moves on to the next scope (`src/node/services/agentDefinitions/agentDefinitionsService.ts:1061-1067`). It now records the refusal of a plugin candidate and throws it as a `PluginAgentRefusalError` when no other scope has the ID. `checkTaskAgentRunnable` (`taskService.ts:9278-9311`) already runs after the parent runtime is loaded, so it maps the refusal there with no new lookup.
+Today `loadAgentDefinition` catches parse and consent errors and moves on to the next scope (`src/node/services/agentDefinitions/agentDefinitionsService.ts:1061-1067`). A4 makes it record the refusal of a plugin candidate and throw it as a `PluginAgentRefusalError` when no other scope has the ID. `checkTaskAgentRunnable` (`taskService.ts:9278-9311`) already runs after the parent runtime is loaded, so it maps the refusal there with no new lookup.
 
 The diagram shows how one spawn by ID resolves.
 
@@ -217,14 +217,14 @@ The preview keeps its `methods` field unchanged and gains a new optional field, 
 
 Only the selected method carries warnings and not-applied items, such as `omitClaudeMd` or Cursor rules. When the selected method fails validation, the preview keeps today's fallback: it selects the next valid method and shows the error as a warning (`installService.ts:2956-2978`). Picking another method in the toggle re-previews, as it does today, so the full component review is always the one for the method being installed. Install checks that the staged tree's digest for the chosen method matches the preview (`installService.ts:4088-4092`).
 
-The "Install as" toggle is always visible when two or more methods fit (`src/browser/features/Settings/Sections/PluginInstallMethods.tsx:94-131`). It now shows each method's long label and counts. The preview preselects the first method in the fixed order, so one click installs what Xum installs today (Alternative N).
+The "Install as" toggle is always visible when two or more methods fit (`src/browser/features/Settings/Sections/PluginInstallMethods.tsx:94-131`). It shows each method's long label and counts. The preview preselects the first method in the fixed order, so one click installs what Xum installs today (Alternative N).
 
 #### B5. Updates
 
 `chooseUpdateMethod` gains the saved method as an input:
 
 1. **Saved method fits:** use it. Consent and the update review work as today.
-2. **Saved method does not fit:** Xum refuses the update, through the existing refusal at `installMethods.ts:626-633` with a new message. The message names the missing or invalid file, or says that a Xum-native root now takes precedence. It lists the methods that fit the new commit, and says "To switch, uninstall the plugin and install it again." The update review shows this error with a "Remove plugin" button that opens the existing uninstall confirmation (`src/browser/features/Settings/Sections/PluginsSettingsSection.tsx:1215-1246`). Nothing is applied, so the plugin stays on its commit and keeps tracking its branch.
+2. **Saved method does not fit:** Xum refuses the update, through the existing refusal at `installMethods.ts:626-633` with a new message. The message names the missing or invalid file, or says that the new commit's Xum-native root takes precedence. It lists the methods that fit the new commit, and says "To switch, uninstall the plugin and install it again." The update review shows this error with a "Remove plugin" button that opens the existing uninstall confirmation (`src/browser/features/Settings/Sections/PluginsSettingsSection.tsx:1215-1246`). Nothing is applied, so the plugin stays on its commit and keeps tracking its branch.
 3. **No saved method:** today's rules.
 
 The update journal does not change, because an update never changes the method. `checkUpdates` still compares only commits (`installService.ts:6552-6601`), so a refused plugin shows "update available" on every check while the remote commit differs from the installed one (Risks & Mitigations).
@@ -334,7 +334,7 @@ PRs 1 and 2 do not depend on Part B. Installing egm from its `distributions/clau
 
 #### Alternative F: "Stay on the current commit" as a commit pin
 
-- **Mechanism**: When the saved method no longer fits, "stay" changes the install's `refType` to `commit`, which `checkUpdates` reports as pinned.
+- **Mechanism**: When the saved method does not fit the new commit, "stay" changes the install's `refType` to `commit`, which `checkUpdates` reports as pinned.
 - **Pros**: It reuses an existing state, and the update badge goes away.
 - **Cons**: The pin is one-way. Updates then refuse with "uninstall and reinstall". The tracked branch name is lost. The user never learns that the manifest came back upstream.
 - **Reason for Rejection**: Decided by: author (delegated). Updates are manual, so not applying one keeps the commit (B5).
