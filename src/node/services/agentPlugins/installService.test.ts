@@ -2330,8 +2330,6 @@ describe("AgentPluginInstallService", () => {
     expect(await listed()).toEqual(["Always delegate to me"]);
   });
 
-  // A Claude agent with `tools: [Read, Grep, Glob]` is mapped to the explore base and the bash
-  // tools, so the review recorded under the earlier mapping no longer matches.
   test("a Claude agent whose mapping changed after its review needs a new review", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
@@ -2358,8 +2356,6 @@ describe("AgentPluginInstallService", () => {
       );
     expect(await loads()).toBe("explore");
 
-    // The record an earlier Xum wrote for the same file: its mapping gave the agent the Exec base
-    // and only the file tools, since Grep and Glob granted nothing.
     const mappedBeforeA3 = {
       name: "reviewer",
       description: "Reviews code",

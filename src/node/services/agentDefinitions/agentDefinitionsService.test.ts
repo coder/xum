@@ -1296,7 +1296,6 @@ base: a
       await writeAgent(path.join(pluginDir, "agents"), agentId, agentName);
     }
 
-    /** The tools of `sampleTools` that a plugin agent keeps as a sub-agent. */
     async function effectiveToolsOf(
       runtime: Runtime,
       workspacePath: string,
@@ -1638,7 +1637,6 @@ base: a
       );
     });
 
-    // egm's reviewers list only Read, Grep and Glob.
     test("a Claude read-only search list runs on Explore with the file and bash tools", async () => {
       using project = new DisposableTempDir("agent-defs-search-list-project");
       using global = new DisposableTempDir("agent-defs-search-list-global");
@@ -1688,7 +1686,6 @@ base: a
       expect(agents.find((a) => a.id === "reviewer")?.base).toBe("explore");
       expect(await toolsOf("reviewer")).toEqual([...fileTools, "bash", "bash_output"]);
 
-      // The denylist keeps Bash off, or leaves no search tool in the list.
       expect(agents.find((a) => a.id === "no-bash")?.base).toBe("explore");
       expect(await toolsOf("no-bash")).toEqual(fileTools);
       for (const id of ["denied-names", "denied-lowercase", "denied-specifier"]) {
@@ -1696,11 +1693,9 @@ base: a
         expect(await toolsOf(id)).toEqual(fileTools);
       }
 
-      // A list with Edit is not a search list: it keeps its mapping.
       expect(agents.find((a) => a.id === "with-edit")?.base).toBe("exec");
       expect(await toolsOf("with-edit")).toEqual([...fileTools, "file_edit_replace_string"]);
 
-      // LS in disallowedTools does not skip the agent.
       expect(agents.map((a) => a.id)).toContain("ls-denied");
       expect(await toolsOf("ls-denied")).toEqual(await toolsOf("exec"));
     });

@@ -111,8 +111,6 @@ describe("Cursor model: fast and is_background", () => {
   });
 });
 
-// A read-only search list gets Explore's base and the bash tools, so a Claude reviewer that lists
-// Grep and Glob can search. The tool lists below are egm's.
 describe("read-only search lists", () => {
   const BASH_TOOLS = ["bash", "bash_output", "bash_background_list"];
   const SAMPLE_TOOLS = [
@@ -129,7 +127,6 @@ describe("read-only search lists", () => {
       { name: "reviewer", description: "Reviews designs", ...extra },
       "reviewer"
     );
-  // The tools of the mapped list on a base that enables every tool.
   const toolsOf = (mapped: Record<string, unknown>) =>
     SAMPLE_TOOLS.filter((tool) =>
       isToolEnabledByConfigs(tool, [
@@ -174,7 +171,6 @@ describe("read-only search lists", () => {
     ]);
   });
 
-  // A list that is not exactly the four names grants Grep and Glob nothing, as before.
   test("[Read, Edit, Grep] and [WebFetch, Grep] keep the mapping they had", () => {
     const edit = map({ tools: ["Read", "Edit", "Grep"] });
     expect(edit.base).toBe("exec");
@@ -211,7 +207,6 @@ describe("read-only search lists", () => {
     expect(toolsOf(mapped)).not.toContain("bash");
   });
 
-  // The denylist runs first, so the rule sees the list that is left.
   test("disallowedTools: Bash removes the bash tools and keeps the Explore base", () => {
     const mapped = map({ tools: ["Read", "Grep", "Glob"], disallowedTools: ["Bash"] });
     expect(mapped.base).toBe("explore");

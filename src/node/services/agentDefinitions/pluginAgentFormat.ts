@@ -31,9 +31,7 @@ type ForeignToolListKey = (typeof FOREIGN_TOOL_LIST_KEYS)[number];
  *   Xum tools do the same job and no more. Every other name grants nothing:
  *   its Xum tools do more than the Claude tool (todo_write replaces the whole
  *   checklist, task_send_message reaches workspaces outside the agent tree).
- *   The one exception is a read-only search list (see READ_ONLY_SEARCH_TOOLS):
- *   Xum has no read-only search tool, so Grep, Glob and LS grant the bash tools
- *   there, and nowhere else.
+ *   The one exception is a read-only search list (see READ_ONLY_SEARCH_TOOLS).
  * - `deny` (in `disallowedTools`) removes every Xum tool that can do the job,
  *   so several names share one family: denying Write also removes Edit.
  */
@@ -114,7 +112,6 @@ const CLAUDE_TOOLS: Readonly<Record<string, ClaudeToolMapping>> = {
   CronCreate: SCHEDULE,
   CronDelete: SCHEDULE,
   CronList: SCHEDULE,
-  // Grep, Glob and LS grant nothing here: only a read-only search list grants them the bash tools.
   Grep: NONE,
   Glob: NONE,
   LS: NONE,
@@ -267,20 +264,18 @@ function mapAllowedEntry(entry: string): readonly string[] {
 /**
  * A Claude `tools` list of only these names, with at least one of Grep, Glob and LS, is a
  * read-only search list: Xum has no read-only search tool, so such an agent runs on Explore with
- * the bash tools to search. This is the one exception to the table rule "the same job and no
- * more". egm's reviewers, which list Read, Grep and Glob, are the case it exists for.
+ * the bash tools to search. egm's reviewers, which list Read, Grep and Glob, are the case it
+ * exists for.
  */
 const READ_ONLY_SEARCH_TOOLS: readonly string[] = ["Read", "Grep", "Glob", "LS"];
 
-/** The tool name of one list entry, without case: `Grep(*.ts)` is `grep`. */
 function lowercaseToolName(entry: string): string | undefined {
   return TOOL_ENTRY_PATTERN.exec(entry)?.[1].toLowerCase();
 }
 
 /**
  * Claude Code removes `disallowedTools` first and keeps the `tools` entries left, so a denied
- * Grep is not part of the list the rule sees. The entries themselves must be the exact names: with
- * case, and with no specifier or `mcp__` entry, as in `mapAllowedEntry`.
+ * Grep is not part of the list the rule sees.
  */
 function isReadOnlySearchList(entries: readonly string[], denylist: readonly string[]): boolean {
   // mutation-equivalent: a tool name matches \w+, so it is never "" and ?? agrees with ||
@@ -420,8 +415,7 @@ export function mapForeignPluginAgentFrontmatter(
     ...raw,
     name: raw.name ?? agentId,
     // Omitted tools inherit every tool in both ecosystems: Exec is Xum's
-    // all-tools agent. Cursor `readonly: true` and a Claude read-only search list narrow to
-    // Explore (no file edits or task spawning). Explore keeps bash, so it is not fully read-only.
+    // all-tools agent.
     base: readonly ? "explore" : "exec",
     // Both ecosystems spawn these as sub-agents, never as main-chat modes, and
     // their bodies are written for delegates, so keep them out of the picker.

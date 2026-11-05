@@ -282,7 +282,6 @@ Body
       ]);
       expect(toolsOf("name: a\ntools: Grep")).toEqual(["bash", "bash_output"]);
       expect(toolsOf("name: a\ntools: LS")).toEqual(["bash", "bash_output"]);
-      // Any other entry, even Edit, ends the rule: Grep and Glob grant nothing, as before.
       expect(toolsOf("name: a\ntools: Read, Grep, Edit")).toEqual(["file_read", "attach_file"]);
     });
 

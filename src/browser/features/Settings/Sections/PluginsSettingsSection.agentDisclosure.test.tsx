@@ -111,7 +111,6 @@ test("a preview with one of each component discloses each one", async () => {
   view.getByText("Slash commands (2)");
   view.getByText("Files (1)");
   view.getByText("Hooks");
-  // A command with a description shows it, and one without shows only its name.
   expect(view.getByText("/ship").parentElement?.textContent).toBe("/ship — Ship it");
   expect(view.getByText("/plain").parentElement?.textContent).toBe("/plain");
   view.getByText(/for: bash/);
