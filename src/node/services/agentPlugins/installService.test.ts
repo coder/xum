@@ -4579,7 +4579,6 @@ describe("AgentPluginInstallService", () => {
         "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
       },
     });
-    /** Commits the plugin's MCP file with `servers`, or without the file when `servers` is undefined. */
     const writeServers = async (servers: Record<string, unknown> | undefined) => {
       const file = path.join(remoteDir, "mcp.json");
       if (servers === undefined) await fsPromises.rm(file);
@@ -4605,7 +4604,6 @@ describe("AgentPluginInstallService", () => {
           ])
         ),
       });
-    /** Installs `servers`, then signs in to `signedInUrls` with the real sign-in service. */
     const installSignedIn = async (servers: Record<string, unknown>, signedInUrls: string[]) => {
       const updater = new AgentPluginInstallService(config, {
         mcpServerManager: {
@@ -4638,9 +4636,7 @@ describe("AgentPluginInstallService", () => {
       );
       await update({ keep: oauthEntry(keepUrl, "client-k") });
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
-      // A server the update keeps stays signed in.
       expect(await oauth.hasAuthTokens({ serverUrl: keepUrl })).toBe(true);
-      // The URL comes back under another client: nothing of the old sign-in is left to reuse.
       await update({
         keep: oauthEntry(keepUrl, "client-k"),
         docs: oauthEntry(docsUrl, "client-b"),
@@ -9047,7 +9043,6 @@ describe("signInResetUrls", () => {
     expect(signInResetUrls(current, tree({ a: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
       mcp,
     ]);
-    // A renamed entry has no previous self: any other identity at the key resets it.
     expect(signInResetUrls(current, tree({ c: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
       mcp,
     ]);

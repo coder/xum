@@ -1750,7 +1750,6 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   return lines;
 }
 
-/** One tree's sign-ins by credential key: the URL, and the identity of each server name there. */
 interface SignInKeyEntry {
   url: string;
   identities: Map<string, string>;
@@ -5580,9 +5579,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * The remote MCP server URLs of an installed plugin's tree: what an uninstall signs out. A
-   * server that fails to load never ran and holds no sign-in, so it is not listed. A tree Xum
-   * cannot read lists none and is logged: it must stay removable.
+   * A server that fails to load never ran and holds no sign-in, so it is not listed. A tree Xum
+   * cannot read lists none: it must stay removable.
    */
   private async installedServerUrls(name: string): Promise<string[]> {
     try {
@@ -5967,7 +5965,7 @@ export class AgentPluginInstallService {
       let recordedSignOuts: string[] = [];
       try {
         // Recorded before the commit, like an update's: a crash after it leaves the sign-outs for
-        // the next start (#6122). A failed write aborts the uninstall with the install intact.
+        // the next start (#6122).
         recordedSignOuts = await this.recordPendingSignOuts(signOutUrls);
         // Before the commit, so a failure leaves trust and approved copies cleared (fail closed)
         // rather than kept for a later install under this name.
@@ -6061,7 +6059,7 @@ export class AgentPluginInstallService {
       }
 
       // Signed out before the final stop, like an update: a startup that raced the sign-out is
-      // invalidated too. A sign-out that fails stays pending for the next pass.
+      // invalidated too.
       await this.signOutAndSettle(entry.name, signOutUrls);
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
