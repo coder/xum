@@ -733,6 +733,10 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
+        with:
+          # WebKit runs the stories tagged "webkit" (iPhone Safari sizes SVG and CSS zoom unlike
+          # Chromium).
+          browsers: chromium webkit
       - run: make storybook-build
       - run: |
           bun x http-server storybook-static -p 6006 &
@@ -749,6 +753,7 @@ jobs:
       # Separate step so a budget overrun is not mixed up with interaction-test failures.
       - run: make storybook-budget
       - run: make test-storybook
+      - run: make test-storybook-webkit
 
   test-e2e:
     # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
