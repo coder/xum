@@ -10,12 +10,23 @@ describe("findZoomDeclarations", () => {
     ["a declaration after a nested rule", "a.css", ".x { &.y { color: red } zoom: 2; }"],
     ["a vendor prefix", "a.css", ".x { -webkit-zoom: 2; }"],
     ["a hex escape", "a.css", ".x { z\\6f om: 2; }"],
+    ["a Tailwind arbitrary property in @apply", "a.css", ".x { @apply p-2 md:[zoom:2]; }"],
     ["an escape of a letter", "a.css", ".x { zo\\om: 2; }"],
     ["an escaped vendor prefix", "a.css", ".x { \\2d webkit-zoom: 2; }"],
     ["a style attribute", "a.html", '<div style="width:1px; zoom: 2">x</div>'],
     ["an unquoted style attribute", "a.html", "<div style=zoom:2>x</div>"],
     ["a character reference in a style attribute", "a.html", '<div style="&#122;oom: 2">x</div>'],
+    [
+      "a Tailwind arbitrary property in a class attribute",
+      "a.html",
+      '<div class="p-2 md:[zoom:2]">x</div>',
+    ],
     ["a style element", "a.html", "<style>.x { zoom: 2 }</style>"],
+    [
+      "a style element in a legacy comment wrapper",
+      "a.html",
+      "<style><!--\n.x { zoom: 2 }\n--></style>",
+    ],
     ["a style attribute in a template", "a.html", '<template><b style="zoom:2"></b></template>'],
     ["a style attribute in a noscript", "a.html", '<noscript><b style="zoom:2"></b></noscript>'],
     ["a style attribute in an SVG", "a.svg", '<svg style="zoom: 2" viewBox="0 0 1 1"></svg>'],
@@ -54,6 +65,17 @@ describe("findZoomDeclarations", () => {
       '<div style="--diagram-zoom: 2; width: 1px">x</div>',
     ],
     ["a class selector in a style element", "a.html", "<style>.zoom:hover { color: red }</style>"],
+    [
+      "a style element in a legacy comment wrapper",
+      "a.html",
+      "<style><!--\n.x { color: red }\n--></style>",
+    ],
+    [
+      "a Tailwind class that is not the zoom property",
+      "a.html",
+      '<div class="[--diagram-zoom:2] zoom-in-95">x</div>',
+    ],
+    ["an @apply without zoom", "a.css", ".x { @apply p-2 zoom-in-95; }"],
     ["SVG text", "a.svg", "<svg><text>Zoom: 100%</text></svg>"],
   ])("ignores %s", (_name, file, source) => {
     expect(findZoomDeclarations(file, source)).toEqual([]);
@@ -64,10 +86,10 @@ describe("findZoomDeclarations", () => {
     expect(findZoomDeclarations("a.css", css)).toEqual([6, 8]);
   });
 
-  test("reports the line in the HTML file, for a style attribute and a style element", () => {
+  test("reports the line where a style attribute or a style element starts", () => {
     const html =
-      '<html>\n<head>\n<style>\n.a {\n  color: red;\n  zoom: 2;\n}\n</style>\n</head>\n<body>\n<div\n  style="color: red;\n zoom: 2">x</div>\n</body>\n</html>';
-    expect(findZoomDeclarations("a.html", html)).toEqual([6, 13]);
+      '<html>\n<head>\n<style>\n.a {\n  zoom: 2;\n}\n</style>\n</head>\n<body>\n<div\n  style="color: red;&#10;zoom: 2">x</div>\n</body>\n</html>';
+    expect(findZoomDeclarations("a.html", html)).toEqual([3, 11]);
   });
 
   test("fails on CSS that does not parse, since a file it cannot read is not proven clean", () => {

@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 import { defaultTreeAdapter, parse, type DefaultTreeAdapterMap } from "parse5";
-import postcss from "postcss";
+import postcss, { type Node } from "postcss";
 
 type ParentNode = DefaultTreeAdapterMap["parentNode"];
 
@@ -37,28 +37,57 @@ function isZoomProperty(property: string): boolean {
   return decodeCssEscapes(property).toLowerCase().replace(VENDOR_PREFIX, "") === "zoom";
 }
 
-function zoomLinesInCss(css: string, firstLine: number): number[] {
-  const lines: number[] = [];
-  postcss.parse(css).walkDecls((declaration) => {
-    if (!isZoomProperty(declaration.prop)) return;
-    assert(declaration.source?.start, "postcss gave a declaration no position");
-    lines.push(firstLine + declaration.source.start.line - 1);
-  });
-  return lines;
+// A Tailwind arbitrary property class such as `[zoom:2]` or `md:[zoom:2]`. Keep in sync with
+// ZOOM_UTILITY in the local/no-css-zoom lint rule.
+const ZOOM_UTILITY = /(?:^|[^\w-])\[(?:-[a-z]+-)?zoom:/i;
+// HTML 4 hid a <style> block from old browsers with `<!--` and `-->`. CSS reads both as tokens
+// to skip, postcss does not, and blanking them keeps every position.
+const CDO_OR_CDC = /<!--|-->/g;
+
+function startLine(node: Node): number {
+  assert(node.source?.start, "postcss gave a node no position");
+  return node.source.start.line;
 }
 
-function zoomLinesInElement(element: DefaultTreeAdapterMap["element"]): number[] {
+function zoomLinesInCss(css: string): number[] {
   const lines: number[] = [];
+  const root = postcss.parse(css.replace(CDO_OR_CDC, (token) => " ".repeat(token.length)));
+  root.walkDecls((declaration) => {
+    if (isZoomProperty(declaration.prop)) lines.push(startLine(declaration));
+  });
+  root.walkAtRules((rule) => {
+    if (rule.name.toLowerCase() === "apply" && ZOOM_UTILITY.test(rule.params)) {
+      lines.push(startLine(rule));
+    }
+  });
+  return lines.sort((a, b) => a - b);
+}
+
+function attributeValue(
+  element: DefaultTreeAdapterMap["element"],
+  name: string
+): string | undefined {
+  return element.attrs.find((attribute) => attribute.name === name)?.value;
+}
+
+// parse5 decodes character references (`&#10;` is a newline), so a line inside a decoded value
+// need not be a line of the file. Markup hits report the line where the attribute or the <style>
+// text starts.
+function zoomLinesInElement(element: DefaultTreeAdapterMap["element"]): number[] {
   const location = element.sourceCodeLocation;
-  const style = element.attrs.find((attribute) => attribute.name === "style");
+  const attributeLine = (name: string) =>
+    location?.attrs?.[name]?.startLine ?? location?.startLine ?? 1;
+  const lines: number[] = [];
+  const style = attributeValue(element, "style");
   if (style !== undefined) {
-    const line = location?.attrs?.style?.startLine ?? location?.startLine ?? 1;
-    lines.push(...zoomLinesInCss(style.value, line));
+    lines.push(...zoomLinesInCss(style).map(() => attributeLine("style")));
   }
+  const classes = attributeValue(element, "class");
+  if (classes !== undefined && ZOOM_UTILITY.test(classes)) lines.push(attributeLine("class"));
   if (element.tagName === "style") {
     const texts = element.childNodes.filter(defaultTreeAdapter.isTextNode);
     const line = texts[0]?.sourceCodeLocation?.startLine ?? location?.startLine ?? 1;
-    lines.push(...zoomLinesInCss(texts.map((text) => text.value).join(""), line));
+    lines.push(...zoomLinesInCss(texts.map((text) => text.value).join("")).map(() => line));
   }
   return lines;
 }
@@ -76,7 +105,7 @@ function zoomLinesBelow(parent: ParentNode): number[] {
 export function findZoomDeclarations(file: string, source: string): number[] {
   switch (extname(file).toLowerCase()) {
     case ".css":
-      return zoomLinesInCss(source, 1);
+      return zoomLinesInCss(source);
     case ".html":
     case ".svg":
       // scriptingEnabled: false parses <noscript> content as elements, so its style attributes
@@ -119,7 +148,9 @@ if (import.meta.main) {
     console.error(`Error: could not parse these files:\n  ${unparsable.join("\n  ")}`);
   }
   if (found.length > 0) {
-    console.error(`Error: do not declare the CSS zoom property:\n  ${found.join("\n  ")}`);
+    console.error(
+      `Error: do not declare the CSS zoom property. In HTML and SVG the line is where the style or class attribute, or the <style> text, starts:\n  ${found.join("\n  ")}`
+    );
     console.error(
       "Safari lays out a zoomed element differently from Chromium. Size the element with explicit pixels computed in code (src/browser/features/Messages/mermaidDiagramBox.ts)."
     );
