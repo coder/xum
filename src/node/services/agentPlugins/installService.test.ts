@@ -4568,6 +4568,118 @@ describe("AgentPluginInstallService", () => {
     await oauth.dispose();
   });
 
+  describe("an update that removes a signed-in MCP server", () => {
+    const docsUrl = "https://docs.example.com/mcp";
+    const keepUrl = "https://keep.example.com/mcp";
+    const oauthEntry = (url: string, clientId: string) => ({
+      type: "streamable-http",
+      url,
+      extensions: {
+        "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+      },
+    });
+    /** Commits the plugin's MCP file with `servers`, or without the file when `servers` is undefined. */
+    const writeServers = async (servers: Record<string, unknown> | undefined) => {
+      const file = path.join(remoteDir, "mcp.json");
+      if (servers === undefined) await fsPromises.rm(file);
+      else
+        await fsPromises.writeFile(
+          file,
+          JSON.stringify({ $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: servers })
+        );
+      await commitAll(remoteDir, Object.keys(servers ?? {}).join(" ") || "no MCP file");
+    };
+    const signedInStore = (urls: string[]) =>
+      JSON.stringify({
+        version: 2,
+        entries: Object.fromEntries(
+          urls.map((serverUrl) => [
+            serverUrl,
+            {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          ])
+        ),
+      });
+    /** Installs `servers`, then signs in to `signedInUrls` with the real sign-in service. */
+    const installSignedIn = async (servers: Record<string, unknown>, signedInUrls: string[]) => {
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: {
+          stopServersWithKeyPrefix: () => Promise.resolve(),
+        } as unknown as MCPServerManager,
+      });
+      await writeServers(servers);
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "mcp-oauth.json"), signedInStore(signedInUrls));
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      const logout = spyOn(oauth, "logout");
+      updater.setMcpOauthService(oauth);
+      const update = async (servers: Record<string, unknown> | undefined) => {
+        await writeServers(servers);
+        const review = await updater.previewUpdate({ name: "demo-plugin" });
+        await updater.update({
+          name: "demo-plugin",
+          consent: { fromSha: review.fromSha, toSha: review.toSha },
+        });
+      };
+      return { oauth, logout, update };
+    };
+
+    test("signs out the removed server, so a later server at its URL does not inherit the credentials", async () => {
+      const { oauth, update } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a"), keep: oauthEntry(keepUrl, "client-k") },
+        [docsUrl, keepUrl]
+      );
+      await update({ keep: oauthEntry(keepUrl, "client-k") });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      // A server the update keeps stays signed in.
+      expect(await oauth.hasAuthTokens({ serverUrl: keepUrl })).toBe(true);
+      // The URL comes back under another client: nothing of the old sign-in is left to reuse.
+      await update({
+        keep: oauthEntry(keepUrl, "client-k"),
+        docs: oauthEntry(docsUrl, "client-b"),
+      });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    });
+
+    test("signs out every server when the update drops the plugin's MCP file", async () => {
+      const { oauth, update } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await update(undefined);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    });
+
+    test("keeps the credentials of a server that is renamed with its URL and client unchanged", async () => {
+      const { oauth, logout, update } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl]
+      );
+      await update({ docs2: oauthEntry(`${docsUrl}/`, "client-a") });
+      expect(logout).not.toHaveBeenCalled();
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      await oauth.dispose();
+    });
+
+    test("does not sign out when the removed server has no sign-in (stdio)", async () => {
+      const stdio = { type: "stdio", command: "node", args: ["${PLUGIN_ROOT}/server.js"] };
+      const { oauth, logout, update } = await installSignedIn(
+        { local: stdio, docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl]
+      );
+      await update({ docs: oauthEntry(docsUrl, "client-a") });
+      expect(logout).not.toHaveBeenCalled();
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      await oauth.dispose();
+    });
+  });
+
   test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
     await fsPromises.rm(path.join(remoteDir, "mcp.json"));
     const servers = (secret: string) =>
