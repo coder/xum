@@ -1760,9 +1760,11 @@ function indexSignIns(
   credentialKey: (url: string) => string | null
 ): Map<string, SignInKeyEntry> {
   const index = new Map<string, SignInKeyEntry>();
+  // mutation-equivalent: a Map is never falsy, so ?? and || agree
   for (const [serverName, { signIn }] of servers ?? []) {
     const key = signIn && credentialKey(signIn.url);
     if (!key || !signIn) continue;
+    // mutation-equivalent: an entry object is never falsy, so ?? and || agree
     const entry = index.get(key) ?? {
       url: signIn.url,
       identityByServerName: new Map<string, string>(),
@@ -5591,6 +5593,7 @@ export class AgentPluginInstallService {
         pluginDir: this.targetPathFor(name),
         scope: "global",
       });
+      // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
       if (plugin?.mcpConfigPath === undefined) return [];
       const { servers } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
