@@ -99,7 +99,7 @@ let warnedUnknownInstallMethod = false;
 /** A newer build's value is logged, not trusted: a row can hold any text. */
 const MAX_LOGGED_METHOD_LENGTH = 64;
 
-export function resetUnknownInstallMethodWarning(): void {
+export function resetUnknownInstallMethodWarningForTests(): void {
   warnedUnknownInstallMethod = false;
 }
 

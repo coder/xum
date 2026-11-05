@@ -9,7 +9,7 @@ import {
   readPluginComponentImports,
   readPluginMcpPolicy,
   readStoredInstallMethod,
-  resetUnknownInstallMethodWarning,
+  resetUnknownInstallMethodWarningForTests,
 } from "./registry";
 import { createRawPluginInstallRow, createTestPluginInstallEntry } from "./testFixtures";
 
@@ -105,7 +105,7 @@ describe("readStoredInstallMethod", () => {
   });
 
   test("a row without the field, or a value that is no row, has no method and no warning", () => {
-    resetUnknownInstallMethodWarning();
+    resetUnknownInstallMethodWarningForTests();
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);
     try {
       expect(readStoredInstallMethod(createRawPluginInstallRow(legacy, {}))).toBeUndefined();
@@ -120,7 +120,7 @@ describe("readStoredInstallMethod", () => {
 
   test("the warning names the unknown value, cut short, or the kind of a value that is no text", () => {
     const warned = (installMethod: unknown) => {
-      resetUnknownInstallMethodWarning();
+      resetUnknownInstallMethodWarningForTests();
       const warn = spyOn(log, "warn").mockImplementation(() => undefined);
       try {
         readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod }));
@@ -135,7 +135,7 @@ describe("readStoredInstallMethod", () => {
   });
 
   test("an unknown value (from a newer build) means the fixed order and warns once per process", () => {
-    resetUnknownInstallMethodWarning();
+    resetUnknownInstallMethodWarningForTests();
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);
     try {
       for (const installMethod of ["codex-plugin", 7, null, { kind: "claude-plugin" }, ""]) {
