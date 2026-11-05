@@ -93,9 +93,10 @@ the message then says to use a checkout under folders you own. Bun on PATH must 
 ```
 
 Launch runs `make dev-server-sandbox` with `--clean-providers --clean-projects`, the mock AI and an
-`env -i` allowlist, in its own process group. It returns when the app is usable, in about 15 s when
-`dist/` is already built. It gives up when the whole launch, seed included, takes longer than
-`VERIFY_XUM_READY_TIMEOUT` seconds (default 300).
+`env -i` allowlist, in its own process group. It returns when the app is usable. That takes about
+2 to 3 minutes on a busy host, most of it the module walk below, plus the rebuild of `dist/` after a
+source change. It gives up when the whole launch, seed and module walk included, takes longer than
+`VERIFY_XUM_READY_TIMEOUT` seconds (default 600).
 Ready means all of these hold:
 
 - the backend that nodemon restarts after the first watch build owns `server.lock` and answers
@@ -103,7 +104,13 @@ Ready means all of these hold:
 - Vite serves the app,
 - the seed is done: onboarding marked seen, a fake Anthropic provider on a dead loopback port (the
   composer refuses to send without a provider), the trusted project `demo-app` (a throwaway git
-  repo) and the workspace `Verify playground` with its worktree set up.
+  repo) and the workspace `Verify playground` with its worktree set up,
+- Vite has transformed every module of the renderer, the lazily loaded ones too (about 1,600).
+  Vite transforms a module on its first request, on one thread, and React Compiler makes that cost
+  about 45 CPU seconds for the first page load. A cold Vite makes the first `open` plus `idle` take
+  longer than agent-browser's 25 s wait. `scripts/warmViteModules.ts` requests the whole graph over
+  HTTP, so the first `open` gets modules from Vite's cache. It fails the launch on a module that
+  Vite cannot serve.
 
 It prints the run's `export` lines and the URL of the seeded workspace. A failed launch prints the
 server log tail and cleans up. Launch refuses while the process group of this checkout's newest
@@ -338,12 +345,17 @@ after their other arguments. Without one they use the newest launch from this ch
   `server.log` shows `optimized dependencies changed. reloading`. The panel and its tab stay open
   across the reload. Run `idle`, wait for the panel's text, and continue from the open tab (see
   the Review recipe).
-- Now and then a lazily loaded module request from agent-browser to Vite never completes. The
-  page or panel then shows `<name> failed to load.` with a `Reload` button, and the console logs
-  `Failed to fetch dynamically imported module`. curl gets the same module at once, so it is not
-  a product failure. `verify-xum.sh idle` exits 3 on it. Run `agent-browser reload`, then repeat
-  the step, and note the reload in your report.
-- A page that stays on `Loading Xum` under host load recovers with `agent-browser reload`.
+- Now and then Chrome fails every module request that is still queued (about 60 while the page
+  loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of the host
+  changed. A Docker container that starts on a shared host adds an interface. The page or panel
+  then shows `<name> failed to load.` with a `Reload` button, and the console logs
+  `Failed to fetch dynamically imported module`. Vite is not at fault: curl gets the same module at
+  once. `React.lazy` keeps the failure, so only a reload recovers. `verify-xum.sh idle` exits 3 on
+  it. Run `agent-browser reload`, then repeat the step, and note the reload in your report. Launch
+  warms Vite, so a page load takes a few seconds and the window for such a change is short.
+- A page that stays on `Loading Xum` is still loading: Vite is transforming modules that no one
+  requested before. After a launch this happens only for modules that a source edit made Vite
+  transform again. Run `idle` once more. `agent-browser reload` does not make it faster.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press
