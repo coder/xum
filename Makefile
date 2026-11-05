@@ -151,7 +151,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook test-storybook-webkit storybook-budget
 .PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
@@ -1000,6 +1000,15 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	$(check_node_version)
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
+
+# The runner opens the Storybook page once for every story file it is given, so only the files
+# that name the tag are visited.
+WEBKIT_STORY_FILES = $(shell grep -rlF '"webkit"' src/browser --include='*.stories.tsx')
+
+test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)
+	$(check_node_version)
+	@test -n "$(WEBKIT_STORY_FILES)" || { echo "No story has the webkit tag"; exit 1; }
+	@bun x test-storybook --browsers webkit --includeTags webkit --testTimeout 30000 $(WEBKIT_STORY_FILES)
 
 storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
 	$(check_node_version)
