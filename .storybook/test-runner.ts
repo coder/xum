@@ -520,7 +520,7 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
       return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
     })
   );
-  assert(boxes.length > 0, "A story tagged webkit must render a Mermaid diagram to paint-check");
+  assert(boxes.length > 0, "A paint check needs a Mermaid diagram in the page");
   return boxes;
 }
 
@@ -558,8 +558,9 @@ function stripsAround(box: Box, viewport: { width: number; height: number }): Pa
 
 async function screenshotStrips(page: StoryPage, strips: PaintStrip[]) {
   const shots: Buffer[] = [];
-  for (const { clip } of strips)
+  for (const { clip } of strips) {
     shots.push(await page.screenshot({ clip, animations: "disabled" }));
+  }
   return shots;
 }
 
@@ -602,8 +603,9 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
       await setDiagramHidden(page, index, false);
     }
     for (const [i, strip] of strips.entries()) {
-      if (!shown[i].equals(hidden[i]))
+      if (!shown[i].equals(hidden[i])) {
         painted.push(`diagram ${index} paints ${strip.name} its box`);
+      }
     }
   }
   assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");

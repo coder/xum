@@ -335,13 +335,13 @@ async function expectDiagramInsideFrame(geometry: DiagramGeometry) {
 /** Waits until the diagram has rendered at the column's width and every box agrees. */
 async function waitForDiagram(
   canvasElement: HTMLElement,
-  expectation: (geometry: DiagramGeometry) => Promise<void>
+  expectation?: (geometry: DiagramGeometry) => Promise<void>
 ) {
   await waitFor(
     async () => {
       const geometry = measureDiagram(canvasElement);
       await expectDiagramInsideFrame(geometry);
-      await expectation(geometry);
+      await expectation?.(geometry);
     },
     { timeout: 10_000 }
   );
@@ -514,7 +514,7 @@ export const MermaidStateDialogPhone: Story = {
     // The test runner pins this size before it plays the story (.storybook/test-runner.ts).
     await expect({ width: window.innerWidth, height: window.innerHeight }).toEqual(PHONE_VIEWPORT);
     await playAtDefaultZoom(async () => {
-      await waitForDiagram(canvasElement, async () => {});
+      await waitForDiagram(canvasElement);
       const controls = within(canvasElement);
       await userEvent.click(controls.getByRole("button", { name: "⤢" }));
       await expectDialogShowsWholeDiagram(canvasElement);
