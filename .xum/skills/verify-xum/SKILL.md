@@ -184,6 +184,52 @@ shows the token.
 `<step>.url.txt` under `evidence/<feature>/`. Pass absolute paths to any other `agent-browser`
 output: it resolves relative paths against its daemon's directory.
 
+### WebKit capture
+
+agent-browser drives Chromium. Phone users run Safari, which is WebKit, and the two engines lay
+some pages out differently, so a Chromium pass cannot show a WebKit-only defect. `webkit-capture`
+opens a page of the run in Playwright WebKit at a phone viewport:
+
+```bash
+.xum/skills/verify-xum/scripts/verify-xum.sh webkit-capture "/workspace/$VERIFY_XUM_WORKSPACE_ID" chat/reply
+```
+
+`webkit-capture <path> <feature>/<step>` loads `<path>` in a new browser (390x844 at 3x, mobile,
+touch), waits as `idle` does and until the `Loading Xum` screen is gone, and writes
+`<step>-webkit.png` and `<step>-webkit.txt` under `evidence/<feature>/`. It exits 3 on
+`<name> failed to load.`, as `idle` does. The report holds the redacted URL, the engine and its
+mode, the viewport, `document.documentElement.scrollWidth <= innerWidth` with both numbers, and
+the console and page errors. Open the PNG: the width line sees only page-level overflow, not
+content that paints outside its frame inside the page.
+
+- The browser starts at `<path>`. It shows what a URL and the server's state give: a transcript
+  that `agent-browser` steps built (the history is on the server), a route, a saved setting. A
+  state that only clicks reach (an open dialog) cannot be captured this way: report that and say
+  what you checked instead.
+- It uses the repo's locked `playwright-core`. WebKit needs GTK and GStreamer libraries that many
+  hosts lack. On `auto` (the default of `VERIFY_XUM_WEBKIT`, which can also be `host` or
+  `docker`) it runs on the host when WebKit launches there (`node_modules/.bin/playwright
+  install webkit`, and `--with-deps` for the libraries). Otherwise it runs the same helper in
+  `mcr.microsoft.com/playwright@sha256:2f05f8a7...` (Playwright 1.64.1, pinned by digest, pulled
+  once). The image's browsers belong to that Playwright version: a Playwright bump needs a new
+  digest in `verify-xum.sh`, and `scripts/verifyXumWebkit.test.ts` fails until it has one. When
+  neither mode works, the command exits 1 and names both fixes.
+- The token reaches the helper on stdin, as it reaches curl in `doctor`. It is in no argv, no
+  environment and no file, and the helper redacts it from every message and from the report. The
+  host helper runs under `env -i` with an allowlist. Playwright drives WebKit over a pipe, so
+  unlike agent-browser no DevTools port and no stream listens.
+- CAUTION: in Docker mode `--network host` lets the container reach every loopback port of the
+  host, the sandbox's backend and its token included. The container gets the token on stdin only,
+  runs one file of this repo from the pinned image as your uid with no capabilities and a
+  read-only root, and mounts only `node_modules` (read-only), that file (read-only) and the step's
+  evidence folder. The command refuses a Docker endpoint that is not a local socket (the token
+  would leave the host), and runs the docker CLI with an empty private config (its `proxies` would
+  otherwise go into the container's environment). Run it only on a host where you are the only
+  local account.
+- Nothing outlives the command except the evidence: the container is removed when it exits and
+  stops itself after 180 s at most, and the private Docker config sits in the run's `tmp` folder
+  that cleanup deletes. Cleanup redacts the report like every other text file of the evidence.
+
 Proof standards:
 
 - Drive the path a user takes. No test-only routes, no state written behind the UI's back except
@@ -202,6 +248,12 @@ Proof standards:
   does not show it, follow the phone layout's own path to it or capture that it is absent, and
   say which. Run `agent-browser set viewport 1280 720` afterwards. A change with no UI needs no
   phone pass: say so.
+- For every UI change to layout, CSS, SVG or scrolling, add a WebKit capture
+  (`verify-xum.sh webkit-capture`, above) of each page the change reaches, and read the
+  `-webkit` PNG next to the `-375` one. Phone users run Safari, which is WebKit, and agent-browser
+  is Chromium: a page that fits in the `-375` capture can still break in WebKit (Mermaid diagrams
+  paint outside their frame on an iPhone). Say which captures you could not make in WebKit, and
+  why.
 - Check side effects next to what is visible: rows in
   `$VERIFY_XUM_ROOT/sessions/<workspace id>/chat.jsonl`, entries in `$VERIFY_XUM_ROOT/config.json`,
   git state in the worktree, or the CLI view above.
