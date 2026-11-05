@@ -10,7 +10,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import * as artifactStoreModule from "./artifactStore";
-import { recordArtifactVersion } from "./artifactVersionStore";
+import { recordArtifactPublish } from "./artifactRecordStore";
 import {
   ARTIFACTS_UNAVAILABLE_REASON,
   DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON,
@@ -131,15 +131,13 @@ describe("artifacts operations", () => {
     expect(read.success && "content" in read.data).toBe(false);
   });
 
-  test("lists paths with stored versions, so deleted working files stay reachable", async () => {
+  test("lists the paths that have a publish record", async () => {
     await writeArtifact("live.md", "# Live");
-    await recordArtifactVersion({
+    await writeArtifact("published.md", "# Published");
+    await recordArtifactPublish({
       sessionDir: path.join(config.sessionsDir, "ws-art"),
-      relPath: "deleted.md",
-      bytes: Buffer.from("kept"),
-      kind: "markdown",
-      label: null,
-      pin: null,
+      relPath: "published.md",
+      title: "Published",
     });
 
     const listing = await listArtifacts(createContext({ enabled: true }), {
@@ -148,8 +146,31 @@ describe("artifacts operations", () => {
 
     expect(listing).toMatchObject({
       success: true,
-      data: { entries: [{ path: "live.md" }], versionedPaths: ["deleted.md"] },
+      data: { publishedPaths: ["published.md"] },
     });
+  });
+
+  test("a live read shows the kind the artifact tool published it as", async () => {
+    await writeArtifact("flow.txt", "graph TD; A-->B");
+    await writeArtifact("plain.txt", "graph TD; A-->B");
+    await recordArtifactPublish({
+      sessionDir: path.join(config.sessionsDir, "ws-art"),
+      relPath: "flow.txt",
+      title: "Flow",
+      kind: "mermaid",
+    });
+    const context = createContext({ enabled: true });
+
+    expect(await readArtifact(context, { workspaceId: "ws-art", path: "flow.txt" })).toMatchObject({
+      success: true,
+      data: { status: "ok", kind: "mermaid", content: "graph TD; A-->B" },
+    });
+    expect(await readArtifact(context, { workspaceId: "ws-art", path: "plain.txt" })).toMatchObject(
+      {
+        success: true,
+        data: { kind: "text" },
+      }
+    );
   });
 
   describe("resolveArtifactsLocation", () => {

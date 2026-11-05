@@ -354,7 +354,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
         getDefaultSendOptions: () =>
           Promise.resolve({ model: "openai:gpt-4o-mini", agentId: "exec" }),
       },
-      { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+      { workspaceId: "test-workspace", path: "form.html", text: "Ship it" }
     );
     expect(sent.success).toBe(true);
     expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
@@ -399,7 +399,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
           getDefaultSendOptions: () =>
             Promise.resolve({ model: "anthropic:claude-sonnet-4-5", agentId: "exec" }),
         },
-        { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+        { workspaceId: "test-workspace", path: "form.html", text: "Ship it" }
       );
       expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
       expect(sent.success).toBe(expectSent);

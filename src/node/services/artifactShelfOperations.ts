@@ -7,17 +7,28 @@ import {
   getArtifactShelfRoot,
   getShelfScopeDir,
   listShelfScope,
+  MAX_SHELF_FILE_BYTES,
   pinToShelf,
   readShelfEntry,
   unpinFromShelf,
 } from "./artifactShelf";
 import {
   buildArtifactReadResult,
+  parseArtifactRelativePath,
   tooLargeArtifactResult,
+  type ArtifactBytesOutcome,
   type ArtifactReadOutcome,
 } from "./artifactStore";
-import { assertArtifactsEnabled, type ArtifactsContext } from "./artifactsOperations";
-import { readArtifactVersionBytes } from "./artifactVersionStore";
+import {
+  assertArtifactsEnabled,
+  MAX_ARTIFACT_READ_BYTES,
+  readArtifactBytesAtLocation,
+  resolveForWorkspace,
+  unreachableError,
+  type ArtifactsContext,
+  type AvailableArtifactsLocation,
+} from "./artifactsOperations";
+import { getArtifactId, readArtifactRecord } from "./artifactRecordStore";
 
 /**
  * Shelf operations shared by the oRPC routes and the agent tools. The shelf is host-local and
@@ -26,36 +37,58 @@ import { readArtifactVersionBytes } from "./artifactVersionStore";
 
 type Outcome<T> = { success: true; data: T } | { success: false; error: string };
 
-/** Copy a stored version to a shelf scope (agent pin from the artifact tool, or a user pin). */
-export async function pinVersionToShelf(params: {
+/**
+ * Copy the artifact's current bytes to a shelf scope (agent pin from the artifact tool, or a
+ * user pin). Title and kind come from the artifact's record, when it has one.
+ */
+export async function pinArtifactToShelf(params: {
   shelfRoot: string;
   projectIdentity: string;
   scope: ArtifactShelfScope;
   sessionDir: string;
+  location: AvailableArtifactsLocation;
   workspaceId: string;
-  artifactId: string;
-  version: number;
+  relPath: string;
   pinnedBy: "agent" | "user";
+  abortSignal?: AbortSignal;
   nowMs?: number;
 }): Promise<Outcome<{ name: string }>> {
   const scopeDir = getShelfScopeDir(params.shelfRoot, params.scope, params.projectIdentity);
   if (typeof scopeDir !== "string") return { success: false, error: scopeDir.error };
-  const stored = await readArtifactVersionBytes(
-    params.sessionDir,
-    params.artifactId,
-    params.version
-  );
-  if (!stored) return { success: false, error: `Artifact version not found: v${params.version}` };
+  let read: ArtifactBytesOutcome;
+  try {
+    read = await readArtifactBytesAtLocation(
+      params.location,
+      params.relPath,
+      MAX_ARTIFACT_READ_BYTES,
+      params.abortSignal
+    );
+  } catch (error) {
+    return unreachableError(error);
+  }
+  switch (read.status) {
+    case "invalid":
+      return { success: false, error: read.error };
+    case "missing":
+      return { success: false, error: `Artifact not found: ${params.relPath}` };
+    case "too_large":
+      return {
+        success: false,
+        error: `Artifact is ${read.size} bytes; shelf files are capped at ${MAX_SHELF_FILE_BYTES} bytes`,
+      };
+    case "ok":
+      break;
+  }
+  const record = await readArtifactRecord(params.sessionDir, getArtifactId(params.relPath));
   const pinned = await pinToShelf({
     shelfRoot: params.shelfRoot,
     scopeDir,
-    relPath: stored.version.path,
-    bytes: stored.bytes,
+    relPath: params.relPath,
+    bytes: read.bytes,
     meta: {
       sourceWorkspaceId: params.workspaceId,
-      version: stored.version.version,
-      title: stored.version.label ?? path.posix.basename(stored.version.path),
-      kind: stored.version.kind ?? getArtifactKind(stored.version.path),
+      title: record?.title ?? path.posix.basename(params.relPath),
+      kind: record?.kind ?? getArtifactKind(params.relPath),
       pinnedAtMs: params.nowMs ?? Date.now(),
       pinnedBy: params.pinnedBy,
     },
@@ -164,17 +197,22 @@ export async function readShelfRoute(
 
 export async function pinToShelfRoute(
   context: ArtifactsContext,
-  input: { workspaceId: string; artifactId: string; version: number; scope: ArtifactShelfScope }
+  input: { workspaceId: string; path: string; scope: ArtifactShelfScope }
 ): Promise<Outcome<{ name: string }>> {
   assertArtifactsEnabled(context);
   const ctx = await workspaceShelfContext(context, input.workspaceId);
   if (!ctx) return notFound(input.workspaceId);
-  return pinVersionToShelf({
+  const segments = parseArtifactRelativePath(input.path);
+  if (typeof segments === "string") return { success: false, error: segments };
+  const location = await resolveForWorkspace(context, input.workspaceId, undefined);
+  if (!location) return notFound(input.workspaceId);
+  if (location.kind === "unavailable") return { success: false, error: location.reason };
+  return pinArtifactToShelf({
     ...ctx,
     scope: input.scope,
+    location,
     workspaceId: input.workspaceId,
-    artifactId: input.artifactId,
-    version: input.version,
+    relPath: segments.join("/"),
     pinnedBy: "user",
   });
 }

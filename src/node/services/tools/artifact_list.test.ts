@@ -9,7 +9,7 @@ import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperation
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import * as artifactInteractions from "@/node/services/artifactInteractions";
 import { setArtifactInteractionState } from "@/node/services/artifactInteractions";
-import { recordArtifactVersion } from "@/node/services/artifactVersionStore";
+import { recordArtifactPublish } from "@/node/services/artifactRecordStore";
 import { createArtifactListTool } from "./artifact_list";
 import { createTestToolConfig, getTestDeps } from "./testHelpers";
 
@@ -88,17 +88,17 @@ describe("artifact_list tool", () => {
     expect(execSpy).not.toHaveBeenCalled();
   });
 
-  test("lists deleted artifacts that still have stored versions", async () => {
+  test("shows the title of published artifacts and leaves deleted ones out", async () => {
     const scratchDir = path.join(tempDir, "scratch");
     await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
     await fs.writeFile(path.join(scratchDir, "artifacts", "live.md"), "live");
     const sessionDir = path.join(tempDir, "session");
-    await recordArtifactVersion({
-      sessionDir,
-      relPath: "gone.md",
-      bytes: Buffer.from("old"),
-      label: "Old report",
-    });
+    for (const [relPath, title] of [
+      ["live.md", "Live report"],
+      ["gone.md", "Old report"],
+    ]) {
+      await recordArtifactPublish({ sessionDir, relPath, title });
+    }
     const config = {
       ...createTestToolConfig(tempDir, { sessionsDir: sessionDir }),
       xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
@@ -108,14 +108,15 @@ describe("artifact_list tool", () => {
       artifacts: Array<Record<string, unknown>>;
     };
 
-    expect(result.artifacts.map((a) => a.path)).toEqual(["live.md", "gone.md"]);
-    expect(result.artifacts[1]).toEqual({
-      path: "gone.md",
-      kind: "markdown",
-      deleted: true,
-      latestVersion: 1,
-      latestLabel: "Old report",
-    });
+    expect(result.artifacts).toEqual([
+      {
+        path: "live.md",
+        kind: "markdown",
+        size: 4,
+        modified: expect.any(String) as string,
+        title: "Live report",
+      },
+    ]);
   });
 
   test("shows the saved state of HTML artifacts", async () => {

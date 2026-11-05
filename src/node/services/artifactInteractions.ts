@@ -32,10 +32,10 @@ import { assertArtifactsEnabled, type ArtifactsContext } from "./artifactsOperat
 import { parseArtifactRelativePath } from "./artifactStore";
 import {
   getArtifactId,
-  readArtifactIndex,
+  readArtifactRecord,
   readArtifactState,
   writeArtifactState,
-} from "./artifactVersionStore";
+} from "./artifactRecordStore";
 import { log } from "./log";
 import type { HistoryService } from "./historyService";
 import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
@@ -52,7 +52,6 @@ const PendingRecordSchema = z.object({
   workspaceId: z.string().min(1),
   artifactPath: z.string().min(1),
   artifactTitle: z.string(),
-  version: z.number().int().nonnegative(),
   text: z.string(),
   data: z.unknown().optional(),
   createdAtMs: z.number(),
@@ -63,6 +62,7 @@ export type PendingArtifactInteraction = z.infer<typeof PendingRecordSchema>;
 
 // Records are validated one by one (below), so one record this version cannot read (corrupt,
 // or written by another app version) does not discard the user's other confirmed sends.
+// Records written before artifact versions were removed also hold a `version`: the schema drops it.
 const PendingFileSchema = z.object({
   version: z.literal(1),
   pending: z.array(z.unknown()),
@@ -153,7 +153,7 @@ export function buildArtifactInteractionText(record: PendingArtifactInteraction)
   ).replace(/</g, "\\u003c");
   return (
     `<artifact_interaction artifact="${escapeXmlAttribute(record.artifactPath)}"` +
-    ` title="${escapeXmlAttribute(record.artifactTitle)}" version="${record.version}"` +
+    ` title="${escapeXmlAttribute(record.artifactTitle)}"` +
     ` action="send">${body}</artifact_interaction>`
   );
 }
@@ -165,28 +165,19 @@ export function buildArtifactInteractionMetadata(
     id: record.id,
     artifactPath: record.artifactPath,
     title: record.artifactTitle,
-    version: record.version,
     action: "send",
     text: record.text,
     ...(record.data !== undefined ? { data: record.data } : {}),
   };
 }
 
-/**
- * Which version an interaction refers to, and its title. `version: null` means the live file: it
- * resolves to the latest stored version, or 0 when the file has none yet.
- */
-export async function resolveArtifactInteractionTarget(
+/** The artifact's title: its record's, else the file name. */
+async function resolveArtifactInteractionTitle(
   sessionDir: string,
-  relPath: string,
-  version: number | null
-): Promise<{ artifactId: string; version: number; title: string }> {
-  const artifactId = getArtifactId(relPath);
-  const index = await readArtifactIndex(sessionDir, artifactId);
-  const latest = index?.versions.at(-1);
-  const resolved = version ?? latest?.version ?? 0;
-  const label = index?.versions.find((entry) => entry.version === resolved)?.label;
-  return { artifactId, version: resolved, title: label ?? path.posix.basename(relPath) };
+  relPath: string
+): Promise<string> {
+  const record = await readArtifactRecord(sessionDir, getArtifactId(relPath));
+  return record?.title ?? path.posix.basename(relPath);
 }
 
 function validateJsonPayload(value: unknown, what: string): string | null {
@@ -272,7 +263,7 @@ async function dispatchPending(
 /** A confirmed send from the Artifacts tab: persist, then dispatch. */
 export async function sendArtifactInteraction(
   deps: ArtifactInteractionDeps,
-  input: { workspaceId: string; path: string; version: number | null; text: string; data?: unknown }
+  input: { workspaceId: string; path: string; text: string; data?: unknown }
 ): Promise<Result<{ id: string }, string>> {
   const segments = parseArtifactRelativePath(input.path);
   if (typeof segments === "string") return Err(segments);
@@ -284,13 +275,11 @@ export async function sendArtifactInteraction(
     if (error != null) return Err(error);
   }
   const sessionDir = sessionDirOf(deps, input.workspaceId);
-  const target = await resolveArtifactInteractionTarget(sessionDir, input.path, input.version);
   const record: PendingArtifactInteraction = {
     id: (deps.newId ?? randomUUID)(),
     workspaceId: input.workspaceId,
     artifactPath: segments.join("/"),
-    artifactTitle: target.title,
-    version: target.version,
+    artifactTitle: await resolveArtifactInteractionTitle(sessionDir, input.path),
     text: input.text,
     ...(input.data !== undefined ? { data: input.data } : {}),
     createdAtMs: (deps.now ?? Date.now)(),
@@ -379,8 +368,7 @@ export async function listWorkspacesWithPendingInteractions(
   return found;
 }
 
-// window.xum.setState belongs to the artifact, not to one version: a republish keeps what the
-// user picked. Only send() still names a version (the one the user saw when they confirmed).
+// window.xum.setState belongs to the artifact: a republish keeps what the user picked.
 export async function getArtifactInteractionState(
   sessionsDir: string,
   input: { workspaceId: string; path: string }
@@ -454,7 +442,7 @@ async function assertRouteWorkspace(
 
 export async function sendInteractionRoute(
   context: InteractionRouteContext,
-  input: { workspaceId: string; path: string; version: number | null; text: string; data?: unknown }
+  input: { workspaceId: string; path: string; text: string; data?: unknown }
 ): Promise<Result<{ id: string }, string>> {
   const missing = await assertRouteWorkspace(context, input.workspaceId);
   if (missing != null) return Err(missing);

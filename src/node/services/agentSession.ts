@@ -292,7 +292,7 @@ import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
 import { AttachmentService } from "./attachmentService";
-import { generateArtifactsIndexAttachment } from "./artifactVersionsOperations";
+import { generateArtifactsIndexAttachment } from "./artifactPublishOperations";
 import type { TodoItem } from "@/common/types/tools";
 import type {
   LoadedSkillSnapshot,

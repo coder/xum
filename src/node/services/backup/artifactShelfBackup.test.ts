@@ -276,7 +276,6 @@ describe("artifact shelf backup", () => {
             bytes: Buffer.from("pinned meanwhile"),
             meta: {
               sourceWorkspaceId: "ws-1",
-              version: 2,
               title: "a.md",
               kind: "text",
               pinnedAtMs: 2,
@@ -581,7 +580,6 @@ describe("artifact shelf through the backup payload store", () => {
         bytes: Buffer.from(`from ${workspace}`),
         meta: {
           sourceWorkspaceId: workspace,
-          version: 1,
           title: file,
           kind: "markdown",
           pinnedAtMs: 1,

@@ -10,6 +10,7 @@ import * as path from "path";
 import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactCapabilities, ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type { ArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -23,7 +24,7 @@ import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentL
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { log } from "@/node/services/log";
 import { getArtifactCapabilities } from "./artifactCapabilities";
-import { listArtifactIndexes } from "./artifactVersionStore";
+import { getArtifactId, listArtifactRecords, readArtifactRecord } from "./artifactRecordStore";
 import {
   listArtifactsOnRuntime,
   readArtifactBytesOnRuntime,
@@ -191,11 +192,11 @@ export async function listArtifacts(
   if (location.kind === "unavailable") {
     return { success: true, data: { available: false, reason: location.reason } };
   }
-  const versionedPaths = await listVersionedArtifactPaths(context, input.workspaceId);
+  const publishedPaths = await listPublishedArtifactPaths(context, input.workspaceId);
   if (location.kind === "runtime") {
     try {
       const listing = await listArtifactsOnRuntime(location.runtime, location.dir, abortSignal);
-      return { success: true, data: { available: true, ...listing, versionedPaths } };
+      return { success: true, data: { available: true, ...listing, publishedPaths } };
     } catch (error) {
       return unreachableError(error);
     }
@@ -205,24 +206,42 @@ export async function listArtifacts(
   });
   return {
     success: true,
-    data: { available: true, dir: location.dir, entries, truncated, versionedPaths },
+    data: { available: true, dir: location.dir, entries, truncated, publishedPaths },
   };
 }
 
 /**
- * Paths with stored versions (host session dir), so the tab keeps deleted working files
- * reachable through their versions. Unreadable indexes leave the list short, never fail it.
+ * Paths with a publish record (host session dir), so the tab can list published files first.
+ * Unreadable records leave the list short, never fail it.
  */
-async function listVersionedArtifactPaths(
+async function listPublishedArtifactPaths(
   context: ArtifactsContext,
   workspaceId: string
 ): Promise<string[]> {
   try {
-    const indexes = await listArtifactIndexes(path.join(context.config.sessionsDir, workspaceId));
-    return indexes.filter((index) => index.versions.length > 0).map((index) => index.path);
+    const records = await listArtifactRecords(path.join(context.config.sessionsDir, workspaceId));
+    return records.map((record) => record.path);
   } catch (error) {
-    log.debug("Could not list artifact version indexes", { error: getErrorMessage(error) });
+    log.debug("Could not list artifact records", { error: getErrorMessage(error) });
     return [];
+  }
+}
+
+/** The `artifact` tool's kind override for a path; an unreadable record means no override. */
+async function readKindOverride(
+  context: ArtifactsContext,
+  workspaceId: string,
+  relPath: string
+): Promise<ArtifactKind | undefined> {
+  try {
+    const record = await readArtifactRecord(
+      path.join(context.config.sessionsDir, workspaceId),
+      getArtifactId(relPath)
+    );
+    return record?.kind;
+  } catch (error) {
+    log.debug("Could not read artifact record", { error: getErrorMessage(error) });
+    return undefined;
   }
 }
 
@@ -241,6 +260,7 @@ export async function readArtifact(
   const location = await resolveForWorkspace(context, input.workspaceId, abortSignal);
   if (!location) return { success: false, error: `Workspace not found: ${input.workspaceId}` };
   if (location.kind === "unavailable") return { success: false, error: location.reason };
+  const kind = await readKindOverride(context, input.workspaceId, input.path);
   if (location.kind === "runtime") {
     try {
       return await readArtifactOnRuntime(
@@ -248,7 +268,8 @@ export async function readArtifact(
         location.dir,
         input.path,
         maxBytes,
-        abortSignal
+        abortSignal,
+        { kind }
       );
     } catch (error) {
       return unreachableError(error);
@@ -256,6 +277,7 @@ export async function readArtifact(
   }
   return readArtifactFromDir(location.dir, input.path, maxBytes, {
     requireDescriptorPaths: location.containerWritable,
+    kind,
   });
 }
 
