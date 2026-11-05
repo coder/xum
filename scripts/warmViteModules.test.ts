@@ -114,6 +114,8 @@ describe("warmModuleGraph", () => {
   test("ignores a 404 for a string that only looks like an import", async () => {
     const { origin } = serve({
       "/": () => new Response(INDEX_HTML, { headers: { "content-type": "text/html" } }),
+      "/@react-refresh": () => js("export default {}"),
+      "/@vite/client": () => js("export {}"),
       "/src/main.tsx": () =>
         js(`const s = 'import x from "/not/a/module.js"'; import "/src/ok.ts"`),
       "/src/ok.ts": () => js("export {}"),
@@ -121,8 +123,8 @@ describe("warmModuleGraph", () => {
 
     const result = await warmModuleGraph(origin);
 
-    expect(result.notFound).toBeGreaterThan(0);
-    expect(result.served).toBe(3);
+    // Only the string inside main.tsx is unrouted. The page's own two scripts are served.
+    expect(result).toEqual({ served: 5, notFound: 1 });
   });
 
   test("fails and names the module when Vite answers a transform error", async () => {

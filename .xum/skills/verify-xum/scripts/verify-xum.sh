@@ -409,16 +409,16 @@ seed() {
 
 # Vite transforms a module on its first request, on one thread, and a cold first page load asks for
 # about 900 of them: about 45 CPU seconds, two thirds of it React Compiler. That outlasts `idle`'s 25 s
-# wait, so the page stays on "Loading Xum". For that whole time Chrome also holds about 60 queued
+# wait, so the page stays on "Loading Xum". For that whole time Chrome also holds dozens of queued
 # module requests, and a host network change fails them (ERR_NETWORK_CHANGED, then "<name> failed to
-# load."). Walking the module graph here, over HTTP and before `ready`, moves that cost into the
+# load." or a page that stays on "Loading Xum"). Walking the module graph here, over HTTP and before `ready`, moves that cost into the
 # launch, so the first `open` gets cached modules. The walk prints to stderr: stdout stays the run's
 # `export` lines. env -i keeps the live Xum's token out of its environment.
 warm_vite_modules() {
   before_launch_deadline
   env -i PATH="$PATH" HOME="$HOME" bun "$CHECKOUT/scripts/warmViteModules.ts" \
     "$VERIFY_XUM_URL" "$(launch_seconds_left)" >&2 \
-    || die "Vite could not serve the renderer's modules (see above), so the first page load would fail"
+    || die "the module walk failed (reason above), so the first page load would not be reliable"
 }
 
 # nodemon waits for a file change after the backend crashes, and none comes during a launch. A
@@ -777,7 +777,7 @@ cmd_idle() {
   # A failed module of the first-load graph leaves the boot screen up with no message, so the wait
   # times out. Say what to try, because the bare "Wait timed out" does not.
   agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null || {
-    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', run idle once more, then agent-browser reload (SKILL.md Gotchas)." >&2
+    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', a module request failed: run agent-browser reload (SKILL.md Gotchas)." >&2
     exit 1
   }
   if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then

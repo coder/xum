@@ -6,15 +6,21 @@
  * first page load asks for about 900 of them (React Compiler runs through Babel on every one).
  * That costs about 45 CPU seconds of Vite time. Under host load the first `open` plus `idle` of a
  * verify-xum run then outlasts agent-browser's 25 s wait and shows "Loading Xum" for as long as
- * the transforms take. During those seconds Chrome also holds about 60 queued module requests,
+ * the transforms take. During those seconds Chrome also holds dozens of queued module requests,
  * which a host network change (a Docker veth coming up) fails with ERR_NETWORK_CHANGED, and the
- * page then shows "<name> failed to load.". A warm Vite serves the same graph in about 2 s.
+ * page then shows "<name> failed to load." or stays on "Loading Xum". A warm Vite serves the
+ * same graph in about 2 s.
  *
  * The walk reads Vite's own output: Vite rewrites every import it serves to an absolute path, so a
  * regex over the served JavaScript finds the static and the `import("...")` edges. A 4xx answer is
  * ignored (a string that only looks like an import). A 5xx answer or a network failure fails the
  * walk, because the browser would fail on that module too. The walk never leaves Vite's origin:
  * the strings come from source files, and `/\\host` is a URL on another host.
+ *
+ * Worker scripts (`new Worker(new URL("...", import.meta.url))`) are left out on purpose. Vite's
+ * dependency scan does not see the highlight worker's `@pierre/highlights`, so the first request
+ * for the worker makes Vite optimize it and invalidate the modules this walk just warmed. Only a
+ * second walk would warm them again.
  *
  * Usage: bun scripts/warmViteModules.ts <vite origin> [<seconds before giving up>]
  */
@@ -170,7 +176,13 @@ if (import.meta.main) {
         `${Math.round((Date.now() - started) / 1000)} s`
     );
   } catch (error) {
-    console.error(`warmViteModules: ${error instanceof Error ? error.message : String(error)}`);
+    const reason =
+      error instanceof Error && error.name === "TimeoutError"
+        ? `the walk did not end within ${seconds} s (the launch deadline): Vite had not answered every module`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    console.error(`warmViteModules: ${reason}`);
     process.exit(1);
   }
 }
