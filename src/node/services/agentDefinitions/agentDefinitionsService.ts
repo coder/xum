@@ -618,11 +618,16 @@ function pluginAgentBody(args: {
   agentId: AgentId;
   candidate: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginName" | "pluginRoot">;
   workspaceRuntime: Runtime;
+  refuseUnreachablePluginFolder: boolean;
 }): string {
   const { parsed, candidate } = args;
   if (!parsed.foreign) return parsed.body;
   const refusal = pluginFolderRefusal(args);
-  if (refusal !== undefined) throw refusal;
+  if (refusal !== undefined) {
+    if (args.refuseUnreachablePluginFolder) throw refusal;
+    // A folder path that is not valid here would only mislead: keep the placeholder as written.
+    return parsed.body;
+  }
   assert(candidate.pluginRoot != null, "a foreign agent file is read only from a plugin");
   return expandPluginPlaceholders(parsed.body, {
     CLAUDE_PLUGIN_ROOT: toAgentBodyPath(candidate.pluginRoot, candidate.runtime),
@@ -946,6 +951,7 @@ export class AgentDefinitionRequestCache {
       // #6426: the default roots differ with trust (project plugin agents).
       options.projectPluginsTrusted === true,
       this.objectId(options.runtimeFactory),
+      options.refuseUnreachablePluginFolder === true,
     ]);
     let definition = this.definitions.get(key);
     if (definition == null) {
@@ -975,6 +981,15 @@ export interface ReadAgentDefinitionOptions {
   projectPluginsTrusted?: boolean;
   /** Builds the host-local runtimes of the plugin and global scans. */
   runtimeFactory: RuntimeFactory;
+  /**
+   * Opt-in for a spawn by ID (the two `task` paths): a foreign plugin agent that names its plugin
+   * folder, which this workspace cannot read, ends the lookup with a `folder-unreachable`
+   * refusal. The agent keeps its ID, so no lower scope's agent starts in its place (A4). Other
+   * reads (the main chat, a base chain, settings) keep loading the agent with its placeholder
+   * as written, so an unreachable agent never breaks them. Applies to the agent read by ID, not
+   * to its bases.
+   */
+  refuseUnreachablePluginFolder?: boolean;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -1106,6 +1121,7 @@ async function loadAgentDefinition(
         resolvedRoot,
         agentId,
         workspaceRuntime: runtime,
+        refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder === true,
         abortSignal,
       });
       if (pkg !== undefined) return pkg;
@@ -1147,6 +1163,7 @@ async function readCandidateDefinition(args: {
   resolvedRoot: string;
   agentId: AgentId;
   workspaceRuntime: Runtime;
+  refuseUnreachablePluginFolder: boolean;
   abortSignal: AbortSignal | undefined;
 }): Promise<AgentDefinitionPackage | undefined> {
   const { candidate, agentId, abortSignal } = args;
@@ -1206,6 +1223,7 @@ async function readCandidateDefinition(args: {
       agentId,
       candidate,
       workspaceRuntime: args.workspaceRuntime,
+      refuseUnreachablePluginFolder: args.refuseUnreachablePluginFolder,
     }),
     // Exact provenance for strict-send pinning; per-plugin candidate roots are
     // unique per plugin, so root identity distinguishes file vs plugin sources.
@@ -1429,6 +1447,9 @@ async function resolveAgentDefinitionWithAiChain(
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       ...baseReadOptions,
       skipScopesAbove,
+      ...(depth === 0
+        ? { refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder }
+        : {}),
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);

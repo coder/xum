@@ -130,10 +130,22 @@ describe("TaskService spawn refusals of plugin agents", () => {
         test(`names ${reason} when the definition read refuses the agent`, async () => {
           const { parentId, taskService } = await setup();
           const refusal = new PluginAgentRefusalError(reason, "design_critic", "egm", detail);
-          spyOn(agentDefinitionsService, "resolveAgentFrontmatter").mockRejectedValue(refusal);
-          spyOn(agentDefinitionsService, "resolveAgentDefinition").mockRejectedValue(refusal);
+          const frontmatterRead = spyOn(
+            agentDefinitionsService,
+            "resolveAgentFrontmatter"
+          ).mockRejectedValue(refusal);
+          const definitionRead = spyOn(
+            agentDefinitionsService,
+            "resolveAgentDefinition"
+          ).mockRejectedValue(refusal);
 
           const created = await spawn(taskService, parentId, "design_critic");
+
+          // The spawn read opts in to the refusal of an unreachable plugin folder (R9).
+          const spawnRead = method === "create" ? frontmatterRead : definitionRead;
+          expect(spawnRead.mock.calls[0]?.[3]).toMatchObject({
+            refuseUnreachablePluginFolder: true,
+          });
 
           expect(created.success).toBe(false);
           if (created.success) return;

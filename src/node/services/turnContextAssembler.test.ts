@@ -2587,6 +2587,46 @@ describe("discoverAvailableSubagentsForToolContext plugin folder availability", 
     ]);
   });
 
+  test("an unavailable plugin agent hides a lower-precedence agent with the same ID from the list", async () => {
+    using home = new DisposableTempDir("task-list-folder-hides");
+    await writeHostPlugin(home.path);
+    await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(home.path, "agents", "twin.md"),
+      "---\nname: Global twin\nbase: exec\nsubagent:\n  runnable: true\n---\nGlobal twin.\n"
+    );
+    await fs.writeFile(
+      path.join(home.path, "plugins", "egm", "agents", "twin.md"),
+      `---\nname: Plugin twin\n---\nRead ${ROOT}/twin.md\n`
+    );
+    const local = new LocalRuntime(home.path);
+    // A host runtime that reports itself as a devcontainer: it reads the host files, but bash runs
+    // in a container, so the plugin agent is unreachable there, as it is on SSH.
+    const devcontainer = Object.create(local, { location: { value: "devcontainer" } }) as Runtime;
+    // A project plugin outranks a global agent.
+    const roots = {
+      projectRoots: [],
+      projectPluginRoots: [path.join(home.path, "plugins")],
+      globalRoot: path.join(home.path, "agents"),
+    };
+    const twinScopes = async (runtime: Runtime) =>
+      (
+        await discoverAvailableSubagentsForToolContext({
+          runtime,
+          workspacePath: home.path,
+          cfg,
+          roots,
+          runtimeFactory,
+        })
+      )
+        .filter((agent) => agent.id === "twin")
+        .map((agent) => agent.scope);
+
+    expect(await twinScopes(local)).toEqual(["project"]);
+    // The unreachable plugin agent holds the ID: the global agent is not offered in its place.
+    expect(await twinScopes(devcontainer)).toEqual([]);
+  });
+
   test("a devcontainer workspace leaves out the agent that names a folder it cannot read", async () => {
     using home = new DisposableTempDir("task-list-folder-devcontainer");
     await writeHostPlugin(home.path);

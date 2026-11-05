@@ -6876,6 +6876,8 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            // A spawn of an unavailable plugin agent is refused: it is not a runnable ID.
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -6933,6 +6935,7 @@ export class TaskService implements AgentTaskIntegration {
         resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
           projectPluginsTrusted,
           runtimeFactory: nodeRuntimeFactory,
+          refuseUnreachablePluginFolder: true,
         }),
         signal
       );
@@ -9240,6 +9243,8 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            // A spawn of an unavailable plugin agent is refused: it is not a runnable ID.
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -9291,6 +9296,7 @@ export class TaskService implements AgentTaskIntegration {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
         runtimeFactory: nodeRuntimeFactory,
+        refuseUnreachablePluginFolder: true,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await this.describeRunnableTaskAgents(placement);

@@ -1926,10 +1926,17 @@ base: a
           expect(listed.find((agent) => agent.id === "native")?.unavailableReason).toBeUndefined();
 
           const refusal = await refusalOf(
-            readAgentDefinition(runtime, checkout.path, "persona", options)
+            readAgentDefinition(runtime, checkout.path, "persona", {
+              ...options,
+              refuseUnreachablePluginFolder: true,
+            })
           );
           expect(refusal.reason).toBe("folder-unreachable");
           expect(refusal.message).toContain("cannot read");
+          // Any other read keeps loading the agent, with the placeholder as written.
+          expect(
+            (await readAgentDefinition(runtime, checkout.path, "persona", options)).body
+          ).toContain(ROOT);
           expect(
             (await readAgentDefinition(runtime, checkout.path, "plain", options)).body
           ).toContain("No folder needed.");
@@ -1962,9 +1969,16 @@ base: a
         expect(explore[0]?.unavailableReason).toContain("folder-unreachable");
 
         const refusal = await refusalOf(
-          readAgentDefinition(runtime, checkout.path, "explore", options)
+          readAgentDefinition(runtime, checkout.path, "explore", {
+            ...options,
+            refuseUnreachablePluginFolder: true,
+          })
         );
         expect(refusal.reason).toBe("folder-unreachable");
+        // Without the opt-in the read loads the plugin's agent, as before: never the built-in one.
+        expect((await readAgentDefinition(runtime, checkout.path, "explore", options)).scope).toBe(
+          "global"
+        );
         // Other built-in agents are not affected.
         expect((await readAgentDefinition(runtime, checkout.path, "exec", options)).scope).toBe(
           "built-in"
@@ -1995,7 +2009,10 @@ base: a
         const options = { roots: localRoots(project.path, global.path, container), runtimeFactory };
 
         const refusal = await refusalOf(
-          readAgentDefinition(devcontainer, project.path, "twin", options)
+          readAgentDefinition(devcontainer, project.path, "twin", {
+            ...options,
+            refuseUnreachablePluginFolder: true,
+          })
         );
         expect(refusal.reason).toBe("folder-unreachable");
         const listed = await discoverAgentDefinitions(devcontainer, project.path, options);
@@ -2006,6 +2023,78 @@ base: a
         const pkg = await readAgentDefinition(local, project.path, "twin", options);
         expect(pkg.scope).toBe("project");
         expect(pkg.body).toContain("persona.md");
+      });
+
+      test("an unreachable foreign exec on SSH breaks neither main-chat resolution nor a base chain through exec", async () => {
+        using hostHome = new DisposableTempDir("agent-defs-unreachable-exec-home");
+        using checkout = new DisposableTempDir("agent-defs-unreachable-exec-checkout");
+        await writePlugin(path.join(hostHome.path, "plugins"), "egm", {
+          "exec.md": foreignAgent(PERSONA_BODY),
+        });
+        const projectAgents = path.join(checkout.path, ".xum", "agents");
+        await fs.mkdir(projectAgents, { recursive: true });
+        await fs.writeFile(
+          path.join(projectAgents, "child.md"),
+          "---\nname: Child\nbase: exec\nsubagent:\n  runnable: true\n---\nChild body\n"
+        );
+        const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+        const options = {
+          roots: {
+            projectRoots: [projectAgents],
+            globalRoot: path.join(hostHome.path, "agents"),
+            globalPluginRoots: [path.join(hostHome.path, "plugins")],
+          },
+          runtimeFactory,
+        };
+
+        // The main chat and settings read `exec` with no opt-in: it resolves, as before.
+        expect((await resolveAgentFrontmatter(runtime, checkout.path, "exec", options)).name).toBe(
+          "Reviewer"
+        );
+        // A base chain through `exec` resolves too, with the plugin's body as written.
+        const chain = await resolveAgentBody(runtime, checkout.path, "child", options);
+        expect(chain).toContain(ROOT);
+        expect(chain).toContain("Child body");
+
+        // A spawn of `exec` is refused. A spawn of `child` is not: the opt-in does not reach its base.
+        const spawnOptions = { ...options, refuseUnreachablePluginFolder: true };
+        const refusal = await refusalOf(
+          resolveAgentFrontmatter(runtime, checkout.path, "exec", spawnOptions)
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
+        expect(
+          (await resolveAgentFrontmatter(runtime, checkout.path, "child", spawnOptions)).name
+        ).toBe("Child");
+      });
+
+      test("one request cache keeps the spawn read (opt-in) apart from every other read", async () => {
+        using hostHome = new DisposableTempDir("agent-defs-unreachable-cache-home");
+        using checkout = new DisposableTempDir("agent-defs-unreachable-cache-checkout");
+        await writePlugin(path.join(hostHome.path, "plugins"), "egm", {
+          "persona.md": foreignAgent(PERSONA_BODY),
+        });
+        const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+        const options = {
+          roots: {
+            projectRoots: [],
+            globalRoot: path.join(hostHome.path, "agents"),
+            globalPluginRoots: [path.join(hostHome.path, "plugins")],
+          },
+          cache: new AgentDefinitionRequestCache(),
+          runtimeFactory,
+        };
+
+        // The same request reads the agent for the main chat first, then for a spawn.
+        expect(
+          (await readAgentDefinition(runtime, checkout.path, "persona", options)).body
+        ).toContain(ROOT);
+        const refusal = await refusalOf(
+          readAgentDefinition(runtime, checkout.path, "persona", {
+            ...options,
+            refuseUnreachablePluginFolder: true,
+          })
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
       });
 
       test("a remote project plugin agent on the remote host that holds its folder is listed and spawns", async () => {
