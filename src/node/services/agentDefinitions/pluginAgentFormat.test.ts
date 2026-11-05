@@ -111,8 +111,8 @@ describe("Cursor model: fast and is_background", () => {
   });
 });
 
-// RFC A3: a read-only search list gets Explore's base and the bash tools, so a Claude reviewer
-// that lists Grep and Glob can search. The frontmatter below is egm's, at the commit the RFC counts.
+// A read-only search list gets Explore's base and the bash tools, so a Claude reviewer that lists
+// Grep and Glob can search. The tool lists below are egm's.
 describe("read-only search lists", () => {
   const BASH_TOOLS = ["bash", "bash_output", "bash_background_list"];
   const SAMPLE_TOOLS = [
@@ -174,7 +174,7 @@ describe("read-only search lists", () => {
     ]);
   });
 
-  // Criterion 6: a list that is not exactly the four names grants Grep and Glob nothing, as before.
+  // A list that is not exactly the four names grants Grep and Glob nothing, as before.
   test("[Read, Edit, Grep] and [WebFetch, Grep] keep the mapping they had", () => {
     const edit = map({ tools: ["Read", "Edit", "Grep"] });
     expect(edit.base).toBe("exec");
@@ -211,7 +211,7 @@ describe("read-only search lists", () => {
     expect(toolsOf(mapped)).not.toContain("bash");
   });
 
-  // Criterion 5, at the mapping: the denylist runs first, so the rule sees the list that is left.
+  // The denylist runs first, so the rule sees the list that is left.
   test("disallowedTools: Bash removes the bash tools and keeps the Explore base", () => {
     const mapped = map({ tools: ["Read", "Grep", "Glob"], disallowedTools: ["Bash"] });
     expect(mapped.base).toBe("explore");
@@ -256,7 +256,6 @@ describe("read-only search lists", () => {
     );
   });
 
-  // Criterion 7.
   test("LS in disallowedTools does not skip the agent and removes nothing", () => {
     const mapped = map({ disallowedTools: ["LS"] });
     expect(mapped.base).toBe("exec");

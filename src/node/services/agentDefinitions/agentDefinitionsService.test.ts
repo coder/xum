@@ -1638,7 +1638,7 @@ base: a
       );
     });
 
-    // RFC A3, criterion 5: egm's reviewers list only Read, Grep and Glob.
+    // egm's reviewers list only Read, Grep and Glob.
     test("a Claude read-only search list runs on Explore with the file and bash tools", async () => {
       using project = new DisposableTempDir("agent-defs-search-list-project");
       using global = new DisposableTempDir("agent-defs-search-list-global");

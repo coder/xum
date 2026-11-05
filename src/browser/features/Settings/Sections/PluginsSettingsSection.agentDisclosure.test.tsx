@@ -76,7 +76,6 @@ test("the install preview marks only read-only agents with the shell note", asyn
   const notes = view.getAllByText(/edit tools removed, shell still available/);
   expect(notes).toHaveLength(1);
   expect(notes[0]?.previousElementSibling?.textContent).toBe("design_critic.md");
-  // The names are separated, and the note stays with its agent.
   expect(notes[0]?.parentElement?.textContent).toStartWith(
     "design_critic.md (edit tools removed, shell still available), synthesizer.md"
   );

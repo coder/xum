@@ -2330,9 +2330,9 @@ describe("AgentPluginInstallService", () => {
     expect(await listed()).toEqual(["Always delegate to me"]);
   });
 
-  // RFC A3, criterion 8: a Claude agent with `tools: [Read, Grep, Glob]` is mapped to the explore
-  // base and the bash tools, so the review recorded under the earlier mapping no longer matches.
-  test("a Claude agent whose mapping changed after its review needs a new review (RFC A3)", async () => {
+  // A Claude agent with `tools: [Read, Grep, Glob]` is mapped to the explore base and the bash
+  // tools, so the review recorded under the earlier mapping no longer matches.
+  test("a Claude agent whose mapping changed after its review needs a new review", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
       path.join(remoteDir, "agents", "reviewer.md"),
