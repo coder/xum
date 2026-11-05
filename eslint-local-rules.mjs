@@ -1724,6 +1724,27 @@ const localPlugin = {
         const isNamed = (node, name) =>
           (node.type === "Identifier" && node.name === name) ||
           (node.type === "Literal" && node.value === name);
+        // CSS names are case-insensitive and may carry a vendor prefix (-webkit-zoom).
+        const ZOOM_NAME = /^\s*(?:-[a-z]+-)?zoom\s*$/i;
+        // `width:1px;zoom:2` in a cssText or style attribute string.
+        const ZOOM_DECLARATION = /(?:^|[;{\s])(?:-[a-z]+-)?zoom\s*:/i;
+        // A Tailwind arbitrary property class such as `[zoom:2]` or `md:[zoom:2]`.
+        const ZOOM_UTILITY = /(?:^|[^\w-])\[(?:-[a-z]+-)?zoom:/i;
+        // The text of a string, a template literal without its expressions, or a concatenation.
+        const staticText = (node) => {
+          switch (node.type) {
+            case "Literal":
+              return typeof node.value === "string" ? node.value : "";
+            case "TemplateLiteral":
+              return node.quasis.map((quasi) => quasi.value.cooked ?? "").join("");
+            case "BinaryExpression":
+              return node.operator === "+" ? staticText(node.left) + staticText(node.right) : "";
+            case "ConditionalExpression":
+              return staticText(node.consequent) + ";" + staticText(node.alternate);
+            default:
+              return "";
+          }
+        };
         const report = (node) => context.report({ node, messageId: "zoom" });
         return {
           // style={{ zoom: 2 }}, style={{ zoom }}, { "zoom": 2 } and { ["zoom"]: 2 }
@@ -1743,17 +1764,40 @@ const localPlugin = {
               report(node.property);
             }
           },
-          // element.style.setProperty("zoom", "2")
           CallExpression(node) {
             const callee = node.callee;
-            if (
-              callee.type === "MemberExpression" &&
-              isNamed(callee.property, "setProperty") &&
-              node.arguments[0]?.type === "Literal" &&
-              node.arguments[0].value === "zoom"
-            ) {
-              report(node.arguments[0]);
+            if (callee.type !== "MemberExpression" || node.arguments.length === 0) return;
+            const [first, second] = node.arguments;
+            // element.style.setProperty("zoom", "2"), "ZOOM" and a template literal
+            if (isNamed(callee.property, "setProperty") && ZOOM_NAME.test(staticText(first))) {
+              report(first);
             }
+            // element.setAttribute("style", "zoom:2")
+            if (
+              isNamed(callee.property, "setAttribute") &&
+              staticText(first).trim().toLowerCase() === "style" &&
+              second &&
+              ZOOM_DECLARATION.test(staticText(second))
+            ) {
+              report(second);
+            }
+          },
+          // element.style.cssText = "zoom: 2"
+          AssignmentExpression(node) {
+            if (
+              node.left.type === "MemberExpression" &&
+              isNamed(node.left.property, "cssText") &&
+              ZOOM_DECLARATION.test(staticText(node.right))
+            ) {
+              report(node.right);
+            }
+          },
+          // className="[zoom:2]", cn("p-2", "[zoom:2]") and `p-2 [zoom:2]`
+          Literal(node) {
+            if (typeof node.value === "string" && ZOOM_UTILITY.test(node.value)) report(node);
+          },
+          TemplateElement(node) {
+            if (ZOOM_UTILITY.test(node.value.cooked ?? "")) report(node);
           },
         };
       },

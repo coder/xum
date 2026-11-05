@@ -35,6 +35,20 @@ describe("local/no-css-zoom", () => {
     "element.style.zoom = '2';",
     "element.style['zoom'] = '2';",
     "element.style.setProperty('zoom', '2');",
+    "element.style.setProperty('ZOOM', '2');",
+    "element.style.setProperty(`zoom`, '2');",
+    "element.style.setProperty('-webkit-zoom', '2');",
+    "element.style.cssText = 'zoom: 2';",
+    "element.style.cssText = 'width:1px;ZOOM : 2';",
+    "element.style.cssText = `position:absolute;zoom:${scale}`;",
+    "element.style.cssText += 'a:b;' + 'zoom:2';",
+    "element.setAttribute('style', 'zoom:2');",
+    "element.setAttribute('STYLE', `width:1px; zoom: 2`);",
+    'const a = <div className="[zoom:2]" />;',
+    'const a = <div className="p-2 md:[zoom:var(--scale)]" />;',
+    "const a = <div className={cn('p-2', 'hover:[zoom:2]')} />;",
+    "const a = <div className={`p-2 [zoom:2] ${other}`} />;",
+    "const a = <div className={cond ? 'p-2' : '[ZOOM:2]'} />;",
   ])("reports %s", (code) => {
     expect(lint(code)).toEqual(["local/no-css-zoom"]);
   });
@@ -48,6 +62,13 @@ describe("local/no-css-zoom", () => {
     "viewer.zoom = 2;",
     "element.style.setProperty('--zoom', '2');",
     "element.style.width = '2px';",
+    "element.style.cssText = 'width:2px';",
+    "element.setAttribute('style', 'width:2px');",
+    "element.setAttribute('data-label', 'zoom: 2');",
+    "const label = 'Zoom: 100%';",
+    'const a = <div className="zoom-in-95 animate-in" />;',
+    'const a = <div className="[--diagram-zoom:2] [transform:scale(2)]" />;',
+    "element.style.setProperty('pinch-zoom', '2');",
   ])("allows %s", (code) => {
     expect(lint(code)).toEqual([]);
   });

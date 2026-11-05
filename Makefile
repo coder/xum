@@ -677,17 +677,13 @@ check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is 
 check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
 	@node scripts/check-oxlint-config.mjs
 
-# <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 # CSS zoom lays out differently in Safari than in Chromium: iPhone Safari painted a Mermaid
-# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom. Every tracked CSS
-# and HTML file counts (src, vscode, static, the HTML entries) except the docs site. A `zoom:` that
-# follows a hyphen, a letter or a digit (`--diagram-zoom:`, `pinch-zoom`) is another name.
-check-no-css-zoom: ## Fail when a tracked CSS or HTML file declares the zoom property
-	@if git grep -niE '(^|[^-[:alnum:]_])zoom[[:space:]]*:' -- '*.css' '*.html' ':!docs'; then \
-		echo "Error: do not declare the CSS zoom property. Safari lays out a zoomed element differently from Chromium. Size the element with explicit pixels computed in code (src/browser/features/Messages/mermaidDiagramBox.ts)."; \
-		exit 1; \
-	fi
+# diagram far outside its frame. TS and TSX are covered by local/no-css-zoom.
+check-no-css-zoom: node_modules/.installed ## Fail when a tracked CSS or HTML file declares the zoom property
+	@bun test ./scripts/check-no-css-zoom.test.ts
+	@bun scripts/check-no-css-zoom.ts
 
+# <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
 	@bun test ./scripts/check-test-seam-comments.test.ts
 	@bun scripts/check-test-seam-comments.ts
