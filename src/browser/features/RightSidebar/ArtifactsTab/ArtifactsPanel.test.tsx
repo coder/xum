@@ -1082,6 +1082,34 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText("alpha")).toBeTruthy();
   });
 
+  test("pinned files cannot be annotated", async () => {
+    const pinnedFile: PinnedArtifactFile = {
+      path: "README.md",
+      kind: "markdown",
+      size: 5,
+      modifiedMs: 1,
+    };
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("report.md", 1, "markdown")],
+        truncated: false,
+      },
+      { "report.md": textFile("report.md", "markdown", "alpha") },
+      {
+        pinned: [pinnedFile],
+        pinnedFiles: { "README.md": textFile("README.md", "markdown", "# Readme") },
+      }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("button", { name: "Annotate" })).toBeTruthy();
+
+    act(() => openArtifact({ workspaceId: "ws-artifacts", path: "README.md", pinned: true }));
+    expect(await view.findByRole("heading", { name: "Readme" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
   test("shows shelf entries read-only and unpins them", async () => {
     const shelfEntry: ArtifactShelfEntry = {
       scope: "global",
@@ -1464,6 +1492,24 @@ describe("ArtifactsPanel", () => {
     // img/b.png is no longer selected, so it is hidden too: J goes straight to the shelf.
     expect(await view.findByRole("heading", { name: "Guide" })).toBeTruthy();
     expect(trigger()).toContain("style-guide.md");
+  });
+
+  test("K skips a lone other file listed before the published one", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("img/a.png", 2, "image"), entry("report.md", 1, "markdown")],
+        truncated: false,
+        publishedPaths: ["report.md"],
+      },
+      { "report.md": textFile("report.md", "markdown", "# Published report") }
+    );
+    const view = renderPanel();
+    expect(await view.findByRole("heading", { name: "Published report" })).toBeTruthy();
+    // img/a.png waits under the collapsed group, so K has nowhere to go.
+    fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
+    expect(readArtifactSelection("ws-artifacts").path).toBe("report.md");
   });
 
   test("published paths past a truncated listing's cap do not hide the listed files", async () => {
