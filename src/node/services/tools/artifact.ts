@@ -68,7 +68,10 @@ export const createArtifactTool: ToolFactory = (config) =>
             abortSignal,
           });
           if (!pinned.success) {
-            return { success: false, error: `Published ${relPath}, but pinning failed: ${pinned.error}` };
+            return {
+              success: false,
+              error: `Published ${relPath}, but pinning failed: ${pinned.error}`,
+            };
           }
         }
         return {
