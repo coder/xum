@@ -51,6 +51,18 @@ function mapFrontmatterForSource(
   }
 }
 
+/** What the plugin mapping says about a raw agent file. Both are false for any other file. */
+function pluginFileFlags(
+  raw: Record<string, unknown>,
+  plugin: { agentId: string } | undefined
+): Pick<ParsedAgentDefinitionMarkdown, "mappedReadonly" | "foreign"> {
+  if (plugin === undefined) return { mappedReadonly: false, foreign: false };
+  return {
+    mappedReadonly: isReadonlyForeignPluginAgent(raw),
+    foreign: isForeignPluginAgentFormat(raw),
+  };
+}
+
 /**
  * Parse an agent definition markdown file into validated YAML frontmatter + markdown body.
  *
@@ -119,10 +131,5 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
-  return {
-    frontmatter: parsed.data,
-    body,
-    mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
-    foreign: input.plugin !== undefined && isForeignPluginAgentFormat(raw),
-  };
+  return { frontmatter: parsed.data, body, ...pluginFileFlags(raw, input.plugin) };
 }

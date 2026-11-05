@@ -773,6 +773,16 @@ function remoteBoxDeletionRefusal(
   return undefined;
 }
 
+/**
+ * Why `createWorkspaceTurn` found no usable agent for an ID. A plugin agent that Xum loads but
+ * refuses is not an unknown agent (RFC A4): its reason is named.
+ */
+function agentLookupFailure(error: unknown, agentId: string): string {
+  return error instanceof PluginAgentRefusalError
+    ? `Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`
+    : `Task.createWorkspaceTurn: unknown agentId (${agentId})`;
+}
+
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
   private readonly workspaceLifecycleLocks = new MutexMap<string>();
@@ -1297,11 +1307,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
-      if (error instanceof PluginAgentRefusalError) {
-        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
-      }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
     try {
@@ -1320,11 +1326,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
-      if (error instanceof PluginAgentRefusalError) {
-        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
-      }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     if (!resolveAgentVisibility(frontmatter.ui).selectable) {
       return Err(
@@ -1452,11 +1454,7 @@ export class WorkspaceTurnManager {
           )
         );
       }
-      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
-      if (error instanceof PluginAgentRefusalError) {
-        return Err(`Task.createWorkspaceTurn: ${formatPluginAgentRefusal(error)}`);
-      }
-      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+      return Err(agentLookupFailure(error, params.agentId));
     }
     if (resolvedScope === "project") {
       return Err(

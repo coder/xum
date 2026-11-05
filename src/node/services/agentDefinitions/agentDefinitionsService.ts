@@ -634,6 +634,15 @@ function pluginAgentBody(args: {
   });
 }
 
+/** The descriptor fields of an agent that is listed but not runnable here (none when it is). */
+function unavailableFields(
+  refusal: PluginAgentRefusalError | undefined,
+  filePath: string
+): Pick<AgentDefinitionDescriptor, "unavailableReason" | "unavailablePath"> {
+  if (refusal === undefined) return {};
+  return { unavailableReason: formatPluginAgentRefusal(refusal), unavailablePath: filePath };
+}
+
 async function readAgentDescriptorFromFile(
   runtime: Runtime,
   filePath: string,
@@ -730,9 +739,7 @@ async function readAgentDescriptorFromFile(
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
       ...(pluginName !== undefined ? { pluginName } : {}),
-      ...(unavailable !== undefined
-        ? { unavailableReason: formatPluginAgentRefusal(unavailable), unavailablePath: filePath }
-        : {}),
+      ...unavailableFields(unavailable, filePath),
     };
 
     const validated = AgentDefinitionDescriptorSchema.safeParse(descriptor);
@@ -1436,7 +1443,9 @@ async function resolveAgentDefinitionWithAiChain(
   async function resolve(
     id: AgentId,
     depth: number,
-    skipScopesAbove?: AgentDefinitionScope
+    skipScopesAbove?: AgentDefinitionScope,
+    /** Set for the agent read by ID only: its bases keep loading an unreachable agent. */
+    refuseUnreachablePluginFolder?: boolean
   ): Promise<ResolvedAgentDefinitionWithAiChain> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
@@ -1447,9 +1456,7 @@ async function resolveAgentDefinitionWithAiChain(
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       ...baseReadOptions,
       skipScopesAbove,
-      ...(depth === 0
-        ? { refuseUnreachablePluginFolder: options.refuseUnreachablePluginFolder }
-        : {}),
+      refuseUnreachablePluginFolder,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -1493,7 +1500,7 @@ async function resolveAgentDefinitionWithAiChain(
     };
   }
 
-  return resolve(agentId, 0, options.skipScopesAbove);
+  return resolve(agentId, 0, options.skipScopesAbove, options.refuseUnreachablePluginFolder);
 }
 
 export async function resolveAgentFrontmatter(
