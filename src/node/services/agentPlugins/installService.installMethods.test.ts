@@ -1107,6 +1107,19 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
     ]);
   });
 
+  test("an unmanaged plugin names its manifest and lists no other method", async () => {
+    await fsPromises.mkdir(installedDir(), { recursive: true });
+    for (const [relative, content] of Object.entries(egmFiles())) {
+      await fsPromises.mkdir(path.dirname(path.join(installedDir(), relative)), {
+        recursive: true,
+      });
+      await fsPromises.writeFile(path.join(installedDir(), relative), content);
+    }
+    const row = await egmRow();
+    expect(row).toMatchObject({ managed: false, manifestPath: ".codex-plugin/plugin.json" });
+    expect(row.otherMethods).toBeUndefined();
+  });
+
   test("a generated install names its generator and lists no other method", async () => {
     await git(remoteDir, "rm", "-q", "-r", ".", "--ignore-unmatch");
     await write({ "skills/alpha/SKILL.md": skillMd("alpha") });

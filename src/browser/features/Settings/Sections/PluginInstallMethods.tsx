@@ -10,7 +10,6 @@ import {
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
 import {
   AGENT_PLUGIN_INSTALL_METHOD_LABELS,
-  installMethodLongLabel,
   installedAsKind,
 } from "@/common/constants/agentPluginInstallMethods";
 import type {
@@ -150,8 +149,9 @@ export const InstallMethodPicker: React.FC<{
           >
             {choice.summary !== undefined ? (
               <>
-                <span className="break-all">
-                  {installMethodLongLabel(choice.summary.method, choice.summary.manifestPath)}
+                <span>
+                  {choice.label}{" "}
+                  <span className="whitespace-nowrap">({choice.summary.manifestPath})</span>
                 </span>
                 <span className="text-muted counter-nums text-[11px] font-normal">
                   {formatMethodCounts(choice.summary.counts)}

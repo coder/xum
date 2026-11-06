@@ -37,6 +37,18 @@ export function installedAsLine(
   return `install method: ${method}; manifest: ${plugin.manifestPath}`;
 }
 
+export function printPlugins(plugins: WorkspaceCompositionPlugin[]): void {
+  console.log(`Plugins (${plugins.length}):`);
+  for (const plugin of plugins) {
+    const version = plugin.version ? `  v${plugin.version}` : "";
+    const components =
+      plugin.components.length > 0 ? plugin.components.join(", ") : "no components";
+    console.log(`  - ${plugin.name} (${plugin.scope})${version}  [${components}]`);
+    console.log(`      ${plugin.rootPath}`);
+    console.log(`      ${installedAsLine(plugin)}`);
+  }
+}
+
 /**
  * Composition inspector (the dsh --dump-config analog): print the effective
  * per-workspace composition by layer — every skill/agent/workflow/MCP server/
@@ -127,15 +139,7 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
   console.log(`project trusted: ${projectTrusted ? "yes" : "no"}`);
   console.log();
 
-  console.log(`Plugins (${composition.plugins.length}):`);
-  for (const plugin of composition.plugins) {
-    const version = plugin.version ? `  v${plugin.version}` : "";
-    const components =
-      plugin.components.length > 0 ? plugin.components.join(", ") : "no components";
-    console.log(`  - ${plugin.name} (${plugin.scope})${version}  [${components}]`);
-    console.log(`      ${plugin.rootPath}`);
-    console.log(`      ${installedAsLine(plugin)}`);
-  }
+  printPlugins(composition.plugins);
   console.log();
 
   if (composition.diagnostics.length > 0) {

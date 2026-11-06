@@ -31,7 +31,3 @@ export function installedAsKind(plugin: {
     ? undefined
     : MANIFEST_PATH_INSTALL_METHODS[plugin.manifestPath];
 }
-
-export function installMethodLongLabel(method: SavedInstallMethod, manifestPath: string): string {
-  return `${AGENT_PLUGIN_INSTALL_METHOD_LABELS[method]} (${manifestPath})`;
-}

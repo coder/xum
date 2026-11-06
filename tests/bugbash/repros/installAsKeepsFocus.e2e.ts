@@ -33,6 +33,6 @@ test(
     await expect(settings.getByRole("radio", "Skills")).toBeFocused();
     // With focus kept, the arrow keys move between the choices again.
     await browser.keyboard.press("ArrowLeft");
-    await expect(settings.getByRole("radio", "Claude Code plugin")).toBeFocused();
+    await expect(settings.getByRole("radio", /^Claude Code plugin\b/)).toBeFocused();
   }
 );

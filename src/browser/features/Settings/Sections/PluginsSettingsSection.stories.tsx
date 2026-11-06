@@ -2217,10 +2217,26 @@ export const AddPluginInstallAsMethodCountsPhoneViewport: Story = {
       canvas.getAllByRole("radio").map((radio) => Math.round(radio.getBoundingClientRect().top))
     );
     if (tops.size < 2) throw new Error("The Install as choices did not wrap onto a second row");
-    for (const radio of canvas.getAllByRole("radio")) {
-      if (radio.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
-        throw new Error("An Install as choice runs past the card at phone width");
-      }
+    // A manifest path wraps whole: never inside the file name, down to a 320 px screen.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const radio of canvas.getAllByRole("radio")) {
+          if (radio.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+            throw new Error(`An Install as choice runs past the card at ${width}`);
+          }
+          if (!radio.textContent?.includes("plugin.json")) continue;
+          const path = within(radio).getByText(/^\(\..+plugin\.json\)$/);
+          const lines = new Set(
+            Array.from(path.getClientRects()).map((rect) => Math.round(rect.top))
+          );
+          if (lines.size !== 1) {
+            throw new Error(`A manifest path is split across lines at ${width}`);
+          }
+        }
+      });
     }
   },
 };
