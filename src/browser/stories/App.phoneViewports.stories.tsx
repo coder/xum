@@ -193,11 +193,11 @@ export const IPhone16e: AppStory = {
 };
 
 /**
- * The folded iPhone Duo's cover display: 466x678 pt, where iOS keeps its status and camera column
- * on the right edge and reports it as an 84 pt `env(safe-area-inset-right)` (on the OS versions
- * that report it; iOS 27.2 reports no side inset there). Pixel cannot report a safe-area inset, so
- * a snapshot of this frame would show nothing of the layout it stands for: the reserve it does
- * stand for is asserted against a CDP-reported inset in .storybook/test-runner.ts (DUO_BAND_STORY).
+ * The folded iPhone Duo's cover display: 466x678 pt, where iOS keeps an 84 pt status and camera
+ * column on the right edge. iOS 27.1 reports it as `env(safe-area-inset-right)`; on iOS 27.2
+ * iosCoverColumn.ts measures it and sets `--ios-cover-column`. Pixel can report neither, so a
+ * snapshot of this frame would show nothing of the layout it stands for: the reserve is asserted for
+ * both in .storybook/test-runner.ts (DUO_BAND_STORY).
  */
 export const DuoCoverDisplay: AppStory = {
   // The assertion sizes the frame to 466x678 itself; this only pins a narrow portrait viewport so a

@@ -1118,7 +1118,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 
@@ -1144,23 +1144,35 @@ body,
   }
 }
 
-/* The folded iPhone Duo's cover display keeps its status and camera column on its right edge and
-   reports it to web content as `env(safe-area-inset-right)`: 84 pt of that display's 466 pt width.
-   Padding the shell by a side inset, which is what every other layout does, gives up a fifth of the
-   width for the whole page while the OS draws over only a band at the top of that column (measured
-   on a folded Duo, 2.95 px per pt: glyphs at x 398..437, y 87..151 of 466x678). So in narrow
-   portrait the shell keeps no right padding and paints that band instead, and content below and
-   left of it uses the full width.
-   Where the OS reports no side inset nothing changes, which is every other case: iPhone and iPad
-   portrait have none, so iOS 27.2 on a Duo, which reports none for the cover display, renders
-   exactly as before. Landscape and wide layouts keep the padding, because there a side inset is a
-   full-height notch, and desktop, Electron and Android report no side inset in portrait.
-   .storybook/test-runner.ts asserts the band geometry against a reported inset. */
+/* The folded iPhone Duo's cover display keeps an 84 pt status column on the right of its 466 pt
+   width. iOS 27.1 reports it as `env(safe-area-inset-right)`; iOS 27.2 reports nothing and lays the
+   page out without it, and iosCoverColumn.ts lays the page out across it again and sets
+   `--ios-cover-column`. This is the right inset either way, so overlays that keep clear of a right
+   inset keep clear of the column. */
+:root {
+  --safe-area-right: max(env(safe-area-inset-right, 0px), var(--ios-cover-column, 0px));
+}
+
+/* The OS draws only in a band at the top of that column (measured on a folded Duo, 2.95 px per pt:
+   glyphs at x 398..437, y 87..151 of 466x678) and takes the touches there. Padding the shell by the
+   whole column gives up a fifth of the width for the whole page, so in narrow portrait the shell
+   keeps no right padding, the fixed header keeps its controls left of the column, and the band
+   below the header is painted over. Content below the band uses the full width.
+   Where no side column exists this changes nothing: iPhone and iPad portrait have none, and
+   landscape and wide layouts keep the shell padding, because there a side inset is a full-height
+   notch. .storybook/test-runner.ts asserts the band geometry. */
 @media (orientation: portrait) and (max-width: 768px) {
   /* The shell's `pr-[env(safe-area-inset-right)]` utility still carries the other layouts;
      !important is how the narrow-layout rules around here win over utilities. */
   .mobile-layout {
     padding-right: 0 !important;
+  }
+
+  /* The header's background spans the display; its controls stop at the column. Its own right
+     padding is px-2. */
+  .mobile-sticky-header {
+    right: 0 !important;
+    padding-right: calc(0.5rem + var(--safe-area-right)) !important;
   }
 
   /* On the body, the one element, rather than on the shell: `mobile-layout` is on three nested
@@ -1170,12 +1182,21 @@ body,
   body::after {
     content: "";
     position: fixed;
-    top: 80px;
-    height: 84px;
+    /* From the top: the fixed header (z-50) covers its own part. */
+    top: 0;
+    height: 172px;
     right: 0;
-    /* Zero wherever the OS reports no side inset, so nothing paints. */
-    width: env(safe-area-inset-right, 0px);
+    /* Zero wherever there is no side column, so nothing paints. */
+    width: var(--safe-area-right);
     background-color: var(--color-surface-primary);
+    /* Text that scrolls under the band fades out instead of being cut mid-letter. Both fades stay
+       clear of the glyphs, which start 16px into the column and end 20px above the band's bottom. */
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right, transparent, #000 16px), linear-gradient(to top, transparent, #000 16px);
+    mask-composite: intersect;
     /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
     pointer-events: none;
     /* Above the page's own content, below the fixed phone header (z-50) and every overlay (1100+). */
@@ -1199,7 +1220,7 @@ body,
     max-width: none !important;
     z-index: 1100 !important;
     border-left: 0 !important;
-    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    padding: env(safe-area-inset-top, 0px) var(--safe-area-right)
       env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
   }
 

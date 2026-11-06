@@ -228,6 +228,8 @@ async function assertTouchResizesRightSidebar(page: StoryPage) {
   }
 }
 
+// iOS 27.1 reports the Duo cover display's status and camera column as a right safe-area inset.
+const RIGHT_COLUMN_INSETS = { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 };
 const MERMAID_SIDE_INSET_STORY =
   "app-chat-messages-markdownrenderer--mermaid-state-dialog-side-inset";
 const SIDE_INSET_TARGETS = new Map<string, { sheet: string } | "toast" | "mermaid-dialog">([
@@ -290,9 +292,7 @@ async function assertClearsRightInset(
   const viewport = page.viewportSize();
   try {
     await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
-    await client.send("Emulation.setSafeAreaInsetsOverride", {
-      insets: { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 },
-    });
+    await client.send("Emulation.setSafeAreaInsetsOverride", { insets: RIGHT_COLUMN_INSETS });
     await page.setViewportSize(SIDE_INSET_VIEWPORT);
     await page.waitForFunction(
       (width) => matchMedia("(pointer: coarse)").matches && innerWidth === width,
@@ -315,50 +315,74 @@ async function assertClearsRightInset(
         { timeout: 5000 }
       );
     }
-    const problems = await root.evaluate(
-      (element, args) => {
-        const found: string[] = [];
-        const limit = innerWidth - args.inset;
-        const box = element.getBoundingClientRect();
-        if (args.toast) {
-          // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
-          if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
-          if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
-          return found;
-        }
-        if (Math.round(box.right) !== innerWidth) {
-          found.push(`sheet background ends at ${Math.round(box.right)}px`);
-        }
-        const controls = element.querySelectorAll<HTMLElement>(
-          "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
-        );
-        for (const control of controls) {
-          const rect = control.getBoundingClientRect();
-          if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
-          let left = rect.left;
-          let right = rect.right;
-          for (let el = control.parentElement; el; el = el.parentElement) {
-            if (getComputedStyle(el).overflowX !== "visible") {
-              const clip = el.getBoundingClientRect();
-              left = Math.max(left, clip.left);
-              right = Math.min(right, clip.right);
+    const findProblems = () =>
+      root.evaluate(
+        (element, args) => {
+          const found: string[] = [];
+          const limit = innerWidth - args.inset;
+          const box = element.getBoundingClientRect();
+          if (args.toast) {
+            // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
+            if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
+            if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
+            return found;
+          }
+          if (Math.round(box.right) !== innerWidth) {
+            found.push(`sheet background ends at ${Math.round(box.right)}px`);
+          }
+          const controls = element.querySelectorAll<HTMLElement>(
+            "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
+          );
+          for (const control of controls) {
+            const rect = control.getBoundingClientRect();
+            if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
+            let left = rect.left;
+            let right = rect.right;
+            for (let el = control.parentElement; el; el = el.parentElement) {
+              if (getComputedStyle(el).overflowX !== "visible") {
+                const clip = el.getBoundingClientRect();
+                left = Math.max(left, clip.left);
+                right = Math.min(right, clip.right);
+              }
+              if (el === element) break;
             }
-            if (el === element) break;
+            // Scrolled out of its container: not on screen.
+            if (right <= left) continue;
+            if (right > limit + 0.5) {
+              const name =
+                control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
+              found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
+            }
           }
-          // Scrolled out of its container: not on screen.
-          if (right <= left) continue;
-          if (right > limit + 0.5) {
-            const name =
-              control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
-            found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
-          }
-        }
-        return found;
-      },
-      { inset: SIDE_INSET_PX, toast: target === "toast" }
-    );
+          return found;
+        },
+        { inset: SIDE_INSET_PX, toast: target === "toast" }
+      );
     // Compare a string: the page's array has another realm's prototype, so deepEqual always fails.
-    assert.equal(problems.join("; "), "", RIGHT_INSET_MESSAGE);
+    assert.equal((await findProblems()).join("; "), "", RIGHT_INSET_MESSAGE);
+    // iOS 27.2 reports no inset for the Duo's column; iosCoverColumn.ts sets its width instead.
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { ...RIGHT_COLUMN_INSETS, right: 0 },
+    });
+    await page.evaluate(
+      (width) => document.documentElement.style.setProperty("--ios-cover-column", `${width}px`),
+      SIDE_INSET_PX
+    );
+    try {
+      // The safe-area probes report the change from a ResizeObserver, after a frame.
+      await page.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      );
+      assert.equal(
+        (await findProblems()).join("; "),
+        "",
+        `Nothing may sit under an ${SIDE_INSET_PX}px --ios-cover-column (limit ${RIGHT_INSET_LIMIT_PX}px)`
+      );
+    } finally {
+      await page.evaluate(() =>
+        document.documentElement.style.removeProperty("--ios-cover-column")
+      );
+    }
   } finally {
     await client.send("Emulation.setSafeAreaInsetsOverride", {
       insets: { top: 0, right: 0, bottom: 0, left: 0 },
@@ -369,15 +393,18 @@ async function assertClearsRightInset(
   }
 }
 
-// The folded iPhone Duo cover display keeps its status and camera column on its right edge and
-// reports it as a right safe-area inset. On a narrow portrait viewport xum reserves only the band
-// the OS draws in, so the page still uses the whole width (the `body::after` rule in globals.css);
-// elsewhere the inset keeps padding the shell.
+// The folded iPhone Duo cover display keeps its status and camera column on its right edge. iOS
+// 27.1 reports it as a right safe-area inset; on iOS 27.2 iosCoverColumn.ts measures it and sets
+// --ios-cover-column. On a narrow portrait viewport xum reserves only the band the OS draws in, so
+// the page still uses the whole width (the `body::after` rule in globals.css); elsewhere the inset
+// keeps padding the shell.
 const DUO_BAND_STORY = "app-phoneviewports--duo-cover-display";
 const DUO_BAND_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 678 };
 // Measured on a folded Duo at 2.95 px per pt: the glyphs sit at x 398..437, y 87..151 of the 466x678
 // cover display. Keep in sync with the rule's top and height.
-const DUO_BAND = { left: SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX, top: 80, height: 84 };
+const DUO_BAND = { left: SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX, top: 0, height: 172 };
+// The phone header's own right padding (px-2), which the column's width adds to.
+const HEADER_GUTTER_PX = 8;
 const DUO_INSETS = { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 };
 const NO_SIDE_INSET = { top: 0, right: 0, bottom: 34, left: 0 };
 
@@ -387,9 +414,12 @@ async function measureRightReserve(page: StoryPage) {
   await shell.waitFor({ state: "attached", timeout: 5000 });
   return shell.evaluate((element) => {
     const band = getComputedStyle(document.body, "::after");
+    const header = document.querySelector(".mobile-sticky-header");
     return {
       innerWidth,
       padding: getComputedStyle(element).paddingRight,
+      headerRight: header ? Math.round(header.getBoundingClientRect().right) : null,
+      headerPadding: header ? getComputedStyle(header).paddingRight : null,
       background: getComputedStyle(element).backgroundColor,
       shellRight: Math.round(element.getBoundingClientRect().right),
       content: band.content,
@@ -403,13 +433,55 @@ async function measureRightReserve(page: StoryPage) {
   });
 }
 
+/** Asserts the narrow-portrait reserve for an 84px status column, whichever way iOS reports it. */
+function assertColumnReserve(
+  reserve: Awaited<ReturnType<typeof measureRightReserve>>,
+  how: string
+) {
+  assert.equal(reserve.padding, "0px", `${how}: a narrow portrait shell keeps no right padding`);
+  assert.equal(reserve.shellRight, reserve.innerWidth, `${how}: the shell spans the whole width`);
+  assert.equal(reserve.width, `${SIDE_INSET_PX}px`, `${how}: the band is as wide as the column`);
+  assert.equal(reserve.right, "0px", `${how}: the band ends at the screen edge`);
+  assert.equal(
+    reserve.innerWidth - SIDE_INSET_PX,
+    DUO_BAND.left,
+    `${how}: the band starts at the OS column's x ${DUO_BAND.left}`
+  );
+  assert.equal(reserve.top, `${DUO_BAND.top}px`, `${how}: the band starts at the top edge`);
+  assert.equal(
+    reserve.height,
+    `${DUO_BAND.height}px`,
+    `${how}: the band covers the OS glyphs to y ${DUO_BAND.top + DUO_BAND.height}`
+  );
+  assert.equal(
+    reserve.pointerEvents,
+    "none",
+    `${how}: the band takes no touches, as the OS band above it takes none`
+  );
+  assert.equal(
+    reserve.bandBackground,
+    reserve.background,
+    `${how}: the band paints the shell's own background`
+  );
+  assert.equal(
+    reserve.headerRight,
+    reserve.innerWidth,
+    `${how}: the header's background spans the display`
+  );
+  assert.equal(
+    reserve.headerPadding,
+    `${HEADER_GUTTER_PX + SIDE_INSET_PX}px`,
+    `${how}: the header keeps its controls left of the column`
+  );
+}
+
 /**
- * A Duo's cover display draws its status column over web content and, on the OS versions that tell
- * the page about it, reports it as `env(safe-area-inset-right)`. Padding the shell by that inset
- * gives up 84 of the 466 px width for the whole page, so in narrow portrait the shell pads nothing
- * and paints only the band the OS draws in. Where no inset is reported (iOS 27.2 on that display,
- * and every other phone in portrait) the band may paint nothing, and sideways a side inset is a
- * full-height notch, so the padding must stay.
+ * A Duo's cover display draws its status column over web content. iOS 27.1 reports it as
+ * `env(safe-area-inset-right)`; iOS 27.2 reports nothing, and iosCoverColumn.ts lays the page out
+ * across the column and sets `--ios-cover-column`. Padding the shell by the column gives up 84 of the
+ * 466 px width for the whole page, so in narrow portrait the shell pads nothing and paints only the
+ * band the OS draws in. Where there is no column (every other phone in portrait) the band may paint
+ * nothing, and sideways a side inset is a full-height notch, so the padding must stay.
  */
 async function assertBandOnlyRightReserve(page: StoryPage) {
   const client = await page.context().newCDPSession(page);
@@ -426,51 +498,32 @@ async function assertBandOnlyRightReserve(page: StoryPage) {
     await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
 
     await settle(DUO_BAND_VIEWPORT, DUO_INSETS);
-    const insetReported = await measureRightReserve(page);
-    assert.equal(insetReported.padding, "0px", "a narrow portrait shell keeps no right padding");
-    assert.equal(
-      insetReported.shellRight,
-      insetReported.innerWidth,
-      "the shell spans the cover display's whole width"
-    );
-    assert.equal(
-      insetReported.width,
-      `${SIDE_INSET_PX}px`,
-      "the band is as wide as the reported inset"
-    );
-    assert.equal(insetReported.right, "0px", "the band ends at the screen edge");
-    assert.equal(
-      insetReported.innerWidth - SIDE_INSET_PX,
-      DUO_BAND.left,
-      `the band starts at the OS column's x ${DUO_BAND.left}`
-    );
-    assert.equal(insetReported.top, `${DUO_BAND.top}px`, "the band starts below the top edge");
-    assert.equal(
-      insetReported.height,
-      `${DUO_BAND.height}px`,
-      `the band covers the OS glyphs to y ${DUO_BAND.top + DUO_BAND.height}`
-    );
-    assert.equal(
-      insetReported.pointerEvents,
-      "none",
-      "the band takes no touches, as the OS band above it takes none"
-    );
-    assert.equal(
-      insetReported.bandBackground,
-      insetReported.background,
-      "the band paints the shell's own background"
-    );
+    assertColumnReserve(await measureRightReserve(page), "iOS 27.1, inset reported");
 
-    // Nothing reported: iOS 27.2 on that display, and every other phone in portrait.
+    // iOS 27.2: no inset, the page laid out across the column, and the column's width measured.
     await settle(DUO_BAND_VIEWPORT, NO_SIDE_INSET);
+    await page.evaluate(
+      (width) => document.documentElement.style.setProperty("--ios-cover-column", `${width}px`),
+      SIDE_INSET_PX
+    );
+    try {
+      assertColumnReserve(await measureRightReserve(page), "iOS 27.2, column measured");
+    } finally {
+      await page.evaluate(() =>
+        document.documentElement.style.removeProperty("--ios-cover-column")
+      );
+    }
+
+    // No column: every other phone in portrait.
     const flush = await measureRightReserve(page);
     assert.equal(flush.padding, "0px", "a flush shell keeps its full width either way");
-    assert.equal(
-      flush.width,
-      "0px",
-      "with no reported inset the band paints nothing on any other phone"
-    );
+    assert.equal(flush.width, "0px", "with no column the band paints nothing on any other phone");
     assert.equal(flush.shellRight, flush.innerWidth, "a flush shell still spans the whole width");
+    assert.equal(
+      flush.headerPadding,
+      `${HEADER_GUTTER_PX}px`,
+      "with no column the header keeps its own gutter"
+    );
 
     // Sideways the same inset is a full-height notch, so nothing may shift into it.
     await settle({ width: DUO_BAND_VIEWPORT.height, height: DUO_BAND_VIEWPORT.width }, DUO_INSETS);
