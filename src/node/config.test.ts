@@ -6580,12 +6580,12 @@ describe("Config", () => {
           Object.keys(treeFields).map((key) => [key, (source as Record<string, unknown>)[key]])
         );
       const workspacePath = () => path.join(config.srcDir, "project", "legacy-task");
-      const writeLegacyFile = (id: string) => {
+      const writeLegacyFile = (id: string, overrides: Record<string, unknown> = {}) => {
         fs.mkdirSync(workspacePath(), { recursive: true });
         fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
         fs.writeFileSync(
           path.join(config.sessionsDir, "legacy-task", "metadata.json"),
-          JSON.stringify({ id, name: "legacy-task", ...treeFields })
+          JSON.stringify({ id, name: "legacy-task", ...treeFields, ...overrides })
         );
       };
       const register = (row: { id?: string; name?: string }) =>
@@ -6619,6 +6619,61 @@ describe("Config", () => {
         await register({ id: "legacy-task-id", name: "legacy-task" });
         expect(pick(await build(config))).toEqual(treeFields);
         expect(pick(await persistedRow())).toEqual(treeFields);
+      });
+
+      it("does not copy a value the row schema rejects", async () => {
+        // A legacy metadata.json is not schema-checked: a bad value must not reach config.json.
+        writeLegacyFile("legacy-task-id", { taskStatus: "bogus" });
+        await register({});
+        await build(config);
+        const row = await persistedRow();
+        expect(row?.parentWorkspaceId).toBe("parent-id");
+        expect(row?.taskStatus).toBeUndefined();
+      });
+
+      it("reads a current-format row's legacy files once per Config, and never with a parent link", async () => {
+        // Every registry build walks every row: the restore must not add file reads to each one.
+        // Both rows have a legacy file; the first one's names the row but holds no tree fields.
+        fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
+        fs.writeFileSync(
+          path.join(config.sessionsDir, "legacy-task", "metadata.json"),
+          JSON.stringify({ id: "legacy-task-id", name: "legacy-task" })
+        );
+        fs.mkdirSync(path.join(config.sessionsDir, "child-task"), { recursive: true });
+        fs.writeFileSync(
+          path.join(config.sessionsDir, "child-task", "metadata.json"),
+          JSON.stringify({ id: "child-task-id", name: "child-task", agentId: "explore" })
+        );
+        await register({ id: "legacy-task-id", name: "legacy-task" });
+        await config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)?.workspaces.push({
+            path: path.join(config.srcDir, "project", "child-task"),
+            id: "child-task-id",
+            name: "child-task",
+            parentWorkspaceId: "parent-id",
+          });
+          // No legacy file at all, like every workspace a current build created.
+          cfg.projects.get(projectPath)?.workspaces.push({
+            path: path.join(config.srcDir, "project", "fresh-task"),
+            id: "fresh-task-id",
+            name: "fresh-task",
+          });
+          return cfg;
+        });
+        const readSpy = spyOn(fs, "readFileSync");
+        try {
+          const legacyReads = (name: string) =>
+            readSpy.mock.calls.filter(([file]) =>
+              String(file).startsWith(path.join(config.sessionsDir, name) + path.sep)
+            ).length;
+          await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+          await config.getAllWorkspaceMetadata({ probeCheckouts: false, archived: "active" });
+          expect(legacyReads("legacy-task")).toBe(1);
+          expect(legacyReads("child-task")).toBe(0);
+          expect(legacyReads("fresh-task")).toBe(0);
+        } finally {
+          readSpy.mockRestore();
+        }
       });
 
       it("does not restore them from a legacy file that names another workspace", async () => {

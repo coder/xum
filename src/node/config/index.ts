@@ -89,11 +89,13 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
 import { stableStringify } from "@/common/utils/stableStringify";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   DelegatedCreationMarkSchema,
   PendingArchiveSchema,
   PendingRemovalSchema,
+  WorkspaceConfigSchema,
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
@@ -1655,6 +1657,70 @@ interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
 }
 
+/** A field that a config row and a legacy metadata.json both hold, with one type. */
+type LegacyTreeField = {
+  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<
+    WorkspaceMetadata[K]
+  > extends NonNullable<Workspace[K]>
+    ? K
+    : never;
+}[keyof Workspace & keyof WorkspaceMetadata];
+
+/**
+ * Task-tree fields (the parent link, the agent, the task state, the archive marks) that the
+ * legacy branch of buildWorkspaceMetadata reads from a metadata.json ahead of the row. A migrated
+ * row reads as current-format, and that branch reads the row alone, so the migration copies each
+ * one the row lacks. A field left behind is lost from then on: a lost parentWorkspaceId detaches
+ * a sub-agent from its parent, whose MCP disables then no longer apply to it.
+ */
+const LEGACY_TREE_FIELDS = [
+  "parentWorkspaceId",
+  "agentType",
+  "agentId",
+  "workflowTask",
+  "taskStatus",
+  "taskPendingGuidance",
+  "taskLaunchError",
+  "reportedAt",
+  "taskModelString",
+  "taskThinkingLevel",
+  "taskPrompt",
+  "taskTrunkBranch",
+  "archivedAt",
+  "unarchivedAt",
+  "subProjectPath",
+  "tags",
+] as const satisfies readonly LegacyTreeField[];
+
+/** The entry names of `dir`; empty when it cannot be listed. */
+function listDirectoryNames(dir: string): ReadonlySet<string> {
+  try {
+    return new Set(fs.readdirSync(dir));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Copies into `row` each LEGACY_TREE_FIELDS value it lacks and `legacy` holds; true when it
+ * copied one. A legacy metadata.json is not schema-checked, so a value the row schema rejects
+ * stays behind instead of reaching config.json.
+ */
+function copyLegacyTreeFields(
+  row: Workspace,
+  legacy: Partial<Record<LegacyTreeField, unknown>>
+): boolean {
+  let copied = false;
+  for (const key of LEGACY_TREE_FIELDS) {
+    if (row[key] !== undefined) continue;
+    const parsed = WorkspaceConfigSchema.shape[key].safeParse(legacy[key]);
+    if (!parsed.success || parsed.data === undefined) continue;
+    Object.assign(row, { [key]: parsed.data });
+    copied = true;
+  }
+  return copied;
+}
+
 /** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
 const CONFIG_FILE_WATCH_MAX_LINKS = 40;
 /** Watch reinstalls one event does while config.json keeps changing; the next event retries. */
@@ -2474,6 +2540,14 @@ export class Config {
     ProjectsConfig,
     Map<string, WorkspaceMetadataMemoEntry>
   >();
+  /** Current-format rows restoreLegacyTreeFields already checked, by path and id. */
+  private readonly legacyTreeRowsChecked = new Set<string>();
+  /**
+   * The session folder names, listed once per Config for restoreLegacyTreeFields: one listing
+   * instead of two failed reads for every row without a parent link. Legacy files come only from
+   * old builds, so a folder created later is not one.
+   */
+  private sessionDirNames?: ReadonlySet<string>;
   private workspaceIndex = new Map<
     string,
     {
@@ -4744,6 +4818,61 @@ export class Config {
     return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
+  /**
+   * A row that an earlier build migrated from a legacy metadata.json kept none of its
+   * LEGACY_TREE_FIELDS. While that file still exists and names this row's id, copy the fields the
+   * row lacks, in memory and through the read-time migration. A row with a parent link has
+   * nothing to restore, and any other row's legacy files are read once per Config.
+   */
+  private restoreLegacyTreeFields(
+    projectPath: string,
+    workspace: Workspace,
+    recordMigration: (
+      projectPath: string,
+      workspacePath: string,
+      apply: (entry: Workspace) => void
+    ) => void
+  ): void {
+    if (workspace.parentWorkspaceId !== undefined) return;
+    const rowKey = `${workspace.path}\0${workspace.id}`;
+    if (this.legacyTreeRowsChecked.has(rowKey)) return;
+    this.legacyTreeRowsChecked.add(rowKey);
+    const legacy = this.readLegacyMetadataNaming(projectPath, workspace);
+    if (legacy === undefined || !copyLegacyTreeFields(workspace, legacy)) return;
+    recordMigration(projectPath, workspace.path, (entry) => {
+      copyLegacyTreeFields(entry, legacy);
+    });
+  }
+
+  /**
+   * The legacy metadata.json of `workspace` (the candidates the legacy branch reads), only when it
+   * names the row's own id: checkout paths are reused, and a file a removed workspace left there
+   * is not this row's. Unreadable or unparseable files count as absent.
+   */
+  private readLegacyMetadataNaming(
+    projectPath: string,
+    workspace: Workspace
+  ): Record<string, unknown> | undefined {
+    this.sessionDirNames ??= listDirectoryNames(this.sessionsDir);
+    const candidateIds = new Set([
+      this.generateLegacyId(projectPath, workspace.path),
+      NodePlatformPaths.basename(workspace.path),
+    ]);
+    for (const candidateId of candidateIds) {
+      if (!this.sessionDirNames.has(candidateId)) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(
+          fs.readFileSync(path.join(this.sessionsDir, candidateId, "metadata.json"), "utf-8")
+        );
+      } catch {
+        continue;
+      }
+      if (isPlainObject(parsed) && parsed.id === workspace.id) return parsed;
+    }
+    return undefined;
+  }
+
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
@@ -4825,6 +4954,7 @@ export class Config {
         try {
           // NEW FORMAT: If workspace has metadata in config, use it directly
           if (workspace.id && workspace.name) {
+            this.restoreLegacyTreeFields(projectPath, workspace, recordWorkspaceMigration);
             const metadata: WorkspaceMetadata = {
               kind: workspace.kind,
               id: workspace.id,
@@ -5120,6 +5250,7 @@ export class Config {
               entry.createdAt ??= metadata.createdAt;
               entry.runtimeConfig ??= metadata.runtimeConfig;
               entry.forkFamilyBaseName ??= metadata.forkFamilyBaseName;
+              copyLegacyTreeFields(entry, metadata);
             });
 
             if (!workspace.projects && metadata.projects) {
