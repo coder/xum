@@ -1,6 +1,7 @@
 import * as http from "http";
 import type { AddressInfo, Socket } from "net";
 import { spawn, type ChildProcess } from "child_process";
+import { getSelfIdentity, linuxBirth } from "../utils/concurrency/processLiveness";
 
 /**
  * Test doubles for the processes that server.lock can name. A real ServerLockfile.peek() asks the
@@ -75,12 +76,26 @@ export async function unservedBaseUrl(): Promise<string> {
 
 /**
  * A live process that is not a xum backend and not this one: the process that now holds a dead
- * backend's pid. Kill it with `kill()`.
+ * backend's pid. Kill it with `kill()`. `exited` settles once the process is gone and reaped, so
+ * its pid is free (until then a killed process is a zombie, which still holds the pid).
  */
-export function startUnrelatedProcess(): { pid: number; kill: () => void } {
+export function startUnrelatedProcess(): {
+  pid: number;
+  kill: () => void;
+  exited: Promise<void>;
+} {
   const child: ChildProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
   });
   if (child.pid == null) throw new Error("could not start an unrelated process");
-  return { pid: child.pid, kill: () => child.kill("SIGKILL") };
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  return { pid: child.pid, kill: () => child.kill("SIGKILL"), exited };
+}
+
+/**
+ * The process identity that a backend with `pid` records in its lock (this host and boot, that
+ * pid's start time). Meaningful where /proc exists; elsewhere `birth` is null.
+ */
+export function identityOf(pid: number): Record<string, unknown> {
+  return { ...getSelfIdentity(), birth: linuxBirth(pid) };
 }

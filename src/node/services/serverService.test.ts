@@ -13,7 +13,12 @@ import {
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
-import { startFakeBackend, startUnrelatedProcess, unservedBaseUrl } from "./testXumBackend";
+import {
+  identityOf,
+  startFakeBackend,
+  startUnrelatedProcess,
+  unservedBaseUrl,
+} from "./testXumBackend";
 
 describe("ServerService", () => {
   test("initializes with null path", async () => {
@@ -191,6 +196,59 @@ describe("ServerService.startServer", () => {
       await running.close();
     }
   });
+
+  test.skipIf(process.platform !== "linux")(
+    "start refuses next to a backend that is frozen (SIGSTOP), and replaces its lock once it is gone",
+    async () => {
+      const service = new ServerService();
+      const lockPath = path.join(tempDir, "server.lock");
+      const backend = startUnrelatedProcess();
+      // The frozen backend's lock: its process identity, and a port that nothing answers on.
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: backend.pid,
+          baseUrl: await unservedBaseUrl(),
+          token: "frozen-token",
+          startedAt: new Date().toISOString(),
+          identity: identityOf(backend.pid),
+        })
+      );
+      const start = () =>
+        service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+
+      process.kill(backend.pid, "SIGSTOP");
+      try {
+        const refused = await start().then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(refused instanceof Error ? refused.message : "").toMatch(/already running/i);
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("frozen-token");
+      } finally {
+        backend.kill();
+      }
+      await backend.exited;
+
+      // The backend is gone: the same lock is stale now, and start replaces it.
+      const info = await start();
+      try {
+        expect(info.baseUrl).not.toBe("");
+        expect(
+          ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
+        ).toBe("test-token");
+      } finally {
+        await service.stopServer();
+      }
+    }
+  );
 
   test("start replaces a lock whose pid an unrelated live process now holds", async () => {
     const service = new ServerService();
