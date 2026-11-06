@@ -4655,6 +4655,45 @@ describe("WorkspaceMcpOverridesService", () => {
     }
   });
 
+  it("prunePluginOverrideKeysForWorkspaces stops waiting for a lock its workspace no longer uses", async () => {
+    // A rename holds the old path's lock while it rewrites config. Once the
+    // workspace has moved, the retry locks the new path instead of waiting
+    // out a lock that no longer fences it.
+    const service = new WorkspaceMcpOverridesService(config);
+    const { first, second, secondLocks } = await twoWorkspacesInLockOrder(service, "moved-busy");
+    const releaseOld = await service.acquireWorkspaceLock(second.workspaceId);
+    await fs.mkdir(path.join(path.dirname(second.workspacePath), "moved"), { recursive: true });
+    const realLink = fsPromisesModule.link;
+    let moved: Promise<unknown> | undefined;
+    const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation((existing, target) => {
+      if (secondLocks.includes(String(target))) {
+        moved ??= config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            for (const workspace of project.workspaces) {
+              if (workspace.id === second.workspaceId) {
+                workspace.name = "moved";
+                workspace.path = path.join(path.dirname(second.workspacePath), "moved");
+              }
+            }
+          }
+          return cfg;
+        });
+      }
+      return realLink(existing, target);
+    });
+    try {
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [first.workspaceId, second.workspaceId],
+        "plugin:0123456789abcdef:"
+      );
+      expect(failures).toEqual([]);
+      expect(moved).toBeDefined();
+    } finally {
+      linkSpy.mockRestore();
+      await releaseOld();
+    }
+  });
+
   it("prunePluginOverrideKeysForWorkspaces fails on an unexpected lock error and releases every lock it took", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const { first, second, secondLocks } = await twoWorkspacesInLockOrder(service, "lock-eio");
