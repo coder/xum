@@ -15,6 +15,7 @@ import {
   ALL_WORKSPACES_TARGET,
   boundContainerMutation,
   isPositivelyAbsent,
+  MAX_WARNED_LENIENT_WALKS,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
   readHostOverrideDocumentNoFollow,
   readWorkspaceOverridesEpochToken,
@@ -4382,6 +4383,36 @@ describe("WorkspaceMcpOverridesService", () => {
         expect(warnSpy).toHaveBeenCalledTimes(1);
       } finally {
         errorSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("warns about the lenient walk again for a new failure, and forgets the oldest past its cap", async () => {
+      const warnSpy = spyOn(log, "warn");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await registerMalformedLegacyEntry();
+        const metadataFile = path.join(config.sessionsDir, "old-branch", "metadata.json");
+        // Each content fails the strict walk with its own message; the workspace count stays 1.
+        const readWith = async (content: string) => {
+          await fs.writeFile(metadataFile, content);
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        };
+        const lenientWarns = () =>
+          warnSpy.mock.calls.filter(([message]) =>
+            String(message).includes("lenient registry walk")
+          ).length;
+        await readWith("{ not json");
+        await readWith("[");
+        expect(lenientWarns()).toBe(2);
+        for (let failure = 0; failure <= MAX_WARNED_LENIENT_WALKS; failure++) {
+          await readWith(`x${failure}`);
+        }
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 3);
+        await readWith("{ not json");
+        expect(lenientWarns()).toBe(MAX_WARNED_LENIENT_WALKS + 4);
+      } finally {
         warnSpy.mockRestore();
       }
     });

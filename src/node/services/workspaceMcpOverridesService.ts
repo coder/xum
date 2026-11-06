@@ -469,6 +469,10 @@ async function boundedRealpath(target: string): Promise<string | undefined> {
     return undefined;
   }
 }
+/** Strict-walk failures already warned about, per Config (see loadAllMetadataTolerant). */
+const warnedLenientWalks = new WeakMap<Config, Set<string>>();
+export const MAX_WARNED_LENIENT_WALKS = 16;
+
 /**
  * Memoized config reads shared across one resolution/publication — or one
  * batch sweep. Loading config.json is a synchronous full parse (~100 ms on a
@@ -477,10 +481,6 @@ async function boundedRealpath(target: string): Promise<string | undefined> {
  * appear hung for tens of minutes. Host realpaths are memoized too: sharer
  * detection canonicalizes every host-local workspace's override path.
  */
-/** Strict-walk failures already warned about, per Config (see loadAllMetadataTolerant). */
-const warnedLenientWalks = new WeakMap<Config, Set<string>>();
-const MAX_WARNED_LENIENT_WALKS = 16;
-
 class ConfigSnapshot {
   private readonly store: {
     legacy?: ProjectsConfig;
