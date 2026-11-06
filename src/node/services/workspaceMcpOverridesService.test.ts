@@ -4179,7 +4179,7 @@ describe("WorkspaceMcpOverridesService", () => {
     await expect(service.acquireWorkspaceLock(healthy.workspaceId)).rejects.toThrow();
   });
 
-  describe("plugin sweeps with an unrelated malformed legacy entry", () => {
+  describe("with an unrelated malformed legacy entry", () => {
     const pluginKey = "plugin:0123456789abcdef:echo";
     const overridesFile = (workspacePath: string) =>
       path.join(workspacePath, ".xum", "mcp.local.jsonc");
@@ -4284,6 +4284,61 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
     });
 
+    it("serves a workspace's pruned overrides authoritatively after the sweep", async () => {
+      // MCP serves read the registry too: one malformed legacy entry must not turn every serve off.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([]);
+
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual(["other"]);
+    });
+
+    it("does not serve a child of the legacy entry authoritatively", async () => {
+      // The child names the legacy entry's stable id, which only the unreadable metadata.json
+      // holds: its inherited settings (a disable included) are unknown, not absent.
+      const service = new WorkspaceMcpOverridesService(config);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(legacyPath),
+        JSON.stringify({ disabledServers: ["global-server"] })
+      );
+      const child = await registerWorkspace("child-of-legacy");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
+          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
+        }
+        return cfg;
+      });
+
+      const read = await service.getOverridesForWorkspace(child.workspaceId);
+      expect(read.authoritative).toBe(false);
+      // The settings dialog reads strictly: it must report the state unavailable, not show `{}`.
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        service.getOverridesForWorkspace(child.workspaceId, { mode: "strict" })
+      ).rejects.toThrow();
+    });
+
+    it("does not serve overrides while config.json is corrupt", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
+
+      const served = await service.getOverridesForWorkspace(healthy.workspaceId).then(
+        (read) => (read.authoritative ? read.overrides : "not authoritative"),
+        () => "refused"
+      );
+      expect(served).toBe("refused");
+    });
+
     // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
     // which reads the same registry first.
     const beforeSweepRead = (change: () => void) => {
@@ -4291,7 +4346,7 @@ describe("WorkspaceMcpOverridesService", () => {
       let changed = false;
       return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
         (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
-          if (!changed && new Error().stack?.includes("loadSweepMetadata")) {
+          if (!changed && new Error().stack?.includes("sweepPluginOverrideKeys")) {
             changed = true;
             change();
           }
