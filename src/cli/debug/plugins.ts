@@ -1,4 +1,8 @@
-import type { WorkspaceCompositionEntry } from "@/common/orpc/schemas/agentPlugins";
+import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
+import type {
+  WorkspaceCompositionEntry,
+  WorkspaceCompositionPlugin,
+} from "@/common/orpc/schemas/agentPlugins";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { defaultConfig } from "@/node/config";
 import {
@@ -21,6 +25,28 @@ function printEntries(label: string, entries: WorkspaceCompositionEntry[]): void
     console.log(`  - ${entry.name}  (${entry.source})${description}${shadowed}`);
   }
   console.log();
+}
+
+export function installedAsLine(
+  plugin: Pick<WorkspaceCompositionPlugin, "installMethod" | "manifestPath">
+): string {
+  const method =
+    plugin.installMethod !== undefined
+      ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[plugin.installMethod]
+      : "none saved (fixed order)";
+  return `install method: ${method}; manifest: ${plugin.manifestPath}`;
+}
+
+export function printPlugins(plugins: WorkspaceCompositionPlugin[]): void {
+  console.log(`Plugins (${plugins.length}):`);
+  for (const plugin of plugins) {
+    const version = plugin.version ? `  v${plugin.version}` : "";
+    const components =
+      plugin.components.length > 0 ? plugin.components.join(", ") : "no components";
+    console.log(`  - ${plugin.name} (${plugin.scope})${version}  [${components}]`);
+    console.log(`      ${plugin.rootPath}`);
+    console.log(`      ${installedAsLine(plugin)}`);
+  }
 }
 
 /**
@@ -113,14 +139,7 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
   console.log(`project trusted: ${projectTrusted ? "yes" : "no"}`);
   console.log();
 
-  console.log(`Plugins (${composition.plugins.length}):`);
-  for (const plugin of composition.plugins) {
-    const version = plugin.version ? `  v${plugin.version}` : "";
-    const components =
-      plugin.components.length > 0 ? plugin.components.join(", ") : "no components";
-    console.log(`  - ${plugin.name} (${plugin.scope})${version}  [${components}]`);
-    console.log(`      ${plugin.rootPath}`);
-  }
+  printPlugins(composition.plugins);
   console.log();
 
   if (composition.diagnostics.length > 0) {

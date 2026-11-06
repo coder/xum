@@ -50,6 +50,7 @@ async function makePlugin(
     containerPath: baseDir,
     dirName: name,
     manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name },
+    manifestPath: "plugin.json",
     notApplied: [],
     mcpConfigPath,
     ...(options?.fileName === ".mcp.json" ? { mcpConfigDialect: "codex" as const } : {}),

@@ -159,8 +159,11 @@ A repository can ship one manifest for each harness: a root `plugin.json`, `.cod
 - A repository whose root `plugin.json` has `$schema` (a Xum-native package) offers only **Agent Plugin**. Such a package can run `hooks.js` and `workflows/` that the other choices never show.
 - A root `plugin.json` without `$schema` is never a choice. A manifest that fails validation is not offered either: the preview shows its error as a warning, and install refuses it.
 - The preview preselects the first choice in the table's order, so one click installs what Xum installed before. Pick another choice to review the components of that manifest.
+- Each choice shows its manifest file and what that manifest gives: skills, agents, and, when there are any, hooks that can run (each runs only after you trust it), hooks that Xum lists and never runs, and MCP servers. Counts follow what the review of that choice lists, so the agents of a Claude Code manifest show before you pick it. A choice that Xum generates (Skills) shows no counts.
 
 Xum saves the choice in the plugin's install record (`installMethod` in `plugins.json`). A restart, the component review, updates and plugin hooks then load that manifest and no other. If its file is missing from the plugin folder, the plugin loads nothing. **Settings → Plugins** marks it as missing, and the error that names the method and the file appears in the workspace composition inspector and in the log. A plugin that Xum generated (from a skills repository, or a marketplace entry without a manifest) and a plugin installed by a Xum version from before the choice have no saved method. They keep reading the manifests in the order above: root `plugin.json` with `$schema`, `.codex-plugin`, `.claude-plugin`, `.cursor-plugin`.
+
+The plugin row in **Settings → Plugins** says **Installed as** with the choice. For a plugin that Xum generated, it says Skills or Claude Code marketplace entry. The row also lists the other manifests of the installed folder with the agents each one would load. Xum reads those manifests without changing the plugin folder. `bun run debug plugins <workspace-id>` prints each plugin's saved method and loaded manifest.
 
 To change the choice, uninstall the plugin and install it again. Xum runs a full review for the new choice.
 

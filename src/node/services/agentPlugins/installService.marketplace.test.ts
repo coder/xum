@@ -193,6 +193,8 @@ describe("AgentPluginInstallService marketplaces", () => {
     const docs = await previewEntry("docs");
     expect(docs.method).toEqual({ kind: "claude-marketplace", entry: "docs" });
     expect(docs.methods).toEqual([docs.method]);
+    // An entry installs through its folder, with no choice between manifests to count.
+    expect(docs.methodSummaries).toBeUndefined();
     expect(docs.skillsCliSkills).toEqual([]);
     expect(docs.source.subpath).toBeUndefined();
     expect(docs.skills.map((skill) => skill.name)).toEqual(["pdf", "xlsx"]);

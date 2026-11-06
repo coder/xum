@@ -25,6 +25,8 @@ import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
   AgentPluginMarketplaceBuild,
+  AgentPluginMethodCounts,
+  AgentPluginMethodSummary,
   AgentPluginMarketplaceListing,
   AgentPluginNotApplied,
   AgentPluginRuleType,
@@ -44,6 +46,10 @@ import type {
   AgentPluginUpdateConsent,
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
+import {
+  AGENT_PLUGIN_INSTALL_METHOD_LABELS,
+  installedAsKind,
+} from "@/common/constants/agentPluginInstallMethods";
 import { resolvePluginHookGrants } from "@/node/services/agentPlugins/hookSandbox";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -104,6 +110,7 @@ import {
   UpdateRefusedError,
   chooseStagedMethod,
   detectInstallMethods,
+  detectManifestMethods,
   generatesManifest,
   isOwnManifestMethod,
   installMethodRequest,
@@ -1997,6 +2004,11 @@ function registryRow(
     : entry;
 }
 
+function loadedAsLabel(plugin: Pick<AgentPluginInfo, "generatedFrom" | "manifestPath">): string {
+  const kind = installedAsKind(plugin);
+  return kind !== undefined ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[kind] : plugin.manifestPath;
+}
+
 interface Discovered {
   plugin: AgentPluginInfo;
   diagnostics: AgentPluginDiagnostic[];
@@ -3101,6 +3113,55 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * What each manifest method that fits gives, in the fixed order. A method that fails
+   * validation has no entry, and neither has a generated method. A method that cannot be counted
+   * has none either: the user did not pick it, so its counts must not fail the preview.
+   */
+  private async summarizeManifestMethods(
+    checked: CheckedInstallMethods,
+    discovered: Map<SavedInstallMethod, Discovered>
+  ): Promise<AgentPluginMethodSummary[]> {
+    const summaries: AgentPluginMethodSummary[] = [];
+    for (const method of checked.methods) {
+      const saved = savedMethodOf(method);
+      const read = saved === undefined ? undefined : discovered.get(saved);
+      if (saved === undefined || read === undefined) continue;
+      try {
+        summaries.push({
+          method: saved,
+          manifestPath: read.plugin.manifestPath,
+          counts: await this.countMethodComponents(read.plugin),
+        });
+      } catch (error) {
+        log.warn("Could not count the components of an install method", {
+          method: saved,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    return summaries;
+  }
+
+  private async countMethodComponents(plugin: AgentPluginInfo): Promise<AgentPluginMethodCounts> {
+    const skills = await this.collectSkillsFromRoots(plugin, []);
+    const { previews: mcpServers } = await this.collectMcpServers(
+      plugin,
+      this.targetPathFor(plugin.name),
+      this.instanceIdFor(plugin.name),
+      []
+    );
+    const hooks = (await loadPluginHooks(plugin)).hooks;
+    const runnable = hooks.filter((hook) => hook.status === "runnable").length;
+    return {
+      skills: skills.length,
+      agents: (await listPluginAgentFiles(plugin.agentsDir, [])).length,
+      hooksCanRun: runnable + (this.collectHook(plugin) !== undefined ? 1 : 0),
+      hooksListed: hooks.length - runnable,
+      mcpServers: mcpServers.length,
+    };
+  }
+
+  /**
    * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
    * or marketplace-entry install, then run the exact runtime validation (manifest + component
    * discovery) against the staged clone. Throws user-facing errors for non-plugins. `marketplace`:
@@ -3110,12 +3171,14 @@ export class AgentPluginInstallService {
     stagedDir: string,
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
     request: InstallMethodRequest,
-    marketplace?: MarketplaceEntryContext
+    marketplace?: MarketplaceEntryContext,
+    options: { countMethods?: boolean } = {}
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
     method: AgentPluginInstallMethod;
     methods: AgentPluginInstallMethod[];
+    methodSummaries: AgentPluginMethodSummary[] | undefined;
     skillsCliSkills: string[];
   }> {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
@@ -3127,6 +3190,12 @@ export class AgentPluginInstallService {
             checked: { ...(await detectInstallMethods(stagedDir)), rejected: [] },
             discovered: new Map<SavedInstallMethod, Discovered>(),
           };
+    // The manifest methods are counted before the `skills` method writes its plugin.json into the
+    // staged tree: that write belongs to the selected method only.
+    const methodSummaries =
+      options.countMethods === true && marketplace === undefined
+        ? await this.summarizeManifestMethods(checked, discovered)
+        : undefined;
     const choice = await chooseStagedMethod(stagedDir, checked, request, source, marketplace);
     const method = choice.method;
 
@@ -3178,6 +3247,7 @@ export class AgentPluginInstallService {
       ],
       method,
       methods: choice.methods,
+      methodSummaries,
       skillsCliSkills: await this.acceptedSkillsCliNames(
         stagedDir,
         checked.skillsRoots,
@@ -4099,12 +4169,10 @@ export class AgentPluginInstallService {
   }): Promise<AgentPluginInstallPreview> {
     const { source, resolved } = args;
     const { dir: stagedDir, sha } = args.staged;
-    const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
-      stagedDir,
-      source,
-      args.request,
-      args.marketplace
-    );
+    const { plugin, warnings, method, methods, methodSummaries, skillsCliSkills } =
+      await this.validateStagedClone(stagedDir, source, args.request, args.marketplace, {
+        countMethods: true,
+      });
     const targetPath = this.targetPathFor(plugin.name);
     // A name collision blocks only the managed install of this method: the preview still lists
     // the other methods and the Skills CLI choice, which creates no managed plugin.
@@ -4162,6 +4230,7 @@ export class AgentPluginInstallService {
       source,
       method,
       methods,
+      ...(methodSummaries !== undefined ? { methodSummaries } : {}),
       skillsCliSkills,
       installBlockedReason,
       lockedSha: sha,
@@ -4904,7 +4973,7 @@ export class AgentPluginInstallService {
       })
     );
     log.info(
-      `Reconciled registry provenance for '${name}' after an interrupted update (→ ${newSha.slice(0, 12)})`
+      `Reconciled registry provenance for '${name}' after an interrupted update (→ ${newSha.slice(0, 12)}, ${loadedAsLabel(plugin)})`
     );
     return true;
   }
@@ -5887,6 +5956,43 @@ export class AgentPluginInstallService {
   /** Started by setMcpOauthService. */
   private pendingSignOutReady: Promise<void> = Promise.resolve();
 
+  private async installMethodFields(
+    plugin: AgentPluginInfo,
+    managed: boolean
+  ): Promise<
+    Pick<AgentPluginListItem, "manifestPath" | "installMethod" | "generatedFrom" | "otherMethods">
+  > {
+    return {
+      manifestPath: plugin.manifestPath,
+      ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
+      ...(plugin.generatedFrom !== undefined ? { generatedFrom: plugin.generatedFrom } : {}),
+      ...(managed && plugin.generatedFrom === undefined
+        ? { otherMethods: await this.otherManifestMethods(plugin) }
+        : {}),
+    };
+  }
+
+  private async otherManifestMethods(
+    plugin: AgentPluginInfo
+  ): Promise<NonNullable<AgentPluginListItem["otherMethods"]>> {
+    const loaded = installedAsKind(plugin);
+    const others: NonNullable<AgentPluginListItem["otherMethods"]> = [];
+    for (const method of await detectManifestMethods(plugin.rootPath)) {
+      if (method === loaded) continue;
+      const read = await discoverAgentPluginAt({
+        pluginDir: plugin.rootPath,
+        scope: "global",
+        choice: manifestChoiceFor(method),
+      });
+      if (read.plugin === null) continue;
+      others.push({
+        method,
+        agents: (await listPluginAgentFiles(read.plugin.agentsDir, [])).length,
+      });
+    }
+    return others;
+  }
+
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
     // or predates recent journals) BEFORE discovery scans the container, so
@@ -5959,6 +6065,7 @@ export class AgentPluginInstallService {
           : {}),
         skillCount,
         mcpServerCount,
+        ...(await this.installMethodFields(plugin, entry !== undefined)),
         ...(entry?.importedComponents !== undefined
           ? { importedComponents: entry.importedComponents }
           : {}),

@@ -367,6 +367,49 @@ describe("buildWorkspaceComposition", () => {
     expect(await composed()).toEqual([]);
   }, 120_000);
 
+  test("names the saved install method and the manifest each plugin loads", async () => {
+    using workspace = new DisposableTempDir("composition-install-method");
+    const xumHome = path.join(workspace.path, ".fixture-mux-home");
+    const pluginsDir = path.join(xumHome, "plugins");
+    await fs.mkdir(path.join(pluginsDir, "claude-saved", ".claude-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginsDir, "claude-saved", ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "claude-saved" })
+    );
+    await fs.mkdir(path.join(pluginsDir, "codex-legacy", ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginsDir, "codex-legacy", ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "codex-legacy" })
+    );
+    await fs.writeFile(
+      path.join(xumHome, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          {
+            ...createTestPluginInstallEntry("claude-saved", { skills: [], mcpServers: [] }),
+            installMethod: "claude-plugin",
+          },
+          createTestPluginInstallEntry("codex-legacy", { skills: [], mcpServers: [] }),
+        ],
+      })
+    );
+    const composition = await buildWorkspaceComposition({
+      runtime: new LocalRuntime(workspace.path),
+      workspacePath: workspace.path,
+      hostCheckoutRoot: workspace.path,
+      xumHome,
+      projectTrusted: false,
+      listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+    });
+    const byName = Object.fromEntries(composition.plugins.map((plugin) => [plugin.name, plugin]));
+    expect(byName["claude-saved"]).toMatchObject({
+      installMethod: "claude-plugin",
+      manifestPath: ".claude-plugin/plugin.json",
+    });
+    expect(byName["codex-legacy"]?.manifestPath).toBe(".codex-plugin/plugin.json");
+    expect(byName["codex-legacy"]?.installMethod).toBeUndefined();
+  }, 120_000);
+
   test("reports a plugin agent that names a folder the workspace cannot read as a diagnostic, not an agent", async () => {
     using workspace = new DisposableTempDir("composition-unreachable-agent");
     const xumHome = path.join(workspace.path, ".fixture-xum-home");

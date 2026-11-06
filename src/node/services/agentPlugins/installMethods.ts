@@ -344,15 +344,34 @@ function manifestMethodKinds(present: Set<string>): SavedInstallMethod[] {
   return kinds;
 }
 
-export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
-  const present = await presentManifests(stagedDir);
+async function detectManifests(dir: string): Promise<{
+  present: Set<string>;
+  rootEntry: boolean;
+  nativeRoot: boolean;
+  schemaLessRoot: boolean;
+  kinds: SavedInstallMethod[];
+}> {
+  const present = await presentManifests(dir);
   const rootEntry = present.has(PLUGIN_MANIFEST_RELATIVE_PATH);
-  const nativeRoot = rootEntry && !(await rootManifestIsSchemaLess(stagedDir));
-  const schemaLessRoot = rootEntry && !nativeRoot;
+  const nativeRoot = rootEntry && !(await rootManifestIsSchemaLess(dir));
+  return {
+    present,
+    rootEntry,
+    nativeRoot,
+    schemaLessRoot: rootEntry && !nativeRoot,
+    kinds: nativeRoot ? ["agent-plugin"] : manifestMethodKinds(present),
+  };
+}
+
+export async function detectManifestMethods(dir: string): Promise<SavedInstallMethod[]> {
+  return (await detectManifests(dir)).kinds;
+}
+
+export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
+  const { present, rootEntry, nativeRoot, schemaLessRoot, kinds } =
+    await detectManifests(stagedDir);
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
-  const methods: AgentPluginInstallMethod[] = nativeRoot
-    ? [{ kind: "agent-plugin" }]
-    : manifestMethodKinds(present).map((kind) => ({ kind }));
+  const methods: AgentPluginInstallMethod[] = kinds.map((kind) => ({ kind }));
   // A root entry or a Codex manifest blocks the generated plugin.json (Xum never shadows them).
   const blocked = rootEntry || present.has(CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
   if (!nativeRoot && !blocked && skillsRoots.length > 0) methods.push({ kind: "skills" });

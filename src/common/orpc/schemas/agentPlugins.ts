@@ -226,6 +226,10 @@ export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSc
 export const SavedInstallMethodSchema = z.enum(["agent-plugin", "claude-plugin", "cursor-plugin"]);
 export type SavedInstallMethod = z.infer<typeof SavedInstallMethodSchema>;
 
+/** The generated methods: Xum writes the plugin.json of the install (`generatedFrom` marker). */
+export const GeneratedMethodKindSchema = z.enum(["skills", "claude-marketplace"]);
+export type GeneratedMethodKind = z.infer<typeof GeneratedMethodKindSchema>;
+
 /**
  * One consent-relevant difference between the installed tree and a staged
  * update (see installService capabilitySurface). `before`/`after` carry the
@@ -265,6 +269,31 @@ export const AgentPluginHooksSchema = z.object({
     .optional(),
 });
 
+/**
+ * What one manifest method of a staged tree gives. Counted by the code that builds the
+ * selected method's component lists, so the counts of the selected method equal that preview.
+ * `hooksCanRun`: hooks that Xum can run for the manifest's format (a Xum-native root's hooks.js as
+ * one hook, Codex `mcp_tool` hooks on mapped events, Cursor command hooks). Each runs only after
+ * the user trusts it. `hooksListed`: hooks Xum shows and never runs (every Claude hook, Codex
+ * command, prompt and agent hooks, and hooks on events Xum does not map).
+ */
+export const AgentPluginMethodCountsSchema = z.object({
+  skills: z.number().int().nonnegative(),
+  agents: z.number().int().nonnegative(),
+  hooksCanRun: z.number().int().nonnegative(),
+  hooksListed: z.number().int().nonnegative(),
+  mcpServers: z.number().int().nonnegative(),
+});
+export type AgentPluginMethodCounts = z.infer<typeof AgentPluginMethodCountsSchema>;
+
+export const AgentPluginMethodSummarySchema = z.object({
+  method: SavedInstallMethodSchema,
+  /** The manifest the method loads, relative to the plugin root, with `/` on every OS. */
+  manifestPath: z.string(),
+  counts: AgentPluginMethodCountsSchema,
+});
+export type AgentPluginMethodSummary = z.infer<typeof AgentPluginMethodSummarySchema>;
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
   /** The method this preview used. Install gets it back. */
@@ -274,6 +303,12 @@ export const AgentPluginInstallPreviewSchema = z.object({
    * skills. A manifest that fails validation is not listed (its error is a warning).
    */
   methods: z.array(AgentPluginInstallMethodSchema),
+  /**
+   * One entry per manifest method that fits, with the components it gives. Generated methods
+   * (skills, claude-marketplace) have none: they write their own plugin.json, and the preview of
+   * the selected one lists its components. Absent for a marketplace entry.
+   */
+  methodSummaries: z.array(AgentPluginMethodSummarySchema).optional(),
   /**
    * Skill folder names found with the skills CLI rules, for the "Skills CLI" choice (empty when
    * the repository has no SKILL.md files). Independent of `method`.
@@ -306,7 +341,8 @@ export const AgentPluginInstallPreviewSchema = z.object({
   agents: z.array(z.string()),
   /**
    * The files of `agents` with Cursor `readonly: true` or a Claude read-only search list: they
-   * run on Explore's tools, so the review says file edits are removed and the shell stays.
+   * run on Explore's tools, so the review says file edits are removed. The shell stays unless the
+   * agent is also in `shellRemovedAgents`.
    */
   readonlyAgents: z.array(z.string()),
   /**
@@ -435,6 +471,18 @@ export const AgentPluginListItemSchema = z.object({
   mcpServerCount: z.number().int().nonnegative(),
   /** The installed plugin's not-applied parts; absent when there are none or the folder is gone. */
   notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
+  /** The saved install method of a managed row; absent: the fixed order read the plugin. */
+  installMethod: SavedInstallMethodSchema.optional(),
+  /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
+  manifestPath: z.string().optional(),
+  generatedFrom: GeneratedMethodKindSchema.optional(),
+  /**
+   * Managed manifest installs: the other manifest methods that the installed copy offers, each
+   * with the agents it loads (read-only discovery; the generated Skills method never runs here).
+   */
+  otherMethods: z
+    .array(z.object({ method: SavedInstallMethodSchema, agents: z.number().int().nonnegative() }))
+    .optional(),
   /**
    * Set on a managed plugin that loads nothing because an older Xum version moved it to a commit
    * whose saved install method nobody reviewed (B3). The row says why, and an update refuses.
@@ -564,6 +612,10 @@ export const WorkspaceCompositionPluginSchema = z.object({
   version: z.string().optional(),
   /** Component kinds the plugin contributes (skills, mcp, agents, workflows, hooks, slashCommands). */
   components: z.array(z.string()),
+  /** The saved install method; absent: the fixed order read the plugin. */
+  installMethod: SavedInstallMethodSchema.optional(),
+  /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
+  manifestPath: z.string(),
 });
 export type WorkspaceCompositionPlugin = z.infer<typeof WorkspaceCompositionPluginSchema>;
 

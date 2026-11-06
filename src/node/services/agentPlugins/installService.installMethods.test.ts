@@ -5,6 +5,7 @@
  * previewed method, and updates regenerate the manifest until the repository ships its own.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,11 +13,13 @@ import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
 import { getApprovedCopiesPath } from "./approvedCopies";
-import { discoverAgentPluginAt, discoverAgentPlugins } from "./discovery";
+import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { listPluginAgentFiles } from "./agentFiles";
 import { reviewedComponentConsent } from "./testFixtures";
 import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { log } from "@/node/services/log";
+import { STAGING_DIR_NAME } from "./journals";
 import { computePluginInstanceId } from "./mcpConfig";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -1012,5 +1015,380 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect((await rawRow()).installMethod).toBe("claude-plugin");
     // Recovery cannot tell which build promoted the tree, so it leaves installMethodSha alone.
     expect((await rawRow()).installMethodSha).toBe(review.fromSha);
+  });
+});
+
+async function treeBytes(dir: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  async function walk(current: string): Promise<void> {
+    for (const entry of await fsPromises.readdir(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      const relative = path.relative(dir, full);
+      if (relative === ".git") continue;
+      if (entry.isDirectory()) {
+        out[`${relative}/`] = "dir";
+        await walk(full);
+      } else if (entry.isSymbolicLink()) {
+        out[relative] = `link:${await fsPromises.readlink(full)}`;
+      } else {
+        const bytes = await fsPromises.readFile(full);
+        out[relative] = crypto.createHash("sha256").update(bytes).digest("hex");
+      }
+    }
+  }
+  await walk(dir);
+  return out;
+}
+
+const NO_HOOKS = { hooksCanRun: 0, hooksListed: 0 };
+const NO_MCP = { mcpServers: 0 };
+
+describe("AgentPluginInstallService method summaries and visibility (egm layout)", () => {
+  let tmpRoot: string;
+  let xumRoot: string;
+  let remoteDir: string;
+  let service: AgentPluginInstallService;
+  const installedDir = () => path.join(xumRoot, "plugins", "egm");
+  const registryFile = () => path.join(xumRoot, "plugins.json");
+
+  async function write(files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      await fsPromises.mkdir(path.dirname(path.join(remoteDir, relative)), { recursive: true });
+      await fsPromises.writeFile(path.join(remoteDir, relative), content);
+    }
+  }
+
+  async function commit(message: string): Promise<string> {
+    await git(remoteDir, "add", "-A");
+    await git(remoteDir, "commit", "-q", "-m", message);
+    return (await git(remoteDir, "rev-parse", "HEAD")).trim();
+  }
+
+  async function installAs(kind: "agent-plugin" | "claude-plugin" | "cursor-plugin") {
+    const preview = await service.preview({ input: remoteDir, method: { kind } });
+    return service.install({
+      source: preview.source,
+      method: preview.method,
+      expectedSha: preview.lockedSha,
+      expectedConsentDigest: preview.consentDigest,
+    });
+  }
+
+  async function registryRows(): Promise<Array<Record<string, unknown>>> {
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    return doc.plugins;
+  }
+
+  async function egmRow() {
+    const item = (await service.list()).find((entry) => entry.name === "egm");
+    if (item === undefined) throw new Error("egm is not listed");
+    return item;
+  }
+
+  beforeEach(async () => {
+    tmpRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-install-visibility-"));
+    xumRoot = path.join(tmpRoot, "xum");
+    remoteDir = path.join(tmpRoot, "egm");
+    await fsPromises.mkdir(remoteDir);
+    service = new AgentPluginInstallService(new Config(xumRoot), {});
+    await git(remoteDir, "init", "-q", "-b", "main");
+    await git(remoteDir, "config", "user.email", "test@example.com");
+    await git(remoteDir, "config", "user.name", "Test");
+    await write(egmFiles());
+    await commit("egm layout");
+  });
+
+  afterEach(async () => {
+    await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("the preview counts what each manifest method gives", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methodSummaries).toEqual([
+      {
+        method: "agent-plugin",
+        manifestPath: ".codex-plugin/plugin.json",
+        counts: { skills: 7, agents: 0, ...NO_HOOKS, ...NO_MCP },
+      },
+      {
+        method: "claude-plugin",
+        manifestPath: ".claude-plugin/plugin.json",
+        counts: { skills: 7, agents: 9, ...NO_HOOKS, ...NO_MCP },
+      },
+      {
+        method: "cursor-plugin",
+        manifestPath: ".cursor-plugin/plugin.json",
+        // The always-apply rule file loads as a skill, so the Cursor preview lists 8.
+        counts: { skills: 8, agents: 7, ...NO_HOOKS, ...NO_MCP },
+      },
+    ]);
+  });
+
+  test("the counts of the selected method are the lists of its own preview", async () => {
+    for (const kind of ["agent-plugin", "claude-plugin", "cursor-plugin"] as const) {
+      const preview = await service.preview({ input: remoteDir, method: { kind } });
+      const summary = preview.methodSummaries?.find((entry) => entry.method === kind);
+      expect(summary?.counts).toEqual({
+        skills: preview.skills.length,
+        agents: preview.agents.length,
+        hooksCanRun: preview.codexHooks.filter((hook) => hook.status === "runnable").length,
+        hooksListed: preview.codexHooks.filter((hook) => hook.status !== "runnable").length,
+        mcpServers: preview.mcpServers.length,
+      });
+    }
+  });
+
+  test("counting leaves the staged tree as committed", async () => {
+    const internals = service as unknown as { removeDir: (dir: string) => Promise<void> };
+    const realRemoveDir = internals.removeDir.bind(internals);
+    const staged: Array<Record<string, string>> = [];
+    const removeSpy = spyOn(internals, "removeDir").mockImplementation(async (dir: string) => {
+      if (path.basename(dir).startsWith("stage-")) staged.push(await treeBytes(dir));
+      await realRemoveDir(dir);
+    });
+    try {
+      await service.preview({ input: remoteDir });
+    } finally {
+      removeSpy.mockRestore();
+    }
+    expect(staged.length).toBeGreaterThan(0);
+    expect(staged.at(-1)).toEqual(await treeBytes(remoteDir));
+  });
+
+  test("a method that cannot be counted has no summary, and the preview still works", async () => {
+    const internals = service as unknown as {
+      countMethodComponents: (plugin: AgentPluginInfo) => Promise<unknown>;
+    };
+    const realCount = internals.countMethodComponents.bind(internals);
+    const countSpy = spyOn(internals, "countMethodComponents").mockImplementation((plugin) =>
+      plugin.manifestPath.startsWith(".claude")
+        ? Promise.reject(new Error("unreadable"))
+        : realCount(plugin)
+    );
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      const preview = await service.preview({ input: remoteDir });
+      expect(preview.methods).toHaveLength(3);
+      expect(preview.methodSummaries?.map((entry) => entry.method)).toEqual([
+        "agent-plugin",
+        "cursor-plugin",
+      ]);
+      expect(warn.mock.calls.map((call) => String(call[0]))).toContain(
+        "Could not count the components of an install method"
+      );
+    } finally {
+      countSpy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  test("a manifest that fails validation has no summary", async () => {
+    await write({ ".claude-plugin/plugin.json": "{ not json" });
+    await commit("break the Claude manifest");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methodSummaries?.map((entry) => entry.method)).toEqual([
+      "agent-plugin",
+      "cursor-plugin",
+    ]);
+  });
+
+  test("a generated method has no summary, and the manifest methods keep theirs", async () => {
+    await git(remoteDir, "rm", "-q", "-r", "plugin.json", ".codex-plugin", ".cursor-plugin");
+    await commit("a Claude plugin with skills");
+    const asClaude = await service.preview({ input: remoteDir });
+    expect(asClaude.methods).toEqual([{ kind: "claude-plugin" }, { kind: "skills" }]);
+    const asSkills = await service.preview({ input: remoteDir, method: { kind: "skills" } });
+    expect(asSkills.method).toEqual({ kind: "skills" });
+    expect(asSkills.methodSummaries).toEqual(asClaude.methodSummaries);
+    expect(asSkills.methodSummaries?.map((entry) => entry.method)).toEqual(["claude-plugin"]);
+  });
+
+  test("a skills repository has no manifest method to count", async () => {
+    await git(remoteDir, "rm", "-q", "-r", ".", "--ignore-unmatch");
+    await write({ "skills/alpha/SKILL.md": skillMd("alpha") });
+    await commit("skills only");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methods).toEqual([{ kind: "skills" }]);
+    expect(preview.methodSummaries).toEqual([]);
+  });
+
+  test("a Codex hook, a Claude hook and an MCP server count under their methods", async () => {
+    await write({
+      "hooks/hooks.json": JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "^bash$", hooks: [{ type: "mcp_tool", server: "scanner", tool: "scan" }] },
+          ],
+        },
+      }),
+      ".mcp.json": JSON.stringify({ mcpServers: { scanner: { command: "node", args: [] } } }),
+    });
+    await commit("hooks and an MCP server");
+    const counts = Object.fromEntries(
+      ((await service.preview({ input: remoteDir })).methodSummaries ?? []).map((entry) => [
+        entry.method,
+        entry.counts,
+      ])
+    );
+    expect(counts["agent-plugin"]).toMatchObject({ hooksCanRun: 1, hooksListed: 0, mcpServers: 1 });
+    expect(counts["claude-plugin"]).toMatchObject({
+      hooksCanRun: 0,
+      hooksListed: 1,
+      mcpServers: 1,
+    });
+  });
+
+  test("a Xum-native root's hooks.js counts as one hook that can run", async () => {
+    await write({
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+      "hooks.js": "export default {};",
+    });
+    await commit("a Xum-native root with hooks.js");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.methodSummaries).toEqual([
+      {
+        method: "agent-plugin",
+        manifestPath: "plugin.json",
+        counts: { skills: 7, agents: 0, hooksCanRun: 1, hooksListed: 0, mcpServers: 0 },
+      },
+    ]);
+  });
+
+  test("an installed plugin names its method, its manifest and the other manifests it offers", async () => {
+    await installAs("claude-plugin");
+    expect(await egmRow()).toMatchObject({
+      installMethod: "claude-plugin",
+      manifestPath: ".claude-plugin/plugin.json",
+      otherMethods: [
+        { method: "agent-plugin", agents: 0 },
+        { method: "cursor-plugin", agents: 7 },
+      ],
+    });
+    expect((await egmRow()).generatedFrom).toBeUndefined();
+  });
+
+  test("an other manifest that fails validation is not listed", async () => {
+    await installAs("claude-plugin");
+    await fsPromises.writeFile(
+      path.join(installedDir(), ".cursor-plugin", "plugin.json"),
+      "{ not json"
+    );
+    expect((await egmRow()).otherMethods).toEqual([{ method: "agent-plugin", agents: 0 }]);
+  });
+
+  test("an install from before the saved method names the manifest the fixed order loads", async () => {
+    await installAs("agent-plugin");
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    for (const row of doc.plugins) delete row.installMethod;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
+    const row = await egmRow();
+    expect(row.installMethod).toBeUndefined();
+    expect(row.manifestPath).toBe(".codex-plugin/plugin.json");
+    expect(row.otherMethods).toEqual([
+      { method: "claude-plugin", agents: 9 },
+      { method: "cursor-plugin", agents: 7 },
+    ]);
+  });
+
+  test("an unmanaged plugin names its manifest and lists no other method", async () => {
+    await fsPromises.mkdir(installedDir(), { recursive: true });
+    for (const [relative, content] of Object.entries(egmFiles())) {
+      await fsPromises.mkdir(path.dirname(path.join(installedDir(), relative)), {
+        recursive: true,
+      });
+      await fsPromises.writeFile(path.join(installedDir(), relative), content);
+    }
+    const row = await egmRow();
+    expect(row).toMatchObject({ managed: false, manifestPath: ".codex-plugin/plugin.json" });
+    expect(row.otherMethods).toBeUndefined();
+  });
+
+  test("a generated install names its generator and lists no other method", async () => {
+    await git(remoteDir, "rm", "-q", "-r", ".", "--ignore-unmatch");
+    await write({ "skills/alpha/SKILL.md": skillMd("alpha") });
+    await commit("skills only");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      method: preview.method,
+      expectedSha: preview.lockedSha,
+      expectedConsentDigest: preview.consentDigest,
+      importedComponents: { skills: ["alpha"], mcpServers: [] },
+    });
+    const row = await egmRow();
+    expect(row).toMatchObject({ generatedFrom: "skills", manifestPath: "plugin.json" });
+    expect(row.installMethod).toBeUndefined();
+    expect(row.otherMethods).toBeUndefined();
+  });
+
+  test("listing the other methods of an installed plugin writes nothing into its folder", async () => {
+    await installAs("agent-plugin");
+    const before = await treeBytes(installedDir());
+    const mtimes = async () =>
+      Object.fromEntries(
+        await Promise.all(
+          Object.keys(before).map(
+            async (relative) =>
+              [
+                relative,
+                (await fsPromises.lstat(path.join(installedDir(), relative))).mtimeMs,
+              ] as const
+          )
+        )
+      );
+    const mtimesBefore = await mtimes();
+    expect((await egmRow()).otherMethods).toHaveLength(2);
+    expect(await treeBytes(installedDir())).toEqual(before);
+    expect(await mtimes()).toEqual(mtimesBefore);
+  });
+
+  test("recovery of an interrupted update logs the method it reconciled", async () => {
+    await installAs("claude-plugin");
+    const staging = path.join(xumRoot, STAGING_DIR_NAME);
+    const trashDir = path.join(staging, `trash-${Date.now()}-egm`);
+    await fsPromises.mkdir(trashDir, { recursive: true });
+    await fsPromises.writeFile(path.join(installedDir(), ".mux-promotion-marker"), "swap-nonce");
+    const newSha = "e".repeat(40);
+    await fsPromises.writeFile(
+      path.join(staging, "update-egm.json"),
+      JSON.stringify({ name: "egm", trashDir, nonce: "swap-nonce", newSha, stagedAt: Date.now() })
+    );
+    const info = spyOn(log, "info").mockImplementation(() => undefined);
+    try {
+      await service.list();
+      const lines = info.mock.calls.map((call) => String(call[0]));
+      const reconciled = lines.filter((line) => line.startsWith("Reconciled registry provenance"));
+      expect(reconciled).toHaveLength(1);
+      expect(reconciled[0]).toContain(`${newSha.slice(0, 12)}, Claude Code plugin`);
+      expect((await registryRows()).map((row) => row.lockedSha)).toEqual([newSha]);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("install and update log lines name the method", async () => {
+    const info = spyOn(log, "info").mockImplementation(() => undefined);
+    try {
+      await installAs("claude-plugin");
+      await write({ "README.md": "more\n" });
+      await commit("readme");
+      const review = await service.previewUpdate({ name: "egm" });
+      await service.update({
+        name: "egm",
+        consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [] },
+      });
+      const lines = info.mock.calls.map((call) => String(call[0]));
+      for (const verb of ["Installed", "Updated"]) {
+        const line = lines.filter((entry) => entry.startsWith(`${verb} agent plugin 'egm'`));
+        expect(line).toHaveLength(1);
+        expect(line[0]).toContain("(Claude Code plugin)");
+      }
+    } finally {
+      info.mockRestore();
+    }
   });
 });

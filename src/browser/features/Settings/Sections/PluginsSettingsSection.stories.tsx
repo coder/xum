@@ -104,6 +104,55 @@ const UNMANAGED_ITEM: AgentPluginListItem = {
   mcpServerCount: 0,
 };
 
+const SKILLS_REPO_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/acme/review-kit.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+const EGM_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/google/elephant-goldfish-model.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+const INSTALLED_BASE = {
+  managed: true,
+  present: true,
+  version: "0.1.0",
+  description: "Draft specs and review designs.",
+  installedAt: "2026-11-05T12:00:00.000Z",
+  mcpServerCount: 0,
+} satisfies Partial<AgentPluginListItem>;
+
+const EGM_INSTALLED: AgentPluginListItem = {
+  ...INSTALLED_BASE,
+  name: "egm",
+  location: "~/.mux/plugins/egm",
+  source: EGM_SOURCE,
+  lockedSha: "113a3afc44e8f4f54722d7150d5701f65cc8ef7f",
+  skillCount: 7,
+  installMethod: "agent-plugin",
+  manifestPath: ".codex-plugin/plugin.json",
+  otherMethods: [
+    { method: "claude-plugin", agents: 9 },
+    { method: "cursor-plugin", agents: 7 },
+  ],
+};
+
+const SKILLS_INSTALLED: AgentPluginListItem = {
+  ...INSTALLED_BASE,
+  name: "review-kit",
+  location: "~/.mux/plugins/review-kit",
+  source: SKILLS_REPO_SOURCE,
+  lockedSha: "3f2a9c1e0b7d4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+  skillCount: 3,
+  manifestPath: "plugin.json",
+  generatedFrom: "skills",
+};
+
 const MISSING_ITEM: AgentPluginListItem = {
   name: "vanished",
   managed: true,
@@ -315,7 +364,7 @@ export const InstalledPhoneViewport: Story = {
     <PluginsSectionStoryShell
       options={{
         agentPlugins: {
-          items: [MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM, MAX_LENGTH_ITEM],
+          items: [MANAGED_ITEM, PINNED_ITEM, UNMANAGED_ITEM, MAX_LENGTH_ITEM, EGM_INSTALLED],
           updateChecks: [
             {
               name: "grill",
@@ -339,6 +388,10 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByText("update available");
     await canvas.findByRole("button", { name: /Update/ });
     await expectInterfaceAsText(canvasElement);
+    const others = await canvas.findByText(/Other install methods/);
+    if (others.getBoundingClientRect().right > pluginCardOf(others).getBoundingClientRect().right) {
+      throw new Error("The install method lines overflow their card at phone width");
+    }
     // Max-length separator-free names must wrap instead of overflowing the
     // card's right edge at phone width.
     const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
@@ -1364,13 +1417,6 @@ export const ComponentReviewIntentWaitsForLiveConnection: Story = {
   },
 };
 
-const SKILLS_REPO_SOURCE = {
-  type: "git" as const,
-  url: "https://github.com/acme/review-kit.git",
-  ref: "main",
-  refType: "branch" as const,
-};
-
 /** A repository with a Claude manifest and a skills/ folder: three ways to install it. */
 const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
   source: SKILLS_REPO_SOURCE,
@@ -1465,16 +1511,17 @@ export const AddPluginInstallAs: Story = {
   },
 };
 
-/** The picker at phone width: choices wrap and nothing overflows the card. */
+/**
+ * The picker at phone width: choices wrap and nothing overflows the card. Play-only:
+ * AddPluginInstallAsMethodCountsPhoneViewport snapshots the same group (Pixel budget).
+ */
 export const AddPluginInstallAsPhoneViewport: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
   parameters: {
     layout: "fullscreen",
-    pixel: {
-      matrix: { themes: ["dark"], viewports: ["phone"] },
-    },
+    pixel: PIXEL_DISABLED,
   },
   render: () => (
     <PluginsSectionStoryShell options={installAsOptions()}>
@@ -2048,5 +2095,170 @@ export const AddPluginCursorReviewPhoneViewport: Story = {
     if (card.scrollWidth > card.clientWidth + 1) {
       throw new Error("The not-applied list overflows the card at phone width");
     }
+  },
+};
+
+const EGM_AGENTS = [
+  "bootstrap_orchestrator.md",
+  "codebase_details.md",
+  "comprehension.md",
+  "design_critic.md",
+  "implementation_readiness.md",
+  "structural.md",
+  "style.md",
+  "synthesizer.md",
+  "zoom_out.md",
+];
+
+const EGM_PREVIEW: AgentPluginInstallPreview = {
+  ...CLAUDE_REPO_PREVIEW,
+  source: EGM_SOURCE,
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }, { kind: "claude-plugin" }, { kind: "cursor-plugin" }],
+  skillsCliSkills: ["egm-draft"],
+  methodSummaries: [
+    {
+      method: "agent-plugin",
+      manifestPath: ".codex-plugin/plugin.json",
+      counts: { skills: 7, agents: 0, hooksCanRun: 0, hooksListed: 0, mcpServers: 0 },
+    },
+    {
+      method: "claude-plugin",
+      manifestPath: ".claude-plugin/plugin.json",
+      counts: { skills: 7, agents: 9, hooksCanRun: 0, hooksListed: 0, mcpServers: 0 },
+    },
+    {
+      method: "cursor-plugin",
+      manifestPath: ".cursor-plugin/plugin.json",
+      counts: { skills: 8, agents: 7, hooksCanRun: 0, hooksListed: 0, mcpServers: 0 },
+    },
+  ],
+  manifest: { name: "egm", version: "0.1.0", description: "Draft specs and review designs." },
+  skills: [{ name: "egm-draft", description: "Draft a spec." }],
+  mcpServers: [],
+  agents: [],
+  targetPath: "~/.mux/plugins/egm",
+};
+
+const EGM_CLAUDE_PREVIEW: AgentPluginInstallPreview = {
+  ...EGM_PREVIEW,
+  method: { kind: "claude-plugin" },
+  agents: EGM_AGENTS,
+};
+
+function egmOptions(): MockORPCClientOptions {
+  return {
+    agentPlugins: {
+      items: [],
+      preview: EGM_PREVIEW,
+      previewsByMethod: { "agent-plugin": EGM_PREVIEW, "claude-plugin": EGM_CLAUDE_PREVIEW },
+    },
+  };
+}
+
+async function expectEgmMethodChoices(canvasElement: HTMLElement) {
+  const canvas = await openInstallAs(canvasElement, "google/elephant-goldfish-model");
+  const choice = (name: RegExp) => canvas.getByRole("radio", { name });
+  await expect(choice(/^Agent Plugin/)).toHaveTextContent(
+    "Agent Plugin (.codex-plugin/plugin.json)7 skills · 0 agents"
+  );
+  await expect(choice(/^Claude Code plugin/)).toHaveTextContent(
+    "Claude Code plugin (.claude-plugin/plugin.json)7 skills · 9 agents"
+  );
+  await expect(choice(/^Cursor plugin/)).toHaveTextContent(
+    "Cursor plugin (.cursor-plugin/plugin.json)8 skills · 7 agents"
+  );
+  await expect(choice(/^Agent Plugin/)).toHaveAttribute("aria-checked", "true");
+  return canvas;
+}
+
+export const AddPluginInstallAsMethodCounts: Story = {
+  // Play-only contract: the phone story below snapshots the same group (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={egmOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await expectEgmMethodChoices(canvasElement);
+    await userEvent.click(canvas.getByRole("radio", { name: /^Claude Code plugin/ }));
+    await canvas.findByText("Agents (9)");
+  },
+};
+
+export const AddPluginInstallAsMethodCountsPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={egmOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await expectEgmMethodChoices(canvasElement);
+    const group = canvas.getByRole("group", { name: "Install as" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The Install as counts overflow the card at phone width");
+    }
+    const tops = new Set(
+      canvas.getAllByRole("radio").map((radio) => Math.round(radio.getBoundingClientRect().top))
+    );
+    if (tops.size < 2) throw new Error("The Install as choices did not wrap onto a second row");
+    // A manifest path wraps whole: never inside the file name, down to a 320 px screen.
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const radio of canvas.getAllByRole("radio")) {
+          if (radio.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+            throw new Error(`An Install as choice runs past the card at ${width}`);
+          }
+          if (!radio.textContent?.includes("plugin.json")) continue;
+          const path = within(radio).getByText(/^\(\..+plugin\.json\)$/);
+          const lines = new Set(
+            Array.from(path.getClientRects()).map((rect) => Math.round(rect.top))
+          );
+          if (lines.size !== 1) {
+            throw new Error(`A manifest path is split across lines at ${width}`);
+          }
+        }
+      });
+    }
+  },
+};
+
+const INSTALLED_AS_OPTIONS: MockORPCClientOptions = {
+  agentPlugins: { items: [EGM_INSTALLED, SKILLS_INSTALLED] },
+};
+
+export const InstalledAsMethods: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={INSTALLED_AS_OPTIONS}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Installed as Agent Plugin");
+    await canvas.findByText(
+      "Other install methods: Claude Code plugin (9 agents) · Cursor plugin (7 agents)"
+    );
+    await canvas.findByText("Installed as Skills");
+    await expect(canvas.getAllByText(/Other install methods/)).toHaveLength(1);
   },
 };

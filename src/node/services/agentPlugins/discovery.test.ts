@@ -3,6 +3,10 @@ import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
 
+import {
+  MANIFEST_PATH_INSTALL_METHODS,
+  installedAsKind,
+} from "@/common/constants/agentPluginInstallMethods";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AGENT_PLUGIN_MANIFEST_TABLE,
@@ -2764,6 +2768,7 @@ describe("generatedFrom marker (skills-only packages)", () => {
         hookTools: loaded,
       });
       expect(plugin.skillsOnly).toBe(loaded ? undefined : true);
+      expect(plugin.generatedFrom).toBe(loaded ? undefined : "skills");
     }
   });
 });
@@ -2832,6 +2837,22 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       skillScripts: (await listPluginSkillScripts(plugin)).length,
     };
   }
+
+  test("a claude-marketplace marker names its generator, and plain or native Claude packages name none", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    await writePlugin(path.join(tmp.path, "plain"), undefined);
+    await writePlugin(path.join(tmp.path, "marked"), { kind: "claude-marketplace", entry: "kit" });
+    const generatedFrom = async (dirName: string) =>
+      (
+        await discoverAgentPluginAt({
+          pluginDir: path.join(tmp.path, dirName),
+          scope: "global",
+          choice: { kind: "fixed-order" },
+        })
+      ).plugin?.generatedFrom;
+    expect(await generatedFrom("plain")).toBeUndefined();
+    expect(await generatedFrom("marked")).toBe("claude-marketplace");
+  });
 
   test("a claude-marketplace marker gets the Claude package set and gains nothing over plain", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
@@ -2935,6 +2956,36 @@ describe("named manifest choice (install methods)", () => {
       [".claude-plugin/plugin.json", "claude-plugin"],
       [".cursor-plugin/plugin.json", "cursor-plugin"],
     ]);
+  });
+
+  test("manifestPath names the loaded manifest, and the method of that path is the method that loaded it", async () => {
+    using tmp = new DisposableTempDir("named-manifest-path");
+    await writeEgmLayout(tmp.path);
+    const loaded = async (choice: Parameters<typeof discoverAgentPluginAt>[0]["choice"]) => {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: tmp.path,
+        scope: "global",
+        choice,
+      });
+      if (plugin === null) throw new Error("not a plugin");
+      return [plugin.manifestPath, installedAsKind(plugin)];
+    };
+    expect(await loaded({ kind: "fixed-order" })).toEqual([
+      ".codex-plugin/plugin.json",
+      "agent-plugin",
+    ]);
+    for (const [method, manifestPath] of [
+      ["agent-plugin", ".codex-plugin/plugin.json"],
+      ["claude-plugin", ".claude-plugin/plugin.json"],
+      ["cursor-plugin", ".cursor-plugin/plugin.json"],
+    ] as const) {
+      expect(await loaded({ kind: "method", method })).toEqual([manifestPath, method]);
+    }
+    for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
+      expect(MANIFEST_PATH_INSTALL_METHODS[spec.relative.split(path.sep).join("/")]).toBe(
+        spec.method
+      );
+    }
   });
 
   test("each named method loads only its own manifest; the fixed order loads the Codex one", async () => {
