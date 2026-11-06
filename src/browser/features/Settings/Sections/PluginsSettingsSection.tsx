@@ -1118,7 +1118,11 @@ const PreviewDisclosures: React.FC<{
               {index > 0 && ", "}
               <span className="text-foreground font-mono break-all">{agent}</span>
               {props.preview.readonlyAgents.includes(agent) && (
-                <span className="text-muted"> (edit tools removed, shell still available)</span>
+                <span className="text-muted">
+                  {props.preview.shellRemovedAgents.includes(agent)
+                    ? " (edit tools removed, shell removed)"
+                    : " (edit tools removed, shell still available)"}
+                </span>
               )}
             </React.Fragment>
           ))}{" "}

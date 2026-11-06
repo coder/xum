@@ -98,6 +98,7 @@ test("a cut file text must be shown in full before the plugin can be installed (
     mcpServers: [],
     agents: [],
     readonlyAgents: [],
+    shellRemovedAgents: [],
     workflows: [],
     slashCommands: [],
     reviewedComponents: [],

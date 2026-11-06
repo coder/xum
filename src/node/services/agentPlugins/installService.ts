@@ -3956,6 +3956,9 @@ export class AgentPluginInstallService {
     const readonlyAgents = agentFiles.flatMap((agent) =>
       agent.readonly ? [showInvisibleControls(agent.file)] : []
     );
+    const shellRemovedAgents = agentFiles.flatMap((agent) =>
+      agent.readonly && !agent.keepsShell ? [showInvisibleControls(agent.file)] : []
+    );
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -4007,6 +4010,7 @@ export class AgentPluginInstallService {
       fileChanges,
       agents,
       readonlyAgents,
+      shellRemovedAgents,
       workflows,
       slashCommands,
       reviewedComponents,

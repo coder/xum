@@ -7,32 +7,36 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { listPluginAgentFiles } from "./agentFiles";
 
-async function readonlyFlags(files: Record<string, string>): Promise<Record<string, boolean>> {
+async function shellFlags(
+  files: Record<string, string>
+): Promise<Record<string, { readonly: boolean; keepsShell: boolean }>> {
   using dir = new DisposableTempDir("agent-files-readonly");
   for (const [name, frontmatter] of Object.entries(files)) {
     await fs.writeFile(path.join(dir.path, name), `---\n${frontmatter}\n---\nBody\n`, "utf-8");
   }
   const agents = await listPluginAgentFiles(dir.path);
-  return Object.fromEntries(agents.map((agent) => [agent.file, agent.readonly]));
+  return Object.fromEntries(
+    agents.map((agent) => [agent.file, { readonly: agent.readonly, keepsShell: agent.keepsShell }])
+  );
 }
 
-test("an agent is read-only for the review only while it runs on Explore and keeps bash", async () => {
+test("a read-only agent is flagged, and so is whether the mapped tools keep its shell", async () => {
   expect(
-    await readonlyFlags({
+    await shellFlags({
       "searcher.md": "description: d\ntools: [Read, Grep, Glob]",
       "cursor-readonly.md": "description: d\nreadonly: true",
       "no-shell.md": "description: d\ntools: [Read, Grep, Glob]\ndisallowedTools: [Bash]",
       "cursor-no-shell.md": "description: d\nreadonly: true\ndisallowedTools: [Bash]",
       "writer.md": "description: d\ntools: [Read, Edit, Grep]",
-      "plain.md": "description: d",
+      "reads-only.md": "description: d\ntools: [Read]",
     })
   ).toEqual({
-    "cursor-no-shell.md": false,
-    "cursor-readonly.md": true,
-    "no-shell.md": false,
-    "plain.md": false,
-    "searcher.md": true,
-    "writer.md": false,
+    "cursor-no-shell.md": { readonly: true, keepsShell: false },
+    "cursor-readonly.md": { readonly: true, keepsShell: true },
+    "no-shell.md": { readonly: true, keepsShell: false },
+    "reads-only.md": { readonly: false, keepsShell: false },
+    "searcher.md": { readonly: true, keepsShell: true },
+    "writer.md": { readonly: false, keepsShell: false },
   });
 });
 

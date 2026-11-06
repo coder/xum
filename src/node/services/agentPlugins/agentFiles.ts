@@ -18,6 +18,8 @@ export interface PluginAgentFile {
    * (no file edits, shell stays).
    */
   readonly: boolean;
+  /** The mapped tools leave the bash tools enabled. */
+  keepsShell: boolean;
 }
 
 /**
@@ -103,7 +105,7 @@ export function ambiguousPluginAgentIds(
 async function readAgentDefinition(
   filePath: string,
   agentId: string
-): Promise<Pick<PluginAgentFile, "frontmatter" | "readonly"> | undefined> {
+): Promise<Pick<PluginAgentFile, "frontmatter" | "readonly" | "keepsShell"> | undefined> {
   try {
     const stat = await fsPromises.stat(filePath);
     // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -121,11 +123,13 @@ async function readAgentDefinition(
       byteSize: stat.size,
       plugin: { agentId },
     });
-    // A `disallowedTools: Bash` list leaves a read-only agent no shell to disclose.
     // mutation-equivalent: `tools` is an object or undefined, never another falsy value
     const tools = parsed.frontmatter.tools ?? {};
-    const keepsShell = isToolEnabledByConfigs("bash", [{ add: [".*"] }, tools]);
-    return { frontmatter: parsed.frontmatter, readonly: parsed.mappedReadonly && keepsShell };
+    return {
+      frontmatter: parsed.frontmatter,
+      readonly: parsed.mappedReadonly,
+      keepsShell: isToolEnabledByConfigs("bash", [{ add: [".*"] }, tools]),
+    };
   } catch {
     return undefined;
   }

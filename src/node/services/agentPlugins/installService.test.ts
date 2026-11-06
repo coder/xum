@@ -2394,19 +2394,19 @@ describe("AgentPluginInstallService", () => {
     expect((await service.list())[0].reviewRequiredCount).toBe(0);
   });
 
-  test("the install preview notes the shell only for read-only agents that keep bash", async () => {
+  test("the install preview names the read-only agents whose shell was removed", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     const agent = (extra: string) =>
-      `---\nname: a\ndescription: Reviews code\ntools: [Read, Grep, Glob]\n${extra}---\nReview.\n`;
-    await fsPromises.writeFile(path.join(remoteDir, "agents", "searcher.md"), agent(""));
-    await fsPromises.writeFile(
-      path.join(remoteDir, "agents", "no-shell.md"),
-      agent("disallowedTools: [Bash]\n")
-    );
-    await commitAll(remoteDir, "add two read-only search agents");
+      `---\nname: a\ndescription: Reviews code\n${extra}---\nReview.\n`;
+    const write = (file: string, frontmatter: string) =>
+      fsPromises.writeFile(path.join(remoteDir, "agents", file), agent(frontmatter));
+    await write("searcher.md", "tools: [Read, Grep, Glob]\n");
+    await write("no-shell.md", "tools: [Read, Grep, Glob]\ndisallowedTools: [Bash]\n");
+    await write("cursor-no-shell.md", "readonly: true\ndisallowedTools: [Bash]\n");
+    await commitAll(remoteDir, "add read-only agents, two without a shell");
     const preview = await service.preview({ input: remoteDir });
-    expect([...preview.agents].sort()).toEqual(["no-shell.md", "searcher.md"]);
-    expect(preview.readonlyAgents).toEqual(["searcher.md"]);
+    expect(preview.readonlyAgents).toEqual(["cursor-no-shell.md", "no-shell.md", "searcher.md"]);
+    expect(preview.shellRemovedAgents).toEqual(["cursor-no-shell.md", "no-shell.md"]);
   });
 
   test("a plugin agent whose ID two files claim does not load (#6629)", async () => {
