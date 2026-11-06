@@ -754,6 +754,7 @@ function groupByCheckout(
     // Merge into a NEW set: no loop below iterates the set it grows.
     const group = new Set([id]);
     for (const key of keysOf(id)) {
+      // mutation-equivalent: a Set is never falsy, so ?? and || agree
       for (const member of groupOfKey.get(key) ?? []) group.add(member);
     }
     for (const member of group) {
@@ -4725,6 +4726,7 @@ export class WorkspaceMcpOverridesService {
     });
     const outcomes = new Map<string, SweptOutcome>();
     await mapWithConcurrency(
+      // mutation-equivalent: an array is never falsy, so ?? and || agree
       groupByCheckout(uniqueIds, (workspaceId) => checkoutKeys.get(workspaceId.trim()) ?? []),
       CHECKOUT_IO_CONCURRENCY,
       async (group) => {
