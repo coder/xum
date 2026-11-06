@@ -6558,6 +6558,77 @@ describe("Config", () => {
         ?.workspaces.find((workspace) => workspace.path === workspacePath);
       expect(persisted?.id).toBe("live-generated-id");
     });
+
+    describe("task-tree fields in a legacy metadata.json", () => {
+      // A migrated row reads as current-format, and that branch reads the row alone: a field the
+      // migration leaves in metadata.json is lost from then on. A lost parentWorkspaceId detaches
+      // a sub-agent from its parent, whose MCP disables then no longer apply to it.
+      const projectPath = "/fake/project";
+      const treeFields = {
+        parentWorkspaceId: "parent-id",
+        agentType: "explore",
+        agentId: "explore",
+        taskStatus: "reported",
+        taskPrompt: "Survey the repo",
+        taskTrunkBranch: "main",
+        taskModelString: "anthropic:claude-sonnet-5-5",
+        reportedAt: "2026-01-02T00:00:00.000Z",
+        archivedAt: "2026-01-03T00:00:00.000Z",
+      } as const;
+      const pick = (source: object | undefined) =>
+        Object.fromEntries(
+          Object.keys(treeFields).map((key) => [key, (source as Record<string, unknown>)[key]])
+        );
+      const workspacePath = () => path.join(config.srcDir, "project", "legacy-task");
+      const writeLegacyFile = (id: string) => {
+        fs.mkdirSync(workspacePath(), { recursive: true });
+        fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
+        fs.writeFileSync(
+          path.join(config.sessionsDir, "legacy-task", "metadata.json"),
+          JSON.stringify({ id, name: "legacy-task", ...treeFields })
+        );
+      };
+      const register = (row: { id?: string; name?: string }) =>
+        config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, { workspaces: [{ path: workspacePath(), ...row }] });
+          return cfg;
+        });
+      const build = async (from: Config) =>
+        (await from.getAllWorkspaceMetadata({ probeCheckouts: false })).find(
+          (metadata) => metadata.id === "legacy-task-id"
+        );
+      // The queued migration write lands before this no-op edit.
+      const persistedRow = async () => {
+        await config.editConfig((cfg) => cfg);
+        return new Config(tempDir)
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((workspace) => workspace.path === workspacePath());
+      };
+
+      it("migrates them into an id-less row", async () => {
+        writeLegacyFile("legacy-task-id");
+        await register({});
+        expect(pick(await build(config))).toEqual(treeFields);
+        expect(pick(await persistedRow())).toEqual(treeFields);
+        expect(pick(await build(new Config(tempDir)))).toEqual(treeFields);
+      });
+
+      it("restores them into a row an earlier build migrated without them", async () => {
+        writeLegacyFile("legacy-task-id");
+        await register({ id: "legacy-task-id", name: "legacy-task" });
+        expect(pick(await build(config))).toEqual(treeFields);
+        expect(pick(await persistedRow())).toEqual(treeFields);
+      });
+
+      it("does not restore them from a legacy file that names another workspace", async () => {
+        // Checkout paths are reused: a file left by a removed workspace is not this row's.
+        writeLegacyFile("removed-workspace-id");
+        await register({ id: "legacy-task-id", name: "legacy-task" });
+        expect((await build(config))?.parentWorkspaceId).toBeUndefined();
+        expect((await persistedRow())?.parentWorkspaceId).toBeUndefined();
+      });
+    });
   });
 
   describe("transcriptOnly derivation", () => {
