@@ -4851,12 +4851,7 @@ export class WorkspaceMcpOverridesService {
       }
     }
 
-    if (options?.publish && after.lenientRegistry) {
-      // Publication resolves inheritance from this registry, which lists a degraded entry under
-      // its fallback id: a child of that entry would publish `{}` for its parent's settings as
-      // disk truth. Evict every cache instead, so the next read goes to disk.
-      await options.publish(null, ALL_WORKSPACES_TARGET);
-    } else if (options?.publish) {
+    if (options?.publish) {
       failures.push(
         ...(await this.publishSweptWorkspaces(
           swept,
@@ -4930,6 +4925,13 @@ export class WorkspaceMcpOverridesService {
     after: ConfigSnapshot,
     budget: PublicationBudget
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    if (after.lenientRegistry) {
+      // Publication resolves inheritance from this registry, which lists a degraded entry under
+      // its fallback id: a child of that entry would publish `{}` for its parent's settings as
+      // disk truth. Evict every cache instead, so the next read goes to disk.
+      await publish(null, ALL_WORKSPACES_TARGET);
+      return [];
+    }
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
     // Publish AFTER every prune landed: an inheriting descendant swept
     // before its parent would otherwise publish the parent's pre-prune
