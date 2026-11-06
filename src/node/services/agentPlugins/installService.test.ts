@@ -6985,6 +6985,11 @@ describe("AgentPluginInstallService", () => {
         return cfg;
       });
     };
+    const rejectionMessage = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
     const serviceRecordingPrunes = (pruned: string[]) =>
       new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: overridesServiceStub((workspaceId: string) => {
@@ -7000,22 +7005,46 @@ describe("AgentPluginInstallService", () => {
         const serviceWithOverrides = serviceRecordingPrunes(pruned);
         await registerLocalWorkspace("ws-1");
         const preview = await serviceWithOverrides.preview({ input: remoteDir });
+        let cause: string;
         if (damage === "corrupt") {
           await fsPromises.writeFile(configFile(), "{ not json");
+          cause = await rejectionMessage(Promise.resolve().then(() => JSON.parse("{ not json")));
         } else {
           // EISDIR stands in for EACCES, which a root test runner would bypass.
           await fsPromises.rm(configFile());
           await fsPromises.mkdir(configFile());
+          cause = await rejectionMessage(fsPromises.readFile(configFile()));
         }
 
-        await expect(
+        const refusal = await rejectionMessage(
           serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
-        ).rejects.toThrow(/workspace enumeration failed.*config\.json/);
+        );
+        expect(refusal).toMatch(/workspace enumeration failed.*config\.json/);
+        expect(refusal).toContain(cause);
         expect(pruned).toEqual([]);
         expect(await registry()).toEqual([]);
         expect(await pathExists(preview.targetPath)).toBe(false);
       }
     );
+
+    test("a fresh install advises a retry when enumeration fails for another reason", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+        Promise.reject(new Error("registry walk failed"))
+      );
+      try {
+        const refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+        expect(refusal).toMatch(/workspace enumeration failed/);
+        expect(refusal).toMatch(/retry/i);
+        expect(refusal).not.toMatch(/config\.json|repair/i);
+      } finally {
+        metadataSpy.mockRestore();
+      }
+    });
 
     test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
       const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
