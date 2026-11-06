@@ -6558,6 +6558,40 @@ describe("Config", () => {
         ?.workspaces.find((workspace) => workspace.path === workspacePath);
       expect(persisted?.id).toBe("live-generated-id");
     });
+
+    it("reports an entry built from its config row alone and still lists it in every build", async () => {
+      // A partially migrated row (an id, no name) whose legacy metadata.json does not parse: a
+      // lenient build fills its name and runtime with defaults, so callers that read its checkout
+      // must learn the id (fallbackIds). Builds without that out-parameter still list the entry.
+      const projectPath = "/fake/project";
+      const workspacePath = path.join(config.srcDir, "project", "half-migrated");
+      const healthyPath = path.join(config.srcDir, "project", "healthy");
+      fs.mkdirSync(workspacePath, { recursive: true });
+      fs.mkdirSync(healthyPath, { recursive: true });
+      const sessionDir = path.join(config.sessionsDir, "half-migrated");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(path.join(sessionDir, "metadata.json"), "{ not json");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            { path: workspacePath, id: "half-migrated-id" },
+            { path: healthyPath, id: "healthy-id", name: "healthy" },
+          ],
+        });
+        return cfg;
+      });
+
+      const fallbackIds = new Set<string>();
+      const registry = await config.getAllWorkspaceMetadata({ probeCheckouts: false, fallbackIds });
+      expect(registry.map((metadata) => metadata.id).sort()).toEqual([
+        "half-migrated-id",
+        "healthy-id",
+      ]);
+      expect([...fallbackIds]).toEqual(["half-migrated-id"]);
+      const probed = await config.getAllWorkspaceMetadata({ persistMigrations: false });
+      expect(probed.map((metadata) => metadata.id)).toContain("half-migrated-id");
+      expect((await config.findWorkspaceMetadata("half-migrated-id"))?.id).toBe("half-migrated-id");
+    });
   });
 
   describe("transcriptOnly derivation", () => {
