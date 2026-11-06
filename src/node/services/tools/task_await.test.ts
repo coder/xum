@@ -801,12 +801,12 @@ describe("task_await tool", () => {
       const parsed = schema.safeParse(args);
       return parsed.success ? null : parsed.error.issues[0]?.message;
     };
-    // Several IDs: the error names the exact single-ID call for each.
-    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 50_000 })).toContain(
-      'task_await(task_ids: ["t1"], timeout_secs: 0, offset_chars: 50000) or task_await(task_ids: ["t2"]'
+    // Several IDs: the error says how many and how to page each report, without quoting them.
+    expect(issue({ task_ids: ["t1", "t2"], offset_chars: 50_000 })).toBe(
+      "offset_chars pages one report, so it needs exactly one task ID; this call has 2. Call task_await once per report with its one task ID, timeout_secs: 0 and the same offset_chars, and await other tasks without offset_chars."
     );
     // No IDs awaits every task.
-    expect(issue({ offset_chars: 50_000 })).toContain("exactly one task ID");
+    expect(issue({ offset_chars: 50_000 })).toContain("exactly one task ID; this call has 0.");
     // One ID (also when repeated), or offset 0, is fine.
     expect(issue({ task_ids: ["t1"], offset_chars: 50_000 })).toBeNull();
     expect(issue({ task_ids: ["t1", "t1"], offset_chars: 50_000 })).toBeNull();
@@ -819,7 +819,8 @@ describe("task_await tool", () => {
       const parsed = schema.safeParse(args);
       return parsed.success ? null : parsed.error.issues[0]?.message;
     };
-    const readAgain = 'task_await(task_ids: ["bash:p1"], timeout_secs: 0) without offset_chars';
+    const readAgain =
+      "call task_await with only a bash task ID from this call, timeout_secs: 0 and no offset_chars";
     expect(issue({ task_ids: ["bash:p1"], offset_chars: 1000 })).toContain(readAgain);
     // With other IDs too, the bash rule wins: the single-ID hint would name a refused call.
     expect(issue({ task_ids: ["t1", "bash:p1"], offset_chars: 1000 })).toContain(readAgain);
