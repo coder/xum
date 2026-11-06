@@ -270,7 +270,7 @@ describe("DockerRuntime.forkWorkspace", () => {
   });
 });
 
-describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made ready", () => {
+describe("DockerRuntime home of the container user", () => {
   let originalCli: string | undefined;
   let cliDir: string;
   let cliBinaryPath: string;
@@ -339,6 +339,14 @@ describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made
     expect(await runtime.resolvePath("/var/mux")).toBe("/var/mux");
     expect(await runtime.resolvePath("repo")).toBe("/src/repo");
     expect(await probeCount()).toBe(0);
+  });
+
+  it("falls back to /root when a container that became ready prints no HOME", async () => {
+    await fs.writeFile(path.join(cliDir, "home"), "\n");
+    const runtime = existingContainerRuntime();
+
+    expect(await runtime.ensureReady()).toEqual({ ready: true });
+    expect(await runtime.resolvePath("~")).toBe("/root");
   });
 
   it("keeps /root for ~ until there is a container to ask", async () => {
