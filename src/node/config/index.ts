@@ -94,7 +94,6 @@ import {
   DelegatedCreationMarkSchema,
   PendingArchiveSchema,
   PendingRemovalSchema,
-  WorkspaceConfigSchema,
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
@@ -1656,29 +1655,25 @@ interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
 }
 
-/** A field that a config row and a legacy metadata.json both hold, with one type. */
-type LegacyTreeField = {
-  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<
+/** A config row field that metadata carries with the same type. */
+type ConfigTreeField = {
+  [K in keyof Workspace & keyof WorkspaceMetadata]: NonNullable<Workspace[K]> extends NonNullable<
     WorkspaceMetadata[K]
-  > extends NonNullable<Workspace[K]>
+  >
     ? K
     : never;
 }[keyof Workspace & keyof WorkspaceMetadata];
 
 /**
- * Task-tree fields (the parent link, the agent, the task state, the archive marks, the
- * sub-project and the tags) that the legacy branch of buildWorkspaceMetadata reads from a
- * metadata.json ahead of the row. A migrated
- * row reads as current-format, and that branch reads the row alone, so the migration copies each
- * one the row lacks. A field left behind is lost from then on: a lost parentWorkspaceId detaches
- * a sub-agent from its parent, whose MCP disables then no longer apply to it.
- *
- * Rows an earlier build migrated are not restored from their legacy file. No Xum build wrote these
- * fields into one: sub-agents (#1219) came after config.json became the store, and that change
- * notes that metadata.json will not have them. Reading legacy files for current-format rows would
- * only let a stray file attach a row to a parent.
+ * Task-tree fields: the parent link, the agent, the task state and how the task holds its
+ * checkout. For a legacy row, buildWorkspaceMetadata takes them from the config row alone and
+ * ignores any value in the row's legacy metadata.json. No Xum build wrote them into that file:
+ * sub-agents (#1219) came after config.json became the store. Read from the file, a value would
+ * hold only until the read-time migration (a migrated row reads the row alone), so a sub-agent's
+ * MCP inheritance would flip after one read, and a stray file could attach any legacy row to a
+ * parent. TaskService already reads these fields from config rows only.
  */
-const LEGACY_TREE_FIELDS = [
+const CONFIG_TREE_FIELDS = [
   "parentWorkspaceId",
   "agentType",
   "agentId",
@@ -1691,26 +1686,17 @@ const LEGACY_TREE_FIELDS = [
   "taskThinkingLevel",
   "taskPrompt",
   "taskTrunkBranch",
-  "archivedAt",
-  "unarchivedAt",
-  "subProjectPath",
-  "tags",
-] as const satisfies readonly LegacyTreeField[];
+  "taskIsolation",
+  "sideChatParentWorkspaceId",
+  "taskDesktopOwnerWorkspaceId",
+  "taskSticky",
+  "taskExecutionId",
+  "taskExecutionStatus",
+] as const satisfies readonly ConfigTreeField[];
 
-/**
- * Copies into `row` each LEGACY_TREE_FIELDS value it lacks and `legacy` holds. A legacy
- * metadata.json is not schema-checked, so a value the row schema rejects stays behind instead of
- * reaching config.json.
- */
-function copyLegacyTreeFields(
-  row: Workspace,
-  legacy: Partial<Record<LegacyTreeField, unknown>>
-): void {
-  for (const key of LEGACY_TREE_FIELDS) {
-    if (row[key] !== undefined) continue;
-    const parsed = WorkspaceConfigSchema.shape[key].safeParse(legacy[key]);
-    if (parsed.success && parsed.data !== undefined) Object.assign(row, { [key]: parsed.data });
-  }
+/** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
+function takeTreeFieldsFromConfig(metadata: WorkspaceMetadata, row: Workspace): void {
+  for (const key of CONFIG_TREE_FIELDS) Object.assign(metadata, { [key]: row[key] });
 }
 
 /** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
@@ -5099,25 +5085,14 @@ export class Config {
             metadata.aiSettings ??= workspace.aiSettings;
             metadata.heartbeat ??= workspace.heartbeat;
 
-            // Preserve tree/task metadata when present in config (metadata.json won't have it)
-            metadata.parentWorkspaceId ??= workspace.parentWorkspaceId;
-            metadata.agentType ??= workspace.agentType;
-            metadata.agentId ??= workspace.agentId;
-            metadata.workflowTask ??= workspace.workflowTask;
+            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS).
+            takeTreeFieldsFromConfig(metadata, workspace);
             metadata.bestOf = isLegacyTaskVariantGroup(metadata.bestOf)
               ? undefined
               : (normalizeWorkspaceBestOf(metadata.bestOf) ??
                 normalizeWorkspaceBestOf(workspace.bestOf));
-            metadata.taskStatus ??= workspace.taskStatus;
-            metadata.taskPendingGuidance ??= workspace.taskPendingGuidance;
-            metadata.taskLaunchError ??= workspace.taskLaunchError;
             metadata.delegatedCreationInterrupted ??=
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
-            metadata.reportedAt ??= workspace.reportedAt;
-            metadata.taskModelString ??= workspace.taskModelString;
-            metadata.taskThinkingLevel ??= workspace.taskThinkingLevel;
-            metadata.taskPrompt ??= workspace.taskPrompt;
-            metadata.taskTrunkBranch ??= workspace.taskTrunkBranch;
             // Preserve archived timestamps from config
             metadata.archivedAt ??= workspace.archivedAt;
             metadata.unarchivedAt ??= workspace.unarchivedAt;
@@ -5178,7 +5153,6 @@ export class Config {
               entry.createdAt ??= metadata.createdAt;
               entry.runtimeConfig ??= metadata.runtimeConfig;
               entry.forkFamilyBaseName ??= metadata.forkFamilyBaseName;
-              copyLegacyTreeFields(entry, metadata);
             });
 
             if (!workspace.projects && metadata.projects) {

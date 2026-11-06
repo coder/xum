@@ -6560,79 +6560,57 @@ describe("Config", () => {
       expect(persisted?.id).toBe("live-generated-id");
     });
 
-    describe("task-tree fields in a legacy metadata.json", () => {
-      // A migrated row reads as current-format, and that branch reads the row alone: a field the
-      // migration leaves in metadata.json is lost from then on. A lost parentWorkspaceId detaches
-      // a sub-agent from its parent, whose MCP disables then no longer apply to it.
+    describe("task-tree fields of a legacy row", () => {
+      // A migrated row reads as current-format, from the row alone. A task-tree value taken from
+      // the legacy metadata.json would hold for one read only, so every build takes them from the
+      // config row (see CONFIG_TREE_FIELDS): before the migration, after it, and after a restart.
       const projectPath = "/fake/project";
-      const treeFields = {
-        parentWorkspaceId: "parent-id",
-        agentType: "explore",
+      const fileTree = {
+        parentWorkspaceId: "file-parent-id",
         agentId: "explore",
-        taskStatus: "reported",
+        taskStatus: "running",
         taskPrompt: "Survey the repo",
-        taskTrunkBranch: "main",
-        taskModelString: "anthropic:claude-sonnet-5-5",
-        reportedAt: "2026-01-02T00:00:00.000Z",
-        archivedAt: "2026-01-03T00:00:00.000Z",
+        taskIsolation: "none",
       } as const;
       const pick = (source: object | undefined) =>
         Object.fromEntries(
-          Object.keys(treeFields).map((key) => [key, (source as Record<string, unknown>)[key]])
+          Object.keys(fileTree).map((key) => [key, (source as Record<string, unknown>)[key]])
         );
       const workspacePath = () => path.join(config.srcDir, "project", "legacy-task");
-      const writeLegacyFile = (id: string, overrides: Record<string, unknown> = {}) => {
+      const register = async (row: Partial<Workspace>) => {
         fs.mkdirSync(workspacePath(), { recursive: true });
         fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
         fs.writeFileSync(
           path.join(config.sessionsDir, "legacy-task", "metadata.json"),
-          JSON.stringify({ id, name: "legacy-task", ...treeFields, ...overrides })
+          JSON.stringify({ id: "legacy-task-id", name: "legacy-task", ...fileTree })
         );
-      };
-      const register = (row: Partial<Workspace>) =>
-        config.editConfig((cfg) => {
+        await config.editConfig((cfg) => {
           cfg.projects.set(projectPath, { workspaces: [{ path: workspacePath(), ...row }] });
           return cfg;
         });
+      };
       const build = async (from: Config) =>
         (await from.getAllWorkspaceMetadata({ probeCheckouts: false })).find(
           (metadata) => metadata.id === "legacy-task-id"
         );
-      // The queued migration write lands before this no-op edit.
-      const persistedRow = async () => {
+      const builds = async () => {
+        const first = pick(await build(config));
+        // The queued migration write lands before this no-op edit.
         await config.editConfig((cfg) => cfg);
-        return new Config(tempDir)
-          .loadConfigOrDefault()
-          .projects.get(projectPath)
-          ?.workspaces.find((workspace) => workspace.path === workspacePath());
+        return [first, pick(await build(new Config(tempDir)))];
       };
 
-      it("migrates them into an id-less row", async () => {
-        writeLegacyFile("legacy-task-id");
+      it("ignores the legacy file's values in every build", async () => {
         await register({});
-        expect(pick(await build(config))).toEqual(treeFields);
-        expect(pick(await persistedRow())).toEqual(treeFields);
-        expect(pick(await build(new Config(tempDir)))).toEqual(treeFields);
+        const absent = Object.fromEntries(Object.keys(fileTree).map((key) => [key, undefined]));
+        expect(await builds()).toEqual([absent, absent]);
       });
 
-      it("keeps a value the row already holds", async () => {
-        // The migration fills only what the row lacks: it never overwrites a persisted value.
-        writeLegacyFile("legacy-task-id");
-        await register({ taskStatus: "interrupted" });
-        await build(config);
-        const row = await persistedRow();
-        expect(row?.parentWorkspaceId).toBe("parent-id");
-        expect(row?.taskStatus).toBe("interrupted");
-      });
-
-      it("does not copy a value the row schema rejects", async () => {
-        // A legacy metadata.json is not schema-checked: a bad value must not reach config.json.
-        writeLegacyFile("legacy-task-id", { taskStatus: "bogus" });
-        await register({});
-        await build(config);
-        const row = await persistedRow();
-        expect(row?.parentWorkspaceId).toBe("parent-id");
-        expect(row?.taskStatus).toBeUndefined();
+      it("serves the config row's values in every build", async () => {
+        const rowTree = { parentWorkspaceId: "row-parent-id", taskStatus: "reported" } as const;
+        await register(rowTree);
+        const expected = { ...pick({}), ...rowTree };
+        expect(await builds()).toEqual([expected, expected]);
       });
     });
   });

@@ -235,50 +235,62 @@ describe("WorkspaceMcpOverridesService", () => {
       });
     });
 
-    it("a legacy child keeps its parent link through the read-time migration", async () => {
-      // An id-less row whose parent link lives only in its legacy metadata.json. The first build
-      // migrates the row: a link left behind makes every later read serve the child's own empty
-      // overrides as authoritative, and a server the parent disabled starts.
-      const service = new WorkspaceMcpOverridesService(config);
-      const parent = await registerWorkspace("legacy-parent");
-      await service.setOverridesForWorkspace(parent.workspaceId, { disabledServers: ["noisy"] });
-      const childPath = getWorkspacePath({
-        srcDir: config.srcDir,
-        projectName: "legacy-child",
-        workspaceName: "old-child",
-      });
-      await fs.mkdir(childPath, { recursive: true });
-      await fs.mkdir(path.join(config.sessionsDir, "old-child"), { recursive: true });
-      await fs.writeFile(
-        path.join(config.sessionsDir, "old-child", "metadata.json"),
-        JSON.stringify({
-          id: "legacy-child-id",
-          name: "old-child",
-          parentWorkspaceId: parent.workspaceId,
-        })
-      );
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-child", {
-          workspaces: [
-            { path: childPath, runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir } },
-          ],
+    // An id-less legacy row. The first build migrates it, and a migrated row is read from config
+    // alone: a parent link read from its legacy metadata.json would flip its MCP inheritance after
+    // one read. The link comes from the config row in every read.
+    for (const { linkIn, inherits } of [
+      { linkIn: "the config row", inherits: true },
+      { linkIn: "the legacy file only", inherits: false },
+    ]) {
+      it(`a legacy child with its parent link in ${linkIn} reads the same before and after migration`, async () => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const parent = await registerWorkspace(`legacy-parent`);
+        await service.setOverridesForWorkspace(parent.workspaceId, { disabledServers: ["noisy"] });
+        const childPath = getWorkspacePath({
+          srcDir: config.srcDir,
+          projectName: "legacy-child",
+          workspaceName: "old-child",
         });
-        return cfg;
-      });
+        await fs.mkdir(childPath, { recursive: true });
+        await fs.mkdir(path.join(config.sessionsDir, "old-child"), { recursive: true });
+        await fs.writeFile(
+          path.join(config.sessionsDir, "old-child", "metadata.json"),
+          JSON.stringify({
+            id: "legacy-child-id",
+            name: "old-child",
+            ...(inherits ? {} : { parentWorkspaceId: parent.workspaceId }),
+          })
+        );
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/legacy-child", {
+            workspaces: [
+              {
+                path: childPath,
+                runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+                ...(inherits ? { parentWorkspaceId: parent.workspaceId } : {}),
+              },
+            ],
+          });
+          return cfg;
+        });
 
-      const inherited = { overrides: { disabledServers: ["noisy"] }, authoritative: true };
-      const read = async (reader: WorkspaceMcpOverridesService) => {
-        const { overrides, authoritative } =
-          await reader.getOverridesForWorkspace("legacy-child-id");
-        return { overrides, authoritative };
-      };
-      for (let attempt = 0; attempt < 3; attempt++) {
-        expect(await read(service)).toEqual(inherited);
-      }
-      // The queued migration write lands before this no-op edit; a restart reads it from disk.
-      await config.editConfig((cfg) => cfg);
-      expect(await read(new WorkspaceMcpOverridesService(new Config(tempDir)))).toEqual(inherited);
-    });
+        const expected = {
+          overrides: inherits ? { disabledServers: ["noisy"] } : {},
+          authoritative: true,
+        };
+        const read = async (reader: WorkspaceMcpOverridesService) => {
+          const { overrides, authoritative } =
+            await reader.getOverridesForWorkspace("legacy-child-id");
+          return { overrides, authoritative };
+        };
+        for (let attempt = 0; attempt < 3; attempt++) {
+          expect(await read(service)).toEqual(expected);
+        }
+        // The queued migration write lands before this no-op edit; a restart reads it from disk.
+        await config.editConfig((cfg) => cfg);
+        expect(await read(new WorkspaceMcpOverridesService(new Config(tempDir)))).toEqual(expected);
+      });
+    }
 
     it("child's own overrides win over the parent's, and saving them uses the inherited revision", async () => {
       const service = new WorkspaceMcpOverridesService(config);
