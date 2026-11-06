@@ -3,6 +3,10 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DockerRuntime, getContainerName, type DockerRuntimeConfig } from "./DockerRuntime";
+import { AgentIdSchema } from "@/common/orpc/schemas";
+import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import { CONTAINER_CLI_ENV } from "./containerCli";
 import {
   RuntimeError,
@@ -341,6 +345,13 @@ describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made
     expect(await probeCount()).toBe(0);
   });
 
+  it("keeps /root for ~ until there is a container to ask", async () => {
+    const runtime = new DockerRuntime({ image: "codercom/example-base:ubuntu" });
+
+    expect(await runtime.resolvePath("~")).toBe("/root");
+    expect(await probeCount()).toBe(0);
+  });
+
   it("reports an unreachable container as a transport failure and probes again later", async () => {
     const runtime = existingContainerRuntime();
     await failProbe(1, "Error response from daemon: container mux-test is not running\n");
@@ -353,13 +364,46 @@ describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made
     expect(await runtime.resolvePath("~/.xum/agents")).toBe("/home/coder/.xum/agents");
   });
 
-  it("does not guess /root when the home probe fails for another reason", async () => {
+  it("reads a built-in agent in a non-root container, whose /root it cannot enter", async () => {
+    class NonRootContainerRuntime extends DockerRuntime {
+      override stat(filePath: string): ReturnType<DockerRuntime["stat"]> {
+        const denied = filePath.startsWith("/root/");
+        return Promise.reject(
+          Object.assign(
+            new RuntimeError(
+              `Failed to stat ${filePath}: ${denied ? "Permission denied" : "No such file"}`,
+              "file_io"
+            ),
+            denied ? {} : { code: "ENOENT" }
+          )
+        );
+      }
+    }
+    const runtime = new NonRootContainerRuntime({
+      image: "codercom/example-base:ubuntu",
+      containerName: "mux-test",
+    });
+
+    const agent = await readAgentDefinition(runtime, "/src", AgentIdSchema.parse("exec"), {
+      runtimeFactory: fakeRuntimeFactory(createMemoryHost()),
+    });
+
+    expect(agent.scope).toBe("built-in");
+  });
+
+  it("does not guess /root when the home probe fails or prints nothing", async () => {
     const runtime = existingContainerRuntime();
     await failProbe(127, "exec: sh: not found\n");
 
     const failure = await runtime.resolvePath("~").catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(RuntimeError);
     expect((failure as RuntimeError).type).toBe("exec");
+
+    await fs.rm(path.join(cliDir, "failure"));
+    await fs.writeFile(path.join(cliDir, "home"), "\n");
+    const empty = await runtime.resolvePath("~").catch((error: unknown) => error);
+    expect(empty).toBeInstanceOf(RuntimeError);
+    expect((empty as RuntimeError).type).toBe("exec");
   });
 });
 

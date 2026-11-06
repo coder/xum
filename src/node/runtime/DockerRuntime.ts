@@ -435,24 +435,41 @@ export class DockerRuntime extends RemoteRuntime {
   }
   // ===== Runtime interface implementations =====
 
-  resolvePath(filePath: string): Promise<string> {
+  async resolvePath(filePath: string): Promise<string> {
     // DockerRuntime uses a fixed workspace base (/src), but we still want reasonable shell-style
     // behavior for callers that pass "~" or "~/...".
-    //
-    // NOTE: Some base images (e.g., codercom/*-base) run as a non-root user (like "coder"), so
-    // "~" should resolve to that user's home (e.g., /home/coder), not /root.
-    const home = this.containerHome ?? "/root";
-
     if (filePath === "~") {
-      return Promise.resolve(home);
+      return this.resolveContainerHome();
     }
     if (filePath.startsWith("~/")) {
-      return Promise.resolve(path.posix.join(home, filePath.slice(2)));
+      return path.posix.join(await this.resolveContainerHome(), filePath.slice(2));
     }
 
-    return Promise.resolve(
-      filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath)
-    );
+    return filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath);
+  }
+
+  /**
+   * The home of the container's default user. Some base images (e.g., codercom/*-base) run as a
+   * non-root user (like "coder"), so "~" is /home/coder there, not /root. A runtime built for an
+   * existing container (Task.create, the agent routes: one per call) learns the user only in
+   * ensureReady, and they read ~/.xum/agents before it: guessing /root made every such read fail
+   * with EACCES, because /root is mode 700. A failed probe is not cached and is not a guess.
+   */
+  private async resolveContainerHome(): Promise<string> {
+    if (this.containerHome !== undefined) return this.containerHome;
+    // Before createWorkspace there is no container to ask.
+    if (this.containerName === undefined) return "/root";
+
+    const probe = await this.probeContainerHome(this.containerName);
+    const home = probe.stdout.trim();
+    if (probe.exitCode !== 0 || home === "") {
+      throw new RuntimeError(
+        `Failed to resolve the home of container ${this.containerName}: ${probe.stderr.trim()}`,
+        isContainerUnavailableExit(probe.exitCode, probe.stderr) ? "network" : "exec"
+      );
+    }
+    this.containerHome = home;
+    return home;
   }
 
   getWorkspacePath(_projectPath: string, _workspaceName: string): string {
@@ -642,6 +659,13 @@ export class DockerRuntime extends RemoteRuntime {
     return { action: "skip" };
   }
 
+  private probeContainerHome(
+    containerName: string,
+    abortSignal?: AbortSignal
+  ): Promise<DockerCommandResult> {
+    return runDockerCommand(`exec ${containerName} sh -c 'echo $HOME'`, 5000, abortSignal);
+  }
+
   protected async detectContainerUser(
     containerName: string,
     abortSignal?: AbortSignal
@@ -649,7 +673,7 @@ export class DockerRuntime extends RemoteRuntime {
     const [uidResult, gidResult, homeResult] = await Promise.all([
       runDockerCommand(`exec ${containerName} id -u`, 5000, abortSignal),
       runDockerCommand(`exec ${containerName} id -g`, 5000, abortSignal),
-      runDockerCommand(`exec ${containerName} sh -c 'echo $HOME'`, 5000, abortSignal),
+      this.probeContainerHome(containerName, abortSignal),
     ]);
 
     return {
