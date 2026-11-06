@@ -149,6 +149,45 @@ describe("WorkspaceMcpOverridesService", () => {
     }
   });
 
+  /**
+   * Holds the global write lock, starts `start` and returns once it has asked for that lock
+   * (a call-through spy on runExclusive). A read or a fork copy asks for it only after it
+   * observed the legacy value it will migrate, so the caller can then change the world while
+   * `start` waits behind the writer. A fixed sleep assumed that much progress and failed, or
+   * passed without testing the race, when the run was slow.
+   *
+   * A `start` that never asks for the lock settles instead: the caller's next assertion then
+   * reports what it did without the lock.
+   */
+  async function startBehindWriterLock<T>(
+    service: WorkspaceMcpOverridesService,
+    start: () => Promise<T>
+  ): Promise<{ release: () => Promise<void>; result: Promise<T> }> {
+    const release = await service.acquireExclusiveLock();
+    const internals = service as unknown as {
+      runExclusive: (fn: () => Promise<unknown>, options?: object) => Promise<unknown>;
+    };
+    const realRunExclusive = internals.runExclusive.bind(service);
+    let requested: () => void = () => undefined;
+    const requestedLock = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    const spy = spyOn(internals, "runExclusive").mockImplementation((fn, options) => {
+      requested();
+      return realRunExclusive(fn, options);
+    });
+    try {
+      const result = start();
+      await Promise.race([requestedLock, result]);
+      return { release, result };
+    } catch (error) {
+      await release();
+      throw error;
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
   describe("sub-agent inheritance", () => {
     async function registerChild(
       parentWorkspaceId: string,
@@ -328,31 +367,10 @@ describe("WorkspaceMcpOverridesService", () => {
       const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
 
       // A writer holds the lock while the read runs: the read observes the
-      // legacy value and queues behind the lock for its migration. The read's
-      // own request for the lock is the signal that it observed the legacy
-      // value (and found no document): a fixed sleep let a slow read observe
-      // the saved document instead.
-      const release = await service.acquireExclusiveLock();
-      const internals = service as unknown as {
-        runExclusive: (fn: () => Promise<unknown>, options?: object) => Promise<unknown>;
-      };
-      const realRunExclusive = internals.runExclusive.bind(service);
-      let readRequestedLock: () => void = () => undefined;
-      const readQueued = new Promise<void>((resolve) => {
-        readRequestedLock = resolve;
-      });
-      const exclusiveSpy = spyOn(internals, "runExclusive").mockImplementation((fn, options) => {
-        readRequestedLock();
-        return realRunExclusive(fn, options);
-      });
-      const read = service.getOverridesForWorkspace(workspaceId);
-      try {
-        // A read that never asks for the lock settles instead (it migrated unfenced): the
-        // assertion below then reports the file it wrote.
-        await Promise.race([readQueued, read]);
-      } finally {
-        exclusiveSpy.mockRestore();
-      }
+      // legacy value and queues behind the lock for its migration.
+      const { release, result: read } = await startBehindWriterLock(service, () =>
+        service.getOverridesForWorkspace(workspaceId)
+      );
       expect(await pathExists(filePath)).toBe(false);
       // The writer persists a disable exactly like setOverridesForWorkspace:
       // document written, legacy value cleared, epoch bumped.
@@ -393,9 +411,9 @@ describe("WorkspaceMcpOverridesService", () => {
       });
       const movedPath = path.join(path.dirname(workspacePath), "renamed");
 
-      const release = await service.acquireExclusiveLock();
-      const read = service.getOverridesForWorkspace(workspaceId);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const { release, result: read } = await startBehindWriterLock(service, () =>
+        service.getOverridesForWorkspace(workspaceId)
+      );
       // Rename lands while the read waits: checkout moved, registry updated.
       await fs.rename(workspacePath, movedPath);
       await config.editConfig((cfg) => {
@@ -1702,13 +1720,13 @@ describe("WorkspaceMcpOverridesService", () => {
       const targetPath = path.join(config.srcDir, "fork-legacy-cleared-target", "branch");
       await fs.mkdir(targetPath, { recursive: true });
 
-      const release = await service.acquireExclusiveLock();
-      const copy = service.copyOverridesToForkedCheckout(source.workspaceId, {
-        runtime: createRuntime({ type: "local" }, { projectPath: targetPath }),
-        workspacePath: targetPath,
-        runtimeConfig: undefined,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const { release, result: copy } = await startBehindWriterLock(service, () =>
+        service.copyOverridesToForkedCheckout(source.workspaceId, {
+          runtime: createRuntime({ type: "local" }, { projectPath: targetPath }),
+          workspacePath: targetPath,
+          runtimeConfig: undefined,
+        })
+      );
       // The clearing save completes while the fork waits for the lock (a
       // sibling process here: config edit + epoch bump).
       await config.editConfig((cfg) => {
