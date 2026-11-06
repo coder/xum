@@ -7134,6 +7134,11 @@ describe("AgentPluginInstallService", () => {
       // and the reason was only in the log. Each cause gets its own advice.
       type Gate = "fresh install" | "reinstall gate";
       const gates: Gate[] = ["fresh install", "reinstall gate"];
+      // Each gate words its refusal in its own way: this tells a test which gate refused.
+      const refusedBy: Record<Gate, RegExp> = {
+        "fresh install": /before installing/,
+        "reinstall gate": /previous uninstall/,
+      };
       const realOverridesService = () => new WorkspaceMcpOverridesService(config);
       const serviceWith = (overrides: WorkspaceMcpOverridesService) =>
         new AgentPluginInstallService(config, { workspaceMcpOverridesService: overrides });
@@ -7201,6 +7206,7 @@ describe("AgentPluginInstallService", () => {
 
           const refusal = await refuse();
 
+          expect(refusal).toMatch(refusedBy[gate]);
           expect(refusal).toContain("1 workspace (ws-1)");
           expect(refusal).toContain(docPath);
           expect(refusal).toMatch(/shrink/i);
@@ -7221,6 +7227,7 @@ describe("AgentPluginInstallService", () => {
           await releaseBusy();
         }
 
+        expect(refusal).toMatch(refusedBy[gate]);
         expect(refusal).toContain("1 workspace (ws-1)");
         expect(refusal).toMatch(/retry/i);
         expect(refusal).not.toMatch(/shrink/i);
