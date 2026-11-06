@@ -1,9 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { MCPServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -13,6 +14,38 @@ import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFi
 
 const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
+
+// The inspector also scans the runtime user's global roots (HOME and the Xum home). A host with many
+// installed skills adds a shell containment probe per skill and root, which took this file over
+// 120-240 s per test, while an empty home takes seconds. Pointing both at an empty folder makes the
+// file independent of the host.
+let hostHome: DisposableTempDir | undefined;
+let previousHome: string | undefined;
+let previousXumRoot: string | undefined;
+
+function hostXumRoot(): string {
+  assert(hostHome !== undefined, "the isolated host home is created in beforeAll");
+  return path.join(hostHome.path, ".xum");
+}
+
+function restoreEnv(name: "HOME" | "XUM_ROOT", value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+beforeAll(() => {
+  hostHome = new DisposableTempDir("composition-host-home");
+  previousHome = process.env.HOME;
+  previousXumRoot = process.env.XUM_ROOT;
+  process.env.HOME = hostHome.path;
+  process.env.XUM_ROOT = hostXumRoot();
+});
+
+afterAll(() => {
+  restoreEnv("HOME", previousHome);
+  restoreEnv("XUM_ROOT", previousXumRoot);
+  hostHome?.[Symbol.dispose]();
+});
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
@@ -110,6 +143,12 @@ describe("buildWorkspaceComposition", () => {
     );
     // Project shell tool hook (hooks.ts precedence: project shadows user-level).
     await fs.writeFile(path.join(workspace.path, ".mux", "tool_pre"), "#!/bin/sh\n", "utf-8");
+    // The only global skill is the one in the isolated Xum home, never a skill of the host.
+    await writeSkill(
+      path.join(hostXumRoot(), "skills", "global-fixture-skill"),
+      "global-fixture-skill",
+      "Global skill"
+    );
 
     const composition = await buildWorkspaceComposition({
       runtime: new LocalRuntime(workspace.path),
@@ -139,6 +178,10 @@ describe("buildWorkspaceComposition", () => {
     const shadowedPluginSkill = shared.find((s) => s.source === PLUGIN_SOURCE);
     expect(projectSkill?.shadowedBy).toBeUndefined();
     expect(shadowedPluginSkill?.shadowedBy).toBe("project");
+
+    expect(composition.skills.filter((s) => s.source === "global").map((s) => s.name)).toEqual([
+      "global-fixture-skill",
+    ]);
 
     // Agents.
     const agent = composition.agents.find((a) => a.name === "fixture-agent");
