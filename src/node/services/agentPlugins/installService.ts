@@ -6819,15 +6819,15 @@ export class AgentPluginInstallService {
     warnings: string[];
     method: AgentPluginInstallMethod;
   }> {
+    // The update would move the older build's hook trust to the next commit (pluginHookTrust.ts).
+    if (await this.closedAfterOlderBuild(entry.name))
+      throw new UpdateRefusedError(MOVED_METHOD_MESSAGE);
     // A subpath install tracks the same folder at the new commit; a folder
     // that disappeared upstream fails here, before any swap.
     // A plugin.json that Xum generated is regenerated from the new commit, unless the
     // repository now has its own manifest. The update review covers every component as usual. A
     // marketplace entry is read again from the marketplace file at the new commit: the staged
     // folder holds only the entry.
-    // The update would move the older build's hook trust to the next commit (pluginHookTrust.ts).
-    if (await this.closedAfterOlderBuild(entry.name))
-      throw new UpdateRefusedError(MOVED_METHOD_MESSAGE);
     const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
     const saved = await this.savedInstallMethod(entry.name);
     const { stagedDir, marketplace } = await this.cloneWithEntry(
