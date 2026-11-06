@@ -6936,7 +6936,8 @@ describe("AgentPluginInstallService", () => {
       serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
     ).rejects.toThrow(/enabledPluginServers must be an array/);
 
-    expect(await pathExists(preview.targetPath)).toBe(false);
+    // The install path: preview.targetPath is display text (`~/...` under HOME) that never exists.
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect(await registry()).toEqual([]);
     expect(await stagingLeftovers()).toEqual([]);
     expect(await fsPromises.readFile(configPath, "utf8")).toBe(malformed);
