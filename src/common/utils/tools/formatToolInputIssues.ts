@@ -9,6 +9,7 @@ export interface ToolInputIssue {
   message: string;
   code?: string;
   origin?: string;
+  keys?: readonly string[];
 }
 
 export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[] {
@@ -66,21 +67,34 @@ function describeReceivedArguments(input: unknown): string {
     return "no arguments";
   }
   const displayable = entries.filter(([key]) => isDisplayableKey(key));
-  const shown = describeDisplayableArguments(displayable);
-  const hidden = entries.length - displayable.length;
-  if (hidden === 0) {
-    return shown;
-  }
-  const notShown = `${hidden} ${hidden === 1 ? "key" : "keys"} not shown`;
-  return shown === "" ? notShown : `${shown} (${notShown})`;
+  return joinWithCounts(
+    displayable.map(([key, value]) => `${key}=${describeReceivedValue(value)}`),
+    entries.length - displayable.length
+  );
 }
 
-function describeDisplayableArguments(entries: Array<[string, unknown]>): string {
-  const parts = entries
-    .slice(0, RECEIVED_MAX_KEYS)
-    .map(([key, value]) => `${key}=${describeReceivedValue(value)}`);
-  const more = entries.length - parts.length;
-  return more > 0 ? `${parts.join(", ")} (+${more} more)` : parts.join(", ");
+// Zod's own message quotes each unrecognized key, so build the text from the
+// keys under the same rule as the received list.
+function describeUnrecognizedKeys(keys: readonly string[]): string {
+  const displayable = keys.filter(isDisplayableKey);
+  const hidden = keys.length - displayable.length;
+  const noun = keys.length === 1 ? "unrecognized key" : "unrecognized keys";
+  if (displayable.length === 0) {
+    return `${hidden} ${noun} not shown`;
+  }
+  return `${noun}: ${joinWithCounts(displayable, hidden)}`;
+}
+
+function joinWithCounts(parts: readonly string[], hidden: number): string {
+  let text = parts.slice(0, RECEIVED_MAX_KEYS).join(", ");
+  if (parts.length > RECEIVED_MAX_KEYS) {
+    text += ` (+${parts.length - RECEIVED_MAX_KEYS} more)`;
+  }
+  if (hidden > 0) {
+    const notShown = `${hidden} ${hidden === 1 ? "key" : "keys"} not shown`;
+    text = text === "" ? notShown : `${text} (${notShown})`;
+  }
+  return text;
 }
 
 function isDisplayableKey(key: string): boolean {
@@ -99,6 +113,10 @@ function describeReceivedValue(value: unknown): string {
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {
   const label = issue.path.length > 0 ? issue.path.map(String).join(".") : "input";
+  if (issue.code === "unrecognized_keys") {
+    // mutation-equivalent: keys is an array or undefined, so ?? and || agree
+    return `${label}: ${describeUnrecognizedKeys(issue.keys ?? [])}`;
+  }
   let text = `${label}: ${issue.message}`;
   // Zod v4 size messages state the limit but not the actual length, which is
   // the number the model needs to shorten its retry.

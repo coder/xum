@@ -52,6 +52,15 @@ describe("formatToolInputIssues", () => {
     expect(parts[2]).not.toContain("received");
   });
 
+  test("skips the received suffix for a string issue that is not about size", () => {
+    const input = { question: "bbb" };
+    const schema = z.object({ question: z.string().regex(/^a/) });
+
+    expect(formatToolInputIssues(issuesFor(schema, input), input)).toBe(
+      "question: Invalid string: must match pattern /^a/"
+    );
+  });
+
   test("labels a root-level issue as the whole input", () => {
     const message = formatToolInputIssues(issuesFor(z.object({ a: z.string() }), "oops"), "oops");
 
@@ -165,6 +174,44 @@ describe("formatToolInputIssues received arguments", () => {
       "script: Required. Received arguments: no named arguments"
     );
     expect(formatToolInputIssues(issues, ["cd"])).toEndWith("no named arguments");
+  });
+});
+
+describe("formatToolInputIssues unrecognized keys", () => {
+  const strictSchema = TOOL_DEFINITIONS.desktop_click.schema;
+  const unrecognized = (extra: Record<string, unknown>) => {
+    const input = { x: 1, y: 2, ...extra };
+    return formatToolInputIssues(issuesFor(strictSchema, input), input);
+  };
+
+  test("shows parameter-shaped keys and counts the others", () => {
+    const message = unrecognized({ ghp_ABCdef123456SECRETxyz: 1, badKey: 2 });
+
+    expect(message).toBe("input: unrecognized keys: badKey (1 key not shown)");
+  });
+
+  test("shows only a count when no key is parameter-shaped", () => {
+    const message = unrecognized({ ghp_ABCdef123456SECRETxyz: 1, "user@example.com": 2 });
+
+    expect(message).toBe("input: 2 unrecognized keys not shown");
+    expect(unrecognized({ AKIAIOSFODNN7EXAMPLE: 1 })).toBe("input: 1 unrecognized key not shown");
+  });
+
+  test("lists displayable keys without a count suffix", () => {
+    expect(unrecognized({ badKey: 1 })).toBe("input: unrecognized key: badKey");
+    expect(unrecognized({ badKey: 1, other_key: 2 })).toBe(
+      "input: unrecognized keys: badKey, other_key"
+    );
+  });
+
+  test("caps the number of listed keys", () => {
+    const extra = Object.fromEntries(
+      Array.from({ length: 12 }, (_, index) => [`key_${"abcdefghijkl"[index]}`, index])
+    );
+
+    expect(unrecognized({ ...extra, "a=b": 1 })).toBe(
+      "input: unrecognized keys: key_a, key_b, key_c, key_d, key_e, key_f, key_g, key_h, key_i, key_j (+2 more) (1 key not shown)"
+    );
   });
 });
 
