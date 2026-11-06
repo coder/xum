@@ -734,6 +734,54 @@ function isRetryableLockError(error: unknown): boolean {
     (error instanceof Error && error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE)
   );
 }
+/** One workspace's result in sweepPluginOverrideKeys. */
+type SweptOutcome =
+  | { ok: true; swept: SweptWorkspace; owesEpoch: boolean }
+  | { ok: false; error: unknown; owesEpoch: boolean };
+function idsByCheckoutKey(
+  ids: readonly string[],
+  keysOf: (id: string) => readonly string[]
+): Map<string, string[]> {
+  const index = new Map<string, string[]>();
+  for (const id of ids) {
+    for (const key of keysOf(id)) {
+      const sharing = index.get(key);
+      if (sharing) sharing.push(id);
+      else index.set(key, [id]);
+    }
+  }
+  return index;
+}
+/**
+ * Group IDs whose checkouts share a lock key: aliases of one checkout (an
+ * isolation:none child and its parent) address one override document, and
+ * two prunes of it at once can collide (Windows refuses a rename over a file
+ * another handle has open). Groups run in parallel, each group's IDs in turn.
+ */
+function groupByCheckout(
+  ids: readonly string[],
+  keysOf: (id: string) => readonly string[]
+): string[][] {
+  const index = idsByCheckoutKey(ids, keysOf);
+  const grouped = new Set<string>();
+  const groups: string[][] = [];
+  for (const id of ids) {
+    if (grouped.has(id)) continue;
+    grouped.add(id);
+    const group = [id];
+    // The array iterator also visits members pushed while it runs.
+    for (const member of group) {
+      for (const other of keysOf(member).flatMap((key) => index.get(key) ?? [])) {
+        if (!grouped.has(other)) {
+          grouped.add(other);
+          group.push(other);
+        }
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
 /**
  * Lock files and checkouts touched at once by a batch (see withWorkspaceLocks).
  * Measured on Node: 7,550 lock files took 70 s one at a time, 4.6 s 16 at a time.
@@ -1092,7 +1140,7 @@ export function isPositivelyAbsent(error: unknown): boolean {
 }
 
 type OverridesFileProbe =
-  | { kind: "file" }
+  | { kind: "file"; size: number }
   | { kind: "absent" }
   /** EACCES, I/O error, transport hiccup: the file may or may not exist. */
   | { kind: "indeterminate"; error: unknown };
@@ -1117,7 +1165,7 @@ async function probeOverridesFile(
           kind: "indeterminate",
           error: new Error(`Workspace MCP overrides path is a directory: ${filePath}`),
         }
-      : { kind: "file" };
+      : { kind: "file", size: stat.size };
   } catch (error) {
     return isPositivelyAbsent(error) ? { kind: "absent" } : { kind: "indeterminate", error };
   }
@@ -1146,14 +1194,29 @@ function selectProbedCandidate(
   return { kind: "absent" };
 }
 
-async function statIsFile(
+/**
+ * Override documents list server names (a few KB). The file is repository
+ * controlled, and the plugin-key sweep reads many checkouts at once, so a
+ * larger one fails its workspace instead of being buffered and parsed.
+ */
+const MAX_PRUNED_OVERRIDES_BYTES = 1024 * 1024;
+/**
+ * Whether a candidate override file exists for the plugin-key prune.
+ * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
+ * so the caller keeps its tombstone instead of retiring it unread.
+ */
+async function prunableFileExists(
   runtime: ReturnType<typeof createRuntime>,
-  filePath: string,
-  mode: "lenient" | "strict"
+  filePath: string
 ): Promise<boolean> {
   const probe = await probeOverridesFile(runtime, filePath);
-  if (probe.kind === "indeterminate" && mode === "strict") {
+  if (probe.kind === "indeterminate") {
     throw probe.error;
+  }
+  if (probe.kind === "file" && probe.size > MAX_PRUNED_OVERRIDES_BYTES) {
+    throw new Error(
+      `Workspace MCP overrides file ${filePath} is ${probe.size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
+    );
   }
   return probe.kind === "file";
 }
@@ -3925,13 +3988,14 @@ export class WorkspaceMcpOverridesService {
     const deadlineAt = Date.now() + budgetMs;
     const remaining = () => Math.max(0, deadlineAt - Date.now());
     // Key derivation probes checkouts (bounded realpaths, but hundreds of
-    // stalled ones add up). A single-workspace writer draws it from its one
-    // budget; the partial batch bounds each derivation by a whole budget, so
-    // its last pass still runs after the waiting budget is spent.
-    const derive = () =>
+    // stalled ones add up): it draws from the same budget as the acquisition
+    // — and the verification run below happens while every lock is held.
+    // Only the partial batch's last pass, which starts once that budget is
+    // spent, bounds each derivation by a whole budget of its own.
+    const derive = (lastPass: boolean) =>
       withDeadline(
         this.checkoutLockKeys(ids),
-        partialAtDeadline ? budgetMs : remaining(),
+        lastPass ? budgetMs : remaining(),
         WORKSPACE_LOCK_TIMEOUT_MESSAGE
       );
     let lastBusyKey: string | undefined;
@@ -3940,11 +4004,11 @@ export class WorkspaceMcpOverridesService {
       const held = new Map<string, () => Promise<void>>();
       let acquiredAll = false;
       try {
-        const derived = await derive();
+        const derived = await derive(lastPass);
         const keys = [...new Set([...derived.keys.values()].flat())].sort();
         const awaited = lastPass ? undefined : awaitedLockKey(keys, lastBusyKey);
         const busy = await this.takeCheckoutLocks(keys, held, awaited, remaining());
-        const verification = await derive();
+        const verification = await derive(lastPass);
         const blocker = lastPass ? undefined : passBlocker(busy, derived, verification);
         if (blocker !== undefined) {
           lastBusyKey = blocker.key;
@@ -4614,6 +4678,7 @@ export class WorkspaceMcpOverridesService {
             const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
             const failures = await this.sweepPluginOverrideKeys(
               workspaceIds.filter((id) => !unlockedIds.has(id.trim())),
+              locked.keys,
               keyPrefix,
               options,
               budget,
@@ -4635,6 +4700,7 @@ export class WorkspaceMcpOverridesService {
   /** Body of prunePluginOverrideKeysForWorkspaces, run under its locks. */
   private async sweepPluginOverrideKeys(
     workspaceIds: readonly string[],
+    checkoutKeys: ReadonlyMap<string, readonly string[]>,
     keyPrefix: string,
     options: PluginSweepOptions | undefined,
     budget: PublicationBudget,
@@ -4667,8 +4733,8 @@ export class WorkspaceMcpOverridesService {
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     // Many checkouts at once: thousands of sequential stats outlasted the
-    // sweep budget. One task per ID (first spelling), so two prunes never
-    // rewrite one checkout concurrently; results keep the input order.
+    // sweep budget. One task per ID (first spelling), and IDs whose
+    // checkouts share a lock key run one after another (see groupByCheckout).
     const seen = new Set<string>();
     const uniqueIds = workspaceIds.filter((workspaceId) => {
       const id = workspaceId.trim();
@@ -4676,14 +4742,27 @@ export class WorkspaceMcpOverridesService {
       seen.add(id);
       return first;
     });
-    const outcomes = await mapWithConcurrency(uniqueIds, CHECKOUT_IO_CONCURRENCY, (workspaceId) =>
-      this.pruneSweptWorkspace(metadataById.get(workspaceId.trim()), workspaceId, keyPrefix, {
-        budget,
-        snapshot,
-      })
+    const outcomes = new Map<string, SweptOutcome>();
+    await mapWithConcurrency(
+      groupByCheckout(uniqueIds, (workspaceId) => checkoutKeys.get(workspaceId.trim()) ?? []),
+      CHECKOUT_IO_CONCURRENCY,
+      async (group) => {
+        for (const workspaceId of group) {
+          outcomes.set(
+            workspaceId,
+            await this.pruneSweptWorkspace(
+              metadataById.get(workspaceId.trim()),
+              workspaceId,
+              keyPrefix,
+              { budget, snapshot }
+            )
+          );
+        }
+      }
     );
-    for (const [index, outcome] of outcomes.entries()) {
-      const workspaceId = uniqueIds[index];
+    for (const workspaceId of uniqueIds) {
+      const outcome = outcomes.get(workspaceId);
+      assert(outcome !== undefined, `sweep produced no outcome for ${workspaceId}`);
       anyOwesEpoch ||= outcome.owesEpoch;
       if (outcome.ok) {
         swept.set(workspaceId, outcome.swept);
@@ -4776,10 +4855,7 @@ export class WorkspaceMcpOverridesService {
     workspaceId: string,
     keyPrefix: string,
     sweep: { budget: PublicationBudget; snapshot: ConfigSnapshot }
-  ): Promise<
-    | { ok: true; swept: SweptWorkspace; owesEpoch: boolean }
-    | { ok: false; error: unknown; owesEpoch: boolean }
-  > {
+  ): Promise<SweptOutcome> {
     // Owed even when a later checkout of the ID fails: an earlier one may
     // already be rewritten.
     let owesEpoch = false;
@@ -4913,7 +4989,7 @@ export class WorkspaceMcpOverridesService {
     // every tombstone retry would fail on the same later file.
     const rewrites: Array<{ filePath: string; text: string }> = [];
     for (const filePath of filePaths) {
-      if (!(await statIsFile(runtime, filePath, "strict"))) {
+      if (!(await prunableFileExists(runtime, filePath))) {
         continue;
       }
       // A document exists: the cross-process signal is owed whether or not

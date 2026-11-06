@@ -4694,6 +4694,91 @@ describe("WorkspaceMcpOverridesService", () => {
     }
   });
 
+  it("prunePluginOverrideKeysForWorkspaces prunes aliases of one checkout one after another", async () => {
+    // An isolation:none child shares its parent's checkout and document; the
+    // sweep's parallel prunes must not read and rewrite that document at once.
+    const service = new WorkspaceMcpOverridesService(config);
+    const projectPath = path.join(tempDir, "alias-project");
+    await registerLocalWorkspace(projectPath, "ws-alias-parent");
+    await registerLocalWorkspace(projectPath, "ws-alias-child", "ws-alias-parent");
+    const docPath = path.join(projectPath, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(docPath), { recursive: true });
+    await fs.writeFile(
+      docPath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    const realStat = fsPromisesModule.stat;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (target !== docPath) {
+        return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return await realStat(target);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof fsPromisesModule.stat);
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        ["ws-alias-parent", "ws-alias-child"],
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      statSpy.mockRestore();
+    }
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBe(1);
+    const after = jsoncParse(await fs.readFile(docPath, "utf-8")) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual(["other"]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces fails an override file too large to read instead of buffering it", async () => {
+    // The file is repository controlled and the sweep reads many checkouts at
+    // once: a huge one must not be parsed 16 times in parallel.
+    const service = new WorkspaceMcpOverridesService(config);
+    const over = await registerWorkspace("doc-over-limit");
+    const atLimit = await registerWorkspace("doc-at-limit");
+    const documentOfSize = (bytes: number, enabledServers: string[]) => {
+      const skeleton = JSON.stringify({ enabledServers, padding: "" });
+      return JSON.stringify({ enabledServers, padding: "x".repeat(bytes - skeleton.length) });
+    };
+    const limit = 1024 * 1024;
+    const overText = documentOfSize(limit + 1, ["plugin:0123456789abcdef:echo"]);
+    const atLimitText = documentOfSize(limit, ["plugin:0123456789abcdef:echo", "other"]);
+    expect([overText.length, atLimitText.length]).toEqual([limit + 1, limit]);
+    for (const [workspace, text] of [
+      [over, overText],
+      [atLimit, atLimitText],
+    ] as const) {
+      await fs.mkdir(path.join(workspace.workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(path.join(workspace.workspacePath, ".xum", "mcp.local.jsonc"), text);
+    }
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [over.workspaceId, atLimit.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([over.workspaceId]);
+    expect(String(failures[0].error)).toMatch(/1048577 bytes, over the 1048576 bytes/);
+    expect(
+      await fs.readFile(path.join(over.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ).toBe(overText);
+    const after = jsoncParse(
+      await fs.readFile(path.join(atLimit.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual(["other"]);
+  });
+
   it("prunePluginOverrideKeysForWorkspaces fails on an unexpected lock error and releases every lock it took", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const { first, second, secondLocks } = await twoWorkspacesInLockOrder(service, "lock-eio");
