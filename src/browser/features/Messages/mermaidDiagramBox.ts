@@ -13,10 +13,14 @@ export interface RenderedDiagram {
   chart: string;
 }
 
-/** Where the diagram is drawn. An inline container width of 0 means unknown (not laid out yet). */
+/**
+ * Where the diagram is drawn. An inline container width of 0 means unknown (not laid out yet).
+ * The dialog's room is the measured content box of the element that holds the drawing: a side
+ * of 0 is unknown, so that axis does not limit the drawing.
+ */
 export type DiagramFrame =
   | { kind: "inline"; containerWidth: number; userZoom: number }
-  | { kind: "dialog"; viewportHeight: number };
+  | { kind: "dialog"; room: DiagramBox };
 
 export interface DiagramBox {
   width: number;
@@ -27,11 +31,31 @@ export interface DiagramBox {
 // the height cap that would shrink a tall layout until its labels are unreadable.
 export const NARROW_DIAGRAM_WIDTH = 640;
 const INLINE_MAX_HEIGHT = 300;
-const DIALOG_HEIGHT_FRACTION = 0.8;
+
+function assertFinitePositive(box: DiagramBox, message: string) {
+  assert(
+    Number.isFinite(box.width) && box.width > 0 && Number.isFinite(box.height) && box.height > 0,
+    message
+  );
+}
 
 function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
   if (frame.kind === "dialog") {
-    return Math.min(1, (frame.viewportHeight * DIALOG_HEIGHT_FRACTION) / measured.height);
+    const { room } = frame;
+    assert(
+      Number.isFinite(room.width) &&
+        room.width >= 0 &&
+        Number.isFinite(room.height) &&
+        room.height >= 0,
+      "The expand dialog needs a finite, non-negative room"
+    );
+    // The dialog is the one place that shows a whole diagram, so it fits both axes. It never
+    // enlarges a small diagram, and an axis that is not measured yet does not limit it.
+    return Math.min(
+      1,
+      room.width > 0 ? room.width / measured.width : 1,
+      room.height > 0 ? room.height / measured.height : 1
+    );
   }
   const { containerWidth, userZoom } = frame;
   // A wide diagram keeps its measured width here and pans inside its frame.
@@ -49,16 +73,9 @@ function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
  * --diagram-width and --diagram-height.
  */
 export function diagramPixelSize(measured: DiagramBox, frame: DiagramFrame): DiagramBox {
-  assert(
-    Number.isFinite(measured.width) &&
-      measured.width > 0 &&
-      Number.isFinite(measured.height) &&
-      measured.height > 0,
-    "A diagram needs a finite, positive measured size"
-  );
+  assertFinitePositive(measured, "A diagram needs a finite, positive measured size");
   const scale = diagramScale(measured, frame);
-  return {
-    width: Math.round(measured.width * scale),
-    height: Math.round(measured.height * scale),
-  };
+  // A very wide, short diagram scaled to a narrow room would round to nothing and vanish.
+  const pixels = (side: number) => Math.max(1, Math.round(side * scale));
+  return { width: pixels(measured.width), height: pixels(measured.height) };
 }

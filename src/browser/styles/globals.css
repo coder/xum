@@ -1543,16 +1543,13 @@ html[data-renderer-inactive] *::after {
 }
 /* Desktop titlebar drag regions (Electron only)
  * -webkit-app-region: drag marks areas that can be used to drag the window
- * -webkit-app-region: no-drag marks interactive elements inside drag regions
+ * -webkit-app-region: no-drag marks interactive elements inside drag regions (the
+ * .titlebar-no-drag rule lives in transcript-content.css, shared with the VS Code webview)
  * These styles only apply in Electron; in browser mode they have no effect */
 .titlebar-drag {
   -webkit-app-region: drag;
   /* Prevent text selection while dragging */
   user-select: none;
-}
-
-.titlebar-no-drag {
-  -webkit-app-region: no-drag;
 }
 
 /* Titlebar-safe inset classes — consume the CSS custom properties set by
