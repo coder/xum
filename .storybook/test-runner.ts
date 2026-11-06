@@ -4,6 +4,7 @@ import { getStoryContext, type TestRunnerConfig } from "@storybook/test-runner";
 import assert from "node:assert/strict";
 import sharp from "sharp";
 import {
+  IOS_STATUS_BAND_HEIGHT_PX,
   MOBILE_TOUCH_TARGET_PX,
   SIDE_INSET_PX,
   SIDE_INSET_VIEWPORT,
@@ -415,7 +416,11 @@ const DUO_BAND_STORY = "app-phoneviewports--duo-cover-display";
 const DUO_BAND_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 678 };
 // Measured on a folded Duo at 2.95 px per pt: the glyphs sit at x 398..437, y 87..151 of the 466x678
 // cover display. Keep in sync with the rule's top and height.
-const DUO_BAND = { left: SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX, top: 0, height: 172 };
+const DUO_BAND = {
+  left: SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX,
+  top: 0,
+  height: IOS_STATUS_BAND_HEIGHT_PX,
+};
 // The phone header's own right padding (px-2), which the column's width adds to.
 const HEADER_GUTTER_PX = 8;
 const DUO_INSETS = { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 };

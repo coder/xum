@@ -1,4 +1,5 @@
 import { isIosStandaloneWebApp } from "@/browser/utils/env";
+import { IOS_STATUS_BAND_HEIGHT_PX } from "@/constants/layout";
 
 /**
  * Takes back the status column of the folded iPhone Duo's cover display for home-screen web apps.
@@ -112,6 +113,10 @@ function hasScrollRoom(element: Element, horizontal: boolean, delta: number): bo
   return range > 1 && (delta < 0 ? position < range - 1 : position > 0);
 }
 
+function canScrollSideways(from: EventTarget | null): boolean {
+  return findScroller(from, true, -1) != null || findScroller(from, true, 1) != null;
+}
+
 /** The innermost element that a drag along this axis would scroll, from the touched one out. */
 function findScroller(
   from: EventTarget | null,
@@ -202,7 +207,7 @@ interface PanState {
   block: boolean | null;
 }
 
-function retargetTouches(list: TouchList, target: Element): Touch[] {
+function retargetTouches(list: ArrayLike<Touch>, target: Element): Touch[] {
   return Array.from(
     list,
     (touch) =>
@@ -228,7 +233,11 @@ function isColumnTouch(event: PointerEvent, column: number): boolean {
     column > 0 &&
     event.isPrimary &&
     event.pointerType === "touch" &&
-    event.clientX >= window.innerWidth
+    event.clientX >= window.innerWidth &&
+    // The status band paints over whatever scrolls under it, so a tap there must not reach a
+    // control the user cannot see (a transcript's Run command button, say). iOS takes no touches
+    // there either, and the header keeps its controls left of the column.
+    event.clientY >= IOS_STATUS_BAND_HEIGHT_PX
   );
 }
 
@@ -418,12 +427,25 @@ class ColumnTouchBridge {
     this.pan = touch ? { x: touch.clientX, y: touch.clientY, block: null } : null;
     const gesture = this.gesture;
     if (gesture == null) return;
-    this.replayTouch(event, gesture);
-    if (touch == null) this.cancelColumnGesture(gesture);
+    if (touch == null) this.cancelColumnGesture(event, gesture);
+    else this.replayTouch(event, gesture);
   }
 
-  /** A second finger makes it a pinch: it must not end as a tap or keep scrolling. */
-  private cancelColumnGesture(gesture: ColumnGesture): void {
+  /**
+   * A second finger makes it a pinch: it must not end as a tap or keep scrolling. The target hears
+   * a touchcancel rather than the two-finger touchstart, so a long-press timer it started stops.
+   */
+  private cancelColumnGesture(event: TouchEvent, gesture: ColumnGesture): void {
+    event.stopImmediatePropagation();
+    const joined = new Set(Array.from(event.changedTouches, (touch) => touch.identifier));
+    const pressed = Array.from(event.touches).filter((touch) => !joined.has(touch.identifier));
+    const cancel = new window.TouchEvent("touchcancel", {
+      bubbles: true,
+      composed: true,
+      view: window,
+      changedTouches: retargetTouches(pressed, gesture.target),
+    });
+    this.dispatchCopy(cancel, gesture.target);
     if (gesture.scroll == null)
       this.replayPointer("pointercancel", gesture.pointer, gesture.target);
     this.gesture = null;
@@ -436,7 +458,9 @@ class ColumnTouchBridge {
       const dx = touch.clientX - pan.x;
       const dy = touch.clientY - pan.y;
       if (Math.hypot(dx, dy) < PAN_INTENT_SLOP_PX) return;
-      pan.block = findDragScroller(event.target, dx, dy) == null;
+      // Only a sideways drag over nothing that scrolls sideways, in either direction, can only pan
+      // the page. A vertical drag is never blocked: the page has no height to pan.
+      pan.block = Math.abs(dx) > Math.abs(dy) && !canScrollSideways(event.target);
     }
     if (pan.block && event.cancelable) event.preventDefault();
   }

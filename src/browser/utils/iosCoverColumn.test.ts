@@ -2,6 +2,7 @@ import "../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
+import { IOS_STATUS_BAND_HEIGHT_PX } from "@/constants/layout";
 import {
   getCoverColumnWidth,
   installIosCoverColumn,
@@ -306,6 +307,17 @@ describe("installIosCoverColumn", () => {
       expect(clicks).toBe(0);
     });
 
+    test("does not click what the status band hides", () => {
+      let clicks = 0;
+      button.addEventListener("click", () => clicks++);
+      document.elementFromPoint = () => button;
+
+      const events = touchInColumn([{ x: 430, y: IOS_STATUS_BAND_HEIGHT_PX - 1 }]);
+
+      expect(clicks).toBe(0);
+      expect(events.some((event) => event.defaultPrevented)).toBe(false);
+    });
+
     test("still clicks a tap that wobbles a little, as fingers do", () => {
       let clicks = 0;
       button.addEventListener("click", () => clicks++);
@@ -431,6 +443,38 @@ describe("installIosCoverColumn", () => {
       expect(clicks).toBe(0);
     });
 
+    test("cancels the press it replayed when a second finger joins", () => {
+      const seen: string[] = [];
+      for (const type of ["touchstart", "touchcancel", "touchend"]) {
+        button.addEventListener(type, (event) => {
+          seen.push(`${type}:${(event as TouchEvent).touches.length}`);
+        });
+      }
+      const root = document.documentElement;
+      const column = new window.Touch({ identifier: 7, target: root, clientX: 430, clientY: 600 });
+      const other = new window.Touch({ identifier: 8, target: root, clientX: 200, clientY: 300 });
+      root.dispatchEvent(pointer("pointerdown", 430, 600));
+      root.dispatchEvent(
+        new window.TouchEvent("touchstart", {
+          bubbles: true,
+          touches: [column],
+          targetTouches: [column],
+          changedTouches: [column],
+        })
+      );
+      root.dispatchEvent(
+        new window.TouchEvent("touchstart", {
+          bubbles: true,
+          touches: [column, other],
+          targetTouches: [column, other],
+          changedTouches: [other],
+        })
+      );
+
+      // A long-press timer that starts on touchstart stops on the touchcancel.
+      expect(seen).toEqual(["touchstart:1", "touchcancel:0"]);
+    });
+
     test("leaves touches left of the column to WebKit", () => {
       let clicks = 0;
       button.addEventListener("click", () => clicks++);
@@ -511,6 +555,28 @@ describe("installIosCoverColumn", () => {
       send("touchmove", at(202, 299));
 
       expect(send("touchmove", at(203, 260))).toBe(false);
+    });
+
+    test("is left to iOS when a vertical drag at a scroller's top turns back up", () => {
+      wrapInScroller(target, 0);
+      uninstall = installIosCoverColumn();
+      const at = (x: number, y: number) =>
+        new window.Touch({ identifier: 1, target, clientX: x, clientY: y });
+      const send = (type: string, point: Touch) => {
+        const event = new window.TouchEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          touches: [point],
+          targetTouches: [point],
+        });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+
+      send("touchstart", at(200, 300));
+      send("touchmove", at(200, 310));
+
+      expect(send("touchmove", at(200, 250))).toBe(false);
     });
 
     test("is left to iOS on the inner display, which has no column", () => {

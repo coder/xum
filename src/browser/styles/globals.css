@@ -1175,6 +1175,7 @@ body,
     position: fixed;
     /* From the top: the fixed header (z-50) covers its own part. */
     top: 0;
+    /* IOS_STATUS_BAND_HEIGHT_PX: iosCoverColumn.ts takes no touches in the band. */
     height: 172px;
     right: 0;
     /* Zero wherever there is no side column, so nothing paints. */
