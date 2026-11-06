@@ -24,8 +24,12 @@ export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[]
   );
 }
 
-const RECEIVED_KEY_MAX_CHARS = 60;
 const RECEIVED_MAX_KEYS = 10;
+const DISPLAYABLE_KEY_MAX_CHARS = 40;
+// Every tool parameter name is lowercase-led snake_case or camelCase without
+// digits (the longest is 19 characters). Keys outside that shape are data a
+// model put in the wrong place (tokens, paths, emails) and are only counted.
+const DISPLAYABLE_KEY = /^[a-z][a-z_]*(?:[A-Z][a-z_]*)*$/;
 
 /**
  * Render zod issues as one concise line: "<path>: <message>[ (received N characters)]".
@@ -34,10 +38,11 @@ const RECEIVED_MAX_KEYS = 10;
  * also reaches the shared log through the tool-error path, so a value could leak
  * a credential there.
  *
- * When a property is missing, the shape of what did arrive is appended: each key
- * with its value's type and length. A model whose script arrived as 2 characters
- * otherwise reads "script: expected string" and concludes it named a field wrong,
- * not that its text was cut.
+ * When a property is missing, the shape of what did arrive is appended: each
+ * parameter-shaped key with its value's type and length, and a count of the
+ * other keys, which could carry data. A model whose script arrived as 2
+ * characters otherwise reads "script: expected string" and concludes it named
+ * a field wrong, not that its text was cut.
  */
 export function formatToolInputIssues(issues: readonly ToolInputIssue[], input: unknown): string {
   const text = issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
@@ -60,11 +65,26 @@ function describeReceivedArguments(input: unknown): string {
   if (entries.length === 0) {
     return "no arguments";
   }
-  const shown = entries
+  const displayable = entries.filter(([key]) => isDisplayableKey(key));
+  const shown = describeDisplayableArguments(displayable);
+  const hidden = entries.length - displayable.length;
+  if (hidden === 0) {
+    return shown;
+  }
+  const notShown = `${hidden} ${hidden === 1 ? "key" : "keys"} not shown`;
+  return shown === "" ? notShown : `${shown} (${notShown})`;
+}
+
+function describeDisplayableArguments(entries: Array<[string, unknown]>): string {
+  const parts = entries
     .slice(0, RECEIVED_MAX_KEYS)
-    .map(([key, value]) => `${escapeKey(truncateKey(key))}=${describeReceivedValue(value)}`);
-  const hidden = entries.length - shown.length;
-  return hidden > 0 ? `${shown.join(", ")} (+${hidden} more)` : shown.join(", ");
+    .map(([key, value]) => `${key}=${describeReceivedValue(value)}`);
+  const more = entries.length - parts.length;
+  return more > 0 ? `${parts.join(", ")} (+${more} more)` : parts.join(", ");
+}
+
+function isDisplayableKey(key: string): boolean {
+  return key.length <= DISPLAYABLE_KEY_MAX_CHARS && DISPLAYABLE_KEY.test(key);
 }
 
 function describeReceivedValue(value: unknown): string {
@@ -75,16 +95,6 @@ function describeReceivedValue(value: unknown): string {
     return `array(${value.length} items)`;
   }
   return value === null ? "null" : typeof value;
-}
-
-// Keys are model-supplied too: JSON escaping without the quotes keeps a newline
-// or quote in a key from starting a new line in the message.
-function escapeKey(key: string): string {
-  return JSON.stringify(key).slice(1, -1);
-}
-
-function truncateKey(key: string): string {
-  return key.length > RECEIVED_KEY_MAX_CHARS ? `${key.slice(0, RECEIVED_KEY_MAX_CHARS - 1)}…` : key;
 }
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {

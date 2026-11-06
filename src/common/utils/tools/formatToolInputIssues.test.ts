@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { formatToolInputIssues, isToolInputIssueArray } from "./formatToolInputIssues";
+import { TOOL_DEFINITIONS } from "./toolDefinitions";
 
 function issuesFor(schema: z.ZodType, value: unknown) {
   const result = schema.safeParse(value);
@@ -104,15 +105,28 @@ describe("formatToolInputIssues received arguments", () => {
     expect(message).not.toContain("31337");
   });
 
-  test("keeps a key with a newline or quote on one line and bounds its length", () => {
-    const input = { 'two\nlines"': 1, [`k${"e".repeat(70)}`]: true, ["x".repeat(60)]: 2 };
+  test("hides data-shaped keys and counts them", () => {
+    const input = {
+      ghp_ABCdef123456SECRET: "x",
+      AKIAIOSFODNN7EXAMPLE: "x",
+      "token=ghp_live_zzzzzzz": "x",
+      "user@example.com /home/mike/.netrc": 1,
+      'two\nlines"': 1,
+    };
 
     const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
 
-    expect(message).toEndWith(
-      `Received arguments: two\\nlines\\"=number, k${"e".repeat(58)}…=boolean, ${"x".repeat(60)}=number`
+    expect(message).toEndWith("Received arguments: 5 keys not shown");
+    expect(message).not.toMatch(/SECRET|EXAMPLE|ghp_live|netrc|example|two/);
+  });
+
+  test("shows a key of up to 40 identifier characters, including a truncated real key", () => {
+    const at40 = `a${"b".repeat(39)}`;
+    const input = { comm: "cd", command: 1, [at40]: 2, [`${at40}c`]: 3 };
+
+    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toEndWith(
+      `Received arguments: comm=string(2 chars), command=number, ${at40}=number (1 key not shown)`
     );
-    expect(message).not.toContain("\n");
   });
 
   test("describes other values by type", () => {
@@ -125,13 +139,19 @@ describe("formatToolInputIssues received arguments", () => {
 
   test("caps the number of listed arguments", () => {
     const keys = (count: number) =>
-      Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, index]));
+      Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [`key_${"abcdefghijkl"[index]}`, index])
+      );
 
     expect(formatToolInputIssues(issuesFor(aliasSchema, keys(11)), keys(11))).toEndWith(
-      "k9=number (+1 more)"
+      "key_j=number (+1 more)"
     );
     expect(formatToolInputIssues(issuesFor(aliasSchema, keys(10)), keys(10))).toEndWith(
-      "k9=number"
+      "key_j=number"
+    );
+    const mixed = { ...keys(12), "x.y": 1, "a=b": 2 };
+    expect(formatToolInputIssues(issuesFor(aliasSchema, mixed), mixed)).toEndWith(
+      "key_j=number (+2 more) (2 keys not shown)"
     );
   });
 
@@ -146,6 +166,27 @@ describe("formatToolInputIssues received arguments", () => {
     );
     expect(formatToolInputIssues(issues, ["cd"])).toEndWith("no named arguments");
   });
+});
+
+function parameterNames(node: unknown, names: Set<string>): void {
+  if (node === null || typeof node !== "object") return;
+  const properties = (node as { properties?: object }).properties ?? {};
+  Object.keys(properties).forEach((name) => names.add(name));
+  Object.values(node).forEach((child) => parameterNames(child, names));
+}
+
+test("shows every tool parameter name as a received key", () => {
+  const names = new Set<string>();
+  for (const { schema } of Object.values(TOOL_DEFINITIONS)) {
+    parameterNames(z.toJSONSchema(schema, { io: "input", unrepresentable: "any" }), names);
+  }
+  const issues = [{ path: ["missing"], message: "Required", code: "invalid_type" }];
+  const hidden = [...names].filter(
+    (name) => !formatToolInputIssues(issues, { [name]: 1 }).endsWith(`: ${name}=number`)
+  );
+
+  expect(names.size).toBeGreaterThan(100);
+  expect(hidden).toEqual([]);
 });
 
 describe("isToolInputIssueArray", () => {
