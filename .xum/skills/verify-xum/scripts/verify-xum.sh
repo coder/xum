@@ -294,16 +294,28 @@ probe_before_launch_deadline() {
   curl -fs --max-time "$(launch_seconds_left)" -o /dev/null "$1"
 }
 
-# A backend started with auth (#7904's `make dev-server`) records its token in server.lock. The
-# header goes to curl on stdin, so the token stays out of every process's argv.
+# The header carries the token of the backend that server.lock names to curl on stdin, so the
+# token stays out of every process's argv. Only while that backend runs, and never the run's copy:
+# while server.lock is missing or names a dead backend (stopped, or restarting under nodemon), its
+# TCP port is free, and another local account can bind it and take the token. Returns 1 without a
+# request then. A `return` and not die: doctor calls this inside `if` and reports the FAIL.
 backend_curl() {
-  local token
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  if [[ -n $token ]]; then
-    printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
-  else
-    curl "$@"
+  local lock pid token
+  lock=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || {
+    echo "verify-xum: $VERIFY_XUM_ROOT/server.lock is gone (the backend stopped or is restarting), so its token is not sent" >&2
+    return 1
+  }
+  pid=$(json_field_or_empty /dev/stdin pid <<<"$lock")
+  token=$(json_field_or_empty /dev/stdin token <<<"$lock")
+  if ! [[ $pid =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "verify-xum: the backend that server.lock names (pid ${pid:-none}) is not running, so its token is not sent" >&2
+    return 1
   fi
+  [[ -n $token ]] || {
+    echo "verify-xum: server.lock has no token" >&2
+    return 1
+  }
+  printf 'Authorization: Bearer %s\n' "$token" | curl -H @- "$@"
 }
 
 api() {
@@ -437,8 +449,9 @@ launch_failed() {
 # XUM_VITE_HOST=0.0.0.0 makes a server listen on every interface, and Vite then answers
 # http://<this machine's IP>:<port>/ (an IP-address Host passes its check). Launch runs it while
 # it waits for readiness too: a server on one non-loopback address never answers the loopback
-# probes, and launch would otherwise wait for its deadline. With "ready" it also refuses when
-# nothing listens on PORT: the server answered a probe there, so ss cannot see its sockets.
+# probes, and launch would otherwise wait for its deadline. Returns 1 when nothing listens on
+# PORT. With "ready" it refuses then instead: the server answered a probe there, so ss cannot see
+# its sockets.
 refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what listens there> [ready]
   local addr addrs
   addrs=$(ss -Hltn "sport = :$1" 2>/dev/null) || die "ss failed, so launch cannot check which addresses $2 listens on"
@@ -448,6 +461,30 @@ refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what lis
     [[ -z $addr || $addr == 127.*:"$1" || $addr == "[::1]:$1" ]] \
       || die "$2 listens on $addr, not only on loopback, so other machines can reach it. A .env file in $CHECKOUT sets its host (XUM_VITE_HOST, MUX_VITE_HOST, VITE_HOST, XUM_BACKEND_HOST, MUX_BACKEND_HOST or BACKEND_HOST): remove that line."
   done <<<"$addrs"
+  [[ -n $addrs ]]
+}
+
+# The checks that need a ready backend: its listeners and the token in its server.lock. Sets
+# token. A nodemon restart kills the backend, and the next one deletes the dead one's server.lock
+# before it binds the port, and writes its own lock after (see run_token). So a missing lock, a
+# lock that changed while the checks ran, or a /health that stopped answering means a restart:
+# return 1, and launch waits for readiness again. Refuse only what one backend showed throughout.
+backend_checks_after_ready() {
+  local before after listening=yes
+  before=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  refuse_off_loopback_listener "$backend_port" "the backend" || listening=no
+  backend_ready "$t0" || return 1
+  after=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
+  [[ $after == "$before" ]] || return 1
+  [[ $listening == yes ]] \
+    || die "ss shows nothing listening on the backend's port $backend_port, so launch cannot check that only loopback reaches it"
+  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
+  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
+  # a token any local account, and a web page that rebinds its DNS name to this machine, can
+  # call its API.
+  token=$(json_field_or_empty /dev/stdin token <<<"$after")
+  [[ -n $token ]] \
+    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
 }
 
 # The process group id that the new group's leader appended to state.env, if it has.
@@ -556,25 +593,17 @@ cmd_launch() {
   VERIFY_XUM_URL="http://127.0.0.1:$vite_port"
   write_state
 
-  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/"; do
+  until backend_ready "$t0" && probe_before_launch_deadline "$VERIFY_XUM_URL/" \
+    && refuse_off_loopback_listener "$vite_port" Vite ready && backend_checks_after_ready; do
     before_launch_deadline
     group_alive "$VERIFY_XUM_PGID" || die "the dev server exited before it was ready"
     backend_crashed_after_rebuild "$log" && die "the backend crashed after its rebuild (nodemon waits for a file change)"
-    refuse_off_loopback_listener "$vite_port" Vite
-    refuse_off_loopback_listener "$backend_port" "the backend"
+    refuse_off_loopback_listener "$vite_port" Vite || true
+    refuse_off_loopback_listener "$backend_port" "the backend" || true
     sleep 1
   done
-  refuse_off_loopback_listener "$vite_port" Vite ready
-  refuse_off_loopback_listener "$backend_port" "the backend" ready
   # Keep the token for redaction (run_token) while server.lock is gone. The run folder is 0700,
   # and the file is 0600.
-  token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
-  # env -i drops XUM_DEV_SERVER_NO_AUTH, but Bun loads the checkout's .env files into the sandbox
-  # script, and a line there can set it again. The backend's TCP port has no Host check, so without
-  # a token any local account, and a web page that rebinds its DNS name to this machine, can
-  # call its API.
-  [[ -n $token ]] \
-    || die "the backend has no auth token, so any local account can control it. A .env file in $CHECKOUT sets XUM_DEV_SERVER_NO_AUTH=1: remove that line."
   (umask 077 && printf '%s' "$token" >"$VERIFY_XUM_RUN/token")
 
   seed
@@ -638,10 +667,10 @@ cmd_env() {
   echo "unset $GIT_REPO_ENV"
 }
 
-# Opens PATH of the run's UI in the run's browser session. When the backend has an auth token, the
-# URL carries `?token=` (the app keeps the token and strips it from the address bar). node reads
-# the token from server.lock and pipes the command to `agent-browser batch` on stdin, so the token
-# is in no process's argv or environment: every local account can read argv.
+# Opens PATH of the run's UI in the run's browser session. The URL carries `?token=` (the app keeps
+# the token and strips it from the address bar). node gets the run's token on fd 3 and pipes the
+# command to `agent-browser batch` on stdin, so the token is in no process's argv or environment:
+# every local account can read argv.
 # Checked before a browser gets the token. A PATH like //host, /\host or /<tab>/host resolves to
 # another origin: never send the token there. One that normalizes to //... (/..//host) stays on
 # the origin, but the app cannot strip ?token= from such an address, so the token stays in it.
@@ -667,16 +696,16 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
-  # server.lock's token, else the run's copy: a restarting backend deletes server.lock for a
-  # moment. node gets it on fd 3, never in argv.
-  token=$(run_token)
+  # The run's token (run_token: server.lock is gone for a moment while nodemon restarts the
+  # backend). node gets it on fd 3, never in argv.
+  token=$(required_run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
     const fs = require("fs");
     const [base, path] = process.argv.slice(1);
     const token = fs.readFileSync(3, "utf8");
     const url = new URL(path, base);
-    if (token) url.searchParams.set("token", token);
+    url.searchParams.set("token", token);
     process.stdout.write(JSON.stringify([["open", url.href]]));' \
     "$VERIFY_XUM_URL" "$path" 3< <(printf %s "$token") \
     | agent-browser --session "$AGENT_BROWSER_SESSION" batch --bail 2>&1) \
@@ -716,11 +745,23 @@ cmd_workspace_field() {
 }
 
 # The backend's token: server.lock's, else the copy launch keeps in the private run folder. A
-# restarting backend deletes server.lock for a moment, and a stopped one for good.
+# stopped backend deletes server.lock for good. A nodemon restart deletes it for a moment: the old
+# backend dies on SIGUSR2 and leaves its lock, the next one deletes that lock at startup because
+# its pid is dead (ServerLockfile.read), and writes its own, with the same token, once it listens.
 run_token() {
   local token
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
   [[ -n $token || ! -f $VERIFY_XUM_RUN/token ]] || token=$(<"$VERIFY_XUM_RUN/token")
+  printf '%s' "$token"
+}
+
+# run_token, or exit 1 when it is empty. Launch refuses a backend without a token and keeps the
+# copy before it seeds, so every run it accepted has one. An empty one means a changed run folder:
+# going on would open the app's token prompt.
+required_run_token() {
+  local token
+  token=$(run_token)
+  [[ -n $token ]] || die "run $VERIFY_XUM_RUN has no auth token (server.lock and its token copy have none). Run verify-xum.sh cleanup, then launch again."
   printf '%s' "$token"
 }
 

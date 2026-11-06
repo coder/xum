@@ -6,9 +6,10 @@ import * as path from "node:path";
 
 // verify-xum's launch must refuse a sandbox that a checkout's .env file (Bun loads it into
 // scripts/dev-server-sandbox.ts) opened beyond loopback: extra allowed Host headers, Vite or the
-// backend listening on every interface, or a backend without an auth token. Each test runs the real verify-xum.sh in a throwaway
-// git repo. A stub `make` stands in for `make dev-server-sandbox`: it prints the sandbox's banner
-// and serves a fake backend and Vite, so launch gets as far as the checks under test.
+// backend listening on every interface, or a backend without an auth token. Each test runs the
+// real verify-xum.sh in a throwaway git repo. A stub `make` stands in for `make
+// dev-server-sandbox`: it prints the sandbox's banner and serves a fake backend and Vite, so
+// launch gets as far as the checks under test.
 const SKILL_SCRIPT = ".xum/skills/verify-xum/scripts/verify-xum.sh";
 const isLinux = process.platform === "linux";
 
@@ -19,6 +20,11 @@ interface Fake {
   // The token the fake backend records in server.lock. Empty: none, as with
   // XUM_DEV_SERVER_NO_AUTH=1.
   token: string;
+  // Acts out a nodemon restart right after readiness: the first /health deletes server.lock, and
+  // a new lock (a later startedAt, the same token) appears 3 s later.
+  restartAfterFirstHealth?: boolean;
+  // The pid that server.lock names. Default: the fake backend's own.
+  lockPid?: number;
 }
 
 // Runs as `make -C <checkout> dev-server-sandbox ...` in the launch's own process group, so its
@@ -35,9 +41,24 @@ const listen = (host, handler) =>
   new Promise((resolve) => {
     const server = http.createServer(handler).listen(0, host, () => resolve(server.address().port));
   });
+let lockPath = "";
+const writeLock = (startedAt) => {
+  const lock = { pid: fake.lockPid ?? process.pid, startedAt: startedAt.toISOString() };
+  if (fake.token) lock.token = fake.token;
+  fs.writeFileSync(lockPath, JSON.stringify(lock));
+};
+let restarted = false;
 (async () => {
+  // Like the real backend, only /health answers without the token. The fake has no API, so a
+  // request with the token gets 404.
   const backendPort = await listen(fake.backendHost, (req, res) => {
-    res.statusCode = req.url === "/health" ? 200 : 404;
+    if (req.url === "/health" && fake.restartAfterFirstHealth && !restarted) {
+      restarted = true;
+      fs.rmSync(lockPath);
+      setTimeout(() => writeLock(new Date()), 3000);
+    }
+    const authorized = fake.token !== "" && req.headers.authorization === "Bearer " + fake.token;
+    res.statusCode = req.url === "/health" ? 200 : authorized ? 404 : 401;
     res.end();
   });
   const vitePort = await listen(fake.viteHost, (_req, res) => res.end("ok"));
@@ -45,9 +66,8 @@ const listen = (host, handler) =>
   const stamp = Date.now();
   fs.mkdirSync(path.join(checkout, "dist"), { recursive: true });
   fs.writeFileSync(path.join(checkout, "dist/.main-build-complete"), String(stamp));
-  const lock = { startedAt: new Date(stamp + 1).toISOString() };
-  if (fake.token) lock.token = fake.token;
-  fs.writeFileSync(path.join(root, "server.lock"), JSON.stringify(lock));
+  lockPath = path.join(root, "server.lock");
+  writeLock(new Date(stamp + 1));
   console.log("  XUM_ROOT:       " + root);
   console.log("  Seed config:     (none)");
   console.log("  Backend:         http://127.0.0.1:" + backendPort);
@@ -258,8 +278,38 @@ test.skipIf(!isLinux)(
   90_000
 );
 
+// While server.lock names a dead backend (stopped, or restarting under nodemon), its port is free
+// for another account to bind. The seed must not send the token there.
 test.skipIf(!isLinux)(
-  "a loopback-only sandbox passes both checks",
+  "launch sends no token while server.lock names a backend that is not running",
+  () => {
+    const dead = spawnSync("true");
+    expect(dead.status).toBe(0);
+    const r = launch({ ...loopback, lockPid: dead.pid });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain(`(pid ${dead.pid}) is not running, so its token is not sent`);
+    // The fake answers 404 only to a request that carries the token.
+    expect(r.stderr).not.toContain("returned error: 404");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// A nodemon restart deletes server.lock for a moment (see run_token in verify-xum.sh). Launch must
+// wait for the new lock, not read the missing one as a backend without a token.
+test.skipIf(!isLinux)(
+  "launch waits for server.lock when a restart deletes it right after readiness",
+  () => {
+    const r = launch({ ...loopback, restartAfterFirstHealth: true });
+    expect(r.stderr).not.toContain("no auth token");
+    expect(r.stderr).toContain("returned error: 404");
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+test.skipIf(!isLinux)(
+  "a loopback-only sandbox with an auth token passes every check",
   () => {
     // The fake backend has no API, so launch fails later, at the seed's first API call.
     const r = launch(loopback);
@@ -267,7 +317,8 @@ test.skipIf(!isLinux)(
     expect(r.stderr).not.toContain("besides loopback");
     expect(r.stderr).not.toContain("not only on loopback");
     expect(r.stderr).not.toContain("no auth token");
-    // curl -f's error for the seed's first API call (readiness asked only for /health).
+    // curl -f's error for the seed's first API call (readiness asked only for /health). 404, not
+    // 401: the call carried the run's token.
     expect(r.stderr).toContain("returned error: 404");
     expect(r.left).toBe(0);
   },
