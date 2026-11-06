@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as fsPromisesModule from "node:fs/promises";
+import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
@@ -4194,7 +4195,17 @@ describe("WorkspaceMcpOverridesService", () => {
         .find((id) => id !== healthy.workspaceId);
       if (legacyId === undefined) throw new Error("the lenient walk lists the legacy entry");
 
-      expect(await sweepOutcome(service, [healthy.workspaceId, legacyId])).toEqual([]);
+      // Registry-only under the locks, the lenient walk too: a checkout probe can stall on a mount.
+      // Config probes through fs.promises, which Bun keeps apart from the fs/promises module.
+      const accessSpy = spyOn(nodeFs.promises, "access");
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId, legacyId])).toEqual([]);
+        expect(accessSpy.mock.calls.map(([target]) => String(target))).not.toContain(
+          healthy.workspacePath
+        );
+      } finally {
+        accessSpy.mockRestore();
+      }
       expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
       expect(await enabledServers(legacyPath)).toEqual(["other"]);
     });
