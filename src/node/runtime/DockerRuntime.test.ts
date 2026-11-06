@@ -271,14 +271,10 @@ describe("DockerRuntime.forkWorkspace", () => {
 });
 
 describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made ready", () => {
-  // Task.create and the agent discovery routes build one DockerRuntime per call for an existing
-  // container and read agent files before ensureReady ran. The container user is then unknown,
-  // and /root (mode 700) is not the home of a non-root user.
   let originalCli: string | undefined;
   let cliDir: string;
   let cliBinaryPath: string;
 
-  /** Stands in for the container CLI. The container user's HOME is whatever `home` holds. */
   async function writeFakeCli(): Promise<void> {
     cliBinaryPath = path.join(cliDir, "fake-container-cli");
     await fs.writeFile(

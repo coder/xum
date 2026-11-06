@@ -448,13 +448,9 @@ export class DockerRuntime extends RemoteRuntime {
     return filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath);
   }
 
-  /**
-   * The home of the container's default user. Some base images (e.g., codercom/*-base) run as a
-   * non-root user (like "coder"), so "~" is /home/coder there, not /root. A runtime built for an
-   * existing container (Task.create, the agent routes: one per call) learns the user only in
-   * ensureReady, and they read ~/.xum/agents before it: guessing /root made every such read fail
-   * with EACCES, because /root is mode 700. A failed probe is not cached and is not a guess.
-   */
+  // Task.create and the agent routes build a runtime per call and read ~/.xum/agents before
+  // ensureReady detects the container user. For a non-root user, a guessed /root (mode 700) fails
+  // every such read with EACCES. A failed probe is not cached.
   private async resolveContainerHome(): Promise<string> {
     if (this.containerHome !== undefined) return this.containerHome;
     // Before createWorkspace there is no container to ask.
