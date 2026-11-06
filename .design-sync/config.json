@@ -371,10 +371,8 @@
     },
     "UpdateRestartOverlay": {
       "cardMode": "single",
-      "primaryStory": "Restarting",
-      "skip": [
-        "components-updaterestartoverlay--restarting-phone"
-      ]
+      "primaryStory": "RestartingPhone",
+      "viewport": "375x667"
     },
     "WorkflowPhaseFlow": {
       "cardMode": "column",

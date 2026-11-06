@@ -283,9 +283,11 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
   captures it at the story's `mobile1` viewport (375x667) instead.
 - **Portaled single-mode cards capture their phone story at its viewport:** AboutDialog
   (BlockedPhone, mobile1 375x667), ForceDeleteModal (Phone, phone390 390x844), PRStackBadge
-  (PhoneWidth, 375x667: the menu sizes itself from `window.innerWidth`) and SkillIndicator
-  (UnavailableProjectSourcesPhone, 390x844). Their dialogs, menus and popovers portal to
-  `body`, so only the capture viewport can reproduce the phone layout.
+  (PhoneWidth, 375x667: the menu sizes itself from `window.innerWidth`), SkillIndicator
+  (UnavailableProjectSourcesPhone, 390x844) and UpdateRestartOverlay (RestartingPhone,
+  375x667). Their dialogs, menus, popovers and covers portal to `body`, so only the capture
+  viewport can reproduce the phone layout. With this sync no single-mode override skips a
+  phone story.
 - **Phone widths in column/grid previews** copy the story's own fixed-width wrapper where it
   has one (the test runner applies no viewport, so most phone stories force a width):
   ChatInputToast and LegacyPlanImportNotice 375, PromptCacheHealth, PluginsSettingsSection

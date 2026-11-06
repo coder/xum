@@ -5,7 +5,8 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 
 // Isolated preview of the full-viewport "Restarting Xum…" cover. The overlay subscribes to
 // api.update.onStatus, so the mock client yields a "restarting" status (mirrors the story).
-// It portals to <body> as a fixed cover → cardMode "single".
+// It portals to <body> as a fixed cover → cardMode "single". The card captures RestartingPhone
+// at its mobile1 viewport (config.json): an inner width wrapper can't size a fixed inset-0 cover.
 
 export const Restarting = () => {
   const [client] = React.useState(() =>
@@ -23,3 +24,6 @@ export const Restarting = () => {
     </MuxPreviewShell>
   );
 };
+
+// Same render as the story; only the viewport differs (pinned in config.json).
+export const RestartingPhone = Restarting;
