@@ -726,7 +726,8 @@ function passBlocker(
     ? undefined
     : { error: new CheckoutKeysChangedError() };
 }
-function isRetryableLockError(error: unknown): boolean {
+/** A busy or moved checkout: waiting and trying again can succeed. */
+export function isRetryableLockError(error: unknown): boolean {
   return (
     error instanceof CheckoutKeysChangedError ||
     // The lock's timeout message appends holder details to ours.
@@ -1183,6 +1184,21 @@ function selectProbedCandidate(
  */
 const MAX_PRUNED_OVERRIDES_BYTES = 1024 * 1024;
 /**
+ * An override file over MAX_PRUNED_OVERRIDES_BYTES. Only the user can fix it,
+ * so a plugin install refusal must say that a retry will not help (it tells
+ * this error apart from a busy lock by type, not by message).
+ */
+export class OverridesFileTooLargeError extends Error {
+  constructor(
+    readonly filePath: string,
+    size: number
+  ) {
+    super(
+      `Workspace MCP overrides file ${filePath} is ${size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
+    );
+  }
+}
+/**
  * Whether a candidate override file exists for the plugin-key prune.
  * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
  * so the caller keeps its tombstone instead of retiring it unread.
@@ -1196,9 +1212,7 @@ async function prunableFileExists(
     throw probe.error;
   }
   if (probe.kind === "file" && probe.size > MAX_PRUNED_OVERRIDES_BYTES) {
-    throw new Error(
-      `Workspace MCP overrides file ${filePath} is ${probe.size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
-    );
+    throw new OverridesFileTooLargeError(filePath, probe.size);
   }
   return probe.kind === "file";
 }

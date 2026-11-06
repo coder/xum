@@ -69,6 +69,8 @@ import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   ALL_WORKSPACES_TARGET,
+  isRetryableLockError,
+  OverridesFileTooLargeError,
   type WorkspaceMcpOverridesService,
 } from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -331,40 +333,102 @@ async function signOutFailure(
 }
 
 /**
- * Workspace IDs an install-time MCP override error lists. Large configs fail
- * the sweep for hundreds of workspaces at once, and a wall of IDs hid the
- * actual advice; the log keeps one warning per workspace.
+ * Workspace IDs (or override file paths) an install-time MCP override error
+ * lists. Large configs fail the sweep for hundreds of workspaces at once, and
+ * a wall of IDs hid the actual advice; the log keeps one warning per workspace.
  */
 const MAX_LISTED_FAILED_WORKSPACES = 5;
 
 /** config.json cannot be read or parsed: a retry alone cannot help, the user must repair it. */
 class UnreadableConfigError extends Error {}
 
+/** "a, b, c, d, e, and 807 more" for an install error. */
+function listWithRest(items: readonly string[]): string {
+  const shown = items.slice(0, MAX_LISTED_FAILED_WORKSPACES);
+  const rest = items.length - shown.length;
+  return `${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""}`;
+}
+
 /** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
 function describeFailedWorkspaces(ids: readonly string[]): string {
   assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
-  const shown = ids.slice(0, MAX_LISTED_FAILED_WORKSPACES);
-  const rest = ids.length - shown.length;
   const noun = ids.length === 1 ? "workspace" : "workspaces";
-  return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
-}
-
-/** Workspaces whose MCP overrides a prune could not clean, with the first error for the user. */
-interface FailedPrunes {
-  failed: string[];
-  firstError?: { workspaceId?: string; message: string };
+  return `${ids.length} ${noun} (${listWithRest(ids)})`;
 }
 
 /**
- * The first prune error as a sentence. A refusal that gave only retry advice
- * left the user stuck when the cause was one they must fix (an override file
- * over the size limit), and the reason was only in the log.
+ * Why one workspace's override cleanup failed, in the classes a user answers
+ * differently: shrink a file (a retry cannot fix it), wait and retry, or
+ * read the message. Advice that only said "retry" left a user stuck on an
+ * override file over the size limit, and the reason was only in the log.
  */
-function firstPruneErrorSentence(firstError: FailedPrunes["firstError"]): string {
-  if (firstError === undefined) return "";
-  const where =
-    firstError.workspaceId === undefined ? "" : `, in workspace ${firstError.workspaceId}`;
-  return ` First error${where}: ${firstError.message.replace(/\.?$/, ".")}`;
+type PruneCause =
+  | { kind: "oversized"; workspaceId: string; filePath: string }
+  | { kind: "busy"; workspaceId: string }
+  | { kind: "other"; workspaceId: string; message: string };
+
+/** Workspaces whose MCP overrides a prune could not clean, and why. */
+interface FailedPrunes {
+  failed: string[];
+  causes: PruneCause[];
+}
+
+function classifyPruneFailure(workspaceId: string, error: unknown): PruneCause {
+  if (error instanceof OverridesFileTooLargeError) {
+    return { kind: "oversized", workspaceId, filePath: error.filePath };
+  }
+  if (isRetryableLockError(error)) {
+    return { kind: "busy", workspaceId };
+  }
+  return { kind: "other", workspaceId, message: getErrorMessage(error) };
+}
+
+function toFailedPrunes(
+  failures: ReadonlyArray<{ workspaceId: string; error: unknown }>
+): FailedPrunes {
+  return {
+    failed: failures.map((failure) => failure.workspaceId),
+    causes: failures.map((failure) => classifyPruneFailure(failure.workspaceId, failure.error)),
+  };
+}
+
+function describeOversizedCauses(causes: readonly PruneCause[]): string[] {
+  const files = new Set<string>();
+  for (const cause of causes) {
+    if (cause.kind === "oversized") files.add(cause.filePath);
+  }
+  if (files.size === 0) return [];
+  const pronoun = files.size === 1 ? "it" : "them";
+  return [
+    `Override file over the size limit: ${listWithRest([...files])}. Shrink or remove ${pronoun}, then install again.`,
+  ];
+}
+
+function describeBusyCauses(causes: readonly PruneCause[]): string[] {
+  const busy = causes.filter((cause) => cause.kind === "busy").length;
+  if (busy === 0) return [];
+  const verb = busy === 1 ? "was" : "were";
+  return [`${busy} ${verb} busy with a rename or an MCP settings update. Retry in a moment.`];
+}
+
+function describeOtherCauses(causes: readonly PruneCause[]): string[] {
+  const others = causes.filter((cause) => cause.kind === "other");
+  const [first] = others;
+  if (first === undefined) return [];
+  return [
+    `${others.length} failed for another reason, first in ${first.workspaceId}: ${first.message.replace(/\.?$/, ".")} If that is a time-out (Xum was busy), retry in a moment.`,
+  ];
+}
+
+/** The cause sentences of an install refusal, each led by a space. */
+function describePruneCauses(causes: readonly PruneCause[]): string {
+  return [
+    ...describeOversizedCauses(causes),
+    ...describeBusyCauses(causes),
+    ...describeOtherCauses(causes),
+  ]
+    .map((sentence) => ` ${sentence}`)
+    .join("");
 }
 
 /**
@@ -6324,10 +6388,10 @@ export class AgentPluginInstallService {
   ): Promise<FailedPrunes> {
     const overridesService = this.deps.workspaceMcpOverridesService;
     if (!overridesService) {
-      return { failed: [] };
+      return { failed: [], causes: [] };
     }
     if (workspaceIds.length === 0) {
-      return { failed: [] };
+      return { failed: [], causes: [] };
     }
     // Raw in-queue patch: preserves unknown fields written by newer
     // builds, throws on unreadable files (tombstone retry), and cannot
@@ -6372,7 +6436,7 @@ export class AgentPluginInstallService {
       // Wholesale failure (lock timeout, unreadable config): no workspace was
       // verified, so every one keeps its tombstone.
       log.warn("Failed to prune plugin MCP overrides", { error: getErrorMessage(error) });
-      return { failed: [...workspaceIds], firstError: { message: getErrorMessage(error) } };
+      return toFailedPrunes(workspaceIds.map((workspaceId) => ({ workspaceId, error })));
     }
     for (const failure of failures) {
       log.warn("Failed to prune plugin MCP overrides for workspace", {
@@ -6380,15 +6444,7 @@ export class AgentPluginInstallService {
         error: getErrorMessage(failure.error),
       });
     }
-    const [first] = failures;
-    return {
-      failed: failures.map((failure) => failure.workspaceId),
-      ...(first === undefined
-        ? {}
-        : {
-            firstError: { workspaceId: first.workspaceId, message: getErrorMessage(first.error) },
-          }),
-    };
+    return toFailedPrunes(failures);
   }
 
   /**
@@ -6621,7 +6677,7 @@ export class AgentPluginInstallService {
         `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). ${retried.advice}`
       );
     }
-    const { failed, firstError } = retried;
+    const { failed, causes } = retried;
     const remaining = this.updateRawPendingPrunes(
       this.rawPendingPrunes(envelope),
       serverKeyPrefix,
@@ -6630,7 +6686,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}).${firstPruneErrorSentence(firstError)} The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}).${describePruneCauses(causes)} The log has the error for each workspace.`
       );
     }
   }
@@ -6660,10 +6716,10 @@ export class AgentPluginInstallService {
         `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). ${retried.advice}`
       );
     }
-    const { failed, firstError } = retried;
+    const { failed, causes } = retried;
     if (failed.length > 0) {
       throw new Error(
-        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'.${firstPruneErrorSentence(firstError)} The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'.${describePruneCauses(causes)} The log has the error for each workspace.`
       );
     }
   }
