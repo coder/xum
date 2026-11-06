@@ -96,7 +96,7 @@ export interface PluginSweepOptions {
    * made installs on large configs (6,302 workspaces) exhaust the sweep's
    * budget and fail. Omitted (or true) keeps the full publication. Saves pass
    * it too. With it, publication looks for checkout sharers only among the
-   * workspaces it reports true for and their ancestors (see withCachedState).
+   * workspaces it reports true for and their ancestors (see sharerCandidates).
    */
   hasSnapshot?: (workspaceId: string) => boolean;
 }
@@ -132,33 +132,31 @@ function isColdRefresh(
 }
 
 /**
- * The sharer candidates a publication canonicalizes when its receiver reports
- * its state (hasSnapshot): the workspaces it holds state for, and their
- * ancestors (a cached descendant of a sharer resolves from the written
- * document). Every other workspace reads disk on its next serve, so whether
- * it shares the written checkout changes nothing it serves, and a first
- * serve already in flight there re-reads once the write's epoch bump fails
- * its postflight (see bumpOverridesEpoch). Scanning them all cost one
- * realpath per registered checkout on every save (7,550 on one host).
+ * The sharer candidates a publication canonicalizes. Without a state hint
+ * (hasSnapshot): every workspace. With one: the workspaces the receiver holds
+ * state for, and their ancestors (a cached descendant of a sharer resolves
+ * from the written document). Every other workspace reads disk on its next
+ * serve, so whether it shares the written checkout changes nothing it
+ * serves, and a first serve already in flight there re-reads once the
+ * write's epoch bump fails its postflight (see bumpOverridesEpoch). Scanning
+ * them all cost one realpath per registered checkout on every save (7,550
+ * on one host).
  */
-function withCachedState(
-  all: readonly FrontendWorkspaceMetadata[],
-  hasSnapshot: (workspaceId: string) => boolean
+function sharerCandidates(
+  all: FrontendWorkspaceMetadata[],
+  hasSnapshot: PluginSweepOptions["hasSnapshot"]
 ): FrontendWorkspaceMetadata[] {
-  const parentsOf = new Map<string, string[]>();
-  for (const m of all) {
-    if (m.parentWorkspaceId == null) continue;
-    const parents = parentsOf.get(m.id);
-    if (parents) parents.push(m.parentWorkspaceId);
-    else parentsOf.set(m.id, [m.parentWorkspaceId]);
-  }
+  if (hasSnapshot === undefined) return all;
+  const byId = groupMetadataById(all, /* hostLocalOnly */ false);
   const keep = new Set<string>();
   const pending = all.filter((m) => hasSnapshot(m.id)).map((m) => m.id);
   // `keep` also ends a corrupted parent cycle.
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
     if (keep.has(id)) continue;
     keep.add(id);
-    pending.push(...(parentsOf.get(id) ?? []));
+    for (const entry of byId.get(id) ?? []) {
+      if (entry.parentWorkspaceId != null) pending.push(entry.parentWorkspaceId);
+    }
   }
   return all.filter((m) => keep.has(m.id));
 }
@@ -2692,7 +2690,7 @@ export class WorkspaceMcpOverridesService {
       const scan = await this.findCheckoutSharers(
         written,
         writtenPath,
-        hasSnapshot === undefined ? all : withCachedState(all, hasSnapshot),
+        sharerCandidates(all, hasSnapshot),
         snapshot,
         budget.remaining(),
         published
