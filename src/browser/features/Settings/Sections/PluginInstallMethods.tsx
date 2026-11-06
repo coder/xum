@@ -8,10 +8,16 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
-import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
+import {
+  AGENT_PLUGIN_INSTALL_METHOD_LABELS,
+  installMethodLongLabel,
+  installedAsKind,
+} from "@/common/constants/agentPluginInstallMethods";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginListItem,
+  AgentPluginMethodCounts,
 } from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { skillsCliSourceProblem } from "@/common/utils/skillsCliSource";
@@ -27,6 +33,21 @@ const SKILLS_CLI_CHOICE = "skills-cli";
 
 export function installMethodLabel(method: AgentPluginInstallMethod): string {
   return AGENT_PLUGIN_INSTALL_METHOD_LABELS[method.kind];
+}
+
+function countLabel(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/** What a manifest method gives. Skills and agents always show: agents are why a user switches. */
+export function formatMethodCounts(counts: AgentPluginMethodCounts): string {
+  return [
+    countLabel(counts.skills, "skill"),
+    countLabel(counts.agents, "agent"),
+    ...(counts.hooksCanRun > 0 ? [`${countLabel(counts.hooksCanRun, "hook")} can run`] : []),
+    ...(counts.hooksListed > 0 ? [`${countLabel(counts.hooksListed, "hook")} listed`] : []),
+    ...(counts.mcpServers > 0 ? [countLabel(counts.mcpServers, "MCP server")] : []),
+  ].join(" · ");
 }
 
 /** A stable choice value per method. A method with fields (a marketplace entry) adds them here. */
@@ -75,7 +96,7 @@ function pickInstallChoice(
 
 /** Segmented "Install as" choice; renders nothing when only one choice fits. */
 export const InstallMethodPicker: React.FC<{
-  preview: Pick<AgentPluginInstallPreview, "method" | "methods">;
+  preview: Pick<AgentPluginInstallPreview, "method" | "methods" | "methodSummaries">;
   /** offersSkillsCli: the last choice is the Skills CLI. */
   cliOffered: boolean;
   cliChosen: boolean;
@@ -90,6 +111,8 @@ export const InstallMethodPicker: React.FC<{
     value: methodKey(method),
     label: installMethodLabel(method),
     method,
+    // Only a manifest method has a summary: a generated method writes its own plugin.json.
+    summary: props.preview.methodSummaries?.find((entry) => entry.method === method.kind),
   }));
   const cliOffered = props.cliOffered;
   if (choices.length + (cliOffered ? 1 : 0) < 2) return null;
@@ -120,9 +143,24 @@ export const InstallMethodPicker: React.FC<{
             key={choice.value}
             value={choice.value}
             size="sm"
-            className="h-7 px-3 text-[13px]"
+            className={
+              choice.summary !== undefined
+                ? "h-auto max-w-full flex-col items-start gap-0.5 px-3 py-1 text-left text-[13px] whitespace-normal"
+                : "h-7 px-3 text-[13px]"
+            }
           >
-            {choice.label}
+            {choice.summary !== undefined ? (
+              <>
+                <span className="break-all">
+                  {installMethodLongLabel(choice.summary.method, choice.summary.manifestPath)}
+                </span>
+                <span className="text-muted counter-nums text-[11px] font-normal">
+                  {formatMethodCounts(choice.summary.counts)}
+                </span>
+              </>
+            ) : (
+              choice.label
+            )}
           </ToggleGroupItem>
         ))}
         {cliOffered && (
@@ -133,6 +171,37 @@ export const InstallMethodPicker: React.FC<{
       </ToggleGroup>
       <p className="text-muted hidden text-[11px] md:block">Arrow keys to move · Space to pick</p>
     </div>
+  );
+};
+
+/**
+ * The method an installed plugin was installed as, and the other manifest methods its folder
+ * offers with the agents each would load. Managed rows only: an unmanaged folder was not installed.
+ */
+export const InstalledMethodLines: React.FC<{
+  item: Pick<
+    AgentPluginListItem,
+    "managed" | "present" | "generatedFrom" | "manifestPath" | "otherMethods"
+  >;
+}> = (props) => {
+  const kind = props.item.managed && props.item.present ? installedAsKind(props.item) : undefined;
+  if (kind === undefined) return null;
+  const others = props.item.otherMethods ?? [];
+  return (
+    <>
+      <p className="break-words">Installed as {AGENT_PLUGIN_INSTALL_METHOD_LABELS[kind]}</p>
+      {others.length > 0 && (
+        <p className="counter-nums break-words">
+          Other install methods:{" "}
+          {others
+            .map(
+              (other) =>
+                `${AGENT_PLUGIN_INSTALL_METHOD_LABELS[other.method]} (${countLabel(other.agents, "agent")})`
+            )
+            .join(" · ")}
+        </p>
+      )}
+    </>
   );
 };
 

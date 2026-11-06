@@ -57,6 +57,7 @@ import {
 } from "./PluginHooksPanel";
 import {
   InstallMethodPicker,
+  InstalledMethodLines,
   SkillsCliInstall,
   installMethodLabel,
   offersSkillsCli,
@@ -2210,6 +2211,7 @@ export const PluginsSettingsSection: React.FC = () => {
                         {item.lockedSha ? ` · ${item.lockedSha.slice(0, 12)}` : ""}
                       </p>
                     )}
+                    <InstalledMethodLines item={item} />
                   </div>
                   <NotAppliedList items={item.notApplied} className="mt-2" />
                   {check?.status === "error" && check.message && (

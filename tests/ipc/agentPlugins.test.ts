@@ -260,6 +260,19 @@ function unwrap<T>(result: Result<T, string>): T {
         { kind: "claude-plugin" },
       ]);
       expect(offered.preview.method).toEqual({ kind: "agent-plugin" });
+      const none = { hooksCanRun: 0, hooksListed: 0, mcpServers: 0 };
+      expect(offered.preview.methodSummaries).toEqual([
+        {
+          method: "agent-plugin",
+          manifestPath: ".codex-plugin/plugin.json",
+          counts: { skills: 1, agents: 0, ...none },
+        },
+        {
+          method: "claude-plugin",
+          manifestPath: ".claude-plugin/plugin.json",
+          counts: { skills: 1, agents: 1, ...none },
+        },
+      ]);
 
       const picked = unwrap(
         await env.orpc.agentPlugins.preview({
@@ -292,6 +305,15 @@ function unwrap<T>(result: Result<T, string>): T {
       expect(row?.installMethod).toBe("claude-plugin");
       // The Claude manifest's agent was reviewed at install: the Codex manifest has no agents.
       expect(Object.keys(row?.componentConsent?.agents ?? {})).toEqual(["reviewer"]);
+
+      const listed = unwrap(await env.orpc.agentPlugins.list()).find(
+        (item) => item.name === "method-ipc"
+      );
+      expect(listed).toMatchObject({
+        installMethod: "claude-plugin",
+        manifestPath: ".claude-plugin/plugin.json",
+        otherMethods: [{ method: "agent-plugin", agents: 0 }],
+      });
     }, 60_000);
   }
 );
