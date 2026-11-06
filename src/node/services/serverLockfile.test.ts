@@ -1,15 +1,17 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
-import { renameSync, writeFileSync } from "fs";
+import { readFileSync, renameSync, writeFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { ServerLockDataSchema, ServerLockfile, type ServerLockData } from "./serverLockfile";
 import {
+  identityOf,
   startFakeBackend,
   startUnrelatedProcess,
   unservedBaseUrl,
   type FakeBackend,
 } from "./testXumBackend";
+import { getSelfIdentity, setSelfIdentityForTests } from "../utils/concurrency/processLiveness";
 
 describe("ServerLockfile", () => {
   let tempDir: string;
@@ -44,6 +46,7 @@ describe("ServerLockfile", () => {
     baseUrl: string;
     token?: string;
     startedAt?: string;
+    identity?: unknown;
   }) {
     const data = {
       token: "foreign-token",
@@ -232,7 +235,196 @@ describe("ServerLockfile", () => {
     expect(data!.token).toBe("valid-token");
   });
 
-  describe("a lock whose pid is alive", () => {
+  test("acquire records the process identity of this backend", async () => {
+    await lockfile.acquire("http://localhost:12345", "test-token");
+
+    const written = ServerLockDataSchema.parse(
+      JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))
+    );
+    expect(written.identity).toEqual({ ...getSelfIdentity() });
+  });
+
+  test("a lock with a malformed identity still reads as a lock", async () => {
+    const live = await backend("xum");
+    const foreign = unrelatedProcess();
+    await writeForeignLock({ pid: foreign.pid, baseUrl: live.baseUrl, identity: "not an object" });
+
+    // Read as a lock without an identity: the probe decides.
+    expect((await lockfile.read())?.pid).toBe(foreign.pid);
+    expect(live.requests).toHaveLength(1);
+  });
+
+  describe.skipIf(process.platform !== "linux")("a lock with a process identity (Linux)", () => {
+    const state = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf-8").split(") ")[1][0];
+    /** SIGSTOP takes effect asynchronously: wait until the kernel shows the process as stopped. */
+    async function stop(pid: number) {
+      process.kill(pid, "SIGSTOP");
+      for (let waited = 0; state(pid) !== "T"; waited += 10) {
+        if (waited > 5_000) throw new Error(`pid ${pid} did not stop (state ${state(pid)})`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+
+    test("the backend's own process is live, with no network", async () => {
+      const backendProcess = unrelatedProcess();
+      const silent = await backend("hang");
+      await writeForeignLock({
+        pid: backendProcess.pid,
+        baseUrl: silent.baseUrl,
+        identity: identityOf(backendProcess.pid),
+      });
+
+      expect((await lockfile.read())?.pid).toBe(backendProcess.pid);
+      expect(silent.requests).toEqual([]);
+    });
+
+    test("a frozen backend (SIGSTOP) is live until it continues, and is never asked", async () => {
+      const backendProcess = unrelatedProcess();
+      // Its listener takes connections and never answers, as a stopped process's does.
+      const frozenListener = await backend("hang");
+      await writeForeignLock({
+        pid: backendProcess.pid,
+        baseUrl: frozenListener.baseUrl,
+        identity: identityOf(backendProcess.pid),
+      });
+
+      await stop(backendProcess.pid);
+      try {
+        const started = Date.now();
+        expect((await lockfile.read())?.pid).toBe(backendProcess.pid);
+        expect(Date.now() - started).toBeLessThan(1_500); // a probe would wait 2 s
+        expect(frozenListener.requests).toEqual([]);
+      } finally {
+        process.kill(backendProcess.pid, "SIGCONT");
+      }
+      expect((await lockfile.read())?.pid).toBe(backendProcess.pid);
+    });
+
+    test("another process on the dead backend's pid is stale, and a xum-shaped squatter on its port is never asked", async () => {
+      const holder = unrelatedProcess();
+      const squatter = await backend("xum");
+      await writeForeignLock({
+        pid: holder.pid,
+        baseUrl: squatter.baseUrl,
+        token: "old-token",
+        // What the dead backend recorded: this host and boot, and a start time that is not the
+        // holder's.
+        identity: { ...identityOf(holder.pid), birth: "linux-ticks:1" },
+      });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(squatter.requests).toEqual([]);
+    });
+
+    test.each([
+      ["another boot", { bootId: "00000000-0000-0000-0000-000000000000" }],
+      ["another PID namespace", { pidNs: "pid:[4026539999]" }],
+    ])("a lock of %s is stale without asking its baseUrl", async (_name, over) => {
+      const holder = unrelatedProcess();
+      const squatter = await backend("xum");
+      await writeForeignLock({
+        pid: holder.pid,
+        baseUrl: squatter.baseUrl,
+        identity: { ...identityOf(holder.pid), ...over },
+      });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(squatter.requests).toEqual([]);
+    });
+
+    test("a gone pid is stale without asking its baseUrl", async () => {
+      const squatter = await backend("xum");
+      await writeForeignLock({
+        pid: 2 ** 30,
+        baseUrl: squatter.baseUrl,
+        identity: { ...getSelfIdentity(), birth: "linux-ticks:1" },
+      });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(squatter.requests).toEqual([]);
+    });
+
+    test("a recorded start time that is unknown leaves the decision to the probe", async () => {
+      const holder = unrelatedProcess();
+      const answering = await backend("xum");
+      await writeForeignLock({
+        pid: holder.pid,
+        baseUrl: answering.baseUrl,
+        identity: { ...identityOf(holder.pid), birth: null },
+      });
+      expect((await lockfile.read())?.pid).toBe(holder.pid);
+
+      await writeForeignLock({
+        pid: holder.pid,
+        baseUrl: await unservedBaseUrl(),
+        identity: { ...identityOf(holder.pid), birth: null },
+      });
+      expect(await lockfile.read()).toBeNull();
+    });
+  });
+
+  describe("a lock whose identity cannot decide", () => {
+    // macOS and Windows: judgeHolder can see only that the pid is alive.
+    const NO_LINUX_DOMAIN = {
+      birth: null,
+      bootId: null,
+      pidNs: null,
+      machineId: null,
+      platform: "darwin",
+      hostname: null,
+    };
+
+    test("a backend that connects and does not answer is live, as before the probe", async () => {
+      const holder = unrelatedProcess();
+      const frozenListener = await backend("hang");
+      await writeForeignLock({ pid: holder.pid, baseUrl: frozenListener.baseUrl });
+
+      // A lock that an older build wrote has no identity.
+      expect((await lockfile.read())?.pid).toBe(holder.pid);
+      expect(frozenListener.requests).toHaveLength(1);
+    });
+
+    test("without Linux's PID domain, the probe decides what a live pid cannot", async () => {
+      setSelfIdentityForTests(NO_LINUX_DOMAIN);
+      try {
+        const holder = unrelatedProcess();
+        const answering = await backend("xum");
+        const other = await backend("other");
+        const lock = { pid: holder.pid, identity: NO_LINUX_DOMAIN };
+
+        await writeForeignLock({ ...lock, baseUrl: answering.baseUrl });
+        expect((await lockfile.read())?.pid).toBe(holder.pid);
+
+        await writeForeignLock({ ...lock, baseUrl: other.baseUrl });
+        expect(await lockfile.read()).toBeNull();
+
+        await writeForeignLock({ ...lock, baseUrl: await unservedBaseUrl() });
+        expect(await lockfile.read()).toBeNull();
+
+        // A gone pid is stale without the network.
+        await writeForeignLock({
+          pid: 2 ** 30,
+          identity: NO_LINUX_DOMAIN,
+          baseUrl: answering.baseUrl,
+        });
+        const asked = answering.requests.length;
+        expect(await lockfile.read()).toBeNull();
+        expect(answering.requests).toHaveLength(asked);
+      } finally {
+        setSelfIdentityForTests(undefined);
+      }
+    });
+
+    test("an older build's lock with a gone pid is stale without asking its baseUrl", async () => {
+      const squatter = await backend("xum");
+      await writeForeignLock({ pid: 2 ** 30, baseUrl: squatter.baseUrl });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(squatter.requests).toEqual([]);
+    });
+  });
+
+  describe("a lock of an older build (no process identity) whose pid is alive", () => {
     // The OS reuses pids: after a crash, any process can hold the dead backend's pid, and in a
     // container every run is pid 1.
     test("an unrelated process holds the pid and nothing serves the baseUrl: stale", async () => {

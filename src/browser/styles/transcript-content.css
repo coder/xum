@@ -257,9 +257,9 @@
   height: var(--diagram-height);
 }
 
-/* The expand dialog's Close button (Mermaid.tsx) sits below the desktop title bar and must not
-   be part of its drag region. This file is shared with the VS Code webview, which renders that
-   button too, so the rule lives here and not in the desktop-only globals.css. */
+/* The expand dialog's Close button (Mermaid.tsx) takes this class in the desktop app only. The rule
+   lives here, not in globals.css, because vscode/src/webview/webviewCss.test.ts fails when the
+   webview bundle names a class that only globals.css defines. */
 .titlebar-no-drag {
   -webkit-app-region: no-drag;
 }

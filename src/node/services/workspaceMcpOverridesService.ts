@@ -516,6 +516,8 @@ class ConfigSnapshot {
     canonical: Map<string, Promise<string | undefined>>;
     /** In-flight writes started by this operation (see trackSideEffect). */
     sideEffects: Set<Promise<unknown>>;
+    /** loadSweepMetadata fell back to the lenient walk. */
+    lenientRegistry?: true;
   };
   private _cancelled = false;
 
@@ -618,6 +620,38 @@ class ConfigSnapshot {
       throwOnError: true,
       probeCheckouts: false,
     }));
+  }
+
+  /**
+   * loadAllMetadata for a plugin override sweep, with checkoutLockKeys' fallback. The strict
+   * walk also fails on an UNRELATED id-less legacy entry whose metadata.json does not parse, and
+   * that must not refuse every plugin install. The lenient walk lists such an entry under its
+   * fallback id, so its checkout is still swept. It is trusted only while config.json itself
+   * loads strictly: a config.json failure degrades it to EMPTY. A requested id that it does not
+   * list fails on its own in the sweep (metadata not found).
+   *
+   * A degraded entry whose config row names no runtime gets the default worktree runtime (its
+   * real one may sit in the unreadable metadata.json), and the sweep prunes the checkout at the
+   * row's persisted path. That is still safe: the sweep removes only this plugin instance's keys,
+   * which are stale consent in any file, and plugin servers never run off-host. Skipping or
+   * failing the entry instead would leave a real stale enable in place, or refuse every install
+   * again.
+   */
+  loadSweepMetadata(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
+    return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
+      this.loadLegacyConfig();
+      this.store.lenientRegistry = true;
+      log.warn(
+        "[MCP] Sweeping plugin overrides from a lenient registry walk: another entry's metadata is unreadable",
+        { workspaceIds, error: getErrorMessage(error) }
+      );
+      return this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+    }));
+  }
+
+  /** The registry came from loadSweepMetadata's lenient fallback: a degraded entry's id is unknown. */
+  get lenientRegistry(): boolean {
+    return this.store.lenientRegistry === true;
   }
 
   canonicalize(identity: string, filePath: string): Promise<string | undefined> {
@@ -4784,7 +4818,7 @@ export class WorkspaceMcpOverridesService {
     // fs.access, which blocks indefinitely on a stalled mount.
     const metadataById = groupMetadataById(
       await withDeadline(
-        snapshot.loadAllMetadata(),
+        snapshot.loadSweepMetadata(workspaceIds),
         budget.remaining(),
         "workspace enumeration exceeded the plugin-prune budget"
       ),
@@ -4859,7 +4893,7 @@ export class WorkspaceMcpOverridesService {
     try {
       afterById = groupMetadataById(
         await withDeadline(
-          after.loadAllMetadata(),
+          after.loadSweepMetadata([...swept.keys()]),
           budget.remaining(),
           "workspace enumeration exceeded the plugin-prune budget"
         ),
@@ -4971,6 +5005,13 @@ export class WorkspaceMcpOverridesService {
     after: ConfigSnapshot,
     budget: PublicationBudget
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    if (after.lenientRegistry) {
+      // Publication resolves inheritance from this registry, which lists a degraded entry under
+      // its fallback id: a child of that entry would publish `{}` for its parent's settings as
+      // disk truth. Evict every cache instead, so the next read goes to disk.
+      await publish(null, ALL_WORKSPACES_TARGET);
+      return [];
+    }
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
     // Publish AFTER every prune landed: an inheriting descendant swept
     // before its parent would otherwise publish the parent's pre-prune

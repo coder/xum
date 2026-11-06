@@ -1,4 +1,7 @@
-export const BASH_DEFAULT_TIMEOUT_SECS = 3;
+// Kill deadline for a bash call whose `timeout_secs` is absent. 60 is both the mode and the median
+// of the values models pass when they pass one. Background processes ignore it (they live until
+// stopped), so only a foreground command can be cut short, and its error says to raise the value.
+export const BASH_DEFAULT_TIMEOUT_SECS = 60;
 
 // tmpfile policy limits (AI agent - conservative for LLM context)
 export const BASH_HARD_MAX_LINES = 300;

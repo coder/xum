@@ -375,15 +375,40 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
-  it("still rejects bash calls without timeout_secs, foreground or background", () => {
-    // Only display_name is filled: a default timeout could kill a long command
-    // partway, while a rejection runs nothing and the model retries.
+  it("accepts a bash call that omits timeout_secs or sends it as null", () => {
+    // Open-weight models omit it constantly, and a rejection costs a model step. The handler owns
+    // the default, so parsing must leave the value absent: a zod default would also bound every
+    // background process, which must instead live until stopped.
     for (const run_in_background of [false, true]) {
-      const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", run_in_background });
-      expect(parsed.success).toBe(false);
-      if (!parsed.success) {
-        expect(parsed.error.issues.map((issue) => issue.path.join("."))).toEqual(["timeout_secs"]);
+      const omitted = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", run_in_background });
+      expect(omitted.success).toBe(true);
+      if (omitted.success) {
+        expect(omitted.data.timeout_secs).toBeUndefined();
       }
+
+      const nulled = TOOL_DEFINITIONS.bash.schema.safeParse({
+        script: "ls",
+        run_in_background,
+        timeout_secs: null,
+      });
+      expect(nulled.success).toBe(true);
+      if (nulled.success) {
+        expect(nulled.data.timeout_secs).toBeNull();
+      }
+    }
+  });
+
+  it("keeps a positive bound on an explicit bash timeout_secs", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", timeout_secs: 5 });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.timeout_secs).toBe(5);
+    }
+
+    for (const timeout_secs of [0, -1]) {
+      expect(TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", timeout_secs }).success).toBe(
+        false
+      );
     }
   });
 

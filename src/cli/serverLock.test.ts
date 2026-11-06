@@ -64,6 +64,38 @@ async function lockOrExit(lockPath: string, server: RunningServer): Promise<"loc
 }
 
 describe.skipIf(process.platform === "win32")("xum server and server.lock", () => {
+  test.skipIf(process.platform !== "linux")(
+    "refuses to start next to a backend that is frozen (SIGSTOP)",
+    async () => {
+      // A frozen backend accepts connections and answers none, so only its process identity in
+      // server.lock tells a second `xum server` that it is still there.
+      using tmp = new DisposableTempDir("xum-server-lock");
+      const lockPath = path.join(tmp.path, "server.lock");
+      const first = startXumServer(tmp.path);
+      const second: { current?: RunningServer } = {};
+      try {
+        expect(await lockOrExit(lockPath, first)).toBe("lock");
+        const pid = first.child.pid!;
+        process.kill(pid, "SIGSTOP");
+        try {
+          second.current = startXumServer(tmp.path);
+          expect(await lockOrExit(lockPath, second.current)).toBe("exited");
+          expect(await second.current.exited).toBe(1);
+          expect(second.current.output()).toContain("already running");
+          // The frozen backend still holds the lock.
+          const lock = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+          expect(lock.pid).toBe(pid);
+        } finally {
+          process.kill(pid, "SIGCONT");
+        }
+      } finally {
+        await second.current?.stop();
+        await first.stop();
+      }
+    },
+    180_000
+  );
+
   test("starts over a lock whose pid an unrelated live process holds", async () => {
     // The backend that wrote the lock crashed. Some other process holds its pid now, and
     // nothing serves its port: the lock is stale, not "already running".
