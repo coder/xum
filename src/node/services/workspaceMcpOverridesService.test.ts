@@ -4197,11 +4197,13 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       ).enabledServers;
     // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // With `id`, a partially migrated row: config.json holds the id, but not the name.
     // Its own runtime config keeps its checkout under this test's root.
-    const registerMalformedLegacyEntry = async () => {
+    const registerMalformedLegacyEntry = async (id?: string) => {
       const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
       await fs.mkdir(legacyPath, { recursive: true });
       const legacyEntry: unknown = {
+        ...(id === undefined ? {} : { id }),
         path: legacyPath,
         runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
       };
@@ -4222,6 +4224,23 @@ describe("WorkspaceMcpOverridesService", () => {
       service.prunePluginOverrideKeysForWorkspaces(workspaceIds, "plugin:0123456789abcdef:").then(
         (failures) => failures.map((failure) => failure.workspaceId).sort(),
         () => "refused" as const
+      );
+    const setParent = (childId: string, parentWorkspaceId: string) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === childId);
+          if (workspace) workspace.parentWorkspaceId = parentWorkspaceId;
+        }
+        return cfg;
+      });
+    const served = (
+      service: WorkspaceMcpOverridesService,
+      workspaceId: string,
+      mode?: "lenient" | "strict"
+    ) =>
+      service.getOverridesForWorkspace(workspaceId, { mode }).then(
+        (read) => (read.authoritative ? read.overrides : "not authoritative"),
+        () => "refused"
       );
 
     it("prunes every requested workspace, the legacy entry's checkout included", async () => {
@@ -4261,13 +4280,7 @@ describe("WorkspaceMcpOverridesService", () => {
         JSON.stringify({ enabledServers: ["parent-server"] })
       );
       const child = await registerWorkspace("child-of-legacy");
-      await config.editConfig((cfg) => {
-        for (const project of cfg.projects.values()) {
-          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
-          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
-        }
-        return cfg;
-      });
+      await setParent(child.workspaceId, "legacy-stable-id");
 
       const published: Array<[string, unknown]> = [];
       const failures = await service.prunePluginOverrideKeysForWorkspaces(
@@ -4297,32 +4310,44 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(read.overrides.enabledServers).toEqual(["other"]);
     });
 
-    it("does not serve a child of the legacy entry authoritatively", async () => {
-      // The child names the legacy entry's stable id, which only the unreadable metadata.json
-      // holds: its inherited settings (a disable included) are unknown, not absent.
-      const service = new WorkspaceMcpOverridesService(config);
-      const legacyPath = await registerMalformedLegacyEntry();
-      await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
-      await fs.writeFile(
-        overridesFile(legacyPath),
-        JSON.stringify({ disabledServers: ["global-server"] })
-      );
-      const child = await registerWorkspace("child-of-legacy");
-      await config.editConfig((cfg) => {
-        for (const project of cfg.projects.values()) {
-          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
-          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
-        }
-        return cfg;
-      });
+    // Id-less: the child names the stable id that only the unreadable metadata.json holds.
+    // Partially migrated: the walk builds the parent from its config row alone (see below).
+    // Either way the inherited settings (a disable included) are unknown, not absent.
+    for (const { shape, entryId, parentId } of [
+      { shape: "id-less", entryId: undefined, parentId: "legacy-stable-id" },
+      { shape: "partially migrated", entryId: "partial-legacy-id", parentId: "partial-legacy-id" },
+    ]) {
+      it(`does not serve a child of the ${shape} legacy entry authoritatively`, async () => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const legacyPath = await registerMalformedLegacyEntry(entryId);
+        await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+        await fs.writeFile(
+          overridesFile(legacyPath),
+          JSON.stringify({ disabledServers: ["global-server"] })
+        );
+        const child = await registerWorkspace("child-of-legacy");
+        await setParent(child.workspaceId, parentId);
 
-      const read = await service.getOverridesForWorkspace(child.workspaceId);
-      expect(read.authoritative).toBe(false);
-      // The settings dialog reads strictly: it must report the state unavailable, not show `{}`.
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-      await expect(
-        service.getOverridesForWorkspace(child.workspaceId, { mode: "strict" })
-      ).rejects.toThrow();
+        expect(await served(service, child.workspaceId)).toBe("not authoritative");
+        // The settings dialog reads strictly: it must report the state unavailable, not show `{}`.
+        expect(await served(service, child.workspaceId, "strict")).toBe("refused");
+      });
+    }
+
+    it("does not serve a partially migrated legacy entry from its config row alone", async () => {
+      // Its id is in config.json, but its name (and on SSH or Docker its runtime) lives only in
+      // the unreadable metadata.json: the checkout the row alone names may not hold its override
+      // file. A healthy workspace beside it is still served.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry("partial-legacy-id");
+
+      expect(await served(service, "partial-legacy-id")).toBe("refused");
+      expect(await served(service, "partial-legacy-id", "strict")).toBe("refused");
+      const read = await service.getOverridesForWorkspace(healthy.workspaceId);
+      expect(read.authoritative).toBe(true);
+      expect(read.overrides.enabledServers).toEqual([pluginKey, "other"]);
     });
 
     it("does not serve overrides while config.json is corrupt", async () => {
@@ -4332,11 +4357,7 @@ describe("WorkspaceMcpOverridesService", () => {
       await registerMalformedLegacyEntry();
       await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
 
-      const served = await service.getOverridesForWorkspace(healthy.workspaceId).then(
-        (read) => (read.authoritative ? read.overrides : "not authoritative"),
-        () => "refused"
-      );
-      expect(served).toBe("refused");
+      expect(await served(service, healthy.workspaceId)).toBe("refused");
     });
 
     // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
