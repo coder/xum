@@ -69,6 +69,22 @@ const exists = (file: string) =>
     () => false
   );
 
+/**
+ * A file a shell redirect writes (`echo $? > file`) exists, empty, between the redirect's create
+ * and its write: wait for the content, not for the file.
+ */
+async function readWhenWritten(file: string, what: string): Promise<string> {
+  let content = "";
+  await waitFor(async () => {
+    content = await fs.readFile(file, "utf-8").then(
+      (text) => text.trim(),
+      () => ""
+    );
+    return content !== "";
+  }, what);
+  return content;
+}
+
 async function tempDir(tag: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `repro-bg-${tag}-`));
   cleanups.push(() => fs.rm(dir, { recursive: true, force: true }));
@@ -132,22 +148,9 @@ describe("terminating a background process that already exited", () => {
     return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
   }
 
-  /** The marker exists, empty, between the shell's create and its write: wait for the code. */
-  async function readExitMarker(exitCodeFile: string): Promise<string> {
-    let code = "";
-    await waitFor(async () => {
-      code = await fs.readFile(exitCodeFile, "utf-8").then(
-        (content) => content.trim(),
-        () => ""
-      );
-      return code !== "";
-    }, "the wrapper's exit_code");
-    return code;
-  }
-
   async function spawnExited(tag: string) {
     const spawned = await spawnExiting(tag);
-    expect(await readExitMarker(spawned.exitCodeFile)).toBe("3");
+    expect(await readWhenWritten(spawned.exitCodeFile, "the wrapper's exit_code")).toBe("3");
     return spawned;
   }
 
@@ -177,7 +180,7 @@ describe("terminating a background process that already exited", () => {
     const { exitCodeFile } = await spawnExiting("term-held", gate);
     await waitFor(() => exists(exitCodeFile), "the created marker");
     expect(await fs.readFile(exitCodeFile, "utf-8")).toBe("");
-    const code = readExitMarker(exitCodeFile);
+    const code = readWhenWritten(exitCodeFile, "the wrapper's exit_code");
     const raced = await Promise.race([
       code.then(() => "settled"),
       Bun.sleep(150).then(() => "held"),
@@ -560,8 +563,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
       },
       mockToolCallOptions
     ) as Promise<BashToolResult>;
-    await waitFor(() => exists(pidFile), "the foreground command");
-    pid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+    pid = Number(await readWhenWritten(pidFile, "the foreground command's pid"));
     expect(pid).toBeGreaterThan(1);
     // The seal a removal or archive holds (workspaceService.ts) while its cleanup() runs.
     using _seal = failMigration ? undefined : manager.sealAdmissions(ws);
