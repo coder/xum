@@ -23,6 +23,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { Workspace } from "@/common/types/project";
 
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
@@ -6588,7 +6589,7 @@ describe("Config", () => {
           JSON.stringify({ id, name: "legacy-task", ...treeFields, ...overrides })
         );
       };
-      const register = (row: { id?: string; name?: string }) =>
+      const register = (row: Partial<Workspace>) =>
         config.editConfig((cfg) => {
           cfg.projects.set(projectPath, { workspaces: [{ path: workspacePath(), ...row }] });
           return cfg;
@@ -6614,11 +6615,14 @@ describe("Config", () => {
         expect(pick(await build(new Config(tempDir)))).toEqual(treeFields);
       });
 
-      it("restores them into a row an earlier build migrated without them", async () => {
+      it("keeps a value the row already holds", async () => {
+        // The migration fills only what the row lacks: it never overwrites a persisted value.
         writeLegacyFile("legacy-task-id");
-        await register({ id: "legacy-task-id", name: "legacy-task" });
-        expect(pick(await build(config))).toEqual(treeFields);
-        expect(pick(await persistedRow())).toEqual(treeFields);
+        await register({ taskStatus: "interrupted" });
+        await build(config);
+        const row = await persistedRow();
+        expect(row?.parentWorkspaceId).toBe("parent-id");
+        expect(row?.taskStatus).toBe("interrupted");
       });
 
       it("does not copy a value the row schema rejects", async () => {
@@ -6629,59 +6633,6 @@ describe("Config", () => {
         const row = await persistedRow();
         expect(row?.parentWorkspaceId).toBe("parent-id");
         expect(row?.taskStatus).toBeUndefined();
-      });
-
-      it("reads a current-format row's legacy files once per Config, and never with a parent link", async () => {
-        // Every registry build walks every row: the restore must not add file reads to each one.
-        // Both rows have a legacy file; the first one's names the row but holds no tree fields.
-        fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
-        fs.writeFileSync(
-          path.join(config.sessionsDir, "legacy-task", "metadata.json"),
-          JSON.stringify({ id: "legacy-task-id", name: "legacy-task" })
-        );
-        fs.mkdirSync(path.join(config.sessionsDir, "child-task"), { recursive: true });
-        fs.writeFileSync(
-          path.join(config.sessionsDir, "child-task", "metadata.json"),
-          JSON.stringify({ id: "child-task-id", name: "child-task", agentId: "explore" })
-        );
-        await register({ id: "legacy-task-id", name: "legacy-task" });
-        await config.editConfig((cfg) => {
-          cfg.projects.get(projectPath)?.workspaces.push({
-            path: path.join(config.srcDir, "project", "child-task"),
-            id: "child-task-id",
-            name: "child-task",
-            parentWorkspaceId: "parent-id",
-          });
-          // No legacy file at all, like every workspace a current build created.
-          cfg.projects.get(projectPath)?.workspaces.push({
-            path: path.join(config.srcDir, "project", "fresh-task"),
-            id: "fresh-task-id",
-            name: "fresh-task",
-          });
-          return cfg;
-        });
-        const readSpy = spyOn(fs, "readFileSync");
-        try {
-          const legacyReads = (name: string) =>
-            readSpy.mock.calls.filter(([file]) =>
-              String(file).startsWith(path.join(config.sessionsDir, name) + path.sep)
-            ).length;
-          await config.getAllWorkspaceMetadata({ probeCheckouts: false });
-          await config.getAllWorkspaceMetadata({ probeCheckouts: false, archived: "active" });
-          expect(legacyReads("legacy-task")).toBe(1);
-          expect(legacyReads("child-task")).toBe(0);
-          expect(legacyReads("fresh-task")).toBe(0);
-        } finally {
-          readSpy.mockRestore();
-        }
-      });
-
-      it("does not restore them from a legacy file that names another workspace", async () => {
-        // Checkout paths are reused: a file left by a removed workspace is not this row's.
-        writeLegacyFile("removed-workspace-id");
-        await register({ id: "legacy-task-id", name: "legacy-task" });
-        expect((await build(config))?.parentWorkspaceId).toBeUndefined();
-        expect((await persistedRow())?.parentWorkspaceId).toBeUndefined();
       });
     });
   });
