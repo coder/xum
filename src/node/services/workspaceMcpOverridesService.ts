@@ -4962,7 +4962,10 @@ export class WorkspaceMcpOverridesService {
     // authoritative publication here, but its subtree is not walked again.
     const published = new Set<string>();
     // The sweep's single budget continues here: each fan-out would
-    // otherwise reset its own 30 s while the locks stay held.
+    // otherwise reset its own 30 s while the locks stay held. Every prune
+    // landed and was verified, so the window restarts here, and again after
+    // each workspace (an eviction included).
+    budget.progress();
     for (const [workspaceId, { metadata, filePaths, ownFileRewritten }] of swept) {
       // This workspace's own files did not change and the receiver holds
       // nothing to repair for it: skip the (disk-reading) resolution. Still
@@ -4972,6 +4975,7 @@ export class WorkspaceMcpOverridesService {
       // the skip, but off-host runtimes never start plugin servers.)
       if (!ownFileRewritten && hasSnapshot?.(workspaceId) === false) {
         await publish(null, workspaceId);
+        budget.progress();
         continue;
       }
       try {

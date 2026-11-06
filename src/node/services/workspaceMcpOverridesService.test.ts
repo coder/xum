@@ -4788,6 +4788,108 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(after.enabledServers).toEqual(["other"]);
   });
 
+  it("prunePluginOverrideKeysForWorkspaces keeps its budget while it evicts uncached workspaces", async () => {
+    // Publication only evicts a workspace whose files did not change and that
+    // the receiver holds nothing for. Thousands of such evictions on a starved
+    // core must not leave the next rewritten workspace an expired deadline.
+    // Here each eviction costs 1 s of clock, so 39 of them need 39 s.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspaces: Array<{ workspaceId: string; workspacePath: string }> = [];
+    for (let index = 0; index < 40; index++) {
+      workspaces.push(await registerWorkspace(`evicting-${index}`));
+    }
+    const last = workspaces[39];
+    const lastDoc = path.join(last.workspacePath, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(lastDoc), { recursive: true });
+    await fs.writeFile(
+      lastDoc,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    const realNow = Date.now;
+    const realStat = fsPromisesModule.stat;
+    let skewMs = 0;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      // Real time: a deadline the evictions had already spent fires first.
+      if (target === lastDoc) await new Promise((resolve) => setTimeout(resolve, 5));
+      return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+    }) as typeof fsPromisesModule.stat);
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        workspaces.map((workspace) => workspace.workspaceId),
+        "plugin:0123456789abcdef:",
+        {
+          publish: (persisted) => {
+            if (persisted === null) skewMs += 1_000;
+            return Promise.resolve();
+          },
+          hasSnapshot: () => false,
+        }
+      );
+    } finally {
+      statSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+
+    expect(failures.map((failure) => String(failure.error))).toEqual([]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces starts publication with a whole window", async () => {
+    // Between the last prune and the first publication the sweep re-reads the
+    // registry and checks every swept workspace for a move. On a large
+    // registry that took the window the last prune had left. Here the re-read
+    // costs 31 s of clock.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspace = await registerWorkspace("publication-window");
+    const doc = path.join(workspace.workspacePath, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(doc), { recursive: true });
+    await fs.writeFile(doc, JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] }));
+    const realNow = Date.now;
+    const realStat = fsPromisesModule.stat;
+    const realEnumerate = config.getAllWorkspaceMetadata.bind(config);
+    let skewMs = 0;
+    let pruned = false;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (target === doc) {
+        // Real time: a deadline the re-read had already spent fires first.
+        if (pruned) await new Promise((resolve) => setTimeout(resolve, 5));
+        pruned = true;
+      }
+      return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+    }) as typeof fsPromisesModule.stat);
+    const enumerateSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+      async (options) => {
+        // After the caller armed the re-read's own deadline.
+        await Promise.resolve();
+        if (pruned && skewMs === 0) skewMs += 31_000;
+        return realEnumerate(options);
+      }
+    );
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [workspace.workspaceId],
+        "plugin:0123456789abcdef:",
+        { publish: () => Promise.resolve() }
+      );
+    } finally {
+      enumerateSpy.mockRestore();
+      statSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+
+    expect(skewMs).toBe(31_000);
+    expect(failures.map((failure) => String(failure.error))).toEqual([]);
+  });
+
   it("prunePluginOverrideKeysForWorkspaces fails a stalled checkout on its own bound while the others finish", async () => {
     // A checkout on a dead mount fails only its own workspace, and soon: the
     // sweep holds every workspace lock while it waits.
