@@ -71,7 +71,7 @@ export const ModelsEmpty: Story = {
     await userEvent.type(canvas.getByRole("combobox", { name: "Model ID" }), "fable");
     const option = await canvas.findByRole("option", { name: /claude-fable-5$/ });
     await expect(option).toHaveTextContent("Anthropic");
-    await expect(canvas.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    await expect(canvas.queryByRole("option", { name: /claude-fable-5-5/ })).toBeNull();
   },
 };
 

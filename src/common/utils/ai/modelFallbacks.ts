@@ -12,7 +12,7 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 
 /**
  * Refusal-fallback chains that the one-time seed passes add to EXISTING
- * configs. Fable 5 safeguards may refuse requests the Opus tier can serve, so
+ * configs. Fable safeguards may refuse requests the Opus tier can serve, so
  * retrying on Opus is the sensible out-of-the-box behavior.
  *
  * The target is pinned to the literal Opus 5 id rather than KNOWN_MODELS.OPUS.id:
@@ -22,11 +22,10 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
  *
  * Seeded into the config exactly once, guarded by
- * migrations.defaultModelFallbacksSeeded (plus the one-shot
- * defaultModelFallbacksSeededFable51 re-seed for the key move to Fable 5.1)
- * — on versions that know the flag,
- * user edits or deletions of these chains are never overridden by updates.
- * (Versions predating the flag strip it on save, so a downgrade→save→
+ * migrations.defaultModelFallbacksSeededFable55 (each earlier fable alias move
+ * has its own flag, see LEGACY_DEFAULT_MODEL_FALLBACKS) — on versions that know
+ * the flag, user edits or deletions of these chains are never overridden by
+ * updates. (Versions predating the flag strip it on save, so a downgrade→save→
  * re-upgrade round-trip re-seeds a deleted chain; bounded to re-adding this
  * benign, re-deletable default.)
  */
@@ -39,6 +38,8 @@ export const SEEDED_MODEL_FALLBACKS: ModelFallbacks = {
  * chains added after the seed flags shipped. Those later chains reach fresh
  * installs only; existing configs get no migration and no new flag, and users
  * add them by hand (docs/config/models.mdx). Maintainer decision on #5087.
+ * (The fable chain is not such a later chain: it keeps the existing `fable`
+ * alias fallback alive across alias moves, so it is seeded.)
  *
  * Sonnet 5.5 → Sonnet 5 mirrors Anthropic's own server-side fallback for
  * Sonnet 5.5's cyber safeguards. Both ids are pinned literals, not
@@ -50,15 +51,33 @@ export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
 };
 
 /**
- * Legacy default chain for the pre-5.1 fable id, seeded alongside
- * DEFAULT_MODEL_FALLBACKS whenever the original seed pass runs (fresh installs
- * and configs that never completed it). Those configs mark
- * defaultModelFallbacksSeeded, so a downgrade to a build whose FABLE is
- * Fable 5 would skip its own seed; carrying this chain keeps the old build's
- * refusal fallback intact.
+ * Default chain of the Fable 5 era, seeded by the original seed pass
+ * (migrations.defaultModelFallbacksSeeded). A build whose FABLE is Fable 5
+ * trusts that flag for this key, so every pass that claims the flag also
+ * carries this chain and a downgrade keeps refusal fallback.
+ */
+export const FABLE_5_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default chain of the Fable 5.1 era, seeded by the
+ * migrations.defaultModelFallbacksSeededFable51 pass. Same downgrade reasoning
+ * as FABLE_5_DEFAULT_MODEL_FALLBACKS, for builds whose FABLE is Fable 5.1.
+ */
+export const FABLE_5_1_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5-1": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Legacy default chains for earlier fable ids, seeded alongside
+ * DEFAULT_MODEL_FALLBACKS on fresh installs. Fresh installs mark every seed
+ * flag, so a downgrade to an older build would skip its own seed; carrying
+ * these chains keeps the old build's refusal fallback intact.
  */
 export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
-  "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
+  ...FABLE_5_DEFAULT_MODEL_FALLBACKS,
+  ...FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
 };
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
@@ -66,6 +85,8 @@ export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
 for (const entry of [
   ...Object.values(Object.freeze(SEEDED_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_1_DEFAULT_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
 ]) {
   Object.freeze(entry);
