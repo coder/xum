@@ -94,9 +94,9 @@ export interface PluginSweepOptions {
    * serve reads disk). The sweep then skips publication for a workspace whose
    * own override files it did not rewrite: thousands of such publications
    * made installs on large configs (6,302 workspaces) exhaust the sweep's
-   * budget and fail. Omitted (or true) keeps the full publication. Saves pass
-   * it too. With it, publication looks for checkout sharers only among the
-   * workspaces it reports true for and their ancestors (see sharerCandidates).
+   * budget and fail. Omitted (or true) keeps the full publication. With it,
+   * publication looks for checkout sharers only among the workspaces it
+   * reports true for and their ancestors (see sharerCandidates).
    */
   hasSnapshot?: (workspaceId: string) => boolean;
 }
@@ -154,6 +154,7 @@ function sharerCandidates(
   for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
     if (keep.has(id)) continue;
     keep.add(id);
+    // mutation-equivalent: an array is never falsy, so ?? and || agree
     for (const entry of byId.get(id) ?? []) {
       if (entry.parentWorkspaceId != null) pending.push(entry.parentWorkspaceId);
     }
@@ -4159,7 +4160,7 @@ export class WorkspaceMcpOverridesService {
        * writer's publication and leave the cache holding the older snapshot.
        */
       publish?: OverridesPublisher;
-      /** The publish receiver's state hint, as for the plugin-key sweep (PluginSweepOptions.hasSnapshot). */
+      /** The publish receiver's state hint (PluginSweepOptions.hasSnapshot). */
       hasSnapshot?: PluginSweepOptions["hasSnapshot"];
     }
   ): Promise<void> {

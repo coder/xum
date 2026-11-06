@@ -1086,7 +1086,7 @@ describe("WorkspaceMcpOverridesService", () => {
             id: entry.id,
             name: entry.id,
             runtimeConfig: { type: "local" },
-            // Present, as on a real registration: a missing one is migrated by a config write.
+            // A missing createdAt is migrated by a config write, which would break configEdits === 0.
             createdAt: "2026-11-06T00:00:00.000Z",
             ...(entry.parentWorkspaceId ? { parentWorkspaceId: entry.parentWorkspaceId } : {}),
           });
@@ -1136,17 +1136,13 @@ describe("WorkspaceMcpOverridesService", () => {
     it("a save does no per-workspace work for unrelated workspaces", async () => {
       const few = await countSaveWork(2);
       const many = await countSaveWork(24);
-      // No unrelated checkout is touched, nothing in config.json changes, and
-      // the legacy lookups do not grow with the registry.
       expect(many.unrelatedRealpaths).toBe(0);
       expect(many.configEdits).toBe(0);
       expect(many.legacyLookups).toBe(few.legacyLookups);
     });
 
     it("a save checks only legacy-carrying workspaces for legacy retirement", async () => {
-      // A legacy config.json value on a workspace that shares the checkout
-      // must be retired (see the shared-save tests above), so carriers are
-      // still canonicalized. Workspaces without one are not.
+      // A sharer's legacy value must be retired (see the shared-save tests above).
       const carrierDir = path.join(tempDir, "legacy-carrier");
       const others = Array.from({ length: 6 }, (_, index) => ({
         dir: path.join(tempDir, `no-legacy-${index}`),
@@ -1194,11 +1190,6 @@ describe("WorkspaceMcpOverridesService", () => {
     });
 
     it("publication reaches only workspaces the receiver holds state for, and their ancestors", async () => {
-      // A workspace the receiver holds no state for reads disk on its next
-      // serve, so canonicalizing its checkout to find out whether it shares
-      // the written one buys nothing. Cached aliases and the cold ancestors
-      // of cached workspaces still count: an inheriting descendant of a
-      // sharer resolves from the written document.
       const realDir = path.join(tempDir, "hint-real");
       const linkHot = path.join(tempDir, "hint-link-hot");
       const linkCold = path.join(tempDir, "hint-link-cold");
@@ -1240,6 +1231,78 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(published).toContainEqual(["hint-hot-alias", disabled]);
       expect(published).toContainEqual(["hint-hot-child", disabled]);
       expect(published.map(([id]) => id)).not.toContain("hint-cold-alias");
+    });
+
+    it("an ancestor chain through an off-host workspace still reaches a cached host descendant", async () => {
+      // hint-chain-host -> hint-chain-remote (SSH) -> hint-chain-alias, which shares the written
+      // checkout. The cached host workspace resolves through the remote parent, so the walk up
+      // must cross the off-host entry; the fan-out then evicts the remote subtree.
+      const realDir = path.join(tempDir, "chain-real");
+      const aliasDir = path.join(tempDir, "chain-alias");
+      await fs.mkdir(realDir, { recursive: true });
+      await fs.symlink(realDir, aliasDir);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "hint-chain-writer" },
+        { dir: aliasDir, id: "hint-chain-alias" },
+      ]);
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/chain-remote", {
+          workspaces: [
+            {
+              path: "/remote/chain",
+              id: "hint-chain-remote",
+              name: "chain",
+              parentWorkspaceId: "hint-chain-alias",
+              runtimeConfig: { type: "ssh", host: "unreachable.invalid", srcBaseDir: "/remote" },
+              createdAt: "2026-11-06T00:00:00.000Z",
+            },
+          ],
+        });
+        return cfg;
+      });
+      await registerLocalWorkspaces(config, [
+        {
+          dir: path.join(tempDir, "chain-host"),
+          id: "hint-chain-host",
+          parentWorkspaceId: "hint-chain-remote",
+        },
+      ]);
+      const service = new WorkspaceMcpOverridesService(config);
+      const published: Array<[string, unknown]> = [];
+      await service.setOverridesForWorkspace(
+        "hint-chain-writer",
+        { disabledServers: ["shots"] },
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+          hasSnapshot: (workspaceId) => workspaceId === "hint-chain-host",
+        }
+      );
+      expect(published).toContainEqual(["hint-chain-host", null]);
+    });
+
+    it("clearing a legacy value still edits config.json when the stored config cannot be read", async () => {
+      // An unreadable config must not read as "nothing to clear": the lenient
+      // loader degrades a read failure to an empty config.
+      const service = new WorkspaceMcpOverridesService(config);
+      const internals = service as unknown as {
+        clearLegacyOverridesInConfig: (workspaceId: string) => Promise<void>;
+      };
+      const empty = config.loadConfigOrDefault();
+      const loadSpy = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
+        if (options?.throwOnError) throw new Error("EIO: config.json unreadable");
+        return { ...empty, projects: new Map() };
+      });
+      const editSpy = spyOn(config, "editConfig").mockResolvedValue(undefined);
+      try {
+        await internals.clearLegacyOverridesInConfig("ws-unreadable");
+        expect(editSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        editSpy.mockRestore();
+        loadSpy.mockRestore();
+      }
     });
   });
 
