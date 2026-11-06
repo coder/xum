@@ -3,7 +3,7 @@ import { renameSync, writeFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { ServerLockDataSchema, ServerLockfile } from "./serverLockfile";
+import { ServerLockDataSchema, ServerLockfile, type ServerLockData } from "./serverLockfile";
 import {
   startFakeBackend,
   startUnrelatedProcess,
@@ -58,6 +58,29 @@ describe("ServerLockfile", () => {
     expect(data!.token).toBe("test-token");
     expect(data!.pid).toBe(process.pid);
     expect(data!.startedAt).toBeDefined();
+  });
+
+  test("acquire records only the optional fields that are usable", async () => {
+    const written = async (extra?: Parameters<ServerLockfile["acquire"]>[2]) => {
+      await lockfile.acquire("http://localhost:12345", "test-token", extra);
+      return ServerLockDataSchema.parse(
+        JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))
+      );
+    };
+    const expectNoOptionalFields = (data: ServerLockData) => {
+      expect(data.bindHost).toBeUndefined();
+      expect(data.port).toBeUndefined();
+      expect(data.networkBaseUrls).toBeUndefined();
+    };
+
+    expectNoOptionalFields(await written());
+    expectNoOptionalFields(await written({}));
+    expectNoOptionalFields(await written({ bindHost: "  ", networkBaseUrls: [] }));
+    expect((await written({ bindHost: " 127.0.0.1 " })).bindHost).toBe("127.0.0.1");
+    // The ends of the port range are ports; a port outside it, or a fraction, is dropped.
+    expect((await written({ port: 0 })).port).toBe(0);
+    expect((await written({ port: 65535 })).port).toBe(65535);
+    for (const port of [-1, 65536, 1.5]) expect((await written({ port })).port).toBeUndefined();
   });
 
   test("acquire persists optional network metadata", async () => {

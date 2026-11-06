@@ -86,6 +86,24 @@ describe("answersAsXumBackend", () => {
     expect(await answersAsXumBackend(await serve(handler), 1_000)).toBe(false);
   });
 
+  test("an answer of exactly the size limit is read, one byte more is not", async () => {
+    const answer = '{"mode":"server","git_describe":"v1"}';
+    const padded = (bytes: number) => answer + " ".repeat(bytes - answer.length);
+    const atLimit = await serve((_req, res) => res.end(padded(4_096)));
+    const overLimit = await serve((_req, res) => res.end(padded(4_097)));
+    expect(await answersAsXumBackend(atLimit)).toBe(true);
+    expect(await answersAsXumBackend(overLimit)).toBe(false);
+  });
+
+  test("a connection that drops in the middle of the answer means no backend", async () => {
+    const dropping = await serve((_req, res) => {
+      res.writeHead(200, { "content-length": "100" });
+      res.write('{"mode":"server",');
+      setTimeout(() => res.destroy(), 20);
+    });
+    expect(await answersAsXumBackend(dropping, 1_000)).toBe(false);
+  });
+
   test("a redirect is not followed, even to a xum backend", async () => {
     const live = await backend("xum");
     const redirecting = await serve((_req, res) => {
@@ -99,8 +117,15 @@ describe("answersAsXumBackend", () => {
 
   test("a URL that is not plain http(s) without credentials means no backend", async () => {
     const live = await backend("xum");
-    const withCredentials = live.baseUrl.replace("http://", "http://user:secret@");
-    for (const url of ["not a url", "ftp://127.0.0.1:21", "file:///etc/passwd", withCredentials]) {
+    const withCredentials = ["http://user:secret@", "http://user@", "http://:secret@"].map(
+      (prefix) => live.baseUrl.replace("http://", prefix)
+    );
+    for (const url of [
+      "not a url",
+      "ftp://127.0.0.1:21",
+      "file:///etc/passwd",
+      ...withCredentials,
+    ]) {
       expect(await answersAsXumBackend(url)).toBe(false);
     }
     expect(live.requests).toEqual([]);
