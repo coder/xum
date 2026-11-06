@@ -4779,8 +4779,9 @@ describe("AgentPluginInstallService", () => {
         [docsUrl],
         {
           mcpConfigService,
-          onStop: async () => {
+          onStop: () => {
             if (armed) stops++;
+            return Promise.resolve();
           },
         }
       );
