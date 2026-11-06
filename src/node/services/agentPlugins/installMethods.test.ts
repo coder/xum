@@ -557,13 +557,16 @@ describe("chooseStagedMethod", () => {
     using tmp = new DisposableTempDir("install-methods-choose");
     await writeTree(tmp.path, args.skills ?? [], args.files);
     const detected = await detectInstallMethods(tmp.path);
-    return chooseStagedMethod(
+    // Awaited before the return: `using` removes the folder when this function returns, and a
+    // returned promise would still be reading it.
+    const choice = await chooseStagedMethod(
       tmp.path,
       { ...detected, rejected: args.rejected ?? [] },
       args.request,
       source,
       undefined
     );
+    return choice;
   }
 
   const egm = {
