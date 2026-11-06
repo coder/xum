@@ -593,11 +593,26 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
 // thousands.
 const MIN_INK_PIXELS = 32;
 
+// Two screenshots of the same page can differ where the page changes by itself: a scroll-driven
+// mask moved 40-60 pixels of the composer toolbar by 1-2 levels. A pixel counts as ink only when
+// it differs between the shown and the hidden screenshot, and not between two shown screenshots.
+const NOISE_LEVELS = 3;
+
+function pixelDiffers(a: Pixels, b: Pixels, at: number) {
+  for (let channel = 0; channel < a.channels; channel++) {
+    if (Math.abs(a.data[at + channel] - b.data[at + channel]) > NOISE_LEVELS) return true;
+  }
+  return false;
+}
+
 /** The box is widened by one pixel so its own antialiased edge never counts. */
-function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
+function differenceOutside(box: Box, shown: Pixels, hidden: Pixels, shownAgain: Pixels) {
   assert(
-    shown.width === hidden.width && shown.height === hidden.height,
-    "Both screenshots must have the viewport's size"
+    shown.width === hidden.width &&
+      shown.height === hidden.height &&
+      shown.width === shownAgain.width &&
+      shown.height === shownAgain.height,
+    "All screenshots must have the viewport's size"
   );
   const left = Math.floor(box.left) - 1;
   const right = Math.ceil(box.right) + 1;
@@ -612,9 +627,7 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
     if (shown.data.subarray(start, end).equals(hidden.data.subarray(start, end))) return;
     for (let x = from; x < to; x++) {
       const at = (y * shown.width + x) * shown.channels;
-      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
-        continue;
-      }
+      if (!pixelDiffers(shown, hidden, at) || pixelDiffers(shown, shownAgain, at)) continue;
       count++;
       sides.add(y >= bottom ? "below" : y < top ? "above" : x < left ? "left of" : "right of");
       bounds.left = Math.min(bounds.left, x);
@@ -641,15 +654,18 @@ async function paintOutside(
   shown: Pixels
 ): Promise<string[]> {
   await setDiagramHidden(page, index, true);
+  let hidden: Pixels;
   try {
-    const { sides, bounds, count } = differenceOutside(box, shown, await viewportPixels(page));
-    const where = `x ${bounds.left}-${bounds.right}, y ${bounds.top}-${bounds.bottom}`;
-    return count >= MIN_INK_PIXELS
-      ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
-      : [];
+    hidden = await viewportPixels(page);
   } finally {
     await setDiagramHidden(page, index, false);
   }
+  const shownAgain = await viewportPixels(page);
+  const { sides, bounds, count } = differenceOutside(box, shown, hidden, shownAgain);
+  const where = `x ${bounds.left}-${bounds.right}, y ${bounds.top}-${bounds.bottom}`;
+  return count >= MIN_INK_PIXELS
+    ? [`diagram ${index} paints ${sides.join(" and ")} its box (${count} px, ${where})`]
+    : [];
 }
 
 function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
