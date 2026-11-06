@@ -7046,6 +7046,22 @@ describe("AgentPluginInstallService", () => {
       }
     });
 
+    test("a fresh install refuses when one workspace's overrides cannot be checked", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub(() =>
+          Promise.reject(new Error("EBUSY: resource busy"))
+        ),
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      await expect(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/ws-1/);
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(preview.targetPath)).toBe(false);
+    });
+
     test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
       const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
       const tombstone = { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] };
