@@ -581,6 +581,31 @@ describe("Mermaid layout stability", () => {
       }
     });
 
+    test("a render that a newer width replaced does not overwrite it when it finishes late", async () => {
+      // The render for the unmeasured container waits on the font, and a resize replaces it.
+      const firstFontWait = Promise.withResolvers<void>();
+      let fontWaits = 0;
+      Object.defineProperty(document, "fonts", {
+        value: {
+          get ready() {
+            return fontWaits++ === 0 ? firstFontWait.promise : Promise.resolve();
+          },
+          load: () => Promise.resolve([]),
+        },
+      });
+      const view = renderMermaid({ chart: WIDE_CHART });
+      const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+
+      act(() => resizeContainer(326));
+      await waitFor(() => expect(viewBoxOf(container).width).toBeGreaterThan(0));
+      const narrow = viewBoxOf(container);
+      expect(narrow.width).toBeLessThanOrEqual(326);
+
+      act(() => firstFontWait.resolve());
+      await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+      expect(viewBoxOf(container)).toEqual(narrow);
+    });
+
     test("an unmeasured container renders the diagram's natural layout", async () => {
       const view = renderMermaid({ chart: WIDE_CHART });
       const container = view.container.querySelector<HTMLElement>(".mermaid-container");

@@ -169,6 +169,17 @@ describe("diagramPixelSize dialog", () => {
     });
   });
 
+  test("a room one pixel wide or high still limits the diagram", () => {
+    expect(diagramPixelSize(STATE_CHART, dialog({ width: 1, height: 1000 }))).toEqual({
+      width: 1,
+      height: 1,
+    });
+    expect(diagramPixelSize(STATE_CHART, dialog({ width: 1000, height: 1 }))).toEqual({
+      width: 2,
+      height: 1,
+    });
+  });
+
   test.each([
     { width: -1, height: 800 },
     { width: 390, height: -1 },
