@@ -325,15 +325,49 @@ describe("ServerLockfile", () => {
   });
 
   describe("release", () => {
+    /**
+     * Makes a successor's lock land at the lock path after release() has read the lock and
+     * before it renames it aside (the successor's acquire() between those two calls).
+     */
+    function successorLandsBeforeRename(lock: Parameters<typeof writeForeignLock>[0]) {
+      const realRename = fs.rename;
+      return spyOn(fs, "rename").mockImplementation(
+        async (...args: Parameters<typeof realRename>) => {
+          if (typeof args[1] === "string" && args[1].endsWith(".release"))
+            await writeForeignLock(lock);
+          return realRename(...args);
+        }
+      );
+    }
+    const asideName = () => `server.lock.${process.pid}.release`;
+
     test("leaves the lock of another backend that replaced this process's lock", async () => {
       // A starter judged this backend stale (it did not answer in time) and acquire()d over it.
       const foreign = unrelatedProcess();
       await lockfile.acquire("http://127.0.0.1:1", "own-token");
       const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+      const before = await fs.stat(lockfile.getLockPath());
 
       await lockfile.release();
 
       expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(theirs);
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+      // The lock never left its path: it is the same file.
+      expect((await fs.stat(lockfile.getLockPath())).ino).toBe(before.ino);
+    });
+
+    test("puts back a successor's lock that landed between the read and the rename", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const theirs = { pid: foreign.pid, baseUrl: "http://127.0.0.1:2", token: "their-token" };
+      const rename = successorLandsBeforeRename(theirs);
+      try {
+        await lockfile.release();
+      } finally {
+        rename.mockRestore();
+      }
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toMatchObject(theirs);
       expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
       // The restored lock holds a token: it keeps the owner-only mode that acquire() gives it.
       if (process.platform !== "win32") {
@@ -341,17 +375,19 @@ describe("ServerLockfile", () => {
       }
     });
 
-    test("keeps a newer lock that is written while the old one is held aside", async () => {
+    test("keeps a newer lock that is written while the successor's lock is held aside", async () => {
       const foreign = unrelatedProcess();
       await lockfile.acquire("http://127.0.0.1:1", "own-token");
-      await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+      const rename = successorLandsBeforeRename({
+        pid: foreign.pid,
+        baseUrl: "http://127.0.0.1:2",
+      });
       const newer = {
         pid: foreign.pid,
         baseUrl: "http://127.0.0.1:3",
         token: "newer-token",
         startedAt: new Date().toISOString(),
       };
-
       // release() reads the lock it took aside: a third backend acquires right then.
       const realReadFile = fs.readFile;
       const read = spyOn(fs, "readFile").mockImplementation((async (
@@ -367,17 +403,18 @@ describe("ServerLockfile", () => {
         await lockfile.release();
       } finally {
         read.mockRestore();
+        rename.mockRestore();
       }
 
       expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(newer);
       expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
     });
 
-    test("keeps another backend's lock aside when it cannot be put back", async () => {
+    test("keeps the successor's lock aside when it cannot be put back", async () => {
       const foreign = unrelatedProcess();
       await lockfile.acquire("http://127.0.0.1:1", "own-token");
-      const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
-
+      const theirs = { pid: foreign.pid, baseUrl: "http://127.0.0.1:2", token: "their-token" };
+      const rename = successorLandsBeforeRename(theirs);
       const copy = spyOn(fs, "copyFile").mockImplementation(() =>
         Promise.reject(Object.assign(new Error("no space left"), { code: "ENOSPC" }))
       );
@@ -385,20 +422,23 @@ describe("ServerLockfile", () => {
         await lockfile.release();
       } finally {
         copy.mockRestore();
+        rename.mockRestore();
       }
 
-      const aside = path.join(tempDir, `server.lock.${process.pid}.release`);
-      expect(await fs.readdir(tempDir)).toEqual([path.basename(aside)]);
-      expect(JSON.parse(await fs.readFile(aside, "utf-8"))).toEqual(theirs);
+      expect(await fs.readdir(tempDir)).toEqual([asideName()]);
+      expect(JSON.parse(await fs.readFile(path.join(tempDir, asideName()), "utf-8"))).toMatchObject(
+        theirs
+      );
     });
 
-    test("removes a lock file that is not a valid lock", async () => {
+    test("leaves a lock file that is not a valid lock", async () => {
       await lockfile.acquire("http://127.0.0.1:1", "own-token");
       await fs.writeFile(lockfile.getLockPath(), "not json");
 
       await lockfile.release();
 
-      expect(await fs.readdir(tempDir)).toEqual([]);
+      expect(await fs.readFile(lockfile.getLockPath(), "utf-8")).toBe("not json");
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
     });
 
     test("does not delete a lock that this process never acquired", async () => {
