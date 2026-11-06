@@ -42,7 +42,7 @@ import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
   backupPluginsOf,
-  consumePendingPluginsSectionIntent,
+  peekPendingPluginsSectionIntent,
   opensAddPanel,
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
@@ -1763,7 +1763,7 @@ export const PluginsSettingsSection: React.FC = () => {
   // below covers commands invoked while this section is already on screen
   // (same-route navigation preserves the mounted component, so no re-init
   // happens).
-  const [initialIntent] = useState(() => consumePendingPluginsSectionIntent());
+  const [initialIntent] = useState(() => peekPendingPluginsSectionIntent());
   const [addOpen, setAddOpen] = useState(opensAddPanel(initialIntent));
   // A new id remounts the Add plugin panel, so a backup reinstall starts from its first plugin
   // and a closed one leaves nothing behind for the next plain add.

@@ -62,7 +62,16 @@ export function publishPluginsSectionIntent(intent: PluginsSectionIntent): void 
   pendingIntent = intent;
 }
 
-/** Consume the buffered intent (mount path); returns null when none is pending. */
+/**
+ * Read the buffered intent without clearing it (mount path). A state initializer must stay pure:
+ * StrictMode runs it twice and keeps the second result, so a read that cleared the buffer handed
+ * the mounting section null. The buffer clears when the mounted section subscribes.
+ */
+export function peekPendingPluginsSectionIntent(): PluginsSectionIntent | null {
+  return pendingIntent;
+}
+
+/** Consume the buffered intent; returns null when none is pending. */
 export function consumePendingPluginsSectionIntent(): PluginsSectionIntent | null {
   const intent = pendingIntent;
   pendingIntent = null;
@@ -74,6 +83,8 @@ export function subscribePluginsSectionIntents(
   listener: (intent: PluginsSectionIntent) => void
 ): () => void {
   listeners.add(listener);
+  // The subscribing section already read the buffered intent at mount (peek above).
+  pendingIntent = null;
   return () => {
     listeners.delete(listener);
   };
