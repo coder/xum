@@ -1100,6 +1100,12 @@ export interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
+  /**
+   * The row already read a completed report for this attempt when the stream ended: a reactivated
+   * execution inherits one. Only a report that lands AFTER the stream ended contradicts a
+   * `nonreport` decision (see StreamEndLedger.resolveStreamEndDecision).
+   */
+  readonly reportedAtEvent: boolean;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it

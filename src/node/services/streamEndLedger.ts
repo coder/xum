@@ -210,6 +210,7 @@ export class StreamEndLedger {
       attempt,
       attemptId,
       messageId,
+      reportedAtEvent: this.rowReportsAttempt(taskId, attemptId),
       outcome: "pending",
       turn: this.deps.workspaceService().getActiveTurnGeneration(taskId),
     };
@@ -258,12 +259,15 @@ export class StreamEndLedger {
     outcome: Exclude<StreamEndDecision["outcome"], "pending">
   ): boolean {
     if (decision?.outcome !== "pending") return false;
-    // `nonreport` says the attempt continues. A row that already reads this attempt's completed
-    // report (another backend's, or adopted from its artifact, landing before this stream's
-    // handler ran) contradicts that: held follow-ups are refused as for any unconfirmed outcome,
-    // never run as a new turn of a reported attempt (#7003).
+    // `nonreport` says the attempt continues. A completed report for this attempt that landed
+    // after the stream ended (another backend's, or adopted from its artifact, before this
+    // stream's handler ran) contradicts that: held follow-ups are refused as for any unconfirmed
+    // outcome, never run as a new turn of a reported attempt (#7003). A row that already read
+    // reported at the stream end is a reactivated execution, which continues.
     const resolved =
-      outcome === "nonreport" && this.rowReportsAttempt(taskId, decision.attemptId)
+      outcome === "nonreport" &&
+      !decision.reportedAtEvent &&
+      this.rowReportsAttempt(taskId, decision.attemptId)
         ? "indeterminate"
         : outcome;
     decision.outcome = resolved;
