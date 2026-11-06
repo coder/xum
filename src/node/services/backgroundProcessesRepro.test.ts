@@ -69,6 +69,22 @@ const exists = (file: string) =>
     () => false
   );
 
+/**
+ * A file a shell redirect writes (`echo $? > file`) exists, empty, between the redirect's create
+ * and its write: wait for the content, not for the file.
+ */
+async function readWhenWritten(file: string, what: string): Promise<string> {
+  let content = "";
+  await waitFor(async () => {
+    content = await fs.readFile(file, "utf-8").then(
+      (text) => text.trim(),
+      () => ""
+    );
+    return content !== "";
+  }, what);
+  return content;
+}
+
 async function tempDir(tag: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `repro-bg-${tag}-`));
   cleanups.push(() => fs.rm(dir, { recursive: true, force: true }));
@@ -82,18 +98,41 @@ async function tempDir(tag: string): Promise<string> {
 // the wrapper's trap wrote with 143. Fixed: the exit code survives (noclobber publish). Still
 // open (#5481): the stop still signals the group.
 
+/**
+ * The wrapper records its exit with the shell's `echo $? > exit_code`, so the marker exists,
+ * empty, from the redirect's create until the write. A slow host can stretch that window.
+ * Spawns started inside `run` get an exported `echo` function that holds the exit code 3 until
+ * `gate` exists (bash imports it at start, so `run` may drop it once the spawn returned).
+ */
+async function withHeldMarkerWrite<T>(gate: string | undefined, run: () => Promise<T>): Promise<T> {
+  if (gate == null) return run();
+  const key = "BASH_FUNC_echo%%";
+  // The runner's own environment may already export an `echo` function: put it back afterwards.
+  const previous = process.env[key];
+  process.env[key] =
+    `() {  case "$1" in 3) while [ ! -e '${gate}' ]; do sleep 0.01; done;; esac; builtin echo "$@"\n}`;
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  }
+}
+
 describe("terminating a background process that already exited", () => {
-  async function spawnExited(tag: string) {
+  async function spawnExiting(tag: string, holdMarkerWriteUntil?: string) {
     const manager = new BackgroundProcessManager(await tempDir(`${tag}-root`));
     const ws = uniqueWorkspace(tag);
     cleanups.push(() => manager.cleanup(ws));
     // The wrapper exits 3 while a `sleep` it started keeps the process group alive. The stale
     // stop under test signals that PGID; holding it with our own process means the signal can
     // only reach this test's group, never a host process that reused the number.
-    const spawned = await manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30 & exit 3", {
-      cwd: process.cwd(),
-      displayName: "exits",
-    });
+    const spawned = await withHeldMarkerWrite(holdMarkerWriteUntil, () =>
+      manager.spawn(new LocalRuntime(process.cwd()), ws, "sleep 30 & exit 3", {
+        cwd: process.cwd(),
+        displayName: "exits",
+      })
+    );
     expect(spawned.success).toBe(true);
     if (!spawned.success) throw new Error(spawned.error);
     // PID === PGID (set -m); stop the group's sleep if the stop under test did not.
@@ -106,10 +145,55 @@ describe("terminating a background process that already exited", () => {
       return Promise.resolve();
     });
     const exitCodeFile = path.join(spawned.outputDir, "exit_code");
-    await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
-    expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
     return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
   }
+
+  /** The step every test of this block settles its exit with. */
+  async function expectExited(spawned: Awaited<ReturnType<typeof spawnExiting>>) {
+    expect(await readWhenWritten(spawned.exitCodeFile, "the wrapper's exit_code")).toBe("3");
+    return spawned;
+  }
+
+  async function spawnExited(tag: string) {
+    return expectExited(await spawnExiting(tag));
+  }
+
+  async function holdMarkerWrite(): Promise<string> {
+    const gate = path.join(await tempDir("gate"), "release");
+    // Registered after the folder's removal, so it runs first and frees a held wrapper.
+    cleanups.push(() => fs.writeFile(gate, ""));
+    return gate;
+  }
+
+  test("a marker the wrapper created but has not written yet reads as still running", async () => {
+    const gate = await holdMarkerWrite();
+    const { manager, processId, exitCodeFile } = await spawnExiting("term-empty", gate);
+    await waitFor(() => exists(exitCodeFile), "the created marker");
+    expect(await fs.readFile(exitCodeFile, "utf-8")).toBe("");
+    expect((await manager.getProcess(processId))?.status).toBe("running");
+    await fs.writeFile(gate, "");
+    await waitFor(
+      async () => (await manager.getProcess(processId))?.status === "exited",
+      "the exit after the write"
+    );
+    expect((await manager.getProcess(processId))?.exitCode).toBe(3);
+  }, 20_000);
+
+  test("the exit code is read once the wrapper wrote it, not once its marker exists", async () => {
+    const gate = await holdMarkerWrite();
+    const spawned = await spawnExiting("term-held", gate);
+    await waitFor(() => exists(spawned.exitCodeFile), "the created marker");
+    expect(await fs.readFile(spawned.exitCodeFile, "utf-8")).toBe("");
+    const exited = expectExited(spawned);
+    const raced = await Promise.race([
+      exited.then(() => "settled"),
+      Bun.sleep(150).then(() => "held"),
+    ]);
+    // Target assertion: reading an empty marker must not count as the exit.
+    expect(raced).toBe("held");
+    await fs.writeFile(gate, "");
+    expect((await exited).processId).toBe(spawned.processId);
+  }, 20_000);
 
   test("control: once the status was refreshed, a stop keeps the real exit code", async () => {
     const { manager, processId, exitCodeFile } = await spawnExited("term-ctl");
@@ -118,7 +202,7 @@ describe("terminating a background process that already exited", () => {
       success: true,
     });
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-  });
+  }, 20_000);
 
   test("a stop after a natural exit does not overwrite the exit code", async () => {
     const { manager, processId, exitCodeFile } = await spawnExited("term");
@@ -483,8 +567,7 @@ describe("#5465 case 1: a refused migration whose command outlives the kill join
       },
       mockToolCallOptions
     ) as Promise<BashToolResult>;
-    await waitFor(() => exists(pidFile), "the foreground command");
-    pid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+    pid = Number(await readWhenWritten(pidFile, "the foreground command's pid"));
     expect(pid).toBeGreaterThan(1);
     // The seal a removal or archive holds (workspaceService.ts) while its cleanup() runs.
     using _seal = failMigration ? undefined : manager.sealAdmissions(ws);

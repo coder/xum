@@ -5199,6 +5199,52 @@ describe("WorkspaceStore", () => {
       unsubscribe();
     });
 
+    it("invalidates streaming-stats cache on tool-call-start so the token count includes the tool's args", async () => {
+      // A tool-call-start adds its input tokens to the live count. Without a bump, a subscriber
+      // that read the stats before the event kept "~0 tokens" until the next delta, so a
+      // transcript's token readout depended on whether React rendered between the two events.
+      const workspaceId = "tool-call-start-invalidates-stats";
+      const streamModel = "anthropic:claude-opus-4-6";
+
+      const send = openChat(workspaceId);
+      recreateStore();
+      await tick(0);
+      createAndAddWorkspace(store, workspaceId);
+
+      const messageId = "tool-call-start-stats-message";
+      await send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        model: streamModel,
+        historySequence: 1,
+        startTime: 1_000,
+      });
+      await send({ type: "caught-up", historyReplayStatus: "complete" });
+
+      let notifications = 0;
+      const unsubscribe = store.subscribeStreamingStats(workspaceId, () => {
+        notifications += 1;
+      });
+      expect(store.getWorkspaceStreamingStats(workspaceId)?.tokenCount).toBe(0);
+
+      await send({
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-call-start-stats-call",
+        toolName: "task_await",
+        args: { task_ids: ["task-a"], timeout_secs: 300 },
+        tokens: 5,
+        timestamp: 1_500,
+      });
+
+      expect(notifications).toBeGreaterThanOrEqual(1);
+      expect(store.getWorkspaceStreamingStats(workspaceId)?.tokenCount).toBe(5);
+
+      unsubscribe();
+    });
+
     it("invalidates streaming-stats cache on stream-start so the new turn never displays the prior turn's TPS", async () => {
       // Repro for "Streaming TPS starts with stale value": reconnect / hydration
       // paths drop aggregator.activeStreams via clearActiveStreams() WITHOUT
