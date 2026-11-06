@@ -1997,14 +1997,18 @@ function remoteServerUrls(
 ): string[] {
   return Object.values(servers).flatMap((info) => {
     if (info.transport === "stdio") return [];
-    if (reviewed === undefined) return [info.url];
-    const name = info.plugin?.serverName;
-    const consented =
-      name !== undefined && Object.hasOwn(reviewed, name) ? reviewed[name] : undefined;
-    return consented !== undefined && consented === info.plugin?.consentFingerprint
-      ? [info.url]
-      : [];
+    return reviewed === undefined || holdsFingerprint(reviewed, info) ? [info.url] : [];
   });
+}
+
+/** The row's consent record for this server is the fingerprint that the server has now. */
+function holdsFingerprint(
+  reviewed: Readonly<Record<string, string>>,
+  info: MCPServerInfo
+): boolean {
+  const name = info.plugin?.serverName;
+  if (name === undefined || !Object.hasOwn(reviewed, name)) return false;
+  return reviewed[name] === info.plugin?.consentFingerprint;
 }
 
 /**

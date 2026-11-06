@@ -154,6 +154,30 @@ export function installMethodShaFor(
   return installMethod !== undefined ? { installMethodSha: lockedSha } : {};
 }
 
+/**
+ * Record (or, for a second row of the same name, clear) the saved method of one identified row.
+ * The method needs only the row's identity, not a full schema pass: a row that a newer build made
+ * invalid (an unknown source kind) still names the manifest that its install reviewed, and loading
+ * another one would run hooks that were trusted for that other manifest during a downgrade.
+ * Imports and consent fail closed on their own. Two rows of one name leave no way to tell which
+ * method is meant, so the choice is cleared.
+ */
+function recordSavedMethod(
+  into: { methodByName: Map<string, SavedInstallMethod>; methodMovedByName: Set<string> },
+  name: string,
+  raw: unknown,
+  duplicate: boolean
+): void {
+  if (duplicate) {
+    into.methodByName.delete(name);
+    into.methodMovedByName.delete(name);
+    return;
+  }
+  const method = readStoredInstallMethod(raw);
+  if (method !== undefined) into.methodByName.set(name, method);
+  if (installMethodMoved(raw)) into.methodMovedByName.add(name);
+}
+
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(registryFile: string): Promise<{
   byName: Map<string, AgentPluginImportedComponents | undefined>;
@@ -200,19 +224,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
         installedAtByName.set(name, parsed.data.installedAt);
       }
-      // The saved method needs only the row's identity, not a full schema pass: a row that a newer
-      // build made invalid (an unknown source kind) still names the manifest that its install
-      // reviewed, and loading another one would run hooks that were trusted for that other manifest
-      // during a downgrade. Imports and consent fail closed on their own. Two rows of one name leave
-      // no way to tell which method is meant, so the choice is cleared.
-      if (duplicate) {
-        methodByName.delete(name);
-        methodMovedByName.delete(name);
-      } else {
-        const method = readStoredInstallMethod(raw);
-        if (method !== undefined) methodByName.set(name, method);
-        if (installMethodMoved(raw)) methodMovedByName.add(name);
-      }
+      recordSavedMethod({ methodByName, methodMovedByName }, name, raw, duplicate);
     }
     if (hasUnidentifiedEntries) {
       log.warn(
