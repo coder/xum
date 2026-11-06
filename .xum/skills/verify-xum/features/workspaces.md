@@ -98,8 +98,7 @@ Preconditions:
 
   ```bash
   mkdir -p "$VERIFY_XUM_EVIDENCE/workspaces"
-  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
-    node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list >"$VERIFY_XUM_EVIDENCE/workspaces/cli-list.txt"
+  verify-xum.sh cli workspace list >"$VERIFY_XUM_EVIDENCE/workspaces/cli-list.txt"
   ```
 
   The file has the titles `Verify playground` and `release-notes`.
