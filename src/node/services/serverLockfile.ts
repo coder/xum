@@ -1,3 +1,4 @@
+import { constants as fsConstants } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
@@ -132,7 +133,11 @@ export class ServerLockfile {
     if (data.pid === process.pid) {
       return ownedLocks.get(this.lockPath) === data.startedAt ? data : null;
     }
-    return (await answersAsXumBackend(data.baseUrl)) ? data : null;
+    if (!(await answersAsXumBackend(data.baseUrl))) return null;
+    // A restart can replace the lock while the probe waits. Hand out the lock that was asked
+    // only if it is still the lock: a caller must not send its token to the successor.
+    const current = await readLockFile(this.lockPath);
+    return current?.pid === data.pid && current.startedAt === data.startedAt ? data : null;
   }
 
   /**
@@ -141,10 +146,10 @@ export class ServerLockfile {
    * starter's acquire(), and deleting that lock would leave the running backend undiscoverable.
    *
    * No unlink can test who owns the file it removes, so this renames the lock out of the way
-   * first, then reads whose it was. A lock that was not ours is renamed back, unless a newer one
-   * was written meanwhile. (A backend that acquires between that check and the rename back is
-   * overwritten by the older live lock: both backends run, and readers find the older one.)
-   * Only rename() is used, because the lock's folder can be on a file system without hard links.
+   * first, then reads whose it was. A lock that was not ours is copied back, and the copy fails
+   * if a newer lock took the path meanwhile (COPYFILE_EXCL creates the file only if it is absent,
+   * and, unlike link(), needs no hard-link support from the lock's file system). A reader that
+   * looks while the copy runs can see a partial file and treat it as no lock.
    */
   async release(): Promise<void> {
     const startedAt = ownedLocks.get(this.lockPath);
@@ -157,18 +162,15 @@ export class ServerLockfile {
       return; // no lock there (or none we can move): nothing of ours to delete
     }
     const taken = await readLockFile(aside);
-    const isOurs = taken?.pid === process.pid && taken.startedAt === startedAt;
-    const newerExists = await fs.access(this.lockPath).then(
-      () => true,
-      () => false
-    );
-    if (isOurs || newerExists || taken == null) {
-      await fs.unlink(aside).catch(() => undefined);
-      return;
+    if (taken != null && (taken.pid !== process.pid || taken.startedAt !== startedAt)) {
+      // Someone else's lock. If it cannot be put back, `aside` stays, so it is not lost.
+      const settled = await fs.copyFile(aside, this.lockPath, fsConstants.COPYFILE_EXCL).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => error.code === "EEXIST"
+      );
+      if (!settled) return;
     }
-    // Someone else's lock, and the path is free: put it back. If that fails, `aside` stays, so
-    // the lock is not lost.
-    await fs.rename(aside, this.lockPath).catch(() => undefined);
+    await fs.unlink(aside).catch(() => undefined);
   }
 
   /**

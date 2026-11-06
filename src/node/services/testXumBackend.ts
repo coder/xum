@@ -26,14 +26,16 @@ export interface FakeBackend {
 
 export async function startFakeBackend(
   mode: FakeBackendMode,
-  options: { prefix?: string } = {}
+  options: { prefix?: string; onRequest?: () => Promise<void> } = {}
 ): Promise<FakeBackend> {
   const prefix = options.prefix ?? "";
   const requests: FakeBackend["requests"] = [];
   const sockets = new Set<Socket>();
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers });
     if (mode === "hang") return;
+    // A test that changes the world while the request is pending (a restart during the probe).
+    await options.onRequest?.();
     if (mode === "xum" && req.method === "GET" && req.url === `${prefix}/version`) {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ git_commit: "abc", git_describe: "v0.0.0-test", mode: "server" }));
