@@ -1063,6 +1063,186 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
+  describe("save cost with many unrelated workspaces", () => {
+    // At 7,550 registered workspaces one settings save took up to 34.6 s: each
+    // save realpathed every registered checkout to find sharers, looked up a
+    // legacy value once per workspace with a registry scan each, and rewrote
+    // the whole config.json although nothing in it changed.
+    function isInside(target: unknown, dirs: readonly string[]): boolean {
+      const spelled = String(target);
+      return dirs.some((dir) => spelled === dir || spelled.startsWith(dir + path.sep));
+    }
+
+    async function registerLocalWorkspaces(
+      cfg: Config,
+      entries: ReadonlyArray<{ dir: string; id: string; parentWorkspaceId?: string }>
+    ): Promise<void> {
+      await Promise.all(entries.map((entry) => fs.mkdir(entry.dir, { recursive: true })));
+      await cfg.editConfig((current) => {
+        for (const entry of entries) {
+          const project = current.projects.get(entry.dir) ?? { workspaces: [] };
+          project.workspaces.push({
+            path: entry.dir,
+            id: entry.id,
+            name: entry.id,
+            runtimeConfig: { type: "local" },
+            // Present, as on a real registration: a missing one is migrated by a config write.
+            createdAt: "2026-11-06T00:00:00.000Z",
+            ...(entry.parentWorkspaceId ? { parentWorkspaceId: entry.parentWorkspaceId } : {}),
+          });
+          current.projects.set(entry.dir, project);
+        }
+        return current;
+      });
+    }
+
+    async function countSaveWork(unrelatedCount: number) {
+      const root = await fs.mkdtemp(path.join(tempDir, `scale-${unrelatedCount}-`));
+      const cfg = new Config(path.join(root, "home"));
+      const unrelated = Array.from({ length: unrelatedCount }, (_, index) => ({
+        dir: path.join(root, `unrelated-${index}`),
+        id: `unrelated-${index}`,
+      }));
+      await registerLocalWorkspaces(cfg, [{ dir: path.join(root, "written"), id: "written" }]);
+      await registerLocalWorkspaces(cfg, unrelated);
+      const service = new WorkspaceMcpOverridesService(cfg);
+      const internals = service as unknown as {
+        getLegacyOverridesFromConfig: (...args: never[]) => unknown;
+      };
+      const legacySpy = spyOn(internals, "getLegacyOverridesFromConfig");
+      const editSpy = spyOn(cfg, "editConfig");
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "written",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        const unrelatedDirs = unrelated.map((entry) => entry.dir);
+        return {
+          legacyLookups: legacySpy.mock.calls.length,
+          configEdits: editSpy.mock.calls.length,
+          unrelatedRealpaths: realpathSpy.mock.calls.filter(([target]) =>
+            isInside(target, unrelatedDirs)
+          ).length,
+        };
+      } finally {
+        realpathSpy.mockRestore();
+        editSpy.mockRestore();
+        legacySpy.mockRestore();
+      }
+    }
+
+    it("a save does no per-workspace work for unrelated workspaces", async () => {
+      const few = await countSaveWork(2);
+      const many = await countSaveWork(24);
+      // No unrelated checkout is touched, nothing in config.json changes, and
+      // the legacy lookups do not grow with the registry.
+      expect(many.unrelatedRealpaths).toBe(0);
+      expect(many.configEdits).toBe(0);
+      expect(many.legacyLookups).toBe(few.legacyLookups);
+    });
+
+    it("a save checks only legacy-carrying workspaces for legacy retirement", async () => {
+      // A legacy config.json value on a workspace that shares the checkout
+      // must be retired (see the shared-save tests above), so carriers are
+      // still canonicalized. Workspaces without one are not.
+      const carrierDir = path.join(tempDir, "legacy-carrier");
+      const others = Array.from({ length: 6 }, (_, index) => ({
+        dir: path.join(tempDir, `no-legacy-${index}`),
+        id: `no-legacy-${index}`,
+      }));
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "legacy-writer"), id: "legacy-writer" },
+        { dir: carrierDir, id: "legacy-carrier" },
+        ...others,
+      ]);
+      const legacy = { enabledServers: ["shots"] };
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const entry = project.workspaces.find((w) => w.id === "legacy-carrier");
+          if (entry) entry.mcp = legacy;
+        }
+        return cfg;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "legacy-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        const touched = realpathSpy.mock.calls.map(([target]) => target);
+        expect(touched.some((target) => isInside(target, [carrierDir]))).toBe(true);
+        expect(
+          touched.filter((target) =>
+            isInside(
+              target,
+              others.map((entry) => entry.dir)
+            )
+          )
+        ).toEqual([]);
+      } finally {
+        realpathSpy.mockRestore();
+      }
+      // The carrier is on another checkout: its legacy value stays.
+      const stored = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === "legacy-carrier");
+      expect(stored?.mcp).toEqual(legacy);
+    });
+
+    it("publication reaches only workspaces the receiver holds state for, and their ancestors", async () => {
+      // A workspace the receiver holds no state for reads disk on its next
+      // serve, so canonicalizing its checkout to find out whether it shares
+      // the written one buys nothing. Cached aliases and the cold ancestors
+      // of cached workspaces still count: an inheriting descendant of a
+      // sharer resolves from the written document.
+      const realDir = path.join(tempDir, "hint-real");
+      const linkHot = path.join(tempDir, "hint-link-hot");
+      const linkCold = path.join(tempDir, "hint-link-cold");
+      const linkParent = path.join(tempDir, "hint-link-parent");
+      const childDir = path.join(tempDir, "hint-child");
+      await fs.mkdir(realDir, { recursive: true });
+      for (const link of [linkHot, linkCold, linkParent]) await fs.symlink(realDir, link);
+      await registerLocalWorkspaces(config, [
+        { dir: realDir, id: "hint-writer" },
+        { dir: linkHot, id: "hint-hot-alias" },
+        { dir: linkCold, id: "hint-cold-alias" },
+        { dir: linkParent, id: "hint-cold-parent-alias" },
+        { dir: childDir, id: "hint-hot-child", parentWorkspaceId: "hint-cold-parent-alias" },
+      ]);
+      const hot = new Set(["hint-hot-alias", "hint-hot-child"]);
+      const service = new WorkspaceMcpOverridesService(config);
+      const published: Array<[string, unknown]> = [];
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "hint-writer",
+          { disabledServers: ["shots"] },
+          {
+            publish: (persisted, workspaceId) => {
+              published.push([workspaceId, persisted]);
+              return Promise.resolve();
+            },
+            hasSnapshot: (workspaceId) => hot.has(workspaceId),
+          }
+        );
+        expect(realpathSpy.mock.calls.filter(([target]) => isInside(target, [linkCold]))).toEqual(
+          []
+        );
+      } finally {
+        realpathSpy.mockRestore();
+      }
+      const disabled = { disabledServers: ["shots"] };
+      expect(published).toContainEqual(["hint-writer", disabled]);
+      expect(published).toContainEqual(["hint-hot-alias", disabled]);
+      expect(published).toContainEqual(["hint-hot-child", disabled]);
+      expect(published.map(([id]) => id)).not.toContain("hint-cold-alias");
+    });
+  });
+
   describe("fork copy", () => {
     it("copies the raw source document verbatim into the fork checkout", async () => {
       const service = new WorkspaceMcpOverridesService(config);

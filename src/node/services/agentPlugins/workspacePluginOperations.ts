@@ -254,6 +254,10 @@ export async function setWorkspaceMcpOverrides(
                   : context.mcpServerManager.forgetWorkspaceOverrides(target)
               )
             : context.mcpServerManager.applyWorkspaceOverrides(target, persisted),
+        // Lets publication skip workspaces the manager holds nothing for
+        // instead of canonicalizing every registered checkout per save.
+        hasSnapshot: (workspaceId) =>
+          context.mcpServerManager.hasWorkspaceOverridesSnapshot(workspaceId),
       }
     );
     return { success: true as const, data: undefined };

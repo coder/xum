@@ -94,7 +94,9 @@ export interface PluginSweepOptions {
    * serve reads disk). The sweep then skips publication for a workspace whose
    * own override files it did not rewrite: thousands of such publications
    * made installs on large configs (6,302 workspaces) exhaust the sweep's
-   * budget and fail. Omitted (or true) keeps the full publication.
+   * budget and fail. Omitted (or true) keeps the full publication. Saves pass
+   * it too. With it, publication looks for checkout sharers only among the
+   * workspaces it reports true for and their ancestors (see withCachedState).
    */
   hasSnapshot?: (workspaceId: string) => boolean;
 }
@@ -127,6 +129,38 @@ function isColdRefresh(
     isHostLocalRuntimeConfig(step.metadata.runtimeConfig) &&
     hasSnapshot?.(step.metadata.id) === false
   );
+}
+
+/**
+ * The sharer candidates a publication canonicalizes when its receiver reports
+ * its state (hasSnapshot): the workspaces it holds state for, and their
+ * ancestors (a cached descendant of a sharer resolves from the written
+ * document). Every other workspace reads disk on its next serve, so whether
+ * it shares the written checkout changes nothing it serves, and a first
+ * serve already in flight there re-reads once the write's epoch bump fails
+ * its postflight (see bumpOverridesEpoch). Scanning them all cost one
+ * realpath per registered checkout on every save (7,550 on one host).
+ */
+function withCachedState(
+  all: readonly FrontendWorkspaceMetadata[],
+  hasSnapshot: (workspaceId: string) => boolean
+): FrontendWorkspaceMetadata[] {
+  const parentsOf = new Map<string, string[]>();
+  for (const m of all) {
+    if (m.parentWorkspaceId == null) continue;
+    const parents = parentsOf.get(m.id);
+    if (parents) parents.push(m.parentWorkspaceId);
+    else parentsOf.set(m.id, [m.parentWorkspaceId]);
+  }
+  const keep = new Set<string>();
+  const pending = all.filter((m) => hasSnapshot(m.id)).map((m) => m.id);
+  // `keep` also ends a corrupted parent cycle.
+  for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
+    if (keep.has(id)) continue;
+    keep.add(id);
+    pending.push(...(parentsOf.get(id) ?? []));
+  }
+  return all.filter((m) => keep.has(m.id));
 }
 
 /** One workspace a plugin-key sweep pruned, as its publication phase needs it. */
@@ -1243,6 +1277,24 @@ function groupMetadataById(
   return grouped;
 }
 
+/**
+ * Each workspace id's legacy config.json `workspace.mcp` value, in one pass:
+ * the FIRST entry registering the id decides, as in
+ * getLegacyOverridesFromConfig (which scans the whole registry per call).
+ */
+function legacyOverridesById(
+  config: ProjectsConfig
+): Map<string, WorkspaceMCPOverrides | undefined> {
+  const byId = new Map<string, WorkspaceMCPOverrides | undefined>();
+  for (const [, project] of config.projects) {
+    for (const workspace of project.workspaces) {
+      if (workspace.id !== undefined && !byId.has(workspace.id))
+        byId.set(workspace.id, workspace.mcp);
+    }
+  }
+  return byId;
+}
+
 export class WorkspaceMcpOverridesService {
   /**
    * Root holding the cross-process coordination state (override epoch file,
@@ -1316,6 +1368,23 @@ export class WorkspaceMcpOverridesService {
       onlyIfEquals?: WorkspaceMCPOverrides;
     }
   ): Promise<void> {
+    // Every save calls this, and editConfig rewrites the whole config.json
+    // even when the transform changes nothing (at 7,550 workspaces each save
+    // then re-serialized, and every later read re-parsed, the registry). Skip
+    // the edit when the stored config holds no value to clear; an unreadable
+    // config falls through to the edit, as before.
+    let stored: ProjectsConfig | undefined;
+    try {
+      stored = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch {
+      stored = undefined;
+    }
+    if (
+      stored !== undefined &&
+      this.getLegacyOverridesFromConfig(workspaceId, stored) === undefined
+    ) {
+      return;
+    }
     const expected =
       options?.onlyIfEquals === undefined ? undefined : JSON.stringify(options.onlyIfEquals);
     await this.config.editConfig((config) => {
@@ -2420,7 +2489,7 @@ export class WorkspaceMcpOverridesService {
     published = new Set<string>(),
     /** Shared by a batch sweep; a single save gets its own (see PublicationBudget). */
     budget: PublicationBudget = createPublicationBudget(),
-    /** A plugin-key sweep's hint (PluginSweepOptions.hasSnapshot); saves pass none. */
+    /** The receiver's state hint (PluginSweepOptions.hasSnapshot). */
     hasSnapshot?: PluginSweepOptions["hasSnapshot"]
   ): Promise<void> {
     try {
@@ -2623,7 +2692,7 @@ export class WorkspaceMcpOverridesService {
       const scan = await this.findCheckoutSharers(
         written,
         writtenPath,
-        all,
+        hasSnapshot === undefined ? all : withCachedState(all, hasSnapshot),
         snapshot,
         budget.remaining(),
         published
@@ -4092,6 +4161,8 @@ export class WorkspaceMcpOverridesService {
        * writer's publication and leave the cache holding the older snapshot.
        */
       publish?: OverridesPublisher;
+      /** The publish receiver's state hint, as for the plugin-key sweep (PluginSweepOptions.hasSnapshot). */
+      hasSnapshot?: PluginSweepOptions["hasSnapshot"];
     }
   ): Promise<void> {
     assert(overrides && typeof overrides === "object", "overrides must be an object");
@@ -4384,7 +4455,10 @@ export class WorkspaceMcpOverridesService {
             resolved.authoritative ? resolved.overrides : null,
             options.publish,
             canonicalPath,
-            afterRemoval
+            afterRemoval,
+            undefined,
+            undefined,
+            options.hasSnapshot
           );
         } finally {
           await afterRemoval.settleSideEffects();
@@ -4418,7 +4492,16 @@ export class WorkspaceMcpOverridesService {
     await retireSharersLegacy();
     await this.ensureOverridesGitignored(runtime, workspacePath, metadata.runtimeConfig);
     if (options?.publish) {
-      await this.publishEffectiveOverrides(workspaceId, normalized, options.publish, canonicalPath);
+      await this.publishEffectiveOverrides(
+        workspaceId,
+        normalized,
+        options.publish,
+        canonicalPath,
+        undefined,
+        undefined,
+        undefined,
+        options.hasSnapshot
+      );
     }
   }
 
@@ -4440,20 +4523,19 @@ export class WorkspaceMcpOverridesService {
     /** Fields this build does not own from the sharers' legacy values (see opaqueLegacyFieldsOf); carried into the written document. */
     opaqueFields: Record<string, unknown>;
   }> {
-    const legacyConfig = snapshot.loadLegacyConfig();
+    const legacyById = legacyOverridesById(snapshot.loadLegacyConfig());
     const all = await snapshot.loadAllMetadata();
-    const carriesLegacy = (m: FrontendWorkspaceMetadata): boolean =>
-      this.getLegacyOverridesFromConfig(m.id, legacyConfig) !== undefined;
-    const none = { sharerIds: [], opaqueFields: {} };
-    // Legacy values are pre-migration leftovers: skip the (realpath-heavy)
-    // sharer scan entirely when no other workspace carries one.
-    if (!all.some((m) => m.id !== written.id && carriesLegacy(m))) {
-      return none;
+    // Legacy values are pre-migration leftovers, and only a carrier's sharing
+    // matters here: canonicalize the carriers, never every registered
+    // checkout (one realpath each made saves at 7,550 workspaces take seconds).
+    const carriers = all.filter((m) => m.id !== written.id && legacyById.get(m.id) !== undefined);
+    if (carriers.length === 0) {
+      return { sharerIds: [], opaqueFields: {} };
     }
     const scan = await this.findCheckoutSharers(
       written,
       writtenPath,
-      all,
+      carriers,
       snapshot,
       PUBLICATION_TIMEOUT_MS,
       new Set([workspaceId])
@@ -4463,18 +4545,16 @@ export class WorkspaceMcpOverridesService {
         "Could not verify which workspaces share this checkout while other workspaces still carry legacy MCP settings; the settings were not saved. Retry."
       );
     }
-    const unverified = scan.indeterminate.filter(carriesLegacy);
+    const unverified = scan.indeterminate;
     if (unverified.length > 0) {
       throw new Error(
         `Workspace(s) ${unverified.map((m) => m.id).join(", ")} may share this checkout and still carry legacy MCP settings that could not be verified; the settings were not saved. Retry.`
       );
     }
-    const sharers = scan.sharers.filter(carriesLegacy);
+    const sharers = scan.sharers;
     const opaqueFields: Record<string, unknown> = {};
     for (const sharer of sharers) {
-      const fields = opaqueLegacyFieldsOf(
-        this.getLegacyOverridesFromConfig(sharer.id, legacyConfig)
-      );
+      const fields = opaqueLegacyFieldsOf(legacyById.get(sharer.id));
       if (fields === undefined) {
         throw new Error(
           `Workspace ${sharer.id} shares this checkout and carries MCP settings written by a newer version of Xum in a form this version cannot preserve; the settings were not saved. Upgrade Xum to edit them.`
