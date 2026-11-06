@@ -598,10 +598,11 @@ class ConfigSnapshot {
    * list fails on its own in the sweep (metadata not found).
    *
    * A degraded entry whose config row names no runtime gets the default worktree runtime (its
-   * real one may sit in the unreadable metadata.json). Sweeping that derived host checkout is
-   * still safe: the sweep removes only this plugin instance's keys, which are stale consent in any
-   * file, and plugin servers never run off-host. Skipping or failing the entry instead would leave
-   * a real stale enable in place, or refuse every install again.
+   * real one may sit in the unreadable metadata.json), and the sweep prunes the checkout at the
+   * row's persisted path. That is still safe: the sweep removes only this plugin instance's keys,
+   * which are stale consent in any file, and plugin servers never run off-host. Skipping or
+   * failing the entry instead would leave a real stale enable in place, or refuse every install
+   * again.
    */
   loadSweepMetadata(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
     return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
