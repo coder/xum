@@ -108,6 +108,52 @@ describe("ReasoningMessage", () => {
     expect(strongSummary?.textContent).toBe("Collecting context");
   });
 
+  // Unicode tag characters are default-ignorables: the row paints nothing, yet reasoning is replayed
+  // to the provider from this part's own text and providerMetadata, so a payload spelled with them
+  // reached the model while the transcript showed an empty trace.
+  describe("unicode tag characters", () => {
+    const tags = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+    test("reveals a payload in the collapsed summary line", () => {
+      const message = createReasoningMessage(`checking${tags("AB")}\nSecond line details`);
+
+      const { getByText } = render(<ReasoningMessage message={message} />);
+
+      expect(getByText("checking<U+E0041><U+E0042>")).toBeDefined();
+    });
+
+    test("reveals a payload inside a leading-bold summary", () => {
+      const message = createReasoningMessage(`**read${tags("XY")}**\nSecond line details`);
+
+      const { container } = render(<ReasoningMessage message={message} />);
+
+      expect(container.querySelector("strong")?.textContent).toBe("read<U+E0058><U+E0059>");
+    });
+
+    test("reveals a payload in the expanded trace", () => {
+      const message = createReasoningMessage(`Summary line\nstep one${tags("AB")}`);
+
+      const { getByText, queryByText } = render(<ReasoningMessage message={message} />);
+
+      // Collapsed: the trace is not mounted yet, so there is nothing to assert on.
+      expect(queryByText(/step one/)).toBeNull();
+
+      fireEvent.click(getByText("Summary line"));
+
+      // The markdown stand-in echoes the content it was handed, which is what reaches the renderer.
+      expect(queryByText(/step one<U\+E0041><U\+E0042>/)).not.toBeNull();
+    });
+
+    test("leaves ordinary reasoning text untouched", () => {
+      const message = createReasoningMessage("Checking the failing test\nSecond line details");
+
+      const { container } = render(<ReasoningMessage message={message} />);
+
+      expect(container.textContent).not.toContain("<U+");
+    });
+  });
+
   // The reasoning content container is the single <div> with these characteristic
   // font + opacity classes; the header icon's aria-hidden is on an SVG, so we
   // specifically target the text container.

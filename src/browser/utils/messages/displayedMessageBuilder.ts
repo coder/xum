@@ -467,7 +467,10 @@ function buildUserDisplayedMessages(options: {
  * characters are in for the same reason — a persisted U+0007 (BEL) is neither whitespace nor
  * default-ignorables but draws no glyph, and the review-text guard already classifies them as
  * invisible. Same class family as `agentPluginReviewText.ts`. NBSP is `\s` to `trim`, so it needs
- * no extra branch.
+ * no extra branch. U+2800 BRAILLE PATTERN BLANK is in as well: it is braille's SPACE, so it is a
+ * letter-like character that none of the three classes covers, yet a part made only of them paints
+ * an empty run of cells (`UNSAFE_TEXT` in openaiExtension already lists it as rendering blank). A
+ * braille passage with real cells in it is not blank-only and keeps its row.
  *
  * Unicode MARKS are deliberately NOT in here. `\p{M}` looks like the invisible-without-a-base
  * class, but it also covers spacing marks (`General_Category=Mc`, e.g. U+0903 DEVANAGARI SIGN
@@ -487,7 +490,7 @@ function buildUserDisplayedMessages(options: {
  * The provider request path drops whitespace-only parts too (`dropEmptyText` in
  * modelMessageTransform); the transcript must not render a gap the model never saw.
  */
-const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}\p{Cc}]*$/u;
+const NO_PAINTABLE_CONTENT = /^[\s\p{Default_Ignorable_Code_Point}\p{Cc}\u2800]*$/u;
 
 function hasDisplayText(text: unknown): boolean {
   if (typeof text !== "string") return false;

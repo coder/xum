@@ -1,5 +1,6 @@
 import React from "react";
 import type { DisplayedMessage } from "@/common/types/message";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
 import { useStickyExpand } from "./useStickyExpand";
 import { normalizeReasoningMarkdown } from "./MarkdownStyles";
@@ -67,6 +68,16 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
       ? `${summaryLineRaw.slice(0, MAX_SUMMARY_CHARS)}…`
       : summaryLineRaw;
   const parsedLeadingBoldSummary = parseLeadingBoldSummary(summaryLine);
+  // Structure above parses the stored bytes; the marks below are for reading only. Reasoning
+  // replays to the provider from this part's own text and providerMetadata, so a payload encoded
+  // in tag characters is model-visible while the row would otherwise draw nothing.
+  const displayedSummaryLine = revealUnicodeTags(summaryLine);
+  const displayedBoldSummary = parsedLeadingBoldSummary
+    ? {
+        boldText: revealUnicodeTags(parsedLeadingBoldSummary.boldText),
+        trailingText: revealUnicodeTags(parsedLeadingBoldSummary.trailingText),
+      }
+    : null;
   const hasAdditionalLines = hasContent && /[\r\n]/.test(trimmedContent);
   // OpenAI models often emit terse, single-line traces; surface them inline instead of hiding behind the label.
   const isSingleLineTrace = !isStreaming && hasContent && !hasAdditionalLines;
@@ -115,7 +126,7 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
 
     return (
       <TypewriterMarkdown
-        content={normalizedContent}
+        content={revealUnicodeTags(normalizedContent)}
         isComplete={!isStreaming}
         preserveLineBreaks
         streamKey={message.historyId}
@@ -157,13 +168,13 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
               </Shimmer>
             ) : hasContent ? (
               <span className={cn("truncate whitespace-nowrap text-text", REASONING_FONT_CLASSES)}>
-                {parsedLeadingBoldSummary ? (
+                {displayedBoldSummary ? (
                   <>
-                    <strong>{parsedLeadingBoldSummary.boldText}</strong>
-                    {parsedLeadingBoldSummary.trailingText}
+                    <strong>{displayedBoldSummary.boldText}</strong>
+                    {displayedBoldSummary.trailingText}
                   </>
                 ) : (
-                  summaryLine
+                  displayedSummaryLine
                 )}
               </span>
             ) : (

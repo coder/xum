@@ -50,6 +50,22 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     }
   });
 
+  test("drops a text row made only of braille blank cells", () => {
+    // U+2800 is braille's SPACE: a letter-like character that is not whitespace, default-ignorable
+    // or a control, so none of the other classes catch it -- yet a run of them paints an empty gap.
+    for (const blank of ["\u2800", "\u2800\u2800\u2800", " \u2800"]) {
+      const displayed = rows([{ type: "text", text: blank }, FAILED_BASH]);
+      expect(displayed.map((row) => row.type)).toEqual(["tool"]);
+    }
+  });
+
+  test("keeps a braille passage, whose blank cells are spaces inside real content", () => {
+    // \u2813\u2815\u2800\u280a spells "he l" -- dropping this would delete rendered text.
+    const displayed = rows([{ type: "text", text: "\u2813\u2815\u2800\u280a" }, FAILED_BASH]);
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+  });
+
   test("keeps content that merely contains invisible characters or emoji", () => {
     // ZWJ, variation selectors and skin-tone modifiers are default-ignorables or
     // marks, so a predicate over classes must not mistake the sequence for one.
