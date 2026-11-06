@@ -135,7 +135,8 @@ describe("setWorkspaceMcpOverrides", () => {
         });
         unrelatedRealpaths = realpathSpy.mock.calls.filter(([target]) =>
           unrelated.some(
-            (entry) => String(target) === entry.dir || String(target).startsWith(entry.dir + path.sep)
+            (entry) =>
+              String(target) === entry.dir || String(target).startsWith(entry.dir + path.sep)
           )
         ).length;
       } finally {
