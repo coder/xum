@@ -24,6 +24,44 @@ const VersionAnswerSchema = z.object({ mode: z.literal("server"), git_describe: 
  */
 export type BackendProbe = "answers" | "silent" | "no";
 
+/** The client for a URL's scheme, or null for a scheme that is not plain http(s). */
+function clientFor(url: URL): typeof http | typeof https | null {
+  if (url.protocol === "https:") return https;
+  return url.protocol === "http:" ? http : null;
+}
+
+/** `GET <baseUrl>/version` as a URL, or null when `baseUrl` cannot be used. */
+function versionUrl(baseUrl: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  if (clientFor(url) == null || url.username !== "" || url.password !== "") return null;
+  // The base URL can carry a path prefix (a reverse proxy mount), so append rather than resolve.
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/version`;
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
+/** Whether a response is a 200 with a `/version` answer of a xum server, read within a size cap. */
+function isVersionResponse(response: http.IncomingMessage): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    if (response.statusCode !== 200) return resolve(false);
+    const chunks: Buffer[] = [];
+    let size = 0;
+    response.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_ANSWER_BYTES) return resolve(false);
+      chunks.push(chunk);
+    });
+    response.on("end", () => resolve(isVersionAnswer(Buffer.concat(chunks).toString("utf8"))));
+    response.on("error", () => resolve(false));
+  });
+}
+
 /**
  * Asks the lock's `baseUrl` whether a xum backend runs there. peek() uses it only where the
  * lock's process identity cannot decide: macOS, Windows, and locks that an older build wrote.
@@ -37,41 +75,19 @@ export function probeXumBackend(
   baseUrl: string,
   timeoutMs: number = XUM_BACKEND_PROBE_TIMEOUT_MS
 ): Promise<BackendProbe> {
+  const url = versionUrl(baseUrl);
+  const client = url == null ? null : clientFor(url);
+  if (url == null || client == null) return Promise.resolve("no");
   return new Promise<BackendProbe>((resolve) => {
-    let url: URL;
-    try {
-      url = new URL(baseUrl);
-    } catch {
-      return resolve("no");
-    }
-    const client = url.protocol === "https:" ? https : url.protocol === "http:" ? http : null;
-    if (client == null || url.username !== "" || url.password !== "") return resolve("no");
-    // The base URL can carry a path prefix (a reverse proxy mount), so append rather than resolve.
-    url.pathname = `${url.pathname.replace(/\/+$/, "")}/version`;
-    url.search = "";
-    url.hash = "";
-
     const timeout = AbortSignal.timeout(timeoutMs);
     let connected = false;
     let responded = false;
     const request = client.get(url, { signal: timeout }, (response) => {
       responded = true;
-      const settle = (answer: BackendProbe) => {
-        resolve(answer);
+      void isVersionResponse(response).then((isVersion) => {
+        resolve(isVersion ? "answers" : "no");
         request.destroy();
-      };
-      if (response.statusCode !== 200) return settle("no");
-      const chunks: Buffer[] = [];
-      let size = 0;
-      response.on("data", (chunk: Buffer) => {
-        size += chunk.length;
-        if (size > MAX_ANSWER_BYTES) return settle("no");
-        chunks.push(chunk);
       });
-      response.on("end", () =>
-        settle(isVersionAnswer(Buffer.concat(chunks).toString("utf8")) ? "answers" : "no")
-      );
-      response.on("error", () => settle("no"));
     });
     request.on("socket", (socket) => {
       if (socket.connecting) socket.once("connect", () => (connected = true));
