@@ -244,6 +244,18 @@ describe("StreamEndLedger decisions", () => {
     expect(t.ledger.findStreamEndDecision(TASK, ATTEMPT)).toBeUndefined();
   });
 
+  test("a nonreport decision of an attempt whose row reads reported resolves indeterminate", () => {
+    const t = harness();
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", undefined, ATTEMPT);
+    const otherDecision = t.ledger.registerStreamEndDecision(TASK, "m2", undefined, OTHER);
+    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("indeterminate");
+    // A report of another attempt says nothing about this one.
+    expect(t.ledger.resolveStreamEndDecision(TASK, otherDecision, "nonreport")).toBe(true);
+    expect(otherDecision?.outcome).toBe("nonreport");
+  });
+
   test("a reported row resolves the attempt's decision indeterminate", () => {
     const t = harness();
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", undefined, ATTEMPT);

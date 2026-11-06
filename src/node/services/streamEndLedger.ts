@@ -258,17 +258,25 @@ export class StreamEndLedger {
     outcome: Exclude<StreamEndDecision["outcome"], "pending">
   ): boolean {
     if (decision?.outcome !== "pending") return false;
-    decision.outcome = outcome;
+    // `nonreport` says the attempt continues. A row that already reads this attempt's completed
+    // report (another backend's, or adopted from its artifact, landing before this stream's
+    // handler ran) contradicts that: held follow-ups are refused as for any unconfirmed outcome,
+    // never run as a new turn of a reported attempt (#7003).
+    const resolved =
+      outcome === "nonreport" && this.rowReportsAttempt(taskId, decision.attemptId)
+        ? "indeterminate"
+        : outcome;
+    decision.outcome = resolved;
     // A stream that published (or may have published) the report ends the attempt WITH a report:
     // it can never produce a no-report receipt, even after this decision is pruned below.
-    if (outcome !== "nonreport" && decision.attempt != null) {
+    if (resolved !== "nonreport" && decision.attempt != null) {
       decision.attempt.receiptEligible = false;
     }
     log.debug("[task-attempt] stream-end decision resolved", {
       taskId,
       attemptId: decision.attemptId,
       messageId: decision.messageId,
-      outcome,
+      outcome: resolved,
     });
     this.pruneStreamEndDecisions(taskId);
     // A stop record of this attempt waits for the decision (recheckWorkspaceStopRelease).
@@ -350,6 +358,15 @@ export class StreamEndLedger {
     return true;
   }
 
+  /** The task's row reads a completed report bound to `attemptId`. */
+  private rowReportsAttempt(taskId: string, attemptId: string): boolean {
+    const workspace = findWorkspaceEntry(
+      this.deps.config().loadConfigOrDefault(),
+      taskId
+    )?.workspace;
+    return workspace?.taskAttemptId === attemptId && hasCompletedAgentReport(workspace);
+  }
+
   /**
    * The row reads a completed report for `attemptId` (#7003): that attempt reported, possibly on
    * another backend. Its pending stream-end decision (`decision`, else the attempt's) resolves
@@ -361,12 +378,7 @@ export class StreamEndLedger {
     attemptId: string | undefined,
     decision?: StreamEndDecision
   ): boolean {
-    if (attemptId == null) return false;
-    const workspace = findWorkspaceEntry(
-      this.deps.config().loadConfigOrDefault(),
-      taskId
-    )?.workspace;
-    if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
+    if (attemptId == null || !this.rowReportsAttempt(taskId, attemptId)) return false;
     this.resolveStreamEndDecision(
       taskId,
       decision ?? this.findStreamEndDecision(taskId, attemptId),

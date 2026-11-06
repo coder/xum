@@ -50,6 +50,7 @@ const model = "openai:gpt-5.2";
 
 interface Internals {
   attemptLedger: {
+    addAttemptSettlementListener: (taskId: string, listener: () => void) => void;
     ownedAttemptByTaskId: Map<string, { attemptId?: string }>;
     attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
     admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
@@ -945,6 +946,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       const stack = await createStack(childId, undefined, { workspaceGoalService: goals });
       const { taskService, svc, workspaceService, completions, sendOptions } = stack;
+      // Only the deferred stream end registers here (no Stop waits on this attempt).
+      const deferrals = spyOn(svc.attemptLedger, "addAttemptSettlementListener");
       try {
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
         const attemptA = entryOf(config, childId)!.taskAttemptId!;
@@ -956,11 +959,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
         ).toEqual(Ok(undefined));
         stack.endStream(0, {}, true);
-        await until(
-          () =>
-            svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
-          "deferred decision"
-        );
+        // The decision is registered pending at the event tick, before the handler runs: only the
+        // handler's deferral shows that this test reaches the deferred path (#7003).
+        await until(() => deferrals.mock.calls.length > 0, "deferred stream end");
         await yieldMacrotasks(30);
         expect(
           svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
