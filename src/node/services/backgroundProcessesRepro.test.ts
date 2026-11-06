@@ -91,7 +91,8 @@ async function tempDir(tag: string): Promise<string> {
 async function withHeldMarkerWrite<T>(gate: string | undefined, run: () => Promise<T>): Promise<T> {
   if (gate == null) return run();
   const key = "BASH_FUNC_echo%%";
-  process.env[key] = `() {  case "$1" in 3) while [ ! -e '${gate}' ]; do sleep 0.01; done;; esac; builtin echo "$@"\n}`;
+  process.env[key] =
+    `() {  case "$1" in 3) while [ ! -e '${gate}' ]; do sleep 0.01; done;; esac; builtin echo "$@"\n}`;
   try {
     return await run();
   } finally {
@@ -128,9 +129,17 @@ describe("terminating a background process that already exited", () => {
     return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
   }
 
+  /** The marker exists, empty, between the shell's create and its write: wait for the code. */
   async function readExitMarker(exitCodeFile: string): Promise<string> {
-    await waitFor(() => exists(exitCodeFile), "the wrapper's exit_code");
-    return (await fs.readFile(exitCodeFile, "utf-8")).trim();
+    let code = "";
+    await waitFor(async () => {
+      code = await fs.readFile(exitCodeFile, "utf-8").then(
+        (content) => content.trim(),
+        () => ""
+      );
+      return code !== "";
+    }, "the wrapper's exit_code");
+    return code;
   }
 
   async function spawnExited(tag: string) {
@@ -166,7 +175,10 @@ describe("terminating a background process that already exited", () => {
     await waitFor(() => exists(exitCodeFile), "the created marker");
     expect(await fs.readFile(exitCodeFile, "utf-8")).toBe("");
     const code = readExitMarker(exitCodeFile);
-    const raced = await Promise.race([code.then(() => "settled"), Bun.sleep(150).then(() => "held")]);
+    const raced = await Promise.race([
+      code.then(() => "settled"),
+      Bun.sleep(150).then(() => "held"),
+    ]);
     // Target assertion: reading an empty marker must not count as the exit.
     expect(raced).toBe("held");
     await fs.writeFile(gate, "");
