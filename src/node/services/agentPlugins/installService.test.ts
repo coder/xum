@@ -20,7 +20,10 @@ import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken }
 import * as treeHash from "./treeHash";
 import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  ALL_WORKSPACES_TARGET,
+  WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
 import { CrossProcessLockTimeoutError } from "@/node/utils/main/crossProcessLock";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
@@ -7095,6 +7098,37 @@ describe("AgentPluginInstallService", () => {
       expect(await pathExists(installPath())).toBe(false);
     });
 
+    test("a sweep that drops cached overrides reaches the manager per workspace or for all", async () => {
+      // The sweep evicts one workspace's cache, or every cache when it cannot
+      // tell which are stale; a stale cache would keep serving the old enable.
+      const evicted: string[] = [];
+      const manager = {
+        stopServersWithKeyPrefix: () => Promise.resolve(),
+        forgetAllWorkspaceOverrides: () => void evicted.push("all"),
+        forgetWorkspaceOverrides: (workspaceId: string) => void evicted.push(workspaceId),
+      } as unknown as MCPServerManager;
+      const sweeping: Pick<WorkspaceMcpOverridesService, "prunePluginOverrideKeysForWorkspaces"> = {
+        prunePluginOverrideKeysForWorkspaces: async (_ids, _prefix, options) => {
+          await options?.publish?.(null, ALL_WORKSPACES_TARGET);
+          await options?.publish?.(null, "ws-1");
+          // A failure ends the install early: nothing else touches the manager.
+          return [{ workspaceId: "ws-1", error: new Error("stop here") }];
+        },
+      };
+      const service = new AgentPluginInstallService(config, {
+        mcpServerManager: manager,
+        workspaceMcpOverridesService: sweeping as WorkspaceMcpOverridesService,
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await service.preview({ input: remoteDir });
+
+      await rejectionMessage(
+        service.install({ source: preview.source, expectedSha: preview.lockedSha })
+      );
+
+      expect(evicted).toEqual(["all", "ws-1"]);
+    });
+
     describe("a refusal says why the override cleanup failed", () => {
       // Retry advice alone left a user stuck on a file that stays too large,
       // and the reason was only in the log. Each cause gets its own advice.
@@ -7167,7 +7201,7 @@ describe("AgentPluginInstallService", () => {
 
           const refusal = await refuse();
 
-          expect(refusal).toContain("ws-1");
+          expect(refusal).toContain("1 workspace (ws-1)");
           expect(refusal).toContain(docPath);
           expect(refusal).toMatch(/shrink/i);
           expect(refusal).not.toMatch(/retry/i);
@@ -7187,7 +7221,7 @@ describe("AgentPluginInstallService", () => {
           await releaseBusy();
         }
 
-        expect(refusal).toContain("ws-1");
+        expect(refusal).toContain("1 workspace (ws-1)");
         expect(refusal).toMatch(/retry/i);
         expect(refusal).not.toMatch(/shrink/i);
         // A busy workspace is a known cause, not the catch-all one.
@@ -8036,36 +8070,41 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
   });
 
-  test("a failed install hygiene sweep reports a count and at most 5 workspace IDs", async () => {
-    // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
-    // the error listed every ID. The log keeps one warning per workspace.
-    const ids = ["ws-1", "ws-2", "ws-3", "ws-4", "ws-5", "ws-6", "ws-7"];
-    const serviceWithOverrides = new AgentPluginInstallService(config, {
-      workspaceMcpOverridesService: overridesServiceStub(() =>
-        Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
-      ),
-    });
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
-      () =>
-        Promise.resolve(
-          ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
-        ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
-    );
-    try {
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      const install = serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
+  test.each([
+    [5, "5 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5)"],
+    [6, "6 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 1 more)"],
+    [7, "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"],
+  ])(
+    "a failed install hygiene sweep of %i workspaces reports a count and at most 5 workspace IDs",
+    async (count, listed) => {
+      // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
+      // the error listed every ID. The log keeps one warning per workspace.
+      const ids = Array.from({ length: count }, (_, index) => `ws-${index + 1}`);
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub(() =>
+          Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
+        ),
       });
-      await expect(install).rejects.toThrow(
-        "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        () =>
+          Promise.resolve(
+            ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
+          ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
       );
-      await expect(install).rejects.not.toThrow(/ws-6/);
-      expect(await registry()).toEqual([]);
-    } finally {
-      metadataSpy.mockRestore();
+      try {
+        const preview = await serviceWithOverrides.preview({ input: remoteDir });
+        const install = serviceWithOverrides.install({
+          source: preview.source,
+          expectedSha: preview.lockedSha,
+        });
+        await expect(install).rejects.toThrow(listed);
+        await expect(install).rejects.not.toThrow(/ws-6/);
+        expect(await registry()).toEqual([]);
+      } finally {
+        metadataSpy.mockRestore();
+      }
     }
-  });
+  );
 
   test("failed per-workspace prunes persist a tombstone that gates reinstall and self-heals", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));

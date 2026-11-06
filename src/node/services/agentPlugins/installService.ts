@@ -351,6 +351,7 @@ function listWithRest(items: readonly string[]): string {
 
 /** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
 function describeFailedWorkspaces(ids: readonly string[]): string {
+  // mutation-equivalent: both callers check `failed.length > 0` first, so an empty list never gets here
   assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
   const noun = ids.length === 1 ? "workspace" : "workspaces";
   return `${ids.length} ${noun} (${listWithRest(ids)})`;
@@ -398,17 +399,17 @@ function describeOversizedCauses(causes: readonly PruneCause[]): string[] {
     if (cause.kind === "oversized") files.add(cause.filePath);
   }
   if (files.size === 0) return [];
-  const pronoun = files.size === 1 ? "it" : "them";
   return [
-    `Override file over the size limit: ${listWithRest([...files])}. Shrink or remove ${pronoun}, then install again.`,
+    `Override file over the size limit: ${listWithRest([...files])}. Shrink or remove each, then install again.`,
   ];
 }
 
 function describeBusyCauses(causes: readonly PruneCause[]): string[] {
-  const busy = causes.filter((cause) => cause.kind === "busy").length;
-  if (busy === 0) return [];
-  const verb = busy === 1 ? "was" : "were";
-  return [`${busy} ${verb} busy with a rename or an MCP settings update. Retry in a moment.`];
+  const busy = causes.filter((cause) => cause.kind === "busy").map((cause) => cause.workspaceId);
+  if (busy.length === 0) return [];
+  return [
+    `Busy with a rename or an MCP settings update: ${listWithRest(busy)}. Retry in a moment.`,
+  ];
 }
 
 function describeOtherCauses(causes: readonly PruneCause[]): string[] {
