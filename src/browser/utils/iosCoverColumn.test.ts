@@ -78,6 +78,24 @@ function emulateDuo(meta: HTMLMetaElement) {
   return display;
 }
 
+const frames = async (count: number) => {
+  for (let i = 0; i < count; i++) {
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+  }
+};
+
+/** A vertical scroller with 500px of room, around `child`. */
+function wrapInScroller(child: Element, scrollTop: number): HTMLDivElement {
+  const scroller = document.createElement("div");
+  scroller.style.overflowY = "auto";
+  Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1000 });
+  Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 500 });
+  scroller.appendChild(child);
+  document.body.appendChild(scroller);
+  scroller.scrollTop = scrollTop;
+  return scroller;
+}
+
 function setStandalone(value: boolean | undefined) {
   Object.defineProperty(window.navigator, "standalone", { configurable: true, get: () => value });
 }
@@ -111,17 +129,24 @@ function touch(type: string, x: number, y: number): TouchEvent {
   });
 }
 
+/** A touch event at a point, stamped with the point's time (ms) when it has one. */
+function touchAt(type: string, point: { x: number; y: number; time?: number }): TouchEvent {
+  const event = touch(type, point.x, point.y);
+  if (point.time != null) Object.defineProperty(event, "timeStamp", { value: point.time });
+  return event;
+}
+
 /** A touch as WebKit delivers one in the column: targeted at the root, pointer events first. */
-function touchInColumn(path: Array<{ x: number; y: number }>) {
+function touchInColumn(path: Array<{ x: number; y: number; time?: number }>) {
   const root = document.documentElement;
   const first = path[0];
   const last = path[path.length - 1];
   if (!first || !last) throw new Error("a touch needs a point");
-  const events = [pointer("pointerdown", first.x, first.y), touch("touchstart", first.x, first.y)];
+  const events = [pointer("pointerdown", first.x, first.y), touchAt("touchstart", first)];
   for (const point of path.slice(1)) {
-    events.push(pointer("pointermove", point.x, point.y), touch("touchmove", point.x, point.y));
+    events.push(pointer("pointermove", point.x, point.y), touchAt("touchmove", point));
   }
-  events.push(pointer("pointerup", last.x, last.y), touch("touchend", last.x, last.y));
+  events.push(pointer("pointerup", last.x, last.y), touchAt("touchend", last));
   return events.map((event) => {
     root.dispatchEvent(event);
     return event;
@@ -193,16 +218,29 @@ describe("installIosCoverColumn", () => {
   test("undoes a sideways pan by laying the page out at device width for two frames", async () => {
     setStandalone(true);
     uninstall = installIosCoverColumn();
-    const frame = () => new Promise((resolve) => window.requestAnimationFrame(resolve));
 
     Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
     window.dispatchEvent(new window.Event("scroll"));
     expect(meta.content).toBe(DEVICE_WIDTH_META);
 
     Object.defineProperty(window, "scrollX", { configurable: true, value: 0 });
-    await frame();
-    await frame();
-    await frame();
+    await frames(3);
+    expect(meta.content).toStartWith("width=466, height=678,");
+
+    // A later pan heals the same way.
+    Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
+    window.dispatchEvent(new window.Event("scroll"));
+    expect(meta.content).toBe(DEVICE_WIDTH_META);
+  });
+
+  test("leaves the pan of a pinch zoom alone", () => {
+    setStandalone(true);
+    uninstall = installIosCoverColumn();
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: { scale: 2 } });
+
+    Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
+    window.dispatchEvent(new window.Event("scroll"));
+
     expect(meta.content).toStartWith("width=466, height=678,");
   });
 
@@ -229,16 +267,23 @@ describe("installIosCoverColumn", () => {
 
     test("clicks the element under the finger, and the page never sees the root as the target", () => {
       const seen: string[] = [];
-      button.addEventListener("pointerdown", () => seen.push("button pointerdown"));
-      button.addEventListener("click", () => seen.push("button click"));
-      document.addEventListener("pointerdown", (event) => {
-        if (event.target === document.documentElement) seen.push("root pointerdown");
-      });
+      // Where React listens: the replayed events must bubble up to it.
+      for (const type of ["pointerdown", "touchstart", "pointerup", "touchend", "click"]) {
+        document.addEventListener(type, (event) => {
+          seen.push(`${type} on ${event.target === button ? "button" : "something else"}`);
+        });
+      }
 
       const events = touchInColumn([{ x: 430, y: 600 }]);
 
       expect(hitTests).toContainEqual({ x: 346, y: 600 });
-      expect(seen).toEqual(["button pointerdown", "button click"]);
+      expect(seen).toEqual([
+        "pointerdown on button",
+        "touchstart on button",
+        "pointerup on button",
+        "touchend on button",
+        "click on button",
+      ]);
       // WebKit's own click for the tap would land somewhere else.
       expect(events.find((event) => event.type === "touchend")?.defaultPrevented).toBe(true);
     });
@@ -261,14 +306,33 @@ describe("installIosCoverColumn", () => {
       expect(clicks).toBe(0);
     });
 
+    test("still clicks a tap that wobbles a little, as fingers do", () => {
+      let clicks = 0;
+      button.addEventListener("click", () => clicks++);
+
+      touchInColumn([
+        { x: 430, y: 600 },
+        { x: 433, y: 604 },
+      ]);
+
+      expect(clicks).toBe(1);
+    });
+
+    test("does not click a press the browser cancelled", () => {
+      let clicks = 0;
+      button.addEventListener("click", () => clicks++);
+      const root = document.documentElement;
+
+      root.dispatchEvent(pointer("pointerdown", 430, 600));
+      root.dispatchEvent(touch("touchstart", 430, 600));
+      root.dispatchEvent(pointer("pointercancel", 430, 600));
+      root.dispatchEvent(touch("touchend", 430, 600));
+
+      expect(clicks).toBe(0);
+    });
+
     test("scrolls what is under the finger, which iOS does not, and cancels the press", () => {
-      const scroller = document.createElement("div");
-      scroller.style.overflowY = "auto";
-      Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1000 });
-      Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 500 });
-      scroller.appendChild(button);
-      document.body.appendChild(scroller);
-      scroller.scrollTop = 300;
+      const scroller = wrapInScroller(button, 300);
       const seen: string[] = [];
       for (const type of ["pointercancel", "click"]) {
         button.addEventListener(type, () => seen.push(type));
@@ -286,6 +350,42 @@ describe("installIosCoverColumn", () => {
       expect(seen).toEqual(["pointercancel"]);
     });
 
+    test("keeps a flick gliding after the finger lifts, but not a slow drag", async () => {
+      const scroller = wrapInScroller(button, 300);
+
+      touchInColumn([
+        { x: 430, y: 600, time: 0 },
+        { x: 430, y: 630, time: 30 },
+        { x: 430, y: 660, time: 60 },
+      ]);
+      const flickReleasedAt = scroller.scrollTop;
+      await frames(3);
+      expect(scroller.scrollTop).toBeLessThan(flickReleasedAt);
+
+      touchInColumn([
+        { x: 430, y: 600, time: 1000 },
+        { x: 430, y: 630, time: 2000 },
+        { x: 430, y: 660, time: 3000 },
+      ]);
+      const dragReleasedAt = scroller.scrollTop;
+      await frames(3);
+      expect(scroller.scrollTop).toBe(dragReleasedAt);
+    });
+
+    test("scrolls the scroller around one that is already at its end", () => {
+      const inner = wrapInScroller(button, 0);
+      const outer = wrapInScroller(inner, 300);
+
+      touchInColumn([
+        { x: 430, y: 600 },
+        { x: 430, y: 640 },
+        { x: 430, y: 660 },
+      ]);
+
+      expect(inner.scrollTop).toBe(0);
+      expect(outer.scrollTop).toBeLessThan(300);
+    });
+
     test("leaves touches left of the column to WebKit", () => {
       let clicks = 0;
       button.addEventListener("click", () => clicks++);
@@ -298,29 +398,60 @@ describe("installIosCoverColumn", () => {
     });
   });
 
-  test("blocks a sideways drag that would only pan the page", () => {
-    setStandalone(true);
-    uninstall = installIosCoverColumn();
-    const target = document.createElement("div");
-    document.body.appendChild(target);
-    const start = new window.Touch({ identifier: 1, target, clientX: 200, clientY: 300 });
-    const moved = new window.Touch({ identifier: 1, target, clientX: 120, clientY: 304 });
+  describe("a drag left of the column", () => {
+    let target: HTMLDivElement;
 
-    target.dispatchEvent(
-      new window.TouchEvent("touchstart", {
-        bubbles: true,
-        touches: [start],
-        targetTouches: [start],
-      })
-    );
-    const move = new window.TouchEvent("touchmove", {
-      bubbles: true,
-      cancelable: true,
-      touches: [moved],
-      targetTouches: [moved],
+    beforeEach(() => {
+      setStandalone(true);
+      target = document.createElement("div");
+      document.body.appendChild(target);
     });
-    target.dispatchEvent(move);
 
-    expect(move.defaultPrevented).toBe(true);
+    /** Drags from (200, 300) by (dx, dy); returns whether the move was prevented. */
+    function drag(dx: number, dy: number): boolean {
+      const start = new window.Touch({ identifier: 1, target, clientX: 200, clientY: 300 });
+      const moved = new window.Touch({
+        identifier: 1,
+        target,
+        clientX: 200 + dx,
+        clientY: 300 + dy,
+      });
+      target.dispatchEvent(
+        new window.TouchEvent("touchstart", {
+          bubbles: true,
+          touches: [start],
+          targetTouches: [start],
+        })
+      );
+      const move = new window.TouchEvent("touchmove", {
+        bubbles: true,
+        cancelable: true,
+        touches: [moved],
+        targetTouches: [moved],
+      });
+      target.dispatchEvent(move);
+      return move.defaultPrevented;
+    }
+
+    test("is blocked when it would only pan the page sideways", () => {
+      uninstall = installIosCoverColumn();
+
+      expect(drag(-80, 4)).toBe(true);
+    });
+
+    test("is left to iOS when it scrolls something", () => {
+      wrapInScroller(target, 300);
+      uninstall = installIosCoverColumn();
+
+      expect(drag(4, -80)).toBe(false);
+    });
+
+    test("is left to iOS on the inner display, which has no column", () => {
+      uninstall = installIosCoverColumn();
+      display.current = INNER;
+      window.dispatchEvent(new window.Event("resize"));
+
+      expect(drag(-80, 4)).toBe(false);
+    });
   });
 });
