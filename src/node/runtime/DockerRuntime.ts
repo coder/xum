@@ -66,6 +66,9 @@ function sanitizeContainerUserId(rawValue: string): string {
   return /^\d+$/.test(trimmedValue) ? trimmedValue : "0";
 }
 
+/** The command that prints the home of the container's default user, as `docker exec` runs it. */
+const PRINT_HOME = "sh -c 'echo $HOME'";
+
 interface ContainerUserInfo {
   uid: string;
   gid: string;
@@ -456,7 +459,7 @@ export class DockerRuntime extends RemoteRuntime {
     // Before createWorkspace there is no container to ask.
     if (this.containerName === undefined) return "/root";
 
-    const probe = await this.probeContainerHome(this.containerName);
+    const probe = await runDockerCommand(`exec ${this.containerName} ${PRINT_HOME}`, 5000);
     const home = probe.stdout.trim();
     if (probe.exitCode !== 0 || home === "") {
       throw new RuntimeError(
@@ -655,13 +658,6 @@ export class DockerRuntime extends RemoteRuntime {
     return { action: "skip" };
   }
 
-  private probeContainerHome(
-    containerName: string,
-    abortSignal?: AbortSignal
-  ): Promise<DockerCommandResult> {
-    return runDockerCommand(`exec ${containerName} sh -c 'echo $HOME'`, 5000, abortSignal);
-  }
-
   protected async detectContainerUser(
     containerName: string,
     abortSignal?: AbortSignal
@@ -669,7 +665,7 @@ export class DockerRuntime extends RemoteRuntime {
     const [uidResult, gidResult, homeResult] = await Promise.all([
       runDockerCommand(`exec ${containerName} id -u`, 5000, abortSignal),
       runDockerCommand(`exec ${containerName} id -g`, 5000, abortSignal),
-      this.probeContainerHome(containerName, abortSignal),
+      runDockerCommand(`exec ${containerName} ${PRINT_HOME}`, 5000, abortSignal),
     ]);
 
     return {
