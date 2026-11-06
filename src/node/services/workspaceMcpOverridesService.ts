@@ -1416,23 +1416,6 @@ export class WorkspaceMcpOverridesService {
       onlyIfEquals?: WorkspaceMCPOverrides;
     }
   ): Promise<void> {
-    // Every save calls this, and editConfig rewrites the whole config.json
-    // even when the transform changes nothing (at 7,550 workspaces each save
-    // then re-serialized, and every later read re-parsed, the registry). Skip
-    // the edit when the stored config holds no value to clear; an unreadable
-    // config falls through to the edit, as before.
-    let stored: ProjectsConfig | undefined;
-    try {
-      stored = this.config.loadConfigOrDefault({ throwOnError: true });
-    } catch {
-      stored = undefined;
-    }
-    if (
-      stored !== undefined &&
-      this.getLegacyOverridesFromConfig(workspaceId, stored) === undefined
-    ) {
-      return;
-    }
     const expected =
       options?.onlyIfEquals === undefined ? undefined : JSON.stringify(options.onlyIfEquals);
     await this.config.editConfig((config) => {

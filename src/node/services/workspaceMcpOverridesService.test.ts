@@ -6,6 +6,7 @@ import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-p
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import { withProjectRegistrationFileLock } from "@/node/config/projectRegistrationLock";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -1106,9 +1107,8 @@ describe("WorkspaceMcpOverridesService", () => {
 
   describe("save cost with many unrelated workspaces", () => {
     // At 7,550 registered workspaces one settings save took up to 34.6 s: each
-    // save realpathed every registered checkout to find sharers, looked up a
-    // legacy value once per workspace with a registry scan each, and rewrote
-    // the whole config.json although nothing in it changed.
+    // save realpathed every registered checkout to find sharers, and looked up
+    // a legacy value once per workspace with a registry scan each.
     function isInside(target: unknown, dirs: readonly string[]): boolean {
       const spelled = String(target);
       return dirs.some((dir) => spelled === dir || spelled.startsWith(dir + path.sep));
@@ -1127,7 +1127,7 @@ describe("WorkspaceMcpOverridesService", () => {
             id: entry.id,
             name: entry.id,
             runtimeConfig: { type: "local" },
-            // A missing createdAt is migrated by a config write, which would break configEdits === 0.
+            // A missing createdAt is migrated by an extra config write.
             createdAt: "2026-11-06T00:00:00.000Z",
             ...(entry.parentWorkspaceId ? { parentWorkspaceId: entry.parentWorkspaceId } : {}),
           });
@@ -1180,12 +1180,11 @@ describe("WorkspaceMcpOverridesService", () => {
       const few = await countSaveWork(2);
       const many = await countSaveWork(24);
       expect(many.unrelatedRealpaths).toBe(0);
-      expect(many.configEdits).toBe(0);
+      expect(many.configEdits).toBe(few.configEdits);
       expect(many.legacyLookups).toBe(few.legacyLookups);
       // An empty save takes the removal branch, which publishes on its own path.
       const cleared = await countSaveWork(24, {});
       expect(cleared.unrelatedRealpaths).toBe(0);
-      expect(cleared.configEdits).toBe(0);
     });
 
     it("a save checks only legacy-carrying workspaces for legacy retirement", async () => {
@@ -1479,26 +1478,34 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(scansWithOwnLegacy).toBe(await sharerScansOfSave("no-legacy-writer"));
     });
 
-    it("clearing a legacy value still edits config.json when the stored config cannot be read", async () => {
-      // An unreadable config must not read as "nothing to clear": the lenient
-      // loader degrades a read failure to an empty config.
+    it("the legacy clear sees a value another process commits under the config lock", async () => {
+      // A downgraded Xum can commit a legacy `workspace.mcp` value while it holds the
+      // cross-process config lock. The clear must read the config only after that hold ends,
+      // as its queued edit does: a check that read before it skipped the clear and left the
+      // value to come back over the user's save.
+      const dir = path.join(tempDir, "locked-legacy");
+      await registerLocalWorkspaces(config, [{ dir, id: "locked-legacy" }]);
       const service = new WorkspaceMcpOverridesService(config);
       const internals = service as unknown as {
         clearLegacyOverridesInConfig: (workspaceId: string) => Promise<void>;
       };
-      const empty = config.loadConfigOrDefault();
-      const loadSpy = spyOn(config, "loadConfigOrDefault").mockImplementation((options) => {
-        if (options?.throwOnError) throw new Error("EIO: config.json unreadable");
-        return { ...empty, projects: new Map() };
+      let clearing: Promise<void> | undefined;
+      await withProjectRegistrationFileLock(config.rootDir, async (lock) => {
+        clearing = internals.clearLegacyOverridesInConfig("locked-legacy");
+        await config.editConfig(
+          (cfg) => {
+            const entry = cfg.projects.get(dir)?.workspaces[0];
+            if (entry) entry.mcp = { enabledServers: ["shots"] };
+            return cfg;
+          },
+          { withinRegistrationLock: lock }
+        );
       });
-      const editSpy = spyOn(config, "editConfig").mockResolvedValue(undefined);
-      try {
-        await internals.clearLegacyOverridesInConfig("ws-unreadable");
-        expect(editSpy).toHaveBeenCalledTimes(1);
-      } finally {
-        editSpy.mockRestore();
-        loadSpy.mockRestore();
-      }
+      await clearing;
+      const stored = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === "locked-legacy");
+      expect(stored?.mcp).toBeUndefined();
     });
   });
 
