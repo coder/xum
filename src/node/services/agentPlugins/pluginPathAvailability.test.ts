@@ -25,7 +25,6 @@ const worktree = new WorktreeRuntime("/host/src", {
   projectPath: "/host/project",
   workspaceName: "ws",
 });
-// The type an SSH workspace reports (runtimeMode.test.ts), on the remote test double.
 const ssh = Object.create(remote, { mode: { value: "ssh" } }) as Runtime;
 
 describe("isPluginPathUsableFrom", () => {
