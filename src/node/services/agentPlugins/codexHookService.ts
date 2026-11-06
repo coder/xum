@@ -29,7 +29,12 @@ import { VERSION } from "@/version";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { isAgentToolsDisabled, isTerminalsDisabled } from "@/node/utils/agentToolsDisabled";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
-import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
+import {
+  discoverAgentPluginAt,
+  discoverAgentPlugins,
+  manifestChoiceFor,
+  type AgentPluginInfo,
+} from "./discovery";
 import { loadPluginHooks, type PluginHookDefinition } from "./codexHooks";
 import { registerCodexPluginHooks, type CodexHookRunnerDeps } from "./codexHookRunner";
 import { registerCursorPluginHooks, type CursorHookGate } from "./cursorHookRunner";
@@ -360,17 +365,18 @@ function instanceIdOf(plugin: AgentPluginInfo): string {
 }
 
 /**
- * The plugin as discovery reads it now: the same manifest choice (root plugin.json, or
- * .codex-plugin/plugin.json), Codex normalization, com.openai overlay and limits as the
- * registration snapshot (Codex PRRT_kwDOPxxmWM6r2lvb: a Codex-only package has no root
- * plugin.json). undefined when it is gone or no longer a valid plugin: the gate then skips the
- * hook.
+ * The plugin as discovery reads it now: the same manifest choice (the saved install method of its
+ * registry row, as the scan passed it, else the fixed order), Codex normalization, com.openai
+ * overlay and limits as the registration snapshot (Codex PRRT_kwDOPxxmWM6r2lvb: a Codex-only
+ * package has no root plugin.json). undefined when it is gone or no longer a valid plugin: the
+ * gate then skips the hook.
  */
 async function rediscover(plugin: AgentPluginInfo): Promise<AgentPluginInfo | undefined> {
   try {
     const { plugin: now } = await discoverAgentPluginAt({
       pluginDir: path.join(plugin.containerPath, plugin.dirName),
       scope: plugin.scope,
+      choice: manifestChoiceFor(plugin.installMethod),
     });
     return now ?? undefined;
   } catch (error) {

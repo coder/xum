@@ -222,7 +222,11 @@ describe("Cursor hooks through discovery", () => {
     for (const [relative, content] of Object.entries(outside ?? {})) {
       await fs.writeFile(path.join(tmp.path, relative), content);
     }
-    const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const { plugin, diagnostics } = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     return { plugin, diagnostics, tmp };
   }
 
@@ -248,7 +252,11 @@ describe("Cursor hooks through discovery", () => {
     const pluginDir = path.join(tmp.path, "plugins", "kit");
     await fs.mkdir(path.join(pluginDir, "hooks"), { recursive: true });
     await fs.symlink(outside, path.join(pluginDir, "hooks", "hooks.json"));
-    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.cursorHooks?.hooks).toEqual([]);
     expect(plugin?.cursorHooks?.warnings).toHaveLength(1);
     expect(plugin?.cursorHooks?.warnings[0]).toContain("hooks/hooks.json cannot be read");

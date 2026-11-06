@@ -214,3 +214,84 @@ function unwrap<T>(result: Result<T, string>): T {
     ).toBe(false);
   }, 60_000);
 });
+
+(shouldRunIntegrationTests() ? describe : describe.skip)(
+  "agent plugin install method choice",
+  () => {
+    let env: TestEnvironment;
+    let remote: string;
+
+    beforeAll(async () => {
+      env = await createTestEnvironment();
+      remote = await createTempGitRepo();
+      const files: Record<string, string> = {
+        "plugin.json": JSON.stringify({ name: "method-ipc" }),
+        ".codex-plugin/plugin.json": JSON.stringify({ name: "method-ipc" }),
+        ".claude-plugin/plugin.json": JSON.stringify({
+          name: "method-ipc",
+          agents: ["./.claude-plugin/agents/reviewer.md"],
+        }),
+        ".claude-plugin/agents/reviewer.md":
+          "---\nname: reviewer\ndescription: Reviews a design\n---\nReview it.\n",
+        "skills/greet/SKILL.md": "---\nname: greet\ndescription: Greets\n---\nHello.\n",
+      };
+      for (const [relative, content] of Object.entries(files)) {
+        await fs.mkdir(path.dirname(path.join(remote, relative)), { recursive: true });
+        await fs.writeFile(path.join(remote, relative), content);
+      }
+      using add = execFileAsync("git", ["-C", remote, "add", "."]);
+      await add.result;
+      using commit = execFileAsync("git", ["-C", remote, "commit", "-m", "Add manifests"]);
+      await commit.result;
+    });
+
+    afterAll(async () => {
+      if (env) await cleanupTestEnvironment(env);
+      if (remote) await cleanupTempGitRepo(remote);
+    });
+
+    it("offers each manifest, installs the chosen one and saves it in the registry row", async () => {
+      const offered = unwrap(
+        await env.orpc.agentPlugins.preview({ input: pathToFileURL(remote).href })
+      );
+      if (offered.kind !== "plugin") throw new Error("expected a plugin preview");
+      expect(offered.preview.methods).toEqual([
+        { kind: "agent-plugin" },
+        { kind: "claude-plugin" },
+      ]);
+      expect(offered.preview.method).toEqual({ kind: "agent-plugin" });
+
+      const picked = unwrap(
+        await env.orpc.agentPlugins.preview({
+          input: pathToFileURL(remote).href,
+          method: { kind: "claude-plugin" },
+        })
+      );
+      if (picked.kind !== "plugin") throw new Error("expected a plugin preview");
+      const preview = picked.preview;
+      expect(preview.agents).toEqual(["reviewer.md"]);
+      unwrap(
+        await env.orpc.agentPlugins.install({
+          source: preview.source,
+          method: preview.method,
+          expectedSha: preview.lockedSha,
+          expectedConsentDigest: preview.consentDigest,
+        })
+      );
+
+      const registry = JSON.parse(
+        await fs.readFile(path.join(env.config.rootDir, "plugins.json"), "utf8")
+      ) as {
+        plugins: {
+          name: string;
+          installMethod?: string;
+          componentConsent?: { agents: Record<string, string> };
+        }[];
+      };
+      const row = registry.plugins.find((entry) => entry.name === "method-ipc");
+      expect(row?.installMethod).toBe("claude-plugin");
+      // The Claude manifest's agent was reviewed at install: the Codex manifest has no agents.
+      expect(Object.keys(row?.componentConsent?.agents ?? {})).toEqual(["reviewer"]);
+    }, 60_000);
+  }
+);

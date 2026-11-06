@@ -42,6 +42,7 @@ import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations
 import {
   consumePendingPluginsSectionIntent,
   subscribePluginsSectionIntents,
+  updateNeedsReview,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
 import {
@@ -1348,6 +1349,35 @@ const ReviewedDefinitions: React.FC<{
   );
 };
 
+const UpdateRefusedPanel: React.FC<{
+  review: AgentPluginUpdateReview;
+  message: string;
+  busy: boolean;
+  onRemove: () => void;
+  onClose: () => void;
+}> = (props) => (
+  <div className="border-border-medium bg-background-secondary mt-2 space-y-2 rounded-md border p-3">
+    <div className="bg-warning/10 text-warning flex items-start gap-2 rounded-md px-3 py-2 text-xs">
+      <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      {/* The message quotes plugin text (validation errors): controls are marked, as in warnings. */}
+      <span className="min-w-0 break-words">{showOneLineControls(props.message)}</span>
+    </div>
+    <p className="text-muted text-xs">
+      Nothing was changed. The plugin stays on {props.review.fromSha.slice(0, 12)} and keeps
+      tracking its branch.
+    </p>
+    <div className="flex flex-wrap gap-2">
+      <Button variant="outline" size="sm" onClick={props.onRemove} disabled={props.busy}>
+        <Trash2 className="h-3.5 w-3.5" />
+        Remove plugin
+      </Button>
+      <Button variant="ghost" size="sm" onClick={props.onClose} disabled={props.busy}>
+        Close
+      </Button>
+    </div>
+  </div>
+);
+
 const UpdateReviewPanel: React.FC<{
   review: AgentPluginUpdateReview;
   mode: ReviewPanelMode;
@@ -1409,6 +1439,33 @@ const UpdateReviewPanel: React.FC<{
     </div>
   );
 };
+
+const UpdateReviewOrRefusal: React.FC<{
+  review: AgentPluginUpdateReview;
+  selective: boolean;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRemove: () => void;
+}> = (props) =>
+  props.review.refused !== undefined ? (
+    <UpdateRefusedPanel
+      review={props.review}
+      message={props.review.refused}
+      busy={props.busy}
+      onRemove={props.onRemove}
+      onClose={props.onCancel}
+    />
+  ) : (
+    <UpdateReviewPanel
+      review={props.review}
+      mode="update"
+      selective={props.selective}
+      busy={props.busy}
+      onConfirm={props.onConfirm}
+      onCancel={props.onCancel}
+    />
+  );
 
 /** How often the section re-lists while a pending sign-out record shows (the backend retries every 30 s). */
 const PENDING_SIGN_OUT_POLL_MS = 30_000;
@@ -1670,6 +1727,27 @@ const ComponentReviewRow: React.FC<{
   );
 };
 
+/** The badge of a managed row whose plugin is not loaded: gone from disk, or closed (B3). */
+function UnavailableBadge(props: { item: AgentPluginListItem }) {
+  if (!props.item.managed || props.item.present) return null;
+  return (
+    <Badge tone="error">
+      {props.item.closedReason !== undefined ? "needs reinstall" : "missing"}
+    </Badge>
+  );
+}
+
+/** Why a managed plugin loads nothing after an older Xum version updated it (B3). */
+function ClosedReasonNote(props: { reason: string | undefined }) {
+  if (props.reason === undefined) return null;
+  return (
+    <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
+      <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
+      <span className="min-w-0 break-words">{props.reason}</span>
+    </p>
+  );
+}
+
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [items, setItems] = useState<AgentPluginListItem[] | null>(null);
@@ -1876,7 +1954,7 @@ export const PluginsSettingsSection: React.FC = () => {
         setError(preview.error);
         return;
       }
-      if (preview.data.changes.length > 0) {
+      if (updateNeedsReview(preview.data)) {
         setUpdateReview(preview.data);
         return;
       }
@@ -2068,7 +2146,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       </span>
                       {item.version && <span className="text-muted text-xs">v{item.version}</span>}
                       {!item.managed && <Badge tone="muted">unmanaged</Badge>}
-                      {item.managed && !item.present && <Badge tone="error">missing</Badge>}
+                      <UnavailableBadge item={item} />
                       {check?.status === "update-available" && (
                         <Badge tone="accent">update available</Badge>
                       )}
@@ -2148,6 +2226,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     <p className="text-muted mt-1 text-xs">{item.description}</p>
                   )}
                   {item.interface && <PluginInterfaceDetails info={item.interface} />}
+                  <ClosedReasonNote reason={item.closedReason} />
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
                     {/* break-all: locations/sources can contain unbreakable
                         64-char tokens (max-length plugin names) that would
@@ -2197,13 +2276,16 @@ export const PluginsSettingsSection: React.FC = () => {
                     />
                   )}
                   {item.managed && updateReview?.name === item.name && (
-                    <UpdateReviewPanel
+                    <UpdateReviewOrRefusal
                       review={updateReview}
-                      mode="update"
                       selective={item.importedComponents !== undefined}
                       busy={isBusy}
                       onConfirm={() => void handleConfirmUpdate(updateReview)}
                       onCancel={() => setUpdateReview(null)}
+                      onRemove={() => {
+                        setUpdateReview(null);
+                        setUninstallTarget(item.name);
+                      }}
                     />
                   )}
                   <ComponentReviewRow

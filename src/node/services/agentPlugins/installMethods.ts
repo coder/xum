@@ -1,7 +1,7 @@
 /**
  * Install methods: how Xum reads a staged repository as a managed plugin.
  *
- * - `agent-plugin`: the repository's plugin.json (or .codex-plugin/plugin.json).
+ * - `agent-plugin`: the repository's plugin.json with `$schema` (or .codex-plugin/plugin.json).
  * - `claude-plugin`: its .claude-plugin/plugin.json.
  * - `cursor-plugin`: its .cursor-plugin/plugin.json.
  * - `skills`: SKILL.md folders only. Xum writes a plugin.json into the staged tree before the
@@ -11,6 +11,13 @@
  * - `cursor-marketplace`: one entry of a Cursor marketplace, for a preview only. The entry
  *   installs through its folder's own manifest; Xum writes none for it and refuses an entry
  *   whose folder has none.
+ *
+ * Which manifest methods are offered: each manifest file a repository has is one method
+ * (the table in discovery.ts, in the fixed order), except that a root plugin.json with `$schema`
+ * (a Xum-native package, which can load hooks.js and workflows/) is offered alone, so that no
+ * choice can hide code the review never showed. A manifest that fails validation is not offered.
+ * The install saves a manifest method in the registry row (`installMethod`), and an update keeps
+ * it: it refuses a commit that no longer fits the saved method (chooseUpdateMethod).
  *
  * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
  * Claude or Cursor manifest does not block `skills`: the generated root plugin.json wins by
@@ -24,7 +31,11 @@ import YAML from "yaml";
 import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
 import { SkillNameSchema } from "@/common/orpc/schemas";
-import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
+import {
+  SavedInstallMethodSchema,
+  type AgentPluginInstallMethod,
+  type SavedInstallMethod,
+} from "@/common/orpc/schemas/agentPlugins";
 import {
   AGENT_PLUGIN_NAME_MAX_LENGTH,
   isValidAgentPluginName,
@@ -34,12 +45,12 @@ import assert from "@/common/utils/assert";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import {
-  CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+  AGENT_PLUGIN_MANIFEST_TABLE,
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-  CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH,
   MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_MANIFEST_RELATIVE_PATH,
   ensurePluginPathContained,
+  manifestFilesOf,
   isSchemaLessRootManifest,
   readPluginFileWithinRootCapped,
 } from "./discovery";
@@ -285,43 +296,76 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 }
 
 export interface DetectedInstallMethods {
-  /** Every method that fits, in order: agent-plugin, claude-plugin or cursor-plugin, skills. */
+  /** Every method that fits, in order: the manifest methods, then skills. */
   methods: AgentPluginInstallMethod[];
   /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
   skillsRoots: SkillsPackageRoot[];
+  /**
+   * The root plugin.json is the package's own manifest (it has `$schema`, or discovery cannot
+   * read it): only `agent-plugin` is offered, and a saved Claude or Cursor method gives way.
+   */
+  nativeRoot: boolean;
+  /** The root plugin.json exists and has no `$schema`: it is never a method of its own. */
+  schemaLessRoot: boolean;
 }
 
 /**
- * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude or a
- * Cursor manifest. It uses discovery's own reader, which follows a symlink inside the tree and
- * refuses one that leaves it, so the method always names the manifest discovery loads. A refused
- * or unreadable file stays the own manifest: discovery then reports its error.
+ * True when discovery reads the root plugin.json as schema-less, so it yields to the other
+ * manifests. It uses discovery's own reader, which follows a symlink inside the tree and refuses
+ * one that leaves it, so the method always names the manifest discovery loads. A refused or
+ * unreadable file stays the own manifest: discovery then reports its error.
  */
 async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
   return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
 }
 
-/** The install methods that fit a staged tree (see the module comment for the rules). */
+/** The manifest files of the table that exist in the tree (an entry of any kind counts). */
+async function presentManifests(stagedDir: string): Promise<Set<string>> {
+  const present = new Set<string>();
+  for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
+    if (await entryExists(stagedDir, spec.relative)) present.add(spec.relative);
+  }
+  return present;
+}
+
+/**
+ * The manifest methods of the files that exist, in the table's order (the fixed order, so the
+ * first one is the method discovery loads). A schema-less root is never a method of its own
+ * (discovery rejects it): it counts only as the sole manifest, so that its validation error
+ * reaches the user.
+ */
+function manifestMethodKinds(present: Set<string>): SavedInstallMethod[] {
+  const kinds: SavedInstallMethod[] = [];
+  for (const spec of AGENT_PLUGIN_MANIFEST_TABLE) {
+    if (spec.relative === PLUGIN_MANIFEST_RELATIVE_PATH) continue;
+    if (present.has(spec.relative) && !kinds.includes(spec.method)) kinds.push(spec.method);
+  }
+  if (kinds.length === 0 && present.has(PLUGIN_MANIFEST_RELATIVE_PATH)) kinds.push("agent-plugin");
+  return kinds;
+}
+
 export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
-  // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
-  const rootEntry = await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH);
-  const claudeManifest = await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH);
-  const cursorManifest = await entryExists(stagedDir, CURSOR_PLUGIN_MANIFEST_RELATIVE_PATH);
-  // Discovery loads a Claude or Cursor manifest over a schema-less root plugin.json
-  // (selectManifest), so the method must be claude-plugin or cursor-plugin there, not agent-plugin.
-  const ownManifest =
-    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)) ||
-    (rootEntry &&
-      !((claudeManifest || cursorManifest) && (await rootManifestIsSchemaLess(stagedDir))));
+  const present = await presentManifests(stagedDir);
+  const rootEntry = present.has(PLUGIN_MANIFEST_RELATIVE_PATH);
+  const nativeRoot = rootEntry && !(await rootManifestIsSchemaLess(stagedDir));
+  const schemaLessRoot = rootEntry && !nativeRoot;
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
-  if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
-  const methods: AgentPluginInstallMethod[] = [];
-  if (claudeManifest) methods.push({ kind: "claude-plugin" });
-  // Discovery loads a Claude manifest before a Cursor one.
-  else if (cursorManifest) methods.push({ kind: "cursor-plugin" });
-  // A root entry that yields to the Claude or Cursor manifest still blocks the generated plugin.json.
-  if (!rootEntry && skillsRoots.length > 0) methods.push({ kind: "skills" });
-  return { methods, skillsRoots };
+  const methods: AgentPluginInstallMethod[] = nativeRoot
+    ? [{ kind: "agent-plugin" }]
+    : manifestMethodKinds(present).map((kind) => ({ kind }));
+  // A root entry or a Codex manifest blocks the generated plugin.json (Xum never shadows them).
+  const blocked = rootEntry || present.has(CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+  if (!nativeRoot && !blocked && skillsRoots.length > 0) methods.push({ kind: "skills" });
+  return { methods, skillsRoots, nativeRoot, schemaLessRoot };
+}
+
+export interface RejectedInstallMethod {
+  method: AgentPluginInstallMethod;
+  problem: string;
+}
+
+export interface CheckedInstallMethods extends DetectedInstallMethods {
+  rejected: RejectedInstallMethod[];
 }
 
 /** Which method a staged clone must use. */
@@ -331,11 +375,16 @@ export type InstallMethodRequest =
   /** Preview with a method, and install: exactly this one. */
   | { mode: "exact"; method: AgentPluginInstallMethod }
   /**
-   * Update: the repository's own manifest when it has one now, else the generator of the
+   * Update. With a saved method (B3): that method, or a refusal when the commit does not fit it.
+   * Without one: the repository's own manifest when it has one now, else the generator of the
    * installed plugin.json (`generatedFrom`), else a Claude manifest. A tree that only fits
    * `skills` does not update an install that Xum did not generate.
    */
-  | { mode: "update"; generatedFrom: GeneratedFrom | undefined };
+  | {
+      mode: "update";
+      generatedFrom: GeneratedFrom | undefined;
+      saved: SavedInstallMethod | undefined;
+    };
 
 /** The request of a preview or an install: the given method, or the first that fits. */
 export function installMethodRequest(
@@ -380,15 +429,20 @@ export function chooseInstallMethod(
       );
     }
     case "update":
-      return chooseUpdateMethod(methods, request.generatedFrom);
+      return chooseUpdateMethod(methods, request.generatedFrom, request.saved);
   }
 }
 
-/** See InstallMethodRequest's `update` mode. */
-function chooseUpdateMethod(
+/**
+ * See InstallMethodRequest's `update` mode. A saved method is the only candidate: when it does
+ * not fit, nothing replaces it (undefined), because the update would change what the user chose.
+ */
+export function chooseUpdateMethod(
   methods: AgentPluginInstallMethod[],
-  generated: GeneratedFrom | undefined
+  generated: GeneratedFrom | undefined,
+  saved: SavedInstallMethod | undefined
 ): AgentPluginInstallMethod | undefined {
+  if (saved !== undefined) return methods.find((method) => method.kind === saved);
   const own = methods.find((method) => method.kind === "agent-plugin");
   if (own !== undefined) return own;
   // A marketplace entry that now ships a Claude or Cursor manifest switches to it (the update
@@ -500,15 +554,19 @@ export interface MarketplaceEntryContext {
   rootSource: boolean;
 }
 
-/** The methods that read a folder's own manifest, so Xum writes no plugin.json for them. */
-const OWN_MANIFEST_METHOD_KINDS: ReadonlyArray<AgentPluginInstallMethod["kind"]> = [
-  "agent-plugin",
-  "claude-plugin",
-  "cursor-plugin",
-];
+/**
+ * The method a registry row saves for `method`: the methods that read a folder's own manifest.
+ * Generated methods keep their `generatedFrom` marker, and a marketplace entry installs through
+ * its folder's manifest with nothing saved.
+ */
+export function savedMethodOf(method: AgentPluginInstallMethod): SavedInstallMethod | undefined {
+  const saved = SavedInstallMethodSchema.safeParse(method.kind);
+  return saved.success ? saved.data : undefined;
+}
 
+/** The methods that read a folder's own manifest, so Xum writes no plugin.json for them. */
 export function isOwnManifestMethod(method: AgentPluginInstallMethod): boolean {
-  return OWN_MANIFEST_METHOD_KINDS.includes(method.kind);
+  return savedMethodOf(method) !== undefined;
 }
 
 /**
@@ -606,37 +664,129 @@ export interface StagedMethodChoice {
 }
 
 /**
+ * An update that Xum will not apply because the commit no longer fits the install (B5). Nothing
+ * is applied: the plugin stays on its commit and keeps tracking its branch.
+ */
+export class UpdateRefusedError extends Error {}
+
+function sentence(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
+function savedMethodMisfit(
+  saved: SavedInstallMethod,
+  checked: CheckedInstallMethods,
+  subpath: string | undefined
+): string {
+  const rejected = checked.rejected.find((entry) => entry.method.kind === saved);
+  if (rejected !== undefined)
+    return sentence(`${AGENT_PLUGIN_INSTALL_METHOD_LABELS[saved]}: ${rejected.problem}`);
+  const files = manifestFilesOf(saved, subpath);
+  if (saved === "agent-plugin" && checked.schemaLessRoot) {
+    // The commit lost the root's `$schema` and has no Codex manifest to fall back to.
+    return `${files[0]} has no $schema in this commit, and ${files[1]} is gone.`;
+  }
+  if (checked.nativeRoot) {
+    return `This commit has a plugin.json with $schema (a Xum-native package), which takes precedence over ${files.join(" and ")}.`;
+  }
+  return files.length === 1
+    ? `${files[0]} is gone in this commit.`
+    : `Neither ${files.join(" nor ")} is in this commit.`;
+}
+
+function updateRefusal(reason: string, methods: AgentPluginInstallMethod[]): UpdateRefusedError {
+  if (methods.length === 0) {
+    return new UpdateRefusedError(`${reason} No install method fits this commit.`);
+  }
+  const fits = methods.map(methodLabel).join(", ");
+  return new UpdateRefusedError(
+    `${reason} Methods that fit this commit: ${fits}. To switch, uninstall the plugin and install it again.`
+  );
+}
+
+function hasProblem(checked: CheckedInstallMethods, method: AgentPluginInstallMethod): boolean {
+  return checked.rejected.some((entry) => sameInstallMethod(entry.method, method));
+}
+
+/**
+ * The methods a request chooses among. A preview without a method and an update with a saved one
+ * choose among the methods that validate. A method asked for by name, and an update without a
+ * saved method, choose among the detected ones: a manifest that fails validation then says why,
+ * as it always has.
+ */
+function candidateMethods(
+  checked: CheckedInstallMethods,
+  fitting: AgentPluginInstallMethod[],
+  request: InstallMethodRequest
+): AgentPluginInstallMethod[] {
+  switch (request.mode) {
+    case "first":
+      return fitting;
+    case "update":
+      return request.saved !== undefined ? fitting : checked.methods;
+    case "exact": {
+      const detected = checked.methods.some((method) => sameInstallMethod(method, request.method));
+      return detected ? checked.methods : fitting;
+    }
+  }
+}
+
+function noMethodError(
+  checked: CheckedInstallMethods,
+  fitting: AgentPluginInstallMethod[],
+  request: InstallMethodRequest,
+  subpath: string | undefined
+): Error {
+  const saved = request.mode === "update" ? request.saved : undefined;
+  if (saved !== undefined)
+    return updateRefusal(savedMethodMisfit(saved, checked, subpath), fitting);
+  if (request.mode === "update" && checked.methods.length > 0) {
+    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
+    // into a generated skills install on update (InstallMethodRequest).
+    return updateRefusal(
+      "The repository no longer has the manifest this plugin was installed from.",
+      fitting
+    );
+  }
+  if (checked.rejected.length > 0) return new Error(checked.rejected[0].problem);
+  return new Error(noInstallMethodMessage(subpath));
+}
+
+/**
  * Choose the method of a staged tree (`marketplace`: the tree is that entry's folder). Throws
- * the message that names every format Xum looked for when none fits.
+ * the message that names every format Xum looked for when none fits, the problem of a method that
+ * failed validation when it is the one asked for, and an UpdateRefusedError when an update does
+ * not fit the install.
  */
 export async function chooseStagedMethod(
   stagedDir: string,
-  detected: DetectedInstallMethods,
+  checked: CheckedInstallMethods,
   request: InstallMethodRequest,
   source: Pick<AgentPluginGitSource, "url" | "subpath">,
   marketplace: MarketplaceEntryContext | undefined
 ): Promise<StagedMethodChoice> {
   if (marketplace !== undefined) {
-    const { methods, warnings } = entryInstallMethods(detected.methods, marketplace);
+    const { methods, warnings } = entryInstallMethods(checked.methods, marketplace);
     const method = chooseInstallMethod(methods, request);
     if (method === undefined) throw new Error(noEntryMethodMessage(marketplace.entry.name, source));
     // A marketplace entry is one plugin: the Skills CLI choice is for a whole repository.
     return { method, methods, warnings, skillsCliSkills: [] };
   }
-  const method = chooseInstallMethod(detected.methods, request);
-  if (method === undefined && request.mode === "update" && detected.methods.length > 0) {
-    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
-    // into a generated skills install on update (InstallMethodRequest).
-    throw new Error(
-      `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
-    );
-  }
-  if (method === undefined) throw new Error(noInstallMethodMessage(source.subpath));
-  const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
+  const fitting = checked.methods.filter((method) => !hasProblem(checked, method));
+  const method = chooseInstallMethod(candidateMethods(checked, fitting, request), request);
+  if (method === undefined) throw noMethodError(checked, fitting, request, source.subpath);
+  const problem = checked.rejected.find((entry) =>
+    sameInstallMethod(entry.method, method)
+  )?.problem;
+  if (problem !== undefined) throw new Error(problem);
+  const cli = await skillsCliSkillNames(stagedDir, checked.skillsRoots);
   return {
     method,
-    methods: detected.methods,
-    warnings: cli.warnings,
+    methods: fitting,
+    warnings: [
+      ...checked.rejected.map((entry) => `${methodLabel(entry.method)}: ${entry.problem}`),
+      ...cli.warnings,
+    ],
     skillsCliSkills: cli.names,
   };
 }

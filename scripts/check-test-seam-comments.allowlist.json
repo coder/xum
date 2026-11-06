@@ -1,5 +1,6 @@
 {
   "allowed": [
+    { "file": "src/node/services/agentPlugins/registry.ts", "symbol": "resetUnknownInstallMethodWarningForTests", "reason": "once-per-process warning flag reset hook named ...ForTests: registry.test.ts counts the unknown-install-method warning and must start from an unwarned process" },
     { "file": "src/browser/features/Messages/AutoModelRoutingBadge.tsx", "symbol": "buildAutoModelRoutingTooltipLines", "reason": "production caller: AutoModelRoutingBadge in the same file" },
     { "file": "src/browser/features/Messages/ModelFallbackBadge.tsx", "symbol": "buildModelFallbackTooltipLines", "reason": "production caller: ModelFallbackBadge in the same file" },
     { "file": "src/browser/features/RightSidebar/StatsTab.tsx", "symbol": "formatModelBreakdownLabel", "reason": "production caller: ModelBreakdownView in the same file" },

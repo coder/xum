@@ -30,6 +30,10 @@ export type PluginsSectionIntent =
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" };
 
+export function updateNeedsReview(review: AgentPluginUpdateReview): boolean {
+  return review.refused !== undefined || review.changes.length > 0;
+}
+
 let pendingIntent: PluginsSectionIntent | null = null;
 const listeners = new Set<(intent: PluginsSectionIntent) => void>();
 

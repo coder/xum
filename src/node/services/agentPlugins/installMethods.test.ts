@@ -8,7 +8,9 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { parseClaudeMarketplace } from "./claudeMarketplace";
 import { discoverAgentPluginAt } from "./discovery";
 import {
+  UpdateRefusedError,
   chooseInstallMethod,
+  chooseStagedMethod,
   detectInstallMethods,
   entryInstallMethods,
   findSkillsPackageRoots,
@@ -185,7 +187,11 @@ describe("detectInstallMethods", () => {
     });
     // No skills: the root entry still blocks a generated plugin.json.
     expect((await detectInstallMethods(claude)).methods).toEqual([{ kind: "claude-plugin" }]);
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: claude, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: claude,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.claudeFallback).toBe(true);
 
     const codex = path.join(tmp.path, "codex");
@@ -194,7 +200,10 @@ describe("detectInstallMethods", () => {
       ".codex-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
       ".claude-plugin/plugin.json": claudeManifest,
     });
-    expect((await detectInstallMethods(codex)).methods).toEqual([{ kind: "agent-plugin" }]);
+    expect((await detectInstallMethods(codex)).methods).toEqual([
+      { kind: "agent-plugin" },
+      { kind: "claude-plugin" },
+    ]);
 
     // Alone, discovery validates the root file and reports its error.
     const alone = path.join(tmp.path, "alone");
@@ -220,7 +229,11 @@ describe("detectInstallMethods", () => {
     });
     await fs.symlink(path.join(linked, "other.json"), path.join(linked, "plugin.json"));
     expect((await detectInstallMethods(linked)).methods).toEqual([{ kind: "claude-plugin" }]);
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: linked, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: linked,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.claudeFallback).toBe(true);
 
     // A symlink that leaves the tree: discovery refuses it, so it stays the own manifest.
@@ -231,7 +244,11 @@ describe("detectInstallMethods", () => {
     await fs.writeFile(path.join(tmp.path, "outside.json"), JSON.stringify({ name: "ponytail" }));
     await fs.symlink(path.join(tmp.path, "outside.json"), path.join(escaping, "plugin.json"));
     expect((await detectInstallMethods(escaping)).methods).toEqual([{ kind: "agent-plugin" }]);
-    const refused = await discoverAgentPluginAt({ pluginDir: escaping, scope: "global" });
+    const refused = await discoverAgentPluginAt({
+      pluginDir: escaping,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(refused.plugin).toBeNull();
 
     const invalid = path.join(tmp.path, "invalid");
@@ -242,14 +259,18 @@ describe("detectInstallMethods", () => {
     expect((await detectInstallMethods(invalid)).methods).toEqual([{ kind: "agent-plugin" }]);
   });
 
-  test("a Cursor manifest is cursor-plugin, after a Claude one, as discovery loads them", async () => {
+  test("a Cursor manifest is cursor-plugin, offered after a Claude one, in the order discovery reads them", async () => {
     using tmp = new DisposableTempDir("install-methods");
     const cursorManifest = JSON.stringify({ name: "pstack" });
 
     const cursor = path.join(tmp.path, "cursor");
     await writeTree(cursor, [], { ".cursor-plugin/plugin.json": cursorManifest });
     expect((await detectInstallMethods(cursor)).methods).toEqual([{ kind: "cursor-plugin" }]);
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: cursor, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: cursor,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.cursorFallback).toBe(true);
 
     const both = path.join(tmp.path, "both");
@@ -257,7 +278,10 @@ describe("detectInstallMethods", () => {
       ".claude-plugin/plugin.json": cursorManifest,
       ".cursor-plugin/plugin.json": cursorManifest,
     });
-    expect((await detectInstallMethods(both)).methods).toEqual([{ kind: "claude-plugin" }]);
+    expect((await detectInstallMethods(both)).methods).toEqual([
+      { kind: "claude-plugin" },
+      { kind: "cursor-plugin" },
+    ]);
 
     // A schema-less root plugin.json yields to the Cursor manifest, as it does to a Claude one.
     const schemaLess = path.join(tmp.path, "schema-less");
@@ -266,8 +290,77 @@ describe("detectInstallMethods", () => {
       ".cursor-plugin/plugin.json": cursorManifest,
     });
     expect((await detectInstallMethods(schemaLess)).methods).toEqual([{ kind: "cursor-plugin" }]);
-    const loaded = await discoverAgentPluginAt({ pluginDir: schemaLess, scope: "global" });
+    const loaded = await discoverAgentPluginAt({
+      pluginDir: schemaLess,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(loaded.plugin?.cursorFallback).toBe(true);
+  });
+});
+
+describe("detectInstallMethods manifest methods", () => {
+  const manifest = JSON.stringify({ name: "egm" });
+  const nativeRoot = JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" });
+
+  test("egm's layout offers the Codex, the Claude and the Cursor manifest, and no generated skills", async () => {
+    using tmp = new DisposableTempDir("install-methods-m1");
+    await writeTree(tmp.path, ["skills/a"], {
+      "plugin.json": manifest,
+      ".codex-plugin/plugin.json": manifest,
+      ".claude-plugin/plugin.json": manifest,
+      ".cursor-plugin/plugin.json": manifest,
+    });
+    const detected = await detectInstallMethods(tmp.path);
+    expect(detected.methods).toEqual([
+      { kind: "agent-plugin" },
+      { kind: "claude-plugin" },
+      { kind: "cursor-plugin" },
+    ]);
+    expect(detected.nativeRoot).toBe(false);
+  });
+
+  test("a root plugin.json with $schema is offered alone, over any other manifest", async () => {
+    using tmp = new DisposableTempDir("install-methods-m1-native");
+    await writeTree(tmp.path, [], {
+      "plugin.json": nativeRoot,
+      ".codex-plugin/plugin.json": manifest,
+      ".claude-plugin/plugin.json": manifest,
+      ".cursor-plugin/plugin.json": manifest,
+    });
+    const detected = await detectInstallMethods(tmp.path);
+    expect(detected.methods).toEqual([{ kind: "agent-plugin" }]);
+    expect(detected.nativeRoot).toBe(true);
+  });
+
+  test("a root plugin.json that cannot be read is the package's own manifest and is offered alone", async () => {
+    using tmp = new DisposableTempDir("install-methods-m1-unreadable");
+    await writeTree(tmp.path, [], {
+      "plugin.json": "{ not json",
+      ".claude-plugin/plugin.json": manifest,
+    });
+    const detected = await detectInstallMethods(tmp.path);
+    expect(detected.methods).toEqual([{ kind: "agent-plugin" }]);
+    expect(detected.nativeRoot).toBe(true);
+  });
+
+  test("Claude and Cursor manifests without a root or Codex manifest still offer generated skills last", async () => {
+    using tmp = new DisposableTempDir("install-methods-m1-skills");
+    await writeTree(tmp.path, ["skills/a"], {
+      ".claude-plugin/plugin.json": manifest,
+      ".cursor-plugin/plugin.json": manifest,
+    });
+    expect((await detectInstallMethods(tmp.path)).methods).toEqual([
+      { kind: "claude-plugin" },
+      { kind: "cursor-plugin" },
+      { kind: "skills" },
+    ]);
+  });
+
+  test("a Codex manifest alone does not offer generated skills", async () => {
+    using tmp = new DisposableTempDir("install-methods-m1-codex");
+    await writeTree(tmp.path, ["skills/a"], { ".codex-plugin/plugin.json": manifest });
+    expect((await detectInstallMethods(tmp.path)).methods).toEqual([{ kind: "agent-plugin" }]);
   });
 });
 
@@ -311,6 +404,17 @@ describe("chooseInstallMethod", () => {
     ).toThrow("cannot be installed as Agent Plugin; it fits: Claude Code plugin, Skills");
   });
 
+  test("a method that fits nothing is refused with the list of what fits, or without one", () => {
+    expect(() =>
+      chooseInstallMethod([], { mode: "exact", method: { kind: "agent-plugin" } })
+    ).toThrow("This repository cannot be installed as Agent Plugin. Preview it again.");
+    expect(() =>
+      chooseInstallMethod([{ kind: "skills" }], { mode: "exact", method: { kind: "agent-plugin" } })
+    ).toThrow(
+      "This repository cannot be installed as Agent Plugin; it fits: Skills. Preview it again."
+    );
+  });
+
   test("a Cursor marketplace entry matches only the same entry", () => {
     const pstack = { kind: "cursor-marketplace" as const, entry: "pstack" };
     expect(chooseInstallMethod([pstack], { mode: "exact", method: { ...pstack } })).toEqual(pstack);
@@ -331,37 +435,351 @@ describe("chooseInstallMethod", () => {
 
   test("update keeps a generated install on skills unless the repository has its own manifest", () => {
     const generatedFrom = { kind: "skills" as const };
-    expect(chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom })).toEqual({
+    expect(
+      chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom, saved: undefined })
+    ).toEqual({
       kind: "skills",
     });
     expect(
-      chooseInstallMethod([{ kind: "agent-plugin" }], { mode: "update", generatedFrom })
+      chooseInstallMethod([{ kind: "agent-plugin" }], {
+        mode: "update",
+        generatedFrom,
+        saved: undefined,
+      })
     ).toEqual({ kind: "agent-plugin" });
     // Not generated: a tree with only SKILL.md files does not update it.
     expect(
-      chooseInstallMethod([{ kind: "skills" }], { mode: "update", generatedFrom: undefined })
+      chooseInstallMethod([{ kind: "skills" }], {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: undefined,
+      })
     ).toBeUndefined();
     expect(
-      chooseInstallMethod(claudeAndSkills, { mode: "update", generatedFrom: undefined })
+      chooseInstallMethod(claudeAndSkills, {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: undefined,
+      })
+    ).toEqual({ kind: "claude-plugin" });
+  });
+
+  test("update with a saved method keeps it when it fits, whatever else fits", () => {
+    const egm = [
+      { kind: "agent-plugin" as const },
+      { kind: "claude-plugin" as const },
+      { kind: "cursor-plugin" as const },
+    ];
+    for (const saved of ["agent-plugin", "claude-plugin", "cursor-plugin"] as const) {
+      expect(chooseInstallMethod(egm, { mode: "update", generatedFrom: undefined, saved })).toEqual(
+        { kind: saved }
+      );
+    }
+    expect(
+      chooseInstallMethod([{ kind: "agent-plugin" }, { kind: "cursor-plugin" }], {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: "claude-plugin",
+      })
+    ).toBeUndefined();
+    expect(
+      chooseInstallMethod([{ kind: "skills" }], {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: "claude-plugin",
+      })
+    ).toBeUndefined();
+  });
+
+  test("update without a saved method keeps today's rules: a Codex install stays on Codex", () => {
+    const egm = [
+      { kind: "agent-plugin" as const },
+      { kind: "claude-plugin" as const },
+      { kind: "cursor-plugin" as const },
+    ];
+    expect(
+      chooseInstallMethod(egm, { mode: "update", generatedFrom: undefined, saved: undefined })
+    ).toEqual({ kind: "agent-plugin" });
+    expect(
+      chooseInstallMethod(egm.slice(1), {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: undefined,
+      })
     ).toEqual({ kind: "claude-plugin" });
   });
 
   test("update reads a Cursor manifest, also for an entry Xum generated from the Claude file", () => {
     const cursorAndSkills = [{ kind: "cursor-plugin" as const }, { kind: "skills" as const }];
     expect(
-      chooseInstallMethod([{ kind: "cursor-plugin" }], { mode: "update", generatedFrom: undefined })
+      chooseInstallMethod([{ kind: "cursor-plugin" }], {
+        mode: "update",
+        generatedFrom: undefined,
+        saved: undefined,
+      })
     ).toEqual({ kind: "cursor-plugin" });
     // A Claude marketplace entry whose folder gained a Cursor manifest switches to it.
     expect(
       chooseInstallMethod(cursorAndSkills, {
         mode: "update",
         generatedFrom: { kind: "claude-marketplace", entry: "kit" },
+        saved: undefined,
       })
     ).toEqual({ kind: "cursor-plugin" });
     // A generated skills install keeps its generator.
     expect(
-      chooseInstallMethod(cursorAndSkills, { mode: "update", generatedFrom: { kind: "skills" } })
+      chooseInstallMethod(cursorAndSkills, {
+        mode: "update",
+        generatedFrom: { kind: "skills" },
+        saved: undefined,
+      })
     ).toEqual({ kind: "skills" });
+  });
+});
+
+describe("chooseStagedMethod", () => {
+  const manifest = JSON.stringify({ name: "egm" });
+  const invalid = (kind: "claude-plugin" | "cursor-plugin") => ({
+    method: { kind },
+    problem: `Invalid plugin: ${kind} is broken`,
+  });
+  const source = {
+    url: "https://github.com/google/elephant-goldfish-model.git",
+    subpath: undefined,
+  };
+
+  async function choose(args: {
+    files: Record<string, string>;
+    request: Parameters<typeof chooseStagedMethod>[2];
+    rejected?: Array<ReturnType<typeof invalid>>;
+    skills?: string[];
+  }) {
+    using tmp = new DisposableTempDir("install-methods-choose");
+    await writeTree(tmp.path, args.skills ?? [], args.files);
+    const detected = await detectInstallMethods(tmp.path);
+    // Awaited before the return: `using` removes the folder when this function returns, and a
+    // returned promise would still be reading it.
+    const choice = await chooseStagedMethod(
+      tmp.path,
+      { ...detected, rejected: args.rejected ?? [] },
+      args.request,
+      source,
+      undefined
+    );
+    return choice;
+  }
+
+  const egm = {
+    "plugin.json": manifest,
+    ".codex-plugin/plugin.json": manifest,
+    ".claude-plugin/plugin.json": manifest,
+    ".cursor-plugin/plugin.json": manifest,
+  };
+
+  test("a preview without a method takes the first manifest in the fixed order", async () => {
+    const choice = await choose({ files: egm, request: { mode: "first" } });
+    expect(choice.method).toEqual({ kind: "agent-plugin" });
+    expect(choice.methods.map((method) => method.kind)).toEqual([
+      "agent-plugin",
+      "claude-plugin",
+      "cursor-plugin",
+    ]);
+    expect(choice.warnings).toEqual([]);
+  });
+
+  test("a manifest that fails validation is not offered: its error is a warning, and the first valid one is chosen", async () => {
+    const choice = await choose({
+      files: egm,
+      rejected: [invalid("claude-plugin")],
+      request: { mode: "first" },
+    });
+    expect(choice.methods.map((method) => method.kind)).toEqual(["agent-plugin", "cursor-plugin"]);
+    expect(choice.warnings).toEqual([
+      "Claude Code plugin: Invalid plugin: claude-plugin is broken",
+    ]);
+
+    // The only manifest is the invalid one: its error is the answer, not "no plugin found".
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "first" },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+  });
+
+  test("install refuses a method that fails validation with its error, and one that is not there by what fits", async () => {
+    const rejected = [invalid("claude-plugin")];
+    await expect(
+      choose({
+        files: egm,
+        rejected,
+        request: { mode: "exact", method: { kind: "claude-plugin" } },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+    await expect(
+      choose({
+        files: { ".cursor-plugin/plugin.json": manifest },
+        request: { mode: "exact", method: { kind: "claude-plugin" } },
+      })
+    ).rejects.toThrow("cannot be installed as Claude Code plugin; it fits: Cursor plugin");
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest, ".cursor-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "exact", method: { kind: "agent-plugin" } },
+      })
+    ).rejects.toThrow("it fits: Cursor plugin. Preview it again.");
+  });
+
+  test("an update with a saved method that fits keeps it; one without a saved method reads today's rules", async () => {
+    const saved = await choose({
+      files: egm,
+      request: { mode: "update", generatedFrom: undefined, saved: "cursor-plugin" },
+    });
+    expect(saved.method).toEqual({ kind: "cursor-plugin" });
+    const legacy = await choose({
+      files: egm,
+      request: { mode: "update", generatedFrom: undefined, saved: undefined },
+    });
+    expect(legacy.method).toEqual({ kind: "agent-plugin" });
+  });
+
+  test("an update of an install without a saved method names the problem of its manifest when it fails validation", async () => {
+    await expect(
+      choose({
+        files: { ".claude-plugin/plugin.json": manifest },
+        rejected: [invalid("claude-plugin")],
+        request: { mode: "update", generatedFrom: undefined, saved: undefined },
+      })
+    ).rejects.toThrow("Invalid plugin: claude-plugin is broken");
+  });
+
+  test("with nothing to install, the message names every format Xum looked for", async () => {
+    await expect(
+      choose({ files: { "README.md": "hi" }, request: { mode: "first" } })
+    ).rejects.toThrow("found at the repository root");
+    await expect(
+      choose({
+        files: { "README.md": "hi" },
+        request: { mode: "update", generatedFrom: undefined, saved: undefined },
+      })
+    ).rejects.toThrow("found at the repository root");
+  });
+});
+
+describe("chooseStagedMethod update refusals (B5)", () => {
+  const manifest = JSON.stringify({ name: "egm" });
+  const switchHint = "To switch, uninstall the plugin and install it again.";
+
+  async function refusal(args: {
+    files: Record<string, string>;
+    saved: "agent-plugin" | "claude-plugin" | "cursor-plugin" | undefined;
+    rejected?: Array<{ method: { kind: "claude-plugin" | "agent-plugin" }; problem: string }>;
+    subpath?: string;
+    skills?: string[];
+  }): Promise<string> {
+    using tmp = new DisposableTempDir("install-methods-refusal");
+    await writeTree(tmp.path, args.skills ?? [], args.files);
+    const detected = await detectInstallMethods(tmp.path);
+    const error = await chooseStagedMethod(
+      tmp.path,
+      { ...detected, rejected: args.rejected ?? [] },
+      { mode: "update", generatedFrom: undefined, saved: args.saved },
+      { url: "https://github.com/google/elephant-goldfish-model.git", subpath: args.subpath },
+      undefined
+    ).then(
+      () => undefined,
+      (caught: unknown) => caught
+    );
+    expect(error).toBeInstanceOf(UpdateRefusedError);
+    return (error as UpdateRefusedError).message;
+  }
+
+  test("a saved Claude manifest that is gone: names the file, lists what fits and how to switch", async () => {
+    expect(
+      await refusal({
+        saved: "claude-plugin",
+        files: {
+          "plugin.json": manifest,
+          ".codex-plugin/plugin.json": manifest,
+          ".cursor-plugin/plugin.json": manifest,
+        },
+      })
+    ).toBe(
+      `.claude-plugin/plugin.json is gone in this commit. Methods that fit this commit: Agent Plugin, Cursor plugin. ${switchHint}`
+    );
+  });
+
+  test("the file is named as the repository shows it, with the installed subfolder", async () => {
+    expect(
+      await refusal({
+        saved: "cursor-plugin",
+        subpath: "distributions/claude",
+        files: { ".claude-plugin/plugin.json": manifest },
+      })
+    ).toContain("distributions/claude/.cursor-plugin/plugin.json is gone in this commit.");
+  });
+
+  test("a saved Agent Plugin names both files it can read", async () => {
+    expect(
+      await refusal({ saved: "agent-plugin", files: { ".claude-plugin/plugin.json": manifest } })
+    ).toBe(
+      `Neither plugin.json nor .codex-plugin/plugin.json is in this commit. Methods that fit this commit: Claude Code plugin. ${switchHint}`
+    );
+  });
+
+  test("a saved Agent Plugin whose root lost $schema, with no Codex manifest, names the root and the Codex file", async () => {
+    expect(
+      await refusal({
+        saved: "agent-plugin",
+        files: { "plugin.json": manifest, ".claude-plugin/plugin.json": manifest },
+      })
+    ).toBe(
+      `plugin.json has no $schema in this commit, and .codex-plugin/plugin.json is gone. Methods that fit this commit: Claude Code plugin. ${switchHint}`
+    );
+  });
+
+  test("a saved manifest that is invalid in this commit: its validation error, and what else fits", async () => {
+    const problem =
+      "Invalid plugin: Invalid plugin manifest (.claude-plugin/plugin.json): 'name' is required";
+    expect(
+      await refusal({
+        saved: "claude-plugin",
+        files: { ".claude-plugin/plugin.json": "{}", ".cursor-plugin/plugin.json": manifest },
+        rejected: [{ method: { kind: "claude-plugin" }, problem }],
+      })
+    ).toBe(
+      `Claude Code plugin: ${problem}. Methods that fit this commit: Cursor plugin. ${switchHint}`
+    );
+  });
+
+  test("a Xum-native root that now takes precedence over the saved Claude manifest", async () => {
+    const message = await refusal({
+      saved: "claude-plugin",
+      files: {
+        "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" }),
+        ".claude-plugin/plugin.json": manifest,
+      },
+    });
+    expect(message).toBe(
+      `This commit has a plugin.json with $schema (a Xum-native package), which takes precedence over .claude-plugin/plugin.json. Methods that fit this commit: Agent Plugin. ${switchHint}`
+    );
+  });
+
+  test("generated skills are listed when they fit, and nothing fitting is said plainly", async () => {
+    expect(await refusal({ saved: "claude-plugin", skills: ["skills/a"], files: {} })).toContain(
+      "Methods that fit this commit: Skills."
+    );
+    expect(await refusal({ saved: "claude-plugin", files: { "README.md": "hi" } })).toBe(
+      ".claude-plugin/plugin.json is gone in this commit. No install method fits this commit."
+    );
+  });
+
+  test("an install with no saved method that no longer fits is refused the same way", async () => {
+    expect(await refusal({ saved: undefined, skills: ["skills/a"], files: {} })).toBe(
+      `The repository no longer has the manifest this plugin was installed from. Methods that fit this commit: Skills. ${switchHint}`
+    );
   });
 });
 
@@ -401,7 +819,11 @@ describe("writeGeneratedManifest", () => {
       },
       extensions: { mux: { generatedFrom: { kind: "skills" } }, "com.openai": { hooks: [] } },
     });
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     expect(plugin?.skillsOnly).toBe(true);
     expect(plugin?.hooksPath).toBeUndefined();
     expect(plugin?.agentsDir).toBeUndefined();
@@ -411,7 +833,11 @@ describe("writeGeneratedManifest", () => {
     using tmp = new DisposableTempDir("install-methods");
     await writeTree(tmp.path, ["pdf", "skills/a"]);
     await writeGeneratedManifest(tmp.path, { kind: "skills" }, source);
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     if (plugin === null) throw new Error("the generated manifest is not a plugin");
     expect(plugin.skillsDirs).toEqual([
       { dir: plugin.rootPath },
@@ -441,6 +867,7 @@ describe("writeGeneratedManifest", () => {
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: tmp.path,
       scope: "global",
+      choice: { kind: "fixed-order" },
     });
 
     expect(plugin?.skillsOnly).toBeUndefined();

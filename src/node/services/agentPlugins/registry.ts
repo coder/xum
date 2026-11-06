@@ -4,6 +4,10 @@ import {
   AgentPluginInstallEntrySchema,
   type AgentPluginImportedComponents,
 } from "@/common/config/schemas/agentPluginInstalls";
+import {
+  SavedInstallMethodSchema,
+  type SavedInstallMethod,
+} from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
 import { log } from "@/node/services/log";
@@ -91,6 +95,65 @@ function registryRowName(raw: unknown): string | undefined {
   return name.success ? name.data : undefined;
 }
 
+let warnedUnknownInstallMethod = false;
+/** A newer build's value is logged, not trusted: a row can hold any text. */
+const MAX_LOGGED_METHOD_LENGTH = 64;
+
+export function resetUnknownInstallMethodWarningForTests(): void {
+  warnedUnknownInstallMethod = false;
+}
+
+/**
+ * Read from the raw row, never from AgentPluginInstallEntrySchema: that schema strips unknown
+ * keys, and a value this build does not know (a newer build's method) must not make the row
+ * invalid, because an invalid row turns off all of the plugin's components and a registry read
+ * error blocks every plugin operation. An unknown value loads by the fixed order and logs one
+ * warning per process.
+ */
+export function readStoredInstallMethod(rawRow: unknown): SavedInstallMethod | undefined {
+  if (rawRow === null || typeof rawRow !== "object") return undefined;
+  const value: unknown = (rawRow as { installMethod?: unknown }).installMethod;
+  if (value === undefined) return undefined;
+  const parsed = SavedInstallMethodSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  if (!warnedUnknownInstallMethod) {
+    warnedUnknownInstallMethod = true;
+    log.warn(
+      "A plugin registry row has an install method this version does not know; loading it by the fixed manifest order",
+      {
+        installMethod:
+          typeof value === "string" ? value.slice(0, MAX_LOGGED_METHOD_LENGTH) : typeof value,
+      }
+    );
+  }
+  return undefined;
+}
+
+/**
+ * True when a row that saved a method no longer vouches for its commit (B3). This build writes
+ * `installMethodSha` (the `lockedSha` of its last install or update with that method) next to
+ * `installMethod`, and older builds keep it unchanged, so a value that differs from `lockedSha`
+ * means that an older build moved the commit. A missing or malformed value counts as a mismatch.
+ * Crash recovery leaves the field alone, because it cannot tell which build promoted the tree. A
+ * row without a saved method has nothing to compare.
+ */
+export function installMethodMoved(rawRow: unknown): boolean {
+  if (readStoredInstallMethod(rawRow) === undefined) return false;
+  const { installMethodSha, lockedSha } = rawRow as {
+    installMethodSha?: unknown;
+    lockedSha?: unknown;
+  };
+  return typeof installMethodSha !== "string" || installMethodSha !== lockedSha;
+}
+
+/** The field an install or an update writes beside `lockedSha`, for a row with a saved method. */
+export function installMethodShaFor(
+  installMethod: SavedInstallMethod | undefined,
+  lockedSha: string
+): { installMethodSha?: string } {
+  return installMethod !== undefined ? { installMethodSha: lockedSha } : {};
+}
+
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(registryFile: string): Promise<{
   byName: Map<string, AgentPluginImportedComponents | undefined>;
@@ -101,6 +164,9 @@ export async function readPluginComponentImports(registryFile: string): Promise<
   consentByName: Map<string, ComponentConsent>;
   /** Install time by plugin name: it binds the install's approved copies (approvedCopies.ts). */
   installedAtByName: Map<string, string>;
+  methodByName: Map<string, SavedInstallMethod>;
+  /** Rows whose saved method an older build moved to a commit (installMethodMoved). */
+  methodMovedByName: Set<string>;
   hasUnidentifiedEntries: boolean;
 } | null> {
   try {
@@ -108,6 +174,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
     const byName = new Map<string, AgentPluginImportedComponents | undefined>();
     const consentByName = new Map<string, ComponentConsent>();
     const installedAtByName = new Map<string, string>();
+    const methodByName = new Map<string, SavedInstallMethod>();
+    const methodMovedByName = new Set<string>();
     let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
       const name = registryRowName(raw);
@@ -130,6 +198,9 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         byName.set(name, parsed.data.importedComponents);
         consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
         installedAtByName.set(name, parsed.data.installedAt);
+        const method = readStoredInstallMethod(raw);
+        if (method !== undefined) methodByName.set(name, method);
+        if (installMethodMoved(raw)) methodMovedByName.add(name);
       }
     }
     if (hasUnidentifiedEntries) {
@@ -140,7 +211,14 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         }
       );
     }
-    return { byName, consentByName, installedAtByName, hasUnidentifiedEntries };
+    return {
+      byName,
+      consentByName,
+      installedAtByName,
+      methodByName,
+      methodMovedByName,
+      hasUnidentifiedEntries,
+    };
   } catch (error) {
     log.warn("Plugin component imports unavailable; suppressing skills and MCP servers", {
       registryFile,

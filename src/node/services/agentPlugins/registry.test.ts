@@ -3,12 +3,17 @@ import * as path from "node:path";
 import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { MCPServerPluginProvenance } from "@/common/types/mcp";
+import { log } from "@/node/services/log";
 import {
+  installMethodMoved,
+  installMethodShaFor,
   isPluginMcpServerAllowed,
   readPluginComponentImports,
   readPluginMcpPolicy,
+  readStoredInstallMethod,
+  resetUnknownInstallMethodWarningForTests,
 } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import { createRawPluginInstallRow, createTestPluginInstallEntry } from "./testFixtures";
 
 const legacy = createTestPluginInstallEntry("demo");
 const selective = createTestPluginInstallEntry("demo", { skills: ["selected"], mcpServers: [] });
@@ -89,6 +94,159 @@ describe("readPluginComponentImports", () => {
     const recovered = await readRows(registryPath, [selective]);
     expect(recovered.hasUnidentifiedEntries).toBe(false);
     expect(recovered.byName.get("demo")).toEqual(selective.importedComponents);
+  });
+});
+
+describe("readStoredInstallMethod", () => {
+  test("reads each saved manifest method from a raw row", () => {
+    for (const method of ["agent-plugin", "claude-plugin", "cursor-plugin"] as const) {
+      expect(
+        readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod: method }))
+      ).toBe(method);
+    }
+  });
+
+  test("a row without the field, or a value that is no row, has no method and no warning", () => {
+    resetUnknownInstallMethodWarningForTests();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      expect(readStoredInstallMethod(createRawPluginInstallRow(legacy, {}))).toBeUndefined();
+      expect(readStoredInstallMethod(null)).toBeUndefined();
+      expect(readStoredInstallMethod("claude-plugin")).toBeUndefined();
+      expect(readStoredInstallMethod([])).toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("the warning names the unknown value, cut short, or the kind of a value that is no text", () => {
+    const warned = (installMethod: unknown) => {
+      resetUnknownInstallMethodWarningForTests();
+      const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+      try {
+        readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod }));
+        return warn.mock.calls.map(([, detail]) => detail);
+      } finally {
+        warn.mockRestore();
+      }
+    };
+    expect(warned("codex-plugin")).toEqual([{ installMethod: "codex-plugin" }]);
+    expect(warned("x".repeat(100))).toEqual([{ installMethod: "x".repeat(64) }]);
+    expect(warned(7)).toEqual([{ installMethod: "number" }]);
+  });
+
+  test("an unknown value (from a newer build) means the fixed order and warns once per process", () => {
+    resetUnknownInstallMethodWarningForTests();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      for (const installMethod of ["codex-plugin", 7, null, { kind: "claude-plugin" }, ""]) {
+        expect(
+          readStoredInstallMethod(createRawPluginInstallRow(legacy, { installMethod }))
+        ).toBeUndefined();
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("readPluginComponentImports saved install methods", () => {
+  test("methodByName holds each row's saved method, by plugin name", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-install-method");
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(createTestPluginInstallEntry("claude"), {
+        installMethod: "claude-plugin",
+      }),
+      createRawPluginInstallRow(createTestPluginInstallEntry("cursor"), {
+        installMethod: "cursor-plugin",
+      }),
+      createTestPluginInstallEntry("legacy"),
+    ]);
+    expect(result.methodByName.get("claude")).toBe("claude-plugin");
+    expect(result.methodByName.get("cursor")).toBe("cursor-plugin");
+    expect(result.methodByName.has("legacy")).toBe(false);
+  });
+
+  test("an unknown installMethod never invalidates the row: imports and consent stay as saved", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-unknown-install-method");
+    const consent = {
+      skills: { greet: "fp" },
+      mcpServers: {},
+      workflows: {},
+      agents: {},
+      slashCommands: {},
+    };
+    const entry = createTestPluginInstallEntry(
+      "demo",
+      { skills: ["greet"], mcpServers: [] },
+      consent
+    );
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(entry, { installMethod: "windsurf-plugin" }),
+    ]);
+    expect(result.byName.get("demo")).toEqual({ skills: ["greet"], mcpServers: [] });
+    expect(result.consentByName.get("demo")).toEqual(consent);
+    expect(result.installedAtByName.get("demo")).toBe(entry.installedAt);
+    expect(result.methodByName.has("demo")).toBe(false);
+  });
+});
+
+describe("installMethodMoved", () => {
+  const saved = (extra: Record<string, unknown>) =>
+    createRawPluginInstallRow(legacy, { installMethod: "claude-plugin", ...extra });
+
+  test("a row that vouches for its commit has not moved", () => {
+    expect(installMethodMoved(saved({ installMethodSha: legacy.lockedSha }))).toBe(false);
+  });
+
+  test("a different, missing or malformed installMethodSha counts as moved", () => {
+    expect(installMethodMoved(saved({ installMethodSha: "b".repeat(40) }))).toBe(true);
+    expect(installMethodMoved(saved({}))).toBe(true);
+    for (const installMethodSha of [7, null, {}, [legacy.lockedSha], ""]) {
+      expect(installMethodMoved(saved({ installMethodSha }))).toBe(true);
+    }
+  });
+
+  test("a row without a saved method, or with one this build does not know, has nothing to compare", () => {
+    expect(installMethodMoved(legacy)).toBe(false);
+    expect(installMethodMoved(createRawPluginInstallRow(legacy, { installMethodSha: "b" }))).toBe(
+      false
+    );
+    resetUnknownInstallMethodWarningForTests();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      expect(installMethodMoved(saved({ installMethod: "windsurf-plugin" }))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(installMethodMoved(null)).toBe(false);
+  });
+
+  test("only a row with a saved method gets an installMethodSha", () => {
+    expect(installMethodShaFor("cursor-plugin", legacy.lockedSha)).toEqual({
+      installMethodSha: legacy.lockedSha,
+    });
+    expect(installMethodShaFor(undefined, legacy.lockedSha)).toEqual({});
+  });
+
+  test("methodMovedByName names the rows that an older build moved", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-method-moved");
+    const entry = (name: string) => createTestPluginInstallEntry(name);
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(entry("current"), {
+        installMethod: "claude-plugin",
+        installMethodSha: legacy.lockedSha,
+      }),
+      createRawPluginInstallRow(entry("moved"), {
+        installMethod: "claude-plugin",
+        installMethodSha: "b".repeat(40),
+      }),
+      createRawPluginInstallRow(entry("unrecorded"), { installMethod: "cursor-plugin" }),
+      entry("legacy"),
+    ]);
+    expect([...result.methodMovedByName].sort()).toEqual(["moved", "unrecorded"]);
   });
 });
 

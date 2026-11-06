@@ -377,6 +377,14 @@ describe("AgentPluginInstallService marketplaces", () => {
     // Install reads marketplace.json from git: the sparse clone holds only plugins/tool.
     await install(preview);
     expect((await installedSkills("tool")).sort()).toEqual(["fix", "lint"]);
+    // A generated entry saves no install method: the plugin.json that Xum wrote fixes its method.
+    const savedMethod = async () => {
+      const doc = JSON.parse(
+        await fsPromises.readFile(path.join(xumRoot, "plugins.json"), "utf8")
+      ) as { plugins: Array<Record<string, unknown>> };
+      return doc.plugins.find((row) => row.name === "tool")?.installMethod;
+    };
+    expect(await savedMethod()).toBeUndefined();
 
     await writeFiles(marketDir, {
       "plugins/tool/.claude-plugin/plugin.json": JSON.stringify({ name: "tool" }),
@@ -386,9 +394,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: path.join(xumRoot, "plugins", "tool"),
       scope: "global",
+      choice: { kind: "fixed-order" },
     });
     // The Claude manifest wins now; Xum no longer writes a plugin.json.
     expect(plugin?.claudeFallback).toBe(true);
+    // The update switched to the folder's own manifest and still saves no method: it reads the
+    // fixed order, as every entry install does.
+    expect(await savedMethod()).toBeUndefined();
     expect(
       await fsPromises.lstat(path.join(xumRoot, "plugins", "tool", "plugin.json")).catch(() => null)
     ).toBeNull();
@@ -419,7 +431,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(kit.agents).toEqual(["a.md", "b.md"]);
     await install(kit);
     const installed = path.join(xumRoot, "plugins", "kit");
-    const current = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    const current = (
+      await discoverAgentPluginAt({
+        pluginDir: installed,
+        scope: "global",
+        choice: { kind: "fixed-order" },
+      })
+    ).plugin;
     // This build: the Claude default .mcp.json, no hooks.js or workflows/.
     expect(current?.mcpConfigPath).toBe(path.join(current?.rootPath ?? "", ".mcp.json"));
     expect(current?.hooksPath).toBeUndefined();
@@ -431,7 +449,13 @@ describe("AgentPluginInstallService marketplaces", () => {
     };
     delete manifest.extensions.mux;
     await fsPromises.writeFile(manifestPath, JSON.stringify(manifest));
-    const older = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    const older = (
+      await discoverAgentPluginAt({
+        pluginDir: installed,
+        scope: "global",
+        choice: { kind: "fixed-order" },
+      })
+    ).plugin;
     expect(older?.hooksPath).toBeUndefined();
     expect(older?.workflowsDir).toBeUndefined();
     expect(older?.mcpConfigPath).toBeUndefined();

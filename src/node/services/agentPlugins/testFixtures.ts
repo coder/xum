@@ -6,6 +6,7 @@ import type {
   AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import type { SavedInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import {
   parseSkillMarkdown,
   skillConsentFrontmatter,
@@ -20,7 +21,12 @@ import {
   type ComponentConsent,
 } from "./componentConsent";
 import { updateApprovedCopies, type ApprovedCopies } from "./approvedCopies";
-import { discoverAgentPluginAt, listPluginSkillFolders, type AgentPluginScope } from "./discovery";
+import {
+  discoverAgentPluginAt,
+  listPluginSkillFolders,
+  manifestChoiceFor,
+  type AgentPluginScope,
+} from "./discovery";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
@@ -48,6 +54,13 @@ export function createTestPluginInstallEntry(
   };
 }
 
+export function createRawPluginInstallRow(
+  entry: AgentPluginInstallEntry,
+  extra: Record<string, unknown>
+): Record<string, unknown> {
+  return { ...entry, ...extra };
+}
+
 /**
  * The consent records an install review stores for every skill, MCP server and workflow of the plugin at
  * `pluginDir` (#6498): a managed registry row without them loads none of its components. Built
@@ -59,10 +72,12 @@ export async function reviewedComponentConsent(args: {
   scope?: AgentPluginScope;
   /** Xum home of the plugin data directory; defaults to the container's parent. */
   xumHome?: string;
+  method?: SavedInstallMethod;
 }): Promise<ComponentConsent> {
   const { plugin, diagnostics } = await discoverAgentPluginAt({
     pluginDir: args.pluginDir,
     scope: args.scope ?? "global",
+    choice: manifestChoiceFor(args.method),
   });
   if (plugin === null) {
     throw new Error(

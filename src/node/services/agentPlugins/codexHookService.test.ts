@@ -12,13 +12,13 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
 import * as discovery from "./discovery";
-import { discoverAgentPluginAt } from "./discovery";
+import { discoverAgentPluginAt, manifestChoiceFor } from "./discovery";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
 import { getPluginHookTrustPath, setPluginHookTrust } from "./pluginHookTrust";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import { createRawPluginInstallRow, createTestPluginInstallEntry } from "./testFixtures";
 
 const workspaceId = "ws-hooks";
 const deny = {
@@ -99,6 +99,7 @@ describe("CodexPluginHookService", () => {
     const { plugin } = await discoverAgentPluginAt({
       pluginDir: pluginRoot(name),
       scope: "global",
+      choice: { kind: "fixed-order" },
     });
     if (plugin === null) throw new Error(`${name} is not a plugin`);
     return plugin;
@@ -619,8 +620,12 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     );
 
   /** Trust as the hooks panel records it: bound to the commit whose files the user reviewed. */
-  async function trustRalph(reviewedSha: string | undefined) {
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+  async function trustRalph(reviewedSha: string | undefined, method?: "cursor-plugin") {
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: root(),
+      scope: "global",
+      choice: manifestChoiceFor(method),
+    });
     for (const hook of plugin?.cursorHooks?.hooks ?? []) {
       await setPluginHookTrust(xumHome, computePluginInstanceId(root()), {
         key: hook.key,
@@ -685,6 +690,46 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     expect(await stop()).toEqual({ kind: "none" });
   });
 
+  /** A Cursor install behind a Codex manifest, trusted at `sha`; `installedSha` is what the row vouches for. */
+  async function installCursorBehindCodexManifest(installedSha: string): Promise<void> {
+    await fs.mkdir(path.join(root(), ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(root(), ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "ralph" })
+    );
+    const sha = "a".repeat(40);
+    await fs.writeFile(
+      path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
+      JSON.stringify({
+        plugins: [
+          createRawPluginInstallRow(
+            { ...createTestPluginInstallEntry("ralph"), lockedSha: sha },
+            { installMethod: "cursor-plugin", installMethodSha: installedSha }
+          ),
+        ],
+      })
+    );
+    await trustRalph(sha, "cursor-plugin");
+  }
+
+  test("a plugin saved as cursor-plugin still runs its Cursor hook behind a Codex manifest", async () => {
+    // The fixed order reads the Codex manifest first, which declares no Cursor hook. The gate
+    // before each call re-reads the plugin through the saved method, as the registration did.
+    await installCursorBehindCodexManifest("a".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect((await stop()).kind).toBe("continue");
+    await writeHooks(`${followup} # changed`);
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
+  test("a Cursor hook of a saved method that an older build moved does not run", async () => {
+    // The older build moved the trust of this hook to a commit it never reviewed (B3): the plugin
+    // loads nothing, so the hook never runs although its trust is bound to the locked commit.
+    await installCursorBehindCodexManifest("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
   test("trust bound to another commit, or to none, does not run the hook", async () => {
     // An older build updated the plugin: the registry moved on, the binding did not (Codex P1).
     await writeRegistry("b".repeat(40));
@@ -722,7 +767,11 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     async (_name, revoke) => {
       let projectTrusted = true;
       await service.ensureWorkspaceHooks(args({ isProjectTrusted: () => projectTrusted }));
-      const { plugin } = await discoverAgentPluginAt({ pluginDir: root(), scope: "global" });
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: root(),
+        scope: "global",
+        choice: { kind: "fixed-order" },
+      });
       const hooks = plugin?.cursorHooks?.hooks ?? [];
       const read = discovery.discoverAgentPluginAt;
       // The gate's rediscovery is its first await: the revoke lands while it runs.

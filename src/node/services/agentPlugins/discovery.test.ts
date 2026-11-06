@@ -5,6 +5,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
+  AGENT_PLUGIN_MANIFEST_TABLE,
   computeAgentPluginContainers,
   discoverAgentPluginAt,
   discoverAgentPlugins,
@@ -20,7 +21,7 @@ import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { loadPluginMcpServers } from "./mcpConfig";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import { createRawPluginInstallRow, createTestPluginInstallEntry } from "./testFixtures";
 import { listPluginSkillScripts } from "./workflowFiles";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
@@ -2184,6 +2185,7 @@ describe("Claude Code plugin discovery", () => {
       pluginDir,
       scope: "global",
       shownRoot: ".codex-plugin",
+      choice: { kind: "fixed-order" },
     });
 
     expect(result.plugin).toBeNull();
@@ -2202,6 +2204,7 @@ describe("Claude Code plugin discovery", () => {
       pluginDir,
       scope: "global",
       shownRoot: ".codex-plugin",
+      choice: { kind: "fixed-order" },
     });
 
     expect(result.plugin).toBeNull();
@@ -2729,7 +2732,11 @@ describe("generatedFrom marker (skills-only packages)", () => {
     ] as const) {
       const pluginDir = path.join(tmp.path, dirName);
       await writeFullPlugin(pluginDir, marker);
-      const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir,
+        scope: "global",
+        choice: { kind: "fixed-order" },
+      });
       if (plugin === null) throw new Error(`${dirName}: not a plugin`);
       const hooks = await loadPluginCodexHooks(plugin);
       const surface = {
@@ -2801,7 +2808,11 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
   }
 
   async function surfaceOf(pluginDir: string) {
-    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     if (plugin === null) throw new Error(`${pluginDir}: not a plugin`);
     const hooks = await loadPluginCodexHooks(plugin);
     return {
@@ -2893,4 +2904,267 @@ test("a snake_case plugin skill folder yields to any kebab-case path that is a d
     { folder: "Foo-Bar", name: "Foo-Bar" },
     { folder: "other_skill", name: "other-skill" },
   ]);
+});
+
+describe("named manifest choice (install methods)", () => {
+  /** egm's layout: a schema-less root plugin.json beside the Codex, Claude and Cursor manifests. */
+  async function writeEgmLayout(pluginDir: string, only?: string[]): Promise<void> {
+    const manifests: Record<string, unknown> = {
+      "plugin.json": { name: "egm" },
+      ".codex-plugin/plugin.json": { name: "egm", description: "from codex" },
+      ".claude-plugin/plugin.json": { name: "egm", description: "from claude" },
+      ".cursor-plugin/plugin.json": { name: "egm", description: "from cursor" },
+    };
+    for (const [relative, manifest] of Object.entries(manifests)) {
+      if (only !== undefined && !only.includes(relative)) continue;
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), JSON.stringify(manifest));
+    }
+  }
+
+  test("the manifest table lists the four files in the fixed order, once", () => {
+    // A new manifest file may only go at the end: a new position changes what an install without
+    // a saved method loads.
+    const files = AGENT_PLUGIN_MANIFEST_TABLE.map((spec) => [
+      spec.relative.split(path.sep).join("/"),
+      spec.method,
+    ]);
+    expect(files).toEqual([
+      ["plugin.json", "agent-plugin"],
+      [".codex-plugin/plugin.json", "agent-plugin"],
+      [".claude-plugin/plugin.json", "claude-plugin"],
+      [".cursor-plugin/plugin.json", "cursor-plugin"],
+    ]);
+  });
+
+  test("each named method loads only its own manifest; the fixed order loads the Codex one", async () => {
+    using tmp = new DisposableTempDir("named-manifest");
+    await writeEgmLayout(tmp.path);
+    const loaded = async (choice: Parameters<typeof discoverAgentPluginAt>[0]["choice"]) => {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: tmp.path,
+        scope: "global",
+        choice,
+      });
+      return [plugin?.manifest.description, plugin?.installMethod];
+    };
+    expect(await loaded({ kind: "fixed-order" })).toEqual(["from codex", undefined]);
+    expect(await loaded({ kind: "method", method: "agent-plugin" })).toEqual([
+      "from codex",
+      "agent-plugin",
+    ]);
+    expect(await loaded({ kind: "method", method: "claude-plugin" })).toEqual([
+      "from claude",
+      "claude-plugin",
+    ]);
+    expect(await loaded({ kind: "method", method: "cursor-plugin" })).toEqual([
+      "from cursor",
+      "cursor-plugin",
+    ]);
+  });
+
+  test("agent-plugin loads the root plugin.json with $schema before the Codex manifest", async () => {
+    using tmp = new DisposableTempDir("named-manifest-root");
+    await writeEgmLayout(tmp.path, [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"]);
+    await fs.writeFile(
+      path.join(tmp.path, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm", description: "root" })
+    );
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "method", method: "agent-plugin" },
+    });
+    expect(plugin?.manifest.description).toBe("root");
+  });
+
+  test("a saved method never falls back: a tree with only a Claude manifest loads no plugin as agent-plugin", async () => {
+    using tmp = new DisposableTempDir("named-manifest-missing");
+    await writeEgmLayout(tmp.path, [".claude-plugin/plugin.json"]);
+    const { plugin, diagnostics } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "method", method: "agent-plugin" },
+    });
+    expect(plugin).toBeNull();
+    const errors = diagnostics.filter((d) => d.severity === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toBe(
+      "Agent Plugin: neither plugin.json nor .codex-plugin/plugin.json exists."
+    );
+  });
+
+  test("a saved method whose manifest is missing reports an error that names the method and the file", async () => {
+    using tmp = new DisposableTempDir("named-manifest-gone");
+    await writeEgmLayout(tmp.path, [".codex-plugin/plugin.json"]);
+    for (const [method, label, file] of [
+      ["claude-plugin", "Claude Code plugin", ".claude-plugin/plugin.json"],
+      ["cursor-plugin", "Cursor plugin", ".cursor-plugin/plugin.json"],
+    ] as const) {
+      const { plugin, diagnostics } = await discoverAgentPluginAt({
+        pluginDir: tmp.path,
+        scope: "global",
+        choice: { kind: "method", method },
+      });
+      expect(plugin).toBeNull();
+      const errors = diagnostics.filter((d) => d.severity === "error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toBe(`${label}: ${file} does not exist.`);
+      expect(errors[0].path).toBe(path.join(await fs.realpath(tmp.path), file));
+    }
+  });
+
+  test("an invalid named manifest loads nothing, even when another manifest is valid", async () => {
+    using tmp = new DisposableTempDir("named-manifest-invalid");
+    await writeEgmLayout(tmp.path, [".codex-plugin/plugin.json"]);
+    await fs.mkdir(path.join(tmp.path, ".claude-plugin"));
+    await fs.writeFile(path.join(tmp.path, ".claude-plugin", "plugin.json"), "{ not json");
+    const { plugin, diagnostics } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "method", method: "claude-plugin" },
+    });
+    expect(plugin).toBeNull();
+    expect(diagnostics.map((d) => d.message).join("\n")).toContain(".claude-plugin/plugin.json");
+  });
+
+  test("a schema-less root plugin.json alone is still reported by agent-plugin, as in the fixed order", async () => {
+    using tmp = new DisposableTempDir("named-manifest-schema-less");
+    await writeEgmLayout(tmp.path, ["plugin.json"]);
+    for (const choice of [
+      { kind: "fixed-order" },
+      { kind: "method", method: "agent-plugin" },
+    ] as const) {
+      const { plugin, diagnostics } = await discoverAgentPluginAt({
+        pluginDir: tmp.path,
+        scope: "global",
+        choice,
+      });
+      expect(plugin).toBeNull();
+      expect(diagnostics.map((d) => d.message).join("\n")).toContain("$schema");
+    }
+  });
+
+  test("the container scan loads each managed plugin by its saved method; unknown or no value use the fixed order", async () => {
+    using tmp = new DisposableTempDir("named-manifest-scan");
+    const home = tmp.path;
+    const container = path.join(home, "plugins");
+    const rows: unknown[] = [];
+    const saved: Record<string, unknown> = {
+      "as-claude": "claude-plugin",
+      "as-cursor": "cursor-plugin",
+      "as-codex": "agent-plugin",
+      "as-unknown": "windsurf-plugin",
+    };
+    for (const name of [...Object.keys(saved), "as-legacy", "unmanaged"]) {
+      await writeEgmLayout(path.join(container, name));
+      // The manifest name is the directory name, as an install leaves it.
+      for (const relative of [".codex-plugin", ".claude-plugin", ".cursor-plugin"]) {
+        const file = path.join(container, name, relative, "plugin.json");
+        const manifest = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+        await fs.writeFile(file, JSON.stringify({ ...manifest, name }));
+      }
+      if (name === "unmanaged") continue;
+      const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
+      rows.push(
+        name in saved
+          ? createRawPluginInstallRow(entry, {
+              installMethod: saved[name],
+              installMethodSha: entry.lockedSha,
+            })
+          : entry
+      );
+    }
+    const registryPath = path.join(home, "plugins.json");
+    await fs.writeFile(registryPath, JSON.stringify({ plugins: rows }));
+
+    const { plugins } = await discoverAgentPlugins([
+      { path: container, scope: "global", registryPath },
+    ]);
+    const loadedFrom = Object.fromEntries(
+      plugins.map((plugin) => [plugin.name, [plugin.manifest.description, plugin.installMethod]])
+    );
+    expect(loadedFrom).toEqual({
+      "as-claude": ["from claude", "claude-plugin"],
+      "as-cursor": ["from cursor", "cursor-plugin"],
+      "as-codex": ["from codex", "agent-plugin"],
+      "as-unknown": ["from codex", undefined],
+      "as-legacy": ["from codex", undefined],
+      unmanaged: ["from codex", undefined],
+    });
+    // The unknown value did not invalidate its row: its imported components still load.
+    expect(plugins.find((plugin) => plugin.name === "as-unknown")?.importedComponents).toEqual({
+      skills: [],
+      mcpServers: [],
+    });
+  });
+
+  test("the container scan loads nothing of a saved method that an older build moved, unless the fixed order loads that manifest", async () => {
+    using tmp = new DisposableTempDir("named-manifest-moved");
+    const home = tmp.path;
+    const container = path.join(home, "plugins");
+    const stale = "b".repeat(40);
+    // [saved method, installMethodSha (a "current" one is the row's lockedSha), manifests it has]
+    const layouts: Record<string, [string, unknown, string[] | undefined]> = {
+      current: ["claude-plugin", "current", undefined],
+      "moved-claude": ["claude-plugin", stale, undefined],
+      "moved-cursor": ["cursor-plugin", stale, undefined],
+      unrecorded: ["claude-plugin", undefined, undefined],
+      malformed: ["claude-plugin", 7, undefined],
+      // The fixed order loads the Claude manifest here too, so the older build reviewed it.
+      "claude-only": ["claude-plugin", stale, [".claude-plugin/plugin.json"]],
+      // An agent-plugin resolves like the fixed order.
+      "moved-codex": ["agent-plugin", stale, undefined],
+      // The fixed order stops at the broken Codex manifest and loads nothing, so no manifest that
+      // the older build could have reviewed is left: the saved one is not it.
+      "broken-codex": ["claude-plugin", stale, undefined],
+    };
+    const rows: unknown[] = [];
+    for (const [name, [method, sha, only]] of Object.entries(layouts)) {
+      await writeEgmLayout(path.join(container, name), only);
+      for (const relative of [".codex-plugin", ".claude-plugin", ".cursor-plugin"]) {
+        const file = path.join(container, name, relative, "plugin.json");
+        const manifest = await fs.readFile(file, "utf8").catch(() => undefined);
+        if (manifest === undefined) continue;
+        await fs.writeFile(file, JSON.stringify({ ...JSON.parse(manifest), name }));
+      }
+      if (name === "broken-codex") {
+        await fs.writeFile(
+          path.join(container, name, ".codex-plugin", "plugin.json"),
+          "{ not json"
+        );
+      }
+      const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
+      rows.push(
+        createRawPluginInstallRow(entry, {
+          installMethod: method,
+          ...(sha === undefined
+            ? {}
+            : { installMethodSha: sha === "current" ? entry.lockedSha : sha }),
+        })
+      );
+    }
+    const registryPath = path.join(home, "plugins.json");
+    await fs.writeFile(registryPath, JSON.stringify({ plugins: rows }));
+
+    const { plugins, diagnostics } = await discoverAgentPlugins([
+      { path: container, scope: "global", registryPath },
+    ]);
+    expect(plugins.map((plugin) => plugin.name).sort()).toEqual([
+      "claude-only",
+      "current",
+      "moved-codex",
+    ]);
+    const closed = diagnostics
+      .filter((diagnostic) => diagnostic.message.includes("An older Xum version updated"))
+      .map((diagnostic) => [path.basename(diagnostic.path), diagnostic.severity])
+      .sort();
+    expect(closed).toEqual([
+      ["broken-codex", "error"],
+      ["malformed", "error"],
+      ["moved-claude", "error"],
+      ["moved-cursor", "error"],
+      ["unrecorded", "error"],
+    ]);
+  });
 });

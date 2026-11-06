@@ -121,7 +121,11 @@ describe("loadPluginCodexHooks", () => {
       },
       "config/extra.json": { hooks: { PreCompact: [{ hooks: [{ type: "agent" }] }] } },
     });
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     assert(plugin, "the Claude package is discovered");
 
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
@@ -153,7 +157,11 @@ describe("loadPluginCodexHooks", () => {
         },
       },
     });
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     assert(plugin, "the Claude package is discovered");
 
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
@@ -182,7 +190,11 @@ describe("loadPluginCodexHooks", () => {
         },
       },
     });
-    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     assert(plugin, "the Claude package is discovered");
 
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
@@ -674,7 +686,11 @@ describe("Codex package manifests (the com.openai extension discovery selected)"
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, typeof content === "string" ? content : JSON.stringify(content));
     }
-    const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    const { plugin, diagnostics } = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      choice: { kind: "fixed-order" },
+    });
     if (plugin === null) throw new Error(`not a plugin: ${JSON.stringify(diagnostics)}`);
     return Object.assign(plugin, { diagnostics });
   }
