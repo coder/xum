@@ -6,6 +6,7 @@ import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-p
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import { log } from "@/node/services/log";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -4355,9 +4356,31 @@ describe("WorkspaceMcpOverridesService", () => {
       const healthy = await registerWorkspace("healthy-beside-legacy");
       await writeEnable(healthy.workspacePath);
       await registerMalformedLegacyEntry();
-      await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
+      // Parseable but structurally invalid: a lenient load still lists the healthy workspace, so
+      // only the strict config.json load refuses. Unparseable bytes would leave nothing to serve.
+      const configFile = path.join(tempDir, "config.json");
+      const doc = JSON.parse(await fs.readFile(configFile, "utf8")) as { projects: unknown[] };
+      doc.projects.push(["/fake/broken-project", { workspaces: "nope" }]);
+      await fs.writeFile(configFile, JSON.stringify(doc));
 
       expect(await served(service, healthy.workspaceId)).toBe("refused");
+    });
+
+    it("logs the legacy entry's load failure with its stack once across reads", async () => {
+      // Each override read walks the registry again (the tool-call gate reads on every call).
+      const errorSpy = spyOn(log, "error");
+      try {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        for (let read = 0; read < 3; read++) {
+          expect(await served(service, healthy.workspaceId)).not.toBe("refused");
+        }
+        expect(errorSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        errorSpy.mockRestore();
+      }
     });
 
     // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
