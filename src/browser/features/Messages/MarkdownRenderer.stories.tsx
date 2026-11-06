@@ -136,7 +136,8 @@ const WIDE_FLOWCHART_CONTENT = mermaidFence(
 
 // A state diagram that Pele lays out at about 2089x1372 px even for a phone-wide column: far
 // larger than any frame it sits in. On iPhone Safari it painted over the paragraphs below it.
-const STATE_DIAGRAM_CONTENT = mermaidFence(`---
+const STATE_DIAGRAM_CONTENT =
+  mermaidFence(`---
 title: "label_low_risk.py: from the checks to the one line it prints"
 ---
 stateDiagram-v2
@@ -225,7 +226,8 @@ stateDiagram-v2
   class s12 bugPath
   class s13 teal
   class s14 pink
-  class s14 breaks`);
+  class s14 breaks`) +
+  "\n\nThis paragraph follows the diagram. On iPhone Safari the diagram painted over text like it.";
 
 // Mirror Pixel's named viewports so each story's globals pin the width that CI snapshots.
 const MERMAID_VIEWPORTS = {

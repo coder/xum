@@ -697,8 +697,9 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<s
 /**
  * iPhone Safari painted a diagram outside the box it laid it out in, and plays read layout boxes
  * only. WebKit lays the page out again at its next screenshot or resize, which repairs that
- * state, so every diagram is compared against one first screenshot and the viewport is left
- * alone: with a diagram hidden, the page outside its box must look the same as with it shown.
+ * state, so each diagram is compared against one first screenshot (one that ends below the
+ * viewport also gets a scrolled one) and the viewport is left alone: with a diagram hidden, the
+ * page outside its box must look the same as with it shown.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
@@ -736,7 +737,11 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
       painted.push(...(await paintBelowWhenScrolled(page, index)));
     }
   }
-  assert.equal(painted.join("; "), "", "A diagram must paint only inside its box and its frame");
+  assert.equal(
+    painted.join("; "),
+    "",
+    "A diagram must paint only inside its box and the container that clips it"
+  );
 }
 
 // Stories that need a pinned viewport (a phone, or a laptop window) for their play, as their
