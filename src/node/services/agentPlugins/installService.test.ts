@@ -6968,6 +6968,8 @@ describe("AgentPluginInstallService", () => {
 
   describe("workspace enumeration for override pruning", () => {
     const configFile = () => path.join(muxRoot, "config.json");
+    // The lexical install location, not preview.targetPath (display text: `~/...` under HOME).
+    const installPath = () => path.join(pluginsDir(), "demo-plugin");
     const registerLocalWorkspace = async (workspaceId: string) => {
       const workspacePath = path.join(muxRoot, "checkouts", workspaceId);
       await fsPromises.mkdir(workspacePath, { recursive: true });
@@ -7025,7 +7027,7 @@ describe("AgentPluginInstallService", () => {
         expect(refusal).toContain(cause);
         expect(pruned).toEqual([]);
         expect(await registry()).toEqual([]);
-        expect(await pathExists(preview.targetPath)).toBe(false);
+        expect(await pathExists(installPath())).toBe(false);
       }
     );
 
@@ -7061,7 +7063,7 @@ describe("AgentPluginInstallService", () => {
         serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
       ).rejects.toThrow(/ws-1/);
       expect(await registry()).toEqual([]);
-      expect(await pathExists(preview.targetPath)).toBe(false);
+      expect(await pathExists(installPath())).toBe(false);
     });
 
     test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
@@ -7099,7 +7101,7 @@ describe("AgentPluginInstallService", () => {
         serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
       ).rejects.toThrow(/config\.json/);
       expect(await registry()).toHaveLength(1);
-      expect(await pathExists(preview.targetPath)).toBe(true);
+      expect(await pathExists(installPath())).toBe(true);
     });
 
     test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
@@ -7124,10 +7126,11 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.mkdir(sessionDir, { recursive: true });
       await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
       await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      expect(await pathExists(installPath())).toBe(true);
 
       await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
       expect(await registry()).toEqual([]);
-      expect(await pathExists(preview.targetPath)).toBe(false);
+      expect(await pathExists(installPath())).toBe(false);
     });
   });
 
