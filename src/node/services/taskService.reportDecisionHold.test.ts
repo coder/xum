@@ -59,6 +59,10 @@ interface Internals {
   };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  isPlanLikeTaskWorkspace: (entry: {
+    projectPath: string;
+    workspace: WorkspaceConfigEntry;
+  }) => Promise<boolean>;
   workspaceEventLocks: { withLock<T>(key: string, operation: () => Promise<T>): Promise<T> };
 }
 const internals = (service: TaskService) => service as unknown as Internals;
@@ -1012,6 +1016,62 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  // The stream-end handler reads the row at its admission, then awaits (the event lock, history
+  // and plan reads) before it finalizes. Another backend's report for the same attempt can land in
+  // that gap, or the parent's wait can adopt it there: the handler then finds the attempt already
+  // reported and publishes nothing. Its decision must still refuse the held follow-up, never read
+  // as "the attempt continues" (#7003). The gate holds the handler in the gap, as a loaded host
+  // does by chance.
+  test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
+    const childId = "holdlatehandler01";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const inGap = Promise.withResolvers<void>();
+    const gap = Promise.withResolvers<void>();
+    const isPlanLike = svc.isPlanLikeTaskWorkspace.bind(taskService);
+    spyOn(svc, "isPlanLikeTaskWorkspace").mockImplementation(async (entry) => {
+      if (entry.workspace.id === childId) {
+        inGap.resolve();
+        await gap.promise;
+      }
+      return isPlanLike(entry);
+    });
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      stack.endStream(0, {}, true);
+      await inGap.promise;
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const workspace of project.workspaces) {
+            if (workspace.id !== childId) continue;
+            workspace.taskStatus = "reported";
+            workspace.reportedAt = "2026-10-01T00:00:02.000Z";
+          }
+        }
+        return cfg;
+      });
+      gap.resolve();
+      await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+      await yieldMacrotasks(10);
+      // Never a new turn of the reported attempt.
+      expect(completions).toHaveLength(1);
+      await until(() => stack.heldTexts().length > 0, "held input");
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+    } finally {
+      gap.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";
