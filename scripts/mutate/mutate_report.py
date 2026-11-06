@@ -309,6 +309,13 @@ def run_test(worker: Path, test: str, timeout: float) -> tuple[bool, float, bool
     return code == 0, time.monotonic() - started, False
 
 
+def drain_output(stream, on_output) -> None:
+    """Read `stream` to its end and drop the bytes: only the fact that some arrived is kept."""
+
+    while stream.read1(65536):
+        on_output()
+
+
 def run_baseline(worker: Path, test: str, limit: float) -> tuple[bool, float, bool]:
     """Like run_test, but cut off by silence, not by total time.
 
@@ -329,12 +336,11 @@ def run_baseline(worker: Path, test: str, limit: float) -> tuple[bool, float, bo
     )
     last_output = [started]
 
-    def drain() -> None:
-        assert proc.stdout is not None
-        while proc.stdout.read1(65536):
-            last_output[0] = time.monotonic()
+    def noted() -> None:
+        last_output[0] = time.monotonic()
 
-    reader = threading.Thread(target=drain, daemon=True)
+    assert proc.stdout is not None
+    reader = threading.Thread(target=drain_output, args=(proc.stdout, noted), daemon=True)
     reader.start()
     try:
         while True:
