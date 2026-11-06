@@ -44,6 +44,13 @@ function registryRow(name: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
+async function exists(target: string): Promise<boolean> {
+  return await fs.access(target).then(
+    () => true,
+    () => false
+  );
+}
+
 async function writeRegistry(root: string, rows: unknown[]): Promise<void> {
   await fs.writeFile(path.join(root, "plugins.json"), JSON.stringify({ plugins: rows }), "utf-8");
 }
@@ -181,11 +188,11 @@ describe("backup of the managed plugin list", () => {
       await writeRegistry(muxRoot, [registryRow("alpha")]);
       const { payload, managed, request } = await prepare();
       await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
-      await fs.access(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH));
+      expect(await exists(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH))).toBe(true);
 
       await payload.exportTo({ ...request, contents: PLUGINS_OFF });
 
-      await expect(fs.access(path.join(managed, PLUGIN_BACKUP_DIR))).rejects.toThrow();
+      expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
     });
 
     it("writes no list when nothing is installed", async () => {
@@ -193,7 +200,7 @@ describe("backup of the managed plugin list", () => {
 
       await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
 
-      await expect(fs.access(path.join(managed, PLUGIN_BACKUP_DIR))).rejects.toThrow();
+      expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
     });
 
     it("leaves a row the restore side would refuse out of the list, not out of the push", async () => {
@@ -326,7 +333,7 @@ describe("backup of the managed plugin list", () => {
         ["alpha", "missing"],
       ]);
       expect(await fs.readFile(path.join(muxRoot, "plugins.json"), "utf-8")).toBe(registryBefore);
-      await expect(fs.access(path.join(muxRoot, "plugins"))).rejects.toThrow();
+      expect(await exists(path.join(muxRoot, "plugins"))).toBe(false);
       expect(restored.changedFiles.some((file) => file.includes("plugin"))).toBe(false);
     });
 
@@ -450,8 +457,8 @@ describe("backup of the managed plugin list", () => {
         ["alpha", "missing"],
         ["beta", "missing"],
       ]);
-      await expect(fs.access(path.join(second, "plugins.json"))).rejects.toThrow();
-      await expect(fs.access(path.join(second, "plugins"))).rejects.toThrow();
+      expect(await exists(path.join(second, "plugins.json"))).toBe(false);
+      expect(await exists(path.join(second, "plugins"))).toBe(false);
     });
 
     it("reports the same rows from a preview", async () => {
