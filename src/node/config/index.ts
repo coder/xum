@@ -1666,8 +1666,9 @@ type LegacyTreeField = {
 }[keyof Workspace & keyof WorkspaceMetadata];
 
 /**
- * Task-tree fields (the parent link, the agent, the task state, the archive marks) that the
- * legacy branch of buildWorkspaceMetadata reads from a metadata.json ahead of the row. A migrated
+ * Task-tree fields (the parent link, the agent, the task state, the archive marks, the
+ * sub-project and the tags) that the legacy branch of buildWorkspaceMetadata reads from a
+ * metadata.json ahead of the row. A migrated
  * row reads as current-format, and that branch reads the row alone, so the migration copies each
  * one the row lacks. A field left behind is lost from then on: a lost parentWorkspaceId detaches
  * a sub-agent from its parent, whose MCP disables then no longer apply to it.
