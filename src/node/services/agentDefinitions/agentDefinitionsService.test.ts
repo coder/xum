@@ -2032,7 +2032,10 @@ base: a
         const pluginDir = await writePlugin(container, "egm", {
           "persona.md": foreignAgent(PERSONA_BODY),
         });
-        const runtime = multiProjectOf(new LocalRuntime(project.path), new LocalRuntime(other.path));
+        const runtime = multiProjectOf(
+          new LocalRuntime(project.path),
+          new LocalRuntime(other.path)
+        );
         const options = { roots: localRoots(project.path, global.path, container), runtimeFactory };
 
         const listed = await discoverAgentDefinitions(runtime, project.path, options);
@@ -2102,9 +2105,9 @@ base: a
         const reviewer = listed.find((agent) => agent.id === "reviewer");
         expect(reviewer?.base).toBe("explore");
         expect(reviewer?.unavailableReason).toBeUndefined();
-        expect(await effectiveToolsOf(local, checkout.path, roots, "reviewer", sampleTools)).toEqual(
-          exploreTools
-        );
+        expect(
+          await effectiveToolsOf(local, checkout.path, roots, "reviewer", sampleTools)
+        ).toEqual(exploreTools);
         const pkg = await readAgentDefinition(local, checkout.path, "reviewer", {
           ...options,
           refuseUnreachablePluginFolder: true,

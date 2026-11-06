@@ -83,7 +83,7 @@ So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools, narrow
 
 A Claude Code or Cursor plugin agent often reads a file from its own plugin, for example `${CLAUDE_PLUGIN_ROOT}/agents/reviewer.md`. Xum replaces `${CLAUDE_PLUGIN_ROOT}` in the body of such an agent with the path of the plugin's folder (`C:/Users/...` on a Windows host). `${CLAUDE_SKILL_DIR}`, `${CLAUDE_PLUGIN_DATA}`, `${CURSOR_PLUGIN_ROOT}`, `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` stay as written, and a plugin agent in the Xum format keeps its body unchanged. The review of a managed plugin does not cover the body, so the replacement never asks for a new review.
 
-A Claude Code or Cursor format agent whose body names `${CLAUDE_PLUGIN_ROOT}` runs only where the workspace can read that folder: a local or worktree workspace for a plugin on the Xum host, and an SSH or Docker workspace for a trusted plugin in that checkout. On any other workspace, such as an SSH, Docker or devcontainer workspace with a plugin from the Xum host, the `task` tool does not list the agent, and spawning it by ID fails with `folder-unreachable`.
+A Claude Code or Cursor format agent whose body names `${CLAUDE_PLUGIN_ROOT}` runs only where the workspace can read that folder: a local or worktree workspace for a plugin on the Xum host (also a multi-project workspace whose projects are all local or worktree), and an SSH or Docker workspace for a trusted plugin in that checkout. On any other workspace, such as an SSH, Docker or devcontainer workspace with a plugin from the Xum host, the `task` tool does not list the agent, and spawning it by ID fails with `folder-unreachable`.
 
 When `task` refuses a plugin agent that Xum loads, the error names the reason instead of saying `unknown agentId`:
 
