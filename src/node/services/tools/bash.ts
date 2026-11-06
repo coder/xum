@@ -975,6 +975,22 @@ async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
 }
 
 /**
+ * Foreground kill deadline. Providers send null for an omitted optional input, so null and absent
+ * both mean the model named no deadline and it gets the shared default.
+ */
+function foregroundTimeoutSecs(requested: number | null | undefined): number {
+  return requested ?? BASH_DEFAULT_TIMEOUT_SECS;
+}
+
+/**
+ * Background max lifetime, in the shape BackgroundProcessManager wants: absence stays absence, so a
+ * dev server started without a timeout outlives the foreground default until it is stopped.
+ */
+function backgroundTimeoutSecs(requested: number | null | undefined): number | undefined {
+  return requested ?? undefined;
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -1158,7 +1174,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            timeoutSecs: timeout_secs, // Auto-terminate after this duration
+            timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
 
@@ -1185,7 +1201,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = foregroundTimeoutSecs(timeout_secs);
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;

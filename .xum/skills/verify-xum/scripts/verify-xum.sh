@@ -728,8 +728,9 @@ cmd_open() {
   # when none runs: the browser it launches later keeps the stream off.
   agent-browser --session "$AGENT_BROWSER_SESSION" stream disable >/dev/null 2>&1 || true
   stream_is_off || die "agent-browser's stream for session $AGENT_BROWSER_SESSION is still on. Not opening the page with the token."
-  # The run's token (run_token: server.lock is gone for a moment while nodemon restarts the
-  # backend). node gets it on fd 3, never in argv.
+  # The run's token (run_token: a stopped backend deletes server.lock, so it falls back to the
+  # copy launch keeps; a nodemon restart leaves the lock in place). node gets it on fd 3, never
+  # in argv.
   token=$(required_run_token)
   # shellcheck disable=SC2001 # sed's character class; bash patterns have none
   out=$(node -e '
@@ -1054,13 +1055,15 @@ is_dev_server_sandbox_root() {
 # CLI speaks only TCP and reads server.lock itself, so this first checks that the backend that
 # server.lock names carries this run's id and is what listens on its port. The port can be free
 # otherwise (see backend_curl), and the CLI would send the token to whoever bound it. The CLI's own
-# read of server.lock ignores a lock whose pid has died (ServerLockfile.read), so a restart after
-# this check is caught there. What is left is the moment between that read and the CLI's connect.
+# read of server.lock ignores a lock whose backend is gone (ServerLockfile.read: on Linux the pid
+# no longer has the start time the lock records; elsewhere the pid is dead or nothing at baseUrl
+# answers as a xum backend), so a restart after this check is caught there. What is left is the
+# moment between that read and the CLI's connect.
 cmd_cli() {
   load_run ""
   local lock pid port listeners
   lock=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) \
-    || die "$VERIFY_XUM_ROOT/server.lock is gone (the backend stopped or is restarting). Try again."
+    || die "$VERIFY_XUM_ROOT/server.lock is gone (the backend stopped)."
   pid=$(json_field_or_empty /dev/stdin pid <<<"$lock")
   [[ $pid =~ ^[0-9]+$ ]] || die "server.lock names no backend pid"
   grep -qszx "VERIFY_XUM_SERVER_OF=$VERIFY_XUM_RUN_ID" "/proc/$pid/environ" \

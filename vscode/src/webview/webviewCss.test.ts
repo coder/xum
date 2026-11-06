@@ -134,7 +134,6 @@ function loadWebviewCss(): Promise<string> {
 const DESKTOP_ONLY_CLASSES = new Set([
   // Electron titlebar insets and drag regions: VS Code owns the window chrome.
   "titlebar-drag",
-  "titlebar-no-drag",
   "titlebar-safe-left",
   "titlebar-safe-left-gutter-4",
   "titlebar-safe-right",
