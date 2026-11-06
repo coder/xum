@@ -62,6 +62,9 @@ test("a refused update shows its message and offers Remove plugin, never an appl
   fireEvent.click(await view.findByRole("button", { name: /^Update$/ }));
 
   await view.findByText(/\.claude-plugin\/plugin\.json is gone in this commit/);
+  // The plugin is on disk and loads: no "missing" or "needs reinstall" badge.
+  expect(view.queryByText("missing")).toBeNull();
+  expect(view.queryByText("needs reinstall")).toBeNull();
   view.getByText(/Nothing was changed\. The plugin stays on aaaaaaaaaaaa/);
   expect(view.queryByRole("button", { name: "Apply update" })).toBeNull();
   expect(view.queryByText(/This removes the plugin directory/)).toBeNull();
