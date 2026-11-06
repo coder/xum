@@ -5,6 +5,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   formatKeybind,
@@ -25,6 +26,12 @@ import {
 } from "@/common/config/schemas/settingsBackup";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
+import {
+  BackupPluginsCard,
+  NO_PLUGIN_BACKUP,
+  reviewBackedUpPlugins,
+  type PluginBackupReport,
+} from "./BackupPluginsCard";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -53,6 +60,7 @@ const BACKUP_SHORTCUTS = [
   ["restore", KEYBINDS.SETTINGS_BACKUP_RESTORE],
   ["toggleOverride", KEYBINDS.SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN],
   ["toggleApproveCommands", KEYBINDS.SETTINGS_BACKUP_APPROVE_COMMANDS],
+  ["reviewPlugins", KEYBINDS.SETTINGS_BACKUP_REVIEW_PLUGINS],
 ] as const;
 
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
@@ -93,6 +101,13 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     flag: "includePreferences",
     label: "Portable preferences",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
+  },
+  {
+    flag: "includePlugins",
+    label: "Agent plugins",
+    description:
+      "The list of installed plugins: each one's repository, tracked branch or tag, and pinned commit. A restore never installs them; it offers each one for review on this machine.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PLUGINS,
   },
   {
     flag: "includeMcp",
@@ -297,6 +312,7 @@ function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | nul
 
 export function BackupSection() {
   const { api } = useAPI();
+  const { setActiveSection } = useSettings();
   // The global artifact shelf only exists with the Artifacts experiment: without it the row is
   // hidden and its shortcut does nothing.
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
@@ -333,6 +349,9 @@ export function BackupSection() {
   // Pinned artifacts the last preview, push, or restore left out, each with its reason.
   const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
   const [symlinkSkipped, setSymlinkSkipped] = useState<string[]>();
+  // The plugin list of the last preview or restore, kept until the settings or the repository
+  // change: it describes that backup's plugins against this machine, nothing more.
+  const [pluginBackup, setPluginBackup] = useState<PluginBackupReport>(NO_PLUGIN_BACKUP);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -411,6 +430,7 @@ export function BackupSection() {
           setProjectBundleSkipped(false);
           setShelfSkipped([]);
           setSymlinkSkipped(undefined);
+          setPluginBackup(NO_PLUGIN_BACKUP);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -523,6 +543,7 @@ export function BackupSection() {
       setProjectBundleSkipped(false);
       setShelfSkipped([]);
       setSymlinkSkipped(undefined);
+      setPluginBackup(NO_PLUGIN_BACKUP);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -592,6 +613,7 @@ export function BackupSection() {
     setProjectBundleSkipped(false);
     setShelfSkipped([]);
     setSymlinkSkipped(undefined);
+    setPluginBackup(NO_PLUGIN_BACKUP);
 
     try {
       const result = await api.backup.preview(requestDraft);
@@ -626,6 +648,7 @@ export function BackupSection() {
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(result.data.symlinkSkipped);
+      setPluginBackup(result.data);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -670,6 +693,7 @@ export function BackupSection() {
       setProjectBundleSkipped(false);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(undefined);
+      setPluginBackup(NO_PLUGIN_BACKUP);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -748,6 +772,7 @@ export function BackupSection() {
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(result.data.symlinkSkipped);
+      setPluginBackup(result.data);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -769,6 +794,15 @@ export function BackupSection() {
     setRestoreConfirmationOpen(true);
   }
 
+  // Hands the missing plugins to Settings → Plugins, where each one gets its install review.
+  function reviewPlugins() {
+    reviewBackedUpPlugins({
+      report: pluginBackup,
+      enabled: !busy,
+      openPlugins: () => setActiveSection("plugins"),
+    });
+  }
+
   const actionsRef = useRef<BackupShortcutHandlers | null>(null);
   actionsRef.current = {
     save: handleSave,
@@ -776,6 +810,7 @@ export function BackupSection() {
     preview: handlePreview,
     push: handlePush,
     restore: openRestoreConfirmation,
+    reviewPlugins,
     toggleOverride: () => {
       // Mirrors the checkbox's own render condition so the shortcut is never advertised
       // while the control is hidden, and never inert while it is visible.
@@ -1143,6 +1178,8 @@ export function BackupSection() {
         intro="These backed-up files are skipped because their local path is a symlink:"
         items={symlinkSkipped}
       />
+
+      <BackupPluginsCard report={pluginBackup} busy={busy} onReview={reviewPlugins} />
 
       {projectImports.length > 0 ? (
         <div className="border-border-light space-y-3 rounded-md border p-3">

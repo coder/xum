@@ -3,10 +3,13 @@ import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
+import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { SettingsProvider, useSettings } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
+import { consumePendingPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { call, os } from "@orpc/server";
 import {
@@ -19,6 +22,16 @@ import { resetTestExperiments } from "@/browser/testUtils";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
+
+/** Shows which Settings section is active, so a test can see where the section sent the user. */
+function ActiveSettingsSection() {
+  const { activeSection, isOpen } = useSettings();
+  return React.createElement(
+    "output",
+    { "data-testid": "settings-route" },
+    isOpen ? activeSection : "closed"
+  );
+}
 
 function backupSectionTree(client: MockClient, inSettingsDialog = false) {
   const section = React.createElement(BackupSection);
@@ -40,7 +53,19 @@ function backupSectionTree(client: MockClient, inSettingsDialog = false) {
     React.createElement(
       TooltipProvider,
       null,
-      React.createElement(APIProvider, { client, children })
+      React.createElement(APIProvider, {
+        client,
+        children: React.createElement(
+          RouterProvider,
+          null,
+          React.createElement(
+            SettingsProvider,
+            null,
+            children,
+            React.createElement(ActiveSettingsSection)
+          )
+        ),
+      })
     )
   );
 }
@@ -1284,5 +1309,230 @@ describe("BackupSection", () => {
     expect(toggle.getAttribute("aria-checked")).toBe("false");
     fireEvent.keyDown(window, shortcut);
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+  });
+
+  describe("plugins in the backup", () => {
+    const SHA_MISSING = "ab".repeat(20);
+    const SHA_INSTALLED = "cd".repeat(20);
+
+    function pluginRow(name: string, status: "missing" | "installed" | "conflict", extra = {}) {
+      return {
+        name,
+        source: {
+          type: "git" as const,
+          url: `https://github.com/example/${name}.git`,
+          ref: "main",
+          refType: "branch" as const,
+        },
+        lockedSha: status === "installed" ? SHA_INSTALLED : SHA_MISSING,
+        status,
+        ...extra,
+      };
+    }
+
+    const PREVIEW_BASE = {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    };
+
+    const RESTORE_BASE = {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    };
+
+    beforeEach(() => {
+      consumePendingPluginsSectionIntent();
+    });
+
+    afterEach(() => {
+      consumePendingPluginsSectionIntent();
+    });
+
+    test("is a content option that is on by default, and toggles from the keyboard", async () => {
+      const { client, view } = renderBackupSection();
+      const canvas = within(view.container);
+      const toggle = await canvas.findByRole("checkbox", { name: "Agent plugins" });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+      fireEvent.keyDown(window, { key: "x", code: "KeyX", ctrlKey: true, altKey: true });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+
+      await waitFor(() =>
+        expect(saveSettings).toHaveBeenCalledWith(
+          expect.objectContaining({ includePlugins: false })
+        )
+      );
+    });
+
+    test("lists the backup's plugins after a preview and offers only the missing ones for review", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [
+            pluginRow("alpha", "missing", {
+              source: {
+                type: "git",
+                url: "https://github.com/example/mono.git",
+                ref: "v1.2.0",
+                refType: "tag",
+                subpath: "packages/alpha",
+              },
+            }),
+            pluginRow("beta", "installed"),
+            pluginRow("gamma", "conflict"),
+            pluginRow("delta", "missing"),
+          ],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.getByText("github.com/example/mono/packages/alpha")).toBeTruthy();
+      expect(canvas.getByText(`v1.2.0 · ${SHA_MISSING.slice(0, 12)}`)).toBeTruthy();
+      expect(canvas.getByText(`main · ${SHA_INSTALLED.slice(0, 12)}`)).toBeTruthy();
+      expect(canvas.getAllByText("Not installed")).toHaveLength(2);
+      expect(canvas.getAllByText("Installed")).toHaveLength(1);
+      expect(canvas.getAllByText("Name in use")).toHaveLength(1);
+      expect(canvas.getByRole("button", { name: /Review and install \(2\)/ })).toBeTruthy();
+    });
+
+    test("opens Settings → Plugins with the missing plugins queued for their install review", async () => {
+      const { client, view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [
+            pluginRow("alpha", "missing"),
+            pluginRow("beta", "installed"),
+            pluginRow("gamma", "conflict"),
+            pluginRow("delta", "missing"),
+          ],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      const install = jest.spyOn(client.agentPlugins, "install");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      fireEvent.click(await canvas.findByRole("button", { name: /Review and install/ }));
+
+      await waitFor(() => expect(canvas.getByTestId("settings-route").textContent).toBe("plugins"));
+      const intent = consumePendingPluginsSectionIntent();
+      expect(intent?.type).toBe("install-from-backup");
+      expect(
+        intent?.type === "install-from-backup" ? intent.plugins.map((p) => p.name) : []
+      ).toEqual(["alpha", "delta"]);
+      // Reviewing is only navigation: the install review is where consent happens.
+      expect(install).not.toHaveBeenCalled();
+    });
+
+    test("reviews from the keyboard only while a preview shows a missing plugin", async () => {
+      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.keyDown(window, chord);
+      expect(consumePendingPluginsSectionIntent()).toBeNull();
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+      fireEvent.keyDown(window, chord);
+
+      await waitFor(() => expect(canvas.getByTestId("settings-route").textContent).toBe("plugins"));
+      expect(consumePendingPluginsSectionIntent()?.type).toBe("install-from-backup");
+    });
+
+    test("offers no review when every listed plugin is installed or its name is taken", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [pluginRow("beta", "installed"), pluginRow("gamma", "conflict")],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("shows no plugin card for a backup without a plugin list", async () => {
+      const { view } = renderBackupSection();
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Backup to repository");
+      expect(canvas.queryByText("Plugins in this backup")).toBeNull();
+    });
+
+    test("says a plugin list was skipped when plugin backup is off", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [], pluginListSkipped: true },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/carries a plugin list, but plugin backup is disabled/);
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("offers the plugins right after a restore, which installed none of them", async () => {
+      const { client, view } = renderBackupSection({
+        backupRestore: { ...RESTORE_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      const install = jest.spyOn(client.agentPlugins, "install");
+
+      await confirmRestore(canvas);
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+      expect(install).not.toHaveBeenCalled();
+    });
+
+    test("drops the plugin card when the settings change, since it describes the old repository", async () => {
+      const { client, view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+
+      await act(async () => {
+        await client.backup.saveSettings({
+          repoUrl: "git@github.com:example/other.git",
+          branch: "main",
+          path: "mux/",
+        });
+      });
+
+      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
+    });
   });
 });
