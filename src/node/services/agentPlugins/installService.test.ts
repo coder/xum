@@ -4604,10 +4604,19 @@ describe("AgentPluginInstallService", () => {
           ])
         ),
       });
-    const installSignedIn = async (servers: Record<string, unknown>, signedInUrls: string[]) => {
+    const pendingRecord = (): Promise<unknown> =>
+      fsPromises.readFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "utf8").then(
+        (text) => JSON.parse(text) as unknown,
+        () => null
+      );
+    const installSignedIn = async (
+      servers: Record<string, unknown>,
+      signedInUrls: string[],
+      onStop?: () => Promise<void>
+    ) => {
       const updater = new AgentPluginInstallService(config, {
         mcpServerManager: {
-          stopServersWithKeyPrefix: () => Promise.resolve(),
+          stopServersWithKeyPrefix: () => onStop?.() ?? Promise.resolve(),
         } as unknown as MCPServerManager,
       });
       await writeServers(servers);
@@ -4711,6 +4720,75 @@ describe("AgentPluginInstallService", () => {
       ]);
       await fsPromises.writeFile(path.join(pluginsDir(), "demo-plugin", "mcp.json"), "{ not json");
       await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      await oauth.dispose();
+    }, 20_000);
+    test("an update records its sign-outs before the old tree stops and moves", async () => {
+      let armed = false;
+      let atFirstStop: unknown = "not read";
+      const { update, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        async () => {
+          if (armed && atFirstStop === "not read") atFirstStop = await pendingRecord();
+        }
+      );
+      armed = true;
+      await update({ docs: oauthEntry(docsUrl, "client-b") });
+      expect(atFirstStop).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall records its sign-outs before the registry commit", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const realWrite = internals.writeRegistry.bind(internals);
+      let atCommit: unknown = "not read";
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementation(
+        async (envelope, entries) => {
+          if (atCommit === "not read") atCommit = await pendingRecord();
+          return realWrite(envelope, entries);
+        }
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(atCommit).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall refuses while the pending sign-out record is corrupt, and leaves the install", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      await expect(
+        updater.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/Sign out of plugin MCP servers/);
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("a plugin whose servers cannot be listed can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const discover = spyOn(discoveryModule, "discoverAgentPluginAt").mockRejectedValueOnce(
+        new Error("EACCES: permission denied")
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+        expect(discover).toHaveBeenCalled();
+      } finally {
+        discover.mockRestore();
+      }
       expect(await registry()).toEqual([]);
       await oauth.dispose();
     }, 20_000);
