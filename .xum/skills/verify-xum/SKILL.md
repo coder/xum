@@ -107,9 +107,10 @@ the message then says to use a checkout under folders you own. Bun on PATH must 
 ```
 
 Launch runs `make dev-server-sandbox` with `--clean-providers --clean-projects`, the mock AI and an
-`env -i` allowlist, in its own process group. It returns when the app is usable, in about 15 s when
-`dist/` is already built. It gives up when the whole launch, seed included, takes longer than
-`VERIFY_XUM_READY_TIMEOUT` seconds (default 300).
+`env -i` allowlist, in its own process group. It returns when the app is usable. That takes about
+2 to 3 minutes on a busy host, most of it the module walk below, plus the rebuild of `dist/` after a
+source change. It gives up when the whole launch, seed and module walk included, takes longer than
+`VERIFY_XUM_READY_TIMEOUT` seconds (default 600).
 Ready means all of these hold:
 
 - the backend that nodemon restarts after the first watch build owns `server.lock` and answers
@@ -117,7 +118,14 @@ Ready means all of these hold:
 - Vite serves the app,
 - the seed is done: onboarding marked seen, a fake Anthropic provider on a dead loopback port (the
   composer refuses to send without a provider), the trusted project `demo-app` (a throwaway git
-  repo) and the workspace `Verify playground` with its worktree set up.
+  repo) and the workspace `Verify playground` with its worktree set up,
+- Vite has transformed every module that the renderer's served code imports, statically or with
+  `import()` (about 1,600). Worker scripts are left out (see Gotchas). Vite transforms a module on
+  its first request, on one thread. For the first page load that is about 45 CPU seconds, most of
+  it in Babel, where React Compiler runs. A cold Vite makes the first `open` plus `idle` take
+  longer than agent-browser's 25 s wait. `scripts/warmViteModules.ts` requests the whole graph over
+  HTTP, so the first `open` gets modules from Vite's cache. It fails the launch on a module that
+  Vite cannot serve.
 
 It prints the run's `export` lines and the URL of the seeded workspace. A failed launch prints the
 server log tail and cleans up. Launch refuses while the process group of this checkout's newest
@@ -148,8 +156,11 @@ The backend always has an auth token: launch refuses a backend whose `server.loc
 Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
 the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
 names that line and says to remove it. (A checkout from before #7904 starts the backend without a
-token, so launch refuses it too.) Doctor and launch read the token from `server.lock` and send it
-to curl on stdin, never in argv.
+token, so launch refuses it too.) Doctor and launch send the token to the backend only over its
+Unix socket, which the Makefile puts in a folder that only you can write, and give it to curl on
+stdin, never in argv. They never send it to the TCP port: while the backend starts, stops or
+restarts under nodemon, that port can be free for another account to bind. Doctor's `/health`
+check needs no token and goes to the TCP port.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
@@ -203,14 +214,19 @@ agent-browser find role button click --name "Open settings" --exact
   `[mock:list-languages]` are in `src/node/services/mock/mockAiRouter.ts`. Mock tool calls are
   canned and leave the worktree alone. A canned `todo_write` (`[mock:todo-nudge]`) still writes
   its TODO list to the workspace's session folder.
-- The CLI drives the same server. Run it under `env -i`: the live Xum's server URL and auth
+- The CLI drives the same server. Run it through `verify-xum.sh cli`, which runs
+  `dist/cli/api.mjs` against the newest run under `env -i`: the live Xum's server URL and auth
   token are in your env under both `XUM_*` and legacy `MUX_*` names, and the CLI reads either.
   With them gone it finds the sandbox through `XUM_ROOT`:
 
   ```bash
-  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
-    node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list
+  verify-xum.sh cli workspace list
   ```
+
+  The CLI talks to the TCP port that `server.lock` names, and it has no Unix-socket mode. So
+  `cli` first checks that the pid in `server.lock` carries this run's id and is the only listener
+  on that port, and refuses otherwise (a backend that is stopping or restarting). A restart in the
+  moment between that check and the CLI's own read of `server.lock` is not covered.
 
 ## Evidence
 
@@ -357,13 +373,29 @@ after their other arguments. Without one they use the newest launch from this ch
 - The first open of a lazily loaded panel on a cold Vite cache (Review, for one) reloads the page:
   `server.log` shows `optimized dependencies changed. reloading`. The panel and its tab stay open
   across the reload. Run `idle`, wait for the panel's text, and continue from the open tab (see
-  the Review recipe).
-- Now and then a lazily loaded module request from agent-browser to Vite never completes. The
-  page or panel then shows `<name> failed to load.` with a `Reload` button, and the console logs
-  `Failed to fetch dynamically imported module`. curl gets the same module at once, so it is not
-  a product failure. `verify-xum.sh idle` exits 3 on it. Run `agent-browser reload`, then repeat
-  the step, and note the reload in your report.
-- A page that stays on `Loading Xum` under host load recovers with `agent-browser reload`.
+  the Review recipe). Vite's scan does not see the dependencies of the highlight worker
+  (`@pierre/highlights`), and a request for that worker on a cache without them logs the same
+  lines. Launch's module walk leaves workers out, so a cold cache still reloads at that request.
+  Vite then invalidates every module it had transformed, so the page load after the reload is as
+  slow as a cold one.
+- Now and then Chrome fails every module request that is still queued (a dozen to over a hundred
+  while the page loads) with `net::ERR_NETWORK_CHANGED`, because a network interface or address of
+  the host changed. A Docker container that starts on a shared host adds one: `ip monitor link`
+  shows its `veth` links at that instant. Vite is not at fault: curl gets the same module at once.
+  What the page shows depends on the failed modules. A lazily loaded one shows
+  `<name> failed to load.` with a `Reload` button, the console logs
+  `Failed to fetch dynamically imported module`, and `verify-xum.sh idle` exits 3. A module of the
+  first-load graph shows nothing: the page stays on `Loading Xum` and `idle` exits 1 after 25 s.
+  `React.lazy` keeps a failure and the boot screen has no failure state, so only a reload
+  recovers. Run `agent-browser reload`, then repeat the step, and note the reload in your report.
+  Launch warms Vite, so a page load takes a few seconds and the window for such a change is
+  short. Under heavy host load a warm load can still take 20 s.
+- A page that stays on `Loading Xum` after `idle` timed out has lost a module request (see the
+  previous item): run `agent-browser reload`. A slow transform is not the usual cause after a
+  launch, because Vite has already transformed every module. Vite transforms a module again after a
+  source edit, and every module again after a dependency re-optimization (the first item above).
+  Then the page can stay on `Loading Xum` for as long as a cold load takes, which is longer than
+  one `idle`: run `idle` again.
 - agent-browser's headless Chromium matches `(hover: none)`, so Tailwind's `hover:` and
   `group-hover:` variants never apply. Controls that appear on hover (a sidebar row's archive
   icon) ignore clicks there. Focus them (`agent-browser focus '[aria-label="<name>"]'`) and press

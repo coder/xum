@@ -822,6 +822,25 @@ function unreviewedRows(
   ];
 }
 
+/**
+ * The agent file lists of the install preview. Display only: the names a user reads before
+ * Install show invisible controls (#6629). `shellRemovedAgents` are the read-only agents whose
+ * mapped tools leave no bash tool.
+ */
+function previewAgentLists(agentFiles: readonly PluginAgentFile[]): {
+  agents: string[];
+  readonlyAgents: string[];
+  shellRemovedAgents: string[];
+} {
+  const names = (keep: (agent: PluginAgentFile) => boolean) =>
+    agentFiles.filter(keep).map((agent) => showInvisibleControls(agent.file));
+  return {
+    agents: names(() => true),
+    readonlyAgents: names((agent) => agent.readonly),
+    shellRemovedAgents: names((agent) => agent.readonly && !agent.keepsShell),
+  };
+}
+
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
@@ -4027,11 +4046,7 @@ export class AgentPluginInstallService {
     assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-    // Display only: the names a user reads before Install show invisible controls (#6629).
-    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-    const readonlyAgents = agentFiles.flatMap((agent) =>
-      agent.readonly ? [showInvisibleControls(agent.file)] : []
-    );
+    const { agents, readonlyAgents, shellRemovedAgents } = previewAgentLists(agentFiles);
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -4083,6 +4098,7 @@ export class AgentPluginInstallService {
       fileChanges,
       agents,
       readonlyAgents,
+      shellRemovedAgents,
       workflows,
       slashCommands,
       reviewedComponents,

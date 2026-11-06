@@ -39,6 +39,7 @@ const preview: AgentPluginInstallPreview = {
   ],
   agents: ["reviewer.md"],
   readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
   consentDigest: "c".repeat(64),

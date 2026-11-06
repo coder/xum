@@ -45,7 +45,7 @@ import {
 } from "./mcpConfig";
 import { getPluginHookTrustPath, setPluginHookTrust } from "./pluginHookTrust";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { skillConsentFingerprint } from "./componentConsent";
+import { agentConsentFingerprint, skillConsentFingerprint } from "./componentConsent";
 import {
   discoverAgentSkills,
   readAgentSkill,
@@ -2328,6 +2328,85 @@ describe("AgentPluginInstallService", () => {
     expect(await listed()).toEqual([]);
     expect((await approveReview()).changes[0]?.before).toBe("Not reviewed on this install");
     expect(await listed()).toEqual(["Always delegate to me"]);
+  });
+
+  test("a Claude agent whose mapping changed after its review needs a new review", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "reviewer.md"),
+      "---\nname: reviewer\ndescription: Reviews code\ntools: [Read, Grep, Glob]\nmodel: inherit\n---\nReview.\n"
+    );
+    await commitAll(remoteDir, "add a Claude read-only search agent");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.readonlyAgents).toEqual(["reviewer.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runtime = new LocalRuntime(muxRoot);
+    const roots = {
+      projectRoots: [],
+      globalRoot: path.join(muxRoot, "agents"),
+      globalPluginRoots: [pluginsDir()],
+    };
+    const loads = () =>
+      readAgentDefinition(runtime, muxRoot, "reviewer", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
+        (agent) => agent.frontmatter.base,
+        () => null
+      );
+    expect(await loads()).toBe("explore");
+
+    const mappedBeforeA3 = {
+      name: "reviewer",
+      description: "Reviews code",
+      base: "exec",
+      ui: { hidden: true },
+      prompt: { append: false },
+      subagent: { runnable: true },
+      tools: { remove: ["(?!(?:file_read|attach_file)$).*"] },
+    };
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: { agents: Record<string, string> } }>;
+    };
+    document.plugins[0].componentConsent.agents.reviewer = agentConsentFingerprint({
+      id: "reviewer",
+      file: "reviewer.md",
+      frontmatter: mappedBeforeA3,
+    });
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    expect(await loads()).toBeNull();
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Agent 'reviewer' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "agents", name: "reviewer" },
+    });
+    expect(review.changes[0]?.after).toContain('"base":"explore"');
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(await loads()).toBe("explore");
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("the install preview names the read-only agents whose shell was removed", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const agent = (extra: string) =>
+      `---\nname: a\ndescription: Reviews code\n${extra}---\nReview.\n`;
+    const write = (file: string, frontmatter: string) =>
+      fsPromises.writeFile(path.join(remoteDir, "agents", file), agent(frontmatter));
+    await write("searcher.md", "tools: [Read, Grep, Glob]\n");
+    await write("no-shell.md", "tools: [Read, Grep, Glob]\ndisallowedTools: [Bash]\n");
+    await write("cursor-no-shell.md", "readonly: true\ndisallowedTools: [Bash]\n");
+    await commitAll(remoteDir, "add read-only agents, two without a shell");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.readonlyAgents).toEqual(["cursor-no-shell.md", "no-shell.md", "searcher.md"]);
+    expect(preview.shellRemovedAgents).toEqual(["cursor-no-shell.md", "no-shell.md"]);
   });
 
   test("a plugin agent whose ID two files claim does not load (#6629)", async () => {

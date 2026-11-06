@@ -305,10 +305,15 @@ export const AgentPluginInstallPreviewSchema = z.object({
   /** Agent definition files (agents/*.md) that become selectable agents. */
   agents: z.array(z.string()),
   /**
-   * The files of `agents` with Cursor `readonly: true`: they run on Explore's tools, so the
-   * review says file edits are removed and the shell stays.
+   * The files of `agents` with Cursor `readonly: true` or a Claude read-only search list: they
+   * run on Explore's tools, so the review says file edits are removed and the shell stays.
    */
   readonlyAgents: z.array(z.string()),
+  /**
+   * The files of `readonlyAgents` whose mapped tools leave no bash tool (a Claude
+   * `disallowedTools: [Bash]`), so the review says the shell is removed too.
+   */
+  shellRemovedAgents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */
   workflows: z.array(z.string()),
   /** Composer slash commands the manifest contributes. */

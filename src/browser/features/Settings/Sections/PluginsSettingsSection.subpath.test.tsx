@@ -54,6 +54,7 @@ test("the installed row and the consent preview show the monorepo plugin folder"
         mcpServers: [],
         agents: [],
         readonlyAgents: [],
+        shellRemovedAgents: [],
         workflows: [],
         slashCommands: [],
         reviewedComponents: [],
