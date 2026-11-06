@@ -32,6 +32,7 @@ import {
 import {
   AgentPluginInstallService,
   describeSignInChanges,
+  signInResetUrls,
   withDiskQuotaWatchdog,
 } from "./installService";
 import {
@@ -45,7 +46,7 @@ import {
 } from "./mcpConfig";
 import { getPluginHookTrustPath, setPluginHookTrust } from "./pluginHookTrust";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { skillConsentFingerprint } from "./componentConsent";
+import { agentConsentFingerprint, skillConsentFingerprint } from "./componentConsent";
 import {
   discoverAgentSkills,
   readAgentSkill,
@@ -2330,6 +2331,85 @@ describe("AgentPluginInstallService", () => {
     expect(await listed()).toEqual(["Always delegate to me"]);
   });
 
+  test("a Claude agent whose mapping changed after its review needs a new review", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "reviewer.md"),
+      "---\nname: reviewer\ndescription: Reviews code\ntools: [Read, Grep, Glob]\nmodel: inherit\n---\nReview.\n"
+    );
+    await commitAll(remoteDir, "add a Claude read-only search agent");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.readonlyAgents).toEqual(["reviewer.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runtime = new LocalRuntime(muxRoot);
+    const roots = {
+      projectRoots: [],
+      globalRoot: path.join(muxRoot, "agents"),
+      globalPluginRoots: [pluginsDir()],
+    };
+    const loads = () =>
+      readAgentDefinition(runtime, muxRoot, "reviewer", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
+        (agent) => agent.frontmatter.base,
+        () => null
+      );
+    expect(await loads()).toBe("explore");
+
+    const mappedBeforeA3 = {
+      name: "reviewer",
+      description: "Reviews code",
+      base: "exec",
+      ui: { hidden: true },
+      prompt: { append: false },
+      subagent: { runnable: true },
+      tools: { remove: ["(?!(?:file_read|attach_file)$).*"] },
+    };
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: { agents: Record<string, string> } }>;
+    };
+    document.plugins[0].componentConsent.agents.reviewer = agentConsentFingerprint({
+      id: "reviewer",
+      file: "reviewer.md",
+      frontmatter: mappedBeforeA3,
+    });
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    expect(await loads()).toBeNull();
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    expect(review.changes).toHaveLength(1);
+    expect(review.changes[0]).toMatchObject({
+      summary: "Agent 'reviewer' needs review",
+      before: "Changed since you reviewed it",
+      component: { kind: "agents", name: "reviewer" },
+    });
+    expect(review.changes[0]?.after).toContain('"base":"explore"');
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(await loads()).toBe("explore");
+    expect((await service.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("the install preview names the read-only agents whose shell was removed", async () => {
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    const agent = (extra: string) =>
+      `---\nname: a\ndescription: Reviews code\n${extra}---\nReview.\n`;
+    const write = (file: string, frontmatter: string) =>
+      fsPromises.writeFile(path.join(remoteDir, "agents", file), agent(frontmatter));
+    await write("searcher.md", "tools: [Read, Grep, Glob]\n");
+    await write("no-shell.md", "tools: [Read, Grep, Glob]\ndisallowedTools: [Bash]\n");
+    await write("cursor-no-shell.md", "readonly: true\ndisallowedTools: [Bash]\n");
+    await commitAll(remoteDir, "add read-only agents, two without a shell");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.readonlyAgents).toEqual(["cursor-no-shell.md", "no-shell.md", "searcher.md"]);
+    expect(preview.shellRemovedAgents).toEqual(["cursor-no-shell.md", "no-shell.md"]);
+  });
+
   test("a plugin agent whose ID two files claim does not load (#6629)", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     await fsPromises.writeFile(
@@ -4566,6 +4646,279 @@ describe("AgentPluginInstallService", () => {
     });
     expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
     await oauth.dispose();
+  });
+
+  describe("stored sign-ins of plugin MCP servers that an update removes or an uninstall deletes", () => {
+    const docsUrl = "https://docs.example.com/mcp";
+    const keepUrl = "https://keep.example.com/mcp";
+    const oauthEntry = (url: string, clientId: string) => ({
+      type: "streamable-http",
+      url,
+      extensions: {
+        "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+      },
+    });
+    const writeServers = async (servers: Record<string, unknown> | undefined) => {
+      const file = path.join(remoteDir, "mcp.json");
+      if (servers === undefined) await fsPromises.rm(file);
+      else
+        await fsPromises.writeFile(
+          file,
+          JSON.stringify({ $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: servers })
+        );
+      await commitAll(remoteDir, Object.keys(servers ?? {}).join(" ") || "no MCP file");
+    };
+    const signedInStore = (urls: string[]) =>
+      JSON.stringify({
+        version: 2,
+        entries: Object.fromEntries(
+          urls.map((serverUrl) => [
+            serverUrl,
+            {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          ])
+        ),
+      });
+    const pendingRecord = (): Promise<unknown> =>
+      fsPromises.readFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "utf8").then(
+        (text) => JSON.parse(text) as unknown,
+        () => null
+      );
+    const installSignedIn = async (
+      servers: Record<string, unknown>,
+      signedInUrls: string[],
+      hooks: { onStop?: () => Promise<void>; mcpConfigService?: MCPConfigService } = {}
+    ) => {
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: {
+          stopServersWithKeyPrefix: () => hooks.onStop?.() ?? Promise.resolve(),
+        } as unknown as MCPServerManager,
+        ...(hooks.mcpConfigService !== undefined
+          ? { mcpConfigService: hooks.mcpConfigService }
+          : {}),
+      });
+      await writeServers(servers);
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "mcp-oauth.json"), signedInStore(signedInUrls));
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      updater.setMcpOauthService(oauth);
+      const update = async (servers: Record<string, unknown> | undefined) => {
+        await writeServers(servers);
+        const review = await updater.previewUpdate({ name: "demo-plugin" });
+        await updater.update({
+          name: "demo-plugin",
+          consent: { fromSha: review.fromSha, toSha: review.toSha },
+        });
+      };
+      return { updater, oauth, update };
+    };
+
+    // The 20 s limits: each test installs and updates a plugin over git, which takes more than the
+    // default 5 s on a loaded runner.
+    test("signs out the removed server, so a later server at its URL does not inherit the credentials", async () => {
+      const { oauth, update } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a"), keep: oauthEntry(keepUrl, "client-k") },
+        [docsUrl, keepUrl]
+      );
+      await update({ keep: oauthEntry(keepUrl, "client-k") });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      expect(await oauth.hasAuthTokens({ serverUrl: keepUrl })).toBe(true);
+      await update({
+        keep: oauthEntry(keepUrl, "client-k"),
+        docs: oauthEntry(docsUrl, "client-b"),
+      });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("signs out every server when the update drops the plugin's MCP file", async () => {
+      const { oauth, update } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await update(undefined);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall signs out the plugin's servers, so a reinstall under another client does not inherit them", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await writeServers({ docs: oauthEntry(docsUrl, "client-b") });
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall whose sign-out fails leaves the URL pending for the next pass", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      spyOn(oauth, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      const record = await fsPromises.readFile(
+        path.join(muxRoot, "plugin-sign-outs-pending.json"),
+        "utf8"
+      );
+      expect(JSON.parse(record)).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall that fails keeps the sign-in and records no sign-out", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+        Promise.reject(new Error("ENOSPC: no space left on device"))
+      );
+      try {
+        await expect(
+          updater.uninstall({ name: "demo-plugin", deletePluginData: false })
+        ).rejects.toThrow(/persist the plugin registry/);
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("a plugin whose MCP file cannot be read can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await fsPromises.writeFile(path.join(pluginsDir(), "demo-plugin", "mcp.json"), "{ not json");
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      await oauth.dispose();
+    }, 20_000);
+    test("an update records its sign-outs before the old tree stops and moves", async () => {
+      let armed = false;
+      let atFirstStop: unknown = "not read";
+      const { update, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        {
+          onStop: async () => {
+            if (armed && atFirstStop === "not read") atFirstStop = await pendingRecord();
+          },
+        }
+      );
+      armed = true;
+      await update({ docs: oauthEntry(docsUrl, "client-b") });
+      expect(atFirstStop).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall records its sign-outs before the registry commit", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const realWrite = internals.writeRegistry.bind(internals);
+      let atCommit: unknown = "not read";
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementation(
+        async (envelope, entries) => {
+          if (atCommit === "not read") atCommit = await pendingRecord();
+          return realWrite(envelope, entries);
+        }
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(atCommit).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall refuses at once while the pending sign-out record is corrupt, and changes nothing", async () => {
+      const mcpConfigService = new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: muxRoot }),
+      });
+      let armed = false;
+      let stops = 0;
+      const { updater, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        {
+          mcpConfigService,
+          onStop: () => {
+            if (armed) stops++;
+            return Promise.resolve();
+          },
+        }
+      );
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "docs"
+      );
+      expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+        success: true,
+        data: undefined,
+      });
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      armed = true;
+      const failure = await updater
+        .uninstall({ name: "demo-plugin", deletePluginData: false })
+        .then(
+          () => undefined,
+          (error: unknown) => error as Error
+        );
+      // The record's own error, naming the Settings recovery step, before anything moves.
+      expect(failure?.message).toMatch(
+        /^The pending plugin sign-out record .*Sign out of plugin MCP servers/
+      );
+      expect(stops).toBe(0);
+      // The record fences plugin discovery, so read the global enablement from its file.
+      const globalConfig = jsonc.parse(
+        await fsPromises.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8")
+      ) as { enabledPluginServers?: string[] };
+      expect(globalConfig.enabledPluginServers).toEqual([key]);
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall of a plugin with no remote servers ignores a corrupt pending record", async () => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+    }, 20_000);
+
+    test("a plugin whose servers cannot be listed can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const discover = spyOn(discoveryModule, "discoverAgentPluginAt").mockRejectedValueOnce(
+        new Error("EACCES: permission denied")
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+        expect(discover).toHaveBeenCalled();
+      } finally {
+        discover.mockRestore();
+      }
+      expect(await registry()).toEqual([]);
+      await oauth.dispose();
+    }, 20_000);
   });
 
   test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
@@ -8994,6 +9347,63 @@ describe("describeSignInChanges", () => {
       "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
       "Client registration removed (https://id.example.com/register)",
     ]);
+  });
+});
+
+describe("signInResetUrls", () => {
+  // The credential key drops a trailing slash, as McpOauthService.credentialKey does.
+  const key = (url: string): string | null => url.replace(/\/$/, "");
+  const tree = (servers: Record<string, { url: string; identity: string } | null>) =>
+    new Map(
+      Object.entries(servers).map(([name, signIn]) => [name, signIn === null ? {} : { signIn }])
+    );
+  const at = (url: string, identity: string) => ({ url, identity });
+  const mcp = "https://mcp.example.com/mcp";
+
+  test("resets a server whose identity changes, and no server whose identity stays", () => {
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+  });
+
+  test("matches by credential key: a respelled URL with the same identity is not a removal", () => {
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "x") }), key)
+    ).toEqual([]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "y") }), key)
+    ).toEqual([`${mcp}/`]);
+  });
+
+  test("a sibling that already has the new identity does not mask a change", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
+    expect(signInResetUrls(current, tree({ a: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+  });
+
+  test("a renamed entry has no previous self: any other identity at the key resets it", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
+    expect(signInResetUrls(current, tree({ c: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "y"), b: at(mcp, "y") }), tree({ c: at(mcp, "y") }), key)
+    ).toEqual([]);
+  });
+
+  test("resets the URL of each server the update removes, and no other", () => {
+    const other = "https://other.example.com/mcp";
+    const current = tree({ a: at(mcp, "x"), b: at(other, "x"), local: null });
+    expect(signInResetUrls(current, tree({ b: at(other, "x") }), key)).toEqual([mcp]);
+    expect(signInResetUrls(current, tree({}), key)).toEqual([mcp, other]);
+  });
+
+  test("a server added at a new key, a tree with no current servers and an unkeyed URL reset nothing", () => {
+    expect(signInResetUrls(tree({}), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(undefined, tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({}), () => null)).toEqual([]);
   });
 });
 

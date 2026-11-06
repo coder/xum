@@ -256,11 +256,40 @@ Body
       ]);
       // A denylist of tools Xum does not have removes nothing: the agent keeps Exec's tools.
       expect(parse("name: a\ndisallowedTools: Grep", "plugin").tools).toBeUndefined();
+      expect(parse("name: a\ndisallowedTools: LS", "plugin").tools).toBeUndefined();
+    });
+
+    test("Grep, Glob and LS grant the bash tools only in a read-only search list", () => {
+      const sample = [
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+        "file_edit_insert",
+        "task",
+      ];
+      const toolsOf = (frontmatter: string) => {
+        const { tools } = parse(frontmatter, "plugin");
+        return sample.filter((tool) =>
+          isToolEnabledByConfigs(tool, [{ add: [".*"] }, ...(tools != null ? [tools] : [])])
+        );
+      };
+      expect(toolsOf("name: a\ntools: Read, Grep, Glob")).toEqual([
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+      ]);
+      expect(toolsOf("name: a\ntools: Grep")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: LS")).toEqual(["bash", "bash_output"]);
+      expect(toolsOf("name: a\ntools: Read, Grep, Edit")).toEqual(["file_read", "attach_file"]);
     });
 
     test("an allowlist that resolves to no Xum tool skips the agent", () => {
       for (const frontmatter of [
-        "name: a\ntools: Grep, Glob",
+        // Grep and Glob grant the bash tools only in a search list, and Bash is denied here.
+        "name: a\ntools: Grep, Glob\ndisallowedTools: Bash",
+        "name: a\ntools: LSP, Monitor",
         "name: a\ntools: []",
         "name: a\ntools: Read\ndisallowedTools: Read",
         // Xum cannot narrow a tool to some of its calls, so it does not grant a specifier.

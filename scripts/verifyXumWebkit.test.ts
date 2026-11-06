@@ -12,6 +12,10 @@ const SKILL_SCRIPTS = path.join(import.meta.dir, "../.xum/skills/verify-xum/scri
 const HELPER = path.join(SKILL_SCRIPTS, "webkit-capture.mjs");
 const TOKEN = "tok-3f9a/+=secret value";
 
+// Every test that starts a process (node, bash, git) passes 90_000 as its timeout, as the launch
+// tests in verifyXumLaunch.test.ts do, except the UTF-8 boundary sweep, which keeps its 20_000: on
+// a heavily loaded host, Bun's default 5 s timeout fails the slower ones.
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -212,31 +216,35 @@ describe("webkit-capture.mjs", () => {
     // The fake page's console error echoes its URL, token included. None of its text is kept.
     expect(report).not.toContain("Failed to load resource");
     expectNoToken(report + run.stdout + run.stderr);
-  });
+  }, 90_000);
 
   test("says when the page is wider than the viewport", async () => {
     const run = await runHelper({ widths: [800, 390] });
     expect(run.exitCode, run.stderr).toBe(0);
     expect(readReport(run)).toContain("scrollWidth <= innerWidth: false (800 <= 390)");
-  });
+  }, 90_000);
 
   test("exits 3 and keeps no evidence when the page shows a failed chunk, as idle does", async () => {
     const run = await runHelper({ states: [1 | SETTLED] });
     expect(run.exitCode).toBe(3);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
     expectNoToken(run.stdout + run.stderr);
-  });
+  }, 90_000);
 
   test.each([
     [8 | SETTLED, "the loading screen"],
     [16 | SETTLED, "a Mermaid diagram that is still rendering"],
     [8, "the loading screen"],
-  ])("names what a page that never settles still shows (state %d)", async (state, shown) => {
-    const run = await runHelper({ states: [state], settleMs: 400 });
-    expect(run.exitCode).toBe(1);
-    expect(run.stderr).toContain(`did not settle in 0.4 s: it still shows ${shown}.`);
-    expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
-  });
+  ])(
+    "names what a page that never settles still shows (state %d)",
+    async (state, shown) => {
+      const run = await runHelper({ states: [state], settleMs: 400 });
+      expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain(`did not settle in 0.4 s: it still shows ${shown}.`);
+      expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
+    },
+    90_000
+  );
 
   test.each([
     [2 | SETTLED, "the startup connection error"],
@@ -248,7 +256,8 @@ describe("webkit-capture.mjs", () => {
       expect(run.exitCode).toBe(1);
       expect(run.stderr).toContain(`the page shows ${shown}.`);
       expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
-    }
+    },
+    90_000
   );
 
   test("keeps no evidence when closing the browser fails after the files were written", async () => {
@@ -257,7 +266,7 @@ describe("webkit-capture.mjs", () => {
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
     expect(run.stderr).toContain("failed while trying to close the browser");
     expect(run.stderr).not.toContain("target closed");
-  });
+  }, 90_000);
 
   test("names the step that failed, and none of the error's own text", async () => {
     const run = await runHelper({
@@ -273,7 +282,7 @@ describe("webkit-capture.mjs", () => {
     expect(controlCharacters(run.stderr)).toEqual([]);
     expectNoToken(run.stderr);
     expect(fs.readdirSync(run.evidenceDir)).toEqual([]);
-  });
+  }, 90_000);
 
   test("no writer other than say() reaches stdout or stderr: console, process.std*, fs writes to fd 1 or 2", () => {
     // fail() goes through say(). Any other way out would skip safe(). Comments are dropped first
@@ -317,7 +326,7 @@ describe("webkit-capture.mjs", () => {
     expect(stderr.trimEnd().split("\n")).toHaveLength(1);
     expectNoToken(stderr);
     expect(stderr).not.toContain("other-secret");
-  });
+  }, 90_000);
 
   test("prints and writes no text that a hostile page controls, and counts its errors", async () => {
     // OSC 52 writes the terminal's clipboard. The page also tries the token, colour codes, a C1 CSI
@@ -357,7 +366,7 @@ describe("webkit-capture.mjs", () => {
     for (const word of ["boom", "end", "red", "del", "Zm9v"])
       expect(everything).not.toContain(word);
     expect(report.split("\n")).toHaveLength(7);
-  });
+  }, 90_000);
 
   test("exits 4 with one fixed line when WebKit does not launch, so the caller can try Docker", async () => {
     const run = await runHelper({
@@ -369,7 +378,7 @@ describe("webkit-capture.mjs", () => {
     expect(controlCharacters(run.stderr)).toEqual([]);
     expect(run.stderr).not.toContain("Zm9v");
     expectNoToken(run.stderr);
-  });
+  }, 90_000);
 
   test("waits for Mermaid's own placeholder, which no CSS transition or busy flag shows", () => {
     // `idle`'s test reads a page that still says "Rendering diagram..." as settled.
@@ -557,20 +566,20 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     const result = runCapture("/workspace/x", "reply");
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("<feature>/<step>");
-  });
+  }, 90_000);
 
   test("accepts <feature>/<step>, and gets as far as reading the run", () => {
     const result = runCapture("/workspace/x", "chat/reply");
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("no run at");
-  });
+  }, 90_000);
 
   test("refuses a path with a control character", () => {
     const result = runCapture(`/workspace/x${ESC}]52;c;Zm9v`, "chat/reply");
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("PATH must not hold a control character");
     expect(controlCharacters(result.stderr)).toEqual([]);
-  });
+  }, 90_000);
 
   test("refuses a path with a lone raw 0x9B byte", () => {
     const root = newRoot();
@@ -587,7 +596,7 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     const stderr = strictUtf8(result.stderr);
     expect(result.status, stderr).toBe(1);
     expect(stderr).toContain("PATH must not hold a control character");
-  });
+  }, 90_000);
 
   describe("has_control_char", () => {
     const body = /^has_control_char\(\) \{[^\n]*\n[\s\S]*?\n\}$/m.exec(scriptSource)?.[0];
@@ -639,9 +648,13 @@ describe("verify-xum.sh webkit-capture arguments", () => {
       ["a C1 CSI encoded in UTF-8", [0xc2, 0x9b]],
       ["ESC", [0x1b]],
       ["DEL", [0x7f]],
-    ])("refuses %s", (_label, bytes) => {
-      expect(refuses(...bytes)).toBe(true);
-    });
+    ])(
+      "refuses %s",
+      (_label, bytes) => {
+        expect(refuses(...bytes)).toBe(true);
+      },
+      90_000
+    );
 
     test.each([
       ["e with an acute accent", [0xc3, 0xa9]],
@@ -656,9 +669,13 @@ describe("verify-xum.sh webkit-capture arguments", () => {
       ["U+10000, the first four-byte character", [0xf0, 0x90, 0x80, 0x80]],
       ["U+10FFFF, the last character", [0xf4, 0x8f, 0xbf, 0xbf]],
       ["plain ASCII", [0x61]],
-    ])("accepts %s", (_label, bytes) => {
-      expect(refuses(...bytes)).toBe(false);
-    });
+    ])(
+      "accepts %s",
+      (_label, bytes) => {
+        expect(refuses(...bytes)).toBe(false);
+      },
+      90_000
+    );
 
     test("agrees with a strict UTF-8 decoder on every string made of boundary bytes", () => {
       const product = (...columns: number[][]) =>
@@ -701,27 +718,32 @@ describe("verify-xum.sh webkit-capture arguments", () => {
       expect(result.stderr).toContain("has a control character in its path");
       expect(controlCharacters(result.stderr)).toEqual([]);
       expect(result.dockerCalls).toEqual([]);
-    }
+    },
+    90_000
   );
 
   test.each([
     ["a local socket with ESC", `unix:///var/run/docker.sock${ESC}]52;c;Zm9v${BEL}`],
     ["a remote host with ESC", `tcp://docker.example:2375${ESC}]52;c;Zm9v${BEL}`],
     ["a local socket with a C1 CSI", `unix:///var/run/docker.sock${C1_CSI}31m`],
-  ])("prints no control character of a Docker endpoint that is %s", (_label, endpoint) => {
-    const result = runDockerMode({ endpoint });
-    expect(result.status, result.stderr).toBe(1);
-    expect(result.stderr).toContain("the Docker endpoint has a control character");
-    expect(controlCharacters(result.stderr)).toEqual([]);
-    expect(result.stderr).not.toContain("Zm9v");
-    expect(result.dockerCalls).toEqual(["context inspect"]);
-  });
+  ])(
+    "prints no control character of a Docker endpoint that is %s",
+    (_label, endpoint) => {
+      const result = runDockerMode({ endpoint });
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain("the Docker endpoint has a control character");
+      expect(controlCharacters(result.stderr)).toEqual([]);
+      expect(result.stderr).not.toContain("Zm9v");
+      expect(result.dockerCalls).toEqual(["context inspect"]);
+    },
+    90_000
+  );
 
   test("names the playwright-core version of node_modules when it is not the image's", () => {
     const result = runDockerMode({ playwrightVersion: "1.0.0" });
     expect(result.status, result.stderr).toBe(1);
     expect(result.stderr).toContain("node_modules holds playwright-core 1.0.0,");
-  });
+  }, 90_000);
 
   test("prints no control character of that version", () => {
     const result = runDockerMode({ playwrightVersion: `1.0.0${ESC}]52;c;Zm9v${BEL}` });
@@ -732,5 +754,5 @@ describe("verify-xum.sh webkit-capture arguments", () => {
     expect(controlCharacters(result.stderr)).toEqual([]);
     expect(result.stderr).not.toContain("Zm9v");
     expect(result.dockerCalls).toEqual(["context inspect"]);
-  });
+  }, 90_000);
 });

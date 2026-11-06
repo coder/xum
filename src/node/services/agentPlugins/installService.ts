@@ -812,6 +812,25 @@ function unreviewedRows(
   ];
 }
 
+/**
+ * The agent file lists of the install preview. Display only: the names a user reads before
+ * Install show invisible controls (#6629). `shellRemovedAgents` are the read-only agents whose
+ * mapped tools leave no bash tool.
+ */
+function previewAgentLists(agentFiles: readonly PluginAgentFile[]): {
+  agents: string[];
+  readonlyAgents: string[];
+  shellRemovedAgents: string[];
+} {
+  const names = (keep: (agent: PluginAgentFile) => boolean) =>
+    agentFiles.filter(keep).map((agent) => showInvisibleControls(agent.file));
+  return {
+    agents: names(() => true),
+    readonlyAgents: names((agent) => agent.readonly),
+    shellRemovedAgents: names((agent) => agent.readonly && !agent.keepsShell),
+  };
+}
+
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
@@ -1749,6 +1768,77 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
           : "Client secret changed"
     );
   return lines;
+}
+
+interface SignInKeyEntry {
+  url: string;
+  identityByServerName: Map<string, string>;
+}
+
+function indexSignIns(
+  servers: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  credentialKey: (url: string) => string | null
+): Map<string, SignInKeyEntry> {
+  const index = new Map<string, SignInKeyEntry>();
+  // mutation-equivalent: a Map is never falsy, so ?? and || agree
+  for (const [serverName, { signIn }] of servers ?? []) {
+    const key = signIn && credentialKey(signIn.url);
+    if (!key || !signIn) continue;
+    // mutation-equivalent: an entry object is never falsy, so ?? and || agree
+    const entry = index.get(key) ?? {
+      url: signIn.url,
+      identityByServerName: new Map<string, string>(),
+    };
+    entry.identityByServerName.set(serverName, signIn.identity);
+    index.set(key, entry);
+  }
+  return index;
+}
+
+/**
+ * Compare an entry with its own previous identity (same name, same key): when two servers share
+ * a URL, another entry already using the new identity must not mask the change. A renamed (or
+ * added) entry has no previous self, and the stored credentials cannot be traced to one entry:
+ * it changed whenever any identity at the key differs.
+ */
+function signInIdentityChanged(
+  before: ReadonlyMap<string, string>,
+  serverName: string,
+  identity: string
+): boolean {
+  const previous = before.get(serverName);
+  return previous !== undefined
+    ? previous !== identity
+    : [...before.values()].some((other) => other !== identity);
+}
+
+/**
+ * The server URLs whose stored credentials an update must sign out: a key whose sign-in identity
+ * changes, and a key the update removes. A removed server keeps its credentials under its URL,
+ * and a later update can add a server at that URL under another identity with no current server
+ * left to show the change, so the removal is the only moment to sign out. A needless sign-out is
+ * acceptable; stale credentials offered under a new identity are not.
+ */
+export function signInResetUrls(
+  current: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  staged: ReadonlyMap<string, { signIn?: SurfaceSignIn }>,
+  credentialKey: (url: string) => string | null
+): string[] {
+  const before = indexSignIns(current, credentialKey);
+  const after = indexSignIns(staged, credentialKey);
+  const resets: string[] = [];
+  for (const [key, now] of after) {
+    const was = before.get(key);
+    if (
+      was !== undefined &&
+      [...now.identityByServerName].some(([serverName, identity]) =>
+        signInIdentityChanged(was.identityByServerName, serverName, identity)
+      )
+    )
+      resets.push(now.url);
+  }
+  for (const [key, was] of before) if (!after.has(key)) resets.push(was.url);
+  return resets;
 }
 
 const LOGO_MAX_BYTES = 512 * 1024;
@@ -3260,32 +3350,7 @@ export class AgentPluginInstallService {
     // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
     const credentialKey = (url: string): string | null =>
       this.mcpOauthService?.credentialKey(url) ?? null;
-    // Compare each entry with its own previous identity (same name, same key): when two
-    // servers share a URL, another entry already using the new identity must not mask the
-    // change. A renamed (or added) entry has no previous self, and the stored credentials
-    // cannot be traced to one entry: reset whenever any identity at the key differs. A
-    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
-    const currentIdentities = new Map<string, Set<string>>();
-    const currentEntryIdentity = new Map<string, string>();
-    for (const [serverName, server] of current?.servers ?? []) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const identities = currentIdentities.get(key) ?? new Set<string>();
-      identities.add(server.signIn.identity);
-      currentIdentities.set(key, identities);
-      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
-    }
-    for (const [serverName, server] of staged.servers) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
-      const identity = server.signIn.identity;
-      const changed =
-        previous !== undefined
-          ? previous !== identity
-          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
-      if (changed) signInResets?.push(server.signIn.url);
-    }
+    signInResets?.push(...signInResetUrls(current?.servers, staged.servers, credentialKey));
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
@@ -3960,11 +4025,7 @@ export class AgentPluginInstallService {
     assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-    // Display only: the names a user reads before Install show invisible controls (#6629).
-    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-    const readonlyAgents = agentFiles.flatMap((agent) =>
-      agent.readonly ? [showInvisibleControls(agent.file)] : []
-    );
+    const { agents, readonlyAgents, shellRemovedAgents } = previewAgentLists(agentFiles);
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -4016,6 +4077,7 @@ export class AgentPluginInstallService {
       fileChanges,
       agents,
       readonlyAgents,
+      shellRemovedAgents,
       workflows,
       slashCommands,
       reviewedComponents,
@@ -5222,8 +5284,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
-   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   * Removes `urls` from the pending sign-outs: they finished, or the update or uninstall rolled
+   * back before it took effect. Best effort: a leftover URL only signs the server out once more.
    */
   private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
     if (urls.length === 0) return;
@@ -5235,7 +5297,7 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  /** Signs out `urls` after an update or an uninstall; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
     // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
@@ -5546,6 +5608,43 @@ export class AgentPluginInstallService {
     return urls;
   }
 
+  /**
+   * Throws the pending record's own error when an uninstall that will record sign-outs cannot
+   * read it. It runs before anything stops or moves: a failure at the commit would roll the tree
+   * back but not the global MCP enablement.
+   */
+  private async assertPendingSignOutsReadable(urls: readonly string[]): Promise<void> {
+    if (urls.length > 0) await this.readPendingSignOuts();
+  }
+
+  /**
+   * A server that fails to load is not listed. A tree Xum cannot read lists none: it must stay
+   * removable.
+   */
+  private async installedServerUrls(name: string): Promise<string[]> {
+    try {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: this.targetPathFor(name),
+        scope: "global",
+      });
+      // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
+      if (plugin?.mcpConfigPath === undefined) return [];
+      const { servers } = await loadPluginMcpServers(plugin, {
+        xumHome: this.config.rootDir,
+        instanceId: this.instanceIdFor(name),
+      });
+      return Object.values(servers).flatMap((info) =>
+        info.transport === "stdio" ? [] : [info.url]
+      );
+    } catch (error) {
+      log.warn("Could not list the MCP servers of a plugin that is being uninstalled", {
+        plugin: name,
+        error: getErrorMessage(error),
+      });
+      return [];
+    }
+  }
+
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
   private async pluginTreeServerUrls(dirName: string, installed: boolean): Promise<string[]> {
     // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
@@ -5765,6 +5864,9 @@ export class AgentPluginInstallService {
       const targetPath = this.targetPathFor(entry.name);
       const instanceId = this.instanceIdFor(entry.name);
       const serverKeyPrefix = buildPluginServerKey(instanceId, "");
+      // Read before the tree moves: its servers' stored sign-ins are keyed by URL and outlive it.
+      const signOutUrls = await this.installedServerUrls(entry.name);
+      await this.assertPendingSignOutsReadable(signOutUrls);
 
       // Enumerate pruning targets BEFORE committing anything: if this fails,
       // the uninstall aborts with the install fully intact (retryable from
@@ -5901,7 +6003,11 @@ export class AgentPluginInstallService {
       } else {
         delete commitEnvelope.pendingOverridePrunes;
       }
+      let recordedSignOuts: string[] = [];
       try {
+        // Recorded before the commit, like an update's: a crash after it leaves the sign-outs for
+        // the next start (#6122).
+        recordedSignOuts = await this.recordPendingSignOuts(signOutUrls);
         // Before the commit, so a failure leaves trust and approved copies cleared (fail closed)
         // rather than kept for a later install under this name.
         await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
@@ -5911,6 +6017,8 @@ export class AgentPluginInstallService {
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
+        // The plugin stays installed: its servers keep their sign-ins.
+        await this.forgetPendingSignOuts(recordedSignOuts);
         const treeRestored = await restoreTree("failed registry write");
         let dataRestored = true;
         if (stagedData) {
@@ -5990,6 +6098,10 @@ export class AgentPluginInstallService {
       if (trashCleaned) {
         await consumeJournal();
       }
+
+      // Signed out before the final stop, like an update: a startup that raced the sign-out is
+      // invalidated too.
+      await this.signOutAndSettle(entry.name, signOutUrls);
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,

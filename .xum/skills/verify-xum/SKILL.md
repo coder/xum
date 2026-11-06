@@ -156,9 +156,11 @@ The backend always has an auth token: launch refuses a backend whose `server.loc
 Launch's `env -i` drops `XUM_DEV_SERVER_NO_AUTH`, but Bun loads the checkout's `.env` files into
 the sandbox script, so a `.env` line `XUM_DEV_SERVER_NO_AUTH=1` turns auth off again. The refusal
 names that line and says to remove it. (A checkout from before #7904 starts the backend without a
-token, so launch refuses it too.) Doctor and launch send curl the token from `server.lock` on stdin,
-never in argv, and only while the backend that `server.lock` names runs: while the backend is
-stopped or nodemon restarts it, its TCP port is free for another account to bind.
+token, so launch refuses it too.) Doctor and launch send the token to the backend only over its
+Unix socket, which the Makefile puts in a folder that only you can write, and give it to curl on
+stdin, never in argv. They never send it to the TCP port: while the backend starts, stops or
+restarts under nodemon, that port can be free for another account to bind. Doctor's `/health`
+check needs no token and goes to the TCP port.
 Exit 1 means do not drive this instance: run cleanup, then launch again.
 
 ## Drive
@@ -212,14 +214,20 @@ agent-browser find role button click --name "Open settings" --exact
   `[mock:list-languages]` are in `src/node/services/mock/mockAiRouter.ts`. Mock tool calls are
   canned and leave the worktree alone. A canned `todo_write` (`[mock:todo-nudge]`) still writes
   its TODO list to the workspace's session folder.
-- The CLI drives the same server. Run it under `env -i`: the live Xum's server URL and auth
+- The CLI drives the same server. Run it through `verify-xum.sh cli`, which runs
+  `dist/cli/api.mjs` against the newest run under `env -i`: the live Xum's server URL and auth
   token are in your env under both `XUM_*` and legacy `MUX_*` names, and the CLI reads either.
   With them gone it finds the sandbox through `XUM_ROOT`:
 
   ```bash
-  env -i PATH="$PATH" HOME="$HOME" XUM_ROOT="$VERIFY_XUM_ROOT" \
-    node "$VERIFY_XUM_CHECKOUT/dist/cli/api.mjs" workspace list
+  verify-xum.sh cli workspace list
   ```
+
+  The CLI talks to the TCP port that `server.lock` names, and it has no Unix-socket mode. So
+  `cli` first checks that the pid in `server.lock` carries this run's id and is the only listener
+  on that port, and refuses otherwise (a backend that is stopping or restarting). The CLI's own
+  read of `server.lock` ignores a lock whose pid has died. A backend that dies in the moment
+  between that read and the CLI's TCP connect is not covered.
 
 ## Evidence
 
