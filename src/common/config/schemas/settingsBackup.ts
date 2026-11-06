@@ -302,6 +302,13 @@ const BackupContentFlagsSchema = z.object({
    * artifacts are agent output, not settings. Project shelves travel only with includeProjects.
    */
   includeGlobalArtifacts: z.boolean().optional(),
+  /**
+   * The list of managed Agent Plugins (source URL, tracked ref and pinned commit) as an
+   * `agent-plugins/` sidecar. On by default, like the other settings: the list carries no code
+   * and no consent, and a restore installs nothing by itself. It only offers each missing
+   * plugin for the normal install review.
+   */
+  includePlugins: z.boolean().optional(),
 });
 
 export type BackupContentFlag = keyof z.infer<typeof BackupContentFlagsSchema>;
@@ -318,6 +325,7 @@ export const BACKUP_CONTENT_DEFAULTS: BackupContents = {
   includePreferences: true,
   includeProjects: false,
   includeGlobalArtifacts: false,
+  includePlugins: true,
 };
 
 export const BACKUP_CONTENT_FLAGS: readonly BackupContentFlag[] =

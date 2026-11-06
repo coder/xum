@@ -3,6 +3,12 @@ import {
   SettingsBackupInputSchema,
   SettingsBackupSchema,
 } from "@/common/config/schemas/settingsBackup";
+import {
+  AgentPluginGitSourceSchema,
+  AgentPluginImportedComponentsSchema,
+  AgentPluginInstallEntrySchema,
+} from "@/common/config/schemas/agentPluginInstalls";
+import { AgentPluginInstallMethodSchema } from "./agentPlugins";
 import { ResultSchema } from "./result";
 
 /**
@@ -47,6 +53,55 @@ export const BackupProjectImportResultSchema = z.object({
    * an import into an already registered project must not tell the user to remove it.
    */
   registered: z.boolean(),
+});
+
+/** Cap on the plugins one backup list names: it is repository-controlled, and a restore shows every row. */
+export const MAX_BACKUP_PLUGIN_ENTRIES = 512;
+
+/**
+ * One managed Agent Plugin as the backup records it: where it came from and which commit it was
+ * pinned to. Only what is needed to offer the install again. Consent, hook trust, approved copies,
+ * enabled servers and timestamps are local facts and never travel (the parse drops them): another
+ * machine's review is the only thing that can approve a plugin there. Fields are capped like the
+ * project bundle's, because the list is repository-controlled.
+ */
+export const BackupPluginEntrySchema = z.object({
+  name: AgentPluginInstallEntrySchema.shape.name,
+  source: AgentPluginGitSourceSchema.extend({
+    url: z.string().min(1).max(2048),
+    ref: z.string().min(1).max(256),
+    subpath: z.string().min(1).max(1024).optional(),
+  }),
+  /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
+  lockedSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  /** The install method of a plugin Xum generated a plugin.json for; absent takes the first that fits. */
+  method: AgentPluginInstallMethodSchema.optional(),
+  importedComponents: AgentPluginImportedComponentsSchema.optional(),
+});
+
+/** The `agent-plugins/manifest.json` sidecar of a backup. */
+export const BackupPluginManifestSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    plugins: z.array(BackupPluginEntrySchema).max(MAX_BACKUP_PLUGIN_ENTRIES),
+  })
+  .refine(
+    (manifest) =>
+      new Set(manifest.plugins.map((plugin) => plugin.name)).size === manifest.plugins.length,
+    {
+      message: "The plugin list names a plugin twice",
+    }
+  );
+
+/**
+ * How a listed plugin compares with this machine's managed installs: `missing` (nothing by that
+ * name), `installed` (that name at the same commit), `conflict` (that name is taken by another
+ * commit or by a folder the installer does not manage).
+ */
+export const BackupPluginInstallStatusSchema = z.enum(["missing", "installed", "conflict"]);
+
+export const BackupPluginInstallSchema = BackupPluginEntrySchema.extend({
+  status: BackupPluginInstallStatusSchema,
 });
 
 export const BackupOperationErrorSchema = z.object({
@@ -128,6 +183,10 @@ export const backup = {
         projectBundleSkipped: z.boolean(),
         /** Artifact shelf files left out of the push or a restore, each with its reason. */
         shelfSkipped: z.array(z.string()).optional(),
+        /** The backup's plugin list against this machine's installs. Restoring installs none of them. */
+        pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
+        /** The backup carries a plugin list but `includePlugins` is off, so it is skipped. */
+        pluginListSkipped: z.boolean().optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -173,6 +232,9 @@ export const backup = {
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
         shelfSkipped: z.array(z.string()).optional(),
+        /** The backup's plugin list against this machine's installs, for the reinstall offer. */
+        pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
+        pluginListSkipped: z.boolean().optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -192,3 +254,6 @@ export type BackupCommandApproval = z.infer<typeof BackupCommandApprovalSchema>;
 export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
+export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
+export type BackupPluginManifest = z.infer<typeof BackupPluginManifestSchema>;
+export type BackupPluginInstall = z.infer<typeof BackupPluginInstallSchema>;
