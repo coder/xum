@@ -632,7 +632,7 @@ interface ForkCopyProgress {
 }
 /** Parallel realpath budget for the sharer scan (see publishEffectiveOverrides). */
 const CANONICALIZE_CONCURRENCY = 16;
-/** Budget for acquiring a workspace lock — or a whole batch of them (see withWorkspaceLocks). */
+/** Budget for waiting on busy workspace locks, for one workspace or a batch (see withWorkspaceLocks). */
 const WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS = 60_000;
 const WORKSPACE_LOCK_RETRY_BACKOFF_MS = 150;
 /** Budget for an unlocked reader's legacy migration to take the write locks (see migrateLegacyOverridesFenced). */
@@ -3759,8 +3759,9 @@ export class WorkspaceMcpOverridesService {
    * saves responsive during a slow remote rename (the global lock is never
    * held across a checkout move).
    *
-   * LOCK ORDER: workspace locks are acquired in sorted order and ALWAYS
-   * before the global lock (runExclusive), never while holding it.
+   * LOCK ORDER: workspace locks are ALWAYS taken before the global lock
+   * (runExclusive), never while holding it. A batch waits for at most one
+   * of them, holding nothing, and only tries the rest (see withWorkspaceLocks).
    * A crashed holder is reclaimed once provably dead (never on age), like
    * the global lock.
    */
@@ -4715,8 +4716,9 @@ export class WorkspaceMcpOverridesService {
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     // Many checkouts at once: thousands of sequential stats outlasted the
-    // sweep budget. One task per ID (first spelling), and IDs whose
-    // checkouts share a lock key run one after another (see groupByCheckout).
+    // sweep budget. One task per ID (first spelling). IDs whose checkouts
+    // share a lock key run one after another (see groupByCheckout), so no
+    // two prunes read or rewrite one checkout's document at once.
     const seen = new Set<string>();
     const uniqueIds = workspaceIds.filter((workspaceId) => {
       const id = workspaceId.trim();

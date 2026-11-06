@@ -4577,6 +4577,8 @@ describe("WorkspaceMcpOverridesService", () => {
     }
 
     expect(failures.map((failure) => failure.workspaceId)).toEqual([busy.workspaceId]);
+    // The holder's details reach the install error's log line.
+    expect(String(failures[0].error)).toMatch(/\.lock is held by pid/);
     const read = async (workspacePath: string) =>
       (
         jsoncParse(
@@ -4692,6 +4694,147 @@ describe("WorkspaceMcpOverridesService", () => {
       linkSpy.mockRestore();
       await releaseOld();
     }
+  });
+
+  /** `count` workspaces whose documents each hold a stale enable for the test plugin. */
+  async function workspacesWithStaleEnables(name: string, count: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const workspace = await registerWorkspace(`${name}-${index}`);
+      await fs.mkdir(path.join(workspace.workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspace.workspacePath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+      );
+      ids.push(workspace.workspaceId);
+    }
+    return ids;
+  }
+
+  it("prunePluginOverrideKeysForWorkspaces releases its checkout locks many at a time", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+    const ids = await workspacesWithStaleEnables("release-many", 40);
+    const realRm = fsPromisesModule.rm;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const rmSpy = spyOn(fsPromisesModule, "rm").mockImplementation(async (target, options) => {
+      const lockFile = String(target);
+      if (
+        !lockFile.includes(`${path.sep}mcp-overrides-locks${path.sep}`) ||
+        !lockFile.endsWith(".lock")
+      ) {
+        return realRm(target, options);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return await realRm(target, options);
+      } finally {
+        inFlight--;
+      }
+    });
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        ids,
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(16);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces prunes many checkouts at a time, at most 16", async () => {
+    // One at a time outlasted the sweep budget at thousands of checkouts;
+    // without a bound, every repository-controlled document is read at once.
+    const service = new WorkspaceMcpOverridesService(config);
+    const ids = await workspacesWithStaleEnables("prune-many", 40);
+    const realLstat = fsPromisesModule.lstat;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const lstatSpy = spyOn(fsPromisesModule, "lstat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (!String(target).endsWith("mcp.local.jsonc")) {
+        return (realLstat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+      }
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return await realLstat(target);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof fsPromisesModule.lstat);
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        ids,
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      lstatSpy.mockRestore();
+    }
+
+    expect(failures).toEqual([]);
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(16);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces names a workspace listed twice once", async () => {
+    const service = new WorkspaceMcpOverridesService(config);
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      ["ws-listed-twice", " ws-listed-twice"],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual(["ws-listed-twice"]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces still bumps the epoch when a workspace fails after a rewrite", async () => {
+    // A corrupted config lists one ID on two checkouts. The first rewrite is
+    // durable even though the second checkout fails, so sibling processes
+    // must learn about it now, not on the retry.
+    const service = new WorkspaceMcpOverridesService(config);
+    const rewritten = await registerWorkspace("epoch-dup-a");
+    const failing = await registerWorkspace("epoch-dup-b");
+    const clean = await registerWorkspace("epoch-clean");
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === failing.workspaceId) workspace.id = rewritten.workspaceId;
+        }
+      }
+      return cfg;
+    });
+    const write = async (workspacePath: string, text: string) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), text);
+    };
+    await write(
+      rewritten.workspacePath,
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo"] })
+    );
+    await write(failing.workspacePath, "x".repeat(1024 * 1024 + 1));
+    const before = await readWorkspaceOverridesEpochToken(config.rootDir);
+
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [rewritten.workspaceId, clean.workspaceId],
+      "plugin:0123456789abcdef:"
+    );
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([rewritten.workspaceId]);
+    const after = jsoncParse(
+      await fs.readFile(path.join(rewritten.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual([]);
+    expect(await readWorkspaceOverridesEpochToken(config.rootDir)).not.toBe(before);
   });
 
   it("prunePluginOverrideKeysForWorkspaces prunes aliases of one checkout one after another", async () => {
