@@ -25,7 +25,11 @@ import * as os from "os";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
-import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
+import {
+  TestTempDir,
+  createTestToolConfig,
+  readExitCodeWhenWritten,
+} from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
 
 interface ProbeFailureControl {
@@ -114,22 +118,6 @@ async function captureProbeError(action: () => Promise<unknown>): Promise<Error 
 
 async function expectProbeCallNotToThrow(action: () => Promise<unknown>): Promise<void> {
   expect(await captureProbeError(action)).toBeNull();
-}
-
-/**
- * The wrapper records its exit with `echo $? > exit_code`, so the marker exists, empty, from the
- * redirect's create until the write, and a slow host can stretch that gap. A status read in the
- * gap sees an empty marker and reports "running": wait for the code, not for the file or a fixed
- * time. The poll lasts up to 5 s, so a test that calls it needs its own timeout.
- */
-async function readExitCodeWhenWritten(outputDir: string): Promise<string> {
-  const exitCodePath = path.join(outputDir, "exit_code");
-  let content = "";
-  for (let attempt = 0; attempt < 200 && content.trim() === ""; attempt++) {
-    content = await fs.readFile(exitCodePath, "utf-8").catch(() => "");
-    if (content.trim() === "") await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return content.trim();
 }
 
 function waitForMonitorMatch(
