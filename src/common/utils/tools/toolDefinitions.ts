@@ -73,6 +73,7 @@ import {
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
 import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
+import { describeCutOffBashScript } from "@/common/utils/tools/bashScriptSyntax";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -2333,7 +2334,13 @@ export const TOOL_DEFINITIONS = {
       },
       z
         .object({
-          script: z.string().describe("Bash script to run"),
+          script: z
+            .string()
+            .superRefine((script, ctx) => {
+              const message = describeCutOffBashScript(script);
+              if (message !== null) ctx.addIssue({ code: "custom", message });
+            })
+            .describe("Bash script to run"),
           model_intent: z
             .string()
             .nullish()
