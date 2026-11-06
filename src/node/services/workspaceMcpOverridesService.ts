@@ -666,6 +666,109 @@ interface CheckoutLockKeys {
   /** The registry view the derivation read (registry-only enumeration). */
   registry: FrontendWorkspaceMetadata[];
 }
+/** What withWorkspaceLocks hands `fn`: `keys` lists only workspaces whose every key is held. */
+interface LockedCheckouts extends CheckoutLockKeys {
+  /** Workspaces left unlocked by a partial last pass (see withWorkspaceLocks). */
+  busy: Array<{ workspaceId: string; error: Error }>;
+}
+/**
+ * Split a verified derivation into the workspaces whose every key is `held`
+ * and the rest, which carry their busy key's error (or a moved checkout's).
+ */
+function lockedSubset(
+  verification: CheckoutLockKeys,
+  held: ReadonlyMap<string, unknown>,
+  busyKeys: ReadonlyMap<string, Error>
+): LockedCheckouts {
+  const keys = new Map<string, string[]>();
+  const busy: LockedCheckouts["busy"] = [];
+  for (const [workspaceId, workspaceKeys] of verification.keys) {
+    const missing = workspaceKeys.find((key) => !held.has(key));
+    if (missing === undefined) {
+      keys.set(workspaceId, workspaceKeys);
+    } else {
+      // mutation-equivalent: an Error is never falsy, so ?? and || agree
+      busy.push({ workspaceId, error: busyKeys.get(missing) ?? new CheckoutKeysChangedError() });
+    }
+  }
+  return { ...verification, keys, busy };
+}
+/**
+ * The lock a batch waits for, holding nothing else: the one that was busy last
+ * time (so a retry waits instead of retaking every lock), else the first.
+ */
+function awaitedLockKey(
+  keys: readonly string[],
+  lastBusyKey: string | undefined
+): string | undefined {
+  return lastBusyKey !== undefined && keys.includes(lastBusyKey) ? lastBusyKey : keys[0];
+}
+function lockKeysFingerprint(derived: CheckoutLockKeys): string {
+  return JSON.stringify([
+    [...new Set([...derived.keys.values()].flat())].sort(),
+    derived.unresolvable.map((entry) => entry.workspaceId).sort(),
+  ]);
+}
+/**
+ * Why a full (not last) batch pass must release and retry: the first busy key
+ * with its lock error, or a checkout that moved between the two derivations.
+ */
+function passBlocker(
+  busy: ReadonlyMap<string, Error>,
+  derived: CheckoutLockKeys,
+  verification: CheckoutLockKeys
+): { key?: string; error: Error } | undefined {
+  const [firstBusy] = [...busy.entries()].sort(([a], [b]) => a.localeCompare(b));
+  if (firstBusy !== undefined) {
+    return { key: firstBusy[0], error: firstBusy[1] };
+  }
+  return lockKeysFingerprint(verification) === lockKeysFingerprint(derived)
+    ? undefined
+    : { error: new CheckoutKeysChangedError() };
+}
+function isRetryableLockError(error: unknown): boolean {
+  return (
+    error instanceof CheckoutKeysChangedError ||
+    // The lock's timeout message appends holder details to ours.
+    error instanceof CrossProcessLockTimeoutError ||
+    (error instanceof Error && error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE)
+  );
+}
+/** One workspace's result in sweepPluginOverrideKeys. */
+type SweptOutcome =
+  | { ok: true; swept: SweptWorkspace; owesEpoch: boolean }
+  | { ok: false; error: unknown; owesEpoch: boolean };
+/**
+ * Group IDs whose checkouts share a lock key: aliases of one checkout (an
+ * isolation:none child and its parent) address one override document, and
+ * two prunes of it at once can collide (Windows refuses a rename over a file
+ * another handle has open). Groups run in parallel, each group's IDs in turn.
+ */
+function groupByCheckout(
+  ids: readonly string[],
+  keysOf: (id: string) => readonly string[]
+): string[][] {
+  const groupOfKey = new Map<string, Set<string>>();
+  const groupOfId = new Map<string, Set<string>>();
+  for (const id of ids) {
+    // Merge into a NEW set: no loop below iterates the set it grows.
+    const group = new Set([id]);
+    for (const key of keysOf(id)) {
+      // mutation-equivalent: a Set is never falsy, so ?? and || agree
+      for (const member of groupOfKey.get(key) ?? []) group.add(member);
+    }
+    for (const member of group) {
+      groupOfId.set(member, group);
+      for (const key of keysOf(member)) groupOfKey.set(key, group);
+    }
+  }
+  return [...new Set(groupOfId.values())].map((group) => [...group]);
+}
+/**
+ * Lock files and checkouts touched at once by a batch (see withWorkspaceLocks).
+ * Measured on Node: 7,550 lock files took 70 s one at a time, 4.6 s 16 at a time.
+ */
+const CHECKOUT_IO_CONCURRENCY = 16;
 const WORKSPACE_LOCK_TIMEOUT_MESSAGE =
   "Another Mux operation (a rename or an MCP settings update) is in progress for this workspace. Wait for it to finish and try again.";
 /** Parallel descendant probes/resolutions per breadth level (see publishEffectiveOverrides). */
@@ -1019,7 +1122,7 @@ export function isPositivelyAbsent(error: unknown): boolean {
 }
 
 type OverridesFileProbe =
-  | { kind: "file" }
+  | { kind: "file"; size: number }
   | { kind: "absent" }
   /** EACCES, I/O error, transport hiccup: the file may or may not exist. */
   | { kind: "indeterminate"; error: unknown };
@@ -1044,7 +1147,7 @@ async function probeOverridesFile(
           kind: "indeterminate",
           error: new Error(`Workspace MCP overrides path is a directory: ${filePath}`),
         }
-      : { kind: "file" };
+      : { kind: "file", size: stat.size };
   } catch (error) {
     return isPositivelyAbsent(error) ? { kind: "absent" } : { kind: "indeterminate", error };
   }
@@ -1073,14 +1176,29 @@ function selectProbedCandidate(
   return { kind: "absent" };
 }
 
-async function statIsFile(
+/**
+ * Override documents list server names (a few KB). The file is repository
+ * controlled, and the plugin-key sweep reads many checkouts at once, so a
+ * larger one fails its workspace instead of being buffered and parsed.
+ */
+const MAX_PRUNED_OVERRIDES_BYTES = 1024 * 1024;
+/**
+ * Whether a candidate override file exists for the plugin-key prune.
+ * Strict: "cannot tell" throws, like a file over MAX_PRUNED_OVERRIDES_BYTES,
+ * so the caller keeps its tombstone instead of retiring it unread.
+ */
+async function prunableFileExists(
   runtime: ReturnType<typeof createRuntime>,
-  filePath: string,
-  mode: "lenient" | "strict"
+  filePath: string
 ): Promise<boolean> {
   const probe = await probeOverridesFile(runtime, filePath);
-  if (probe.kind === "indeterminate" && mode === "strict") {
+  if (probe.kind === "indeterminate") {
     throw probe.error;
+  }
+  if (probe.kind === "file" && probe.size > MAX_PRUNED_OVERRIDES_BYTES) {
+    throw new Error(
+      `Workspace MCP overrides file ${filePath} is ${probe.size} bytes, over the ${MAX_PRUNED_OVERRIDES_BYTES} bytes Xum reads to remove plugin keys. Remove or shrink it, then retry.`
+    );
   }
   return probe.kind === "file";
 }
@@ -3823,80 +3941,119 @@ export class WorkspaceMcpOverridesService {
   }
 
   /**
-   * Run `fn` holding the checkout locks of `workspaceIds`. ONE acquisition
-   * budget for the whole batch, and no unrelated lock is retained while
-   * waiting: the first lock is awaited (nothing else is held), every further
-   * lock is only TRIED; when one is busy, everything acquired so far is
-   * released and the batch retries after a short backoff until the budget
-   * runs out. A sweep over A and B therefore never keeps A's writers waiting
-   * behind a slow rename of B. The ids' checkout keys are re-derived under
-   * the locks: a rename that moved a checkout in between changes its key, and
-   * the batch then releases and retries with the current keys. `fn` receives
-   * the registry view that verification read under the locks.
+   * Run `fn` holding the checkout locks of `workspaceIds`. The budget bounds
+   * WAITING for busy locks, not the I/O of taking free ones (thousands of
+   * lock files took longer than the whole budget one at a time), and no
+   * unrelated lock is retained while waiting: only one lock is ever awaited,
+   * with nothing else held; every other lock is TRIED, many at once. When one
+   * is busy, everything acquired so far is released and the batch retries
+   * after a short backoff, first waiting for the lock that was busy. A sweep
+   * over A and B therefore never keeps A's writers waiting behind a slow
+   * rename of B. The ids' checkout keys are re-derived under the locks: a
+   * rename that moved a checkout in between changes its key, and the batch
+   * then releases and retries with the current keys. `fn` receives the
+   * registry view that verification read under the locks.
+   *
+   * `partialAtDeadline` (the plugin-key sweep): once the budget is spent, one
+   * last pass tries every lock and runs `fn` for the workspaces whose locks it
+   * holds, listing the rest in `busy`, so one long rename fails only its own
+   * workspace instead of the whole batch.
    */
   private async withWorkspaceLocks<T>(
     workspaceIds: readonly string[],
-    fn: (locked: CheckoutLockKeys) => Promise<T>,
-    budgetMs = WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS
+    fn: (locked: LockedCheckouts) => Promise<T>,
+    budgetMs = WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+    options: { partialAtDeadline?: boolean } = {}
   ): Promise<T> {
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
+    const partialAtDeadline = options.partialAtDeadline === true;
     const deadlineAt = Date.now() + budgetMs;
     const remaining = () => Math.max(0, deadlineAt - Date.now());
     // Key derivation probes checkouts (bounded realpaths, but hundreds of
     // stalled ones add up): it draws from the same budget as the acquisition
     // — and the verification run below happens while every lock is held.
-    const derive = () =>
-      withDeadline(this.checkoutLockKeys(ids), remaining(), WORKSPACE_LOCK_TIMEOUT_MESSAGE);
-    const fingerprint = (derived: CheckoutLockKeys) =>
-      JSON.stringify([
-        [...new Set([...derived.keys.values()].flat())].sort(),
-        derived.unresolvable.map((entry) => entry.workspaceId).sort(),
-      ]);
+    // Only the partial batch's last pass, which starts once that budget is
+    // spent, bounds each derivation by a whole budget of its own.
+    const derive = (lastPass: boolean) =>
+      withDeadline(
+        this.checkoutLockKeys(ids),
+        lastPass ? budgetMs : remaining(),
+        WORKSPACE_LOCK_TIMEOUT_MESSAGE
+      );
+    let lastBusyKey: string | undefined;
     for (;;) {
-      const releases: Array<() => Promise<void>> = [];
+      const lastPass = partialAtDeadline && remaining() === 0;
+      const held = new Map<string, () => Promise<void>>();
       let acquiredAll = false;
       try {
-        const derived = await derive();
+        const derived = await derive(lastPass);
         const keys = [...new Set([...derived.keys.values()].flat())].sort();
-        for (const [index, key] of keys.entries()) {
-          if (remaining() === 0) {
-            throw new Error(WORKSPACE_LOCK_TIMEOUT_MESSAGE);
-          }
-          releases.push(await this.acquireCheckoutLock(key, index === 0 ? remaining() : 0));
-        }
-        const verification = await derive();
-        if (fingerprint(verification) !== fingerprint(derived)) {
-          if (remaining() === 0) {
-            throw new Error(WORKSPACE_LOCK_TIMEOUT_MESSAGE);
-          }
-          throw new CheckoutKeysChangedError();
-        }
-        if (remaining() === 0) {
-          throw new Error(WORKSPACE_LOCK_TIMEOUT_MESSAGE);
+        const awaited = lastPass ? undefined : awaitedLockKey(keys, lastBusyKey);
+        const busy = await this.takeCheckoutLocks(keys, held, awaited, remaining());
+        const verification = await derive(lastPass);
+        const blocker = lastPass ? undefined : passBlocker(busy, derived, verification);
+        if (blocker !== undefined) {
+          lastBusyKey = blocker.key;
+          throw blocker.error;
         }
         acquiredAll = true;
-        return await fn(verification);
+        return await fn(lockedSubset(verification, held, busy));
       } catch (error) {
         const retry =
           !acquiredAll &&
-          error instanceof Error &&
-          (error instanceof CheckoutKeysChangedError ||
-            // The lock's timeout message appends holder details to ours.
-            error instanceof CrossProcessLockTimeoutError ||
-            error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE) &&
-          Date.now() < deadlineAt;
+          !lastPass &&
+          isRetryableLockError(error) &&
+          // mutation-equivalent: < and <= differ only in the deadline's own millisecond
+          (partialAtDeadline || Date.now() < deadlineAt);
         if (!retry) {
           throw error;
         }
       } finally {
-        for (const release of releases.reverse()) {
-          await release();
-        }
+        // A release retries its unlink and never rejects (see crossProcessLock).
+        await mapWithConcurrency([...held.values()], CHECKOUT_IO_CONCURRENCY, (release) =>
+          release()
+        );
       }
       await new Promise((resolve) =>
         setTimeout(resolve, WORKSPACE_LOCK_RETRY_BACKOFF_MS + Math.random() * 100)
       );
     }
+  }
+
+  /**
+   * Take `keys` into `held`: `awaited` waits up to `waitMs` (nothing else is
+   * held yet), every other key is only tried. Returns the busy keys with the
+   * lock's timeout error. Every attempt settles before this returns, so a
+   * caller releasing `held` afterwards cannot miss a late acquisition.
+   */
+  private async takeCheckoutLocks(
+    keys: readonly string[],
+    held: Map<string, () => Promise<void>>,
+    awaited: string | undefined,
+    waitMs: number
+  ): Promise<Map<string, CrossProcessLockTimeoutError>> {
+    if (awaited !== undefined) {
+      held.set(awaited, await this.acquireCheckoutLock(awaited, waitMs));
+    }
+    const busy = new Map<string, CrossProcessLockTimeoutError>();
+    const unexpected: unknown[] = [];
+    await mapWithConcurrency(
+      keys.filter((key) => !held.has(key)),
+      CHECKOUT_IO_CONCURRENCY,
+      async (key) => {
+        try {
+          // mutation-equivalent: a 1 ms try-lock also fails a busy key, one sleep later
+          held.set(key, await this.acquireCheckoutLock(key, 0));
+        } catch (error) {
+          if (error instanceof CrossProcessLockTimeoutError) busy.set(key, error);
+          else unexpected.push(error);
+        }
+      }
+    );
+    if (unexpected.length > 0) {
+      throw unexpected[0];
+    }
+    return busy;
   }
 
   /**
@@ -4458,7 +4615,14 @@ export class WorkspaceMcpOverridesService {
    * parse of the whole config.json — made that sweep take ~1s per workspace
    * and the install appear hung. Per-workspace failures are collected (the
    * caller persists a retry tombstone for them) instead of aborting the sweep;
-   * only wholesale failures (lock timeout, unreadable config) throw.
+   * a workspace whose lock stays busy for the whole budget is one of them.
+   * Only wholesale failures (unreadable config) throw.
+   *
+   * Every workspace this reports clean was pruned in the same critical
+   * section, never across two: between two, a dialog save could copy a
+   * not-yet-pruned parent's inherited enable into an already-pruned child.
+   * Callers retry by sweeping every live workspace again, so a tombstone only
+   * clears on a call that reports no failure at all.
    */
   async prunePluginOverrideKeysForWorkspaces(
     workspaceIds: readonly string[],
@@ -4467,52 +4631,58 @@ export class WorkspaceMcpOverridesService {
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
-    // Every swept workspace's lock first (sorted), then the global lock: a
-    // rename holding a workspace lock across its checkout move cannot be
+    // Every swept workspace's lock first, then the global lock: a rename
+    // holding a workspace lock across its checkout move cannot be
     // interleaved with this sweep's stat of that checkout.
-    return this.withWorkspaceLocks(workspaceIds, (locked) =>
-      this.runExclusive(async () => {
-        // ONE budget for the whole sweep — the registry scan, every target's
-        // prune and the cache fan-out afterwards: this runs under every
-        // selected workspace lock AND the global lock, and a single checkout
-        // on a stalled NFS/FUSE mount must not hold unrelated settings writes
-        // past their acquisition timeout. Timed-out targets become
-        // per-workspace failures (the caller keeps their tombstones); a
-        // rewrite already in flight is joined before the locks are released.
-        const budget = createPublicationBudget();
-        const snapshot = new ConfigSnapshot(
-          this.config,
-          false,
-          undefined,
-          /* writerLocksHeld */ true
-        );
-        try {
-          // Workspaces whose checkout identity could not be established were
-          // not locked: they fail (tombstone kept) instead of being pruned
-          // under a fence their symlink aliases could bypass.
-          const failures = await this.sweepPluginOverrideKeys(
-            workspaceIds.filter(
-              (id) => !locked.unresolvable.some((entry) => entry.workspaceId === id.trim())
-            ),
-            keyPrefix,
-            options,
-            budget,
-            snapshot
+    return this.withWorkspaceLocks(
+      workspaceIds,
+      (locked) =>
+        this.runExclusive(async () => {
+          // ONE budget for the whole sweep — the registry scan, every target's
+          // prune and the cache fan-out afterwards: this runs under every
+          // selected workspace lock AND the global lock, and a single checkout
+          // on a stalled NFS/FUSE mount must not hold unrelated settings writes
+          // past their acquisition timeout. Timed-out targets become
+          // per-workspace failures (the caller keeps their tombstones); a
+          // rewrite already in flight is joined before the locks are released.
+          const budget = createPublicationBudget();
+          const snapshot = new ConfigSnapshot(
+            this.config,
+            false,
+            undefined,
+            /* writerLocksHeld */ true
           );
-          return [
-            ...locked.unresolvable.map(({ workspaceId, error }) => ({ workspaceId, error })),
-            ...failures,
-          ];
-        } finally {
-          await snapshot.settleSideEffects();
-        }
-      })
+          try {
+            // Workspaces whose checkout identity could not be established, or
+            // whose lock stayed busy, were not locked: they fail (tombstone
+            // kept) instead of being pruned under a fence they do not hold.
+            const unlocked = [...locked.unresolvable, ...locked.busy];
+            const unlockedIds = new Set(unlocked.map((entry) => entry.workspaceId));
+            const failures = await this.sweepPluginOverrideKeys(
+              workspaceIds.filter((id) => !unlockedIds.has(id.trim())),
+              locked.keys,
+              keyPrefix,
+              options,
+              budget,
+              snapshot
+            );
+            return [
+              ...unlocked.map(({ workspaceId, error }) => ({ workspaceId, error })),
+              ...failures,
+            ];
+          } finally {
+            await snapshot.settleSideEffects();
+          }
+        }),
+      WORKSPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+      { partialAtDeadline: true }
     );
   }
 
   /** Body of prunePluginOverrideKeysForWorkspaces, run under its locks. */
   private async sweepPluginOverrideKeys(
     workspaceIds: readonly string[],
+    checkoutKeys: ReadonlyMap<string, readonly string[]>,
     keyPrefix: string,
     options: PluginSweepOptions | undefined,
     budget: PublicationBudget,
@@ -4544,38 +4714,43 @@ export class WorkspaceMcpOverridesService {
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
     const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
-    for (const workspaceId of workspaceIds) {
-      try {
-        const entries = metadataById.get(workspaceId.trim());
-        if (!entries) {
-          throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
-        }
-        const pruned: Array<readonly string[]> = [];
-        let ownFileRewritten = false;
-        for (const metadata of entries) {
-          // Bounded by the remaining sweep budget: local stat/read/write
-          // on a disconnected mount can block indefinitely. A timeout is
-          // this workspace's failure (tombstone kept); its write, if one
-          // started, is joined before the locks are released.
-          // Own cancellable scope: a losing prune that resumes after the
-          // deadline (a stat/read finally answering) must not start its
-          // rewrite once the caller moved on — settleSideEffects can only
-          // join a write that has been registered by then.
-          const step = snapshot.scoped();
-          const result = await withDeadline(
-            this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix, step),
-            budget.remaining(),
-            `pruning workspace ${metadata.id} exceeded the plugin-prune budget`,
-            () => step.cancel()
+    // Many checkouts at once: thousands of sequential stats outlasted the
+    // sweep budget. One task per ID (first spelling), and IDs whose
+    // checkouts share a lock key run one after another (see groupByCheckout).
+    const seen = new Set<string>();
+    const uniqueIds = workspaceIds.filter((workspaceId) => {
+      const id = workspaceId.trim();
+      const first = !seen.has(id);
+      seen.add(id);
+      return first;
+    });
+    const outcomes = new Map<string, SweptOutcome>();
+    await mapWithConcurrency(
+      // mutation-equivalent: an array is never falsy, so ?? and || agree
+      groupByCheckout(uniqueIds, (workspaceId) => checkoutKeys.get(workspaceId.trim()) ?? []),
+      CHECKOUT_IO_CONCURRENCY,
+      async (group) => {
+        for (const workspaceId of group) {
+          outcomes.set(
+            workspaceId,
+            await this.pruneSweptWorkspace(
+              metadataById.get(workspaceId.trim()),
+              workspaceId,
+              keyPrefix,
+              { budget, snapshot }
+            )
           );
-          pruned.push(result.filePaths);
-          anyOwesEpoch ||= result.owesEpoch;
-          ownFileRewritten ||= result.rewrote;
         }
-        // Publication reads the first entry, matching getWorkspaceMetadata's lookup.
-        swept.set(workspaceId, { metadata: entries[0], filePaths: pruned[0], ownFileRewritten });
-      } catch (error) {
-        failures.push({ workspaceId, error });
+      }
+    );
+    for (const workspaceId of uniqueIds) {
+      const outcome = outcomes.get(workspaceId);
+      assert(outcome !== undefined, `sweep produced no outcome for ${workspaceId}`);
+      anyOwesEpoch ||= outcome.owesEpoch;
+      if (outcome.ok) {
+        swept.set(workspaceId, outcome.swept);
+      } else {
+        failures.push({ workspaceId, error: outcome.error });
       }
     }
     if (swept.size === 0) {
@@ -4655,6 +4830,53 @@ export class WorkspaceMcpOverridesService {
       );
     }
     return failures;
+  }
+
+  /** One workspace of sweepPluginOverrideKeys: every host-local checkout registered under its ID. */
+  private async pruneSweptWorkspace(
+    entries: readonly FrontendWorkspaceMetadata[] | undefined,
+    workspaceId: string,
+    keyPrefix: string,
+    sweep: { budget: PublicationBudget; snapshot: ConfigSnapshot }
+  ): Promise<SweptOutcome> {
+    // Owed even when a later checkout of the ID fails: an earlier one may
+    // already be rewritten.
+    let owesEpoch = false;
+    try {
+      if (!entries) {
+        throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
+      }
+      const pruned: Array<readonly string[]> = [];
+      let ownFileRewritten = false;
+      for (const metadata of entries) {
+        // Bounded by the remaining sweep budget: local stat/read/write
+        // on a disconnected mount can block indefinitely. A timeout is
+        // this workspace's failure (tombstone kept); its write, if one
+        // started, is joined before the locks are released.
+        // Own cancellable scope: a losing prune that resumes after the
+        // deadline (a stat/read finally answering) must not start its
+        // rewrite once the caller moved on — settleSideEffects can only
+        // join a write that has been registered by then.
+        const step = sweep.snapshot.scoped();
+        const result = await withDeadline(
+          this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix, step),
+          sweep.budget.remaining(),
+          `pruning workspace ${metadata.id} exceeded the plugin-prune budget`,
+          () => step.cancel()
+        );
+        pruned.push(result.filePaths);
+        owesEpoch ||= result.owesEpoch;
+        ownFileRewritten ||= result.rewrote;
+      }
+      // Publication reads the first entry, matching getWorkspaceMetadata's lookup.
+      return {
+        ok: true,
+        swept: { metadata: entries[0], filePaths: pruned[0], ownFileRewritten },
+        owesEpoch,
+      };
+    } catch (error) {
+      return { ok: false, error, owesEpoch };
+    }
   }
 
   /**
@@ -4750,7 +4972,7 @@ export class WorkspaceMcpOverridesService {
     // every tombstone retry would fail on the same later file.
     const rewrites: Array<{ filePath: string; text: string }> = [];
     for (const filePath of filePaths) {
-      if (!(await statIsFile(runtime, filePath, "strict"))) {
+      if (!(await prunableFileExists(runtime, filePath))) {
         continue;
       }
       // A document exists: the cross-process signal is owed whether or not
