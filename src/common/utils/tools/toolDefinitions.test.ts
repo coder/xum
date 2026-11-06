@@ -425,6 +425,19 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("shows the raw bash arguments when a cut-off call is also missing timeout_secs", () => {
+    // `command` is renamed to `script` before validation; the summary shows the raw key.
+    const input = { command: "cd", display_name: "List scratch dirs" };
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse(input);
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(formatToolInputIssues(parsed.error.issues, input)).toBe(
+        'timeout_secs: Invalid input: expected number, received undefined. Received arguments: command="cd" (2 chars), display_name="List scratch dirs" (17 chars)'
+      );
+    }
+  });
+
   it("accepts a complete multi-line bash script with quoted subshells", () => {
     const script = [
       'cd "$(git rev-parse --show-toplevel)"',

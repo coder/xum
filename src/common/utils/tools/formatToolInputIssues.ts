@@ -24,13 +24,61 @@ export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[]
   );
 }
 
+const RECEIVED_PREVIEW_MAX_CHARS = 60;
+const RECEIVED_MAX_KEYS = 10;
+
 /**
  * Render zod issues as one concise line: "<path>: <message>[ (received N characters)]".
- * Never echoes the input value itself; the AI SDK's own message does, which buries the
+ * Never echoes the whole input; the AI SDK's own message does, which buries the
  * actionable issue under kilobytes of the model's rejected input.
+ *
+ * When a property is missing, a bounded preview of what did arrive is appended on
+ * purpose: a model whose script arrived as `cd` otherwise reads "timeout_secs:
+ * expected number" and concludes it forgot a field, not that its text was cut.
  */
 export function formatToolInputIssues(issues: readonly ToolInputIssue[], input: unknown): string {
-  return issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
+  const text = issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
+  const missing = issues.some((issue) => isMissingProperty(issue, input));
+  return missing ? `${text}. Received arguments: ${describeReceivedArguments(input)}` : text;
+}
+
+// Paths resolve against the raw input, before any schema preprocess renames an
+// alias key (bash `command` -> `script`), so an aliased key also reads as missing
+// here; the received list then shows the alias as it arrived.
+function isMissingProperty(issue: ToolInputIssue, input: unknown): boolean {
+  return issue.code === "invalid_type" && resolvePath(input, issue.path) === undefined;
+}
+
+function describeReceivedArguments(input: unknown): string {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return "no named arguments";
+  }
+  const entries = Object.entries(input);
+  if (entries.length === 0) {
+    return "no arguments";
+  }
+  const shown = entries
+    .slice(0, RECEIVED_MAX_KEYS)
+    .map(([key, value]) => `${truncate(key)}=${describeReceivedValue(value)}`);
+  const hidden = entries.length - shown.length;
+  return hidden > 0 ? `${shown.join(", ")} (+${hidden} more)` : shown.join(", ");
+}
+
+function describeReceivedValue(value: unknown): string {
+  if (typeof value === "string") {
+    return `${JSON.stringify(truncate(value))} (${value.length} chars)`;
+  }
+  if (Array.isArray(value)) {
+    return "[array]";
+  }
+  return value !== null && typeof value === "object" ? "{object}" : String(value);
+}
+
+// dry-duplicate-ok: bounds a model-facing preview; capTitle and truncateText bound other surfaces with their own limits
+function truncate(text: string): string {
+  return text.length > RECEIVED_PREVIEW_MAX_CHARS
+    ? `${text.slice(0, RECEIVED_PREVIEW_MAX_CHARS - 1)}…`
+    : text;
 }
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {

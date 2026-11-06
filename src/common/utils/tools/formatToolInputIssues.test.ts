@@ -55,6 +55,7 @@ describe("formatToolInputIssues", () => {
     const message = formatToolInputIssues(issuesFor(z.object({ a: z.string() }), "oops"), "oops");
 
     expect(message).toStartWith("input: ");
+    expect(message).not.toContain("Received");
   });
 
   test("skips the received suffix when the value at the path is not a string", () => {
@@ -62,6 +63,75 @@ describe("formatToolInputIssues", () => {
 
     expect(formatToolInputIssues(issues, { question: 42 })).toBe("question: Too big");
     expect(formatToolInputIssues(issues, null)).toBe("question: Too big");
+  });
+});
+
+describe("formatToolInputIssues received arguments", () => {
+  const aliasSchema = z.preprocess(
+    (value) => {
+      const { command, ...rest } = value as Record<string, unknown>;
+      return command === undefined ? rest : { script: command, ...rest };
+    },
+    z.object({ script: z.string(), timeout_secs: z.number() })
+  );
+
+  test("shows an aliased key as it arrived when the preprocess left the canonical one unset", () => {
+    const input = { command: 5, timeout_secs: 1 };
+
+    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toEndWith(
+      "Received arguments: command=5, timeout_secs=1"
+    );
+  });
+
+  test("adds nothing when the property is present but has the wrong type", () => {
+    const input = { script: 5, timeout_secs: 1 };
+
+    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toBe(
+      "script: Invalid input: expected string, received number"
+    );
+  });
+
+  test("bounds each preview and escapes it onto one line", () => {
+    const long = `line one\n${"x".repeat(100)}`;
+    const atLimit = "y".repeat(60);
+    const input = { [`k${"e".repeat(70)}`]: long, exact: atLimit };
+
+    const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
+
+    expect(message).toContain(`k${"e".repeat(58)}…=`);
+    expect(message).toContain(`="line one\\n${"x".repeat(50)}…" (109 chars)`);
+    expect(message).toContain(`exact="${atLimit}" (60 chars)`);
+    expect(message).not.toContain("\n");
+  });
+
+  test("describes non-string values by kind", () => {
+    const input = { flag: false, nothing: null, list: [1], nested: { a: 1 } };
+
+    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toEndWith(
+      "Received arguments: flag=false, nothing=null, list=[array], nested={object}"
+    );
+  });
+
+  test("caps the number of listed arguments", () => {
+    const keys = (count: number) =>
+      Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, index]));
+
+    expect(formatToolInputIssues(issuesFor(aliasSchema, keys(11)), keys(11))).toEndWith(
+      "k9=9 (+1 more)"
+    );
+    expect(formatToolInputIssues(issuesFor(aliasSchema, keys(10)), keys(10))).toEndWith("k9=9");
+  });
+
+  test("says so when no named arguments arrived", () => {
+    const issues = [{ path: ["script"], message: "Required", code: "invalid_type" }];
+
+    expect(formatToolInputIssues(issues, {})).toBe(
+      "script: Required. Received arguments: no arguments"
+    );
+    expect(formatToolInputIssues(issues, null)).toBe(
+      "script: Required. Received arguments: no named arguments"
+    );
+    expect(formatToolInputIssues(issues, ["cd"])).toEndWith("no named arguments");
   });
 });
 
