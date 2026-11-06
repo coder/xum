@@ -57,6 +57,7 @@ const COMMENT_PREFIX = /[ \t\n;&|()<>]/;
 // (`<<<`) never matches a word, because the word cannot start with `<`.
 const HEREDOC_OPERATOR = /<<(?:(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
 const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
+const UNMODELLED_DELIMITER_QUOTING = /\$['"]/;
 const CASE_WORD = /case[ \t\n]/y;
 
 const PREVIEW_MAX_CHARS = 60;
@@ -187,7 +188,7 @@ class ShellScanner {
     } else if (char === "#" || char === "c") {
       return this.stepWordStart(frame, char);
     } else if (char === "<") {
-      this.readRedirect();
+      return this.readRedirect();
     } else if (char === "\n" && this.heredocs.length > 0) {
       return this.skipHeredocBodies();
     } else {
@@ -232,12 +233,16 @@ class ShellScanner {
     this.index = end;
   }
 
-  private readRedirect(): void {
+  private readRedirect(): Verdict | undefined {
     HEREDOC_OPERATOR.lastIndex = this.index;
     const match = HEREDOC_OPERATOR.exec(this.text);
     if (match === null) {
       this.index += 1;
-      return;
+      return undefined;
+    }
+    if (match[2] !== undefined && UNMODELLED_DELIMITER_QUOTING.test(match[2])) {
+      // Bash decodes $'...' and $"..." delimiters; the scanner does not.
+      return "complete";
     }
     if (match[2] !== undefined) {
       this.heredocs.push({
@@ -250,6 +255,7 @@ class ShellScanner {
       });
     }
     this.index = HEREDOC_OPERATOR.lastIndex;
+    return undefined;
   }
 
   private skipHeredocBodies(): Verdict | undefined {

@@ -34,6 +34,9 @@ describe("describeCutOffBashScript", () => {
     ["comment in a command substitution that ends at the newline", `x=$(ls # note\n)`],
     ["indented terminator of a plain heredoc stays in the body", `cat <<EOF\n\tEOF\n'`],
     ["backslash kept in a quoted heredoc delimiter", `cat <<'E\\F'\nEF\nit's\nE\\F\n`],
+    // Bash decodes these delimiters to EOF; the scanner does not model $'' or $"" there.
+    ["ANSI-C quoted heredoc delimiter", `cat <<$'EOF'\nhi\n$EOF\nit's\nEOF\n`],
+    ["locale-quoted heredoc delimiter", `cat <<$"EOF"\nhi\n$EOF\nit's\nEOF\n`],
     ["heredoc whose body follows a multi-line $(", `cat <<EOF; y=$(\necho hi\n)\nit's\nEOF\n`],
     ["no-break space before a hash is part of the word", `(echo a\u00a0#)`],
     ["carriage return before a hash is part of the word", `(echo a\r#)`],
