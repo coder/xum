@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  dialogDiagramRoom,
-  dialogMaxBox,
   diagramPixelSize,
   NARROW_DIAGRAM_WIDTH,
   type DiagramBox,
@@ -94,40 +92,23 @@ describe("diagramPixelSize inline", () => {
 });
 
 describe("diagramPixelSize dialog", () => {
-  const PHONE = { width: 390, height: 844 };
-  const LAPTOP = { width: 1280, height: 720 };
+  // The room a 390 x 844 phone and a 1280 x 720 laptop window leave for the drawing.
+  const PHONE_ROOM = { width: 231, height: 639 };
+  const LAPTOP_ROOM = { width: 1032, height: 528 };
   const STATE_CHART = { width: 2089, height: 1372 };
 
-  function dialog(viewport: DiagramBox): DiagramFrame {
-    return { kind: "dialog", viewport };
+  function dialog(room: DiagramBox): DiagramFrame {
+    return { kind: "dialog", room };
   }
 
-  test("leaves 90% of the viewport inside the overlay's padding, less the dialog's own padding", () => {
-    expect(dialogMaxBox(PHONE)).toEqual({ width: 279, height: 687 });
-    expect(dialogDiagramRoom(PHONE)).toEqual({ width: 231, height: 639 });
-    expect(dialogDiagramRoom(LAPTOP)).toEqual({ width: 1032, height: 528 });
-  });
-
-  test("a viewport smaller than the paddings still leaves one pixel", () => {
-    expect(dialogMaxBox({ width: 60, height: 70 })).toEqual({ width: 1, height: 1 });
-    expect(dialogDiagramRoom({ width: 60, height: 70 })).toEqual({ width: 1, height: 1 });
-  });
-
-  test("a dialog box too small for its padding leaves one pixel of room", () => {
-    // The box is 18 x 45 px: less than the 48 px that the dialog's padding takes on each axis.
-    expect(dialogMaxBox({ width: 100, height: 130 })).toEqual({ width: 18, height: 45 });
-    expect(dialogDiagramRoom({ width: 100, height: 130 })).toEqual({ width: 1, height: 1 });
-  });
-
   test.each([
-    { name: "a wide chart on a phone", measured: STATE_CHART, viewport: PHONE },
-    { name: "a wide chart on a laptop", measured: STATE_CHART, viewport: LAPTOP },
-    { name: "a tall chart on a phone", measured: { width: 300, height: 3000 }, viewport: PHONE },
-    { name: "a tall chart on a laptop", measured: { width: 300, height: 3000 }, viewport: LAPTOP },
-    { name: "a very wide chart", measured: { width: 9000, height: 400 }, viewport: LAPTOP },
-  ])("shows the whole of $name", ({ measured, viewport }) => {
-    const room = dialogDiagramRoom(viewport);
-    const box = diagramPixelSize(measured, dialog(viewport));
+    { name: "a wide chart on a phone", measured: STATE_CHART, room: PHONE_ROOM },
+    { name: "a wide chart on a laptop", measured: STATE_CHART, room: LAPTOP_ROOM },
+    { name: "a tall chart on a phone", measured: { width: 300, height: 3000 }, room: PHONE_ROOM },
+    { name: "a tall chart on a laptop", measured: { width: 300, height: 3000 }, room: LAPTOP_ROOM },
+    { name: "a very wide chart", measured: { width: 9000, height: 400 }, room: LAPTOP_ROOM },
+  ])("shows the whole of $name", ({ measured, room }) => {
+    const box = diagramPixelSize(measured, dialog(room));
     expect(box.width).toBeLessThanOrEqual(room.width);
     expect(box.height).toBeLessThanOrEqual(room.height);
     // One scale gives both sides, up to the rounding of each side to a pixel.
@@ -143,46 +124,61 @@ describe("diagramPixelSize dialog", () => {
   });
 
   test("a very wide, short diagram keeps at least one pixel on its short side", () => {
-    expect(diagramPixelSize({ width: 100000, height: 100 }, dialog(PHONE))).toEqual({
+    expect(diagramPixelSize({ width: 100000, height: 100 }, dialog(PHONE_ROOM))).toEqual({
       width: 231,
       height: 1,
     });
   });
 
   test("the tighter axis decides the scale", () => {
-    // A phone's room is 231 x 639: the width is tighter for a wide chart.
-    expect(diagramPixelSize(STATE_CHART, dialog(PHONE))).toEqual({ width: 231, height: 152 });
-    expect(diagramPixelSize({ width: 300, height: 3000 }, dialog(PHONE))).toEqual({
+    expect(diagramPixelSize(STATE_CHART, dialog(PHONE_ROOM))).toEqual({ width: 231, height: 152 });
+    expect(diagramPixelSize({ width: 300, height: 3000 }, dialog(PHONE_ROOM))).toEqual({
       width: 64,
       height: 639,
     });
   });
 
   test("a diagram that fits the room keeps its measured size", () => {
-    expect(diagramPixelSize({ width: 1032, height: 528 }, dialog(LAPTOP))).toEqual({
+    expect(diagramPixelSize({ width: 1032, height: 528 }, dialog(LAPTOP_ROOM))).toEqual({
       width: 1032,
       height: 528,
     });
-    expect(diagramPixelSize({ width: 200, height: 100 }, dialog(LAPTOP))).toEqual({
+    expect(diagramPixelSize({ width: 200, height: 100 }, dialog(LAPTOP_ROOM))).toEqual({
       width: 200,
       height: 100,
     });
   });
 
   test("a diagram one pixel too large for the room shrinks", () => {
-    expect(diagramPixelSize({ width: 1033, height: 528 }, dialog(LAPTOP)).width).toBe(1032);
-    expect(diagramPixelSize({ width: 1032, height: 529 }, dialog(LAPTOP)).height).toBe(528);
+    expect(diagramPixelSize({ width: 1033, height: 528 }, dialog(LAPTOP_ROOM)).width).toBe(1032);
+    expect(diagramPixelSize({ width: 1032, height: 529 }, dialog(LAPTOP_ROOM)).height).toBe(528);
+  });
+
+  test("a room that is not measured yet leaves the natural size", () => {
+    expect(diagramPixelSize(STATE_CHART, dialog({ width: 0, height: 0 }))).toEqual(STATE_CHART);
+  });
+
+  test("a side that is not measured yet does not limit the diagram", () => {
+    expect(diagramPixelSize(STATE_CHART, dialog({ width: 0, height: 686 }))).toEqual({
+      width: 1045,
+      height: 686,
+    });
+    expect(diagramPixelSize(STATE_CHART, dialog({ width: 1044, height: 0 }))).toEqual({
+      width: 1044,
+      height: 686,
+    });
   });
 
   test.each([
-    { width: 0, height: 800 },
-    { width: 390, height: 0 },
     { width: -1, height: 800 },
+    { width: 390, height: -1 },
     { width: Number.NaN, height: 800 },
+    { width: 390, height: Number.NaN },
+    { width: Number.POSITIVE_INFINITY, height: 800 },
     { width: 390, height: Number.POSITIVE_INFINITY },
-  ])("refuses the viewport $width x $height", (viewport) => {
-    expect(() => diagramPixelSize(STATE_CHART, dialog(viewport))).toThrow(
-      "The expand dialog needs a finite, positive viewport"
+  ])("refuses the room $width x $height", (room) => {
+    expect(() => diagramPixelSize(STATE_CHART, dialog(room))).toThrow(
+      "The expand dialog needs a finite, non-negative room"
     );
   });
 });

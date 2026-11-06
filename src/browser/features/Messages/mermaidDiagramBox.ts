@@ -13,10 +13,14 @@ export interface RenderedDiagram {
   chart: string;
 }
 
-/** Where the diagram is drawn. An inline container width of 0 means unknown (not laid out yet). */
+/**
+ * Where the diagram is drawn. An inline container width of 0 means unknown (not laid out yet).
+ * The dialog's room is the measured content box of the element that holds the drawing: a side
+ * of 0 is unknown, so that axis does not limit the drawing.
+ */
 export type DiagramFrame =
   | { kind: "inline"; containerWidth: number; userZoom: number }
-  | { kind: "dialog"; viewport: DiagramBox };
+  | { kind: "dialog"; room: DiagramBox };
 
 export interface DiagramBox {
   width: number;
@@ -28,13 +32,6 @@ export interface DiagramBox {
 export const NARROW_DIAGRAM_WIDTH = 640;
 const INLINE_MAX_HEIGHT = 300;
 
-// The expand dialog is at most DIALOG_MAX_PERCENT of an overlay that pads the viewport by
-// DIALOG_OVERLAY_PADDING, and its drawing sits inside DIALOG_PADDING. Mermaid.tsx styles the
-// dialog with these same numbers, so the room computed here is the room the dialog has.
-export const DIALOG_OVERLAY_PADDING = 40;
-export const DIALOG_MAX_PERCENT = 90;
-export const DIALOG_PADDING = 24;
-
 function assertFinitePositive(box: DiagramBox, message: string) {
   assert(
     Number.isFinite(box.width) && box.width > 0 && Number.isFinite(box.height) && box.height > 0,
@@ -42,28 +39,23 @@ function assertFinitePositive(box: DiagramBox, message: string) {
   );
 }
 
-/** The largest box the expand dialog can have in a viewport, in whole pixels (at least 1). */
-export function dialogMaxBox(viewport: DiagramBox): DiagramBox {
-  assertFinitePositive(viewport, "The expand dialog needs a finite, positive viewport");
-  const max = (side: number) =>
-    Math.max(1, Math.floor(((side - 2 * DIALOG_OVERLAY_PADDING) * DIALOG_MAX_PERCENT) / 100));
-  return { width: max(viewport.width), height: max(viewport.height) };
-}
-
-/** The room the expand dialog leaves for a drawing, in whole pixels (at least 1). */
-export function dialogDiagramRoom(viewport: DiagramBox): DiagramBox {
-  const max = dialogMaxBox(viewport);
-  return {
-    width: Math.max(1, max.width - 2 * DIALOG_PADDING),
-    height: Math.max(1, max.height - 2 * DIALOG_PADDING),
-  };
-}
-
 function diagramScale(measured: DiagramBox, frame: DiagramFrame): number {
   if (frame.kind === "dialog") {
-    const room = dialogDiagramRoom(frame.viewport);
-    // The dialog is the one place that shows a whole diagram, so it fits both axes.
-    return Math.min(1, room.width / measured.width, room.height / measured.height);
+    const { room } = frame;
+    assert(
+      Number.isFinite(room.width) &&
+        room.width >= 0 &&
+        Number.isFinite(room.height) &&
+        room.height >= 0,
+      "The expand dialog needs a finite, non-negative room"
+    );
+    // The dialog is the one place that shows a whole diagram, so it fits both axes. It never
+    // enlarges a small diagram, and an axis that is not measured yet does not limit it.
+    return Math.min(
+      1,
+      room.width > 0 ? room.width / measured.width : 1,
+      room.height > 0 ? room.height / measured.height : 1
+    );
   }
   const { containerWidth, userZoom } = frame;
   // A wide diagram keeps its measured width here and pans inside its frame.
