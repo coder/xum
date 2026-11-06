@@ -19,8 +19,8 @@ export interface RejectedToolCallLogContext {
 /**
  * The SDK's InvalidToolInputError message echoes the entire submitted input
  * and buries the zod issue at the end, so the model retries blind. Render only
- * the issues (with received string lengths and, for a missing property, a
- * bounded preview of the received arguments) when the cause chain
+ * the issues (with received string lengths and, for a missing property, the
+ * received keys with each value's type and length) when the cause chain
  * (InvalidToolInputError -> TypeValidationError -> ZodError) exposes them.
  */
 export function describeInvalidToolInput(toolName: string, input: unknown, error: unknown): string {

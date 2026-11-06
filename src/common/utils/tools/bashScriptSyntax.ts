@@ -60,8 +60,6 @@ const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
 const UNMODELLED_DELIMITER_QUOTING = /\$['"]/;
 const CASE_WORD = /case[ \t\n]/y;
 
-const PREVIEW_MAX_CHARS = 60;
-
 const CONSTRUCT_PHRASES: Record<CutOffShellConstruct, string> = {
   "single-quote": "an unterminated single quote is open",
   "double-quote": "an unterminated double quote is open",
@@ -296,9 +294,8 @@ function findCutOffShellConstruct(script: string): CutOffShellConstruct | null {
 
 /**
  * Model-facing rejection for a cut-off script, or null when it looks complete.
- * Unlike other input errors this echoes a short tail of the value: the received
- * length and where the text stops are what show a model that its text was cut,
- * not that it named an argument wrong.
+ * The received length is what shows a model that its text was cut. The script
+ * itself is never echoed: this text also reaches the shared log.
  */
 export function describeCutOffBashScript(script: string): string | null {
   const construct = findCutOffShellConstruct(script);
@@ -307,11 +304,6 @@ export function describeCutOffBashScript(script: string): string | null {
   }
   return (
     `arrived cut off: ${CONSTRUCT_PHRASES[construct]} at end of input ` +
-    `(received ${script.length} characters: ${previewTail(script)}). Re-send the whole script.`
+    `(received ${script.length} characters). Re-send the whole script.`
   );
-}
-
-function previewTail(script: string): string {
-  const flat = script.replace(/\s+/g, " ");
-  return flat.length <= PREVIEW_MAX_CHARS ? flat : `…${flat.slice(-(PREVIEW_MAX_CHARS - 1))}`;
 }

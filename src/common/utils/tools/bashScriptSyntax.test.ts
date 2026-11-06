@@ -119,26 +119,11 @@ describe("describeCutOffBashScript", () => {
     expect(describeCutOffBashScript(script)).toContain(construct);
   });
 
-  test("names the open construct, the received length and the script", () => {
-    expect(describeCutOffBashScript(`cd "$X`)).toBe(
-      'arrived cut off: an unterminated double quote is open at end of input (received 6 characters: cd "$X). Re-send the whole script.'
+  test("names the open construct and the received length, never the script", () => {
+    const script = `curl -H "Authorization: Bearer sk-SECRET`;
+
+    expect(describeCutOffBashScript(script)).toBe(
+      `arrived cut off: an unterminated double quote is open at end of input (received ${script.length} characters). Re-send the whole script.`
     );
-  });
-
-  test("previews only the tail of a long script on one line", () => {
-    const script = `echo start\n${"a".repeat(80)}\necho "end`;
-    const message = describeCutOffBashScript(script);
-
-    expect(message).toContain(`(received ${script.length} characters: …`);
-    const preview = /characters: (.*)\)\. Re-send/.exec(message ?? "")?.[1] ?? "";
-    expect(preview).toHaveLength(60);
-    expect(preview).toEndWith(' echo "end');
-    expect(message).not.toContain("\n");
-  });
-
-  test("keeps a script of exactly the preview limit whole", () => {
-    const script = `echo "${"a".repeat(54)}`;
-    expect(script).toHaveLength(60);
-    expect(describeCutOffBashScript(script)).toContain(`characters: ${script})`);
   });
 });

@@ -24,17 +24,20 @@ export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[]
   );
 }
 
-const RECEIVED_PREVIEW_MAX_CHARS = 60;
+const RECEIVED_KEY_MAX_CHARS = 60;
 const RECEIVED_MAX_KEYS = 10;
 
 /**
  * Render zod issues as one concise line: "<path>: <message>[ (received N characters)]".
- * Never echoes the whole input; the AI SDK's own message does, which buries the
- * actionable issue under kilobytes of the model's rejected input.
+ * Never echoes an input value: the AI SDK's own message does, which buries the
+ * actionable issue under kilobytes of the model's rejected input, and this text
+ * also reaches the shared log through the tool-error path, so a value could leak
+ * a credential there.
  *
- * When a property is missing, a bounded preview of what did arrive is appended on
- * purpose: a model whose script arrived as `cd` otherwise reads "timeout_secs:
- * expected number" and concludes it forgot a field, not that its text was cut.
+ * When a property is missing, the shape of what did arrive is appended: each key
+ * with its value's type and length. A model whose script arrived as 2 characters
+ * otherwise reads "script: expected string" and concludes it named a field wrong,
+ * not that its text was cut.
  */
 export function formatToolInputIssues(issues: readonly ToolInputIssue[], input: unknown): string {
   const text = issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
@@ -59,32 +62,29 @@ function describeReceivedArguments(input: unknown): string {
   }
   const shown = entries
     .slice(0, RECEIVED_MAX_KEYS)
-    .map(([key, value]) => `${escapeKey(truncate(key))}=${describeReceivedValue(value)}`);
+    .map(([key, value]) => `${escapeKey(truncateKey(key))}=${describeReceivedValue(value)}`);
   const hidden = entries.length - shown.length;
   return hidden > 0 ? `${shown.join(", ")} (+${hidden} more)` : shown.join(", ");
 }
 
 function describeReceivedValue(value: unknown): string {
   if (typeof value === "string") {
-    return `${JSON.stringify(truncate(value))} (${value.length} chars)`;
+    return `string(${value.length} chars)`;
   }
   if (Array.isArray(value)) {
-    return "[array]";
+    return `array(${value.length} items)`;
   }
-  return value !== null && typeof value === "object" ? "{object}" : String(value);
+  return value === null ? "null" : typeof value;
 }
 
-// Keys get the values' JSON escaping without the quotes, so a newline in a key
-// cannot start a new line in the message the model reads.
+// Keys are model-supplied too: JSON escaping without the quotes keeps a newline
+// or quote in a key from starting a new line in the message.
 function escapeKey(key: string): string {
   return JSON.stringify(key).slice(1, -1);
 }
 
-// dry-duplicate-ok: bounds a model-facing preview; capTitle and truncateText bound other surfaces with their own limits
-function truncate(text: string): string {
-  return text.length > RECEIVED_PREVIEW_MAX_CHARS
-    ? `${text.slice(0, RECEIVED_PREVIEW_MAX_CHARS - 1)}…`
-    : text;
+function truncateKey(key: string): string {
+  return key.length > RECEIVED_KEY_MAX_CHARS ? `${key.slice(0, RECEIVED_KEY_MAX_CHARS - 1)}…` : key;
 }
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {

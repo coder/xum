@@ -76,10 +76,10 @@ describe("formatToolInputIssues received arguments", () => {
   );
 
   test("shows an aliased key as it arrived when the preprocess left the canonical one unset", () => {
-    const input = { command: 5, timeout_secs: 1 };
+    const input = { command: 5, display_name: "List scratch dirs", timeout_secs: 1 };
 
-    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toEndWith(
-      "Received arguments: command=5, timeout_secs=1"
+    expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toBe(
+      "script: Invalid input: expected string, received number. Received arguments: command=number, display_name=string(17 chars), timeout_secs=number"
     );
   });
 
@@ -91,25 +91,35 @@ describe("formatToolInputIssues received arguments", () => {
     );
   });
 
-  test("bounds each preview and escapes it onto one line", () => {
-    const long = `line one\n${"x".repeat(100)}`;
-    const atLimit = "y".repeat(60);
-    const input = { [`k${"e".repeat(70)}`]: long, exact: atLimit, "two\nlines": 1 };
+  test("never echoes an argument value", () => {
+    const secret = "ghp_0123456789abcdefSECRET";
+    const input = { cmd: `curl -H "Authorization: ${secret}"`, token: secret, retries: 31337 };
 
     const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
 
-    expect(message).toContain(`k${"e".repeat(58)}…=`);
-    expect(message).toContain(`="line one\\n${"x".repeat(50)}…" (109 chars)`);
-    expect(message).toContain(`exact="${atLimit}" (60 chars)`);
-    expect(message).toContain("two\\nlines=1");
+    expect(message).toEndWith(
+      `Received arguments: cmd=string(${input.cmd.length} chars), token=string(26 chars), retries=number`
+    );
+    expect(message).not.toContain("SECRET");
+    expect(message).not.toContain("31337");
+  });
+
+  test("keeps a key with a newline or quote on one line and bounds its length", () => {
+    const input = { 'two\nlines"': 1, [`k${"e".repeat(70)}`]: true };
+
+    const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
+
+    expect(message).toEndWith(
+      `Received arguments: two\\nlines\\"=number, k${"e".repeat(58)}…=boolean`
+    );
     expect(message).not.toContain("\n");
   });
 
-  test("describes non-string values by kind", () => {
-    const input = { flag: false, nothing: null, list: [1], nested: { a: 1 } };
+  test("describes other values by type", () => {
+    const input = { nothing: null, list: [1, 2], nested: { a: 1 }, absent: undefined };
 
     expect(formatToolInputIssues(issuesFor(aliasSchema, input), input)).toEndWith(
-      "Received arguments: flag=false, nothing=null, list=[array], nested={object}"
+      "Received arguments: nothing=null, list=array(2 items), nested=object, absent=undefined"
     );
   });
 
@@ -118,9 +128,11 @@ describe("formatToolInputIssues received arguments", () => {
       Object.fromEntries(Array.from({ length: count }, (_, index) => [`k${index}`, index]));
 
     expect(formatToolInputIssues(issuesFor(aliasSchema, keys(11)), keys(11))).toEndWith(
-      "k9=9 (+1 more)"
+      "k9=number (+1 more)"
     );
-    expect(formatToolInputIssues(issuesFor(aliasSchema, keys(10)), keys(10))).toEndWith("k9=9");
+    expect(formatToolInputIssues(issuesFor(aliasSchema, keys(10)), keys(10))).toEndWith(
+      "k9=number"
+    );
   });
 
   test("says so when no named arguments arrived", () => {
