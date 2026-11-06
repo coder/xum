@@ -1541,6 +1541,38 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
+  test("an unowned re-drive whose attempt another backend reported during the stream refuses the held follow-up as indeterminate", async () => {
+    const childId = "holdredrive003";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    try {
+      await taskService.recoverInterruptedTasks();
+      await until(() => completions.length === 1, "the re-drive's stream");
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      // Another backend reports the re-driven attempt while this stream runs: no start of the
+      // attempt is known here, so the row's report cannot be read as inherited.
+      await editChildRow(config, childId, (row) => {
+        row.taskStatus = "reported";
+        row.reportedAt = REPORTED_AT;
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      expect(completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
   test("an unowned re-drive whose row another backend re-admitted meanwhile: its stream end neither fences the successor's input nor publishes its report as the successor's", async () => {
     const childId = "holdredrive002";
     const foreign = "att_00000000000000b7";

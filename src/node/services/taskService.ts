@@ -1107,9 +1107,9 @@ export interface StreamEndDecision {
   readonly attemptId: string;
   readonly messageId: string;
   /**
-   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; for an
-   * attempt this process does not own, a report the row already read at the stream end). Only a
-   * report that is not inherited contradicts a `nonreport` decision (see
+   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; always
+   * false for an attempt this process does not own, which has no start to compare). Only a report
+   * that is not inherited contradicts a `nonreport` decision (see
    * StreamEndLedger.resolveStreamEndDecision).
    */
   readonly inheritedReport: boolean;

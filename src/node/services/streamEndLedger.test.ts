@@ -279,12 +279,12 @@ describe("StreamEndLedger decisions", () => {
     expect(owned.receiptEligible).toBe(true);
   });
 
-  test("an unowned stream whose row already read reported at the stream end continues", () => {
+  test("an unowned stream whose row reads reported is refused, never assumed to continue", () => {
     const t = harness();
     t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", undefined, ATTEMPT);
     expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
-    expect(decision?.outcome).toBe("nonreport");
+    expect(decision?.outcome).toBe("indeterminate");
   });
 
   test("a reported row resolves the attempt's decision indeterminate", () => {
