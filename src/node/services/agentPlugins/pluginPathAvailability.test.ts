@@ -69,6 +69,13 @@ describe("isPluginPathUsableFrom in a multi-project workspace", () => {
     }
   });
 
+  test("a wrapper inside a wrapper is on the host only when every leaf runtime is", () => {
+    const allOnHost = multiProjectOf(multiProjectOf(host, worktree), host);
+    const innerSsh = multiProjectOf(multiProjectOf(host, ssh), host);
+    expect(isPluginPathUsableFrom(host, allOnHost)).toBe(true);
+    expect(isPluginPathUsableFrom(host, innerSsh)).toBe(false);
+  });
+
   test("a wrapper that wraps nothing is not proven to run on the host", () => {
     const empty = Object.create(host, { wrappedRuntimes: { value: [] } }) as Runtime;
     expect(isPluginPathUsableFrom(host, empty)).toBe(false);
@@ -120,5 +127,8 @@ describe("describeWorkspaceRuntime", () => {
     );
     expect(describeWorkspaceRuntime(multiProjectOf(remote))).toBe("multi-project remote");
     expect(describeWorkspaceRuntime(multiProjectOf(host, worktree))).toBe("multi-project");
+    expect(describeWorkspaceRuntime(multiProjectOf(multiProjectOf(host, ssh), host))).toBe(
+      "multi-project multi-project ssh"
+    );
   });
 });
