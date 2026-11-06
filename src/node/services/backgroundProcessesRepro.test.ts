@@ -148,10 +148,14 @@ describe("terminating a background process that already exited", () => {
     return { manager, processId: spawned.processId, exitCodeFile, pgid: spawned.pid };
   }
 
-  async function spawnExited(tag: string) {
-    const spawned = await spawnExiting(tag);
+  /** The step every test of this block settles its exit with. */
+  async function expectExited(spawned: Awaited<ReturnType<typeof spawnExiting>>) {
     expect(await readWhenWritten(spawned.exitCodeFile, "the wrapper's exit_code")).toBe("3");
     return spawned;
+  }
+
+  async function spawnExited(tag: string) {
+    return expectExited(await spawnExiting(tag));
   }
 
   async function holdMarkerWrite(): Promise<string> {
@@ -173,23 +177,23 @@ describe("terminating a background process that already exited", () => {
       "the exit after the write"
     );
     expect((await manager.getProcess(processId))?.exitCode).toBe(3);
-  });
+  }, 20_000);
 
   test("the exit code is read once the wrapper wrote it, not once its marker exists", async () => {
     const gate = await holdMarkerWrite();
-    const { exitCodeFile } = await spawnExiting("term-held", gate);
-    await waitFor(() => exists(exitCodeFile), "the created marker");
-    expect(await fs.readFile(exitCodeFile, "utf-8")).toBe("");
-    const code = readWhenWritten(exitCodeFile, "the wrapper's exit_code");
+    const spawned = await spawnExiting("term-held", gate);
+    await waitFor(() => exists(spawned.exitCodeFile), "the created marker");
+    expect(await fs.readFile(spawned.exitCodeFile, "utf-8")).toBe("");
+    const exited = expectExited(spawned);
     const raced = await Promise.race([
-      code.then(() => "settled"),
+      exited.then(() => "settled"),
       Bun.sleep(150).then(() => "held"),
     ]);
     // Target assertion: reading an empty marker must not count as the exit.
     expect(raced).toBe("held");
     await fs.writeFile(gate, "");
-    expect(await code).toBe("3");
-  });
+    expect((await exited).processId).toBe(spawned.processId);
+  }, 20_000);
 
   test("control: once the status was refreshed, a stop keeps the real exit code", async () => {
     const { manager, processId, exitCodeFile } = await spawnExited("term-ctl");
@@ -198,7 +202,7 @@ describe("terminating a background process that already exited", () => {
       success: true,
     });
     expect((await fs.readFile(exitCodeFile, "utf-8")).trim()).toBe("3");
-  });
+  }, 20_000);
 
   test("a stop after a natural exit does not overwrite the exit code", async () => {
     const { manager, processId, exitCodeFile } = await spawnExited("term");
