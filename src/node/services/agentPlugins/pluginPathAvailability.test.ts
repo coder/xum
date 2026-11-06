@@ -4,7 +4,11 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 
-import { isPluginPathUsableFrom, toAgentBodyPath } from "./pluginPathAvailability";
+import {
+  describeWorkspaceRuntime,
+  isPluginPathUsableFrom,
+  toAgentBodyPath,
+} from "./pluginPathAvailability";
 
 const host = new LocalRuntime("/host/project");
 const otherHost = new LocalRuntime("/host/other");
@@ -67,5 +71,15 @@ describe("toAgentBodyPath", () => {
 
   test("keeps a backslash inside a POSIX path", () => {
     expect(toAgentBodyPath("/home/u/odd\\name/egm", host)).toBe("/home/u/odd\\name/egm");
+  });
+});
+
+describe("describeWorkspaceRuntime", () => {
+  test("names the runtime type when the runtime gives one, else its location family", () => {
+    expect(describeWorkspaceRuntime({ mode: "ssh", location: "remote" })).toBe("ssh");
+    expect(describeWorkspaceRuntime({ mode: "docker", location: "remote" })).toBe("docker");
+    expect(describeWorkspaceRuntime(devcontainer)).toBe("devcontainer");
+    expect(describeWorkspaceRuntime(remote)).toBe("remote");
+    expect(describeWorkspaceRuntime({})).toBe("unknown");
   });
 });

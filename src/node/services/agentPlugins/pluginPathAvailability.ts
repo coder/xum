@@ -42,3 +42,12 @@ export function toAgentBodyPath(pluginPath: string, sourceRuntime: Runtime): str
   if (isRemoteRuntime(sourceRuntime)) return pluginPath;
   return WIN32_ABSOLUTE_PATH.test(pluginPath) ? pluginPath.replaceAll("\\", "/") : pluginPath;
 }
+
+/**
+ * How a message names the workspace's runtime: its type (`ssh`, `docker`, `devcontainer`) when the
+ * runtime gives one, else its location family.
+ */
+export function describeWorkspaceRuntime(runtime: Pick<Runtime, "mode" | "location">): string {
+  // mutation-equivalent: a runtime's mode and location are never "", so ?? and || agree
+  return runtime.mode ?? runtime.location ?? "unknown";
+}

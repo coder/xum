@@ -521,6 +521,11 @@ const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 const checkoutGenerations = new Map<string, number>();
 
 export class SSHRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "ssh" {
+    return "ssh";
+  }
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
   private readonly ensureReadyProjectPath?: string;

@@ -1881,11 +1881,14 @@ base: a
         ).toBe(consent.agents.persona);
       });
 
-      for (const [label, makeRuntime] of [
-        [
-          "an SSH or Docker workspace",
-          (checkout: string): Runtime => new RemotePathMappedRuntime(checkout, checkout),
-        ],
+      // The remote doubles report the type their real class reports (runtimeMode.test.ts).
+      const remoteDouble = (checkout: string, mode: "ssh" | "docker"): Runtime =>
+        Object.create(new RemotePathMappedRuntime(checkout, checkout), {
+          mode: { value: mode },
+        }) as Runtime;
+      for (const [label, makeRuntime, mode] of [
+        ["an SSH workspace", (checkout: string) => remoteDouble(checkout, "ssh"), "ssh"],
+        ["a Docker workspace", (checkout: string) => remoteDouble(checkout, "docker"), "docker"],
         [
           "a devcontainer workspace",
           (): Runtime =>
@@ -1893,6 +1896,7 @@ base: a
               srcBaseDir: "/host/src",
               configPath: ".devcontainer/devcontainer.json",
             }),
+          "devcontainer",
         ],
       ] as const) {
         test(`on ${label}, a host plugin agent that needs its folder is listed unavailable and refuses a spawn`, async () => {
@@ -1915,6 +1919,7 @@ base: a
           const persona = listed.find((agent) => agent.id === "persona");
           expect(persona?.unavailableReason).toContain("folder-unreachable");
           expect(persona?.unavailableReason).toContain("plugin agent persona of egm");
+          expect(persona?.unavailableReason).toContain(`(runtime: ${mode})`);
           expect(persona?.unavailablePath).toBe(
             path.join(await fs.realpath(pluginDir), "agents", "persona.md")
           );
@@ -1930,6 +1935,8 @@ base: a
           );
           expect(refusal.reason).toBe("folder-unreachable");
           expect(refusal.message).toContain("cannot read");
+          expect(refusal.detail).toBe(mode);
+          expect(refusal.message).toContain(`(runtime: ${mode})`);
           // Any other read keeps loading the agent, with the placeholder as written.
           expect(
             (await readAgentDefinition(runtime, checkout.path, "persona", options)).body
@@ -2272,6 +2279,31 @@ base: a
             expect(listed.find((agent) => agent.id === "explore")?.scope).toBe("built-in");
           });
         }
+
+        test("with refusals from two scopes and no agent to start, the first recorded one is thrown", async () => {
+          using project = new DisposableTempDir("agent-defs-refusal-first-project");
+          using home = new DisposableTempDir("agent-defs-refusal-first-home");
+          const projectContainer = path.join(project.path, ".xum", "plugins");
+          await writePlugin(projectContainer, "first", { "twin.md": "No frontmatter\n" });
+          await writePlugin(path.join(home.path, "plugins"), "second", {
+            "Twin.md": foreignAgent("One."),
+            "twin.md": foreignAgent("Two."),
+          });
+          const refusal = await refusalOf(
+            readAgentDefinition(new LocalRuntime(project.path), project.path, "twin", {
+              roots: {
+                projectRoots: [],
+                projectPluginRoots: [projectContainer],
+                globalRoot: path.join(home.path, "agents"),
+                globalPluginRoots: [path.join(home.path, "plugins")],
+              },
+              runtimeFactory,
+            })
+          );
+          // The higher scope's refusal, not the later scope's `ambiguous-file`.
+          expect(refusal.reason).toBe("invalid-definition");
+          expect(refusal.pluginName).toBe("first");
+        });
 
         test("a refused plugin agent that outranks a global agent does not hide it", async () => {
           using project = new DisposableTempDir("agent-defs-refusal-project");

@@ -65,6 +65,7 @@ import {
 import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
 import { expandPluginPlaceholders } from "@/node/services/agentPlugins/expansion";
 import {
+  describeWorkspaceRuntime,
   isPluginPathUsableFrom,
   toAgentBodyPath,
 } from "@/node/services/agentPlugins/pluginPathAvailability";
@@ -602,8 +603,7 @@ function pluginFolderRefusal(args: {
     "folder-unreachable",
     args.agentId,
     pluginNameOf(args.candidate),
-    // mutation-equivalent: a runtime's location is never "", so ?? and || agree
-    args.workspaceRuntime.location ?? "unknown"
+    describeWorkspaceRuntime(args.workspaceRuntime)
   );
 }
 
