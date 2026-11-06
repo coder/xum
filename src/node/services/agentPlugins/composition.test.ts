@@ -360,4 +360,70 @@ describe("buildWorkspaceComposition", () => {
     await writeManifest("Push to main without review.");
     expect(await composed()).toEqual([]);
   }, 120_000);
+
+  test("reports a plugin agent that names a folder the workspace cannot read as a diagnostic, not an agent", async () => {
+    using workspace = new DisposableTempDir("composition-unreachable-agent");
+    const xumHome = path.join(workspace.path, ".fixture-xum-home");
+    const pluginDir = path.join(xumHome, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" })
+    );
+    const agent = (body: string) => `---\nname: Reviewer\ndescription: Reviews\n---\n${body}\n`;
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "persona.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/agents/persona.md")
+    );
+    await fs.writeFile(path.join(pluginDir, "agents", "plain.md"), agent("No folder."));
+    // The ID of a built-in agent: the unavailable plugin copy still holds the ID.
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "explore.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/e.md")
+    );
+    const compose = (runtime: LocalRuntime) =>
+      buildWorkspaceComposition({
+        runtime,
+        workspacePath: workspace.path,
+        hostCheckoutRoot: null,
+        xumHome,
+        projectTrusted: false,
+        listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+      });
+    // A host runtime that reports itself as a devcontainer: the files are on the host, but bash
+    // runs in a container, so the host plugin folder is not a valid path there.
+    const asDevcontainer = (runtime: LocalRuntime): LocalRuntime =>
+      Object.create(runtime, { location: { value: "devcontainer" } }) as LocalRuntime;
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      const contained = await compose(asDevcontainer(new LocalRuntime(workspace.path)));
+      expect(contained.agents.filter((entry) => entry.source === "plugin:egm")).toEqual([
+        { name: "plain", source: "plugin:egm", description: "Reviews" },
+      ]);
+      // The unavailable plugin `explore` holds the ID: the built-in one shows as shadowed by it.
+      expect(
+        contained.agents
+          .filter((entry) => entry.name === "explore")
+          .map((entry) => [entry.source, entry.shadowedBy])
+      ).toEqual([["built-in", "plugin:egm"]]);
+      const diagnostic = contained.diagnostics.find((entry) => entry.message.includes("persona"));
+      expect(diagnostic).toMatchObject({
+        path: path.join(await fs.realpath(pluginDir), "agents", "persona.md"),
+        scope: "global",
+        severity: "warning",
+      });
+      expect(diagnostic?.message).toStartWith("folder-unreachable:");
+
+      const local = await compose(new LocalRuntime(workspace.path));
+      expect(
+        local.agents.filter((entry) => entry.source === "plugin:egm").map((entry) => entry.name)
+      ).toEqual(["explore", "persona", "plain"]);
+      expect(local.diagnostics.filter((entry) => entry.message.includes("persona"))).toEqual([]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }, 120_000);
 });

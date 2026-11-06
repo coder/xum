@@ -4,6 +4,7 @@ import { agentConsentFingerprint } from "@/node/services/agentPlugins/componentC
 import { parseAgentDefinitionMarkdown } from "./parseAgentDefinitionMarkdown";
 import {
   ForeignPluginAgentToolsError,
+  isForeignPluginAgentFormat,
   isReadonlyForeignPluginAgent,
   mapForeignPluginAgentFrontmatter,
 } from "./pluginAgentFormat";
@@ -20,6 +21,18 @@ function parsePluginAgent(frontmatterYaml: string) {
 function fingerprint(frontmatter: unknown) {
   return agentConsentFingerprint({ id: "reviewer", file: "reviewer.md", frontmatter });
 }
+
+describe("isForeignPluginAgentFormat", () => {
+  test("a file with only Claude Code or Cursor keys is foreign", () => {
+    expect(isForeignPluginAgentFormat({ name: "a", tools: "Read, Grep" })).toBe(true);
+    expect(isForeignPluginAgentFormat({ description: "d", readonly: true })).toBe(true);
+  });
+
+  test("any Xum-only key, or tools as an object, makes it a Xum-format file", () => {
+    expect(isForeignPluginAgentFormat({ name: "a", base: "exec" })).toBe(false);
+    expect(isForeignPluginAgentFormat({ name: "a", tools: { add: ["file_read"] } })).toBe(false);
+  });
+});
 
 describe("mapForeignPluginAgentFrontmatter readonly", () => {
   test("readonly: true runs on Explore with Explore's prompt before the agent's body", () => {

@@ -225,8 +225,9 @@ agent-browser find role button click --name "Open settings" --exact
 
   The CLI talks to the TCP port that `server.lock` names, and it has no Unix-socket mode. So
   `cli` first checks that the pid in `server.lock` carries this run's id and is the only listener
-  on that port, and refuses otherwise (a backend that is stopping or restarting). A restart in the
-  moment between that check and the CLI's own read of `server.lock` is not covered.
+  on that port, and refuses otherwise (a backend that is stopping or restarting). The CLI's own
+  read of `server.lock` ignores a lock whose pid has died. A backend that dies in the moment
+  between that read and the CLI's TCP connect is not covered.
 
 ## Evidence
 

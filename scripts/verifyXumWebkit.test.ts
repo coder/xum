@@ -13,8 +13,8 @@ const HELPER = path.join(SKILL_SCRIPTS, "webkit-capture.mjs");
 const TOKEN = "tok-3f9a/+=secret value";
 
 // Every test that starts a process (node, bash, git) passes 90_000 as its timeout, as the launch
-// tests in verifyXumLaunch.test.ts do: on a heavily loaded host, Bun's default 5 s timeout fails
-// the slower ones.
+// tests in verifyXumLaunch.test.ts do, except the UTF-8 boundary sweep, which keeps its 20_000: on
+// a heavily loaded host, Bun's default 5 s timeout fails the slower ones.
 
 const tempDirs: string[] = [];
 

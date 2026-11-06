@@ -333,6 +333,11 @@ export function getContainerName(projectPath: string, workspaceName: string): st
  * Extends RemoteRuntime for shared exec/file operations.
  */
 export class DockerRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "docker" {
+    return "docker";
+  }
   private readonly config: DockerRuntimeConfig;
   /** Container name - set during construction (for existing) or createWorkspace (for new) */
   private containerName?: string;
