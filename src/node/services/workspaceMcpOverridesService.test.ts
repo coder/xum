@@ -1233,6 +1233,36 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(published.map(([id]) => id)).not.toContain("hint-cold-alias");
     });
 
+    it("a duplicated id carries the legacy value of its first entry, as in every other lookup", async () => {
+      // Corrupted config: one id on two checkouts, only the second with a legacy value.
+      const firstDir = path.join(tempDir, "dup-legacy-first");
+      const secondDir = path.join(tempDir, "dup-legacy-second");
+      await registerLocalWorkspaces(config, [
+        { dir: path.join(tempDir, "dup-legacy-writer"), id: "dup-legacy-writer" },
+        { dir: firstDir, id: "dup-legacy" },
+        { dir: secondDir, id: "dup-legacy" },
+      ]);
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects.get(secondDir)?.workspaces[0];
+        if (entry) entry.mcp = { enabledServers: ["shots"] };
+        return cfg;
+      });
+      const service = new WorkspaceMcpOverridesService(config);
+      const realpathSpy = spyOn(fsPromisesModule, "realpath");
+      try {
+        await service.setOverridesForWorkspace(
+          "dup-legacy-writer",
+          { disabledServers: ["shots"] },
+          { publish: () => Promise.resolve(), hasSnapshot: () => false }
+        );
+        expect(
+          realpathSpy.mock.calls.filter(([target]) => isInside(target, [firstDir, secondDir]))
+        ).toEqual([]);
+      } finally {
+        realpathSpy.mockRestore();
+      }
+    });
+
     it("an ancestor chain through an off-host workspace still reaches a cached host descendant", async () => {
       // hint-chain-host -> hint-chain-remote (SSH) -> hint-chain-alias, which shares the written
       // checkout. The cached host workspace resolves through the remote parent, so the walk up
