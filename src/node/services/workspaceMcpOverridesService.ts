@@ -137,8 +137,9 @@ function isColdRefresh(
  * state for, and their ancestors (a cached descendant of a sharer resolves
  * from the written document). Every other workspace reads disk on its next
  * serve, so whether it shares the written checkout changes nothing it
- * serves, and a first serve already in flight there re-reads once the
- * write's epoch bump fails its postflight (see bumpOverridesEpoch). Scanning
+ * serves, and a first serve already in flight there fails closed (its
+ * postflight sees the write's epoch bump and asks the caller to retry; see
+ * bumpOverridesEpoch) instead of starting servers from the old document. Scanning
  * them all cost one realpath per registered checkout on every save (7,550
  * on one host).
  */
