@@ -7,6 +7,10 @@ import type { MCPServerInfo } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { buildWorkspaceComposition } from "./composition";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -15,36 +19,22 @@ import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFi
 const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
 
-// The inspector also scans the runtime user's global roots (HOME and the Xum home). A host with many
-// installed skills adds a shell containment probe per skill and root (about 990 in the first test),
-// so three tests ran into their 120 s and 240 s limits, while an empty home takes seconds. Pointing
-// both at an empty folder makes the file independent of the host.
-let hostHome: DisposableTempDir | undefined;
-let previousHome: string | undefined;
-let previousXumRoot: string | undefined;
+// The inspector also scans the runtime user's global roots. A host with many installed skills adds
+// a shell containment probe per skill and root (about 990 in the first test), so three tests ran
+// into their 120 s and 240 s limits, while an empty home takes seconds.
+let hostHome: IsolatedHostHome | undefined;
 
-function hostXumRoot(): string {
+function isolatedHome(): IsolatedHostHome {
   assert(hostHome !== undefined, "the isolated host home is created in beforeAll");
-  return path.join(hostHome.path, ".xum");
-}
-
-function restoreEnv(name: "HOME" | "XUM_ROOT", value: string | undefined): void {
-  if (value === undefined) delete process.env[name];
-  else process.env[name] = value;
+  return hostHome;
 }
 
 beforeAll(() => {
-  hostHome = new DisposableTempDir("composition-host-home");
-  previousHome = process.env.HOME;
-  previousXumRoot = process.env.XUM_ROOT;
-  process.env.HOME = hostHome.path;
-  process.env.XUM_ROOT = hostXumRoot();
+  hostHome = isolateHostHome("composition-host-home");
 });
 
 afterAll(() => {
-  restoreEnv("HOME", previousHome);
-  restoreEnv("XUM_ROOT", previousXumRoot);
-  hostHome?.[Symbol.dispose]();
+  hostHome?.restore();
 });
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
@@ -143,11 +133,24 @@ describe("buildWorkspaceComposition", () => {
     );
     // Project shell tool hook (hooks.ts precedence: project shadows user-level).
     await fs.writeFile(path.join(workspace.path, ".mux", "tool_pre"), "#!/bin/sh\n", "utf-8");
-    // The only global skill is the one in the isolated Xum home, never a skill of the host.
+    // The only global skill and the only global plugin are the ones in the isolated homes, never
+    // those of the host.
     await writeSkill(
-      path.join(hostXumRoot(), "skills", "global-fixture-skill"),
+      path.join(isolatedHome().xumRoot, "skills", "global-fixture-skill"),
       "global-fixture-skill",
       "Global skill"
+    );
+    const homePluginDir = path.join(
+      isolatedHome().homePath,
+      ".agents",
+      "plugins",
+      "home-fixture-plugin"
+    );
+    await fs.mkdir(homePluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(homePluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "home-fixture-plugin" }),
+      "utf-8"
     );
 
     const composition = await buildWorkspaceComposition({
@@ -181,6 +184,9 @@ describe("buildWorkspaceComposition", () => {
 
     expect(composition.skills.filter((s) => s.source === "global").map((s) => s.name)).toEqual([
       "global-fixture-skill",
+    ]);
+    expect(composition.plugins.filter((p) => p.scope === "global").map((p) => p.name)).toEqual([
+      "home-fixture-plugin",
     ]);
 
     // Agents.
