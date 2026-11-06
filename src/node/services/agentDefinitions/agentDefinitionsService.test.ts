@@ -30,6 +30,7 @@ import {
   discoverAgentDefinitions,
   listAgentDefinitions,
   type AgentDefinitionsContext,
+  type AgentDefinitionsRoots,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentBody,
@@ -1304,6 +1305,34 @@ base: a
       await writeAgent(path.join(pluginDir, "agents"), agentId, agentName);
     }
 
+    async function effectiveToolsOf(
+      runtime: Runtime,
+      workspacePath: string,
+      roots: AgentDefinitionsRoots,
+      agentId: string,
+      sampleTools: string[]
+    ): Promise<string[]> {
+      const id = AgentIdSchema.parse(agentId);
+      const agentDefinition = await readAgentDefinition(runtime, workspacePath, id, {
+        roots,
+        runtimeFactory,
+      });
+      const chain = await resolveAgentInheritanceChain({
+        runtime,
+        workspacePath,
+        agentId: id,
+        agentDefinition,
+        workspaceId: "ws",
+        runtimeFactory,
+      });
+      const policy = resolveToolPolicyForAgent({
+        agents: chain,
+        isSubagent: true,
+        disableTaskToolsForDepth: false,
+      });
+      return applyToolPolicyToNames(sampleTools, policy);
+    }
+
     test("plugin agents are discovered with plugin attribution at lowest project precedence", async () => {
       using project = new DisposableTempDir("agent-defs-plugin-project");
       using global = new DisposableTempDir("agent-defs-plugin-global");
@@ -1548,7 +1577,7 @@ base: a
         // Claude Code denylist: every inherited tool except file writes and spawning.
         "no-writes": "name: no-writes\ndescription: d\ndisallowedTools: [Write, Edit, Agent]",
         // Nothing resolves: Claude Code refuses to launch it, so Xum skips it.
-        unresolved: "name: unresolved\ndescription: d\ntools: Grep, Glob",
+        unresolved: "name: unresolved\ndescription: d\ntools: LSP, Monitor",
         // A Xum-format file with a Claude denylist: Xum cannot honor both, so it skips it.
         mixed: "name: mixed\nbase: exec\nsubagent:\n  runnable: true\ndisallowedTools: [Bash]",
       };
@@ -1585,27 +1614,8 @@ base: a
       expect(ids).not.toContain("unresolved");
       expect(ids).not.toContain("mixed");
 
-      const toolsOf = async (agentId: string) => {
-        const id = AgentIdSchema.parse(agentId);
-        const agentDefinition = await readAgentDefinition(runtime, project.path, id, {
-          roots,
-          runtimeFactory,
-        });
-        const chain = await resolveAgentInheritanceChain({
-          runtime,
-          workspacePath: project.path,
-          agentId: id,
-          agentDefinition,
-          workspaceId: "ws",
-          runtimeFactory,
-        });
-        const policy = resolveToolPolicyForAgent({
-          agents: chain,
-          isSubagent: true,
-          disableTaskToolsForDepth: false,
-        });
-        return applyToolPolicyToNames(sampleTools, policy);
-      };
+      const toolsOf = (agentId: string) =>
+        effectiveToolsOf(runtime, project.path, roots, agentId, sampleTools);
       const sampleTools = [
         "agent_report",
         "bash",
@@ -1634,6 +1644,69 @@ base: a
         // Workflows spawn sub-agents too, so denying Agent removes them.
         exec.filter((tool) => !/^(file_edit_|task|workflow_)/.test(tool))
       );
+    });
+
+    test("a Claude read-only search list runs on Explore with the file and bash tools", async () => {
+      using project = new DisposableTempDir("agent-defs-search-list-project");
+      using global = new DisposableTempDir("agent-defs-search-list-global");
+
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      await writePluginWithAgent(pluginContainer, "egm", "placeholder", "Placeholder");
+      const lists: Record<string, string> = {
+        reviewer: "tools: [Read, Grep, Glob]",
+        "no-bash": "tools: [Read, Grep, Glob]\ndisallowedTools: [Bash]",
+        "denied-names": "tools: [Read, Grep, Glob]\ndisallowedTools: [Grep, Glob]",
+        "denied-lowercase": "tools: [Read, Grep, Glob]\ndisallowedTools: [grep, glob]",
+        "denied-specifier": "tools: [Read, Grep, Glob]\ndisallowedTools: [Grep(*.ts), Glob]",
+        "with-edit": "tools: [Read, Edit, Grep]",
+        "ls-denied": "disallowedTools: [LS]",
+      };
+      for (const [id, list] of Object.entries(lists)) {
+        await fs.writeFile(
+          path.join(pluginContainer, "egm", "agents", `${id}.md`),
+          `---\nname: ${id}\ndescription: d\n${list}\n---\nBody\n`,
+          "utf-8"
+        );
+      }
+      const roots = {
+        projectRoots: [],
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+      const agents = await discoverAgentDefinitions(runtime, project.path, {
+        roots,
+        runtimeFactory,
+      });
+      const sampleTools = [
+        "agent_report",
+        "file_read",
+        "attach_file",
+        "bash",
+        "bash_output",
+        "file_edit_replace_string",
+        "task",
+        "web_fetch",
+      ];
+      const toolsOf = (agentId: string) =>
+        effectiveToolsOf(runtime, project.path, roots, agentId, sampleTools);
+      const fileTools = ["agent_report", "file_read", "attach_file"];
+
+      expect(agents.find((a) => a.id === "reviewer")?.base).toBe("explore");
+      expect(await toolsOf("reviewer")).toEqual([...fileTools, "bash", "bash_output"]);
+
+      expect(agents.find((a) => a.id === "no-bash")?.base).toBe("explore");
+      expect(await toolsOf("no-bash")).toEqual(fileTools);
+      for (const id of ["denied-names", "denied-lowercase", "denied-specifier"]) {
+        expect(agents.find((a) => a.id === id)?.base).toBe("exec");
+        expect(await toolsOf(id)).toEqual(fileTools);
+      }
+
+      expect(agents.find((a) => a.id === "with-edit")?.base).toBe("exec");
+      expect(await toolsOf("with-edit")).toEqual([...fileTools, "file_edit_replace_string"]);
+
+      expect(agents.map((a) => a.id)).toContain("ls-denied");
+      expect(await toolsOf("ls-denied")).toEqual(await toolsOf("exec"));
     });
 
     test("remote runtimes list global host plugin agents but not project plugin agents", async () => {

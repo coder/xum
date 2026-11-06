@@ -809,6 +809,25 @@ function unreviewedRows(
   ];
 }
 
+/**
+ * The agent file lists of the install preview. Display only: the names a user reads before
+ * Install show invisible controls (#6629). `shellRemovedAgents` are the read-only agents whose
+ * mapped tools leave no bash tool.
+ */
+function previewAgentLists(agentFiles: readonly PluginAgentFile[]): {
+  agents: string[];
+  readonlyAgents: string[];
+  shellRemovedAgents: string[];
+} {
+  const names = (keep: (agent: PluginAgentFile) => boolean) =>
+    agentFiles.filter(keep).map((agent) => showInvisibleControls(agent.file));
+  return {
+    agents: names(() => true),
+    readonlyAgents: names((agent) => agent.readonly),
+    shellRemovedAgents: names((agent) => agent.readonly && !agent.keepsShell),
+  };
+}
+
 const COMPONENT_LABELS: Record<keyof ComponentConsent, string> = {
   skills: "Skill",
   mcpServers: "MCP server",
@@ -1202,11 +1221,9 @@ async function runGit(
  * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
 function sparseCloneFlags(subpath: string | undefined, url: string): string[] {
-  // --no-local: for a plain local-path source, git's local-clone shortcut
-  // ignores --depth and --filter and copies the whole repository history.
   return subpath === undefined
     ? []
-    : ["--filter=blob:none", "--no-checkout", "--no-local", ...localUploadPackFlags(url)];
+    : ["--filter=blob:none", "--no-checkout", ...localUploadPackFlags(url)];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
@@ -2737,6 +2754,14 @@ export class AgentPluginInstallService {
         "--depth",
         "1",
         "--single-branch",
+        // --no-local, always: for a plain local-path source, git's local-clone shortcut
+        // (1) ignores --depth and --filter and copies the whole repository history, and
+        // (2) copies or hard-links the source's `objects/` files one by one, so a background
+        // `git repack` of that repository (git runs one detached after a commit) that removes
+        // a loose object between the directory listing and the copy fails the clone with
+        // "failed to copy file to ...: No such file or directory". The transport reads the
+        // source through `git upload-pack`, which git keeps safe against a concurrent repack.
+        "--no-local",
         ...sparseCloneFlags(subpath, url),
         "--branch",
         ref,
@@ -3951,11 +3976,7 @@ export class AgentPluginInstallService {
     assertReviewFits(fileChanges);
     const openaiInterface = await interfaceSummary(plugin, warnings);
     const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-    // Display only: the names a user reads before Install show invisible controls (#6629).
-    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-    const readonlyAgents = agentFiles.flatMap((agent) =>
-      agent.readonly ? [showInvisibleControls(agent.file)] : []
-    );
+    const { agents, readonlyAgents, shellRemovedAgents } = previewAgentLists(agentFiles);
     const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
       showInvisibleControls
     );
@@ -4007,6 +4028,7 @@ export class AgentPluginInstallService {
       fileChanges,
       agents,
       readonlyAgents,
+      shellRemovedAgents,
       workflows,
       slashCommands,
       reviewedComponents,

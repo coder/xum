@@ -21,7 +21,8 @@ export interface ParsedAgentDefinitionMarkdown {
   frontmatter: AgentDefinitionFrontmatter;
   body: string;
   /**
-   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true`.
+   * A plugin agent that the Claude Code or Cursor mapping runs on Explore for `readonly: true` or a
+   * Claude read-only search list.
    * The schema strips the key, so the install review reads it here (agentFiles.ts).
    */
   mappedReadonly: boolean;

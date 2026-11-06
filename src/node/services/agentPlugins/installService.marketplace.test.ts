@@ -685,6 +685,19 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(nested.skills.map((skill) => skill.name)).toEqual(["crm"]);
   });
 
+  // The flake behind "failed to copy file to ...: No such file or directory": git runs a detached
+  // `git maintenance` after each commit, and once that repacks the fixture it deletes loose
+  // objects while a local-path clone copies the same files one by one. A background repack cannot
+  // be paused from a test, so this plants what that copy cannot take: a symlink in `objects/`
+  // ("symlink ... exists, refusing to clone with --local"). `git upload-pack` never reads it.
+  test("a local source is cloned through git's transport, not by copying its object files", async () => {
+    await fsPromises.symlink(
+      "missing-target",
+      path.join(marketDir, ".git", "objects", "info", "stale-link")
+    );
+    expect((await listMarketplace()).name).toBe("acme-market");
+  });
+
   test("only one build of a name installs: the second is refused until the first is uninstalled", async () => {
     await writeCursorMarketplace();
     await install(await previewCursorEntry("pstack"));
