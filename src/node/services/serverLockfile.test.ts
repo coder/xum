@@ -39,7 +39,12 @@ describe("ServerLockfile", () => {
   }
 
   /** Writes a lock as another process would have: not through acquire(), so this process does not own it. */
-  async function writeForeignLock(lock: { pid: number; baseUrl: string; token?: string }) {
+  async function writeForeignLock(lock: {
+    pid: number;
+    baseUrl: string;
+    token?: string;
+    startedAt?: string;
+  }) {
     const data = {
       token: "foreign-token",
       startedAt: new Date().toISOString(),
@@ -286,6 +291,30 @@ describe("ServerLockfile", () => {
       expect(live.requests).toHaveLength(1);
     });
 
+    test("a lock that is removed or rewritten by the same pid while its backend is asked is not handed out", async () => {
+      const foreign = unrelatedProcess();
+      const startedAt = "2026-01-01T00:00:00.000Z";
+      let whileAsked: () => Promise<void> = () => Promise.resolve();
+      const live = await backend("xum", { onRequest: () => whileAsked() });
+      const lock = { pid: foreign.pid, baseUrl: live.baseUrl, startedAt };
+
+      // The backend stopped: release() removed the lock.
+      await writeForeignLock(lock);
+      whileAsked = () => fs.rm(lockfile.getLockPath());
+      expect(await lockfile.read()).toBeNull();
+
+      // The same process restarted its server: the new lock has its pid and a later startedAt.
+      await writeForeignLock(lock);
+      whileAsked = () =>
+        writeForeignLock({ ...lock, startedAt: "2026-01-02T00:00:00.000Z" }).then(() => undefined);
+      expect(await lockfile.read()).toBeNull();
+
+      // Nothing changes: the same lock is handed out.
+      await writeForeignLock(lock);
+      whileAsked = () => Promise.resolve();
+      expect((await lockfile.read())?.startedAt).toBe(startedAt);
+    });
+
     test("a lock this process acquired is live without asking its baseUrl", async () => {
       await lockfile.acquire(await unservedBaseUrl(), "own-token");
 
@@ -349,10 +378,9 @@ describe("ServerLockfile", () => {
       await lockfile.acquire("http://127.0.0.1:1", "own-token");
       const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
 
-      const realCopyFile = fs.copyFile;
-      const copy = spyOn(fs, "copyFile").mockImplementation((async () => {
-        throw Object.assign(new Error("no space left"), { code: "ENOSPC" });
-      }) as typeof realCopyFile);
+      const copy = spyOn(fs, "copyFile").mockImplementation(() =>
+        Promise.reject(Object.assign(new Error("no space left"), { code: "ENOSPC" }))
+      );
       try {
         await lockfile.release();
       } finally {

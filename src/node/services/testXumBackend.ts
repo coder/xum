@@ -31,7 +31,7 @@ export async function startFakeBackend(
   const prefix = options.prefix ?? "";
   const requests: FakeBackend["requests"] = [];
   const sockets = new Set<Socket>();
-  const server = http.createServer(async (req, res) => {
+  const answer = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers });
     if (mode === "hang") return;
     // A test that changes the world while the request is pending (a restart during the probe).
@@ -43,6 +43,9 @@ export async function startFakeBackend(
     }
     res.statusCode = 404;
     res.end("<html>not found</html>");
+  };
+  const server = http.createServer((req, res) => {
+    answer(req, res).catch(() => res.destroy());
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
