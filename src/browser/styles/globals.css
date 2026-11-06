@@ -1144,6 +1144,45 @@ body,
   }
 }
 
+/* The folded iPhone Duo's cover display keeps its status and camera column on its right edge and
+   reports it to web content as `env(safe-area-inset-right)`: 84 pt of that display's 466 pt width.
+   Padding the shell by a side inset, which is what every other layout does, gives up a fifth of the
+   width for the whole page while the OS draws over only a band at the top of that column (measured
+   on a folded Duo, 2.95 px per pt: glyphs at x 398..437, y 87..151 of 466x678). So in narrow
+   portrait the shell keeps no right padding and paints that band instead, and content below and
+   left of it uses the full width.
+   Where the OS reports no side inset nothing changes, which is every other case: iPhone and iPad
+   portrait have none, so iOS 27.2 on a Duo, which reports none for the cover display, renders
+   exactly as before. Landscape and wide layouts keep the padding, because there a side inset is a
+   full-height notch, and desktop, Electron and Android report no side inset in portrait.
+   .storybook/test-runner.ts asserts the band geometry against a reported inset. */
+@media (orientation: portrait) and (max-width: 768px) {
+  /* The shell's `pr-[env(safe-area-inset-right)]` utility still carries the other layouts;
+     !important is how the narrow-layout rules around here win over utilities. */
+  .mobile-layout {
+    padding-right: 0 !important;
+  }
+
+  /* On the body, the one element, rather than on the shell: `mobile-layout` is on three nested
+     elements, the reserve is fixed to the viewport edge anyway, and a pseudo-element adds no node to
+     the tree the phone skeleton pins (`make check-phone-chrome`). It paints the shell's own
+     background, which is what the band sits on. */
+  body::after {
+    content: "";
+    position: fixed;
+    top: 80px;
+    height: 84px;
+    right: 0;
+    /* Zero wherever the OS reports no side inset, so nothing paints. */
+    width: env(safe-area-inset-right, 0px);
+    background-color: var(--color-surface-primary);
+    /* The OS draws over this band and takes no touches there, so the reserve takes none either. */
+    pointer-events: none;
+    /* Above the page's own content, below the fixed phone header (z-50) and every overlay (1100+). */
+    z-index: 40;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
