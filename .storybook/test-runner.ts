@@ -748,21 +748,23 @@ interface Pixels {
 }
 
 async function waitForRenderedDiagrams(page: StoryPage) {
-  const rendered = await page.evaluate(
-    async ([frames, diagrams, timeout]: [string, string, number]) => {
-      const isRendered = () => {
-        const drawn = document.querySelectorAll(diagrams).length;
-        return drawn > 0 && drawn === document.querySelectorAll(frames).length;
-      };
-      // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
-      const deadline = performance.now() + timeout;
-      while (!isRendered() && performance.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      return isRendered();
-    },
-    [MERMAID_PAGE_FRAME_SELECTOR, MERMAID_PAGE_DIAGRAM_SELECTOR, DIAGRAM_RENDER_TIMEOUT_MS]
-  );
+  const args: [string, string, number] = [
+    MERMAID_PAGE_FRAME_SELECTOR,
+    MERMAID_PAGE_DIAGRAM_SELECTOR,
+    DIAGRAM_RENDER_TIMEOUT_MS,
+  ];
+  const rendered = await page.evaluate(async ([frames, diagrams, timeout]) => {
+    const isRendered = () => {
+      const drawn = document.querySelectorAll(diagrams).length;
+      return drawn > 0 && drawn === document.querySelectorAll(frames).length;
+    };
+    // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
+    const deadline = performance.now() + timeout;
+    while (!isRendered() && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return isRendered();
+  }, args);
   assert(rendered, NO_DIAGRAM_MESSAGE);
 }
 
