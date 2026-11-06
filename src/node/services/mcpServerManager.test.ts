@@ -5537,10 +5537,14 @@ describe("MCPServerManager", () => {
 
   test("the startup deadline fires once a connection hangs, however long real I/O delays the hang", async () => {
     // The harness waits for the hang itself. It once gave the hang a fixed number of event-loop
-    // turns, which a loaded host used up before the startup's real I/O (here a 400 ms sleep, which
-    // fake timers do not touch) reached the hang: "startup never hung".
+    // turns, which a loaded host used up before the startup's real I/O (here a child process that
+    // runs 400 ms: fake timers fake every sleep, so only I/O takes real time) reached the hang:
+    // "startup never hung".
     configService.listServers = mock(() => Promise.resolve({ late: stdioConfig("late-cmd") }));
-    servers.serve("late-cmd", { connect: () => Bun.sleep(400), hang: true });
+    servers.serve("late-cmd", {
+      connect: async () => void (await Bun.spawn(["sleep", "0.4"]).exited),
+      hang: true,
+    });
     const result = await servers.expireStartupDeadline(() =>
       manager.getToolsForWorkspace(workspaceRequest("ws-late-hang"))
     );
