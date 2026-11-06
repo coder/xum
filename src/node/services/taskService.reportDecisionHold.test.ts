@@ -1024,8 +1024,16 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   // reported and publishes nothing. Its decision must still refuse the held follow-up, never read
   // as "the attempt continues" (#7003). The gate holds the handler in the gap, as a loaded host
   // does by chance.
-  test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
-    const childId = "holdlatehandler01";
+  const REPORTED_AT = "2026-10-01T00:00:02.000Z";
+  /**
+   * Queues a follow-up behind a child's stream, ends the stream with its handler held after the
+   * admission read, lets `editRow` change the child's row in that gap, then releases the handler
+   * and waits for the follow-up's fate: dispatched (a second stream) or refused and held.
+   */
+  async function endStreamWithRowEditedInGap(
+    childId: string,
+    editRow: (row: WorkspaceConfigEntry) => void
+  ) {
     const stack = await createStack(childId);
     const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
     const inGap = Promise.withResolvers<void>();
@@ -1038,12 +1046,12 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       }
       return isPlanLike(entry);
     });
+    const onCanceled = mock((_reason: string) => undefined);
     try {
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
       expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
         Ok(undefined)
       );
-      const onCanceled = mock((_reason: string) => undefined);
       expect(
         await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
       ).toEqual(Ok(undefined));
@@ -1052,24 +1060,84 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await config.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
           for (const workspace of project.workspaces) {
-            if (workspace.id !== childId) continue;
-            workspace.taskStatus = "reported";
-            workspace.reportedAt = "2026-10-01T00:00:02.000Z";
+            if (workspace.id === childId) editRow(workspace);
           }
         }
         return cfg;
       });
       gap.resolve();
-      await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
       await yieldMacrotasks(10);
+      return { stack, onCanceled };
+    } catch (error) {
+      await stack.cleanup();
+      throw error;
+    } finally {
+      gap.resolve();
+    }
+  }
+
+  test("a stream end that finds its attempt already reported by another writer refuses the held follow-up as indeterminate", async () => {
+    const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler01", (row) => {
+      row.taskStatus = "reported";
+      row.reportedAt = REPORTED_AT;
+    });
+    try {
       // Never a new turn of the reported attempt.
-      expect(completions).toHaveLength(1);
-      await until(() => stack.heldTexts().length > 0, "held input");
+      expect(stack.completions).toHaveLength(1);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
     } finally {
-      gap.resolve();
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("a report of another attempt landing in the gap is not this attempt's report: the held follow-up meets the stale-attempt gate", async () => {
+    const { stack, onCanceled } = await endStreamWithRowEditedInGap("holdlatehandler02", (row) => {
+      row.taskAttemptId = "att_00000000000000b7";
+      row.taskStatus = "reported";
+      row.reportedAt = REPORTED_AT;
+    });
+    try {
+      expect(stack.completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(onCanceled.mock.calls).toEqual([[SEND_ADMISSION_STALE_MESSAGE]]);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // A reactivated child keeps `taskStatus: reported` with a fresh attempt: its row reads reported
+  // from the first send on, so a reported row never means that its current attempt reported.
+  test("a follow-up queued during a reactivated child's stream still runs after it", async () => {
+    const childId = "holdreactivated01";
+    const stack = await createStack(childId, {
+      taskStatus: "reported",
+      reportedAt: REPORTED_AT,
+    });
+    const { workspaceService, completions, sendOptions } = stack;
+    try {
+      expect(await workspaceService.sendMessage(childId, "manual rescue", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      await until(() => completions.length === 1, "the continuation stream");
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      expect(completions).toHaveLength(2);
+      expect(stack.heldTexts()).toEqual([]);
+      expect(onCanceled).not.toHaveBeenCalled();
+    } finally {
       await stack.cleanup();
     }
   }, 20_000);
