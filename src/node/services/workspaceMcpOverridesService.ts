@@ -806,7 +806,9 @@ interface PublicationBudget {
 function createPublicationBudget(timeoutMs = PUBLICATION_TIMEOUT_MS): PublicationBudget {
   let deadlineAt = Date.now() + timeoutMs;
   return {
+    // mutation-equivalent: remaining() only arms timers, and Node runs a 0 ms timer after 1 ms
     remaining: () => Math.max(1, deadlineAt - Date.now()),
+    // mutation-equivalent: >= and > differ only in the deadline's own millisecond
     exhausted: () => Date.now() >= deadlineAt,
     progress: () => {
       deadlineAt = Date.now() + timeoutMs;
