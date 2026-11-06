@@ -2075,7 +2075,7 @@ export class BackupInvalidPayloadError extends Error {
 }
 
 /** An fs failure carries an errno string; a validation failure does not. */
-function isFilesystemError(error: unknown): boolean {
+export function isFilesystemError(error: unknown): boolean {
   return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string";
 }
 

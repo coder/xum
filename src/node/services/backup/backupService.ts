@@ -19,6 +19,7 @@ import {
   type BackupCredentialKind,
   type BackupFileChange,
   type BackupOperationError,
+  type BackupPluginInstall,
   type BackupProjectImport,
   type BackupProjectImportResult,
 } from "@/common/orpc/schemas/backup";
@@ -97,6 +98,9 @@ export interface BackupPayloadStore {
     projectBundleSkipped: boolean;
     /** Shelf files a restore would not write, with the reason (M5c). */
     shelfSkipped?: string[];
+    /** The backup's plugin list against this machine's installs; a restore installs none. */
+    pluginInstalls?: BackupPluginInstall[];
+    pluginListSkipped?: boolean;
     symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
@@ -131,6 +135,8 @@ export interface BackupPayloadStore {
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
     shelfSkipped?: string[];
+    pluginInstalls?: BackupPluginInstall[];
+    pluginListSkipped?: boolean;
     symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
@@ -578,6 +584,8 @@ export class BackupService {
         projectBundleSkipped: boolean;
         /** Artifact shelf files left out of the push or the restore, with the reason. */
         shelfSkipped: string[];
+        pluginInstalls?: BackupPluginInstall[];
+        pluginListSkipped?: boolean;
         symlinkSkipped?: string[];
         pushError: string | null;
       },
@@ -624,6 +632,8 @@ export class BackupService {
           ...("pushError" in exported ? [] : (exported.shelfSkipped ?? [])),
           ...(restorePreview.shelfSkipped ?? []),
         ],
+        pluginInstalls: restorePreview.pluginInstalls,
+        pluginListSkipped: restorePreview.pluginListSkipped,
         symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
@@ -715,6 +725,8 @@ export class BackupService {
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
         shelfSkipped: string[];
+        pluginInstalls?: BackupPluginInstall[];
+        pluginListSkipped?: boolean;
         symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
@@ -835,6 +847,8 @@ export class BackupService {
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
               shelfSkipped: restored.shelfSkipped ?? [],
+              pluginInstalls: restored.pluginInstalls,
+              pluginListSkipped: restored.pluginListSkipped,
               symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
