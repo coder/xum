@@ -753,6 +753,7 @@ const PINNED_VIEWPORT_STORIES = new Map([
   ["app-waitingonyou--phone", { width: 390, height: 844 }],
   ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
   ["app-chat-messages-markdownrenderer--mermaid-state-dialog-phone", { width: 390, height: 844 }],
+  ["app-chat-tools-proposeplan--propose-plan-mobile", { width: 390, height: 844 }],
   [
     "app-chat-messages-markdownrenderer--mermaid-state-dialog-desktop",
     { width: 1200, height: 900 },
