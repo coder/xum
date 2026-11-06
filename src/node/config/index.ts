@@ -1608,6 +1608,13 @@ export interface WorkspaceMetadataOptions {
    */
   legacyAliasIds?: Set<string>;
   /**
+   * Out-parameter collecting the ids of entries that a lenient build made from the config row
+   * alone, because the entry's own legacy metadata.json could not be read or parsed. Defaults
+   * fill the name and runtime that file holds, so the entry's checkout path may be wrong:
+   * callers that read files in that checkout must not trust such an entry.
+   */
+  fallbackIds?: Set<string>;
+  /**
    * Probe each worktree checkout's existence (fs.access) to classify
    * transcript-only workspaces. Default true. Callers that only need the
    * registry (ids, paths, runtime, parent links) pass false: one stalled
@@ -1637,12 +1644,14 @@ export interface WorkspaceMetadataOptions {
 
 /**
  * Memoized registry-only enumeration for one loaded config snapshot. The
- * build's own alias collection is retained so later callers passing their
- * own `legacyAliasIds` out-parameter still receive every alias.
+ * build's own alias and fallback collections are retained so later callers
+ * passing their own `legacyAliasIds` or `fallbackIds` out-parameter still
+ * receive every id.
  */
 interface WorkspaceMetadataMemoEntry {
   result: Promise<FrontendWorkspaceMetadata[]>;
   legacyAliasIds: Set<string>;
+  fallbackIds: Set<string>;
 }
 
 /**
@@ -4666,13 +4675,15 @@ export class Config {
       // Memoize the in-flight promise: the startup burst issues several
       // enumerations before the first one resolves.
       const legacyAliasIds = new Set<string>();
+      const fallbackIds = new Set<string>();
       const degraded = { value: false };
       const result = this.buildWorkspaceMetadata(config, config.projects, {
         ...options,
         legacyAliasIds,
+        fallbackIds,
         degraded,
       });
-      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds };
+      const created: WorkspaceMetadataMemoEntry = { result, legacyAliasIds, fallbackIds };
       entry = created;
       memo.set(memoKey, created);
       const forget = () => {
@@ -4693,6 +4704,9 @@ export class Config {
     const metadata = await entry.result;
     if (options.legacyAliasIds !== undefined) {
       for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
+    }
+    if (options.fallbackIds !== undefined) {
+      for (const fallbackId of entry.fallbackIds) options.fallbackIds.add(fallbackId);
     }
     // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
     // caller's in-place filter/sort from leaking into another.
@@ -5284,6 +5298,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
+          options?.fallbackIds?.add(metadata.id);
           workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }

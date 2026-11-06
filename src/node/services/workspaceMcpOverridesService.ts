@@ -483,8 +483,11 @@ class ConfigSnapshot {
     canonical: Map<string, Promise<string | undefined>>;
     /** In-flight writes started by this operation (see trackSideEffect). */
     sideEffects: Set<Promise<unknown>>;
-    /** loadAllMetadataTolerant fell back to the lenient walk. */
-    lenientRegistry?: true;
+    /**
+     * Set when loadAllMetadataTolerant fell back to the lenient walk: the ids of the entries it
+     * built from their config row alone (Config's `fallbackIds`).
+     */
+    fallbackIds?: Set<string>;
   };
   private _cancelled = false;
 
@@ -603,24 +606,38 @@ class ConfigSnapshot {
    * row's persisted path. That is still safe: the sweep removes only this plugin instance's keys,
    * which are stale consent in any file, and plugin servers never run off-host. Skipping or
    * failing the entry instead would leave a real stale enable in place, or refuse every install
-   * again.
+   * again. An override read refuses such an entry instead (see assertReadableEntry).
    */
   loadAllMetadataTolerant(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
     return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
       this.loadLegacyConfig();
-      this.store.lenientRegistry = true;
+      const fallbackIds = new Set<string>();
+      this.store.fallbackIds = fallbackIds;
       // A count, not the ids: an install sweep can request thousands.
       log.warn(
         "[MCP] Resolving workspace MCP overrides from a lenient registry walk: another entry's metadata is unreadable",
         { workspaceCount: workspaceIds.length, error: getErrorMessage(error) }
       );
-      return this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, fallbackIds });
     }));
   }
 
   /** The registry came from loadAllMetadataTolerant's fallback: a degraded entry's id is unknown. */
   get lenientRegistry(): boolean {
-    return this.store.lenientRegistry === true;
+    return this.store.fallbackIds !== undefined;
+  }
+
+  /**
+   * Throws for an entry that the lenient walk built from its config row alone: its name and
+   * runtime may live only in its unreadable metadata.json, so the checkout it names may not
+   * hold its override file, and a disable there is unknown, not absent.
+   */
+  assertReadableEntry(workspaceId: string): void {
+    if (this.store.fallbackIds?.has(workspaceId) === true) {
+      throw new Error(
+        `Workspace ${workspaceId} metadata is unreadable; its MCP overrides are unknown`
+      );
+    }
   }
 
   canonicalize(identity: string, filePath: string): Promise<string | undefined> {
@@ -2001,6 +2018,8 @@ export class WorkspaceMcpOverridesService {
     inheritanceDepth = 0
   ): Promise<ResolvedOverrides> {
     const workspaceId = metadata.id;
+    // Here, not in the callers: the requested workspace and every inherited ancestor alike.
+    snapshot.assertReadableEntry(workspaceId);
     const { runtime, workspacePath, hostFilesystem } = this.resolveWorkspace(metadata, snapshot);
     const filePaths = this.getOverridesFilePaths(workspacePath, metadata.runtimeConfig);
     const canonicalPath = filePaths[0];
