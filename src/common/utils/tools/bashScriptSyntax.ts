@@ -7,8 +7,9 @@
  * unterminated heredoc) is left to bash. Where the scanner cannot follow bash's
  * nesting it gives up and calls the script complete: a missed cut costs one
  * shell error, a false rejection blocks real work. It gives up on, for example,
- * a quote inside a double-quoted `${...}`, `case` inside `$(...)`, and a heredoc
- * delimiter with `$'`, `$"` or a backslash inside its quotes.
+ * a quote inside a double-quoted `${...}`, `case` inside `$(...)`, a heredoc
+ * delimiter with `$'`, `$"` or a backslash inside its quotes, and one with an
+ * unquoted backtick.
  */
 type CutOffShellConstruct =
   | "single-quote"
@@ -60,9 +61,14 @@ const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 
 // Bash splits words only on these blanks, not on CR, NBSP or other Unicode spaces.
 const WORD_BOUNDARY = /[ \t\n;&|()<>]/;
+// A quoted run, an escaped character or a plain character of a heredoc delimiter.
+const DELIMITER_PART = /'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`]/.source;
 // `<<[-]WORD` starts a heredoc whose body begins on the next line. A here-string
 // (`<<<`) never matches a word, because the word cannot start with `<`.
-const HEREDOC_OPERATOR = /<<(?:(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
+const HEREDOC_OPERATOR = new RegExp(`<<(?:(-?)[ \\t]*((?:${DELIMITER_PART})+))?`, "y");
+// An unquoted backtick in the delimiter word: bash ends the body at the word as
+// written, and the word runs on through blanks inside the backticks.
+const BACKTICK_DELIMITER = new RegExp(`<<-?[ \\t]*(?:${DELIMITER_PART})*\``, "y");
 const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
 const UNMODELLED_DELIMITER_QUOTING = /\$['"]|'[^']*\\|"[^"]*\\/;
 const CASE_WORD = /case[ \t\n]/y;
@@ -316,6 +322,10 @@ class ShellScanner {
   }
 
   private readRedirect(): Verdict | undefined {
+    BACKTICK_DELIMITER.lastIndex = this.index;
+    if (BACKTICK_DELIMITER.test(this.text)) {
+      return "complete";
+    }
     HEREDOC_OPERATOR.lastIndex = this.index;
     const match = HEREDOC_OPERATOR.exec(this.text);
     if (match === null) {

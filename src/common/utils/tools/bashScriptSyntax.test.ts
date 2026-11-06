@@ -53,6 +53,15 @@ describe("describeCutOffBashScript", () => {
     ["backslash in a single-quoted delimiter", "cat <<'E\\'OF'\n$(cut\nE\\'OF\n"],
     ["double-quoted delimiter look-alike line", 'cat <<"E\\"OF"\nE\\\necho "unclosed\n'],
     ["single-quoted delimiter look-alike line", "cat <<'E\\'OF'\nE\\\necho 'unclosed\n"],
+    // Bash ends the body at a backtick delimiter as written; the scanner gives up on it.
+    ["backtick heredoc delimiter", "cat <<`echo EOF`\nit's\n`echo EOF`\n"],
+    ["backtick heredoc delimiter after <<-", "cat <<-`echo EOF`\n\tit's\n\t`echo EOF`\n"],
+    ["backtick heredoc delimiter after a blank", "cat << `echo EOF`\nit's\n`echo EOF`\n"],
+    [
+      "backtick heredoc delimiter inside a command substitution",
+      "x=$(cat <<`echo EOF`\n${x\n`echo EOF`\n)\n",
+    ],
+    ["backtick inside a heredoc delimiter word", "cat <<x`y`\nx\nit's\nx`y`\n"],
     ["heredoc whose body follows a multi-line $(", `cat <<EOF; y=$(\necho hi\n)\nit's\nEOF\n`],
     ["no-break space before a hash is part of the word", `(echo a\u00a0#)`],
     ["carriage return before a hash is part of the word", `(echo a\r#)`],
@@ -141,6 +150,26 @@ describe("describeCutOffBashScript", () => {
       `cat <<\\EOF\nit's\nEOF\necho "x`,
     ],
     ["double quote after a here-string", "unterminated double quote", `cat <<<"here"\necho "x`],
+    [
+      "single quote after a heredoc with an unclosed quote in its body",
+      "unterminated single quote",
+      `cat <<EOF\nit's\nEOF\necho 'cut\n`,
+    ],
+    [
+      "single quote after a quoted delimiter holding backticks",
+      "unterminated single quote",
+      "cat <<\"a`b`c\"\nit's\na`b`c\necho 'cut\n",
+    ],
+    [
+      "single quote after a delimiter of escaped backticks",
+      "unterminated single quote",
+      "cat <<\\`cmd\\`\nit's\n`cmd`\necho 'cut\n",
+    ],
+    [
+      "single quote after a here-string of a backtick command",
+      "unterminated single quote",
+      "cat <<< `echo hi`\necho 'cut\n",
+    ],
     [
       "double quote after an input redirect",
       "unterminated double quote",
