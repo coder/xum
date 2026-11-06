@@ -227,6 +227,53 @@ describe("ACP ToolRouter", () => {
     }
   });
 
+  it("waits without a deadline for a delegated non-bash terminal call", async () => {
+    // The bash default belongs to bash alone: a terminal tool that has no timeout_secs at all must
+    // still be waited on until it exits. Delays are recorded rather than shortened here, because
+    // the assertion is that no deadline is armed.
+    const armedDelays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((
+      callback: (...args: never[]) => void,
+      delayMs?: number,
+      ...args: unknown[]
+    ) => {
+      armedDelays.push(delayMs ?? 0);
+      return realSetTimeout(callback, delayMs, ...(args as []));
+    }) as unknown as typeof globalThis.setTimeout;
+
+    try {
+      const { router } = createRouter({
+        createTerminal: async () => ({
+          id: "non-bash-term",
+          currentOutput: async () => ({ output: "done\n", truncated: false }),
+          waitForExit: async () => {
+            await new Promise<void>((resolve) => {
+              realSetTimeout(() => resolve(), 5);
+            });
+            return { exitCode: 0 };
+          },
+          kill: async () => undefined,
+          release: async () => undefined,
+          [Symbol.asyncDispose]: async () => undefined,
+        }),
+      });
+
+      const result = await router.delegateToEditor("session-1", "terminal.run", {
+        command: "sleep",
+      });
+
+      expect(result).toMatchObject<Record<string, unknown>>({
+        success: true,
+        output: "done\n",
+        exitCode: 0,
+      });
+      expect(armedDelays).not.toContain(BASH_DEFAULT_TIMEOUT_SECS * 1000);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
   it("honors timeout_secs for delegated file_read calls", async () => {
     const { router } = createRouter({
       readTextFile: async () => await new Promise(() => undefined),

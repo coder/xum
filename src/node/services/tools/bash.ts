@@ -975,12 +975,19 @@ async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
 }
 
 /**
- * Collapse the timeout an omitted or null `timeout_secs` leaves behind to "the model gave no
- * value". The field is `.nullish()` because providers send null for an omitted optional input, and
- * each caller applies its own default from there: foreground a kill deadline, background none.
+ * Foreground kill deadline. Providers send null for an omitted optional input, so null and absent
+ * both mean the model named no deadline and it gets the shared default.
  */
-function omitNullTimeout(timeoutSecs: number | null | undefined): number | undefined {
-  return timeoutSecs ?? undefined;
+function foregroundTimeoutSecs(requested: number | null | undefined): number {
+  return requested ?? BASH_DEFAULT_TIMEOUT_SECS;
+}
+
+/**
+ * Background max lifetime, in the shape BackgroundProcessManager wants: absence stays absence, so a
+ * dev server started without a timeout outlives the foreground default until it is stopped.
+ */
+function backgroundTimeoutSecs(requested: number | null | undefined): number | undefined {
+  return requested ?? undefined;
 }
 
 /**
@@ -1011,7 +1018,6 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Treat display_name as untrusted input: it ends up in filesystem paths.
       const safeDisplayName = resolveBashDisplayName(script, display_name);
-      const requestedTimeoutSecs = omitNullTimeout(timeout_secs);
       const validationError = validateScript(script, config);
       if (validationError) return validationError;
 
@@ -1168,9 +1174,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            // Auto-terminate after this duration, if the model named one: a background process must
-            // outlive the foreground default, so it runs until stopped.
-            timeoutSecs: requestedTimeoutSecs,
+            timeoutSecs: backgroundTimeoutSecs(timeout_secs),
           }
         );
 
@@ -1197,7 +1201,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = requestedTimeoutSecs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = foregroundTimeoutSecs(timeout_secs);
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;

@@ -1,8 +1,6 @@
 // Kill deadline for a bash call whose `timeout_secs` is absent. 60 is both the mode and the median
-// of the values models pass when they pass one, so the default matches what they ask for; a short
-// value would cut ordinary git, bun and make work off mid-run. Background processes ignore it (they
-// live until stopped), so only a foreground command can be cut short, and its timeout error tells
-// the model to raise the value.
+// of the values models pass when they pass one. Background processes ignore it (they live until
+// stopped), so only a foreground command can be cut short, and its error says to raise the value.
 export const BASH_DEFAULT_TIMEOUT_SECS = 60;
 
 // tmpfile policy limits (AI agent - conservative for LLM context)
