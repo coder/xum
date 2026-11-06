@@ -388,7 +388,6 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByText("update available");
     await canvas.findByRole("button", { name: /Update/ });
     await expectInterfaceAsText(canvasElement);
-    // The install method lines wrap inside the card of a plugin with other manifests.
     const others = await canvas.findByText(/Other install methods/);
     if (others.getBoundingClientRect().right > pluginCardOf(others).getBoundingClientRect().right) {
       throw new Error("The install method lines overflow their card at phone width");
@@ -2107,7 +2106,6 @@ const EGM_AGENTS = [
   "zoom_out.md",
 ];
 
-/** egm's layout: three manifests that each give the same skills and a different set of agents. */
 const EGM_PREVIEW: AgentPluginInstallPreview = {
   ...CLAUDE_REPO_PREVIEW,
   source: EGM_SOURCE,
@@ -2154,7 +2152,6 @@ function egmOptions(): MockORPCClientOptions {
   };
 }
 
-/** The file and the counts of each toggle choice, and that picking one previews that method. */
 async function expectEgmMethodChoices(canvasElement: HTMLElement) {
   const canvas = await openInstallAs(canvasElement, "google/elephant-goldfish-model");
   const choice = (name: RegExp) => canvas.getByRole("radio", { name });
@@ -2171,7 +2168,6 @@ async function expectEgmMethodChoices(canvasElement: HTMLElement) {
   return canvas;
 }
 
-/** egm: Install as lists each manifest with the agents it gives, and Agent Plugin is preselected. */
 export const AddPluginInstallAsMethodCounts: Story = {
   // Play-only contract: the phone story below snapshots the same group (Pixel budget).
   parameters: { pixel: PIXEL_DISABLED },
@@ -2187,10 +2183,6 @@ export const AddPluginInstallAsMethodCounts: Story = {
   },
 };
 
-/**
- * The counted choices at phone width: each choice is a block of three lines, so the group wraps
- * onto more rows and no label or count runs past the card (AGENTS.md Storybook responsive rule).
- */
 export const AddPluginInstallAsMethodCountsPhoneViewport: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
@@ -2233,7 +2225,6 @@ const INSTALLED_AS_OPTIONS: MockORPCClientOptions = {
   agentPlugins: { items: [EGM_INSTALLED, SKILLS_INSTALLED] },
 };
 
-/** An install row says how it was installed, and which other manifests its folder offers. */
 export const InstalledAsMethods: Story = {
   parameters: { pixel: PIXEL_DISABLED },
   render: () => (

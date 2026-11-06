@@ -111,7 +111,6 @@ export const InstallMethodPicker: React.FC<{
     value: methodKey(method),
     label: installMethodLabel(method),
     method,
-    // Only a manifest method has a summary: a generated method writes its own plugin.json.
     summary: props.preview.methodSummaries?.find((entry) => entry.method === method.kind),
   }));
   const cliOffered = props.cliOffered;
@@ -174,10 +173,6 @@ export const InstallMethodPicker: React.FC<{
   );
 };
 
-/**
- * The method an installed plugin was installed as, and the other manifest methods its folder
- * offers with the agents each would load. Managed rows only: an unmanaged folder was not installed.
- */
 export const InstalledMethodLines: React.FC<{
   item: Pick<
     AgentPluginListItem,

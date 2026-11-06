@@ -469,7 +469,6 @@ export const AgentPluginListItemSchema = z.object({
   installMethod: SavedInstallMethodSchema.optional(),
   /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
   manifestPath: z.string().optional(),
-  /** Set when Xum wrote the plugin.json of this install (a Skills or marketplace-entry install). */
   generatedFrom: GeneratedMethodKindSchema.optional(),
   /**
    * Managed manifest installs: the other manifest methods that the installed copy offers, each

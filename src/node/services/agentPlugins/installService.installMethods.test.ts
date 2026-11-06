@@ -694,7 +694,6 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
   });
 });
 
-/** Every file under `dir` (`.git` excluded) as `relative path -> sha256`, plus each directory. */
 async function treeBytes(dir: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   async function walk(current: string): Promise<void> {

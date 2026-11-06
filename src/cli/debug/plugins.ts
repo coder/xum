@@ -27,7 +27,6 @@ function printEntries(label: string, entries: WorkspaceCompositionEntry[]): void
   console.log();
 }
 
-/** The install method a plugin was saved with and the manifest that discovery loaded. */
 export function installedAsLine(
   plugin: Pick<WorkspaceCompositionPlugin, "installMethod" | "manifestPath">
 ): string {

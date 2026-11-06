@@ -1901,7 +1901,6 @@ function registryRow(
   return installMethod !== undefined ? { ...entry, installMethod } : entry;
 }
 
-/** The install method that loaded a plugin, for a log line; the manifest path when no method does. */
 function loadedAsLabel(plugin: Pick<AgentPluginInfo, "generatedFrom" | "manifestPath">): string {
   const kind = installedAsKind(plugin);
   return kind !== undefined ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[kind] : plugin.manifestPath;
@@ -3020,10 +3019,6 @@ export class AgentPluginInstallService {
     return summaries;
   }
 
-  /**
-   * The components one manifest of a staged tree gives, from the code that builds the selected
-   * method's lists in the preview. Reads only. The throwaway warning lists are the preview's job.
-   */
   private async countMethodComponents(plugin: AgentPluginInfo): Promise<AgentPluginMethodCounts> {
     const skills = await this.collectSkillsFromRoots(plugin, []);
     const { previews: mcpServers } = await this.collectMcpServers(
@@ -3054,7 +3049,6 @@ export class AgentPluginInstallService {
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
     request: InstallMethodRequest,
     marketplace?: MarketplaceEntryContext,
-    /** The preview only: count what each manifest method gives. */
     countMethods = false
   ): Promise<{
     plugin: AgentPluginInfo;
@@ -5781,18 +5775,12 @@ export class AgentPluginInstallService {
       manifestPath: plugin.manifestPath,
       ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
       ...(plugin.generatedFrom !== undefined ? { generatedFrom: plugin.generatedFrom } : {}),
-      // A generated install has no other manifest to offer: Xum wrote its plugin.json.
       ...(managed && plugin.generatedFrom === undefined
         ? { otherMethods: await this.otherManifestMethods(plugin) }
         : {}),
     };
   }
 
-  /**
-   * The manifest methods of an installed copy besides the one that loads, each with the agents it
-   * would load. One read-only discovery per method: the generated `skills` method writes into
-   * the tree, so it never runs here. A manifest that fails validation is not offered.
-   */
   private async otherManifestMethods(
     plugin: AgentPluginInfo
   ): Promise<NonNullable<AgentPluginListItem["otherMethods"]>> {

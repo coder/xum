@@ -344,7 +344,6 @@ function manifestMethodKinds(present: Set<string>): SavedInstallMethod[] {
   return kinds;
 }
 
-/** The manifest files of a folder, and what they offer, without the skills scan. */
 async function detectManifests(dir: string): Promise<{
   present: Set<string>;
   rootEntry: boolean;
@@ -364,11 +363,6 @@ async function detectManifests(dir: string): Promise<{
   };
 }
 
-/**
- * The manifest methods that a folder's files offer, in the fixed order. The installed
- * copy of a plugin uses it to list the methods it does not load, with no skills scan and no
- * write.
- */
 export async function detectManifestMethods(dir: string): Promise<SavedInstallMethod[]> {
   return (await detectManifests(dir)).kinds;
 }
