@@ -565,7 +565,7 @@ describe("StepPreparation.createStreamResult", () => {
   }
 
   test.each([
-    ["a step tracker", { workspaceId: "ws-1" } as StepMessageTracker, "ws-1"],
+    ["a step tracker", { workspaceId: "ws-1", recordSystemSections: () => undefined }, "ws-1"],
     ["no step tracker", undefined, undefined],
   ])(
     "logs a rejected tool call with the request's model and %s",
