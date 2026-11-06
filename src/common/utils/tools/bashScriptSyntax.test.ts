@@ -22,6 +22,7 @@ describe("describeCutOffBashScript", () => {
     ["heredoc that runs to end of input", `cat <<EOF\nit's`],
     ["heredoc ending in a newline without its terminator", `echo "$(cat <<''\nbody\n`],
     ["empty heredoc delimiter ends at the first empty line", `cat <<''\nit's\n\necho ok`],
+    ["heredoc body starts on the line after the operator", `cat <<X # X\nit's\nX`],
     ["heredoc inside a command substitution", `x=$(cat <<EOF\nit's\nEOF\n)`],
     ["comment inside backticks stops at the backtick", "echo `ls # it's`"],
     ["single quotes inside unquoted parameter expansion", `echo \${x:-'a } b'}`],
@@ -81,7 +82,7 @@ describe("describeCutOffBashScript", () => {
     ["trailing backslash", "trailing backslash", `echo foo \\`],
     ["trailing backslash before a final newline", "trailing backslash", `echo foo \\\n`],
   ])("rejects an open construct: %s", (_name, construct, script) => {
-    expect(describeCutOffBashScript(script)).toContain(construct);
+    expect(describeCutOffBashScript(script)).toEqual(expect.stringContaining(construct));
   });
 
   test("names the open construct, the received length and the script", () => {

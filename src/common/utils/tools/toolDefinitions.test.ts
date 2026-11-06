@@ -421,8 +421,8 @@ describe("TOOL_DEFINITIONS", () => {
 
     expect(parsed.success).toBe(false);
     if (!parsed.success) {
-      expect(formatToolInputIssues(parsed.error.issues, input)).toStartWith(
-        "script: arrived cut off: "
+      expect(formatToolInputIssues(parsed.error.issues, input)).toMatch(
+        /^script: arrived cut off: /
       );
     }
   });

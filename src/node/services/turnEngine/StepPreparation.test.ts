@@ -564,34 +564,40 @@ describe("StepPreparation.createStreamResult", () => {
     return captured;
   }
 
-  test("logs a rejected tool call with the request's model and workspace", async () => {
-    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
-    const transform = captureStreamOptions({ workspaceId: "ws-1" }).transform!({
-      tools: {},
-      stopStream: () => undefined,
-    });
-    const error = new InvalidToolInputError({
-      toolName: "bash",
-      toolInput: '{"command":"cd"}',
-      cause: undefined,
-    });
-    const writer = transform.writable.getWriter();
-    void writer.write({
-      type: "tool-call",
-      toolCallId: "cut",
-      toolName: "bash",
-      input: { command: "cd" },
-      dynamic: true,
-      invalid: true,
-      error,
-    } as TextStreamPart<ToolSet>);
-    await transform.readable.getReader().read();
+  test.each([
+    ["a step tracker", { workspaceId: "ws-1" } as StepMessageTracker, "ws-1"],
+    ["no step tracker", undefined, undefined],
+  ])(
+    "logs a rejected tool call with the request's model and %s",
+    async (_name, tracker, workspaceId) => {
+      const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+      const transform = captureStreamOptions(tracker).transform!({
+        tools: {},
+        stopStream: () => undefined,
+      });
+      const error = new InvalidToolInputError({
+        toolName: "bash",
+        toolInput: '{"command":"cd"}',
+        cause: undefined,
+      });
+      const writer = transform.writable.getWriter();
+      void writer.write({
+        type: "tool-call",
+        toolCallId: "cut",
+        toolName: "bash",
+        input: { command: "cd" },
+        dynamic: true,
+        invalid: true,
+        error,
+      } as TextStreamPart<ToolSet>);
+      await transform.readable.getReader().read();
 
-    // The logged fields are owned by summarizeInvalidToolInputErrors.test.ts.
-    expect(warn).toHaveBeenCalledWith(
-      "Rejected a tool call with invalid input",
-      expect.objectContaining({ model: "local:qwen", workspaceId: "ws-1" })
-    );
-    warn.mockRestore();
-  });
+      // The logged fields are owned by summarizeInvalidToolInputErrors.test.ts.
+      expect(warn).toHaveBeenCalledWith(
+        "Rejected a tool call with invalid input",
+        expect.objectContaining({ model: "local:qwen", workspaceId })
+      );
+      warn.mockRestore();
+    }
+  );
 });
