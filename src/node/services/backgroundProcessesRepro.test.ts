@@ -91,12 +91,15 @@ async function tempDir(tag: string): Promise<string> {
 async function withHeldMarkerWrite<T>(gate: string | undefined, run: () => Promise<T>): Promise<T> {
   if (gate == null) return run();
   const key = "BASH_FUNC_echo%%";
+  // The runner's own environment may already export an `echo` function: put it back afterwards.
+  const previous = process.env[key];
   process.env[key] =
     `() {  case "$1" in 3) while [ ! -e '${gate}' ]; do sleep 0.01; done;; esac; builtin echo "$@"\n}`;
   try {
     return await run();
   } finally {
-    delete process.env[key];
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
   }
 }
 

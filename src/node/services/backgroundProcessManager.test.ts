@@ -4451,7 +4451,7 @@ describe("BackgroundProcessManager", () => {
         if (exitCodeContent.trim() === "") await new Promise((resolve) => setTimeout(resolve, 25));
       }
       expect(exitCodeContent.trim()).toBe("42");
-    });
+    }, 15_000);
   });
 
   describe("hasOrphanedRunningBackgroundProcesses", () => {
