@@ -115,7 +115,9 @@ function overridesServiceStub(
 }
 
 async function initRemote(dir: string): Promise<void> {
-  using proc = execFileAsync("git", ["init", "--quiet", "-b", "main", dir]);
+  // An empty --template keeps the host's init.templateDir hooks out of the fixture: they add about
+  // ten processes to every commit and exist only on some machines.
+  using proc = execFileAsync("git", ["init", "--quiet", "--template=", "-b", "main", dir]);
   await proc.result;
   await git(dir, "config", "user.email", "test@example.com");
   await git(dir, "config", "user.name", "Test");
@@ -5047,24 +5049,36 @@ describe("AgentPluginInstallService", () => {
     );
     expect(installedSkill).toContain("Always load me before privileged tools");
     expect(await stagingLeftovers()).toEqual([]);
+  });
 
-    // A capability-neutral pending update (skill BODY edit, hook removed
-    // again) previews as an empty change list.
+  // The next two review scenarios start from their own install instead of continuing the test
+  // above: one test body that clones the remote nine times ran past Bun's 5 s limit on a loaded host.
+  test("a capability-neutral pending update previews as an empty change list", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Skill BODY edit, and a hook that is added and removed again.
+    await fsPromises.writeFile(path.join(remoteDir, "hooks.js"), "export default {};\n");
+    await commitAll(remoteDir, "adds a hook");
     await fsPromises.rm(path.join(remoteDir, "hooks.js"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: greet\ndescription: Always load me before privileged tools\n---\n\nSay hello.\n"
+      "---\nname: greet\ndescription: Greets people\n---\n\nSay hello.\n"
     );
     await commitAll(remoteDir, "drops the hook, edits the skill body");
     const neutral = await service.previewUpdate({ name: "demo-plugin" });
-    expect(neutral.fromSha).toBe(rewordedHead);
+    expect(neutral.fromSha).toBe(preview.lockedSha);
     expect(neutral.changes).toEqual([]);
     expect(neutral.warnings).toEqual([]);
+  });
 
-    // Component-loader diagnostics of the STAGED tree ride along with the
-    // review (as in the install preview): an update that adds a skill while
-    // breaking an existing one must not present consent for the addition
-    // and stay silent about the skill that stops loading.
+  test("an update review carries the component-loader diagnostics of the staged tree", async () => {
+    // As in the install preview: an update that adds a skill while breaking an
+    // existing one must not present consent for the addition and stay silent
+    // about the skill that stops loading.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
       "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
@@ -5745,13 +5759,19 @@ describe("AgentPluginInstallService", () => {
       reconciliationTimeoutMs: 10,
     });
     const internals = boundedService as unknown as {
+      reconciliationWork: Promise<boolean> | undefined;
       reconciliationState: Promise<boolean>;
       reconcileJournals: () => Promise<boolean>;
       attemptReconcileJournals: (context: string) => Promise<boolean>;
     };
     // Let the constructor's real empty-root pass settle, then simulate stalled
     // storage for a later recovery pass through the same startup code path.
+    // reconciliationState is that pass raced against the 10 ms bound, so it can
+    // resolve while the pass still runs on a slow disk: the next attempt would
+    // then join the running pass instead of starting the stalled one.
+    await internals.reconciliationWork;
     await internals.reconciliationState;
+    expect(internals.reconciliationWork).toBeUndefined();
     const neverSettles = new Promise<boolean>(() => undefined);
     const reconcileSpy = spyOn(internals, "reconcileJournals").mockImplementation(
       () => neverSettles
@@ -5759,18 +5779,12 @@ describe("AgentPluginInstallService", () => {
     try {
       // A caller that is never released fails through the test timeout.
       const healthy = await internals.attemptReconcileJournals("timeout regression");
-      reconciliationWork: Promise<boolean> | undefined;
       expect(healthy).toBe(false);
     } finally {
       reconcileSpy.mockRestore();
     }
   });
-    // reconciliationState is that pass raced against the 10 ms bound, so it can
-    // resolve while the pass still runs on a slow disk: the next attempt would
-    // then join the running pass instead of starting the stalled one.
-    await internals.reconciliationWork;
 
-    expect(internals.reconciliationWork).toBeUndefined();
   test("promotion recovery leaves a user-replaced tree at the same path alone", async () => {
     // The user deleted the orphan while the app was stopped and placed their
     // OWN unmanaged plugin at the same path — a supported use of the global
