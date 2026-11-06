@@ -281,6 +281,7 @@ Grouped by delivery PR. Paths are relative to the repository root.
   - `isPluginPathUsableFrom` is the shared availability rule for plugin skills and agents.
   - `agentResolution.test.ts` also changed.
 - **PR 2** ([#7939](https://github.com/coder/xum/pull/7939), merged as `05f5bf7c2f`): the install review labels an agent "(edit tools removed, shell removed)" when its mapped tools leave no bash tool, and the preview gains the field `shellRemovedAgents`.
+- **Criterion 9** passed in a real-model run of the Dogfood steps on a local merge of the PR 1 head `e3d7c59203` and the PR 2 head `a8eda2a7be`, with egm's `distributions/claude` at `113a3afc44` ([evidence](https://github.com/coder/xum/pull/7939#issuecomment-6671744536)). The child read `agents/design_critic.md` from the plugin folder and searched the code with `grep` through bash. Both PRs gained commits after the run and before they merged.
 
 ---
 
