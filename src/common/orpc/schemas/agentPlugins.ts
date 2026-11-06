@@ -435,6 +435,11 @@ export const AgentPluginListItemSchema = z.object({
   mcpServerCount: z.number().int().nonnegative(),
   /** The installed plugin's not-applied parts; absent when there are none or the folder is gone. */
   notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
+  /**
+   * Set on a managed plugin that loads nothing because an older Xum version moved it to a commit
+   * whose saved install method nobody reviewed (B3). The row says why, and an update refuses.
+   */
+  closedReason: z.string().optional(),
 });
 
 /**

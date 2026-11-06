@@ -2085,9 +2085,12 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
   }
 }
 
-/** The diagnostic of a plugin that an older build moved to a commit with its saved manifest unreviewed. */
-const MOVED_METHOD_DIAGNOSTIC =
-  "An older Xum version updated this plugin after its install method was saved, so this version has not reviewed that manifest at this commit. The plugin loads nothing until it is reset or installed again.";
+/**
+ * What Xum says about a plugin that an older build moved to a commit with its saved manifest
+ * unreviewed (B3): the diagnostic of the scan, the Settings row and the update refusal.
+ */
+export const MOVED_METHOD_MESSAGE =
+  "An older Xum version updated this plugin after you chose how to install it, so Xum has not reviewed that manifest at this commit. The plugin loads nothing. Uninstall it and install it again to review it.";
 
 function managedManifestChoice(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
@@ -2441,7 +2444,7 @@ export async function discoverAgentPlugins(
             path: path.join(container.path, entryName),
             scope: container.scope,
             severity: "error",
-            message: MOVED_METHOD_DIAGNOSTIC,
+            message: MOVED_METHOD_MESSAGE,
           });
           plugin = null;
         }

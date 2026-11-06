@@ -583,6 +583,75 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect((await rawRow()).installMethodSha).toBeUndefined();
   });
 
+  /** What an older build leaves after its update: lockedSha moved on, installMethodSha did not. */
+  async function olderBuildUpdates(): Promise<string> {
+    const vouchedFor = (await rawRow()).installMethodSha as string;
+    await write({ "README.md": `older build ${Math.random()}\n` });
+    await commit("an upstream commit");
+    await updateWithReview();
+    await editRow((row) => {
+      row.installMethodSha = vouchedFor;
+    });
+    return vouchedFor;
+  }
+
+  const loadedPlugins = async () =>
+    (
+      await discoverAgentPlugins([
+        { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+      ])
+    ).plugins;
+
+  test("a Claude install that an older build updated loads nothing, says why, and refuses an update", async () => {
+    await installAs("claude-plugin");
+    await olderBuildUpdates();
+    expect(await loadedPlugins()).toEqual([]);
+
+    const row = await service.list().then((rows) => rows.find((item) => item.name === "egm"));
+    expect(row).toMatchObject({ managed: true, present: false });
+    expect(row?.closedReason).toContain("An older Xum version updated this plugin");
+
+    // Xum writes nothing to repair it: no registry field, no hook trust, no sign-out record.
+    const registryBefore = await fsPromises.readFile(registryFile(), "utf8");
+    await write({ "README.md": "newer\n" });
+    await commit("another upstream commit");
+    const review = await service.previewUpdate({ name: "egm" });
+    expect(review.changes).toEqual([]);
+    expect(review.refused).toBe(row?.closedReason);
+    await expect(service.update({ name: "egm" })).rejects.toThrow(row?.closedReason as string);
+    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(registryBefore);
+    expect(await fsPromises.readdir(xumRoot)).not.toContain("plugin-hook-trust");
+
+    // A reinstall reviews it again and vouches for the new commit.
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    await installAs("claude-plugin");
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect(
+      (await service.list()).find((item) => item.name === "egm")?.closedReason
+    ).toBeUndefined();
+  });
+
+  test("a saved Agent Plugin, or a saved manifest that the fixed order loads too, keeps loading after an older build's update", async () => {
+    await installAs("agent-plugin");
+    await olderBuildUpdates();
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect((await service.list())[0]?.closedReason).toBeUndefined();
+    await write({ "README.md": "an update\n" });
+    const next = await commit("an update");
+    await updateWithReview();
+    expect((await rawRow()).installMethodSha).toBe((await rawRow()).lockedSha);
+    expect((await rawRow()).lockedSha).toBe(next);
+    await service.uninstall({ name: "egm", deletePluginData: true });
+
+    // Only the Claude manifest is left: the fixed order loads it, so the older build reviewed it.
+    await git(remoteDir, "rm", "-q", "-r", "plugin.json", ".codex-plugin", ".cursor-plugin");
+    await commit("a Claude-only repository");
+    await installAs("claude-plugin");
+    await olderBuildUpdates();
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect((await service.list())[0]?.closedReason).toBeUndefined();
+  });
+
   test("an update whose commit fits the saved method keeps it", async () => {
     await installAs("claude-plugin");
     await write({ "README.md": "more\n" });

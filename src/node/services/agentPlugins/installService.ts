@@ -87,6 +87,8 @@ import {
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
   manifestChoiceFor,
+  MOVED_METHOD_MESSAGE,
+  movedMethodMatters,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
@@ -171,6 +173,7 @@ import {
 } from "./journals";
 import {
   PLUGIN_REGISTRY_FILE_NAME,
+  installMethodMoved,
   installMethodShaFor,
   readPluginRegistryDocument,
   readStoredInstallMethod,
@@ -2135,6 +2138,22 @@ export class AgentPluginInstallService {
 
   private async installedChoice(name: string) {
     return manifestChoiceFor(await this.savedInstallMethod(name));
+  }
+
+  /**
+   * True when an older build moved this plugin to a commit whose saved manifest nobody reviewed
+   * (B3). Discovery loads nothing of such a plugin. Xum writes no hook trust, sign-in or registry
+   * field for it: a reinstall reviews it and starts with no hook trust.
+   */
+  private async closedAfterOlderBuild(name: string): Promise<boolean> {
+    const { rawEntries } = await this.readRegistryDocument("lenient");
+    const raw = rawEntries.find((entry) => this.rawEntryName(entry) === name);
+    const saved = readStoredInstallMethod(raw);
+    return (
+      saved !== undefined &&
+      installMethodMoved(raw) &&
+      (await movedMethodMatters(this.targetPathFor(name), saved))
+    );
   }
 
   /**
@@ -5807,12 +5826,15 @@ export class AgentPluginInstallService {
       });
     }
 
-    // Registry entries whose directory vanished (self-heal display; uninstall still works).
+    // Registry entries whose directory vanished (self-heal display; uninstall still works), and
+    // plugins that an older build moved, which discovery leaves out (B3).
     for (const entry of managedByName.values()) {
+      const closed = await this.closedAfterOlderBuild(entry.name);
       items.push({
         name: entry.name,
         managed: true,
         present: false,
+        ...(closed ? { closedReason: MOVED_METHOD_MESSAGE } : {}),
         location: shortenHome(this.targetPathFor(entry.name)),
         ...(entry.manifest?.version !== undefined ? { version: entry.manifest.version } : {}),
         ...(entry.manifest?.description !== undefined
@@ -6800,6 +6822,9 @@ export class AgentPluginInstallService {
     // repository now has its own manifest. The update review covers every component as usual. A
     // marketplace entry is read again from the marketplace file at the new commit: the staged
     // folder holds only the entry.
+    // The update would move the older build's hook trust to the next commit (pluginHookTrust.ts).
+    if (await this.closedAfterOlderBuild(entry.name))
+      throw new UpdateRefusedError(MOVED_METHOD_MESSAGE);
     const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
     const saved = await this.savedInstallMethod(entry.name);
     const { stagedDir, marketplace } = await this.cloneWithEntry(
