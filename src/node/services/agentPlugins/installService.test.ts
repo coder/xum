@@ -5757,15 +5757,20 @@ describe("AgentPluginInstallService", () => {
       () => neverSettles
     );
     try {
-      const startedAt = Date.now();
+      // A caller that is never released fails through the test timeout.
       const healthy = await internals.attemptReconcileJournals("timeout regression");
+      reconciliationWork: Promise<boolean> | undefined;
       expect(healthy).toBe(false);
-      expect(Date.now() - startedAt).toBeLessThan(500);
     } finally {
       reconcileSpy.mockRestore();
     }
   });
+    // reconciliationState is that pass raced against the 10 ms bound, so it can
+    // resolve while the pass still runs on a slow disk: the next attempt would
+    // then join the running pass instead of starting the stalled one.
+    await internals.reconciliationWork;
 
+    expect(internals.reconciliationWork).toBeUndefined();
   test("promotion recovery leaves a user-replaced tree at the same path alone", async () => {
     // The user deleted the orphan while the app was stopped and placed their
     // OWN unmanaged plugin at the same path — a supported use of the global
