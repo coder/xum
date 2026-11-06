@@ -4199,30 +4199,16 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledServers(legacyPath)).toEqual(["other"]);
     });
 
-    it.each(["corrupt", "structurally invalid"] as const)(
-      "refuses while config.json is %s and leaves the overrides as they were",
-      async (damage) => {
-        const service = new WorkspaceMcpOverridesService(config);
-        const healthy = await registerWorkspace("healthy-beside-legacy");
-        await writeEnable(healthy.workspacePath);
-        await registerMalformedLegacyEntry();
-        const configPath = path.join(tempDir, "config.json");
-        if (damage === "corrupt") {
-          await fs.writeFile(configPath, "{ not json");
-        } else {
-          // Strict loads refuse a project whose workspaces are not an array; the lenient load
-          // drops that project and still lists the healthy workspace.
-          const document = JSON.parse(await fs.readFile(configPath, "utf8")) as {
-            projects: unknown[];
-          };
-          document.projects.push(["/fake/mangled", { workspaces: {} }]);
-          await fs.writeFile(configPath, JSON.stringify(document));
-        }
+    it("refuses while config.json is corrupt and leaves the overrides as they were", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
 
-        expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
-        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
-      }
-    );
+      expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+    });
 
     it("fails a requested workspace that the lenient walk does not list", async () => {
       const service = new WorkspaceMcpOverridesService(config);

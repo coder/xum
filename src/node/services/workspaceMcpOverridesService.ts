@@ -587,6 +587,25 @@ class ConfigSnapshot {
     }));
   }
 
+  /**
+   * loadAllMetadata for a plugin override sweep, with checkoutLockKeys' fallback. The strict
+   * walk also fails on an UNRELATED id-less legacy entry whose metadata.json does not parse, and
+   * that must not refuse every plugin install. The lenient walk lists such an entry under its
+   * fallback id, so its checkout is still swept. It is trusted only while config.json itself
+   * loads strictly: a config.json failure degrades it to EMPTY. A requested id that it does not
+   * list fails on its own in the sweep (metadata not found).
+   */
+  loadSweepMetadata(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
+    return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
+      this.loadLegacyConfig();
+      log.warn(
+        "[MCP] Sweeping plugin overrides from a lenient registry walk: another entry's metadata is unreadable",
+        { workspaceIds, error: getErrorMessage(error) }
+      );
+      return this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
+    }));
+  }
+
   canonicalize(identity: string, filePath: string): Promise<string | undefined> {
     if (identity !== "host") {
       return Promise.resolve(filePath);
@@ -4705,7 +4724,7 @@ export class WorkspaceMcpOverridesService {
     // fs.access, which blocks indefinitely on a stalled mount.
     const metadataById = groupMetadataById(
       await withDeadline(
-        snapshot.loadAllMetadata(),
+        snapshot.loadSweepMetadata(workspaceIds),
         budget.remaining(),
         "workspace enumeration exceeded the plugin-prune budget"
       ),
@@ -4780,7 +4799,7 @@ export class WorkspaceMcpOverridesService {
     try {
       afterById = groupMetadataById(
         await withDeadline(
-          after.loadAllMetadata(),
+          after.loadSweepMetadata([...swept.keys()]),
           budget.remaining(),
           "workspace enumeration exceeded the plugin-prune budget"
         ),
