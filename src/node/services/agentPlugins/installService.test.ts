@@ -20,7 +20,7 @@ import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken }
 import * as treeHash from "./treeHash";
 import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -32,6 +32,7 @@ import {
 import {
   AgentPluginInstallService,
   describeSignInChanges,
+  signInResetUrls,
   withDiskQuotaWatchdog,
 } from "./installService";
 import {
@@ -115,7 +116,9 @@ function overridesServiceStub(
 }
 
 async function initRemote(dir: string): Promise<void> {
-  using proc = execFileAsync("git", ["init", "--quiet", "-b", "main", dir]);
+  // An empty --template keeps the host's init.templateDir hooks out of the fixture: they add about
+  // twenty processes to every commit and exist only on some machines.
+  using proc = execFileAsync("git", ["init", "--quiet", "--template=", "-b", "main", dir]);
   await proc.result;
   await git(dir, "config", "user.email", "test@example.com");
   await git(dir, "config", "user.name", "Test");
@@ -4647,6 +4650,279 @@ describe("AgentPluginInstallService", () => {
     await oauth.dispose();
   });
 
+  describe("stored sign-ins of plugin MCP servers that an update removes or an uninstall deletes", () => {
+    const docsUrl = "https://docs.example.com/mcp";
+    const keepUrl = "https://keep.example.com/mcp";
+    const oauthEntry = (url: string, clientId: string) => ({
+      type: "streamable-http",
+      url,
+      extensions: {
+        "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+      },
+    });
+    const writeServers = async (servers: Record<string, unknown> | undefined) => {
+      const file = path.join(remoteDir, "mcp.json");
+      if (servers === undefined) await fsPromises.rm(file);
+      else
+        await fsPromises.writeFile(
+          file,
+          JSON.stringify({ $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: servers })
+        );
+      await commitAll(remoteDir, Object.keys(servers ?? {}).join(" ") || "no MCP file");
+    };
+    const signedInStore = (urls: string[]) =>
+      JSON.stringify({
+        version: 2,
+        entries: Object.fromEntries(
+          urls.map((serverUrl) => [
+            serverUrl,
+            {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          ])
+        ),
+      });
+    const pendingRecord = (): Promise<unknown> =>
+      fsPromises.readFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "utf8").then(
+        (text) => JSON.parse(text) as unknown,
+        () => null
+      );
+    const installSignedIn = async (
+      servers: Record<string, unknown>,
+      signedInUrls: string[],
+      hooks: { onStop?: () => Promise<void>; mcpConfigService?: MCPConfigService } = {}
+    ) => {
+      const updater = new AgentPluginInstallService(config, {
+        mcpServerManager: {
+          stopServersWithKeyPrefix: () => hooks.onStop?.() ?? Promise.resolve(),
+        } as unknown as MCPServerManager,
+        ...(hooks.mcpConfigService !== undefined
+          ? { mcpConfigService: hooks.mcpConfigService }
+          : {}),
+      });
+      await writeServers(servers);
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "mcp-oauth.json"), signedInStore(signedInUrls));
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      updater.setMcpOauthService(oauth);
+      const update = async (servers: Record<string, unknown> | undefined) => {
+        await writeServers(servers);
+        const review = await updater.previewUpdate({ name: "demo-plugin" });
+        await updater.update({
+          name: "demo-plugin",
+          consent: { fromSha: review.fromSha, toSha: review.toSha },
+        });
+      };
+      return { updater, oauth, update };
+    };
+
+    // The 20 s limits: each test installs and updates a plugin over git, which takes more than the
+    // default 5 s on a loaded runner.
+    test("signs out the removed server, so a later server at its URL does not inherit the credentials", async () => {
+      const { oauth, update } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a"), keep: oauthEntry(keepUrl, "client-k") },
+        [docsUrl, keepUrl]
+      );
+      await update({ keep: oauthEntry(keepUrl, "client-k") });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      expect(await oauth.hasAuthTokens({ serverUrl: keepUrl })).toBe(true);
+      await update({
+        keep: oauthEntry(keepUrl, "client-k"),
+        docs: oauthEntry(docsUrl, "client-b"),
+      });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("signs out every server when the update drops the plugin's MCP file", async () => {
+      const { oauth, update } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await update(undefined);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall signs out the plugin's servers, so a reinstall under another client does not inherit them", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await writeServers({ docs: oauthEntry(docsUrl, "client-b") });
+      const preview = await updater.preview({ input: remoteDir });
+      await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall whose sign-out fails leaves the URL pending for the next pass", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      spyOn(oauth, "logout").mockResolvedValue({ success: false, error: "disk full" });
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      const record = await fsPromises.readFile(
+        path.join(muxRoot, "plugin-sign-outs-pending.json"),
+        "utf8"
+      );
+      expect(JSON.parse(record)).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall that fails keeps the sign-in and records no sign-out", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+        Promise.reject(new Error("ENOSPC: no space left on device"))
+      );
+      try {
+        await expect(
+          updater.uninstall({ name: "demo-plugin", deletePluginData: false })
+        ).rejects.toThrow(/persist the plugin registry/);
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(false);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("a plugin whose MCP file cannot be read can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      await fsPromises.writeFile(path.join(pluginsDir(), "demo-plugin", "mcp.json"), "{ not json");
+      await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      await oauth.dispose();
+    }, 20_000);
+    test("an update records its sign-outs before the old tree stops and moves", async () => {
+      let armed = false;
+      let atFirstStop: unknown = "not read";
+      const { update, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        {
+          onStop: async () => {
+            if (armed && atFirstStop === "not read") atFirstStop = await pendingRecord();
+          },
+        }
+      );
+      armed = true;
+      await update({ docs: oauthEntry(docsUrl, "client-b") });
+      expect(atFirstStop).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall records its sign-outs before the registry commit", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const internals = updater as unknown as {
+        writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+      };
+      const realWrite = internals.writeRegistry.bind(internals);
+      let atCommit: unknown = "not read";
+      const writeSpy = spyOn(internals, "writeRegistry").mockImplementation(
+        async (envelope, entries) => {
+          if (atCommit === "not read") atCommit = await pendingRecord();
+          return realWrite(envelope, entries);
+        }
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(atCommit).toEqual({ version: 1, urls: [docsUrl] });
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall refuses at once while the pending sign-out record is corrupt, and changes nothing", async () => {
+      const mcpConfigService = new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: muxRoot }),
+      });
+      let armed = false;
+      let stops = 0;
+      const { updater, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        {
+          mcpConfigService,
+          onStop: () => {
+            if (armed) stops++;
+            return Promise.resolve();
+          },
+        }
+      );
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "docs"
+      );
+      expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+        success: true,
+        data: undefined,
+      });
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      armed = true;
+      const failure = await updater
+        .uninstall({ name: "demo-plugin", deletePluginData: false })
+        .then(
+          () => undefined,
+          (error: unknown) => error as Error
+        );
+      // The record's own error, naming the Settings recovery step, before anything moves.
+      expect(failure?.message).toMatch(
+        /^The pending plugin sign-out record .*Sign out of plugin MCP servers/
+      );
+      expect(stops).toBe(0);
+      // The record fences plugin discovery, so read the global enablement from its file.
+      const globalConfig = jsonc.parse(
+        await fsPromises.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8")
+      ) as { enabledPluginServers?: string[] };
+      expect(globalConfig.enabledPluginServers).toEqual([key]);
+      expect(await registry()).toHaveLength(1);
+      expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
+      await oauth.dispose();
+    }, 20_000);
+
+    test("an uninstall of a plugin with no remote servers ignores a corrupt pending record", async () => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+    }, 20_000);
+
+    test("a plugin whose servers cannot be listed can still be uninstalled", async () => {
+      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
+        docsUrl,
+      ]);
+      const discover = spyOn(discoveryModule, "discoverAgentPluginAt").mockRejectedValueOnce(
+        new Error("EACCES: permission denied")
+      );
+      try {
+        await updater.uninstall({ name: "demo-plugin", deletePluginData: false });
+        expect(discover).toHaveBeenCalled();
+      } finally {
+        discover.mockRestore();
+      }
+      expect(await registry()).toEqual([]);
+      await oauth.dispose();
+    }, 20_000);
+  });
+
   test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
     await fsPromises.rm(path.join(remoteDir, "mcp.json"));
     const servers = (secret: string) =>
@@ -5047,24 +5323,36 @@ describe("AgentPluginInstallService", () => {
     );
     expect(installedSkill).toContain("Always load me before privileged tools");
     expect(await stagingLeftovers()).toEqual([]);
+  });
 
-    // A capability-neutral pending update (skill BODY edit, hook removed
-    // again) previews as an empty change list.
+  // The next two review scenarios start from their own install instead of continuing the test
+  // above: one test body that clones the remote nine times ran past Bun's 5 s limit on a loaded host.
+  test("a capability-neutral pending update previews as an empty change list", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Skill BODY edit, and a hook that is added and removed again.
+    await fsPromises.writeFile(path.join(remoteDir, "hooks.js"), "export default {};\n");
+    await commitAll(remoteDir, "adds a hook");
     await fsPromises.rm(path.join(remoteDir, "hooks.js"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: greet\ndescription: Always load me before privileged tools\n---\n\nSay hello.\n"
+      "---\nname: greet\ndescription: Greets people\n---\n\nSay hello.\n"
     );
     await commitAll(remoteDir, "drops the hook, edits the skill body");
     const neutral = await service.previewUpdate({ name: "demo-plugin" });
-    expect(neutral.fromSha).toBe(rewordedHead);
+    expect(neutral.fromSha).toBe(preview.lockedSha);
     expect(neutral.changes).toEqual([]);
     expect(neutral.warnings).toEqual([]);
+  });
 
-    // Component-loader diagnostics of the STAGED tree ride along with the
-    // review (as in the install preview): an update that adds a skill while
-    // breaking an existing one must not present consent for the addition
-    // and stay silent about the skill that stops loading.
+  test("an update review carries the component-loader diagnostics of the staged tree", async () => {
+    // As in the install preview: an update that adds a skill while breaking an
+    // existing one must not present consent for the addition and stay silent
+    // about the skill that stops loading.
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
       "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
@@ -5452,7 +5740,12 @@ describe("AgentPluginInstallService", () => {
     await commitAll(remoteDir, "cwd pointing at plugin data");
 
     const preview = await service.preview({ input: remoteDir });
-    const dataPath = getPluginDataPath(muxRoot, computePluginInstanceId(preview.targetPath));
+    // preview.targetPath is display text (`~/...` when the root sits under HOME), not the lexical
+    // install location that the instance ID hashes.
+    const dataPath = getPluginDataPath(
+      muxRoot,
+      computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"))
+    );
     expect(preview.mcpServers[0].summary).toContain(`cwd: '${dataPath}'`);
   });
 
@@ -5740,22 +6033,27 @@ describe("AgentPluginInstallService", () => {
       reconciliationTimeoutMs: 10,
     });
     const internals = boundedService as unknown as {
+      reconciliationWork: Promise<boolean> | undefined;
       reconciliationState: Promise<boolean>;
       reconcileJournals: () => Promise<boolean>;
       attemptReconcileJournals: (context: string) => Promise<boolean>;
     };
     // Let the constructor's real empty-root pass settle, then simulate stalled
     // storage for a later recovery pass through the same startup code path.
+    // reconciliationState is that pass raced against the 10 ms bound, so it can
+    // resolve while the pass still runs on a slow disk: the next attempt would
+    // then join the running pass instead of starting the stalled one.
+    await internals.reconciliationWork;
     await internals.reconciliationState;
+    expect(internals.reconciliationWork).toBeUndefined();
     const neverSettles = new Promise<boolean>(() => undefined);
     const reconcileSpy = spyOn(internals, "reconcileJournals").mockImplementation(
       () => neverSettles
     );
     try {
-      const startedAt = Date.now();
+      // A caller that is never released fails through the test timeout.
       const healthy = await internals.attemptReconcileJournals("timeout regression");
       expect(healthy).toBe(false);
-      expect(Date.now() - startedAt).toBeLessThan(500);
     } finally {
       reconcileSpy.mockRestore();
     }
@@ -6638,7 +6936,8 @@ describe("AgentPluginInstallService", () => {
       serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha })
     ).rejects.toThrow(/enabledPluginServers must be an array/);
 
-    expect(await pathExists(preview.targetPath)).toBe(false);
+    // The install path: preview.targetPath is display text (`~/...` under HOME) that never exists.
+    expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
     expect(await registry()).toEqual([]);
     expect(await stagingLeftovers()).toEqual([]);
     expect(await fsPromises.readFile(configPath, "utf8")).toBe(malformed);
@@ -6690,6 +6989,174 @@ describe("AgentPluginInstallService", () => {
     } finally {
       failingSpy.mockRestore();
     }
+  });
+
+  describe("workspace enumeration for override pruning", () => {
+    const configFile = () => path.join(muxRoot, "config.json");
+    // The lexical install location, not preview.targetPath (display text: `~/...` under HOME).
+    const installPath = () => path.join(pluginsDir(), "demo-plugin");
+    const registerLocalWorkspace = async (workspaceId: string) => {
+      const workspacePath = path.join(muxRoot, "checkouts", workspaceId);
+      await fsPromises.mkdir(workspacePath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(workspacePath, {
+          workspaces: [
+            {
+              path: workspacePath,
+              id: workspaceId,
+              name: workspaceId,
+              runtimeConfig: { type: "local" },
+            },
+          ],
+        });
+        return cfg;
+      });
+    };
+    const rejectionMessage = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+    const serviceRecordingPrunes = (pruned: string[]) =>
+      new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub((workspaceId: string) => {
+          pruned.push(workspaceId);
+          return Promise.resolve();
+        }),
+      });
+
+    test.each(["corrupt", "unreadable"] as const)(
+      "a fresh install refuses when config.json is %s",
+      async (damage) => {
+        const pruned: string[] = [];
+        const serviceWithOverrides = serviceRecordingPrunes(pruned);
+        await registerLocalWorkspace("ws-1");
+        const preview = await serviceWithOverrides.preview({ input: remoteDir });
+        let cause: string;
+        if (damage === "corrupt") {
+          await fsPromises.writeFile(configFile(), "{ not json");
+          cause = await rejectionMessage(
+            Promise.resolve().then(() => JSON.parse("{ not json") as unknown)
+          );
+        } else {
+          // EISDIR stands in for EACCES, which a root test runner would bypass.
+          await fsPromises.rm(configFile());
+          await fsPromises.mkdir(configFile());
+          cause = await rejectionMessage(fsPromises.readFile(configFile()));
+        }
+
+        const refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+        expect(refusal).toMatch(/workspace enumeration failed.*config\.json/);
+        expect(refusal).toContain(cause);
+        expect(pruned).toEqual([]);
+        expect(await registry()).toEqual([]);
+        expect(await pathExists(installPath())).toBe(false);
+      }
+    );
+
+    test("a fresh install advises a retry when enumeration fails for another reason", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+        Promise.reject(new Error("registry walk failed"))
+      );
+      try {
+        const refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+        expect(refusal).toMatch(/workspace enumeration failed/);
+        expect(refusal).toMatch(/retry/i);
+        expect(refusal).not.toMatch(/config\.json|repair/i);
+      } finally {
+        metadataSpy.mockRestore();
+      }
+    });
+
+    test("a fresh install refuses when one workspace's overrides cannot be checked", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub(() =>
+          Promise.reject(new Error("EBUSY: resource busy"))
+        ),
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      await expect(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/ws-1/);
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(installPath())).toBe(false);
+    });
+
+    test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
+      const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+      const tombstone = { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] };
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      await fsPromises.writeFile(
+        registryFile(),
+        JSON.stringify({ plugins: [], pendingOverridePrunes: [tombstone] })
+      );
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await fsPromises.writeFile(configFile(), "{ not json");
+
+      await expect(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/could not verify .*\(workspace enumeration failed\).*config\.json/);
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown;
+      };
+      expect(doc.pendingOverridePrunes).toEqual([tombstone]);
+    });
+
+    test("an uninstall refuses and names config.json when it does not parse", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await fsPromises.writeFile(configFile(), "{ not json");
+
+      await expect(
+        serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/config\.json/);
+      expect(await registry()).toHaveLength(1);
+      expect(await pathExists(installPath())).toBe(true);
+    });
+
+    test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fsPromises.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = { path: legacyPath };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      expect(await pathExists(installPath())).toBe(true);
+
+      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(installPath())).toBe(false);
+    });
   });
 
   test("a failed trash deletion after update releases the dir for staging reclamation", async () => {
@@ -7400,7 +7867,7 @@ describe("AgentPluginInstallService", () => {
     await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
 
     stops = 0;
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementationOnce(() =>
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.reject(new Error("metadata enumeration failed"))
     );
     try {
@@ -8195,7 +8662,11 @@ describe("AgentPluginInstallService", () => {
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
     await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
-    const key = buildPluginServerKey(computePluginInstanceId(preview.targetPath), "echo");
+    // The lexical install location, not preview.targetPath (display text: `~/...` under HOME).
+    const key = buildPluginServerKey(
+      computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+      "echo"
+    );
     expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
     expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
       success: true,
@@ -8955,6 +9426,63 @@ describe("describeSignInChanges", () => {
       "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
       "Client registration removed (https://id.example.com/register)",
     ]);
+  });
+});
+
+describe("signInResetUrls", () => {
+  // The credential key drops a trailing slash, as McpOauthService.credentialKey does.
+  const key = (url: string): string | null => url.replace(/\/$/, "");
+  const tree = (servers: Record<string, { url: string; identity: string } | null>) =>
+    new Map(
+      Object.entries(servers).map(([name, signIn]) => [name, signIn === null ? {} : { signIn }])
+    );
+  const at = (url: string, identity: string) => ({ url, identity });
+  const mcp = "https://mcp.example.com/mcp";
+
+  test("resets a server whose identity changes, and no server whose identity stays", () => {
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+  });
+
+  test("matches by credential key: a respelled URL with the same identity is not a removal", () => {
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "x") }), key)
+    ).toEqual([]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "x") }), tree({ b: at(`${mcp}/`, "y") }), key)
+    ).toEqual([`${mcp}/`]);
+  });
+
+  test("a sibling that already has the new identity does not mask a change", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
+    expect(signInResetUrls(current, tree({ a: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+  });
+
+  test("a renamed entry has no previous self: any other identity at the key resets it", () => {
+    const current = tree({ a: at(mcp, "x"), b: at(mcp, "y") });
+    expect(signInResetUrls(current, tree({ c: at(mcp, "y"), b: at(mcp, "y") }), key)).toEqual([
+      mcp,
+    ]);
+    expect(
+      signInResetUrls(tree({ a: at(mcp, "y"), b: at(mcp, "y") }), tree({ c: at(mcp, "y") }), key)
+    ).toEqual([]);
+  });
+
+  test("resets the URL of each server the update removes, and no other", () => {
+    const other = "https://other.example.com/mcp";
+    const current = tree({ a: at(mcp, "x"), b: at(other, "x"), local: null });
+    expect(signInResetUrls(current, tree({ b: at(other, "x") }), key)).toEqual([mcp]);
+    expect(signInResetUrls(current, tree({}), key)).toEqual([mcp, other]);
+  });
+
+  test("a server added at a new key, a tree with no current servers and an unkeyed URL reset nothing", () => {
+    expect(signInResetUrls(tree({}), tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(undefined, tree({ a: at(mcp, "x") }), key)).toEqual([]);
+    expect(signInResetUrls(tree({ a: at(mcp, "x") }), tree({}), () => null)).toEqual([]);
   });
 });
 

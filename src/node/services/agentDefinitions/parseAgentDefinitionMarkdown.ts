@@ -5,6 +5,7 @@ import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/m
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  isForeignPluginAgentFormat,
   isReadonlyForeignPluginAgent,
   mapForeignPluginAgentFrontmatter,
 } from "./pluginAgentFormat";
@@ -25,6 +26,12 @@ export interface ParsedAgentDefinitionMarkdown {
    * The schema strips the key, so the install review reads it here (agentFiles.ts).
    */
   mappedReadonly: boolean;
+  /**
+   * A plugin agent in Claude Code or Cursor format (the mapping ran). The body of such an agent
+   * names its plugin folder with `${CLAUDE_PLUGIN_ROOT}`; a Xum-format plugin agent body is
+   * never rewritten.
+   */
+  foreign: boolean;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -43,6 +50,17 @@ function mapFrontmatterForSource(
   } catch (err) {
     throw new AgentDefinitionParseError(getErrorMessage(err));
   }
+}
+
+function pluginFileFlags(
+  raw: Record<string, unknown>,
+  plugin: { agentId: string } | undefined
+): Pick<ParsedAgentDefinitionMarkdown, "mappedReadonly" | "foreign"> {
+  if (plugin === undefined) return { mappedReadonly: false, foreign: false };
+  return {
+    mappedReadonly: isReadonlyForeignPluginAgent(raw),
+    foreign: isForeignPluginAgentFormat(raw),
+  };
 }
 
 /**
@@ -113,9 +131,5 @@ export function parseAgentDefinitionMarkdown(input: {
     );
   }
 
-  return {
-    frontmatter: parsed.data,
-    body,
-    mappedReadonly: input.plugin !== undefined && isReadonlyForeignPluginAgent(raw),
-  };
+  return { frontmatter: parsed.data, body, ...pluginFileFlags(raw, input.plugin) };
 }

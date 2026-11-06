@@ -21,8 +21,8 @@ interface Fake {
   // XUM_DEV_SERVER_NO_AUTH=1.
   token: string;
   // Acts out a nodemon restart right after readiness. At the first /health the old backend dies:
-  // its port and socket close, and its lock stays and names a dead pid. 3 s later the next backend
-  // deletes that lock, and 1 s after that it listens again and writes its own.
+  // its port and socket close, and its lock stays and names a dead pid. 4 s later the next backend
+  // listens again and writes its own lock over it (ServerLockfile.read never deletes a stale lock).
   restartAfterFirstHealth?: boolean;
   // Arms the `ss` stub of swapLockSs at the first /health.
   swapLockDuringCheck?: boolean;
@@ -32,6 +32,8 @@ interface Fake {
   lockPid?: number;
   // The mode of the socket's folder. Default: 0700, as the Makefile makes it.
   socketDirMode?: number;
+  // Puts the socket's folder in a folder that everyone can write, without the sticky bit.
+  socketInOpenFolder?: boolean;
 }
 
 // Runs as `make -C <checkout> dev-server-sandbox ...` in the launch's own process group, so its
@@ -49,7 +51,12 @@ const checkout = process.argv[process.argv.indexOf("-C") + 1];
 setTimeout(() => process.exit(0), 60_000);
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR, "mux-dev-server-"));
 // mkdtemp makes the folder 0700, as the Makefile's socket folder is.
-const socketDir = fs.mkdtempSync(path.join(process.env.TMPDIR, "sock-"));
+let socketParent = process.env.TMPDIR;
+if (fake.socketInOpenFolder) {
+  socketParent = fs.mkdtempSync(path.join(process.env.TMPDIR, "open-"));
+  fs.chmodSync(socketParent, 0o777);
+}
+const socketDir = fs.mkdtempSync(path.join(socketParent, "sock-"));
 if (fake.socketDirMode !== undefined) fs.chmodSync(socketDir, fake.socketDirMode);
 const socketPath = path.join(socketDir, "b.sock");
 const lockPath = path.join(root, "server.lock");
@@ -97,7 +104,6 @@ const listen = (server, ...args) => new Promise((resolve) => server.listen(...ar
     tcp.close();
     unix.close();
     writeLock(spawnSync("true").pid, new Date(stamp + 1));
-    setTimeout(() => fs.rmSync(lockPath), 3000);
     setTimeout(async () => {
       fs.rmSync(socketPath, { force: true });
       await listen(tcp, backendPort, fake.backendHost);
@@ -172,7 +178,11 @@ function bunVersion(env: NodeJS.ProcessEnv): string {
 // Starts one launch against the fake and returns its result. Each stub is an extra command in
 // launch's PATH, ahead of the real one.
 function launch(fake: Fake, stubs: Record<string, string> = {}) {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vx-launch-"));
+  // Under /tmp, not os.tmpdir(): the fake's Unix socket lies about 51 bytes below this folder
+  // (home/<run id>/tmp/sock-XXXXXX/b.sock), and Linux caps a socket path at 107 bytes, so under a
+  // TMPDIR longer than about 39 bytes curl refused the path. /tmp is sticky, so the run home under
+  // it passes launch's ancestor check.
+  tmp = fs.mkdtempSync("/tmp/vx-launch-");
   const repo = path.join(tmp, "repo");
   const bin = path.join(tmp, "bin");
   fs.mkdirSync(path.join(repo, path.dirname(SKILL_SCRIPT)), { recursive: true, mode: 0o755 });
@@ -411,10 +421,26 @@ test.skipIf(!isLinux)(
   90_000
 );
 
-// A nodemon restart frees the backend's port and leaves a lock that names a dead pid, then the
-// next backend deletes that lock for a moment (see run_token in verify-xum.sh). Launch must wait
-// for the new backend, not refuse its port as unseen or the missing lock as a backend without a
-// token.
+// A folder above the socket's that others can write lets them rename the socket's folder away and
+// put their own in its place.
+test.skipIf(!isLinux)(
+  "launch refuses a backend socket below a folder that others can write",
+  () => {
+    const r = launch({ ...loopback, socketInOpenFolder: true });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(
+      /open-\w+, above the backend's socket, is writable by group or others and not sticky \(mode 777\)/
+    );
+    expect(r.stderr).not.toContain("returned error: 404");
+    expect(tcpTokenRequests()).toEqual([]);
+    expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// A nodemon restart frees the backend's port and leaves a lock that names a dead pid until the
+// next backend writes its own (see run_token in verify-xum.sh). Launch must wait for the new
+// backend, not refuse its port as unseen or the dead lock's backend as one without a token.
 test.skipIf(!isLinux)(
   "launch waits out a restart right after readiness",
   () => {

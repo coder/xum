@@ -82,29 +82,22 @@ export class ServerLockfile {
   /**
    * Read the lockfile and validate it.
    * Returns null if the lockfile doesn't exist or is stale (dead PID).
+   *
+   * A reader never deletes a stale lock. Unlinking it by path after the pid check would also
+   * delete the lock of a backend that started in between (acquire() renames its lock into place),
+   * and nothing writes that lock again before the next restart, so the CLI and every other
+   * reader would find no running backend. The next acquire() replaces a stale lock with an
+   * atomic rename, and its owner's release() removes it.
    */
   async read(): Promise<ServerLockData | null> {
-    try {
-      const data = await this.readData();
-      if (!data) return null;
-
-      // Validate PID is still alive
-      if (!this.isProcessAlive(data.pid)) {
-        // Clean up stale lockfile
-        await this.release();
-        return null;
-      }
-
-      return data;
-    } catch {
-      return null;
-    }
+    return this.peek();
   }
 
   /**
    * Read a live lockfile without ever deleting it.
-   * On-demand discovery (the desktop "Open Server Window" action) uses this so it cannot race a
-   * starting xum server that is replacing a stale lock.
+   * Same as read() now that read() never deletes either. #4854 added it for on-demand discovery
+   * (the desktop "Open Server Window" action), which must not race a starting xum server that is
+   * replacing a stale lock, and its callers keep the name.
    */
   async peek(): Promise<ServerLockData | null> {
     const data = await this.readData();
@@ -134,6 +127,10 @@ export class ServerLockfile {
   /**
    * Check if a process with the given PID is still running.
    * Uses signal 0 which tests existence without actually sending a signal.
+   *
+   * This cannot tell the server from an unrelated process that reused its pid: such a lock reads
+   * as live, and startServer() refuses while it does. read() never deleted a lock whose pid is
+   * alive, so that held before it stopped deleting stale ones too.
    */
   private isProcessAlive(pid: number): boolean {
     try {
