@@ -64,6 +64,11 @@ interface SqlExplorerProps {
   }) => Promise<SavedQuery | null>;
 }
 
+/** The run answered (`ran`) and no newer run started since: its SQL is what the results show. */
+function isShownRun(ran: boolean, executionId: number, latestExecutionId: number): boolean {
+  return ran && executionId === latestExecutionId;
+}
+
 export function SqlExplorer(props: SqlExplorerProps) {
   const [sql, setSql] = useState(SAMPLE_QUERIES[0].sql);
   const { data, loading, error, executeQuery } = useAnalyticsRawQuery();
@@ -94,9 +99,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
     }
 
     const thisExecutionId = ++executionIdRef.current;
-    await executeQuery(substituteTimeFilter(normalizedSql, props.timeFilterSql));
+    const ran = await executeQuery(substituteTimeFilter(normalizedSql, props.timeFilterSql));
 
-    if (thisExecutionId === executionIdRef.current) {
+    // A run that did not answer (offline, failed) leaves the shown results with the SQL that
+    // produced them: recording this SQL would let "Save as Panel" save a query that never ran.
+    if (isShownRun(ran, thisExecutionId, executionIdRef.current)) {
       // Keep the raw SQL (with placeholder) so "Save as Panel" stores a query
       // that keeps tracking the dashboard's date-range selection.
       setLastExecutedSql(normalizedSql);
