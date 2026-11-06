@@ -1654,6 +1654,12 @@ interface WorkspaceMetadataMemoEntry {
   fallbackIds: Set<string>;
 }
 
+/** Copies a memo entry's ids into a caller's out-parameter, when it passed one. */
+function addAll(target: Set<string> | undefined, ids: ReadonlySet<string>): void {
+  if (target === undefined) return;
+  for (const id of ids) target.add(id);
+}
+
 /**
  * Build-internal options: `degraded` is set when a lenient build swallowed a
  * legacy metadata.json read/parse failure and substituted fallback identity
@@ -1662,6 +1668,15 @@ interface WorkspaceMetadataMemoEntry {
  */
 interface WorkspaceMetadataBuildOptions extends WorkspaceMetadataOptions {
   degraded?: { value: boolean };
+}
+
+/** Marks a build degraded; `fallbackId` names an entry built from its config row alone. */
+function markDegraded(
+  options: WorkspaceMetadataBuildOptions | undefined,
+  fallbackId?: string
+): void {
+  if (options?.degraded) options.degraded.value = true;
+  if (fallbackId !== undefined) options?.fallbackIds?.add(fallbackId);
 }
 
 /** Symlinks a config.json watch follows before it stops, like the kernel's ELOOP bound. */
@@ -4702,12 +4717,8 @@ export class Config {
       }, forget);
     }
     const metadata = await entry.result;
-    if (options.legacyAliasIds !== undefined) {
-      for (const aliasId of entry.legacyAliasIds) options.legacyAliasIds.add(aliasId);
-    }
-    if (options.fallbackIds !== undefined) {
-      for (const fallbackId of entry.fallbackIds) options.fallbackIds.add(fallbackId);
-    }
+    addAll(options.legacyAliasIds, entry.legacyAliasIds);
+    addAll(options.fallbackIds, entry.fallbackIds);
     // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
     // caller's in-place filter/sort from leaking into another.
     return metadata.slice();
@@ -4764,9 +4775,6 @@ export class Config {
     options?: WorkspaceMetadataBuildOptions
   ): Promise<FrontendWorkspaceMetadata[]> {
     const probeCheckouts = options?.probeCheckouts ?? true;
-    const markDegraded = () => {
-      if (options?.degraded) options.degraded.value = true;
-    };
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -4984,7 +4992,7 @@ export class Config {
                 // closed — the unreadable alias file may hide a registered
                 // identity.
                 if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
-                  markDegraded();
+                  markDegraded(options);
                   continue;
                 }
                 throw readError;
@@ -5014,7 +5022,7 @@ export class Config {
               if (options?.throwOnError) {
                 throw parseError;
               }
-              markDegraded();
+              markDegraded(options);
             }
             const aliasId = aliasMetadata?.id;
             if (typeof aliasId === "string" && aliasId.length > 0) {
@@ -5239,7 +5247,6 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
-          markDegraded();
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
@@ -5298,7 +5305,7 @@ export class Config {
             subProjectPath: workspace.subProjectPath,
           };
 
-          options?.fallbackIds?.add(metadata.id);
+          markDegraded(options, metadata.id);
           workspaceMetadata.push(this.addPathsToMetadata(metadata, workspace.path));
         }
       }
