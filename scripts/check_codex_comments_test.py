@@ -783,6 +783,22 @@ else:
             ("unknown summary status", clean.replace(COMPLETED_LABEL, "⚠️ Findings")),
             ("failed summary status", clean.replace(COMPLETED_LABEL, "❌ Failed")),
             ("text in the summary line", clean.replace("</strong>: ", "</strong>: " + finding + " ")),
+            (
+                "text after the summary label",
+                clean.replace(
+                    COMPLETED_LABEL + "</summary>", COMPLETED_LABEL + " " + finding + "</summary>", 1
+                ),
+            ),
+            (
+                "text on the details line",
+                clean.replace(
+                    "<details>\n<summary><strong>", "<details> " + finding + "\n<summary><strong>", 1
+                ),
+            ),
+            (
+                "text after the summary line",
+                clean.replace("</summary>\n", "</summary> " + finding + "\n", 1),
+            ),
             ("text before the table", clean.replace("</summary>\n", "</summary>\n\n" + finding + "\n", 1)),
             ("no closing tag", clean.removesuffix("\n\n</details>")),
             ("two closing tags", clean + "\n\n</details>"),
@@ -790,7 +806,13 @@ else:
             ("a closing tag without the fold", FIXTURES["summary"]["body"] + "\n\n</details>"),
         ):
             with self.subTest(case):
+                self.assertNotEqual(body, clean)
                 self.assert_gate(1, snapshot([comment(body)]))
+        # Text before the marker is not Codex's board: it fails at once instead of reading as
+        # a review that is still running.
+        running = collapsed(FIXTURES["summary"]["body"], RUNNING_LABEL)
+        with self.subTest("text before the metadata marker"):
+            self.assert_gate(1, snapshot([comment(finding + "\n" + running)]))
 
     def test_a_collapsed_running_board_waits_out_an_earlier_failure_notice(self):
         # coder/xum#7966: CI saw Codex's collapsed running board beside the failure notice of
