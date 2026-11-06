@@ -179,7 +179,14 @@ export class ServerLockfile {
     }
     const byIdentity = judgeByIdentity(data);
     if (byIdentity === "stale") return null;
+    // No await since the read: a lock that is replaced after this point is replaced just as much
+    // after the return, as for every reader. Only the probe waits on the network, so only its
+    // branch reads the lock again.
     if (byIdentity === "live") return data;
+    // "silent" (connected, no answer in time) is live on purpose: a frozen backend looks like it,
+    // and a second backend must not start next to one. Only macOS, Windows and older builds' locks
+    // reach this line, and there the public /version answer proves nothing either: a process that
+    // answers it gets the token as well as one that stalls (see the limits in probeXumBackend).
     if ((await probeXumBackend(data.baseUrl)) === "no") return null;
     // A restart can replace the lock while the probe waits. Hand out the lock that was asked
     // only if it is still the lock: a caller must not send its token to the successor.
