@@ -20,7 +20,7 @@ import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken }
 import * as treeHash from "./treeHash";
 import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -6685,10 +6685,16 @@ describe("AgentPluginInstallService", () => {
       expect(doc.pendingOverridePrunes).toEqual([tombstone]);
     });
 
-    test("an unrelated malformed legacy workspace entry does not block a fresh install", async () => {
-      const pruned: string[] = [];
-      const serviceWithOverrides = serviceRecordingPrunes(pruned);
+    test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
       await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
       // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
       const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
       await fsPromises.mkdir(legacyPath, { recursive: true });
@@ -6702,13 +6708,9 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
       await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
 
-      const preview = await serviceWithOverrides.preview({ input: remoteDir });
-      await serviceWithOverrides.install({
-        source: preview.source,
-        expectedSha: preview.lockedSha,
-      });
-      expect(pruned).toContain("ws-1");
-      expect(await registry()).toHaveLength(1);
+      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(preview.targetPath)).toBe(false);
     });
   });
 
