@@ -161,6 +161,9 @@ export class FakeMcpServers {
         ),
       ]);
       assert(outcome === "hung", "FakeMcpServers.expireStartupDeadline: startup never hung");
+      // One more turn, so the other startups in flight finish what their microtasks reach (a
+      // sibling that fails at once must fail before the deadline fires, not time out with it).
+      await new Promise((resolve) => setImmediate(resolve));
       fakeTimers.advanceTimersByTime(MCP_STARTUP_TIMEOUT_MS);
       return await pending;
     } finally {
