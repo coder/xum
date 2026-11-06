@@ -197,7 +197,12 @@ describeIntegration("MCP tool call identity in chat", () => {
       // The built-in row is located by its script, not by the tool name: bash args
       // without timeout_secs validate now, so this row renders the real bash card
       // (labelled with the command) instead of the generic fallback that printed
-      // the raw tool name.
+      // the raw tool name. Script text is not as unique as a tool name, so require
+      // exactly one match or the negative assertion could bind to another row.
+      const bashRows = within(root).getAllByText("ls", { exact: true });
+      if (bashRows.length !== 1) {
+        throw new Error(`Expected one bash row for script "ls", found ${bashRows.length}`);
+      }
       expect(
         within(toolCard(root, "ls").header).queryByRole("button", {
           name: /Server information/,
