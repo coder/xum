@@ -11,6 +11,7 @@ import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { execFileAsync } from "@/node/utils/disposableExec";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -95,6 +96,19 @@ async function writeFile(file: string, content: string): Promise<void> {
   await fs.writeFile(file, content);
 }
 
+/**
+ * `count` empty folders in `parent`, from one `mkdir` process. Thousands of awaited fs.mkdir calls
+ * took seconds on a loaded host, and two tests need more than half of MAX_REMOTE_PLUGIN_ENTRIES.
+ */
+async function mkdirMany(parent: string, count: number): Promise<void> {
+  using proc = execFileAsync(
+    "mkdir",
+    Array.from({ length: count }, (_, i) => `d${i}`),
+    { cwd: parent }
+  );
+  await proc.result;
+}
+
 /** A checkout with plugin `kit` (one skill, one agent, an MCP config) in `.xum/plugins`. */
 async function checkoutWithKit(dir: string) {
   const root = await fs.realpath(dir);
@@ -142,7 +156,7 @@ describe("createRemoteProjectPluginSnapshot", () => {
     expect(await snapshot?.fs.realpath(path.join(root, "linked")).catch(() => null)).toBeNull();
   });
 
-  test("no tar, a failing tar or too many entries loads no plugins", async () => {
+  test("no tar or a failing tar loads no plugins", async () => {
     using checkout = new DisposableTempDir("remote-plugins-tar");
     const { root, container } = await checkoutWithKit(checkout.path);
     const bin = path.join(root, "bin");
@@ -176,15 +190,24 @@ describe("createRemoteProjectPluginSnapshot", () => {
       `#!/bin/sh\n${Bun.which("tar") ?? "tar"} "$@"\nexit 1\n`
     );
     expect(await snapshotWith(`PATH=${bin}\n`)).toBeNull();
-    await fs.rm(bin, { recursive: true });
+  });
+
+  // Its own test: the 4000 directories and their removal are most of the cost, and one body with
+  // the tar cases ran past Bun's 5 s limit on a loaded host.
+  test("too many entries loads no plugins", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-entries");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    const snapshot = () =>
+      createRemoteProjectPluginSnapshot({
+        runtime: new CountingRemoteRuntime(root, "test"),
+        checkoutRoot: root,
+        containers: [container],
+      });
+    expect(await snapshot()).not.toBeNull();
     const crowded = path.join(container, "kit", "skills", "crowded");
     await fs.mkdir(crowded);
-    await Promise.all(
-      Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES }, (_, i) =>
-        fs.mkdir(path.join(crowded, `d${i}`))
-      )
-    );
-    expect(await snapshotWith("")).toBeNull();
+    await mkdirMany(crowded, MAX_REMOTE_PLUGIN_ENTRIES);
+    expect(await snapshot()).toBeNull();
   });
 });
 
@@ -271,11 +294,7 @@ describe("buildRemotePluginListingScript", () => {
     // Walked twice, these entries would pass the entry cap.
     const many = path.join(kit, "skills", "review", "many");
     await fs.mkdir(many);
-    await Promise.all(
-      Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES / 2 + 100 }, (_, i) =>
-        fs.mkdir(path.join(many, `d${i}`))
-      )
-    );
+    await mkdirMany(many, MAX_REMOTE_PLUGIN_ENTRIES / 2 + 100);
     await fs.symlink(kit, path.join(container, "alias"));
     const snapshot = await createRemoteProjectPluginSnapshot({
       runtime: new CountingRemoteRuntime(root, "test"),
