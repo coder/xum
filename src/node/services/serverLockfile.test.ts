@@ -1,8 +1,9 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { renameSync, writeFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { ServerLockfile } from "./serverLockfile";
+import { ServerLockDataSchema, ServerLockfile } from "./serverLockfile";
 
 describe("ServerLockfile", () => {
   let tempDir: string;
@@ -71,31 +72,92 @@ describe("ServerLockfile", () => {
     expect(data).toBeNull();
   });
 
-  test("read returns null for stale lockfile (dead PID)", async () => {
+  test("read returns null for stale lockfile (dead PID) and leaves it in place", async () => {
     const lockPath = lockfile.getLockPath();
 
     // Write lockfile with fake dead PID
-    await fs.writeFile(
-      lockPath,
-      JSON.stringify({
-        pid: 999999999, // Very unlikely to be a real PID
-        baseUrl: "http://localhost:12345",
-        token: "test-token",
-        startedAt: new Date().toISOString(),
-      })
-    );
+    const stale = JSON.stringify({
+      pid: 999999999, // Very unlikely to be a real PID
+      baseUrl: "http://localhost:12345",
+      token: "test-token",
+      startedAt: new Date().toISOString(),
+    });
+    await fs.writeFile(lockPath, stale);
 
     const data = await lockfile.read();
     expect(data).toBeNull();
 
-    // Stale lockfile should be cleaned up
-    let exists = true;
+    // A reader never deletes: the next acquire() replaces the stale lock.
+    expect(await fs.readFile(lockPath, "utf-8")).toBe(stale);
+  });
+
+  test("a lock that a starting backend writes during the pid check survives read()", async () => {
+    // read() used to unlink a stale lock by path, so a backend that wrote its lock between the
+    // pid check and the unlink lost it, and nothing wrote it again before the next restart. The
+    // pid check is synchronous: acquire()'s two steps (a temp file, then a rename) run inside it.
+    const DEAD_PID = 999999999;
+    const lockPath = lockfile.getLockPath();
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: DEAD_PID,
+        baseUrl: "http://localhost:11111",
+        token: "stale-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    const realKill = process.kill.bind(process);
+    const kill = spyOn(process, "kill").mockImplementation(((
+      pid: number,
+      signal?: string | number
+    ) => {
+      // Other code's kill() calls pass through: only the pid check of the stale lock lands the lock.
+      if (pid === DEAD_PID && signal === 0) {
+        const temp = `${lockPath}.${process.pid}.tmp`;
+        writeFileSync(
+          temp,
+          JSON.stringify({
+            pid: process.pid,
+            baseUrl: "http://localhost:22222",
+            token: "fresh-token",
+            startedAt: new Date().toISOString(),
+          }),
+          { mode: 0o600 }
+        );
+        renameSync(temp, lockPath);
+      }
+      return realKill(pid, signal as never);
+    }) as typeof process.kill);
     try {
-      await fs.access(lockPath);
-    } catch {
-      exists = false;
+      // read() judged the lock it read: stale.
+      expect(await lockfile.read()).toBeNull();
+    } finally {
+      kill.mockRestore();
     }
-    expect(exists).toBe(false);
+
+    const remaining = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+    expect(remaining.token).toBe("fresh-token");
+    expect((await lockfile.read())?.baseUrl).toBe("http://localhost:22222");
+  });
+
+  test("acquire replaces a stale lock, so a restart needs no cleanup before it", async () => {
+    await fs.writeFile(
+      lockfile.getLockPath(),
+      JSON.stringify({
+        pid: 999999999,
+        baseUrl: "http://localhost:11111",
+        token: "stale-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+    expect(await lockfile.read()).toBeNull();
+
+    await lockfile.acquire("http://localhost:22222", "fresh-token");
+
+    const data = await lockfile.read();
+    expect(data?.token).toBe("fresh-token");
+    expect(data?.pid).toBe(process.pid);
   });
 
   test("read returns data for lockfile with current PID", async () => {
