@@ -3049,7 +3049,7 @@ export class AgentPluginInstallService {
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
     request: InstallMethodRequest,
     marketplace?: MarketplaceEntryContext,
-    countMethods = false
+    options: { countMethods?: boolean } = {}
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
@@ -3070,7 +3070,7 @@ export class AgentPluginInstallService {
     // The manifest methods are counted before the `skills` method writes its plugin.json into the
     // staged tree: that write belongs to the selected method only.
     const methodSummaries =
-      countMethods && marketplace === undefined
+      options.countMethods === true && marketplace === undefined
         ? await this.summarizeManifestMethods(checked, discovered)
         : undefined;
     const choice = await chooseStagedMethod(stagedDir, checked, request, source, marketplace);
@@ -4072,7 +4072,9 @@ export class AgentPluginInstallService {
     const { source, resolved } = args;
     const { dir: stagedDir, sha } = args.staged;
     const { plugin, warnings, method, methods, methodSummaries, skillsCliSkills } =
-      await this.validateStagedClone(stagedDir, source, args.request, args.marketplace, true);
+      await this.validateStagedClone(stagedDir, source, args.request, args.marketplace, {
+        countMethods: true,
+      });
     const targetPath = this.targetPathFor(plugin.name);
     // A name collision blocks only the managed install of this method: the preview still lists
     // the other methods and the Skills CLI choice, which creates no managed plugin.
