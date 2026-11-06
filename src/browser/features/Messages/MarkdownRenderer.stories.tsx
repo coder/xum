@@ -239,7 +239,10 @@ const MERMAID_VIEWPORTS = {
     // A phone in landscape, with a side inset on its right (the notch).
     sideInset: {
       name: "Side inset",
-      styles: { width: `${SIDE_INSET_VIEWPORT.width}px`, height: `${SIDE_INSET_VIEWPORT.height}px` },
+      styles: {
+        width: `${SIDE_INSET_VIEWPORT.width}px`,
+        height: `${SIDE_INSET_VIEWPORT.height}px`,
+      },
       type: "mobile",
     },
   },

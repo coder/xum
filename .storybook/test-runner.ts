@@ -569,7 +569,10 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
     })
   );
   // A chart that failed to render, or is still rendering, has no diagram to compare.
-  assert(boxes.length > 0, `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`);
+  assert(
+    boxes.length > 0,
+    `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`
+  );
   return boxes;
 }
 
