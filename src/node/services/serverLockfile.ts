@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
+import { answersAsXumBackend } from "./xumBackendProbe";
 
 export const ServerLockDataSchema = z.object({
   pid: z.number(),
@@ -17,6 +18,14 @@ export const ServerLockDataSchema = z.object({
 });
 
 export type ServerLockData = z.infer<typeof ServerLockDataSchema>;
+
+/**
+ * The locks this process wrote and has not released: lock path -> the `startedAt` it wrote.
+ * A lock that names this process's own pid is live only if it is in here. Otherwise an earlier
+ * process wrote it and the OS gave its pid to this one (every run of a container is pid 1), and
+ * no HTTP answer can tell the two apart, because this process answers for itself.
+ */
+const ownedLocks = new Map<string, string>();
 
 /**
  * Manages the server lockfile at ~/.xum/server.lock
@@ -77,11 +86,13 @@ export class ServerLockfile {
       mode: 0o600, // Owner read/write only
     });
     await fs.rename(tempPath, this.lockPath);
+    ownedLocks.set(this.lockPath, data.startedAt);
   }
 
   /**
    * Read the lockfile and validate it.
-   * Returns null if the lockfile doesn't exist or is stale (dead PID).
+   * Returns null if the lockfile doesn't exist or is stale: its pid is dead, or the pid is alive
+   * but no xum backend runs at the lock's baseUrl (see peek()).
    *
    * A reader never deletes a stale lock. Unlinking it by path after the pid check would also
    * delete the lock of a backend that started in between (acquire() renames its lock into place),
@@ -98,10 +109,21 @@ export class ServerLockfile {
    * Same as read() now that read() never deletes either. #4854 added it for on-demand discovery
    * (the desktop "Open Server Window" action), which must not race a starting xum server that is
    * replacing a stale lock, and its callers keep the name.
+   *
+   * A lock is live only if its pid is alive and it is the lock of a running backend:
+   * - A lock with this process's own pid is live only if this process acquired it (ownedLocks).
+   * - Any other lock is live only if a xum backend answers at its baseUrl. The OS reuses pids, so
+   *   a live pid alone does not make a lock live, and a reader that trusted it would refuse to
+   *   start next to a backend that is gone, or send the lock's token to whatever listens on its
+   *   port now. The probe carries no token (see answersAsXumBackend).
    */
   async peek(): Promise<ServerLockData | null> {
     const data = await this.readData();
-    return data && this.isProcessAlive(data.pid) ? data : null;
+    if (data == null || !this.isProcessAlive(data.pid)) return null;
+    if (data.pid === process.pid) {
+      return ownedLocks.get(this.lockPath) === data.startedAt ? data : null;
+    }
+    return (await answersAsXumBackend(data.baseUrl)) ? data : null;
   }
 
   private async readData(): Promise<ServerLockData | null> {
@@ -114,13 +136,33 @@ export class ServerLockfile {
   }
 
   /**
-   * Release the lockfile by deleting it.
+   * Release the lock this process acquired. Another backend's lock is never deleted: a backend
+   * that a starter judged stale (it did not answer in time) has had its lock replaced by the
+   * starter's acquire(), and deleting that lock would leave the running backend undiscoverable.
+   *
+   * No unlink can test who owns the file it removes, so this renames the lock out of the way
+   * first, then reads whose it was. A lock that was not ours goes back, unless an even newer one
+   * was written meanwhile (link() fails on an existing path).
    */
   async release(): Promise<void> {
+    const startedAt = ownedLocks.get(this.lockPath);
+    ownedLocks.delete(this.lockPath);
+    if (startedAt == null) return;
+    const aside = `${this.lockPath}.${process.pid}.release`;
     try {
-      await fs.unlink(this.lockPath);
+      await fs.rename(this.lockPath, aside);
     } catch {
-      // Ignore cleanup errors (file may not exist)
+      return; // no lock there (or none we can move): nothing of ours to delete
+    }
+    try {
+      const taken = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(aside, "utf-8")));
+      if (taken.pid !== process.pid || taken.startedAt !== startedAt) {
+        await fs.link(aside, this.lockPath);
+      }
+    } catch {
+      // Unreadable, or a newer lock took the path: ours is gone either way.
+    } finally {
+      await fs.unlink(aside).catch(() => undefined);
     }
   }
 
@@ -128,9 +170,8 @@ export class ServerLockfile {
    * Check if a process with the given PID is still running.
    * Uses signal 0 which tests existence without actually sending a signal.
    *
-   * This cannot tell the server from an unrelated process that reused its pid: such a lock reads
-   * as live, and startServer() refuses while it does. read() never deleted a lock whose pid is
-   * alive, so that held before it stopped deleting stale ones too.
+   * This cannot tell the server from an unrelated process that reused its pid, so peek() also
+   * asks the lock's baseUrl.
    */
   private isProcessAlive(pid: number): boolean {
     try {
