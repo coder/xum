@@ -7,6 +7,7 @@ import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createProposePlanTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { waitForRenderedMermaidDiagram } from "@/browser/stories/storyPlayHelpers";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/ProposePlan" };
 export default meta;
@@ -21,6 +22,7 @@ const PLAN_TOC_PIXEL_MATRIX = { viewports: ["desktop"] } as const;
  * Tests the plan card rendering with icon action buttons at the bottom.
  */
 export const ProposePlan: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -79,6 +81,9 @@ graph TD
       }
     />
   ),
+  play: async ({ canvasElement }) => {
+    await waitForRenderedMermaidDiagram(canvasElement);
+  },
   parameters: {
     docs: {
       description: {
@@ -96,6 +101,7 @@ graph TD
  * Shows the Implement button (no Continue in Auto).
  */
 export const ProposePlanInPlanMode: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() => {
@@ -155,6 +161,9 @@ graph TD
       }}
     />
   ),
+  play: async ({ canvasElement }) => {
+    await waitForRenderedMermaidDiagram(canvasElement);
+  },
   parameters: {
     docs: {
       description: {
@@ -174,6 +183,8 @@ graph TD
  */
 export const ProposePlanMobile: AppStory = {
   ...ProposePlan,
+  // Storybook reads tags only from string literals, so the spread does not carry them.
+  tags: ["paint-check"],
   parameters: {
     ...ProposePlan.parameters,
     viewport: { defaultViewport: "mobile1" },
@@ -197,6 +208,7 @@ export const ProposePlanMobile: AppStory = {
  * the TOC alongside the plan.
  */
 export const ProposePlanWithTableOfContents: AppStory = {
+  tags: ["paint-check"],
   render: () => (
     <AppWithMocks
       setup={() =>
@@ -274,6 +286,7 @@ Blue/green cutover with automatic rollback on auth-error spikes.
     viewport: { value: "wide", isRotated: false },
   },
   play: async ({ canvasElement }) => {
+    await waitForRenderedMermaidDiagram(canvasElement);
     const shouldAssertFullToc = isPixel() || window.innerWidth >= PLAN_TOC_MIN_WIDTH;
     if (!shouldAssertFullToc) {
       return;

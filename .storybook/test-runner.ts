@@ -593,6 +593,19 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
 // thousands.
 const MIN_INK_PIXELS = 32;
 
+// Two screenshots of the same page can differ where the page changes by itself: a scroll-driven
+// mask moved 40-60 pixels of the composer toolbar by 1-2 levels. A pixel counts as ink only when
+// it differs by more than this. Do not compare against a second shown screenshot instead: the
+// first screenshot repairs a stale WebKit layout, so ink that only it shows is the case to catch.
+const NOISE_LEVELS = 3;
+
+function pixelDiffers(a: Pixels, b: Pixels, at: number) {
+  for (let channel = 0; channel < a.channels; channel++) {
+    if (Math.abs(a.data[at + channel] - b.data[at + channel]) > NOISE_LEVELS) return true;
+  }
+  return false;
+}
+
 /** The box is widened by one pixel so its own antialiased edge never counts. */
 function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   assert(
@@ -612,9 +625,7 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
     if (shown.data.subarray(start, end).equals(hidden.data.subarray(start, end))) return;
     for (let x = from; x < to; x++) {
       const at = (y * shown.width + x) * shown.channels;
-      if (shown.data.compare(hidden.data, at, at + shown.channels, at, at + shown.channels) === 0) {
-        continue;
-      }
+      if (!pixelDiffers(shown, hidden, at)) continue;
       count++;
       sides.add(y >= bottom ? "below" : y < top ? "above" : x < left ? "left of" : "right of");
       bounds.left = Math.min(bounds.left, x);
@@ -753,6 +764,7 @@ const PINNED_VIEWPORT_STORIES = new Map([
   ["app-waitingonyou--phone", { width: 390, height: 844 }],
   ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
   ["app-chat-messages-markdownrenderer--mermaid-state-dialog-phone", { width: 390, height: 844 }],
+  ["app-chat-tools-proposeplan--propose-plan-mobile", { width: 390, height: 844 }],
   [
     "app-chat-messages-markdownrenderer--mermaid-state-dialog-desktop",
     { width: 1200, height: 900 },
