@@ -4963,13 +4963,23 @@ describe("WorkspaceMcpOverridesService", () => {
       }
       return realGetAll(...args);
     }) as typeof realGetAll);
-    let failures: Array<{ workspaceId: string; error: unknown }>;
+    // Without the cut, the stalled read waits out a whole real minute. Stop
+    // waiting after 3 s so that case fails on the assertion, not on a timeout.
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<"stalled">((resolve) => {
+      watchdog = setTimeout(() => resolve("stalled"), 3_000);
+    });
+    let failures: Array<{ workspaceId: string; error: unknown }> | "stalled";
     try {
-      failures = await service.prunePluginOverrideKeysForWorkspaces(
-        workspaces.map((workspace) => workspace.workspaceId),
-        "plugin:0123456789abcdef:"
-      );
+      failures = await Promise.race([
+        service.prunePluginOverrideKeysForWorkspaces(
+          workspaces.map((workspace) => workspace.workspaceId),
+          "plugin:0123456789abcdef:"
+        ),
+        stalled,
+      ]);
     } finally {
+      clearTimeout(watchdog);
       nowSpy.mockRestore();
       linkSpy.mockRestore();
       metadataSpy.mockRestore();
