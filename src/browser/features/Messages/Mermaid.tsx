@@ -746,8 +746,10 @@ const DIALOG_OVERLAY_PADDING_PX = 40;
 const DIALOG_PERCENT = 90;
 const DIALOG_PADDING_PX = 24;
 
+// The right side reads --safe-area-right, which also covers the Duo cover display's status column
+// on iOS 27.2 (see globals.css).
 const overlayInset = (side: "top" | "right" | "bottom" | "left") =>
-  `max(${DIALOG_OVERLAY_PADDING_PX}px, env(safe-area-inset-${side}, 0px))`;
+  `max(${DIALOG_OVERLAY_PADDING_PX}px, ${side === "right" ? "var(--safe-area-right)" : `env(safe-area-inset-${side}, 0px)`})`;
 
 // Modal component for fullscreen diagram view
 const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
@@ -812,7 +814,7 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
         style={{
           position: "absolute",
           top: `calc(${CLOSE_BUTTON_INSET_PX + (desktop ? DESKTOP_TITLEBAR_HEIGHT_PX : 0)}px + env(safe-area-inset-top, 0px))`,
-          right: `calc(${CLOSE_BUTTON_INSET_PX}px + env(safe-area-inset-right, 0px))`,
+          right: `calc(${CLOSE_BUTTON_INSET_PX}px + var(--safe-area-right))`,
           background: "var(--color-background)",
           border: "1px solid var(--color-border-subtle)",
           color: "var(--color-text)",

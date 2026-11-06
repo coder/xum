@@ -247,8 +247,11 @@ const MERMAID_DIALOG_DRAWING = ".mermaid-modal > svg.pele";
  * The story's play closed the dialog, so open it again under the inset. The dialog is the frame
  * around the drawing's container.
  */
-async function mermaidDialogInsetProblems(page: StoryPage) {
+async function openMermaidDialog(page: StoryPage) {
   await page.getByRole("button", { name: "⤢", exact: true }).click({ timeout: 5000 });
+}
+
+async function mermaidDialogInsetProblems(page: StoryPage) {
   // The drawing starts at its full size, and shrinks to the dialog's room once it has measured it.
   await page.waitForFunction(
     (selector) => {
@@ -278,6 +281,68 @@ async function mermaidDialogInsetProblems(page: StoryPage) {
   return problems;
 }
 
+/** Finds what a phone sheet or a toast puts under the right inset, once the sheet has laid out. */
+async function sheetOrToastProblemFinder(
+  page: StoryPage,
+  target: { sheet: string } | "toast"
+): Promise<() => Promise<string[]>> {
+  const root =
+    target === "toast"
+      ? page.getByRole("status").locator("..")
+      : page.getByRole("dialog", { name: target.sheet });
+  if (target !== "toast") {
+    // The md+ dialog turns into the full-width phone sheet once the new width lays out.
+    await page.waitForFunction(
+      (dialog) => dialog?.getBoundingClientRect().left === 0,
+      await root.elementHandle({ timeout: 5000 }),
+      { timeout: 5000 }
+    );
+  }
+  return () =>
+    root.evaluate(
+      (element, args) => {
+        const found: string[] = [];
+        const limit = innerWidth - args.inset;
+        const box = element.getBoundingClientRect();
+        if (args.toast) {
+          // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
+          if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
+          if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
+          return found;
+        }
+        if (Math.round(box.right) !== innerWidth) {
+          found.push(`sheet background ends at ${Math.round(box.right)}px`);
+        }
+        const controls = element.querySelectorAll<HTMLElement>(
+          "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
+        );
+        for (const control of controls) {
+          const rect = control.getBoundingClientRect();
+          if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
+          let left = rect.left;
+          let right = rect.right;
+          for (let el = control.parentElement; el; el = el.parentElement) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              left = Math.max(left, clip.left);
+              right = Math.min(right, clip.right);
+            }
+            if (el === element) break;
+          }
+          // Scrolled out of its container: not on screen.
+          if (right <= left) continue;
+          if (right > limit + 0.5) {
+            const name =
+              control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
+            found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
+          }
+        }
+        return found;
+      },
+      { inset: SIDE_INSET_PX, toast: target === "toast" }
+    );
+}
+
 /**
  * Phone sheets and toasts (portaled) and the Mermaid expand dialog (fixed) escape the app shell,
  * which pads the side safe areas, so they must keep their controls clear of a right inset
@@ -299,65 +364,13 @@ async function assertClearsRightInset(
       SIDE_INSET_VIEWPORT.width,
       { timeout: 5000 }
     );
+    let findProblems: () => Promise<string[]>;
     if (target === "mermaid-dialog") {
-      assert.equal((await mermaidDialogInsetProblems(page)).join("; "), "", RIGHT_INSET_MESSAGE);
-      return;
+      await openMermaidDialog(page);
+      findProblems = () => mermaidDialogInsetProblems(page);
+    } else {
+      findProblems = await sheetOrToastProblemFinder(page, target);
     }
-    const root =
-      target === "toast"
-        ? page.getByRole("status").locator("..")
-        : page.getByRole("dialog", { name: target.sheet });
-    if (target !== "toast") {
-      // The md+ dialog turns into the full-width phone sheet once the new width lays out.
-      await page.waitForFunction(
-        (dialog) => dialog?.getBoundingClientRect().left === 0,
-        await root.elementHandle({ timeout: 5000 }),
-        { timeout: 5000 }
-      );
-    }
-    const findProblems = () =>
-      root.evaluate(
-        (element, args) => {
-          const found: string[] = [];
-          const limit = innerWidth - args.inset;
-          const box = element.getBoundingClientRect();
-          if (args.toast) {
-            // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
-            if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
-            if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
-            return found;
-          }
-          if (Math.round(box.right) !== innerWidth) {
-            found.push(`sheet background ends at ${Math.round(box.right)}px`);
-          }
-          const controls = element.querySelectorAll<HTMLElement>(
-            "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
-          );
-          for (const control of controls) {
-            const rect = control.getBoundingClientRect();
-            if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
-            let left = rect.left;
-            let right = rect.right;
-            for (let el = control.parentElement; el; el = el.parentElement) {
-              if (getComputedStyle(el).overflowX !== "visible") {
-                const clip = el.getBoundingClientRect();
-                left = Math.max(left, clip.left);
-                right = Math.min(right, clip.right);
-              }
-              if (el === element) break;
-            }
-            // Scrolled out of its container: not on screen.
-            if (right <= left) continue;
-            if (right > limit + 0.5) {
-              const name =
-                control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
-              found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
-            }
-          }
-          return found;
-        },
-        { inset: SIDE_INSET_PX, toast: target === "toast" }
-      );
     // Compare a string: the page's array has another realm's prototype, so deepEqual always fails.
     assert.equal((await findProblems()).join("; "), "", RIGHT_INSET_MESSAGE);
     // iOS 27.2 reports no inset for the Duo's column; iosCoverColumn.ts sets its width instead.

@@ -35,6 +35,12 @@ const MAX_PHONE_SCREEN_WIDTH_PX = 600;
 const MAX_STATUS_COLUMN_WIDTH_PX = 120;
 /** A touch that moves further than this is a drag, not a tap. */
 const TAP_SLOP_PX = 10;
+/**
+ * A drag left of the column picks its axis once it has moved this far, so a vertical scroll whose
+ * first move wobbles sideways is not blocked as a sideways pan. A pan that starts before then
+ * slips through, and the viewport heals it.
+ */
+const PAN_INTENT_SLOP_PX = 6;
 const VIEWPORT_WIDTH = /\bwidth=[^,]*/;
 const VIEWPORT_HEIGHT = /,\s*height=[^,]*/;
 
@@ -347,11 +353,13 @@ class ColumnTouchBridge {
   }
 
   private onPointerDown(event: PointerEvent): void {
+    if (this.replayed.has(event)) return;
+    // Any new touch stops a glide, as it stops a native one, including a touch left of the column.
+    this.stopGlide();
     const column = this.getColumn();
-    if (this.replayed.has(event) || !isColumnTouch(event, column)) return;
+    if (!isColumnTouch(event, column)) return;
     const target = hitTestColumn(event.clientX, event.clientY, column);
     if (target == null) return;
-    this.stopGlide();
     this.gesture = {
       target,
       x: event.clientX,
@@ -408,7 +416,17 @@ class ColumnTouchBridge {
     if (this.replayed.has(event)) return;
     const touch = event.touches.length === 1 ? event.touches[0] : undefined;
     this.pan = touch ? { x: touch.clientX, y: touch.clientY, block: null } : null;
-    if (this.gesture != null) this.replayTouch(event, this.gesture);
+    const gesture = this.gesture;
+    if (gesture == null) return;
+    this.replayTouch(event, gesture);
+    if (touch == null) this.cancelColumnGesture(gesture);
+  }
+
+  /** A second finger makes it a pinch: it must not end as a tap or keep scrolling. */
+  private cancelColumnGesture(gesture: ColumnGesture): void {
+    if (gesture.scroll == null)
+      this.replayPointer("pointercancel", gesture.pointer, gesture.target);
+    this.gesture = null;
   }
 
   private blockPagePan(touch: Touch, event: TouchEvent): void {
@@ -417,7 +435,7 @@ class ColumnTouchBridge {
     if (pan.block === null) {
       const dx = touch.clientX - pan.x;
       const dy = touch.clientY - pan.y;
-      if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+      if (Math.hypot(dx, dy) < PAN_INTENT_SLOP_PX) return;
       pan.block = findDragScroller(event.target, dx, dy) == null;
     }
     if (pan.block && event.cancelable) event.preventDefault();

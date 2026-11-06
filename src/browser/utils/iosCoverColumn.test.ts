@@ -386,6 +386,51 @@ describe("installIosCoverColumn", () => {
       expect(outer.scrollTop).toBeLessThan(300);
     });
 
+    test("stops a glide when a new touch lands left of the column", async () => {
+      const scroller = wrapInScroller(button, 300);
+      touchInColumn([
+        { x: 430, y: 600, time: 0 },
+        { x: 430, y: 630, time: 30 },
+        { x: 430, y: 660, time: 60 },
+      ]);
+      await frames(1);
+
+      const root = document.documentElement;
+      root.dispatchEvent(pointer("pointerdown", 300, 600));
+      root.dispatchEvent(touch("touchstart", 300, 600));
+      const stoppedAt = scroller.scrollTop;
+      await frames(3);
+
+      expect(scroller.scrollTop).toBe(stoppedAt);
+    });
+
+    test("does not click when a second finger joins, as in a pinch", () => {
+      let clicks = 0;
+      button.addEventListener("click", () => clicks++);
+      const root = document.documentElement;
+      const column = new window.Touch({ identifier: 7, target: root, clientX: 430, clientY: 600 });
+      const other = new window.Touch({ identifier: 8, target: root, clientX: 200, clientY: 300 });
+      const send = (type: string, touches: Touch[], changed: Touch) =>
+        root.dispatchEvent(
+          new window.TouchEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            touches,
+            targetTouches: touches,
+            changedTouches: [changed],
+          })
+        );
+
+      root.dispatchEvent(pointer("pointerdown", 430, 600));
+      send("touchstart", [column], column);
+      send("touchstart", [column, other], other);
+      root.dispatchEvent(pointer("pointerup", 430, 600));
+      send("touchend", [other], column);
+      send("touchend", [], other);
+
+      expect(clicks).toBe(0);
+    });
+
     test("leaves touches left of the column to WebKit", () => {
       let clicks = 0;
       button.addEventListener("click", () => clicks++);
@@ -444,6 +489,28 @@ describe("installIosCoverColumn", () => {
       uninstall = installIosCoverColumn();
 
       expect(drag(4, -80)).toBe(false);
+    });
+
+    test("is left to iOS when a vertical scroll starts with a sideways wobble", () => {
+      wrapInScroller(target, 300);
+      uninstall = installIosCoverColumn();
+      const at = (x: number, y: number) =>
+        new window.Touch({ identifier: 1, target, clientX: x, clientY: y });
+      const send = (type: string, point: Touch) => {
+        const event = new window.TouchEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          touches: [point],
+          targetTouches: [point],
+        });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+
+      send("touchstart", at(200, 300));
+      send("touchmove", at(202, 299));
+
+      expect(send("touchmove", at(203, 260))).toBe(false);
     });
 
     test("is left to iOS on the inner display, which has no column", () => {
