@@ -873,7 +873,9 @@ describe("AgentPluginInstallService marketplaces", () => {
   // The catalog of anthropics/skills at its present scale: five entries that share "./" and list
   // 4, 12, 1, 1 and 1 skills. The names and lists follow its marketplace.json, the text is ours.
   // This test used to copy a local clone of that repository (445 files, 13 MB) and ran only on
-  // the one machine that had it, so CI skipped it.
+  // the one machine that had it, so CI skipped it. On the real data Xum counts 0 skills for
+  // `claude-api` (its description is over 1024 characters: see "a skill that Xum rejects counts
+  // nowhere"), and the generated skill has a short one, so it counts 1 here.
   test("a catalog shaped like anthropics/skills lists five entries; document-skills previews its four skills", async () => {
     const catalog: Record<string, string[]> = {
       "document-skills": ["xlsx", "docx", "pptx", "pdf"],
