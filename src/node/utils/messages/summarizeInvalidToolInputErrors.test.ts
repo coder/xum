@@ -144,13 +144,13 @@ describe("summarizeInvalidToolInputErrors logging", () => {
 
     const fields = warn.mock.calls[0]?.[1] as { arguments: string; argumentsBytes: number };
     expect(fields.argumentsBytes).toBe(5011);
-    expect(fields.arguments).toHaveLength(2049);
+    expect(fields.arguments).toHaveLength(513);
     expect(fields.arguments).toStartWith('{"text":"xxx');
     expect(fields.arguments).toEndWith("x…");
   });
 
   test("keeps arguments at the cap whole", async () => {
-    const toolInput = "y".repeat(2048);
+    const toolInput = "y".repeat(512);
     const error = new InvalidToolInputError({ toolName: "note", toolInput, cause: undefined });
     const rejected = rejectedCall("edge", {}, error);
 

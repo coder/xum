@@ -94,13 +94,14 @@ describe("formatToolInputIssues received arguments", () => {
   test("bounds each preview and escapes it onto one line", () => {
     const long = `line one\n${"x".repeat(100)}`;
     const atLimit = "y".repeat(60);
-    const input = { [`k${"e".repeat(70)}`]: long, exact: atLimit };
+    const input = { [`k${"e".repeat(70)}`]: long, exact: atLimit, "two\nlines": 1 };
 
     const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
 
     expect(message).toContain(`k${"e".repeat(58)}…=`);
     expect(message).toContain(`="line one\\n${"x".repeat(50)}…" (109 chars)`);
     expect(message).toContain(`exact="${atLimit}" (60 chars)`);
+    expect(message).toContain("two\\nlines=1");
     expect(message).not.toContain("\n");
   });
 

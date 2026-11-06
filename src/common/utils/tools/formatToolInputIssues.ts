@@ -59,7 +59,7 @@ function describeReceivedArguments(input: unknown): string {
   }
   const shown = entries
     .slice(0, RECEIVED_MAX_KEYS)
-    .map(([key, value]) => `${truncate(key)}=${describeReceivedValue(value)}`);
+    .map(([key, value]) => `${escapeKey(truncate(key))}=${describeReceivedValue(value)}`);
   const hidden = entries.length - shown.length;
   return hidden > 0 ? `${shown.join(", ")} (+${hidden} more)` : shown.join(", ");
 }
@@ -72,6 +72,12 @@ function describeReceivedValue(value: unknown): string {
     return "[array]";
   }
   return value !== null && typeof value === "object" ? "{object}" : String(value);
+}
+
+// Keys get the values' JSON escaping without the quotes, so a newline in a key
+// cannot start a new line in the message the model reads.
+function escapeKey(key: string): string {
+  return JSON.stringify(key).slice(1, -1);
 }
 
 // dry-duplicate-ok: bounds a model-facing preview; capTitle and truncateText bound other surfaces with their own limits

@@ -12,8 +12,8 @@ describe("describeCutOffBashScript", () => {
     ["comment after a semicolon", `echo hi;#don't`],
     ["comment inside a subshell", `( ls # it's\n)`],
     ["$# is not a comment", `(echo $#)`],
-    ["backslash inside a comment", `# trailing \\`],
-    ["escaped trailing backslash", `echo foo \\\\`],
+    ["trailing backslash (bash accepts it)", `echo foo \\`],
+    ["trailing backslash before a final newline", `echo foo \\\n`],
     ["backslash then newline mid-script", `echo foo \\\n  bar`],
     ["trailing pipe is left to bash", `ls |`],
     ["trailing && is left to bash", `ls &&`],
@@ -26,13 +26,41 @@ describe("describeCutOffBashScript", () => {
     ["heredoc inside a command substitution", `x=$(cat <<EOF\nit's\nEOF\n)`],
     ["comment inside backticks stops at the backtick", "echo `ls # it's`"],
     ["single quotes inside unquoted parameter expansion", `echo \${x:-'a } b'}`],
-    ["single quote inside double-quoted parameter expansion", `echo "\${x:-don't}"`],
+    // Bash rejects this one, but a quote inside a double-quoted ${...} is not modelled: a miss.
+    ["unmodelled quote inside double-quoted parameter expansion", `echo "\${x:-don't}"`],
     ["$' inside a double quote is literal", `echo "$'x"`],
     ["case pattern parenthesis", `case $x in a) echo "hi";; esac`],
     ["parenthesis inside a parameter expansion", `echo \${x%(*}`],
     ["comment in a command substitution that ends at the newline", `x=$(ls # note\n)`],
     ["indented terminator of a plain heredoc stays in the body", `cat <<EOF\n\tEOF\n'`],
+    ["backslash kept in a quoted heredoc delimiter", `cat <<'E\\F'\nEF\nit's\nE\\F\n`],
+    ["heredoc whose body follows a multi-line $(", `cat <<EOF; y=$(\necho hi\n)\nit's\nEOF\n`],
+    ["no-break space before a hash is part of the word", `(echo a\u00a0#)`],
+    ["carriage return before a hash is part of the word", `(echo a\r#)`],
   ])("accepts a complete script: %s", (_name, script) => {
+    expect(describeCutOffBashScript(script)).toBeNull();
+  });
+
+  // Bash's quoting inside a double-quoted ${...} is not modelled, so a quote there gives up.
+  test.each([
+    `jq -n --arg v "\${val//'"'/\\\\\\"}" '{}'`,
+    `echo "\${s//'"'/\\\\\\"}"`,
+    `echo "\${x#'"'}"`,
+    `echo "\${x:-'"'}"`,
+    `echo "\${x:+'"'}"`,
+    `echo "\${x%%'"'*}"`,
+    `echo "\${x^^'"'}"`,
+    `echo "\${x:-'$('}"`,
+    "echo \"${x:-'`'}\"",
+  ])("accepts a quote inside a double-quoted parameter expansion: %s", (script) => {
+    expect(describeCutOffBashScript(script)).toBeNull();
+  });
+
+  // A case pattern's ) would close the enclosing frame, so a case there gives up.
+  test.each([
+    `echo "$(case $x in a) echo "it's";; esac)"`,
+    `x="$(case $1 in\n  -h) printf "%s\\n" "it's help" ;;\nesac)"`,
+  ])("accepts a case statement inside parentheses: %s", (script) => {
     expect(describeCutOffBashScript(script)).toBeNull();
   });
 
@@ -59,6 +87,11 @@ describe("describeCutOffBashScript", () => {
       "unterminated double quote",
       `cat <<'EOF'\nit's\nEOF\necho "x`,
     ],
+    [
+      "double quote after a backslash-quoted heredoc delimiter",
+      "unterminated double quote",
+      `cat <<\\EOF\nit's\nEOF\necho "x`,
+    ],
     ["double quote after a here-string", "unterminated double quote", `cat <<<"here"\necho "x`],
     [
       "double quote after an input redirect",
@@ -79,10 +112,8 @@ describe("describeCutOffBashScript", () => {
     ["process substitution", "unclosed (", `diff <(sort a`],
     ["parameter expansion", "unclosed ${", `echo \${x`],
     ["parameter expansion inside a double quote", "unclosed ${", `echo "\${x:-$(ls)`],
-    ["trailing backslash", "trailing backslash", `echo foo \\`],
-    ["trailing backslash before a final newline", "trailing backslash", `echo foo \\\n`],
   ])("rejects an open construct: %s", (_name, construct, script) => {
-    expect(describeCutOffBashScript(script)).toEqual(expect.stringContaining(construct));
+    expect(describeCutOffBashScript(script)).toContain(construct);
   });
 
   test("names the open construct, the received length and the script", () => {

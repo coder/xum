@@ -11,7 +11,10 @@ import {
 } from "@/common/utils/tools/formatToolInputIssues";
 import { log } from "@/node/services/log";
 
-const LOGGED_ARGUMENTS_MAX_CHARS = 2048;
+// A bounded sample, not a full record: a cut-off script shows within its first
+// few words. Other rejected-input logs keep less (the input depth guard logs
+// only inputLength; historyService logs 100 characters of a malformed line).
+const LOGGED_ARGUMENTS_MAX_CHARS = 512;
 
 export interface RejectedToolCallLogContext {
   model?: string;

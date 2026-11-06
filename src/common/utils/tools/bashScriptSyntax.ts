@@ -3,9 +3,10 @@
  * arguments that stop partway through the script (often right after a quote
  * or `$(`), and running the fragment exits 0 with no output, so the model
  * repeats the same cut. Only constructs still open at end of input count;
- * anything a complete script could end with (a trailing `|` or `&&`, an
- * unterminated heredoc) is left to bash, because rejecting a complete script
- * would cost more than running a fragment.
+ * anything a complete script could end with (a trailing `|`, `&&` or `\`, an
+ * unterminated heredoc) is left to bash. Where the scanner cannot follow bash's
+ * nesting it gives up and calls the script complete: a missed cut costs one
+ * shell error, a false rejection blocks real work.
  */
 type CutOffShellConstruct =
   | "single-quote"
@@ -13,17 +14,18 @@ type CutOffShellConstruct =
   | "backtick"
   | "command-substitution"
   | "subshell"
-  | "parameter-expansion"
-  | "line-continuation";
+  | "parameter-expansion";
 
 type Frame = "code" | "paren" | "command" | "backtick" | "double" | "param" | "quotedParam";
 
-// "complete" ends the scan early without a finding (an unterminated heredoc).
+// "complete" ends the scan early without a finding: an unterminated heredoc, or
+// syntax the scanner does not model.
 type Verdict = CutOffShellConstruct | "complete";
 
 interface PendingHeredoc {
   delimiter: string;
   stripTabs: boolean;
+  depth: number;
 }
 
 const CLOSERS: Partial<Record<Frame, string>> = {
@@ -46,13 +48,16 @@ const OPEN_FRAME_CONSTRUCTS: Record<Exclude<Frame, "code">, CutOffShellConstruct
 
 // Frames where shell syntax (comments, heredocs, subshells) is parsed.
 const CODE_FRAMES = new Set<Frame>(["code", "paren", "command", "backtick"]);
-// Inside double quotes, even within a nested `${...}`, a single quote is literal.
-// Bash versions disagree for `"${x:-'a'}"`, so treat it as literal to never reject.
+// Frames inside a double-quoted string, where `$'` and a nested `${` stay quoted.
 const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 
-const COMMENT_PREFIX = /[\s;&|()<>]/;
-// `<<<` is a here-string; `<<[-]WORD` starts a heredoc whose body begins on the next line.
-const HEREDOC_OPERATOR = /<<(?:<|(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
+// Bash splits words only on these blanks, not on CR, NBSP or other Unicode spaces.
+const COMMENT_PREFIX = /[ \t\n;&|()<>]/;
+// `<<[-]WORD` starts a heredoc whose body begins on the next line. A here-string
+// (`<<<`) never matches a word, because the word cannot start with `<`.
+const HEREDOC_OPERATOR = /<<(?:(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
+const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
+const CASE_WORD = /case[ \t\n]/y;
 
 const PREVIEW_MAX_CHARS = 60;
 
@@ -63,14 +68,12 @@ const CONSTRUCT_PHRASES: Record<CutOffShellConstruct, string> = {
   "command-substitution": "an unclosed $( is open",
   subshell: "an unclosed ( is open",
   "parameter-expansion": "an unclosed ${ is open",
-  "line-continuation": "a trailing backslash continues the line",
 };
 
 class ShellScanner {
   private index = 0;
   private readonly stack: Frame[] = ["code"];
   private readonly heredocs: PendingHeredoc[] = [];
-  private endsInContinuation = false;
 
   constructor(private readonly text: string) {}
 
@@ -82,10 +85,7 @@ class ShellScanner {
       }
     }
     const frame = this.frame();
-    if (frame !== "code") {
-      return OPEN_FRAME_CONSTRUCTS[frame];
-    }
-    return this.endsInContinuation ? "line-continuation" : null;
+    return frame === "code" ? null : OPEN_FRAME_CONSTRUCTS[frame];
   }
 
   private frame(): Frame {
@@ -96,7 +96,7 @@ class ShellScanner {
     const frame = this.frame();
     const char = this.text[this.index];
     if (char === "\\") {
-      this.skipEscape();
+      this.index += 2;
     } else if (char === CLOSERS[frame]) {
       this.stack.pop();
       this.index += 1;
@@ -107,14 +107,14 @@ class ShellScanner {
   }
 
   private stepOpener(frame: Frame, char: string): Verdict | undefined {
-    if (char === "'" && !QUOTED_FRAMES.has(frame)) {
-      return this.skipSingleQuote();
+    if (char === "'" || char === '"') {
+      return this.stepQuote(frame, char);
     }
     if (char === "$") {
       return this.stepDollar(frame);
     }
-    if (char === '"' || char === "`") {
-      this.push(char === '"' ? "double" : "backtick", 1);
+    if (char === "`") {
+      this.push("backtick", 1);
     } else if (CODE_FRAMES.has(frame)) {
       return this.stepCode(frame, char);
     } else {
@@ -123,17 +123,24 @@ class ShellScanner {
     return undefined;
   }
 
+  private stepQuote(frame: Frame, char: string): Verdict | undefined {
+    if (frame === "quotedParam") {
+      // Bash's quoting inside a double-quoted ${...} varies by operator and version.
+      return "complete";
+    }
+    if (char === '"') {
+      this.push("double", 1);
+    } else if (frame === "double") {
+      this.index += 1;
+    } else {
+      return this.skipSingleQuote();
+    }
+    return undefined;
+  }
+
   private push(frame: Frame, width: number): void {
     this.stack.push(frame);
     this.index += width;
-  }
-
-  private skipEscape(): void {
-    const remaining = this.text.length - this.index - 1;
-    if (remaining === 0 || (remaining === 1 && this.text[this.index + 1] === "\n")) {
-      this.endsInContinuation = true;
-    }
-    this.index += 2;
   }
 
   private skipSingleQuote(): Verdict | undefined {
@@ -177,8 +184,8 @@ class ShellScanner {
   private stepCode(frame: Frame, char: string): Verdict | undefined {
     if (char === "(") {
       this.push("paren", 1);
-    } else if (char === "#" && this.atWordStart()) {
-      this.skipComment(frame);
+    } else if (char === "#" || char === "c") {
+      return this.stepWordStart(frame, char);
     } else if (char === "<") {
       this.readRedirect();
     } else if (char === "\n" && this.heredocs.length > 0) {
@@ -187,6 +194,25 @@ class ShellScanner {
       this.index += 1;
     }
     return undefined;
+  }
+
+  private stepWordStart(frame: Frame, char: string): Verdict | undefined {
+    if (!this.atWordStart()) {
+      this.index += 1;
+    } else if (char === "#") {
+      this.skipComment(frame);
+    } else if (CLOSERS[frame] === ")" && this.atCaseWord()) {
+      // A case pattern's `)` would close this frame early.
+      return "complete";
+    } else {
+      this.index += 1;
+    }
+    return undefined;
+  }
+
+  private atCaseWord(): boolean {
+    CASE_WORD.lastIndex = this.index;
+    return CASE_WORD.test(this.text);
   }
 
   private atWordStart(): boolean {
@@ -215,14 +241,22 @@ class ShellScanner {
     }
     if (match[2] !== undefined) {
       this.heredocs.push({
-        delimiter: match[2].replace(/['"\\]/g, ""),
+        delimiter: match[2].replace(
+          HEREDOC_DELIMITER_QUOTING,
+          (quoted: string, single?: string, double?: string) => single ?? double ?? quoted.slice(1)
+        ),
         stripTabs: match[1] === "-",
+        depth: this.stack.length,
       });
     }
     this.index = HEREDOC_OPERATOR.lastIndex;
   }
 
   private skipHeredocBodies(): Verdict | undefined {
+    if (this.heredocs.some((heredoc) => heredoc.depth !== this.stack.length)) {
+      // The line ends inside a frame opened after the heredoc operator.
+      return "complete";
+    }
     let position = this.index;
     for (const heredoc of this.heredocs.splice(0)) {
       position = this.findHeredocEnd(heredoc, position + 1);
