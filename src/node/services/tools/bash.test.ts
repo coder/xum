@@ -1565,38 +1565,42 @@ describe("bash tool", () => {
     }
   });
 
-  it("should use default timeout (3s) when timeout_secs is undefined", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      timeout_secs: undefined,
-    };
-
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
-
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
+  it("should bound a foreground call whose timeout_secs is omitted with the default deadline", async () => {
+    // timeout_secs is optional, so an omitted value must still reach the runtime as a deadline.
+    // 60 is the mode and median of the values models pass when they pass one; a shorter default
+    // would cut ordinary git, bun and make work off mid-run.
+    using tempDir = new TestTempDir("test-bash-timeout");
+    const deadlines: Array<number | undefined> = [];
+    class DeadlineRecordingRuntime extends LocalRuntime {
+      override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        deadlines.push(options.timeout);
+        return super.exec(command, options);
+      }
     }
-  });
+    const config = createTestToolConfig(process.cwd(), {
+      runtime: new DeadlineRecordingRuntime(process.cwd()),
+    });
+    config.runtimeTempDir = tempDir.path;
+    // Trusted: an untrusted repo runs an extra git-automation probe per call.
+    config.trusted = true;
+    const tool = createBashTool(config);
 
-  it("should use default timeout (3s) when timeout_secs is omitted", async () => {
-    using testEnv = createTestBashTool();
-    const tool = testEnv.tool;
-    const args = {
-      script: "echo hello",
-      // timeout_secs omitted entirely
-    };
+    const omitted = (await tool.execute!(
+      { script: "echo hello", display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
 
-    const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+    expect(omitted.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(60);
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.output).toBe("hello");
-      expect(result.exitCode).toBe(0);
-    }
+    deadlines.length = 0;
+    const explicit = (await tool.execute!(
+      { script: "echo hello", timeout_secs: 7, display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(explicit.success).toBe(true);
+    expect(deadlines.at(-1)).toBe(7);
   });
 
   // Note: Zero and negative timeout_secs are rejected by Zod schema validation
@@ -2383,6 +2387,42 @@ describe("bash tool - background execution", () => {
     await manager.terminateAll();
     fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
+  });
+
+  it("should pass an absent background timeout through as no auto-terminate deadline", async () => {
+    // The foreground default must not leak into a background spawn: BackgroundProcessManager arms
+    // auto-termination only for a number, so a dev server started without timeout_secs keeps
+    // running until task_stop. The schema also allows null now, which must not become a deadline.
+    using tempDir = new TestTempDir("test-bash-bg-timeout");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    const spawn = spyOn(manager, "spawn");
+    const tool = createBashTool(config);
+
+    try {
+      for (const [timeout_secs, display_name] of [
+        [undefined, "bg-no-timeout"],
+        [null, "bg-null-timeout"],
+        [3600, "bg-explicit-timeout"],
+      ] as const) {
+        const result = (await tool.execute!(
+          { script: "sleep 30", run_in_background: true, display_name, timeout_secs },
+          mockToolCallOptions
+        )) as BashToolResult;
+        expect(result.success).toBe(true);
+      }
+
+      expect(spawn.mock.calls.map(([, , , options]) => options.timeoutSecs)).toEqual([
+        undefined,
+        undefined,
+        3600,
+      ]);
+    } finally {
+      await manager.terminateAll();
+      fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
+    }
   });
 
   it("should start background process and return process ID", async () => {

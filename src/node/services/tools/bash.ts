@@ -975,6 +975,15 @@ async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
 }
 
 /**
+ * Collapse the timeout an omitted or null `timeout_secs` leaves behind to "the model gave no
+ * value". The field is `.nullish()` because providers send null for an omitted optional input, and
+ * each caller applies its own default from there: foreground a kill deadline, background none.
+ */
+function omitNullTimeout(timeoutSecs: number | null | undefined): number | undefined {
+  return timeoutSecs ?? undefined;
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -1002,6 +1011,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Treat display_name as untrusted input: it ends up in filesystem paths.
       const safeDisplayName = resolveBashDisplayName(script, display_name);
+      const requestedTimeoutSecs = omitNullTimeout(timeout_secs);
       const validationError = validateScript(script, config);
       if (validationError) return validationError;
 
@@ -1158,7 +1168,9 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
-            timeoutSecs: timeout_secs, // Auto-terminate after this duration
+            // Auto-terminate after this duration, if the model named one: a background process must
+            // outlive the foreground default, so it runs until stopped.
+            timeoutSecs: requestedTimeoutSecs,
           }
         );
 
@@ -1185,7 +1197,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       // Setup execution parameters
-      const effectiveTimeout = timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS;
+      const effectiveTimeout = requestedTimeoutSecs ?? BASH_DEFAULT_TIMEOUT_SECS;
       const startTime = performance.now();
       const totalBytesRef = { current: 0 }; // Use ref for shared access in line handler
       let overflowReason: string | null = null;

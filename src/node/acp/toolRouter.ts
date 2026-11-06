@@ -5,6 +5,7 @@ import type {
   PermissionOption,
   RequestPermissionOutcome,
 } from "@agentclientprotocol/sdk";
+import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import type { RuntimeMode } from "@/common/types/runtime";
 import { handleStringReplace } from "@/node/services/tools/file_edit_replace_shared";
 
@@ -818,17 +819,16 @@ async function waitForTerminalExitWithTimeout(
   terminal: DelegatedTerminalHandle,
   timeoutSecs: number | undefined
 ): Promise<Awaited<ReturnType<DelegatedTerminalHandle["waitForExit"]>>> {
-  if (timeoutSecs == null) {
-    return terminal.waitForExit();
-  }
-
-  assert(Number.isFinite(timeoutSecs) && timeoutSecs > 0, "wait timeoutSecs must be > 0");
+  // An omitted timeout_secs gets the shared bash deadline: a delegated foreground command must not
+  // be waited on without end, unlike a delegated background terminal.
+  const deadlineSecs = timeoutSecs ?? BASH_DEFAULT_TIMEOUT_SECS;
+  assert(Number.isFinite(deadlineSecs) && deadlineSecs > 0, "wait timeoutSecs must be > 0");
 
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
-      reject(new TerminalWaitTimeoutError(timeoutSecs));
-    }, timeoutSecs * 1000);
+      reject(new TerminalWaitTimeoutError(deadlineSecs));
+    }, deadlineSecs * 1000);
     timeoutHandle.unref?.();
   });
 

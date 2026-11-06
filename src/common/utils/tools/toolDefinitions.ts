@@ -64,6 +64,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import {
+  BASH_DEFAULT_TIMEOUT_SECS,
   BASH_HARD_MAX_LINES,
   BASH_MAX_LINE_BYTES,
   BASH_MAX_TOTAL_BYTES,
@@ -2325,9 +2326,6 @@ export const TOOL_DEFINITIONS = {
         // Rejecting the call costs a model step and a retry, so fill it here
         // while the model-visible schema keeps it required. The script-derived
         // name is the same one bash.ts already falls back to.
-        // timeout_secs gets no default on purpose: a short default would start a
-        // long install or build and kill it partway, while a rejection runs
-        // nothing and the model retries with a timeout.
         if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
           obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
         }
@@ -2342,11 +2340,19 @@ export const TOOL_DEFINITIONS = {
             .describe(
               "User-facing purpose shown in collapsed chat: a present-participle phrase under 100 chars (e.g. 'Running the unit tests'), without the command or duration, which Xum shows."
             ),
+          // The handler applies the default, not zod: a background process started without a
+          // timeout must live until it is stopped, so a schema-level default would give every dev
+          // server a timed death. A rejection used to be the answer to an omitted value, but it
+          // costs a model step that open-weight models pay constantly; the foreground default is
+          // the median of the explicit values, and its timeout error tells the model to raise it.
           timeout_secs: z
             .number()
             .positive()
+            .nullish()
             .describe(
-              "Seconds: foreground kill deadline, or background max lifetime. Start small; raise on retry."
+              "Seconds: foreground kill deadline, or background max lifetime. " +
+                `Omitted: foreground gets a ${BASH_DEFAULT_TIMEOUT_SECS}s kill deadline, and a background process lives until it is stopped or the workspace is removed. ` +
+                "Start small; raise on retry."
             ),
           run_in_background: z
             .boolean()

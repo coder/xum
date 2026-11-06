@@ -1,4 +1,5 @@
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { BASH_DEFAULT_TIMEOUT_SECS } from "../../src/common/constants/toolLimits";
 import { ToolRouter } from "../../src/node/acp/toolRouter";
 
 function createRouter(overrides?: {
@@ -173,6 +174,57 @@ describe("ACP ToolRouter", () => {
       error: expect.stringContaining("Command exceeded timeout of 0.02 seconds"),
     });
     expect(killCalls).toBe(1);
+  });
+
+  it("waits on a delegated foreground bash call with the default deadline when timeout_secs is omitted", async () => {
+    // Making timeout_secs optional in the schema made an omitted value reachable here, and an
+    // unbounded waitForExit would hang the turn. setTimeout is accelerated so the default deadline
+    // (tens of seconds) can be observed without spending it; the recorded delay is the deadline.
+    const armedDelays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((
+      callback: (...args: never[]) => void,
+      delayMs?: number,
+      ...args: unknown[]
+    ) => {
+      armedDelays.push(delayMs ?? 0);
+      return realSetTimeout(callback, 5, ...(args as []));
+    }) as unknown as typeof globalThis.setTimeout;
+
+    try {
+      let killCalls = 0;
+
+      const { router } = createRouter({
+        createTerminal: async () => ({
+          id: "default-timeout-term",
+          currentOutput: async () => ({ output: "partial\n", truncated: false }),
+          waitForExit: async () => await new Promise(() => undefined),
+          kill: async () => {
+            killCalls += 1;
+            return undefined;
+          },
+          release: async () => undefined,
+          [Symbol.asyncDispose]: async () => undefined,
+        }),
+      });
+
+      const result = await router.delegateToEditor("session-1", "bash", {
+        script: "tail -f /tmp/log",
+      });
+
+      expect(result).toMatchObject<Record<string, unknown>>({
+        success: false,
+        output: "partial\n",
+        exitCode: -1,
+        error: expect.stringContaining(
+          `Command exceeded timeout of ${BASH_DEFAULT_TIMEOUT_SECS} seconds`
+        ),
+      });
+      expect(armedDelays).toContain(BASH_DEFAULT_TIMEOUT_SECS * 1000);
+      expect(killCalls).toBe(1);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
   });
 
   it("honors timeout_secs for delegated file_read calls", async () => {
