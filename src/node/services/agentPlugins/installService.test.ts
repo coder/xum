@@ -4815,6 +4815,14 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     }, 20_000);
 
+    test("an uninstall of a plugin with no remote servers ignores a corrupt pending record", async () => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+    }, 20_000);
+
     test("a plugin whose servers cannot be listed can still be uninstalled", async () => {
       const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
         docsUrl,
