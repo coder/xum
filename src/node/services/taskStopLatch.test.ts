@@ -22,7 +22,14 @@ function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
 }
 
 function streamEnd(outcome: StreamEndDecision["outcome"]): StreamEndDecision {
-  return { attempt: undefined, attemptId: ATTEMPT, messageId: "msg-1", outcome, turn: undefined };
+  return {
+    attempt: undefined,
+    attemptId: ATTEMPT,
+    messageId: "msg-1",
+    reportedAtEvent: false,
+    outcome,
+    turn: undefined,
+  };
 }
 
 /** A config whose only workspace is TASK, with this execution mirror. */

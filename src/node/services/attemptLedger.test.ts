@@ -393,6 +393,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        reportedAtEvent: false,
         outcome,
         turn: undefined,
       };
@@ -896,6 +897,7 @@ describe("AttemptLedger", () => {
         attempt: undefined,
         attemptId: ATTEMPT,
         messageId: "msg-1",
+        reportedAtEvent: false,
         outcome,
         turn: undefined,
       });
