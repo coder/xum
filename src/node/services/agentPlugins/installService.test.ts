@@ -7190,6 +7190,8 @@ describe("AgentPluginInstallService", () => {
         expect(refusal).toContain("ws-1");
         expect(refusal).toMatch(/retry/i);
         expect(refusal).not.toMatch(/shrink/i);
+        // A busy workspace is a known cause, not the catch-all one.
+        expect(refusal).not.toMatch(/another reason/i);
       });
 
       test("each failed workspace gets its own cause when the causes differ", async () => {
@@ -7231,7 +7233,7 @@ describe("AgentPluginInstallService", () => {
         expect(refusal).toContain("ws-1");
         expect(refusal).toContain("ws-2");
         expect(refusal).toMatch(/retry/i);
-        expect(refusal).not.toMatch(/shrink/i);
+        expect(refusal).not.toMatch(/shrink|another reason/i);
       });
     });
 
