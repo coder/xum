@@ -7012,6 +7012,25 @@ describe("AgentPluginInstallService", () => {
         return cfg;
       });
     };
+    // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // Its own runtime config keeps its checkout under this test's root.
+    const registerMalformedLegacyEntry = async () => {
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fsPromises.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = {
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      return legacyPath;
+    };
     const rejectionMessage = (promise: Promise<unknown>) =>
       promise.then(
         () => "resolved",
@@ -7129,6 +7148,41 @@ describe("AgentPluginInstallService", () => {
       expect(await pathExists(installPath())).toBe(true);
     });
 
+    test("a fresh install sweeps every workspace when an unrelated legacy entry's metadata is malformed", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      const staleEnable = buildPluginServerKey(computePluginInstanceId(installPath()), "echo");
+      const overridesFile = (checkout: string) => path.join(checkout, ".xum", "mcp.local.jsonc");
+      await registerLocalWorkspace("ws-1");
+      const checkouts = [
+        path.join(muxRoot, "checkouts", "ws-1"),
+        await registerMalformedLegacyEntry(),
+      ];
+      for (const checkout of checkouts) {
+        await fsPromises.mkdir(path.dirname(overridesFile(checkout)), { recursive: true });
+        await fsPromises.writeFile(
+          overridesFile(checkout),
+          JSON.stringify({ enabledServers: [staleEnable, "other"] })
+        );
+      }
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      expect(await registry()).toHaveLength(1);
+      for (const checkout of checkouts) {
+        const overrides = JSON.parse(
+          await fsPromises.readFile(overridesFile(checkout), "utf8")
+        ) as {
+          enabledServers?: string[];
+        };
+        expect(overrides.enabledServers).toEqual(["other"]);
+      }
+    });
+
     test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
       const serviceWithOverrides = new AgentPluginInstallService(config, {
         workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
@@ -7139,18 +7193,7 @@ describe("AgentPluginInstallService", () => {
         source: preview.source,
         expectedSha: preview.lockedSha,
       });
-      // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
-      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
-      await fsPromises.mkdir(legacyPath, { recursive: true });
-      const legacyEntry: unknown = { path: legacyPath };
-      await config.editConfig((cfg) => {
-        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
-        return cfg;
-      });
-      const sessionDir = path.join(config.sessionsDir, "old-branch");
-      await fsPromises.mkdir(sessionDir, { recursive: true });
-      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
-      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      await registerMalformedLegacyEntry();
       expect(await pathExists(installPath())).toBe(true);
 
       await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });

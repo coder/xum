@@ -4138,6 +4138,102 @@ describe("WorkspaceMcpOverridesService", () => {
     await expect(service.acquireWorkspaceLock(healthy.workspaceId)).rejects.toThrow();
   });
 
+  describe("plugin sweeps with an unrelated malformed legacy entry", () => {
+    const pluginKey = "plugin:0123456789abcdef:echo";
+    const overridesFile = (workspacePath: string) =>
+      path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const writeEnable = async (workspacePath: string) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(workspacePath),
+        JSON.stringify({ enabledServers: [pluginKey, "other"] })
+      );
+    };
+    const enabledServers = async (workspacePath: string) =>
+      (
+        JSON.parse(await fs.readFile(overridesFile(workspacePath), "utf8")) as {
+          enabledServers?: string[];
+        }
+      ).enabledServers;
+    // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // Its own runtime config keeps its checkout under this test's root.
+    const registerMalformedLegacyEntry = async () => {
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fs.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = {
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fs.mkdir(sessionDir, { recursive: true });
+      await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+      ).rejects.toThrow();
+      return legacyPath;
+    };
+    const sweepOutcome = (service: WorkspaceMcpOverridesService, workspaceIds: string[]) =>
+      service.prunePluginOverrideKeysForWorkspaces(workspaceIds, "plugin:0123456789abcdef:").then(
+        (failures) => failures.map((failure) => failure.workspaceId).sort(),
+        () => "refused" as const
+      );
+
+    it("prunes every requested workspace, the legacy entry's checkout included", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await writeEnable(legacyPath);
+      const legacyId = (await config.getAllWorkspaceMetadata({ probeCheckouts: false }))
+        .map((metadata) => metadata.id)
+        .find((id) => id !== healthy.workspaceId);
+      if (legacyId === undefined) throw new Error("the lenient walk lists the legacy entry");
+
+      expect(await sweepOutcome(service, [healthy.workspaceId, legacyId])).toEqual([]);
+      expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
+      expect(await enabledServers(legacyPath)).toEqual(["other"]);
+    });
+
+    it.each(["corrupt", "structurally invalid"] as const)(
+      "refuses while config.json is %s and leaves the overrides as they were",
+      async (damage) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        const configPath = path.join(tempDir, "config.json");
+        if (damage === "corrupt") {
+          await fs.writeFile(configPath, "{ not json");
+        } else {
+          // Strict loads refuse a project whose workspaces are not an array; the lenient load
+          // drops that project and still lists the healthy workspace.
+          const document = JSON.parse(await fs.readFile(configPath, "utf8")) as {
+            projects: unknown[];
+          };
+          document.projects.push(["/fake/mangled", { workspaces: {} }]);
+          await fs.writeFile(configPath, JSON.stringify(document));
+        }
+
+        expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
+
+    it("fails a requested workspace that the lenient walk does not list", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await registerMalformedLegacyEntry();
+
+      const outcome = await sweepOutcome(service, [healthy.workspaceId, "ws-not-registered"]);
+      expect(outcome === "refused" || outcome.includes("ws-not-registered")).toBe(true);
+    });
+  });
+
   it("aliases sharing one checkout contend for one lock", async () => {
     // An isolation:none child and its parent hold distinct ids for one
     // override document: a rename through one id must fence a save through
