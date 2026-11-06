@@ -328,10 +328,31 @@ describe("WorkspaceMcpOverridesService", () => {
       const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
 
       // A writer holds the lock while the read runs: the read observes the
-      // legacy value and queues behind the lock for its migration.
+      // legacy value and queues behind the lock for its migration. The read's
+      // own request for the lock is the signal that it observed the legacy
+      // value (and found no document): a fixed sleep let a slow read observe
+      // the saved document instead.
       const release = await service.acquireExclusiveLock();
+      const internals = service as unknown as {
+        runExclusive: (fn: () => Promise<unknown>, options?: object) => Promise<unknown>;
+      };
+      const realRunExclusive = internals.runExclusive.bind(service);
+      let readRequestedLock: () => void = () => undefined;
+      const readQueued = new Promise<void>((resolve) => {
+        readRequestedLock = resolve;
+      });
+      const exclusiveSpy = spyOn(internals, "runExclusive").mockImplementation((fn, options) => {
+        readRequestedLock();
+        return realRunExclusive(fn, options);
+      });
       const read = service.getOverridesForWorkspace(workspaceId);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        // A read that never asks for the lock settles instead (it migrated unfenced): the
+        // assertion below then reports the file it wrote.
+        await Promise.race([readQueued, read]);
+      } finally {
+        exclusiveSpy.mockRestore();
+      }
       expect(await pathExists(filePath)).toBe(false);
       // The writer persists a disable exactly like setOverridesForWorkspace:
       // document written, legacy value cleared, epoch bumped.
