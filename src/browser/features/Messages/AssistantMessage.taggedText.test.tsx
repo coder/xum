@@ -66,7 +66,10 @@ describe("AssistantMessage invisible-tag handling", () => {
       <AssistantMessage
         message={assistantMessage(original)}
         workspaceId="ws-1"
-        clipboardWriteText={async (text) => void copies.push(text)}
+        clipboardWriteText={(text) => {
+          copies.push(text);
+          return Promise.resolve();
+        }}
       />
     );
 

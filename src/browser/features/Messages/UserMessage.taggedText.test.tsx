@@ -58,7 +58,10 @@ function renderUserMessage(
   return render(
     <UserMessage
       message={userMessage(content)}
-      clipboardWriteText={async (text) => void handlers.onCopy(text)}
+      clipboardWriteText={(text) => {
+        handlers.onCopy(text);
+        return Promise.resolve();
+      }}
       onEdit={handlers.onEdit}
     />
   );
