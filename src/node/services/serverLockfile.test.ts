@@ -3,11 +3,18 @@ import { renameSync, writeFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { ServerLockDataSchema, ServerLockfile } from "./serverLockfile";
+import { ServerLockDataSchema, ServerLockfile, type ServerLockData } from "./serverLockfile";
+import {
+  startFakeBackend,
+  startUnrelatedProcess,
+  unservedBaseUrl,
+  type FakeBackend,
+} from "./testXumBackend";
 
 describe("ServerLockfile", () => {
   let tempDir: string;
   let lockfile: ServerLockfile;
+  const cleanups: Array<() => void | Promise<void>> = [];
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-lock-test-"));
@@ -15,8 +22,37 @@ describe("ServerLockfile", () => {
   });
 
   afterEach(async () => {
+    for (const cleanup of cleanups.splice(0)) await cleanup();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
+
+  async function backend(...args: Parameters<typeof startFakeBackend>): Promise<FakeBackend> {
+    const started = await startFakeBackend(...args);
+    cleanups.push(started.close);
+    return started;
+  }
+
+  function unrelatedProcess() {
+    const started = startUnrelatedProcess();
+    cleanups.push(started.kill);
+    return started;
+  }
+
+  /** Writes a lock as another process would have: not through acquire(), so this process does not own it. */
+  async function writeForeignLock(lock: {
+    pid: number;
+    baseUrl: string;
+    token?: string;
+    startedAt?: string;
+  }) {
+    const data = {
+      token: "foreign-token",
+      startedAt: new Date().toISOString(),
+      ...lock,
+    };
+    await fs.writeFile(lockfile.getLockPath(), JSON.stringify(data), { mode: 0o600 });
+    return data;
+  }
 
   test("acquire creates lockfile with correct data", async () => {
     await lockfile.acquire("http://localhost:12345", "test-token");
@@ -27,6 +63,29 @@ describe("ServerLockfile", () => {
     expect(data!.token).toBe("test-token");
     expect(data!.pid).toBe(process.pid);
     expect(data!.startedAt).toBeDefined();
+  });
+
+  test("acquire records only the optional fields that are usable", async () => {
+    const written = async (extra?: Parameters<ServerLockfile["acquire"]>[2]) => {
+      await lockfile.acquire("http://localhost:12345", "test-token", extra);
+      return ServerLockDataSchema.parse(
+        JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))
+      );
+    };
+    const expectNoOptionalFields = (data: ServerLockData) => {
+      expect(data.bindHost).toBeUndefined();
+      expect(data.port).toBeUndefined();
+      expect(data.networkBaseUrls).toBeUndefined();
+    };
+
+    expectNoOptionalFields(await written());
+    expectNoOptionalFields(await written({}));
+    expectNoOptionalFields(await written({ bindHost: "  ", networkBaseUrls: [] }));
+    expect((await written({ bindHost: " 127.0.0.1 " })).bindHost).toBe("127.0.0.1");
+    // The ends of the port range are ports; a port outside it, or a fraction, is dropped.
+    expect((await written({ port: 0 })).port).toBe(0);
+    expect((await written({ port: 65535 })).port).toBe(65535);
+    for (const port of [-1, 65536, 1.5]) expect((await written({ port })).port).toBeUndefined();
   });
 
   test("acquire persists optional network metadata", async () => {
@@ -92,6 +151,10 @@ describe("ServerLockfile", () => {
   });
 
   test("a lock that a starting backend writes during the pid check survives read()", async () => {
+    // The starting backend is another process: a live pid that is not this one, and a backend
+    // that answers at its baseUrl.
+    const starting = await backend("xum");
+    const startingProcess = unrelatedProcess();
     // read() used to unlink a stale lock by path, so a backend that wrote its lock between the
     // pid check and the unlink lost it, and nothing wrote it again before the next restart. The
     // pid check is synchronous: acquire()'s two steps (a temp file, then a rename) run inside it.
@@ -118,8 +181,8 @@ describe("ServerLockfile", () => {
         writeFileSync(
           temp,
           JSON.stringify({
-            pid: process.pid,
-            baseUrl: "http://localhost:22222",
+            pid: startingProcess.pid,
+            baseUrl: starting.baseUrl,
             token: "fresh-token",
             startedAt: new Date().toISOString(),
           }),
@@ -138,7 +201,7 @@ describe("ServerLockfile", () => {
 
     const remaining = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
     expect(remaining.token).toBe("fresh-token");
-    expect((await lockfile.read())?.baseUrl).toBe("http://localhost:22222");
+    expect((await lockfile.read())?.baseUrl).toBe(starting.baseUrl);
   });
 
   test("acquire replaces a stale lock, so a restart needs no cleanup before it", async () => {
@@ -167,6 +230,236 @@ describe("ServerLockfile", () => {
     expect(data).not.toBeNull();
     expect(data!.baseUrl).toBe("http://127.0.0.1:54321");
     expect(data!.token).toBe("valid-token");
+  });
+
+  describe("a lock whose pid is alive", () => {
+    // The OS reuses pids: after a crash, any process can hold the dead backend's pid, and in a
+    // container every run is pid 1.
+    test("an unrelated process holds the pid and nothing serves the baseUrl: stale", async () => {
+      const unrelated = unrelatedProcess();
+      await writeForeignLock({ pid: unrelated.pid, baseUrl: await unservedBaseUrl() });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(await lockfile.peek()).toBeNull();
+      // A reader leaves the file: acquire() replaces it.
+      await fs.access(lockfile.getLockPath());
+    });
+
+    test("another server answers at the baseUrl: stale, and nothing is sent to it", async () => {
+      const unrelated = unrelatedProcess();
+      const other = await backend("other");
+      await writeForeignLock({ pid: unrelated.pid, baseUrl: other.baseUrl, token: "secret-token" });
+
+      expect(await lockfile.read()).toBeNull();
+      // Whoever listens there never sees the lock's token, in a header or in the URL.
+      expect(JSON.stringify(other.requests)).not.toContain("secret-token");
+    });
+
+    test("a xum backend answers at the baseUrl: live, and the probe sends no token", async () => {
+      const foreign = unrelatedProcess();
+      const live = await backend("xum");
+      await writeForeignLock({ pid: foreign.pid, baseUrl: live.baseUrl, token: "secret-token" });
+
+      const data = await lockfile.read();
+      expect(data?.pid).toBe(foreign.pid);
+      expect(data?.token).toBe("secret-token");
+      expect(JSON.stringify(live.requests)).not.toContain("secret-token");
+    });
+
+    test("a lock with this process's pid that this process did not write is stale", async () => {
+      // A container restart gives the new run the old run's pid. A xum backend answering at the
+      // baseUrl does not make the lock this process's: only its own acquire() does.
+      const live = await backend("xum");
+      await writeForeignLock({ pid: process.pid, baseUrl: live.baseUrl });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(live.requests).toEqual([]);
+    });
+
+    test("a lock that is replaced while its backend is asked is not handed out", async () => {
+      // A restart: the successor's acquire() lands while the old backend's answer is pending.
+      const foreign = unrelatedProcess();
+      const successor = unrelatedProcess();
+      const live = await backend("xum", {
+        onRequest: async () => {
+          await writeForeignLock({ pid: successor.pid, baseUrl: "http://127.0.0.1:2" });
+        },
+      });
+      await writeForeignLock({ pid: foreign.pid, baseUrl: live.baseUrl, token: "old-token" });
+
+      expect(await lockfile.read()).toBeNull();
+      expect(live.requests).toHaveLength(1);
+    });
+
+    test("a lock that is removed or rewritten by the same pid while its backend is asked is not handed out", async () => {
+      const foreign = unrelatedProcess();
+      const startedAt = "2026-01-01T00:00:00.000Z";
+      let whileAsked: () => Promise<void> = () => Promise.resolve();
+      const live = await backend("xum", { onRequest: () => whileAsked() });
+      const lock = { pid: foreign.pid, baseUrl: live.baseUrl, startedAt };
+
+      // The backend stopped: release() removed the lock.
+      await writeForeignLock(lock);
+      whileAsked = () => fs.rm(lockfile.getLockPath());
+      expect(await lockfile.read()).toBeNull();
+
+      // The same process restarted its server: the new lock has its pid and a later startedAt.
+      await writeForeignLock(lock);
+      whileAsked = () =>
+        writeForeignLock({ ...lock, startedAt: "2026-01-02T00:00:00.000Z" }).then(() => undefined);
+      expect(await lockfile.read()).toBeNull();
+
+      // Nothing changes: the same lock is handed out.
+      await writeForeignLock(lock);
+      whileAsked = () => Promise.resolve();
+      expect((await lockfile.read())?.startedAt).toBe(startedAt);
+    });
+
+    test("a lock this process acquired is live without asking its baseUrl", async () => {
+      await lockfile.acquire(await unservedBaseUrl(), "own-token");
+
+      expect((await lockfile.read())?.token).toBe("own-token");
+      // Another instance on the same path (another service of this process) sees it too.
+      expect((await new ServerLockfile(tempDir).peek())?.token).toBe("own-token");
+    });
+  });
+
+  describe("release", () => {
+    /**
+     * Makes a successor's lock land at the lock path after release() has read the lock and
+     * before it renames it aside (the successor's acquire() between those two calls).
+     */
+    function successorLandsBeforeRename(lock: Parameters<typeof writeForeignLock>[0]) {
+      const realRename = fs.rename;
+      return spyOn(fs, "rename").mockImplementation(
+        async (...args: Parameters<typeof realRename>) => {
+          if (typeof args[1] === "string" && args[1].endsWith(".release"))
+            await writeForeignLock(lock);
+          return realRename(...args);
+        }
+      );
+    }
+    const asideName = () => `server.lock.${process.pid}.release`;
+
+    test("leaves the lock of another backend that replaced this process's lock", async () => {
+      // A starter judged this backend stale (it did not answer in time) and acquire()d over it.
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+      const before = await fs.stat(lockfile.getLockPath());
+
+      await lockfile.release();
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(theirs);
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+      // The lock never left its path: it is the same file.
+      expect((await fs.stat(lockfile.getLockPath())).ino).toBe(before.ino);
+    });
+
+    test("puts back a successor's lock that landed between the read and the rename", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const theirs = { pid: foreign.pid, baseUrl: "http://127.0.0.1:2", token: "their-token" };
+      const rename = successorLandsBeforeRename(theirs);
+      try {
+        await lockfile.release();
+      } finally {
+        rename.mockRestore();
+      }
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toMatchObject(theirs);
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+      // The restored lock holds a token: it keeps the owner-only mode that acquire() gives it.
+      if (process.platform !== "win32") {
+        expect((await fs.stat(lockfile.getLockPath())).mode & 0o777).toBe(0o600);
+      }
+    });
+
+    test("keeps a newer lock that is written while the successor's lock is held aside", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const rename = successorLandsBeforeRename({
+        pid: foreign.pid,
+        baseUrl: "http://127.0.0.1:2",
+      });
+      const newer = {
+        pid: foreign.pid,
+        baseUrl: "http://127.0.0.1:3",
+        token: "newer-token",
+        startedAt: new Date().toISOString(),
+      };
+      // release() reads the lock it took aside: a third backend acquires right then.
+      const realReadFile = fs.readFile;
+      const read = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof realReadFile>
+      ) => {
+        const content = await realReadFile(...args);
+        if (typeof args[0] === "string" && args[0].endsWith(".release")) {
+          await fs.writeFile(lockfile.getLockPath(), JSON.stringify(newer));
+        }
+        return content;
+      }) as typeof realReadFile);
+      try {
+        await lockfile.release();
+      } finally {
+        read.mockRestore();
+        rename.mockRestore();
+      }
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(newer);
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+    });
+
+    test("keeps the successor's lock aside when it cannot be put back", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const theirs = { pid: foreign.pid, baseUrl: "http://127.0.0.1:2", token: "their-token" };
+      const rename = successorLandsBeforeRename(theirs);
+      const copy = spyOn(fs, "copyFile").mockImplementation(() =>
+        Promise.reject(Object.assign(new Error("no space left"), { code: "ENOSPC" }))
+      );
+      try {
+        await lockfile.release();
+      } finally {
+        copy.mockRestore();
+        rename.mockRestore();
+      }
+
+      expect(await fs.readdir(tempDir)).toEqual([asideName()]);
+      expect(JSON.parse(await fs.readFile(path.join(tempDir, asideName()), "utf-8"))).toMatchObject(
+        theirs
+      );
+    });
+
+    test("leaves a lock file that is not a valid lock", async () => {
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      await fs.writeFile(lockfile.getLockPath(), "not json");
+
+      await lockfile.release();
+
+      expect(await fs.readFile(lockfile.getLockPath(), "utf-8")).toBe("not json");
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+    });
+
+    test("does not delete a lock that this process never acquired", async () => {
+      const foreign = unrelatedProcess();
+      const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+
+      await lockfile.release();
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(theirs);
+    });
+
+    test("a second release() after the first leaves a newer foreign lock alone", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      await lockfile.release();
+      const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+
+      await lockfile.release();
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(theirs);
+    });
   });
 
   test("release removes lockfile", async () => {
