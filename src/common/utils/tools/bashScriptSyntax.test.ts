@@ -48,6 +48,11 @@ describe("describeCutOffBashScript", () => {
     // Bash decodes these delimiters to EOF; the scanner does not model $'' or $"" there.
     ["ANSI-C quoted heredoc delimiter", `cat <<$'EOF'\nhi\n$EOF\nit's\nEOF\n`],
     ["locale-quoted heredoc delimiter", `cat <<$"EOF"\nhi\n$EOF\nit's\nEOF\n`],
+    // A backslash inside a quoted delimiter is not modelled, so the scan gives up.
+    ["escaped quote in a double-quoted delimiter", 'cat <<"E\\"OF"\n$(cut\nE"OF\n'],
+    ["backslash in a single-quoted delimiter", "cat <<'E\\'OF'\n$(cut\nE\\'OF\n"],
+    ["double-quoted delimiter look-alike line", 'cat <<"E\\"OF"\nE\\\necho "unclosed\n'],
+    ["single-quoted delimiter look-alike line", "cat <<'E\\'OF'\nE\\\necho 'unclosed\n"],
     ["heredoc whose body follows a multi-line $(", `cat <<EOF; y=$(\necho hi\n)\nit's\nEOF\n`],
     ["no-break space before a hash is part of the word", `(echo a\u00a0#)`],
     ["carriage return before a hash is part of the word", `(echo a\r#)`],
@@ -109,6 +114,11 @@ describe("describeCutOffBashScript", () => {
     ],
     ["double quote ending in a backslash", "unterminated double quote", `echo "a \\`],
     ["double quote after a heredoc", "unterminated double quote", `cat <<A\nA\necho "x`],
+    [
+      "double quote after a double-quoted delimiter",
+      "unterminated double quote",
+      'cat <<"EOF"\nEOF\necho "unclosed\n',
+    ],
     [
       "double quote after a quoted heredoc delimiter",
       "unterminated double quote",

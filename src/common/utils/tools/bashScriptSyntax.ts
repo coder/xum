@@ -6,7 +6,9 @@
  * anything a complete script could end with (a trailing `|`, `&&` or `\`, an
  * unterminated heredoc) is left to bash. Where the scanner cannot follow bash's
  * nesting it gives up and calls the script complete: a missed cut costs one
- * shell error, a false rejection blocks real work.
+ * shell error, a false rejection blocks real work. It gives up on, for example,
+ * a quote inside a double-quoted `${...}`, `case` inside `$(...)`, and a heredoc
+ * delimiter with `$'`, `$"` or a backslash inside its quotes.
  */
 type CutOffShellConstruct =
   | "single-quote"
@@ -57,7 +59,7 @@ const WORD_BOUNDARY = /[ \t\n;&|()<>]/;
 // (`<<<`) never matches a word, because the word cannot start with `<`.
 const HEREDOC_OPERATOR = /<<(?:(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
 const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
-const UNMODELLED_DELIMITER_QUOTING = /\$['"]/;
+const UNMODELLED_DELIMITER_QUOTING = /\$['"]|'[^']*\\|"[^"]*\\/;
 const CASE_WORD = /case[ \t\n]/y;
 
 const CONSTRUCT_PHRASES: Record<CutOffShellConstruct, string> = {
@@ -301,7 +303,7 @@ class ShellScanner {
       return undefined;
     }
     if (match[2] !== undefined && UNMODELLED_DELIMITER_QUOTING.test(match[2])) {
-      // Bash decodes $'...' and $"..." delimiters; the scanner does not.
+      // Bash decodes $'', $"" and escapes in quoted delimiters; the scanner does not.
       return "complete";
     }
     if (match[2] !== undefined) {
