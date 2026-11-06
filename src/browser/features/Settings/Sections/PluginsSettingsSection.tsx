@@ -1099,6 +1099,17 @@ const NotAppliedList: React.FC<{ items?: readonly AgentPluginNotApplied[]; class
   );
 };
 
+/** What a read-only agent loses: its edit tools, and its shell when a `disallowedTools` list removed it. */
+const ReadonlyAgentNote: React.FC<{ preview: AgentPluginInstallPreview; agent: string }> = (
+  props
+) => {
+  if (!props.preview.readonlyAgents.includes(props.agent)) return null;
+  const shell = props.preview.shellRemovedAgents.includes(props.agent)
+    ? "shell removed"
+    : "shell still available";
+  return <span className="text-muted"> (edit tools removed, {shell})</span>;
+};
+
 /** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
 const PreviewDisclosures: React.FC<{
   preview: AgentPluginInstallPreview;
@@ -1117,17 +1128,16 @@ const PreviewDisclosures: React.FC<{
             <React.Fragment key={agent}>
               {index > 0 && ", "}
               <span className="text-foreground font-mono break-all">{agent}</span>
-              {props.preview.readonlyAgents.includes(agent) && (
-                <span className="text-muted"> (edit tools removed, shell still available)</span>
-              )}
+              <ReadonlyAgentNote preview={props.preview} agent={agent} />
             </React.Fragment>
           ))}{" "}
           <span className="text-muted">
             — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
             such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
             Claude Code tools or disallowedTools list. Unless that list removes Bash, it can run
-            shell commands, which can change any file. readonly: true removes only the file edit and
-            task tools.
+            shell commands, which can change any file. A list of only Read, Grep, Glob and LS that
+            names Grep, Glob or LS also gets the shell, for search. readonly: true removes only the
+            file edit and task tools.
           </span>
         </p>
       </div>
