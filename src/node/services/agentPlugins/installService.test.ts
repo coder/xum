@@ -7091,6 +7091,94 @@ describe("AgentPluginInstallService", () => {
       expect(await pathExists(installPath())).toBe(false);
     });
 
+    test("a fresh install refusal names an override file over the size limit", async () => {
+      // Retry advice alone left the user stuck: the file stays too large.
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      await registerLocalWorkspace("ws-1");
+      const docPath = path.join(muxRoot, "checkouts", "ws-1", ".xum", "mcp.local.jsonc");
+      await fsPromises.mkdir(path.dirname(docPath), { recursive: true });
+      await fsPromises.writeFile(docPath, JSON.stringify({ padding: "x".repeat(1024 * 1024) }));
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      const refusal = await rejectionMessage(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      );
+
+      expect(refusal).toMatch(/could not check the MCP overrides of 1 workspace \(ws-1\)/);
+      expect(refusal).toMatch(/\d+ bytes, over the \d+ bytes/);
+      expect(await registry()).toEqual([]);
+    });
+
+    test("a fresh install refusal says another operation holds the workspace", async () => {
+      const overrides = new WorkspaceMcpOverridesService(config);
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overrides,
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const locksDir = path.join(muxRoot, "mcp-overrides-locks");
+      const before = new Set(await fsPromises.readdir(locksDir).catch(() => [] as string[]));
+      const releaseBusy = await overrides.acquireWorkspaceLock("ws-1");
+      const busyLocks = new Set(
+        (await fsPromises.readdir(locksDir))
+          .filter((name) => name.endsWith(".lock") && !before.has(name))
+          .map((name) => path.join(locksDir, name))
+      );
+      expect(busyLocks.size).toBeGreaterThan(0);
+      const realNow = Date.now;
+      const realLink = fsPromises.link;
+      let skewMs = 0;
+      const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+      // Every attempt on the busy lock costs a whole waiting budget.
+      const linkSpy = spyOn(fsPromises, "link").mockImplementation((existing, target) => {
+        if (busyLocks.has(String(target))) skewMs += 61_000;
+        return realLink(existing, target);
+      });
+      let refusal: string;
+      try {
+        refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+      } finally {
+        nowSpy.mockRestore();
+        linkSpy.mockRestore();
+        await releaseBusy();
+      }
+
+      expect(refusal).toMatch(/could not check the MCP overrides of 1 workspace \(ws-1\)/);
+      expect(refusal).toMatch(/in progress for this workspace/);
+      expect(refusal).not.toMatch(/over the \d+ bytes/);
+      expect(await registry()).toEqual([]);
+    });
+
+    test("the reinstall gate refusal names the first cleanup error", async () => {
+      const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      await registerLocalWorkspace("ws-1");
+      const docPath = path.join(muxRoot, "checkouts", "ws-1", ".xum", "mcp.local.jsonc");
+      await fsPromises.mkdir(path.dirname(docPath), { recursive: true });
+      await fsPromises.writeFile(docPath, JSON.stringify({ padding: "x".repeat(1024 * 1024) }));
+      await fsPromises.writeFile(
+        registryFile(),
+        JSON.stringify({
+          plugins: [],
+          pendingOverridePrunes: [{ prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] }],
+        })
+      );
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      const refusal = await rejectionMessage(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      );
+
+      expect(refusal).toMatch(/could not clean up its workspace MCP overrides yet/);
+      expect(refusal).toMatch(/\d+ bytes, over the \d+ bytes/);
+    });
+
     test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
       const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
       const tombstone = { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] };

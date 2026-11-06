@@ -349,6 +349,24 @@ function describeFailedWorkspaces(ids: readonly string[]): string {
   return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
 }
 
+/** Workspaces whose MCP overrides a prune could not clean, with the first error for the user. */
+interface FailedPrunes {
+  failed: string[];
+  firstError?: { workspaceId?: string; message: string };
+}
+
+/**
+ * The first prune error as a sentence. A refusal that gave only retry advice
+ * left the user stuck when the cause was one they must fix (an override file
+ * over the size limit), and the reason was only in the log.
+ */
+function firstPruneErrorSentence(firstError: FailedPrunes["firstError"]): string {
+  if (firstError === undefined) return "";
+  const where =
+    firstError.workspaceId === undefined ? "" : `, in workspace ${firstError.workspaceId}`;
+  return ` First error${where}: ${firstError.message.replace(/\.?$/, ".")}`;
+}
+
 /**
  * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
  * already name the recovery step. A read error gets one here.
@@ -6204,7 +6222,10 @@ export class AgentPluginInstallService {
       // reinstall gate). The shrink is gated on the re-enumeration only, not
       // on the delta persist above: failedPruneIds covers the full union, so
       // a successful shrink IS the durable record for failed delta prunes.
-      const failedPruneIds = await this.pruneWorkspaceOverrides(serverKeyPrefix, pruneIds);
+      const { failed: failedPruneIds } = await this.pruneWorkspaceOverrides(
+        serverKeyPrefix,
+        pruneIds
+      );
       if (pruneIds.length > 0 && postCommitEnumerated) {
         // STRICT re-read for the shrink: a lenient read degrading a transient
         // I/O error or corruption to an empty document would make this write
@@ -6300,13 +6321,13 @@ export class AgentPluginInstallService {
   private async pruneWorkspaceOverrides(
     serverKeyPrefix: string,
     workspaceIds: string[]
-  ): Promise<string[]> {
+  ): Promise<FailedPrunes> {
     const overridesService = this.deps.workspaceMcpOverridesService;
     if (!overridesService) {
-      return [];
+      return { failed: [] };
     }
     if (workspaceIds.length === 0) {
-      return [];
+      return { failed: [] };
     }
     // Raw in-queue patch: preserves unknown fields written by newer
     // builds, throws on unreadable files (tombstone retry), and cannot
@@ -6351,7 +6372,7 @@ export class AgentPluginInstallService {
       // Wholesale failure (lock timeout, unreadable config): no workspace was
       // verified, so every one keeps its tombstone.
       log.warn("Failed to prune plugin MCP overrides", { error: getErrorMessage(error) });
-      return [...workspaceIds];
+      return { failed: [...workspaceIds], firstError: { message: getErrorMessage(error) } };
     }
     for (const failure of failures) {
       log.warn("Failed to prune plugin MCP overrides for workspace", {
@@ -6359,7 +6380,15 @@ export class AgentPluginInstallService {
         error: getErrorMessage(failure.error),
       });
     }
-    return failures.map((failure) => failure.workspaceId);
+    const [first] = failures;
+    return {
+      failed: failures.map((failure) => failure.workspaceId),
+      ...(first === undefined
+        ? {}
+        : {
+            firstError: { workspaceId: first.workspaceId, message: getErrorMessage(first.error) },
+          }),
+    };
   }
 
   /**
@@ -6525,7 +6554,7 @@ export class AgentPluginInstallService {
     prefix: string;
     workspaceIds: string[];
   }): Promise<
-    { enumerated: true; failed: string[] } | { enumerated: false; failed: string[]; advice: string }
+    ({ enumerated: true } & FailedPrunes) | { enumerated: false; failed: string[]; advice: string }
   > {
     let liveWorkspaceIds: string[];
     try {
@@ -6543,7 +6572,7 @@ export class AgentPluginInstallService {
     }
     return {
       enumerated: true,
-      failed: await this.pruneWorkspaceOverrides(prune.prefix, liveWorkspaceIds),
+      ...(await this.pruneWorkspaceOverrides(prune.prefix, liveWorkspaceIds)),
     };
   }
 
@@ -6592,7 +6621,7 @@ export class AgentPluginInstallService {
         `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). ${retried.advice}`
       );
     }
-    const { failed } = retried;
+    const { failed, firstError } = retried;
     const remaining = this.updateRawPendingPrunes(
       this.rawPendingPrunes(envelope),
       serverKeyPrefix,
@@ -6601,7 +6630,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}). The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}).${firstPruneErrorSentence(firstError)} The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
@@ -6631,10 +6660,10 @@ export class AgentPluginInstallService {
         `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). ${retried.advice}`
       );
     }
-    const { failed } = retried;
+    const { failed, firstError } = retried;
     if (failed.length > 0) {
       throw new Error(
-        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'.${firstPruneErrorSentence(firstError)} The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
