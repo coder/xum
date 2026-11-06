@@ -7420,7 +7420,7 @@ describe("AgentPluginInstallService", () => {
     await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
 
     stops = 0;
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementationOnce(() =>
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.reject(new Error("metadata enumeration failed"))
     );
     try {
