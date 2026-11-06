@@ -25,6 +25,12 @@ describe("describeCutOffBashScript", () => {
     ["heredoc body starts on the line after the operator", `cat <<X # X\nit's\nX`],
     ["heredoc inside a command substitution", `x=$(cat <<EOF\nit's\nEOF\n)`],
     ["comment inside backticks stops at the backtick", "echo `ls # it's`"],
+    ["escaped backtick in a backtick comment", "x=`\n# a \\` and a ' quote\n`\n"],
+    ["escaped backtick in a backtick comment before the closer", "echo `# hi \\` there 'x\n`\n"],
+    ["escaped backslash before a backtick closer in a comment", "echo `ls # a \\\\` 'x'\n"],
+    // Bash parses the text inside backticks only when it runs.
+    ["unbalanced quote inside backticks", "echo `ls 'x`; echo ok\n"],
+    ["heredoc inside backticks", "x=`cat <<EOF\nit's\nEOF\n`\n"],
     ["single quotes inside unquoted parameter expansion", `echo \${x:-'a } b'}`],
     // Bash rejects this one, but a quote inside a double-quoted ${...} is not modelled: a miss.
     ["unmodelled quote inside double-quoted parameter expansion", `echo "\${x:-don't}"`],
@@ -116,6 +122,11 @@ describe("describeCutOffBashScript", () => {
     ],
     ["backtick", "unterminated backtick", "echo `ls"],
     ["backtick inside a double quote", "unterminated backtick", 'echo "`ls'],
+    [
+      "backtick whose comment has only an escaped backtick",
+      "unterminated backtick",
+      "echo `# hi \\` there",
+    ],
     ["command substitution", "unclosed $(", `T=$(cat file`],
     ["command substitution inside a double quote", "unclosed $(", `echo "$(ls`],
     ["command substitution whose ) is in a comment", "unclosed $(", `echo $(ls # )`],

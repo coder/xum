@@ -16,7 +16,7 @@ type CutOffShellConstruct =
   | "subshell"
   | "parameter-expansion";
 
-type Frame = "code" | "paren" | "command" | "backtick" | "double" | "param" | "quotedParam";
+type Frame = "code" | "paren" | "command" | "double" | "param" | "quotedParam";
 
 // "complete" ends the scan early without a finding: an unterminated heredoc, or
 // syntax the scanner does not model.
@@ -31,7 +31,6 @@ interface PendingHeredoc {
 const CLOSERS: Partial<Record<Frame, string>> = {
   paren: ")",
   command: ")",
-  backtick: "`",
   double: '"',
   param: "}",
   quotedParam: "}",
@@ -40,14 +39,13 @@ const CLOSERS: Partial<Record<Frame, string>> = {
 const OPEN_FRAME_CONSTRUCTS: Record<Exclude<Frame, "code">, CutOffShellConstruct> = {
   paren: "subshell",
   command: "command-substitution",
-  backtick: "backtick",
   double: "double-quote",
   param: "parameter-expansion",
   quotedParam: "parameter-expansion",
 };
 
 // Frames where shell syntax (comments, heredocs, subshells) is parsed.
-const CODE_FRAMES = new Set<Frame>(["code", "paren", "command", "backtick"]);
+const CODE_FRAMES = new Set<Frame>(["code", "paren", "command"]);
 // Frames inside a double-quoted string, where `$'` and a nested `${` stay quoted.
 const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 
@@ -113,12 +111,12 @@ class ShellScanner {
       return this.stepDollar(frame);
     }
     if (char === "`") {
-      this.push("backtick", 1);
-    } else if (CODE_FRAMES.has(frame)) {
-      return this.stepCode(frame, char);
-    } else {
-      this.index += 1;
+      return this.skipBackticks();
     }
+    if (CODE_FRAMES.has(frame)) {
+      return this.stepCode(frame, char);
+    }
+    this.index += 1;
     return undefined;
   }
 
@@ -228,7 +226,7 @@ class ShellScanner {
     if (!this.atWordStart()) {
       this.index += 1;
     } else if (char === "#") {
-      this.skipComment(frame);
+      this.skipComment();
     } else if (CLOSERS[frame] === ")" && this.atCaseWord()) {
       // A case pattern's `)` would close this frame early.
       return "complete";
@@ -247,17 +245,33 @@ class ShellScanner {
     return this.index === 0 || WORD_BOUNDARY.test(this.text[this.index - 1]);
   }
 
-  private skipComment(frame: Frame): void {
+  private skipComment(): void {
     const newline = this.text.indexOf("\n", this.index);
-    let end = newline === -1 ? this.text.length : newline;
-    // Bash finds the closing backtick before it parses the command inside, so a
-    // comment there cannot hide it.
-    const tick = frame === "backtick" ? this.text.indexOf("`", this.index) : -1;
-    // mutation-equivalent: a backtick index never equals a newline index or the text length
-    if (tick !== -1 && tick < end) {
-      end = tick;
+    this.index = newline === -1 ? this.text.length : newline;
+  }
+
+  // Bash ends a backtick substitution at the first unescaped backtick and parses
+  // the text inside only when it runs, so quotes and comments there do not count.
+  private skipBackticks(): Verdict | undefined {
+    let tick = this.text.indexOf("`", this.index + 1);
+    // mutation-equivalent: isEscaped(-1) is false and a closer is never at 0, so the guard only saves a call
+    while (tick !== -1 && this.isEscaped(tick)) {
+      tick = this.text.indexOf("`", tick + 1);
     }
-    this.index = end;
+    if (tick === -1) {
+      return "backtick";
+    }
+    this.index = tick + 1;
+    return undefined;
+  }
+
+  // Whether an odd run of backslashes precedes `position`.
+  private isEscaped(position: number): boolean {
+    let backslashes = 0;
+    while (this.text[position - backslashes - 1] === "\\") {
+      backslashes += 1;
+    }
+    return backslashes % 2 === 1;
   }
 
   private readRedirect(): Verdict | undefined {
