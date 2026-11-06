@@ -22,7 +22,7 @@ import {
   MAX_COLD_READS,
   MAX_COLD_READS_PER_HOST,
 } from "./remoteProjectPlugins";
-import { MAX_REMOTE_PLUGIN_ENTRIES } from "./remotePluginListing";
+import { MAX_LISTING_OUTPUT_BYTES, MAX_REMOTE_PLUGIN_ENTRIES } from "./remotePluginListing";
 
 // The listing script runs through RemoteRuntime.exec in a local shell, so these tests run the
 // exact command an SSH or Docker runtime would run (with the host's GNU tools).
@@ -44,6 +44,50 @@ class CountingRemoteRuntime extends ShellRemoteRuntime {
     this.execs++;
     return super.exec(this.prefix + command, options);
   }
+}
+
+/**
+ * Answers every exec with one captured listing, so a test of the cache policy runs no shell. The
+ * LRU test needs about 40 listings: with the real script that is over a thousand processes, and
+ * it passed Bun's 5 s limit on a loaded host.
+ */
+class ReplayedListingRuntime extends CountingRemoteRuntime {
+  constructor(
+    loginDir: string,
+    hostKey: string,
+    private readonly listing: string
+  ) {
+    super(loginDir, hostKey);
+  }
+  override exec(): Promise<ExecStream> {
+    this.execs++;
+    const bytes = new TextEncoder().encode(this.listing);
+    const stream = (chunk?: Uint8Array) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (chunk !== undefined) controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+    return Promise.resolve({
+      stdout: stream(bytes),
+      stderr: stream(),
+      stdin: new WritableStream<Uint8Array>(),
+      exitCode: Promise.resolve(0),
+      duration: Promise.resolve(0),
+    });
+  }
+}
+
+/** What the real listing script prints for `container`, run once with the options of a read. */
+async function captureListing(root: string, container: string): Promise<string> {
+  const result = await execBuffered(
+    new CountingRemoteRuntime(root, "capture"),
+    buildRemotePluginListingScript(root, [container]),
+    { cwd: "/", timeout: 10, maxOutputBytes: MAX_LISTING_OUTPUT_BYTES }
+  );
+  expect(result.exitCode).toBe(0);
+  return result.stdout;
 }
 
 async function writeFile(file: string, content: string): Promise<void> {
@@ -288,9 +332,10 @@ describe("getRemoteProjectPluginSnapshot", () => {
   test("the least recently used key goes over the entry cap; a failure is not retried at once", async () => {
     using checkout = new DisposableTempDir("remote-plugins-lru");
     const { root, container } = await checkoutWithKit(checkout.path);
+    const listing = await captureListing(root, container);
     const runtimes = Array.from(
       { length: MAX_CACHED_SNAPSHOTS + 1 },
-      (_, i) => new CountingRemoteRuntime(root, `host-${i}`)
+      (_, i) => new ReplayedListingRuntime(root, `host-${i}`, listing)
     );
     for (const runtime of runtimes)
       await getRemoteProjectPluginSnapshot(runtime, root, [container]);
@@ -304,7 +349,7 @@ describe("getRemoteProjectPluginSnapshot", () => {
     // A failure is cached; once its retry delay is over it is read again and becomes the newest
     // entry. Here it is the oldest of 16, so a new key would evict it if it kept its place.
     clearRemoteProjectPluginSnapshots();
-    const failing = new CountingRemoteRuntime(root, "down");
+    const failing = new ReplayedListingRuntime(root, "down", listing);
     failing.exec = () => {
       failing.execs++;
       return Promise.reject(new Error("ssh: connection refused"));
@@ -317,7 +362,7 @@ describe("getRemoteProjectPluginSnapshot", () => {
     }
     const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
     try {
-      failing.exec = CountingRemoteRuntime.prototype.exec.bind(failing);
+      failing.exec = ReplayedListingRuntime.prototype.exec.bind(failing);
       expect(await getRemoteProjectPluginSnapshot(failing, root, [container])).not.toBeNull();
       await getRemoteProjectPluginSnapshot(runtimes[16], root, [container]);
       await getRemoteProjectPluginSnapshot(failing, root, [container]);
@@ -330,9 +375,10 @@ describe("getRemoteProjectPluginSnapshot", () => {
   test("concurrent reads past the entry cap stay single-flight", async () => {
     using checkout = new DisposableTempDir("remote-plugins-inflight-cap");
     const { root, container } = await checkoutWithKit(checkout.path);
+    const listing = await captureListing(root, container);
     const runtimes = Array.from(
       { length: MAX_CACHED_SNAPSHOTS + 1 },
-      (_, i) => new CountingRemoteRuntime(root, `burst-${i}`)
+      (_, i) => new ReplayedListingRuntime(root, `burst-${i}`, listing)
     );
     const reads = runtimes.map((runtime) =>
       getRemoteProjectPluginSnapshot(runtime, root, [container])
