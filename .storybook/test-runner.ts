@@ -747,11 +747,6 @@ interface Pixels {
   channels: number;
 }
 
-/**
- * Mermaid loads lazily and draws after a story's play has ended, so a frame can still show its
- * placeholder when the check starts. A diagram that never draws (a broken chart shows an error in
- * place of its frame) fails the story instead of passing with nothing compared.
- */
 async function waitForRenderedDiagrams(page: StoryPage) {
   try {
     await page.waitForFunction(
@@ -763,17 +758,12 @@ async function waitForRenderedDiagrams(page: StoryPage) {
       { timeout: DIAGRAM_RENDER_TIMEOUT_MS }
     );
   } catch (error) {
-    // Matched by name because this file cannot import Playwright (see the top of the file).
     const name = typeof error === "object" && error !== null && "name" in error && error.name;
     if (name === "TimeoutError") assert.fail(NO_DIAGRAM_MESSAGE);
     throw error;
   }
 }
 
-/**
- * Only a tagged story is compared with its box. The frame is enough to know a story shows a
- * diagram: it exists before Mermaid has drawn into it. A story tagged `!test` is not visited.
- */
 async function assertDiagramStoryIsTagged(page: StoryPage) {
   assert.equal(
     await page.locator(MERMAID_PAGE_FRAME_SELECTOR).count(),
@@ -913,10 +903,6 @@ function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
 const MIN_BELOW_PX = 8;
 const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ceil(box.bottom) - 1;
 
-/**
- * Only the part of the box inside the viewport is compared with what surrounds it, so a box that
- * lies outside the viewport (or has no area) would pass without testing anything.
- */
 function overlapsViewport(box: Box, viewport: Pick<Pixels, "width" | "height">) {
   return (
     Math.min(box.right, viewport.width) > Math.max(box.left, 0) &&
