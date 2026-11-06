@@ -311,7 +311,7 @@ describe("ServerLockfile", () => {
         ...args: Parameters<typeof realReadFile>
       ) => {
         const content = await realReadFile(...args);
-        if (String(args[0]).endsWith(".release")) {
+        if (typeof args[0] === "string" && args[0].endsWith(".release")) {
           await fs.writeFile(lockfile.getLockPath(), JSON.stringify(newer));
         }
         return content;
