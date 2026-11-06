@@ -30,6 +30,12 @@ export const NARROW_VIEWPORT_MAX_WIDTH_PX = 768;
 // landscape): the composer's live line opens its lists in a bottom sheet there, as on phones.
 export const SHORT_VIEWPORT_MAX_HEIGHT_PX = 500;
 
+// The iPhone Duo cover display keeps a status and camera column on its right edge (an 84 px right
+// safe-area inset in Apple's simulator) at a width where xum shows its phone layout. Shared so the
+// Storybook test runner and the stories that it pins to this viewport cannot drift apart.
+export const SIDE_INSET_PX = 84;
+export const SIDE_INSET_VIEWPORT = { width: 466, height: 700 };
+
 // Keep composer controls aligned without relying on individual component defaults. This is a floor,
 // not a fixed height: mobile raises touch targets to MOBILE_TOUCH_TARGET_PX, and a pill that caps
 // its height would clip the controls inside it instead of growing with them.

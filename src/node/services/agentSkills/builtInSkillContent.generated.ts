@@ -2208,7 +2208,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "## Styling",
       "",
       "- Never use emoji characters as UI icons or status indicators; emoji rendering varies across platforms and fonts.",
-      "- Never use CSS `zoom`: Safari and Chromium lay a zoomed element out differently, and iPhone Safari painted a Mermaid diagram far outside its frame (`local/no-css-zoom`, `make check-no-css-zoom`). Size the element with explicit pixels computed in code (see `mermaidDiagramBox.ts`). Tag a story `webkit` when its layout must hold in Safari: `make test-storybook-webkit` plays those stories in WebKit (CI runs it in `Test / Storybook`).",
+      "- Never use CSS `zoom`: Safari and Chromium lay a zoomed element out differently, and iPhone Safari painted a Mermaid diagram far outside its frame (`local/no-css-zoom`, `make check-no-css-zoom`). Size the element with explicit pixels computed in code (see `mermaidDiagramBox.ts`). Tag a story `webkit` when its layout must hold in Safari: `make test-storybook-webkit` plays those stories in WebKit (CI runs it in `Test / Storybook`). Tag it `paint-check` instead when it shows a Mermaid diagram: the runner then also compares what the engine paints with the diagram's box, and fails the story when it shows no rendered diagram.",
       "- Prefer SVG icons (usually from `lucide-react`) or shared icon components under `src/browser/components/icons/`.",
       "- For tool call headers, use `ToolIcon` from `src/browser/features/Tools/Shared/ToolPrimitives.tsx`.",
       "- If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon/EmojiIcon.tsx`) instead of rendering the emoji.",
