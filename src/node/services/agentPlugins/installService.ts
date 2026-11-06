@@ -5719,9 +5719,52 @@ export class AgentPluginInstallService {
       const choice = manifestChoiceFor(
         readStoredInstallMethod(rawEntries.find((entry) => this.rawEntryName(entry) === dirName))
       );
-      urls.push(...(await this.pluginTreeServerUrls(dirName, installed.has(dirName), choice)));
+      urls.push(
+        ...(await this.pluginTreeServerUrlsAnyBuild(dirName, installed.has(dirName), choice))
+      );
     }
     return urls;
+  }
+
+  /**
+   * One credential once, whatever URL spelling reached it: the first URL stays. Without the
+   * sign-in service no key exists, and the URL itself stands in for it.
+   */
+  private uniqueByCredential(urls: readonly string[]): string[] {
+    const seen = new Set<string>();
+    return urls.filter((url) => {
+      const key = this.mcpOauthService?.credentialKey(url) ?? url;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  /**
+   * The remote servers of one tree for a sign-out, through the saved method and through the fixed
+   * order. An older build ignores the saved method, loads the fixed-order manifest and can store
+   * sign-ins for a server that only that manifest declares (B3). Those sign-ins outlive the plugin
+   * (they are keyed by URL), so a sign-out that listed only the saved manifest would leave them. A
+   * fixed-order manifest that cannot be read lists none: only an older build loads it, and it must
+   * not keep a healthy plugin from being signed out or removed.
+   */
+  private async pluginTreeServerUrlsAnyBuild(
+    dirName: string,
+    installed: boolean,
+    choice: ManifestChoice
+  ): Promise<string[]> {
+    const saved = await this.pluginTreeServerUrls(dirName, installed, choice);
+    if (choice.kind === "fixed-order") return saved;
+    const fixedOrder = await this.pluginTreeServerUrls(dirName, false, {
+      kind: "fixed-order",
+    }).catch((error: unknown) => {
+      log.warn("Could not list the MCP servers of the fixed-order manifest of a plugin", {
+        plugin: dirName,
+        error: getErrorMessage(error),
+      });
+      return [];
+    });
+    return this.uniqueByCredential([...saved, ...fixedOrder]);
   }
 
   /**
@@ -5738,11 +5781,24 @@ export class AgentPluginInstallService {
    * removable.
    */
   private async installedServerUrls(name: string): Promise<string[]> {
+    // A registry that cannot be read names no saved method: the tree must stay removable.
+    const saved = await this.installedChoice(name).catch(
+      (): ManifestChoice => ({ kind: "fixed-order" })
+    );
+    const choices: ManifestChoice[] =
+      saved.kind === "fixed-order" ? [saved] : [saved, { kind: "fixed-order" }];
+    const urls: string[] = [];
+    // Each manifest on its own: one that cannot be read lists none, and must not hide the other's.
+    for (const choice of choices) urls.push(...(await this.serverUrlsOfManifest(name, choice)));
+    return this.uniqueByCredential(urls);
+  }
+
+  private async serverUrlsOfManifest(name: string, choice: ManifestChoice): Promise<string[]> {
     try {
       const { plugin } = await discoverAgentPluginAt({
         pluginDir: this.targetPathFor(name),
         scope: "global",
-        choice: await this.installedChoice(name),
+        choice,
       });
       // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
       if (plugin?.mcpConfigPath === undefined) return [];

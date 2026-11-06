@@ -888,6 +888,72 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(loggedOut).toEqual([serverUrl]);
   });
 
+  /**
+   * A Claude install whose two manifests each declare a remote MCP server: the Claude manifest
+   * its own file, and the fixed-order Codex manifest the default `.mcp.json`. An older build loads
+   * the Codex one and can store a sign-in for its server, which outlives the plugin (B3).
+   */
+  async function installWithServerPerManifest(urls: { claude: string; codex: string }) {
+    const claudeManifest = JSON.parse(
+      await fsPromises.readFile(path.join(remoteDir, ".claude-plugin", "plugin.json"), "utf8")
+    ) as Record<string, unknown>;
+    await write({
+      ".claude-plugin/plugin.json": JSON.stringify({
+        ...claudeManifest,
+        mcpServers: "./claude.mcp.json",
+      }),
+      "claude.mcp.json": JSON.stringify({
+        mcpServers: { claude: { type: "http", url: urls.claude } },
+      }),
+      ".mcp.json": JSON.stringify({ mcpServers: { codex: { type: "http", url: urls.codex } } }),
+    });
+    await commit("a remote MCP server for each manifest");
+    await installAs("claude-plugin");
+    const loggedOut: string[] = [];
+    service.setMcpOauthService({
+      logout: (input: { serverUrl: string }) => {
+        loggedOut.push(input.serverUrl);
+        return Promise.resolve({ success: true });
+      },
+      credentialKey: (url: string) => url,
+    } as unknown as McpOauthService);
+    await (
+      service as unknown as { settledSignOutPasses: () => Promise<void> }
+    ).settledSignOutPasses();
+    return loggedOut;
+  }
+
+  const claudeServer = "https://claude.example.com/mcp";
+  const codexServer = "https://codex.example.com/mcp";
+
+  test("an uninstall signs out the servers of both manifests: an older build loads the fixed-order one", async () => {
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
+  });
+
+  test("the sign-out recovery signs out the servers of both manifests", async () => {
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await fsPromises.writeFile(path.join(xumRoot, "plugin-sign-outs-pending.json"), "{ not json");
+    await service.signOutPluginServers();
+    expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
+  });
+
+  test("a server that both manifests declare is signed out once", async () => {
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: claudeServer,
+    });
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([claudeServer]);
+  });
+
   test("a restart saves the approved copies of a tree through its saved method", async () => {
     await installAs("claude-plugin");
     const copiesFile = getApprovedCopiesPath(
