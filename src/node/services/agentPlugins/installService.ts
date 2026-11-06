@@ -46,7 +46,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import {
   SkillNameSchema,
   resolveSkillAdvertise,
@@ -336,6 +336,9 @@ async function signOutFailure(
  * actual advice; the log keeps one warning per workspace.
  */
 const MAX_LISTED_FAILED_WORKSPACES = 5;
+
+/** config.json cannot be read or parsed: a retry alone cannot help, the user must repair it. */
+class UnreadableConfigError extends Error {}
 
 /** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
 function describeFailedWorkspaces(ids: readonly string[]): string {
@@ -6257,7 +6260,27 @@ export class AgentPluginInstallService {
     if (!this.deps.workspaceMcpOverridesService) {
       return [];
     }
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
+    // Strict: the lenient walk reads an unreadable or corrupt config.json as
+    // zero workspaces, and an empty list passes every consent check here.
+    const allMetadata = await this.config
+      .getAllWorkspaceMetadata({ throwOnError: true })
+      .catch((error: unknown) => {
+        // The strict walk also fails on an unrelated id-less legacy entry
+        // whose metadata.json does not parse. That must not block every
+        // install, so fall back to the lenient walk, which degrades that
+        // entry, but only while config.json itself still loads strictly.
+        try {
+          this.config.loadConfigOrDefault({ throwOnError: true });
+        } catch (configError) {
+          throw new UnreadableConfigError(
+            `Xum could not read ${shortenHome(configFilePath(this.config.rootDir))} (${getErrorMessage(configError)}). Repair the file or restore it from a backup, then try again.`
+          );
+        }
+        log.warn("Enumerating workspaces for override pruning from a lenient registry walk", {
+          error: getErrorMessage(error),
+        });
+        return this.config.getAllWorkspaceMetadata();
+      });
     return allMetadata
       .filter((metadata) => {
         const runtimeType = metadata.runtimeConfig.type;
@@ -6495,12 +6518,15 @@ export class AgentPluginInstallService {
    * because unenumerated delta workspaces cannot be ruled out — callers must
    * then keep the tombstone even when `failed` is empty (an empty SENTINEL
    * tombstone records exactly this "delta workspaces unknown" state, and a
-   * failed re-enumeration cannot rule them out either).
+   * failed re-enumeration cannot rule them out either). `advice` tells the
+   * user what to do about the failed enumeration.
    */
   private async retryPrune(prune: {
     prefix: string;
     workspaceIds: string[];
-  }): Promise<{ enumerated: boolean; failed: string[] }> {
+  }): Promise<
+    { enumerated: true; failed: string[] } | { enumerated: false; failed: string[]; advice: string }
+  > {
     let liveWorkspaceIds: string[];
     try {
       liveWorkspaceIds = await this.listWorkspaceIdsForOverridePruning();
@@ -6509,7 +6535,11 @@ export class AgentPluginInstallService {
         error: getErrorMessage(error),
       });
       await this.pruneWorkspaceOverrides(prune.prefix, prune.workspaceIds);
-      return { enumerated: false, failed: prune.workspaceIds };
+      return {
+        enumerated: false,
+        failed: prune.workspaceIds,
+        advice: error instanceof UnreadableConfigError ? error.message : "Retry in a moment.",
+      };
     }
     return {
       enumerated: true,
@@ -6552,16 +6582,17 @@ export class AgentPluginInstallService {
       return;
     }
 
-    const { enumerated, failed } = await this.retryPrune(match);
-    if (!enumerated) {
+    const retried = await this.retryPrune(match);
+    if (!retried.enumerated) {
       // Delta workspaces cannot be ruled out without a live enumeration:
       // keep the tombstone verbatim (even an empty sentinel) and stay
       // blocked — clearing it here would let the reinstall proceed over
       // workspaces the sweep never saw.
       throw new Error(
-        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). Retry in a moment.`
+        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed } = retried;
     const remaining = this.updateRawPendingPrunes(
       this.rawPendingPrunes(envelope),
       serverKeyPrefix,
@@ -6591,15 +6622,16 @@ export class AgentPluginInstallService {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
     await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
     await this.deps.mcpConfigService?.pruneEnabledPluginServers(serverKeyPrefix);
-    const { enumerated, failed } = await this.retryPrune({
+    const retried = await this.retryPrune({
       prefix: serverKeyPrefix,
       workspaceIds: [],
     });
-    if (!enumerated) {
+    if (!retried.enumerated) {
       throw new Error(
-        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). Retry in a moment.`
+        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed } = retried;
     if (failed.length > 0) {
       throw new Error(
         `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
