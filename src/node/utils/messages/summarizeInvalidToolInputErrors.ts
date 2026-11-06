@@ -8,8 +8,18 @@ import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import {
   formatToolInputIssues,
   isToolInputIssueArray,
+  RECEIVED_ARGUMENTS_MARKER,
+  UNRECOGNIZED_KEY_MARKER,
+  UNRECOGNIZED_KEYS_MARKER,
 } from "@/common/utils/tools/formatToolInputIssues";
 import { log } from "@/node/services/log";
+
+export const INVALID_TOOL_INPUT_PREFIX = "Invalid input for tool ";
+
+const LOGGED_ERROR_MAX_CHARS = 500;
+const SUMMARY_HEAD = /^([^:]*: )(.*)$/;
+const SDK_ERROR_NAME = /^[A-Za-z_$][\w$]*Error: /;
+const UNRECOGNIZED_KEY_MARKERS = [UNRECOGNIZED_KEY_MARKER, UNRECOGNIZED_KEYS_MARKER];
 
 export interface RejectedToolCallLogContext {
   model?: string;
@@ -29,12 +39,63 @@ export function describeInvalidToolInput(toolName: string, input: unknown, error
     for (let depth = 0; depth < 3 && typeof cause === "object" && cause !== null; depth += 1) {
       const issues: unknown = (cause as { issues?: unknown }).issues;
       if (isToolInputIssueArray(issues)) {
-        return `Invalid input for tool ${toolName}: ${formatToolInputIssues(issues, input)}`;
+        return `${INVALID_TOOL_INPUT_PREFIX}${toolName}: ${formatToolInputIssues(issues, input)}`;
       }
       cause = (cause as { cause?: unknown }).cause;
     }
   }
   return clampErrorMessage(getErrorMessage(error));
+}
+
+/**
+ * The copy of a rejected call's error for the shared log. The model keeps the
+ * key names it sent, on purpose: they are its own text and show it what to fix.
+ * The log is shared across workspaces, so the sink is the boundary, and no shape
+ * rule tells a parameter name from a key that holds a credential. Clauses that
+ * list keys become [redacted], label path segments after the first become
+ * [withheld], an SDK message that echoes the input keeps only its error name,
+ * and only the first line is kept, capped at 500 characters. Segment 0 is
+ * schema-declared for every mux tool, but a dynamic or MCP tool whose whole
+ * argument object is a free-form map would put model text there.
+ */
+export function redactRejectedToolCallError(error: unknown): unknown {
+  if (typeof error !== "string" || !error.startsWith(INVALID_TOOL_INPUT_PREFIX)) {
+    return error;
+  }
+  const newline = error.indexOf("\n");
+  const line = newline === -1 ? error : error.slice(0, newline);
+  const redacted = line.replace(
+    SUMMARY_HEAD,
+    (_match, head: string, body: string) => `${head}${redactBody(body)}`
+  );
+  const cut = newline === -1 ? "" : " [further lines withheld]";
+  return clampErrorMessage(`${redacted}${cut}`, LOGGED_ERROR_MAX_CHARS);
+}
+
+function redactBody(body: string): string {
+  const errorName = SDK_ERROR_NAME.exec(body);
+  if (errorName !== null) {
+    return `${errorName[0]}[withheld]`;
+  }
+  const receivedAt = body.indexOf(`. ${RECEIVED_ARGUMENTS_MARKER}`);
+  const issues = (receivedAt === -1 ? body : body.slice(0, receivedAt))
+    .split("; ")
+    .map(redactIssue)
+    .join("; ");
+  return receivedAt === -1 ? issues : `${issues}. ${RECEIVED_ARGUMENTS_MARKER}[redacted]`;
+}
+
+function redactIssue(issue: string): string {
+  const labelEnd = issue.indexOf(": ");
+  if (labelEnd === -1) {
+    return issue;
+  }
+  const label = issue.slice(0, labelEnd);
+  const message = issue.slice(labelEnd + 2);
+  const dot = label.indexOf(".");
+  const shownLabel = dot === -1 ? label : `${label.slice(0, dot)}.[withheld]`;
+  const marker = UNRECOGNIZED_KEY_MARKERS.find((candidate) => message.startsWith(candidate));
+  return `${shownLabel}: ${marker === undefined ? message : `${marker}[redacted]`}`;
 }
 
 /**

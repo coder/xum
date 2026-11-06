@@ -25,11 +25,17 @@ export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[]
   );
 }
 
+export const RECEIVED_ARGUMENTS_MARKER = "Received arguments: ";
+export const UNRECOGNIZED_KEY_MARKER = "unrecognized key: ";
+export const UNRECOGNIZED_KEYS_MARKER = "unrecognized keys: ";
+
 const RECEIVED_MAX_KEYS = 10;
 const DISPLAYABLE_KEY_MAX_CHARS = 40;
 // Every tool parameter name is lowercase-led snake_case or camelCase without
-// digits (the longest is 19 characters). Keys outside that shape are data a
-// model put in the wrong place (tokens, paths, emails) and are only counted.
+// digits (the longest is 19 characters). Keys outside that shape are only
+// counted, which keeps most misplaced data out of the model's retry text. This
+// is a display rule: a lowercase-led credential still fits it, so the log copy
+// is redacted separately (redactRejectedToolCallError).
 const DISPLAYABLE_KEY = /^[a-z][a-z_]*(?:[A-Z][a-z_]*)*$/;
 
 /**
@@ -48,7 +54,9 @@ const DISPLAYABLE_KEY = /^[a-z][a-z_]*(?:[A-Z][a-z_]*)*$/;
 export function formatToolInputIssues(issues: readonly ToolInputIssue[], input: unknown): string {
   const text = issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
   const missing = issues.some((issue) => isMissingProperty(issue, input));
-  return missing ? `${text}. Received arguments: ${describeReceivedArguments(input)}` : text;
+  return missing
+    ? `${text}. ${RECEIVED_ARGUMENTS_MARKER}${describeReceivedArguments(input)}`
+    : text;
 }
 
 // Paths resolve against the raw input, before any schema preprocess renames an
@@ -78,11 +86,11 @@ function describeReceivedArguments(input: unknown): string {
 function describeUnrecognizedKeys(keys: readonly string[]): string {
   const displayable = keys.filter(isDisplayableKey);
   const hidden = keys.length - displayable.length;
-  const noun = keys.length === 1 ? "unrecognized key" : "unrecognized keys";
+  const marker = keys.length === 1 ? UNRECOGNIZED_KEY_MARKER : UNRECOGNIZED_KEYS_MARKER;
   if (displayable.length === 0) {
-    return `${hidden} ${noun} not shown`;
+    return `${hidden} ${marker.slice(0, -": ".length)} not shown`;
   }
-  return `${noun}: ${joinWithCounts(displayable, hidden)}`;
+  return `${marker}${joinWithCounts(displayable, hidden)}`;
 }
 
 function joinWithCounts(parts: readonly string[], hidden: number): string {
