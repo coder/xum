@@ -9,6 +9,7 @@ import { Effect, Semaphore } from "effect";
 import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
@@ -2498,6 +2499,12 @@ export class Config {
     ProjectsConfig,
     Map<string, WorkspaceMetadataMemoEntry>
   >();
+  /**
+   * Metadata load failures already logged with their stack. A degraded entry fails the same way
+   * on every lenient build, and MCP override reads build once per read (the tool-call gate reads
+   * on every call), so each distinct failure logs its stack once and a one-line debug after.
+   */
+  private readonly loggedMetadataLoadFailures = new Set<string>();
   private workspaceIndex = new Map<
     string,
     {
@@ -4769,6 +4776,20 @@ export class Config {
     return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
+  /** See loggedMetadataLoadFailures. */
+  private logMetadataLoadFailure(workspacePath: string, error: unknown): void {
+    const key = `${workspacePath}\0${getErrorMessage(error)}`;
+    if (this.loggedMetadataLoadFailures.has(key)) {
+      log.debug("Failed to load/migrate workspace metadata (stack logged before)", {
+        workspacePath,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    this.loggedMetadataLoadFailures.add(key);
+    log.error(`Failed to load/migrate workspace metadata:`, error);
+  }
+
   private async buildWorkspaceMetadata(
     config: ProjectsConfig,
     projects: Iterable<[string, ProjectConfig]>,
@@ -5247,7 +5268,7 @@ export class Config {
           if (options?.throwOnError) {
             throw error;
           }
-          log.error(`Failed to load/migrate workspace metadata:`, error);
+          this.logMetadataLoadFailure(workspace.path, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           const metadata: WorkspaceMetadata = {
