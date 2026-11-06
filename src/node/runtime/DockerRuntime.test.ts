@@ -282,7 +282,7 @@ describe("DockerRuntime home of the container user", () => {
       [
         "#!/bin/sh",
         'dir=$(dirname "$0")',
-        'echo "$*" >> "$dir/calls.log"',
+        'echo "argc=$# $*" >> "$dir/calls.log"',
         'if [ -f "$dir/failure" ]; then',
         '  cat "$dir/failure" >&2',
         '  exit "$(cat "$dir/failure-exit")"',
@@ -347,6 +347,26 @@ describe("DockerRuntime home of the container user", () => {
 
     expect(await runtime.ensureReady()).toEqual({ ready: true });
     expect(await runtime.resolvePath("~")).toBe("/root");
+  });
+
+  it("hands the probe to the container CLI as separate arguments, without a host shell", async () => {
+    const runtime = new DockerRuntime({
+      image: "codercom/example-base:ubuntu",
+      containerName: "mux test",
+    });
+
+    expect(await runtime.resolvePath("~")).toBe("/home/coder");
+    const calls = await fs.readFile(path.join(cliDir, "calls.log"), "utf8");
+    expect(calls).toContain("argc=5 exec mux test sh -c echo $HOME");
+  });
+
+  it("reports a container CLI that cannot start as a transport failure", async () => {
+    process.env[CONTAINER_CLI_ENV] = path.join(cliDir, "no-such-cli");
+    const runtime = existingContainerRuntime();
+
+    const failure = await runtime.resolvePath("~").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RuntimeError);
+    expect((failure as RuntimeError).type).toBe("network");
   });
 
   it("keeps /root for ~ until there is a container to ask", async () => {

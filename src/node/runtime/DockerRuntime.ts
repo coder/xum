@@ -66,8 +66,8 @@ function sanitizeContainerUserId(rawValue: string): string {
   return /^\d+$/.test(trimmedValue) ? trimmedValue : "0";
 }
 
-/** The command that prints the home of the container's default user, as `docker exec` runs it. */
-const PRINT_HOME = "sh -c 'echo $HOME'";
+/** The `docker exec` arguments that print the home of the container's default user. */
+const PRINT_HOME_ARGS = ["sh", "-c", "echo $HOME"];
 
 interface ContainerUserInfo {
   uid: string;
@@ -459,12 +459,19 @@ export class DockerRuntime extends RemoteRuntime {
     // Before createWorkspace there is no container to ask.
     if (this.containerName === undefined) return "/root";
 
-    const probe = await runDockerCommand(`exec ${this.containerName} ${PRINT_HOME}`, 5000);
+    const probe = await runContainerSpawnCommand(
+      ["exec", this.containerName, ...PRINT_HOME_ARGS],
+      5000
+    );
     const home = probe.stdout.trim();
     if (probe.exitCode !== 0 || home === "") {
+      // A negative exit code means the CLI did not finish (it timed out, or could not start), so
+      // the container's state is unknown.
+      const unavailable =
+        probe.exitCode < 0 || isContainerUnavailableExit(probe.exitCode, probe.stderr);
       throw new RuntimeError(
         `Failed to resolve the home of container ${this.containerName}: ${probe.stderr.trim()}`,
-        isContainerUnavailableExit(probe.exitCode, probe.stderr) ? "network" : "exec"
+        unavailable ? "network" : "exec"
       );
     }
     this.containerHome = home;
@@ -665,7 +672,7 @@ export class DockerRuntime extends RemoteRuntime {
     const [uidResult, gidResult, homeResult] = await Promise.all([
       runDockerCommand(`exec ${containerName} id -u`, 5000, abortSignal),
       runDockerCommand(`exec ${containerName} id -g`, 5000, abortSignal),
-      runDockerCommand(`exec ${containerName} ${PRINT_HOME}`, 5000, abortSignal),
+      runContainerSpawnCommand(["exec", containerName, ...PRINT_HOME_ARGS], 5000, abortSignal),
     ]);
 
     return {
