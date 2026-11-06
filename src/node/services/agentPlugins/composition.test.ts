@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { MCPServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { buildWorkspaceComposition } from "./composition";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -13,6 +18,24 @@ import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFi
 
 const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
+
+// The inspector also scans the runtime user's global roots. A host with many installed skills adds
+// a shell containment probe per skill and root (about 990 in the first test), so three tests ran
+// into their 120 s and 240 s limits, while an empty home takes seconds.
+let hostHome: IsolatedHostHome | undefined;
+
+function isolatedHome(): IsolatedHostHome {
+  assert(hostHome !== undefined, "the isolated host home is created in beforeAll");
+  return hostHome;
+}
+
+beforeAll(() => {
+  hostHome = isolateHostHome("composition-host-home");
+});
+
+afterAll(() => {
+  hostHome?.restore();
+});
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
@@ -110,6 +133,25 @@ describe("buildWorkspaceComposition", () => {
     );
     // Project shell tool hook (hooks.ts precedence: project shadows user-level).
     await fs.writeFile(path.join(workspace.path, ".mux", "tool_pre"), "#!/bin/sh\n", "utf-8");
+    // The only global skill and the only global plugin are the ones in the isolated homes, never
+    // those of the host.
+    await writeSkill(
+      path.join(isolatedHome().xumRoot, "skills", "global-fixture-skill"),
+      "global-fixture-skill",
+      "Global skill"
+    );
+    const homePluginDir = path.join(
+      isolatedHome().homePath,
+      ".agents",
+      "plugins",
+      "home-fixture-plugin"
+    );
+    await fs.mkdir(homePluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(homePluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "home-fixture-plugin" }),
+      "utf-8"
+    );
 
     const composition = await buildWorkspaceComposition({
       runtime: new LocalRuntime(workspace.path),
@@ -139,6 +181,13 @@ describe("buildWorkspaceComposition", () => {
     const shadowedPluginSkill = shared.find((s) => s.source === PLUGIN_SOURCE);
     expect(projectSkill?.shadowedBy).toBeUndefined();
     expect(shadowedPluginSkill?.shadowedBy).toBe("project");
+
+    expect(composition.skills.filter((s) => s.source === "global").map((s) => s.name)).toEqual([
+      "global-fixture-skill",
+    ]);
+    expect(composition.plugins.filter((p) => p.scope === "global").map((p) => p.name)).toEqual([
+      "home-fixture-plugin",
+    ]);
 
     // Agents.
     const agent = composition.agents.find((a) => a.name === "fixture-agent");
