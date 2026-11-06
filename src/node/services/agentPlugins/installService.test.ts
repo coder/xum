@@ -5452,7 +5452,12 @@ describe("AgentPluginInstallService", () => {
     await commitAll(remoteDir, "cwd pointing at plugin data");
 
     const preview = await service.preview({ input: remoteDir });
-    const dataPath = getPluginDataPath(muxRoot, computePluginInstanceId(preview.targetPath));
+    // preview.targetPath is display text (`~/...` when the root sits under HOME), not the lexical
+    // install location that the instance ID hashes.
+    const dataPath = getPluginDataPath(
+      muxRoot,
+      computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"))
+    );
     expect(preview.mcpServers[0].summary).toContain(`cwd: '${dataPath}'`);
   });
 
@@ -8195,7 +8200,11 @@ describe("AgentPluginInstallService", () => {
     });
     const preview = await serviceWithMcp.preview({ input: remoteDir });
     await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
-    const key = buildPluginServerKey(computePluginInstanceId(preview.targetPath), "echo");
+    // The lexical install location, not preview.targetPath (display text: `~/...` under HOME).
+    const key = buildPluginServerKey(
+      computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+      "echo"
+    );
     expect((await mcpConfigService.listServers())[key]?.disabled).toBe(true);
     expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
       success: true,
