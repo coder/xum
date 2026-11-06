@@ -27,9 +27,6 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 const skillMd = (name: string) => `---\nname: ${name}\ndescription: The ${name} skill\n---\nBody\n`;
 
-/** The scratch clone of anthropics/skills, when this machine has it (no network needed). */
-const ANTHROPIC_SKILLS_CLONE = "/home/coder/.mux/sessions/912d5d0f95/scratch/as";
-
 async function initRepo(dir: string): Promise<void> {
   await fsPromises.mkdir(dir, { recursive: true });
   await git(dir, "init", "-q", "-b", "main");
@@ -897,30 +894,63 @@ describe("AgentPluginInstallService marketplaces", () => {
     expect(existsSync(installed)).toBe(false);
   });
 
-  test.skipIf(!existsSync(ANTHROPIC_SKILLS_CLONE))(
-    "anthropics/skills: document-skills previews /pdf",
-    async () => {
-      // A shallow clone cannot serve as a remote: copy its tree into a fresh repository.
-      const copy = path.join(tmpRoot, "skills");
-      await fsPromises.cp(ANTHROPIC_SKILLS_CLONE, copy, {
-        recursive: true,
-        filter: (source) => path.basename(source) !== ".git",
-      });
-      await initRepo(copy);
-      await commit(copy, "copy");
-      const listed = await service.previewSource({ input: copy });
-      if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
-      expect(listed.marketplace.entries.length).toBe(5);
-      const preview = await service.preview({
-        input: copy,
-        method: { kind: "claude-marketplace", entry: "document-skills" },
-      });
-      expect(preview.skills.map((skill) => skill.name).sort()).toEqual([
-        "docx",
-        "pdf",
-        "pptx",
-        "xlsx",
-      ]);
-    }
-  );
+  // The catalog of anthropics/skills at its present scale: five entries that share "./" and list
+  // 4, 12, 1, 1 and 1 skills. The names and lists follow its marketplace.json, the text is ours.
+  // This test used to copy a local clone of that repository (445 files, 13 MB) and ran only on
+  // the one machine that had it, so CI skipped it. On the real data Xum counts 0 skills for
+  // `claude-api` (its description is over 1024 characters: see "a skill that Xum rejects counts
+  // nowhere"), and the generated skill has a short one, so it counts 1 here.
+  test("a catalog shaped like anthropics/skills lists five entries; document-skills previews its four skills", async () => {
+    const catalog: Record<string, string[]> = {
+      "document-skills": ["xlsx", "docx", "pptx", "pdf"],
+      "example-skills": [
+        "algorithmic-art",
+        "brand-guidelines",
+        "canvas-design",
+        "doc-coauthoring",
+        "frontend-design",
+        "internal-comms",
+        "mcp-builder",
+        "skill-creator",
+        "slack-gif-creator",
+        "theme-factory",
+        "web-artifacts-builder",
+        "webapp-testing",
+      ],
+      "claude-api": ["claude-api"],
+      "academy-guide": ["academy-guide"],
+      "discernment-nudge": ["discernment-nudge"],
+    };
+    const skills = Object.values(catalog).flat();
+    const catalogDir = path.join(tmpRoot, "skills");
+    await initRepo(catalogDir);
+    await writeFiles(catalogDir, {
+      ".claude-plugin/marketplace.json": marketplace(
+        Object.entries(catalog).map(([name, listed]) => ({
+          name,
+          source: "./",
+          strict: false,
+          skills: listed.map((skill) => `./skills/${skill}`),
+        }))
+      ),
+      ...Object.fromEntries(skills.map((skill) => [`skills/${skill}/SKILL.md`, skillMd(skill)])),
+    });
+    await commit(catalogDir, "catalog");
+
+    const listed = await service.previewSource({ input: catalogDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(singleBuildRows(listed.marketplace).map((row) => [row.name, row.skillCount])).toEqual(
+      Object.entries(catalog).map(([name, listedSkills]) => [name, listedSkills.length])
+    );
+    const preview = await service.preview({
+      input: catalogDir,
+      method: { kind: "claude-marketplace", entry: "document-skills" },
+    });
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual([
+      "docx",
+      "pdf",
+      "pptx",
+      "xlsx",
+    ]);
+  });
 });

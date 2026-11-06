@@ -27,7 +27,13 @@ import {
  * (src/node/services/agentPlugins/discovery.ts) remains the source of truth
  * for what loads, so drift between registry and disk self-heals: directories
  * without a registry entry show as "unmanaged", entries without a directory
- * show as "missing".
+ * show as "missing". Discovery still reads only the folder: the row's saved
+ * `installMethod` only decides which manifest of that folder it reads.
+ *
+ * `installMethod` (agent-plugin, claude-plugin or cursor-plugin) is an optional RAW field
+ * that this schema does not list, so parsing strips it. readStoredInstallMethod
+ * (src/node/services/agentPlugins/registry.ts) reads it from the raw row instead, and an
+ * unknown value from a newer build means the fixed manifest order, never an invalid row.
  */
 
 export const AgentPluginGitSourceSchema = z.object({

@@ -11,6 +11,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import type { McpOauthService } from "@/node/services/mcpOauthService";
+import { getApprovedCopiesPath } from "./approvedCopies";
 import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { listPluginAgentFiles } from "./agentFiles";
 import { reviewedComponentConsent } from "./testFixtures";
@@ -18,6 +20,7 @@ import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { log } from "@/node/services/log";
 import { STAGING_DIR_NAME } from "./journals";
+import { computePluginInstanceId } from "./mcpConfig";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -691,6 +694,140 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     await commit("Codex only");
     await updateWithReview();
     expect((await rawRow()).lockedSha).toBe((await git(remoteDir, "rev-parse", "HEAD")).trim());
+  });
+
+  /**
+   * The readers below must follow the saved method, not the fixed order. With the Codex manifest
+   * broken, the fixed order finds no plugin in the installed tree and only a reader that loads
+   * `.claude-plugin/plugin.json` still does, so each test fails if its reader forgets the method.
+   */
+  async function breakCodexManifest(): Promise<void> {
+    await fsPromises.writeFile(
+      path.join(installedDir(), ".codex-plugin", "plugin.json"),
+      "{ not json"
+    );
+    const discover = (choice: Parameters<typeof discoverAgentPluginAt>[0]["choice"]) =>
+      discoverAgentPluginAt({ pluginDir: installedDir(), scope: "global", choice });
+    expect((await discover({ kind: "fixed-order" })).plugin).toBeNull();
+    expect((await discover({ kind: "method", method: "claude-plugin" })).plugin?.name).toBe("egm");
+  }
+
+  test("the component inventory reads the installed tree through the saved method", async () => {
+    await installAs("claude-plugin");
+    await breakCodexManifest();
+    const inventory = await service.getComponents({ name: "egm" });
+    expect(inventory.skills.map((skill) => skill.name).sort()).toEqual([...EGM_SKILLS].sort());
+  });
+
+  test("the hook gate lists and records a decision on hooks through the saved method", async () => {
+    await write({
+      "hooks/hooks.json": JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher: "^bash$", hooks: [{ type: "mcp_tool", server: "scanner", tool: "scan" }] },
+          ],
+        },
+      }),
+    });
+    await commit("a hooks file");
+    await installAs("claude-plugin");
+    await breakCodexManifest();
+
+    const { hooks } = await service.getHooks({ name: "egm" });
+    expect(hooks.map((hook) => [hook.event, hook.review])).toEqual([["PreToolUse", "new"]]);
+    // Xum lists the hooks of a Claude plugin and never runs them: the user can only disable one.
+    await service.setHookTrust({
+      name: "egm",
+      key: hooks[0].key,
+      hash: hooks[0].hash,
+      state: "disabled",
+    });
+    expect((await service.getHooks({ name: "egm" })).hooks[0]?.review).toBe("disabled");
+  });
+
+  test("the sign-out recovery lists the remote servers of a tree through its saved method", async () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    await write({
+      ".mcp.json": JSON.stringify({ mcpServers: { remote: { type: "http", url: serverUrl } } }),
+    });
+    await commit("a remote MCP server");
+    await installAs("claude-plugin");
+    await breakCodexManifest();
+
+    const loggedOut: string[] = [];
+    service.setMcpOauthService({
+      logout: (input: { serverUrl: string }) => {
+        loggedOut.push(input.serverUrl);
+        return Promise.resolve({ success: true });
+      },
+      credentialKey: (url: string) => url,
+    } as unknown as McpOauthService);
+    await (
+      service as unknown as { settledSignOutPasses: () => Promise<void> }
+    ).settledSignOutPasses();
+    loggedOut.length = 0;
+    // A record that cannot be read: the servers come from the installed plugin trees.
+    await fsPromises.writeFile(path.join(xumRoot, "plugin-sign-outs-pending.json"), "{ not json");
+    await service.signOutPluginServers();
+    expect(loggedOut).toEqual([serverUrl]);
+  });
+
+  test("a restart saves the approved copies of a tree through its saved method", async () => {
+    await installAs("claude-plugin");
+    const copiesFile = getApprovedCopiesPath(
+      xumRoot,
+      computePluginInstanceId(path.join(xumRoot, "plugins", "egm"))
+    );
+    // An install approved by a build without copies: the startup sweep saves them.
+    await fsPromises.rm(copiesFile);
+    await breakCodexManifest();
+    const restarted = new AgentPluginInstallService(new Config(xumRoot), {});
+    const internals = restarted as unknown as {
+      reconciliationState: Promise<boolean>;
+      startupApprovedCopiesSweep: Promise<void> | undefined;
+    };
+    expect(await internals.reconciliationState).toBe(true);
+    await internals.startupApprovedCopiesSweep;
+    const copies = JSON.parse(await fsPromises.readFile(copiesFile, "utf8")) as {
+      skills: Record<string, unknown>;
+    };
+    expect(Object.keys(copies.skills).sort()).toEqual([...EGM_SKILLS].sort());
+  });
+
+  test("crash recovery reconciles a promoted update through the saved method", async () => {
+    await installAs("claude-plugin");
+    await write({ "README.md": "more\n" });
+    const next = await commit("readme");
+    const review = await service.previewUpdate({ name: "egm" });
+    // The update dies after the promote: the journal deletion and the registry write both fail.
+    const internals = service as unknown as {
+      consumeJournalFile: (journalPath: string) => Promise<void>;
+      writeRegistry: (envelope: Record<string, unknown>, entries: unknown[]) => Promise<void>;
+    };
+    const consumeSpy = spyOn(internals, "consumeJournalFile").mockImplementationOnce(() =>
+      Promise.reject(new Error("EBUSY: resource busy"))
+    );
+    const writeSpy = spyOn(internals, "writeRegistry").mockImplementationOnce(() =>
+      Promise.reject(new Error("ENOSPC: no space left on device"))
+    );
+    try {
+      await expect(
+        service.update({
+          name: "egm",
+          consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [] },
+        })
+      ).rejects.toThrow(/ENOSPC/);
+    } finally {
+      consumeSpy.mockRestore();
+      writeSpy.mockRestore();
+    }
+    expect((await rawRow()).lockedSha).toBe(review.fromSha);
+    await breakCodexManifest();
+
+    // Section open runs recovery: it reads the promoted tree through the saved method.
+    await service.list();
+    expect((await rawRow()).lockedSha).toBe(next);
+    expect((await rawRow()).installMethod).toBe("claude-plugin");
   });
 });
 

@@ -515,6 +515,7 @@ export const AddPluginConsentPreview: Story = {
             ],
             agents: ["grill-master.md"],
             readonlyAgents: [],
+            shellRemovedAgents: [],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
             reviewedComponents: [
@@ -613,6 +614,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             mcpServers: [],
             agents: [],
             readonlyAgents: [],
+            shellRemovedAgents: [],
             workflows: [],
             slashCommands: [],
             reviewedComponents: [],
@@ -1431,6 +1433,7 @@ const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
   mcpServers: [{ serverName: "review-db", transport: "stdio", summary: "node ./bin/db.js" }],
   agents: ["reviewer.md"],
   readonlyAgents: [],
+  shellRemovedAgents: [],
   workflows: [],
   slashCommands: [],
   reviewedComponents: [],
@@ -2013,6 +2016,7 @@ const CURSOR_KIT_PREVIEW: AgentPluginInstallPreview = {
   ],
   agents: ["ci-watcher.md", "reviewer.md"],
   readonlyAgents: ["reviewer.md"],
+  shellRemovedAgents: [],
   notApplied: [
     { part: "field", name: "variables", reason: "not applied in Xum" },
     { part: "hook", name: "hooks", reason: "Cursor hooks run in a later Xum build" },
