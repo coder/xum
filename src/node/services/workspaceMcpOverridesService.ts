@@ -483,6 +483,8 @@ class ConfigSnapshot {
     canonical: Map<string, Promise<string | undefined>>;
     /** In-flight writes started by this operation (see trackSideEffect). */
     sideEffects: Set<Promise<unknown>>;
+    /** loadSweepMetadata fell back to the lenient walk. */
+    lenientRegistry?: true;
   };
   private _cancelled = false;
 
@@ -604,12 +606,18 @@ class ConfigSnapshot {
   loadSweepMetadata(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
     return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
       this.loadLegacyConfig();
+      this.store.lenientRegistry = true;
       log.warn(
         "[MCP] Sweeping plugin overrides from a lenient registry walk: another entry's metadata is unreadable",
         { workspaceIds, error: getErrorMessage(error) }
       );
       return this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
     }));
+  }
+
+  /** The registry came from loadSweepMetadata's lenient fallback: a degraded entry's id is unknown. */
+  get lenientRegistry(): boolean {
+    return this.store.lenientRegistry === true;
   }
 
   canonicalize(identity: string, filePath: string): Promise<string | undefined> {
@@ -4843,7 +4851,12 @@ export class WorkspaceMcpOverridesService {
       }
     }
 
-    if (options?.publish) {
+    if (options?.publish && after.lenientRegistry) {
+      // Publication resolves inheritance from this registry, which lists a degraded entry under
+      // its fallback id: a child of that entry would publish `{}` for its parent's settings as
+      // disk truth. Evict every cache instead, so the next read goes to disk.
+      await options.publish(null, ALL_WORKSPACES_TARGET);
+    } else if (options?.publish) {
       failures.push(
         ...(await this.publishSweptWorkspaces(
           swept,
