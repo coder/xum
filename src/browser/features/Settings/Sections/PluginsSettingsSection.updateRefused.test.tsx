@@ -94,3 +94,26 @@ test("an update review without a refusal still asks for confirmation", async () 
   await view.findByRole("button", { name: "Apply update" });
   expect(view.queryByRole("button", { name: "Remove plugin" })).toBeNull();
 });
+
+test("a plugin that an older Xum version moved says why it loads nothing, and keeps Uninstall", async () => {
+  const closedReason =
+    "An older Xum version updated this plugin after you chose how to install it, so Xum has not reviewed that manifest at this commit. The plugin loads nothing. Uninstall it and install it again to review it.";
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [{ ...item, present: false, skillCount: 0, closedReason }],
+    },
+  });
+  const view = render(
+    <APIProvider client={api}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+
+  await view.findByText(/An older Xum version updated this plugin/);
+  view.getByText("needs reinstall");
+  expect(view.queryByText("missing")).toBeNull();
+  expect(view.queryByRole("button", { name: /Manage components/ })).toBeNull();
+  view.getByRole("button", { name: "Uninstall egm" });
+});

@@ -183,6 +183,36 @@ describe("ServerService.startServer", () => {
     expect(lockData.token).toBe("other-server-token");
   });
 
+  test("start replaces the stale lock of a dead server", async () => {
+    const service = new ServerService();
+    const lockPath = path.join(tempDir, "server.lock");
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999999999, // Not a live process
+        baseUrl: "http://127.0.0.1:9999",
+        token: "dead-server-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+
+    const info = await service.startServer({
+      xumHome: tempDir,
+      context: stubContext,
+      authToken: "test-token",
+      port: 0,
+    });
+
+    try {
+      const lockData = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8")));
+      expect(lockData.pid).toBe(process.pid);
+      expect(lockData.baseUrl).toBe(info.baseUrl);
+      expect(lockData.token).toBe("test-token");
+    } finally {
+      await service.stopServer();
+    }
+  });
+
   test("successful start creates lockfile and server", async () => {
     const service = new ServerService();
 

@@ -1647,6 +1647,32 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
+/**
+ * Whether an older build's move of a saved method matters (B3): the saved manifest is not the
+ * manifest that the fixed order loads from the installed tree. The older build loaded and
+ * reviewed the fixed-order manifest, so for any other saved manifest nobody reviewed its
+ * components, Cursor hooks or OAuth servers at the new commit. `agent-plugin` resolves like the
+ * fixed order (B1), so it never matters.
+ */
+export async function movedMethodMatters(
+  pluginDir: string,
+  saved: SavedInstallMethod
+): Promise<boolean> {
+  if (saved === "agent-plugin") return false;
+  let rootReal: string;
+  try {
+    rootReal = await pluginFs().realpath(pluginDir);
+  } catch {
+    return true;
+  }
+  const selected = await selectManifest(rootReal, undefined, { kind: "fixed-order" });
+  if (selected === null || "error" in selected) return true;
+  const fixedOrderMethod = AGENT_PLUGIN_MANIFEST_TABLE.find(
+    (spec) => spec.relative === selected.relative
+  )?.method;
+  return fixedOrderMethod !== saved;
+}
+
 function normalizeSelectedManifest(manifestRelative: string, raw: unknown): NormalizedManifest {
   const spec = AGENT_PLUGIN_MANIFEST_TABLE.find((entry) => entry.relative === manifestRelative);
   assert(spec !== undefined, `normalizeSelectedManifest: unknown manifest ${manifestRelative}`);
@@ -2075,6 +2101,47 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
   }
 }
 
+/**
+ * What Xum says about a plugin that an older build moved to a commit with its saved manifest
+ * unreviewed (B3): the diagnostic of the scan, the Settings row and the update refusal.
+ */
+export const MOVED_METHOD_MESSAGE =
+  "An older Xum version updated this plugin after you chose how to install it, so Xum has not reviewed that manifest at this commit. The plugin loads nothing. Uninstall it and install it again to review it.";
+
+/**
+ * discoverPluginAt for a plugin of a managed container. It loads the manifest its install saved
+ * (B2); anything else, and a registry that cannot be read, read the fixed order. A saved method
+ * that an older build moved to a commit loads nothing until it is reset or reinstalled: its saved
+ * manifest was never reviewed at that commit (B3).
+ */
+async function discoverManagedPluginAt(
+  args: Omit<Parameters<typeof discoverPluginAt>[0], "choice"> & {
+    imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined;
+  }
+): Promise<AgentPluginInfo | null> {
+  const { imports, ...rest } = args;
+  const plugin = await discoverPluginAt({
+    ...rest,
+    choice: managedManifestChoice(imports, args.dirName),
+  });
+  const saved = imports?.methodByName.get(args.dirName);
+  if (
+    plugin === null ||
+    saved === undefined ||
+    imports?.methodMovedByName.has(args.dirName) !== true ||
+    !(await movedMethodMatters(args.pluginDir, saved))
+  ) {
+    return plugin;
+  }
+  args.diagnostics.push({
+    path: path.join(args.containerPath, args.dirName),
+    scope: args.scope,
+    severity: "error",
+    message: MOVED_METHOD_MESSAGE,
+  });
+  return null;
+}
+
 function managedManifestChoice(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   entryName: string
@@ -2404,15 +2471,13 @@ export async function discoverAgentPlugins(
       const instancePath = path.join(container.path, entryName);
       let plugin = snapshot.plugins.get(entryName);
       if (plugin === undefined) {
-        plugin = await discoverPluginAt({
+        plugin = await discoverManagedPluginAt({
           pluginDir: path.join(canonicalPath, entryName),
           containerPath: container.path,
           dirName: entryName,
           scope: container.scope,
           diagnostics,
-          // A managed plugin loads the manifest its install saved (B2); anything else, and a
-          // registry that cannot be read, read the fixed order.
-          choice: managedManifestChoice(snapshot.imports, entryName),
+          imports: snapshot.imports,
         });
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {

@@ -483,6 +483,11 @@ export const AgentPluginListItemSchema = z.object({
   otherMethods: z
     .array(z.object({ method: SavedInstallMethodSchema, agents: z.number().int().nonnegative() }))
     .optional(),
+  /**
+   * Set on a managed plugin that loads nothing because an older Xum version moved it to a commit
+   * whose saved install method nobody reviewed (B3). The row says why, and an update refuses.
+   */
+  closedReason: z.string().optional(),
 });
 
 /**

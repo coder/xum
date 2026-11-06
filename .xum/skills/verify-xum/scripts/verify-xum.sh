@@ -487,10 +487,10 @@ refuse_off_loopback_listener() { # refuse_off_loopback_listener <port> <what lis
 }
 
 # The checks that need a ready backend: its listeners and the token in its server.lock. Sets
-# token. A nodemon restart kills the backend, and the next one deletes the dead one's server.lock
-# before it binds the port, and writes its own lock after (see run_token). So a missing lock, a
-# lock that changed while the checks ran, or a /health that stopped answering means a restart:
-# return 1, and launch waits for readiness again. Refuse only what one backend showed throughout.
+# token. A nodemon restart kills the backend, and the next one writes its own lock once it listens
+# (see run_token), replacing the dead one's. So a missing lock, a lock that changed while the
+# checks ran, or a /health that stopped answering means a restart: return 1, and launch waits for
+# readiness again. Refuse only what one backend showed throughout.
 backend_checks_after_ready() {
   local before after listening=yes
   before=$(cat "$VERIFY_XUM_ROOT/server.lock" 2>/dev/null) || return 1
@@ -777,9 +777,10 @@ cmd_workspace_field() {
 }
 
 # The backend's token: server.lock's, else the copy launch keeps in the private run folder. A
-# stopped backend deletes server.lock for good. A nodemon restart deletes it for a moment: the old
-# backend dies on SIGUSR2 and leaves its lock, the next one deletes that lock at startup because
-# its pid is dead (ServerLockfile.read), and writes its own, with the same token, once it listens.
+# stopped backend deletes server.lock for good. A nodemon restart replaces it: the old backend
+# dies on SIGUSR2 and leaves its lock, which names a dead pid until the next one writes its own,
+# with the same token, once it listens (ServerLockfile.read ignores a stale lock and never
+# deletes it).
 run_token() {
   local token
   token=$(json_field_or_empty "$VERIFY_XUM_ROOT/server.lock" token)
@@ -1052,8 +1053,9 @@ is_dev_server_sandbox_root() {
 # URL and token are in the caller's env under XUM_* and MUX_* names, and the CLI reads either. The
 # CLI speaks only TCP and reads server.lock itself, so this first checks that the backend that
 # server.lock names carries this run's id and is what listens on its port. The port can be free
-# otherwise (see backend_curl), and the CLI would send the token to whoever bound it. A restart
-# between this check and the CLI's own read of server.lock leaves a short window it cannot close.
+# otherwise (see backend_curl), and the CLI would send the token to whoever bound it. The CLI's own
+# read of server.lock ignores a lock whose pid has died (ServerLockfile.read), so a restart after
+# this check is caught there. What is left is the moment between that read and the CLI's connect.
 cmd_cli() {
   load_run ""
   local lock pid port listeners

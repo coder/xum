@@ -79,6 +79,23 @@ A plugin agent without any of those fields is read as a Claude Code or Cursor su
 
 So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools, narrowed by any Claude Code tool list: without one, it can run shell commands and edit files. The body replaces Exec's prompt. Xum still adds its sub-agent instructions (commit the work so the parent can apply the patch, and report back), because the parent depends on them. A `readonly: true` agent, or one with a [read-only search list](#read-only-search-lists), gets Explore's tools, prompt and sub-agent instructions instead, with its own body after Explore's prompt. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
 
+#### Plugin folder and spawn errors
+
+A Claude Code or Cursor plugin agent often reads a file from its own plugin, for example `${CLAUDE_PLUGIN_ROOT}/agents/reviewer.md`. Xum replaces `${CLAUDE_PLUGIN_ROOT}` in the body of such an agent with the path of the plugin's folder (`C:/Users/...` on a Windows host). `${CLAUDE_SKILL_DIR}`, `${CLAUDE_PLUGIN_DATA}`, `${CURSOR_PLUGIN_ROOT}`, `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` stay as written, and a plugin agent in the Xum format keeps its body unchanged. The review of a managed plugin does not cover the body, so the replacement never asks for a new review.
+
+A Claude Code or Cursor format agent whose body names `${CLAUDE_PLUGIN_ROOT}` runs only where the workspace can read that folder: a local or worktree workspace for a plugin on the Xum host (also a multi-project workspace whose projects are all local or worktree), and an SSH or Docker workspace for a trusted plugin in that checkout. On any other workspace, such as an SSH, Docker or devcontainer workspace with a plugin from the Xum host, the `task` tool does not list the agent, and spawning it by ID fails with `folder-unreachable`.
+
+When `task` refuses a plugin agent that Xum loads, the error names the reason instead of saying `unknown agentId`:
+
+| Reason               | Meaning                                                                                                                                       | What to do                                                       |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `not-reviewed`       | A managed plugin's agent that you have not reviewed, or that changed since you reviewed it.                                                   | Open **Settings → Plugins** and select **Review** on the plugin. |
+| `ambiguous-file`     | Two files in the plugin's `agents/` folder have the same agent ID, such as `Helper.md` and `helper.md` on a case-sensitive file system.       | Keep one of the files.                                           |
+| `folder-unreachable` | The agent names `${CLAUDE_PLUGIN_ROOT}`, and this workspace cannot read the plugin folder.                                                    | Run the agent from a local or worktree workspace.                |
+| `invalid-definition` | The file does not parse, its Claude Code tool list [cannot be mapped](#claude-code-tool-lists), or it is a link that leads out of the plugin. | Fix the file. The error includes the cause.                      |
+
+If a lower-precedence agent has the same ID, `not-reviewed`, `ambiguous-file` and `invalid-definition` skip the plugin agent, and that agent starts instead: the error appears only when no other agent has the ID. `folder-unreachable` never falls back. The unreachable agent keeps its ID, so Xum neither lists nor starts the lower agent: on an SSH workspace, a `task` spawn of a plugin agent named `exec` that names `${CLAUDE_PLUGIN_ROOT}` fails with `folder-unreachable` and does not start the built-in Exec agent. Only a `task` spawn is refused: the main chat and an agent that has the unreachable agent as its base keep loading it. An agent ID that no scope has still fails with `unknown agentId`.
+
 #### Claude Code tool lists
 
 `tools` (allowlist) and `disallowedTools` (denylist) take Claude Code tool names, as a comma-separated string or a list. In `tools`, only the core tools grant Xum tools, and only the Xum tools that do the same job and no more, with one exception for [read-only search lists](#read-only-search-lists). A name in `disallowedTools` removes every Xum tool that can do its job, so it can remove more:

@@ -5,6 +5,8 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import type { MCPServerPluginProvenance } from "@/common/types/mcp";
 import { log } from "@/node/services/log";
 import {
+  installMethodMoved,
+  installMethodShaFor,
   isPluginMcpServerAllowed,
   readPluginComponentImports,
   readPluginMcpPolicy,
@@ -188,6 +190,63 @@ describe("readPluginComponentImports saved install methods", () => {
     expect(result.consentByName.get("demo")).toEqual(consent);
     expect(result.installedAtByName.get("demo")).toBe(entry.installedAt);
     expect(result.methodByName.has("demo")).toBe(false);
+  });
+});
+
+describe("installMethodMoved", () => {
+  const saved = (extra: Record<string, unknown>) =>
+    createRawPluginInstallRow(legacy, { installMethod: "claude-plugin", ...extra });
+
+  test("a row that vouches for its commit has not moved", () => {
+    expect(installMethodMoved(saved({ installMethodSha: legacy.lockedSha }))).toBe(false);
+  });
+
+  test("a different, missing or malformed installMethodSha counts as moved", () => {
+    expect(installMethodMoved(saved({ installMethodSha: "b".repeat(40) }))).toBe(true);
+    expect(installMethodMoved(saved({}))).toBe(true);
+    for (const installMethodSha of [7, null, {}, [legacy.lockedSha], ""]) {
+      expect(installMethodMoved(saved({ installMethodSha }))).toBe(true);
+    }
+  });
+
+  test("a row without a saved method, or with one this build does not know, has nothing to compare", () => {
+    expect(installMethodMoved(legacy)).toBe(false);
+    expect(installMethodMoved(createRawPluginInstallRow(legacy, { installMethodSha: "b" }))).toBe(
+      false
+    );
+    resetUnknownInstallMethodWarningForTests();
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      expect(installMethodMoved(saved({ installMethod: "windsurf-plugin" }))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(installMethodMoved(null)).toBe(false);
+  });
+
+  test("only a row with a saved method gets an installMethodSha", () => {
+    expect(installMethodShaFor("cursor-plugin", legacy.lockedSha)).toEqual({
+      installMethodSha: legacy.lockedSha,
+    });
+    expect(installMethodShaFor(undefined, legacy.lockedSha)).toEqual({});
+  });
+
+  test("methodMovedByName names the rows that an older build moved", async () => {
+    using tmp = new DisposableTempDir("plugin-registry-method-moved");
+    const entry = (name: string) => createTestPluginInstallEntry(name);
+    const result = await readRows(path.join(tmp.path, "plugins.json"), [
+      createRawPluginInstallRow(entry("current"), {
+        installMethod: "claude-plugin",
+        installMethodSha: legacy.lockedSha,
+      }),
+      createRawPluginInstallRow(entry("moved"), {
+        installMethod: "claude-plugin",
+        installMethodSha: "b".repeat(40),
+      }),
+      createRawPluginInstallRow(entry("unrecorded"), { installMethod: "cursor-plugin" }),
+      entry("legacy"),
+    ]);
+    expect([...result.methodMovedByName].sort()).toEqual(["moved", "unrecorded"]);
   });
 });
 

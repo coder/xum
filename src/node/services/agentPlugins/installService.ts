@@ -55,7 +55,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showInvisibleControls, showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import {
   SkillNameSchema,
   resolveSkillAdvertise,
@@ -93,6 +93,8 @@ import {
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
   manifestChoiceFor,
+  MOVED_METHOD_MESSAGE,
+  movedMethodMatters,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
@@ -178,6 +180,8 @@ import {
 } from "./journals";
 import {
   PLUGIN_REGISTRY_FILE_NAME,
+  installMethodMoved,
+  installMethodShaFor,
   readPluginRegistryDocument,
   readStoredInstallMethod,
 } from "./registry";
@@ -356,6 +360,9 @@ async function signOutFailure(
  * actual advice; the log keeps one warning per workspace.
  */
 const MAX_LISTED_FAILED_WORKSPACES = 5;
+
+/** config.json cannot be read or parsed: a retry alone cannot help, the user must repair it. */
+class UnreadableConfigError extends Error {}
 
 /** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
 function describeFailedWorkspaces(ids: readonly string[]): string {
@@ -1787,6 +1794,77 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   return lines;
 }
 
+interface SignInKeyEntry {
+  url: string;
+  identityByServerName: Map<string, string>;
+}
+
+function indexSignIns(
+  servers: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  credentialKey: (url: string) => string | null
+): Map<string, SignInKeyEntry> {
+  const index = new Map<string, SignInKeyEntry>();
+  // mutation-equivalent: a Map is never falsy, so ?? and || agree
+  for (const [serverName, { signIn }] of servers ?? []) {
+    const key = signIn && credentialKey(signIn.url);
+    if (!key || !signIn) continue;
+    // mutation-equivalent: an entry object is never falsy, so ?? and || agree
+    const entry = index.get(key) ?? {
+      url: signIn.url,
+      identityByServerName: new Map<string, string>(),
+    };
+    entry.identityByServerName.set(serverName, signIn.identity);
+    index.set(key, entry);
+  }
+  return index;
+}
+
+/**
+ * Compare an entry with its own previous identity (same name, same key): when two servers share
+ * a URL, another entry already using the new identity must not mask the change. A renamed (or
+ * added) entry has no previous self, and the stored credentials cannot be traced to one entry:
+ * it changed whenever any identity at the key differs.
+ */
+function signInIdentityChanged(
+  before: ReadonlyMap<string, string>,
+  serverName: string,
+  identity: string
+): boolean {
+  const previous = before.get(serverName);
+  return previous !== undefined
+    ? previous !== identity
+    : [...before.values()].some((other) => other !== identity);
+}
+
+/**
+ * The server URLs whose stored credentials an update must sign out: a key whose sign-in identity
+ * changes, and a key the update removes. A removed server keeps its credentials under its URL,
+ * and a later update can add a server at that URL under another identity with no current server
+ * left to show the change, so the removal is the only moment to sign out. A needless sign-out is
+ * acceptable; stale credentials offered under a new identity are not.
+ */
+export function signInResetUrls(
+  current: ReadonlyMap<string, { signIn?: SurfaceSignIn }> | undefined,
+  staged: ReadonlyMap<string, { signIn?: SurfaceSignIn }>,
+  credentialKey: (url: string) => string | null
+): string[] {
+  const before = indexSignIns(current, credentialKey);
+  const after = indexSignIns(staged, credentialKey);
+  const resets: string[] = [];
+  for (const [key, now] of after) {
+    const was = before.get(key);
+    if (
+      was !== undefined &&
+      [...now.identityByServerName].some(([serverName, identity]) =>
+        signInIdentityChanged(was.identityByServerName, serverName, identity)
+      )
+    )
+      resets.push(now.url);
+  }
+  for (const [key, was] of before) if (!after.has(key)) resets.push(was.url);
+  return resets;
+}
+
 const LOGO_MAX_BYTES = 512 * 1024;
 // No SVG: a data-URL <img> cannot run script, but raster-only keeps the
 // renderer away from markup altogether. No GIF: OpenAI does not list it, and it
@@ -1913,11 +1991,17 @@ function shownStagedRoot(
   return marketplace === undefined ? source.subpath : undefined;
 }
 
+/**
+ * The registry row of an install: the entry, plus its saved install method (B3) and the commit
+ * this build installed it at (`installMethodSha`) when it has a method.
+ */
 function registryRow(
   entry: AgentPluginInstallEntry,
   installMethod: SavedInstallMethod | undefined
-): AgentPluginInstallEntry & { installMethod?: SavedInstallMethod } {
-  return installMethod !== undefined ? { ...entry, installMethod } : entry;
+): AgentPluginInstallEntry & { installMethod?: SavedInstallMethod; installMethodSha?: string } {
+  return installMethod !== undefined
+    ? { ...entry, installMethod, ...installMethodShaFor(installMethod, entry.lockedSha) }
+    : entry;
 }
 
 function loadedAsLabel(plugin: Pick<AgentPluginInfo, "generatedFrom" | "manifestPath">): string {
@@ -2140,6 +2224,26 @@ export class AgentPluginInstallService {
 
   private async installedChoice(name: string) {
     return manifestChoiceFor(await this.savedInstallMethod(name));
+  }
+
+  private async closedReasonField(name: string): Promise<{ closedReason?: string }> {
+    return (await this.closedAfterOlderBuild(name)) ? { closedReason: MOVED_METHOD_MESSAGE } : {};
+  }
+
+  /**
+   * True when an older build moved this plugin to a commit whose saved manifest nobody reviewed
+   * (B3). Discovery loads nothing of such a plugin. Xum writes no hook trust, sign-in or registry
+   * field for it: a reinstall reviews it and starts with no hook trust.
+   */
+  private async closedAfterOlderBuild(name: string): Promise<boolean> {
+    const { rawEntries } = await this.readRegistryDocument("lenient");
+    const raw = rawEntries.find((entry) => this.rawEntryName(entry) === name);
+    const saved = readStoredInstallMethod(raw);
+    return (
+      saved !== undefined &&
+      installMethodMoved(raw) &&
+      (await movedMethodMatters(this.targetPathFor(name), saved))
+    );
   }
 
   /**
@@ -3416,32 +3520,7 @@ export class AgentPluginInstallService {
     // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
     const credentialKey = (url: string): string | null =>
       this.mcpOauthService?.credentialKey(url) ?? null;
-    // Compare each entry with its own previous identity (same name, same key): when two
-    // servers share a URL, another entry already using the new identity must not mask the
-    // change. A renamed (or added) entry has no previous self, and the stored credentials
-    // cannot be traced to one entry: reset whenever any identity at the key differs. A
-    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
-    const currentIdentities = new Map<string, Set<string>>();
-    const currentEntryIdentity = new Map<string, string>();
-    for (const [serverName, server] of current?.servers ?? []) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const identities = currentIdentities.get(key) ?? new Set<string>();
-      identities.add(server.signIn.identity);
-      currentIdentities.set(key, identities);
-      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
-    }
-    for (const [serverName, server] of staged.servers) {
-      const key = server.signIn && credentialKey(server.signIn.url);
-      if (!key || !server.signIn) continue;
-      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
-      const identity = server.signIn.identity;
-      const changed =
-        previous !== undefined
-          ? previous !== identity
-          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
-      if (changed) signInResets?.push(server.signIn.url);
-    }
+    signInResets?.push(...signInResetUrls(current?.servers, staged.servers, credentialKey));
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
     // instructions without the user ever invoking it. Gate both.
@@ -5386,8 +5465,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
-   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   * Removes `urls` from the pending sign-outs: they finished, or the update or uninstall rolled
+   * back before it took effect. Best effort: a leftover URL only signs the server out once more.
    */
   private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
     if (urls.length === 0) return;
@@ -5399,7 +5478,7 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  /** Signs out `urls` after an update or an uninstall; the ones that failed stay pending. */
   private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
     const done: string[] = [];
     // One deadline for every wait of this update: N hung logouts must not hold the lock N times.
@@ -5714,6 +5793,44 @@ export class AgentPluginInstallService {
     return urls;
   }
 
+  /**
+   * Throws the pending record's own error when an uninstall that will record sign-outs cannot
+   * read it. It runs before anything stops or moves: a failure at the commit would roll the tree
+   * back but not the global MCP enablement.
+   */
+  private async assertPendingSignOutsReadable(urls: readonly string[]): Promise<void> {
+    if (urls.length > 0) await this.readPendingSignOuts();
+  }
+
+  /**
+   * A server that fails to load is not listed. A tree Xum cannot read lists none: it must stay
+   * removable.
+   */
+  private async installedServerUrls(name: string): Promise<string[]> {
+    try {
+      const { plugin } = await discoverAgentPluginAt({
+        pluginDir: this.targetPathFor(name),
+        scope: "global",
+        choice: await this.installedChoice(name),
+      });
+      // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
+      if (plugin?.mcpConfigPath === undefined) return [];
+      const { servers } = await loadPluginMcpServers(plugin, {
+        xumHome: this.config.rootDir,
+        instanceId: this.instanceIdFor(name),
+      });
+      return Object.values(servers).flatMap((info) =>
+        info.transport === "stdio" ? [] : [info.url]
+      );
+    } catch (error) {
+      log.warn("Could not list the MCP servers of a plugin that is being uninstalled", {
+        plugin: name,
+        error: getErrorMessage(error),
+      });
+      return [];
+    }
+  }
+
   /** One plugin tree's remote MCP server URLs; throws when the tree's servers cannot be read. */
   private async pluginTreeServerUrls(
     dirName: string,
@@ -5907,12 +6024,14 @@ export class AgentPluginInstallService {
       });
     }
 
-    // Registry entries whose directory vanished (self-heal display; uninstall still works).
+    // Registry entries whose directory vanished (self-heal display; uninstall still works), and
+    // plugins that an older build moved, which discovery leaves out (B3).
     for (const entry of managedByName.values()) {
       items.push({
         name: entry.name,
         managed: true,
         present: false,
+        ...(await this.closedReasonField(entry.name)),
         location: shortenHome(this.targetPathFor(entry.name)),
         ...(entry.manifest?.version !== undefined ? { version: entry.manifest.version } : {}),
         ...(entry.manifest?.description !== undefined
@@ -5975,6 +6094,9 @@ export class AgentPluginInstallService {
       const targetPath = this.targetPathFor(entry.name);
       const instanceId = this.instanceIdFor(entry.name);
       const serverKeyPrefix = buildPluginServerKey(instanceId, "");
+      // Read before the tree moves: its servers' stored sign-ins are keyed by URL and outlive it.
+      const signOutUrls = await this.installedServerUrls(entry.name);
+      await this.assertPendingSignOutsReadable(signOutUrls);
 
       // Enumerate pruning targets BEFORE committing anything: if this fails,
       // the uninstall aborts with the install fully intact (retryable from
@@ -6111,7 +6233,11 @@ export class AgentPluginInstallService {
       } else {
         delete commitEnvelope.pendingOverridePrunes;
       }
+      let recordedSignOuts: string[] = [];
       try {
+        // Recorded before the commit, like an update's: a crash after it leaves the sign-outs for
+        // the next start (#6122).
+        recordedSignOuts = await this.recordPendingSignOuts(signOutUrls);
         // Before the commit, so a failure leaves trust and approved copies cleared (fail closed)
         // rather than kept for a later install under this name.
         await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
@@ -6121,6 +6247,8 @@ export class AgentPluginInstallService {
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)
         );
       } catch (error) {
+        // The plugin stays installed: its servers keep their sign-ins.
+        await this.forgetPendingSignOuts(recordedSignOuts);
         const treeRestored = await restoreTree("failed registry write");
         let dataRestored = true;
         if (stagedData) {
@@ -6200,6 +6328,10 @@ export class AgentPluginInstallService {
       if (trashCleaned) {
         await consumeJournal();
       }
+
+      // Signed out before the final stop, like an update: a startup that raced the sign-out is
+      // invalidated too.
+      await this.signOutAndSettle(entry.name, signOutUrls);
 
       // Re-invalidate AFTER the tree is gone: a getToolsForWorkspace call
       // that started right after the pre-rename stop snapshots the new epoch,
@@ -6358,7 +6490,27 @@ export class AgentPluginInstallService {
     if (!this.deps.workspaceMcpOverridesService) {
       return [];
     }
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
+    // Strict: the lenient walk reads an unreadable or corrupt config.json as
+    // zero workspaces, and an empty list passes every consent check here.
+    const allMetadata = await this.config
+      .getAllWorkspaceMetadata({ throwOnError: true })
+      .catch((error: unknown) => {
+        // The strict walk also fails on an unrelated id-less legacy entry
+        // whose metadata.json does not parse. That must not block every
+        // install, so fall back to the lenient walk, which degrades that
+        // entry, but only while config.json itself still loads strictly.
+        try {
+          this.config.loadConfigOrDefault({ throwOnError: true });
+        } catch (configError) {
+          throw new UnreadableConfigError(
+            `Xum could not read ${shortenHome(configFilePath(this.config.rootDir))} (${getErrorMessage(configError)}). Repair the file or restore it from a backup, then try again.`
+          );
+        }
+        log.warn("Enumerating workspaces for override pruning from a lenient registry walk", {
+          error: getErrorMessage(error),
+        });
+        return this.config.getAllWorkspaceMetadata();
+      });
     return allMetadata
       .filter((metadata) => {
         const runtimeType = metadata.runtimeConfig.type;
@@ -6596,12 +6748,15 @@ export class AgentPluginInstallService {
    * because unenumerated delta workspaces cannot be ruled out — callers must
    * then keep the tombstone even when `failed` is empty (an empty SENTINEL
    * tombstone records exactly this "delta workspaces unknown" state, and a
-   * failed re-enumeration cannot rule them out either).
+   * failed re-enumeration cannot rule them out either). `advice` tells the
+   * user what to do about the failed enumeration.
    */
   private async retryPrune(prune: {
     prefix: string;
     workspaceIds: string[];
-  }): Promise<{ enumerated: boolean; failed: string[] }> {
+  }): Promise<
+    { enumerated: true; failed: string[] } | { enumerated: false; failed: string[]; advice: string }
+  > {
     let liveWorkspaceIds: string[];
     try {
       liveWorkspaceIds = await this.listWorkspaceIdsForOverridePruning();
@@ -6610,7 +6765,11 @@ export class AgentPluginInstallService {
         error: getErrorMessage(error),
       });
       await this.pruneWorkspaceOverrides(prune.prefix, prune.workspaceIds);
-      return { enumerated: false, failed: prune.workspaceIds };
+      return {
+        enumerated: false,
+        failed: prune.workspaceIds,
+        advice: error instanceof UnreadableConfigError ? error.message : "Retry in a moment.",
+      };
     }
     return {
       enumerated: true,
@@ -6653,16 +6812,17 @@ export class AgentPluginInstallService {
       return;
     }
 
-    const { enumerated, failed } = await this.retryPrune(match);
-    if (!enumerated) {
+    const retried = await this.retryPrune(match);
+    if (!retried.enumerated) {
       // Delta workspaces cannot be ruled out without a live enumeration:
       // keep the tombstone verbatim (even an empty sentinel) and stay
       // blocked — clearing it here would let the reinstall proceed over
       // workspaces the sweep never saw.
       throw new Error(
-        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). Retry in a moment.`
+        `A previous uninstall of '${name}' could not verify its workspace MCP override cleanup yet (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed } = retried;
     const remaining = this.updateRawPendingPrunes(
       this.rawPendingPrunes(envelope),
       serverKeyPrefix,
@@ -6692,15 +6852,16 @@ export class AgentPluginInstallService {
     const serverKeyPrefix = buildPluginServerKey(this.instanceIdFor(name), "");
     await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
     await this.deps.mcpConfigService?.pruneEnabledPluginServers(serverKeyPrefix);
-    const { enumerated, failed } = await this.retryPrune({
+    const retried = await this.retryPrune({
       prefix: serverKeyPrefix,
       workspaceIds: [],
     });
-    if (!enumerated) {
+    if (!retried.enumerated) {
       throw new Error(
-        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). Retry in a moment.`
+        `Could not verify that no workspace holds stale MCP overrides for '${name}' (workspace enumeration failed). ${retried.advice}`
       );
     }
+    const { failed } = retried;
     if (failed.length > 0) {
       throw new Error(
         `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
@@ -6894,6 +7055,9 @@ export class AgentPluginInstallService {
     warnings: string[];
     method: AgentPluginInstallMethod;
   }> {
+    // The update would move the older build's hook trust to the next commit (pluginHookTrust.ts).
+    if (await this.closedAfterOlderBuild(entry.name))
+      throw new UpdateRefusedError(MOVED_METHOD_MESSAGE);
     // A subpath install tracks the same folder at the new commit; a folder
     // that disappeared upstream fails here, before any swap.
     // A plugin.json that Xum generated is regenerated from the new commit, unless the
@@ -7429,6 +7593,7 @@ export class AgentPluginInstallService {
               } = rawManifest;
               return {
                 ...rawRecord,
+                ...installMethodShaFor(readStoredInstallMethod(rawRecord), updated.lockedSha),
                 lockedSha: updated.lockedSha,
                 updatedAt: updated.updatedAt,
                 manifest: { ...preservedManifest, ...updated.manifest },

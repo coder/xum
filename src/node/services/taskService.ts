@@ -125,6 +125,10 @@ import {
   resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import {
+  formatPluginAgentRefusal,
+  PluginAgentRefusalError,
+} from "@/node/services/agentDefinitions/pluginAgentRefusal";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -6872,6 +6876,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -6929,6 +6934,7 @@ export class TaskService implements AgentTaskIntegration {
         resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
           projectPluginsTrusted,
           runtimeFactory: nodeRuntimeFactory,
+          refuseUnreachablePluginFolder: true,
         }),
         signal
       );
@@ -6955,6 +6961,9 @@ export class TaskService implements AgentTaskIntegration {
             error
           )
         );
+      }
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.createMany: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableAgents(reservation);
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
@@ -9233,6 +9242,7 @@ export class TaskService implements AgentTaskIntegration {
       const runnableIds = (
         await Promise.all(
           allAgents.map(async (agent) => {
+            if (agent.unavailableReason !== undefined) return null;
             try {
               const frontmatter = await resolveAgentFrontmatter(
                 runtime,
@@ -9284,6 +9294,7 @@ export class TaskService implements AgentTaskIntegration {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
         runtimeFactory: nodeRuntimeFactory,
+        refuseUnreachablePluginFolder: true,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await this.describeRunnableTaskAgents(placement);
@@ -9306,6 +9317,10 @@ export class TaskService implements AgentTaskIntegration {
         return Err(
           formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
         );
+      }
+      // A plugin agent that Xum loads but refuses is not an unknown agent (RFC A4).
+      if (error instanceof PluginAgentRefusalError) {
+        return Err(`Task.create: ${formatPluginAgentRefusal(error)}`);
       }
       const hint = await this.describeRunnableTaskAgents(placement);
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);

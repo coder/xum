@@ -1,11 +1,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { MCPServerInfo } from "@/common/types/mcp";
+import assert from "@/common/utils/assert";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import {
+  isolateHostHome,
+  type IsolatedHostHome,
+} from "@/node/services/hostHomeIsolation.testHarness";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { buildWorkspaceComposition } from "./composition";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -13,6 +18,24 @@ import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFi
 
 const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
+
+// The inspector also scans the runtime user's global roots. A host with many installed skills adds
+// a shell containment probe per skill and root (about 990 in the first test), so three tests ran
+// into their 120 s and 240 s limits, while an empty home takes seconds.
+let hostHome: IsolatedHostHome | undefined;
+
+function isolatedHome(): IsolatedHostHome {
+  assert(hostHome !== undefined, "the isolated host home is created in beforeAll");
+  return hostHome;
+}
+
+beforeAll(() => {
+  hostHome = isolateHostHome("composition-host-home");
+});
+
+afterAll(() => {
+  hostHome?.restore();
+});
 
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
   await fs.mkdir(dir, { recursive: true });
@@ -110,6 +133,25 @@ describe("buildWorkspaceComposition", () => {
     );
     // Project shell tool hook (hooks.ts precedence: project shadows user-level).
     await fs.writeFile(path.join(workspace.path, ".mux", "tool_pre"), "#!/bin/sh\n", "utf-8");
+    // The only global skill and the only global plugin are the ones in the isolated homes, never
+    // those of the host.
+    await writeSkill(
+      path.join(isolatedHome().xumRoot, "skills", "global-fixture-skill"),
+      "global-fixture-skill",
+      "Global skill"
+    );
+    const homePluginDir = path.join(
+      isolatedHome().homePath,
+      ".agents",
+      "plugins",
+      "home-fixture-plugin"
+    );
+    await fs.mkdir(homePluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(homePluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "home-fixture-plugin" }),
+      "utf-8"
+    );
 
     const composition = await buildWorkspaceComposition({
       runtime: new LocalRuntime(workspace.path),
@@ -139,6 +181,13 @@ describe("buildWorkspaceComposition", () => {
     const shadowedPluginSkill = shared.find((s) => s.source === PLUGIN_SOURCE);
     expect(projectSkill?.shadowedBy).toBeUndefined();
     expect(shadowedPluginSkill?.shadowedBy).toBe("project");
+
+    expect(composition.skills.filter((s) => s.source === "global").map((s) => s.name)).toEqual([
+      "global-fixture-skill",
+    ]);
+    expect(composition.plugins.filter((p) => p.scope === "global").map((p) => p.name)).toEqual([
+      "home-fixture-plugin",
+    ]);
 
     // Agents.
     const agent = composition.agents.find((a) => a.name === "fixture-agent");
@@ -359,5 +408,71 @@ describe("buildWorkspaceComposition", () => {
     });
     expect(byName["codex-legacy"]?.manifestPath).toBe(".codex-plugin/plugin.json");
     expect(byName["codex-legacy"]?.installMethod).toBeUndefined();
+  }, 120_000);
+
+  test("reports a plugin agent that names a folder the workspace cannot read as a diagnostic, not an agent", async () => {
+    using workspace = new DisposableTempDir("composition-unreachable-agent");
+    const xumHome = path.join(workspace.path, ".fixture-xum-home");
+    const pluginDir = path.join(xumHome, "plugins", "egm");
+    await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "egm" })
+    );
+    const agent = (body: string) => `---\nname: Reviewer\ndescription: Reviews\n---\n${body}\n`;
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "persona.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/agents/persona.md")
+    );
+    await fs.writeFile(path.join(pluginDir, "agents", "plain.md"), agent("No folder."));
+    // The ID of a built-in agent: the unavailable plugin copy still holds the ID.
+    await fs.writeFile(
+      path.join(pluginDir, "agents", "explore.md"),
+      agent("Read ${CLAUDE_PLUGIN_ROOT}/e.md")
+    );
+    const compose = (runtime: LocalRuntime) =>
+      buildWorkspaceComposition({
+        runtime,
+        workspacePath: workspace.path,
+        hostCheckoutRoot: null,
+        xumHome,
+        projectTrusted: false,
+        listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
+      });
+    // A host runtime that reports itself as a devcontainer: the files are on the host, but bash
+    // runs in a container, so the host plugin folder is not a valid path there.
+    const asDevcontainer = (runtime: LocalRuntime): LocalRuntime =>
+      Object.create(runtime, { location: { value: "devcontainer" } }) as LocalRuntime;
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      const contained = await compose(asDevcontainer(new LocalRuntime(workspace.path)));
+      expect(contained.agents.filter((entry) => entry.source === "plugin:egm")).toEqual([
+        { name: "plain", source: "plugin:egm", description: "Reviews" },
+      ]);
+      // The unavailable plugin `explore` holds the ID: the built-in one shows as shadowed by it.
+      expect(
+        contained.agents
+          .filter((entry) => entry.name === "explore")
+          .map((entry) => [entry.source, entry.shadowedBy])
+      ).toEqual([["built-in", "plugin:egm"]]);
+      const diagnostic = contained.diagnostics.find((entry) => entry.message.includes("persona"));
+      expect(diagnostic).toMatchObject({
+        path: path.join(await fs.realpath(pluginDir), "agents", "persona.md"),
+        scope: "global",
+        severity: "warning",
+      });
+      expect(diagnostic?.message).toStartWith("folder-unreachable:");
+
+      const local = await compose(new LocalRuntime(workspace.path));
+      expect(
+        local.agents.filter((entry) => entry.source === "plugin:egm").map((entry) => entry.name)
+      ).toEqual(["explore", "persona", "plain"]);
+      expect(local.diagnostics.filter((entry) => entry.message.includes("persona"))).toEqual([]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   }, 120_000);
 });

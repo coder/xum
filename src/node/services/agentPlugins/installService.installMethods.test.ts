@@ -562,6 +562,100 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect((await service.previewUpdate({ name: "egm" })).changes).toEqual([]);
   });
 
+  test("install and update write installMethodSha with lockedSha, only for a row with a saved method", async () => {
+    await installAs("claude-plugin");
+    const installed = await rawRow();
+    expect(installed.installMethodSha).toBe(installed.lockedSha);
+
+    await write({ "README.md": "more\n" });
+    const next = await commit("readme");
+    await updateWithReview();
+    const updated = await rawRow();
+    expect([updated.lockedSha, updated.installMethodSha]).toEqual([next, next]);
+
+    // A row without a saved method has no installMethodSha, at install or after an update.
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    await installAs("agent-plugin");
+    await editRow((row) => {
+      delete row.installMethod;
+      delete row.installMethodSha;
+    });
+    await write({ "README.md": "again\n" });
+    await commit("readme again");
+    await updateWithReview();
+    expect((await rawRow()).installMethodSha).toBeUndefined();
+  });
+
+  /** What an older build leaves after its update: lockedSha moved on, installMethodSha did not. */
+  async function olderBuildUpdates(): Promise<string> {
+    const vouchedFor = (await rawRow()).installMethodSha as string;
+    await write({ "README.md": `older build ${Math.random()}\n` });
+    await commit("an upstream commit");
+    await updateWithReview();
+    await editRow((row) => {
+      row.installMethodSha = vouchedFor;
+    });
+    return vouchedFor;
+  }
+
+  const loadedPlugins = async () =>
+    (
+      await discoverAgentPlugins([
+        { path: path.join(xumRoot, "plugins"), scope: "global", registryPath: registryFile() },
+      ])
+    ).plugins;
+
+  test("a Claude install that an older build updated loads nothing, says why, and refuses an update", async () => {
+    await installAs("claude-plugin");
+    await olderBuildUpdates();
+    expect(await loadedPlugins()).toEqual([]);
+
+    const row = await service.list().then((rows) => rows.find((item) => item.name === "egm"));
+    expect(row).toMatchObject({ managed: true, present: false });
+    const reason = row?.closedReason ?? "";
+    expect(reason).toContain("An older Xum version updated this plugin");
+
+    // Xum writes nothing to repair it: no registry field, no hook trust, no sign-out record.
+    const registryBefore = await fsPromises.readFile(registryFile(), "utf8");
+    await write({ "README.md": "newer\n" });
+    await commit("another upstream commit");
+    const review = await service.previewUpdate({ name: "egm" });
+    expect(review.changes).toEqual([]);
+    expect(review.refused).toBe(reason);
+    await expect(service.update({ name: "egm" })).rejects.toThrow(reason);
+    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(registryBefore);
+    expect(await fsPromises.readdir(xumRoot)).not.toContain("plugin-hook-trust");
+
+    // A reinstall reviews it again and vouches for the new commit.
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    await installAs("claude-plugin");
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect(
+      (await service.list()).find((item) => item.name === "egm")?.closedReason
+    ).toBeUndefined();
+  });
+
+  test("a saved Agent Plugin, or a saved manifest that the fixed order loads too, keeps loading after an older build's update", async () => {
+    await installAs("agent-plugin");
+    await olderBuildUpdates();
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect((await service.list())[0]?.closedReason).toBeUndefined();
+    await write({ "README.md": "an update\n" });
+    const next = await commit("an update");
+    await updateWithReview();
+    expect((await rawRow()).installMethodSha).toBe((await rawRow()).lockedSha);
+    expect((await rawRow()).lockedSha).toBe(next);
+    await service.uninstall({ name: "egm", deletePluginData: true });
+
+    // Only the Claude manifest is left: the fixed order loads it, so the older build reviewed it.
+    await git(remoteDir, "rm", "-q", "-r", "plugin.json", ".codex-plugin", ".cursor-plugin");
+    await commit("a Claude-only repository");
+    await installAs("claude-plugin");
+    await olderBuildUpdates();
+    expect((await loadedPlugins()).map((plugin) => plugin.name)).toEqual(["egm"]);
+    expect((await service.list())[0]?.closedReason).toBeUndefined();
+  });
+
   test("an update whose commit fits the saved method keeps it", async () => {
     await installAs("claude-plugin");
     await write({ "README.md": "more\n" });
@@ -772,6 +866,31 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(loggedOut).toEqual([serverUrl]);
   });
 
+  test("an uninstall signs out the remote servers of a tree through its saved method", async () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    await write({
+      ".mcp.json": JSON.stringify({ mcpServers: { remote: { type: "http", url: serverUrl } } }),
+    });
+    await commit("a remote MCP server");
+    await installAs("claude-plugin");
+    await breakCodexManifest();
+
+    const loggedOut: string[] = [];
+    service.setMcpOauthService({
+      logout: (input: { serverUrl: string }) => {
+        loggedOut.push(input.serverUrl);
+        return Promise.resolve({ success: true });
+      },
+      credentialKey: (url: string) => url,
+    } as unknown as McpOauthService);
+    await (
+      service as unknown as { settledSignOutPasses: () => Promise<void> }
+    ).settledSignOutPasses();
+    loggedOut.length = 0;
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([serverUrl]);
+  });
+
   test("a restart saves the approved copies of a tree through its saved method", async () => {
     await installAs("claude-plugin");
     const copiesFile = getApprovedCopiesPath(
@@ -828,6 +947,8 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     await service.list();
     expect((await rawRow()).lockedSha).toBe(next);
     expect((await rawRow()).installMethod).toBe("claude-plugin");
+    // Recovery cannot tell which build promoted the tree, so it leaves installMethodSha alone.
+    expect((await rawRow()).installMethodSha).toBe(review.fromSha);
   });
 });
 

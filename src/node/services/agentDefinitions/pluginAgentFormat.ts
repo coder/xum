@@ -150,6 +150,10 @@ function isXumFormat(raw: Record<string, unknown>): boolean {
   return XUM_ONLY_KEYS.some((key) => key in raw) || isPlainObject(raw.tools);
 }
 
+export function isForeignPluginAgentFormat(raw: Record<string, unknown>): boolean {
+  return !isXumFormat(raw);
+}
+
 /**
  * Cursor `readonly: true`, or a Claude Code read-only search list, in a Claude Code or Cursor
  * format file: the mapping runs it on Explore, and a mapped tool list only removes tools, so file
