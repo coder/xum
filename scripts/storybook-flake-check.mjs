@@ -129,10 +129,10 @@ if (baseItems.length === 0) {
 console.log(`Capturing ${baseItems.length} Pixel variant(s) x ${runs} runs...`);
 
 /**
- * Each capture owns a browser (see captureRepeatedly), so this caps the browsers open at once.
- * Pixel's own cap of 32 pages in one browser would open 32 browsers on a big host.
+ * Browsers open at once while isolating a failed batch (see captureRepeatedly): each capture
+ * there owns a browser, so this stays below Pixel's own cap of 32 pages in one browser.
  */
-const PARALLEL_CAPTURES = Math.min(pixelConfig.config.shotConcurrency, 12);
+const PARALLEL_ISOLATED_CAPTURES = Math.min(pixelConfig.config.shotConcurrency, 12);
 
 /**
  * Capture every item `count` times.
@@ -145,32 +145,47 @@ async function captureRepeatedly(items, count, label) {
   const renderFailures = new Set();
   const captureErrors = new Map();
   const originalLog = console.log;
-  const onShot = (item) => {
-    if (item.render?.status !== "rendered") renderFailures.add(item.id);
-    if (!item.image) return;
-    const variants = renders.get(item.id) ?? new Map();
-    variants.set(pixelUtils.hashBuffer(item.image), item.image);
-    renders.set(item.id, variants);
-  };
   for (let run = 0; run < count; run++) {
     // Fresh shot items per run: takeScreenShots mutates them (image, timings, logs).
     const fresh = items.map((item) => ({ ...item }));
+    const reported = new Set();
+    const onShot = (item) => {
+      reported.add(item.id);
+      if (item.render?.status !== "rendered") renderFailures.add(item.id);
+      if (!item.image) return;
+      const variants = renders.get(item.id) ?? new Map();
+      variants.set(pixelUtils.hashBuffer(item.image), item.image);
+      renders.set(item.id, variants);
+    };
     // Pixel logs several lines per shot; keep our own summary readable by default.
     if (!values.verbose) console.log = () => undefined;
     try {
-      // One call per variant, not one for the whole batch. Pixel swallows a page.goto timeout and
-      // then evaluates on the page that is still loading, so a story that took over 30 s to load
-      // on a saturated runner threw "Execution context was destroyed" out of the whole call. That
-      // aborted the batch and named no story. A throw from one variant's call names it, and it
-      // counts as a render failure that the confirmation pass checks again.
-      await mapLimit(fresh, PARALLEL_CAPTURES, async (item) => {
-        try {
-          await pixelShots.takeScreenShots([item], undefined, onShot);
-        } catch (error) {
-          renderFailures.add(item.id);
-          captureErrors.set(item.id, String(error).split("\n")[0]);
+      await pixelShots.takeScreenShots(fresh, undefined, onShot);
+    } catch (error) {
+      // Pixel swallows a page.goto timeout (30 s) and then evaluates on the page that is still
+      // loading, so a story that was too slow to load on a saturated runner throws "Execution
+      // context was destroyed" out of the whole call. That aborts the batch and names no story.
+      // Capture the variants that have not reported one by one: a throw then names its story and
+      // counts as a render failure, which the confirmation pass checks again.
+      console.log = originalLog;
+      const unreported = items.filter((item) => !reported.has(item.id));
+      console.log(
+        `  ${label} run ${run + 1}/${count}: a capture threw (${String(error).split("\n")[0]}); ` +
+          `capturing the ${unreported.length} variant(s) that had not finished one by one`
+      );
+      if (!values.verbose) console.log = () => undefined;
+      await mapLimit(
+        unreported.map((item) => ({ ...item })),
+        PARALLEL_ISOLATED_CAPTURES,
+        async (item) => {
+          try {
+            await pixelShots.takeScreenShots([item], undefined, onShot);
+          } catch (itemError) {
+            renderFailures.add(item.id);
+            captureErrors.set(item.id, String(itemError).split("\n")[0]);
+          }
         }
-      });
+      );
     } finally {
       console.log = originalLog;
     }
