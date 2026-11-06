@@ -402,7 +402,7 @@ export interface AgentPluginInfo {
    * the fixed order read it. The hook gate reads the plugin again with the same choice.
    */
   installMethod?: SavedInstallMethod;
-  /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS (B6). */
+  /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
   manifestPath: string;
   /**
    * Xum wrote this plugin.json (a Skills or marketplace-entry install). A repository can claim it
@@ -1402,7 +1402,7 @@ function packageRules(args: {
   /** A .claude-plugin/plugin.json package, or one generated from a marketplace entry. */
   claudePackage: boolean;
   claudeComponents: ClaudePluginComponents | undefined;
-  generatedKind: GeneratedMethodKind | undefined;
+  generatedField: { generatedFrom?: GeneratedMethodKind };
 } {
   const generatedFrom = args.rootManifest ? readGeneratedFrom(args.manifest) : undefined;
   if (generatedFrom?.kind === "claude-marketplace") {
@@ -1410,7 +1410,7 @@ function packageRules(args: {
       manifest: claudeMarketplaceManifest(args.manifest),
       skillsOnly: false,
       claudePackage: true,
-      generatedKind: "claude-marketplace",
+      generatedField: { generatedFrom: "claude-marketplace" },
       claudeComponents: {
         ...(generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {}),
         ...(generatedFrom.agentFiles !== undefined ? { agentFiles: generatedFrom.agentFiles } : {}),
@@ -1423,7 +1423,7 @@ function packageRules(args: {
     skillsOnly,
     claudePackage: args.claudeFallback,
     claudeComponents: args.claudeFallback ? args.claude : undefined,
-    generatedKind: skillsOnly ? "skills" : undefined,
+    generatedField: skillsOnly ? { generatedFrom: "skills" } : {},
   };
 }
 
@@ -1721,7 +1721,7 @@ async function discoverPluginAt(args: {
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
   }
 
-  const { manifest, skillsOnly, claudePackage, claudeComponents, generatedKind } = packageRules({
+  const { manifest, skillsOnly, claudePackage, claudeComponents, generatedField } = packageRules({
     manifest: validation.manifest,
     rootManifest: manifestRelative === PLUGIN_MANIFEST_RELATIVE_PATH,
     claudeFallback,
@@ -1837,7 +1837,7 @@ async function discoverPluginAt(args: {
     manifest,
     manifestPath: manifestRelative.split(path.sep).join("/"),
     ...installMethodField(choice),
-    ...(generatedKind !== undefined ? { generatedFrom: generatedKind } : {}),
+    ...generatedField,
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),

@@ -365,7 +365,7 @@ async function detectManifests(dir: string): Promise<{
 }
 
 /**
- * The manifest methods that a folder's files offer, in the fixed order (rule M1). The installed
+ * The manifest methods that a folder's files offer, in the fixed order. The installed
  * copy of a plugin uses it to list the methods it does not load, with no skills scan and no
  * write.
  */

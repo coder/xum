@@ -96,7 +96,7 @@ function summarizePlugin(plugin: AgentPluginInfo): WorkspaceCompositionPlugin {
     rootPath: plugin.rootPath,
     components,
     manifestPath: plugin.manifestPath,
-    ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
+    installMethod: plugin.installMethod,
     ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
   };
 }

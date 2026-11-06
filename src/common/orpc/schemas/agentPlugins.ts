@@ -270,7 +270,7 @@ export const AgentPluginHooksSchema = z.object({
 });
 
 /**
- * What one manifest method of a staged tree gives (RFC B4). Counted by the code that builds the
+ * What one manifest method of a staged tree gives. Counted by the code that builds the
  * selected method's component lists, so the counts of the selected method equal that preview.
  * `hooksCanRun`: hooks that Xum can run for the manifest's format (a Xum-native root's hooks.js as
  * one hook, Codex `mcp_tool` hooks on mapped events, Cursor command hooks). Each runs only after
@@ -465,7 +465,7 @@ export const AgentPluginListItemSchema = z.object({
   mcpServerCount: z.number().int().nonnegative(),
   /** The installed plugin's not-applied parts; absent when there are none or the folder is gone. */
   notApplied: z.array(AgentPluginNotAppliedSchema).optional(),
-  /** The saved install method of a managed row (B3); absent: the fixed order read the plugin. */
+  /** The saved install method of a managed row; absent: the fixed order read the plugin. */
   installMethod: SavedInstallMethodSchema.optional(),
   /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
   manifestPath: z.string().optional(),
@@ -602,10 +602,10 @@ export const WorkspaceCompositionPluginSchema = z.object({
   version: z.string().optional(),
   /** Component kinds the plugin contributes (skills, mcp, agents, workflows, hooks, slashCommands). */
   components: z.array(z.string()),
-  /** The saved install method (B3); absent: the fixed order read the plugin. */
+  /** The saved install method; absent: the fixed order read the plugin. */
   installMethod: SavedInstallMethodSchema.optional(),
   /** The manifest discovery loaded, relative to the plugin root, with `/` on every OS. */
-  manifestPath: z.string().optional(),
+  manifestPath: z.string(),
 });
 export type WorkspaceCompositionPlugin = z.infer<typeof WorkspaceCompositionPluginSchema>;
 

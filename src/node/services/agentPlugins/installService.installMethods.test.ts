@@ -11,12 +11,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Config } from "@/node/config";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { discoverAgentPluginAt, discoverAgentPlugins } from "./discovery";
+import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { listPluginAgentFiles } from "./agentFiles";
 import { reviewedComponentConsent } from "./testFixtures";
 import { AgentPluginInstallService } from "./installService";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { log } from "@/node/services/log";
+import { STAGING_DIR_NAME } from "./journals";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   using proc = execFileAsync("git", [`-C`, cwd, ...args]);
@@ -750,6 +751,13 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
     });
   }
 
+  async function registryRows(): Promise<Array<Record<string, unknown>>> {
+    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    return doc.plugins;
+  }
+
   async function egmRow() {
     const item = (await service.list()).find((entry) => entry.name === "egm");
     if (item === undefined) throw new Error("egm is not listed");
@@ -824,6 +832,33 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
     }
     expect(staged.length).toBeGreaterThan(0);
     expect(staged.at(-1)).toEqual(await treeBytes(remoteDir));
+  });
+
+  test("a method that cannot be counted has no summary, and the preview still works", async () => {
+    const internals = service as unknown as {
+      countMethodComponents: (plugin: AgentPluginInfo) => Promise<unknown>;
+    };
+    const realCount = internals.countMethodComponents.bind(internals);
+    const countSpy = spyOn(internals, "countMethodComponents").mockImplementation((plugin) =>
+      plugin.manifestPath.startsWith(".claude")
+        ? Promise.reject(new Error("unreadable"))
+        : realCount(plugin)
+    );
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      const preview = await service.preview({ input: remoteDir });
+      expect(preview.methods).toHaveLength(3);
+      expect(preview.methodSummaries?.map((entry) => entry.method)).toEqual([
+        "agent-plugin",
+        "cursor-plugin",
+      ]);
+      expect(warn.mock.calls.map((call) => String(call[0]))).toContain(
+        "Could not count the components of an install method"
+      );
+    } finally {
+      countSpy.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   test("a manifest that fails validation has no summary", async () => {
@@ -911,6 +946,15 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
     expect((await egmRow()).generatedFrom).toBeUndefined();
   });
 
+  test("an other manifest that fails validation is not listed", async () => {
+    await installAs("claude-plugin");
+    await fsPromises.writeFile(
+      path.join(installedDir(), ".cursor-plugin", "plugin.json"),
+      "{ not json"
+    );
+    expect((await egmRow()).otherMethods).toEqual([{ method: "agent-plugin", agents: 0 }]);
+  });
+
   test("an install from before the saved method names the manifest the fixed order loads", async () => {
     await installAs("agent-plugin");
     const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
@@ -966,7 +1010,31 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
     expect(await mtimes()).toEqual(mtimesBefore);
   });
 
-  test("install, update and recovery log lines name the method", async () => {
+  test("recovery of an interrupted update logs the method it reconciled", async () => {
+    await installAs("claude-plugin");
+    const staging = path.join(xumRoot, STAGING_DIR_NAME);
+    const trashDir = path.join(staging, `trash-${Date.now()}-egm`);
+    await fsPromises.mkdir(trashDir, { recursive: true });
+    await fsPromises.writeFile(path.join(installedDir(), ".mux-promotion-marker"), "swap-nonce");
+    const newSha = "e".repeat(40);
+    await fsPromises.writeFile(
+      path.join(staging, "update-egm.json"),
+      JSON.stringify({ name: "egm", trashDir, nonce: "swap-nonce", newSha, stagedAt: Date.now() })
+    );
+    const info = spyOn(log, "info").mockImplementation(() => undefined);
+    try {
+      await service.list();
+      const lines = info.mock.calls.map((call) => String(call[0]));
+      const reconciled = lines.filter((line) => line.startsWith("Reconciled registry provenance"));
+      expect(reconciled).toHaveLength(1);
+      expect(reconciled[0]).toContain(`${newSha.slice(0, 12)}, Claude Code plugin`);
+      expect((await registryRows()).map((row) => row.lockedSha)).toEqual([newSha]);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  test("install and update log lines name the method", async () => {
     const info = spyOn(log, "info").mockImplementation(() => undefined);
     try {
       await installAs("claude-plugin");
@@ -978,12 +1046,11 @@ describe("AgentPluginInstallService method summaries and visibility (egm layout)
         consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [] },
       });
       const lines = info.mock.calls.map((call) => String(call[0]));
-      expect(lines.filter((line) => line.startsWith("Installed agent plugin 'egm'"))).toEqual([
-        expect.stringContaining("(Claude Code plugin)"),
-      ]);
-      expect(lines.filter((line) => line.startsWith("Updated agent plugin 'egm'"))).toEqual([
-        expect.stringContaining("(Claude Code plugin)"),
-      ]);
+      for (const verb of ["Installed", "Updated"]) {
+        const line = lines.filter((entry) => entry.startsWith(`${verb} agent plugin 'egm'`));
+        expect(line).toHaveLength(1);
+        expect(line[0]).toContain("(Claude Code plugin)");
+      }
     } finally {
       info.mockRestore();
     }

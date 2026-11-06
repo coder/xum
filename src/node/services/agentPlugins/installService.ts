@@ -1901,6 +1901,12 @@ function registryRow(
   return installMethod !== undefined ? { ...entry, installMethod } : entry;
 }
 
+/** The install method that loaded a plugin, for a log line; the manifest path when no method does. */
+function loadedAsLabel(plugin: Pick<AgentPluginInfo, "generatedFrom" | "manifestPath">): string {
+  const kind = installedAsKind(plugin);
+  return kind !== undefined ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[kind] : plugin.manifestPath;
+}
+
 interface Discovered {
   plugin: AgentPluginInfo;
   diagnostics: AgentPluginDiagnostic[];
@@ -2985,7 +2991,7 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * What each manifest method that fits gives (B4), in the fixed order. A method that fails
+   * What each manifest method that fits gives, in the fixed order. A method that fails
    * validation has no entry, and neither has a generated method. A method that cannot be counted
    * has none either: the user did not pick it, so its counts must not fail the preview.
    */
@@ -3048,7 +3054,7 @@ export class AgentPluginInstallService {
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
     request: InstallMethodRequest,
     marketplace?: MarketplaceEntryContext,
-    /** The preview only: count what each manifest method gives (B4). */
+    /** The preview only: count what each manifest method gives. */
     countMethods = false
   ): Promise<{
     plugin: AgentPluginInfo;
@@ -4875,9 +4881,8 @@ export class AgentPluginInstallService {
         };
       })
     );
-    const loadedAs = installedAsKind(plugin);
     log.info(
-      `Reconciled registry provenance for '${name}' after an interrupted update (→ ${newSha.slice(0, 12)}, ${loadedAs !== undefined ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[loadedAs] : plugin.manifestPath})`
+      `Reconciled registry provenance for '${name}' after an interrupted update (→ ${newSha.slice(0, 12)}, ${loadedAsLabel(plugin)})`
     );
     return true;
   }
@@ -5766,9 +5771,26 @@ export class AgentPluginInstallService {
   /** Started by setMcpOauthService. */
   private pendingSignOutReady: Promise<void> = Promise.resolve();
 
+  private async installMethodFields(
+    plugin: AgentPluginInfo,
+    managed: boolean
+  ): Promise<
+    Pick<AgentPluginListItem, "manifestPath" | "installMethod" | "generatedFrom" | "otherMethods">
+  > {
+    return {
+      manifestPath: plugin.manifestPath,
+      ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
+      ...(plugin.generatedFrom !== undefined ? { generatedFrom: plugin.generatedFrom } : {}),
+      // A generated install has no other manifest to offer: Xum wrote its plugin.json.
+      ...(managed && plugin.generatedFrom === undefined
+        ? { otherMethods: await this.otherManifestMethods(plugin) }
+        : {}),
+    };
+  }
+
   /**
    * The manifest methods of an installed copy besides the one that loads, each with the agents it
-   * would load (B6). One read-only discovery per method: the generated `skills` method writes into
+   * would load. One read-only discovery per method: the generated `skills` method writes into
    * the tree, so it never runs here. A manifest that fails validation is not offered.
    */
   private async otherManifestMethods(
@@ -5864,12 +5886,7 @@ export class AgentPluginInstallService {
           : {}),
         skillCount,
         mcpServerCount,
-        manifestPath: plugin.manifestPath,
-        ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
-        ...(plugin.generatedFrom !== undefined ? { generatedFrom: plugin.generatedFrom } : {}),
-        ...(entry !== undefined && plugin.generatedFrom === undefined
-          ? { otherMethods: await this.otherManifestMethods(plugin) }
-          : {}),
+        ...(await this.installMethodFields(plugin, entry !== undefined)),
         ...(entry?.importedComponents !== undefined
           ? { importedComponents: entry.importedComponents }
           : {}),

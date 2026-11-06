@@ -35,7 +35,7 @@ export function installedAsLine(
     plugin.installMethod !== undefined
       ? AGENT_PLUGIN_INSTALL_METHOD_LABELS[plugin.installMethod]
       : "none saved (fixed order)";
-  return `install method: ${method}; manifest: ${plugin.manifestPath ?? "unknown"}`;
+  return `install method: ${method}; manifest: ${plugin.manifestPath}`;
 }
 
 /**
