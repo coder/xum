@@ -5,6 +5,7 @@ pytest. The end-to-end run (real bun processes) is in check.test.ts.
 """
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -308,13 +309,11 @@ def test_a_dropped_baseline_leaves_no_process_behind(tmp_path, monkeypatch):
     child = int(pidfile.read_text())
 
     def alive() -> bool:
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            return False
-        return True
+        # An orphaned child can stay a zombie for good where PID 1 does not reap (some containers),
+        # and kill(pid, 0) succeeds for a zombie: its state tells it from a running process.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout.strip()
+        return state != "" and not state.startswith("Z")
 
-    # A killed child can linger briefly as an unreaped zombie.
     for _ in range(100):
         if not alive():
             break
