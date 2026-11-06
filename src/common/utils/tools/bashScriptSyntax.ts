@@ -258,8 +258,10 @@ class ShellScanner {
     return CASE_WORD.test(this.text);
   }
 
+  // An escaped blank or operator (`foo\ #`) is part of the word, not a boundary.
   private atWordStart(): boolean {
-    return this.index === 0 || WORD_BOUNDARY.test(this.text[this.index - 1]);
+    const previous = this.index - 1;
+    return previous < 0 || (WORD_BOUNDARY.test(this.text[previous]) && !this.isEscaped(previous));
   }
 
   private skipComment(): void {
