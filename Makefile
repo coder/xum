@@ -1008,9 +1008,7 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	@bun x test-storybook --testTimeout 30000
 
 # The runner opens the Storybook page once for every story file it is given, so only the files
-# that name a tag are visited. "paint-check" stories also compare each Mermaid diagram's paint
-# with its box (.storybook/test-runner.ts), and fail when they show no rendered diagram, so a
-# story that only needs WebKit takes "webkit".
+# that name a tag are visited.
 WEBKIT_STORY_FILES = $(shell grep -rlF -e '"webkit"' -e '"paint-check"' src/browser --include='*.stories.tsx')
 
 test-storybook-webkit: node_modules/.installed ## Run the stories tagged "webkit" or "paint-check" in WebKit, which sizes SVG and CSS zoom unlike Chromium (requires Storybook to be running or built)

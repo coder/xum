@@ -242,10 +242,8 @@ const RIGHT_INSET_MESSAGE = `Nothing may sit under a ${SIDE_INSET_PX}px right sa
 const MERMAID_DIALOG_DRAWING = ".mermaid-modal > svg.pele";
 
 /**
- * The expand dialog's overlay pads each edge by max(40px, env(safe-area-inset-*)), and its Close
- * button sits env(safe-area-inset-right) in from the corner. The story closed the dialog, so open
- * it again under the inset, and compare the right edge of the dialog, its drawing and its Close
- * button with the inset. The dialog is the frame around the drawing's container.
+ * The story's play closed the dialog, so open it again under the inset. The dialog is the frame
+ * around the drawing's container.
  */
 async function mermaidDialogInsetProblems(page: StoryPage) {
   await page.getByRole("button", { name: "⤢", exact: true }).click({ timeout: 5000 });
@@ -279,9 +277,10 @@ async function mermaidDialogInsetProblems(page: StoryPage) {
 }
 
 /**
- * Phone sheets and toasts are portaled out of the app shell, which pads the side safe areas, so
- * they must keep their controls clear of a right inset themselves, while a sheet's background
- * still fills the width. Plays cannot set safe-area insets; CDP can (env() reads the override).
+ * Phone sheets and toasts (portaled) and the Mermaid expand dialog (fixed) escape the app shell,
+ * which pads the side safe areas, so they must keep their controls clear of a right inset
+ * themselves, while a sheet's background still fills the width. Plays cannot set safe-area
+ * insets; CDP can (env() reads the override).
  */
 async function assertClearsRightInset(
   page: StoryPage,
@@ -537,7 +536,6 @@ async function assertSheetTouchTargets(page: StoryPage) {
 }
 
 const PAINT_CHECK_TAG = "paint-check";
-// The diagrams in the page, not the copy in the expand dialog.
 const PAGE_DIAGRAMS = ".mermaid-container:not(.mermaid-modal) > svg";
 
 interface Box {
@@ -554,7 +552,6 @@ interface Pixels {
   channels: number;
 }
 
-/** Where each diagram in the page may paint: its own box, inside the container that clips it. */
 async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
   const boxes = await page.$$eval(PAGE_DIAGRAMS, (diagrams) =>
     diagrams.map((diagram) => {
@@ -568,7 +565,6 @@ async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
       return { left, top, right: Math.max(left, right), bottom: Math.max(top, bottom) };
     })
   );
-  // A chart that failed to render, or is still rendering, has no diagram to compare.
   assert(
     boxes.length > 0,
     `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`
@@ -593,14 +589,11 @@ function setDiagramHidden(page: StoryPage, index: number, hidden: boolean) {
   );
 }
 
-// A few pixels differ between any two screenshots (the fringe of a text glyph, a fading glow),
-// more so on a loaded machine. A diagram that escapes its box changes thousands.
+// Screenshot noise (glyph fringes, fading glows) changes a few pixels. An escaped diagram changes
+// thousands.
 const MIN_INK_PIXELS = 32;
 
-/**
- * Where two screenshots differ outside a box: how many pixels, which sides of the box they lie
- * on, and their bounds. The box is widened by one pixel, so its own antialiased edge never counts.
- */
+/** The box is widened by one pixel so its own antialiased edge never counts. */
 function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   assert(
     shown.width === hidden.width && shown.height === hidden.height,
@@ -613,7 +606,6 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   const sides = new Set<string>();
   const bounds = { left: Infinity, top: Infinity, right: -1, bottom: -1 };
   let count = 0;
-  // Compares one run of a row, and looks at its pixels only when the run differs.
   const scan = (y: number, from: number, to: number) => {
     const start = (y * shown.width + from) * shown.channels;
     const end = (y * shown.width + to) * shown.channels;
@@ -642,7 +634,6 @@ function differenceOutside(box: Box, shown: Pixels, hidden: Pixels) {
   return { count, sides: [...sides].sort(), bounds };
 }
 
-/** Hides one diagram, takes a second picture, and says where it differs outside the box. */
 async function paintOutside(
   page: StoryPage,
   index: number,
@@ -661,10 +652,6 @@ async function paintOutside(
   }
 }
 
-/**
- * Scrolls what follows a diagram's frame into view, or puts the page back. A tall diagram ends
- * below the viewport, and the page does not scroll by itself.
- */
 function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
   return page.$$eval(
     PAGE_DIAGRAMS,
@@ -683,15 +670,14 @@ function scrollBelowDiagram(page: StoryPage, index: number, scroll: boolean) {
   );
 }
 
-/** Room for a few lines of text below a box, which is where a diagram that escapes paints. */
+// iPhone Safari painted the escaped diagram below its box, so a diagram needs this much page
+// below it to compare.
 const MIN_BELOW_PX = 8;
 const roomBelow = (box: Box, viewportHeight: number) => viewportHeight - Math.ceil(box.bottom) - 1;
 
 /**
- * Compares the strip below a diagram's box in a scrolled view, for a diagram that ends below the
- * viewport. The strip is where iPhone Safari painted over the text, so a diagram that has none
- * to compare fails. The first screenshot has repaired a stale WebKit layout by now, so this view
- * catches paint that escapes the box in a settled layout, not the stale state.
+ * For a diagram that ends below the viewport. By now the first screenshot has repaired any stale
+ * WebKit layout, so this scrolled view only catches paint that escapes a settled layout.
  */
 async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<string[]> {
   await scrollBelowDiagram(page, index, true);
@@ -709,14 +695,10 @@ async function paintBelowWhenScrolled(page: StoryPage, index: number): Promise<s
 }
 
 /**
- * An engine can lay a diagram out in one box and paint it in another. iPhone Safari painted a
- * state diagram over the paragraphs below its frame. A play reads layout boxes only, so compare
- * pixels: outside the box a diagram is laid out in, and outside the container that clips it,
- * the page must look the same with that diagram hidden as with it shown. WebKit lays the page
- * out again at its next screenshot or resize, which repairs the very state this check looks
- * for. So the page is shown to the camera once, before anything else touches it, and every
- * diagram is compared against that one picture. The viewport is left alone for the same reason.
- * Only a diagram that ends below the viewport is scrolled into view afterwards.
+ * iPhone Safari painted a diagram outside the box it laid it out in, and plays read layout boxes
+ * only. WebKit lays the page out again at its next screenshot or resize, which repairs that
+ * state, so every diagram is compared against one first screenshot and the viewport is left
+ * alone: with a diagram hidden, the page outside its box must look the same as with it shown.
  */
 async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   // A hovered button shows a tooltip, which fades in and out between two screenshots.
@@ -724,9 +706,8 @@ async function assertNoDiagramInkOutsideItsBox(page: StoryPage) {
   await page.waitForFunction(() => document.querySelector('[role="tooltip"]') === null, undefined, {
     timeout: 5000,
   });
-  // A font or a late render that arrives between two screenshots moves the text around the
-  // diagram, so wait until the page has held still for a few frames. Reading boxes and waiting
-  // for frames do not make WebKit lay the page out again, which a screenshot does.
+  // Wait for fonts and late renders by polling boxes across frames, not by comparing screenshots:
+  // a screenshot makes WebKit lay the page out again.
   await page.evaluate(async (selector) => {
     await document.fonts.ready;
     const layout = () =>
@@ -777,10 +758,8 @@ const viewportsToRestore = new WeakMap<object, { width: number; height: number }
 
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
-    // A play calls this right after a state change. WebKit can keep the page laid out for the old
-    // state, and paint it, until its next screenshot or resize, so postVisit alone sees a page
-    // that has repaired itself. exposeFunction throws on a second registration, so register once
-    // per Playwright page.
+    // A play calls this before a screenshot or resize repairs a stale WebKit layout.
+    // exposeFunction throws on a second registration.
     if (!paintHookReady.has(page)) {
       paintHookReady.add(page);
       await page.exposeFunction("__storybookAssertPaint", () =>
@@ -804,10 +783,8 @@ const config: TestRunnerConfig = {
     // Runs after a failed play too, so a pinned viewport never leaks into the next story.
     const restoreViewport = viewportsToRestore.get(page);
     try {
-      // At the size the play ran in: a resize lays the page out again, and so repairs the stale
-      // state that this check looks for. A failed play already reports its own error, which this
-      // check would hide. A tagged story must show a rendered diagram, so a chart that failed to
-      // render, or is still rendering, fails.
+      // Before the viewport is restored, since a resize repairs a stale WebKit layout. Skipped
+      // after a failed play so its own error shows.
       if (
         !context.hasFailure &&
         (await getStoryContext(page, context)).tags?.includes(PAINT_CHECK_TAG)

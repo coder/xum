@@ -236,7 +236,6 @@ const MERMAID_VIEWPORTS = {
       styles: { width: "1200px", height: "900px" },
       type: "desktop",
     },
-    // A phone in landscape, with a side inset on its right (the notch).
     sideInset: {
       name: "Side inset",
       styles: {
@@ -299,9 +298,8 @@ interface PaintHook {
 }
 
 /**
- * Plays read layout boxes, and WebKit can lay a page out for the old state while it paints the
- * new one. The test runner (.storybook/test-runner.ts) compares pixels outside each diagram's box
- * with the diagram hidden, and a play calls it right after a state change.
+ * Runs the test runner's pixel check (.storybook/test-runner.ts) now, before a screenshot or
+ * resize repairs a stale WebKit layout.
  */
 async function expectNoDiagramInkOutsideBox() {
   const assertPaint = (window as Window & PaintHook).__storybookAssertPaint;
@@ -392,10 +390,7 @@ async function playAtDefaultZoom(play: () => Promise<void>) {
 
 /** Below 640 px a left-to-right flowchart turns top-to-bottom and drops the height cap. */
 export const MermaidPhone: Story = {
-  // The browser test run also plays this story in WebKit, which sizes replaced elements and
-  // CSS zoom differently from Chromium (iPhone Safari), and compares what each engine paints
-  // with where it laid the diagram out (.storybook/test-runner.ts). Storybook reads tags from
-  // string literals, so every story that shows a diagram repeats this one.
+  // Storybook reads tags only from string literals, so every Mermaid story repeats this one.
   tags: ["paint-check"],
   globals: { viewport: { value: "phone390", isRotated: false } },
   parameters: { viewport: MERMAID_VIEWPORTS, pixel: { matrix: { viewports: ["phone"] } } },
@@ -605,11 +600,8 @@ export const MermaidStateDialogDesktop: Story = {
 };
 
 /**
- * A device can cover an edge of the layout viewport (a notch, a home indicator), and the dialog's
- * overlay keeps its padding clear of it with env(safe-area-inset-*). A play cannot set that
- * value, so in Chromium the test runner sets a right inset with CDP, opens the dialog again and
- * checks that the dialog, its drawing and its Close button end before the inset
- * (.storybook/test-runner.ts). WebKit plays the story at the same size, with no inset.
+ * A play cannot set env(safe-area-inset-*), so in Chromium the test runner sets a right inset with
+ * CDP and checks the dialog against it (.storybook/test-runner.ts). WebKit plays it with no inset.
  */
 export const MermaidStateDialogSideInset: Story = {
   tags: ["paint-check"],
