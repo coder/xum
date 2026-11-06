@@ -16,7 +16,7 @@ type CutOffShellConstruct =
   | "subshell"
   | "parameter-expansion";
 
-type Frame = "code" | "paren" | "command" | "double" | "param" | "quotedParam";
+type Frame = "code" | "paren" | "command" | "arith" | "double" | "param" | "quotedParam";
 
 // "complete" ends the scan early without a finding: an unterminated heredoc, or
 // syntax the scanner does not model.
@@ -31,6 +31,7 @@ interface PendingHeredoc {
 const CLOSERS: Partial<Record<Frame, string>> = {
   paren: ")",
   command: ")",
+  arith: ")",
   double: '"',
   param: "}",
   quotedParam: "}",
@@ -39,6 +40,7 @@ const CLOSERS: Partial<Record<Frame, string>> = {
 const OPEN_FRAME_CONSTRUCTS: Record<Exclude<Frame, "code">, CutOffShellConstruct> = {
   paren: "subshell",
   command: "command-substitution",
+  arith: "subshell",
   double: "double-quote",
   param: "parameter-expansion",
   quotedParam: "parameter-expansion",
@@ -116,7 +118,11 @@ class ShellScanner {
     if (CODE_FRAMES.has(frame)) {
       return this.stepCode(frame, char);
     }
-    this.index += 1;
+    if (frame === "arith" && char === "(") {
+      this.push("arith", 1);
+    } else {
+      this.index += 1;
+    }
     return undefined;
   }
 
@@ -168,6 +174,7 @@ class ShellScanner {
     const quoted = QUOTED_FRAMES.has(frame);
     if (next === "(") {
       this.push("command", 2);
+      this.pushArithmetic();
     } else if (next === "{") {
       this.push(quoted ? "quotedParam" : "param", 2);
     } else if (next === "'" && !quoted) {
@@ -199,7 +206,17 @@ class ShellScanner {
       return "complete";
     }
     this.push("paren", 1);
+    this.pushArithmetic();
     return undefined;
+  }
+
+  // `$((` and `((` start arithmetic, where `<<` is a shift and `#` is not a
+  // comment. A subshell written as `((...)...)` reads the same way, which only
+  // skips heredoc and comment parsing inside it.
+  private pushArithmetic(): void {
+    if (this.text[this.index] === "(") {
+      this.push("arith", 1);
+    }
   }
 
   // Whether the current word has a `[` that no `]` has closed yet.

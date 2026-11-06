@@ -29,6 +29,10 @@ describe("describeCutOffBashScript", () => {
     ["escaped backtick in a backtick comment before the closer", "echo `# hi \\` there 'x\n`\n"],
     ["escaped backslash before a backtick closer in a comment", "echo `ls # a \\\\` 'x'\n"],
     // Bash parses the text inside backticks only when it runs.
+    ["arithmetic shift then a later line", `echo $((1 << 2))\necho ok\n`],
+    ["heredoc on a line after arithmetic", `echo $((1 << 2))\ncat <<EOF\nit's\nEOF\n`],
+    ["arithmetic command with a shift", `((x = 1 << 2))\necho ok\n`],
+    ["subshell right inside a command substitution", `x=$((cd /; ls) | wc -l)\n`],
     ["unbalanced quote inside backticks", "echo `ls 'x`; echo ok\n"],
     ["heredoc inside backticks", "x=`cat <<EOF\nit's\nEOF\n`\n"],
     ["single quotes inside unquoted parameter expansion", `echo \${x:-'a } b'}`],
@@ -131,6 +135,27 @@ describe("describeCutOffBashScript", () => {
     ["command substitution inside a double quote", "unclosed $(", `echo "$(ls`],
     ["command substitution whose ) is in a comment", "unclosed $(", `echo $(ls # )`],
     ["subshell", "unclosed (", `( cd x`],
+    [
+      "double quote after an arithmetic shift",
+      "unterminated double quote",
+      `echo $((1 << 2))\necho "cut\n`,
+    ],
+    [
+      "double quote after a heredoc that follows arithmetic",
+      "unterminated double quote",
+      `echo $((1 << 2))\ncat <<EOF\nit's\nEOF\necho "x`,
+    ],
+    [
+      "double quote after an arithmetic command",
+      "unterminated double quote",
+      `(( x <<= 1 ))\necho "cut`,
+    ],
+    [
+      "double quote after nested arithmetic parentheses",
+      "unterminated double quote",
+      `echo $(( (1 << 2) + 1 ))\necho "cut`,
+    ],
+    ["parenthesis left open inside arithmetic", "unclosed (", `echo $((1 + (2`],
     ["subshell after a closed array subscript", "unclosed (", `a[x]=1; (cd x`],
     ["subshell right after a closed bracket in the same word", "unclosed (", `a[x](cd y`],
     ["process substitution", "unclosed (", `diff <(sort a`],
