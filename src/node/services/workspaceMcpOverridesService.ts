@@ -483,7 +483,7 @@ class ConfigSnapshot {
     canonical: Map<string, Promise<string | undefined>>;
     /** In-flight writes started by this operation (see trackSideEffect). */
     sideEffects: Set<Promise<unknown>>;
-    /** loadSweepMetadata fell back to the lenient walk. */
+    /** loadAllMetadataTolerant fell back to the lenient walk. */
     lenientRegistry?: true;
   };
   private _cancelled = false;
@@ -590,12 +590,13 @@ class ConfigSnapshot {
   }
 
   /**
-   * loadAllMetadata for a plugin override sweep, with checkoutLockKeys' fallback. The strict
-   * walk also fails on an UNRELATED id-less legacy entry whose metadata.json does not parse, and
-   * that must not refuse every plugin install. The lenient walk lists such an entry under its
-   * fallback id, so its checkout is still swept. It is trusted only while config.json itself
-   * loads strictly: a config.json failure degrades it to EMPTY. A requested id that it does not
-   * list fails on its own in the sweep (metadata not found).
+   * loadAllMetadata for a plugin override sweep or an override read, with checkoutLockKeys'
+   * fallback. The strict walk also fails on an UNRELATED id-less legacy entry whose metadata.json
+   * does not parse, and that must not refuse every plugin install or turn MCP off for every
+   * serve. The lenient walk lists such an entry under its fallback id, so its checkout is still
+   * swept. It is trusted only while config.json itself loads strictly: a config.json failure
+   * degrades it to EMPTY. A requested id that it does not list fails on its own (metadata not
+   * found), and a parent it does not list is unknown, not removed (see loadInheritedOverrides).
    *
    * A degraded entry whose config row names no runtime gets the default worktree runtime (its
    * real one may sit in the unreadable metadata.json), and the sweep prunes the checkout at the
@@ -604,19 +605,20 @@ class ConfigSnapshot {
    * failing the entry instead would leave a real stale enable in place, or refuse every install
    * again.
    */
-  loadSweepMetadata(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
+  loadAllMetadataTolerant(workspaceIds: readonly string[]): Promise<FrontendWorkspaceMetadata[]> {
     return (this.store.all = this.loadAllMetadata().catch((error: unknown) => {
       this.loadLegacyConfig();
       this.store.lenientRegistry = true;
+      // A count, not the ids: an install sweep can request thousands.
       log.warn(
-        "[MCP] Sweeping plugin overrides from a lenient registry walk: another entry's metadata is unreadable",
-        { workspaceIds, error: getErrorMessage(error) }
+        "[MCP] Resolving workspace MCP overrides from a lenient registry walk: another entry's metadata is unreadable",
+        { workspaceCount: workspaceIds.length, error: getErrorMessage(error) }
       );
       return this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
     }));
   }
 
-  /** The registry came from loadSweepMetadata's lenient fallback: a degraded entry's id is unknown. */
+  /** The registry came from loadAllMetadataTolerant's fallback: a degraded entry's id is unknown. */
   get lenientRegistry(): boolean {
     return this.store.lenientRegistry === true;
   }
@@ -1889,12 +1891,16 @@ export class WorkspaceMcpOverridesService {
   ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string; authoritative: boolean }> {
     const snapshot = new ConfigSnapshot(this.config);
     const mode = options?.mode ?? "lenient";
-    const resolution = (async () =>
-      this.resolveOverridesFor(
+    const resolution = (async () => {
+      // Every request-path read goes through here: one unrelated malformed legacy entry must not
+      // turn MCP off for every workspace (see loadAllMetadataTolerant).
+      await snapshot.loadAllMetadataTolerant([workspaceId]);
+      return this.resolveOverridesFor(
         await this.getWorkspaceMetadata(workspaceId, snapshot),
         mode,
         snapshot
-      ))();
+      );
+    })();
     let resolved: ResolvedOverrides;
     if (options?.timeoutMs === undefined && options?.signal === undefined) {
       resolved = await resolution;
@@ -2399,6 +2405,11 @@ export class WorkspaceMcpOverridesService {
       const all = await snapshot.loadAllMetadata();
       const parent = all.find((m) => m.id === parentWorkspaceId);
       if (parent === undefined) {
+        // A lenient registry lists a degraded legacy entry under its fallback id, so a missing
+        // parent can be that entry: its settings (a disable included) are unknown, not absent.
+        if (snapshot.lenientRegistry) {
+          throw new Error(`Parent workspace ${parentWorkspaceId} is missing from a lenient read`);
+        }
         return { overrides: {}, authoritative: true };
       }
       const inherited = await this.resolveOverridesFor(
@@ -3886,9 +3897,10 @@ export class WorkspaceMcpOverridesService {
       // metadata.json is unreadable or malformed. Rename and removal take
       // this lock, so that must not brick every healthy workspace until the
       // user repairs persisted state by hand (self-healing rule). The lenient
-      // walk skips such entries; it is trusted only when it still registers
-      // every requested id — a config.json failure degrades it to EMPTY, and
-      // "absent" would then wrongly fall through to the id-only key.
+      // walk lists such an entry under its fallback id instead of failing; it
+      // is trusted only when it still registers every requested id — a
+      // config.json failure degrades it to EMPTY, and "absent" would then
+      // wrongly fall through to the id-only key.
       const lenient = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
       const registered = new Set(lenient.map((metadata) => metadata.id));
       if (!workspaceIds.every((id) => registered.has(id))) {
@@ -4739,7 +4751,7 @@ export class WorkspaceMcpOverridesService {
     // fs.access, which blocks indefinitely on a stalled mount.
     const metadataById = groupMetadataById(
       await withDeadline(
-        snapshot.loadSweepMetadata(workspaceIds),
+        snapshot.loadAllMetadataTolerant(workspaceIds),
         budget.remaining(),
         "workspace enumeration exceeded the plugin-prune budget"
       ),
@@ -4814,7 +4826,7 @@ export class WorkspaceMcpOverridesService {
     try {
       afterById = groupMetadataById(
         await withDeadline(
-          after.loadSweepMetadata([...swept.keys()]),
+          after.loadAllMetadataTolerant([...swept.keys()]),
           budget.remaining(),
           "workspace enumeration exceeded the plugin-prune budget"
         ),
