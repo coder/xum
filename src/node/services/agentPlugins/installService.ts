@@ -171,6 +171,7 @@ import {
 } from "./journals";
 import {
   PLUGIN_REGISTRY_FILE_NAME,
+  installMethodShaFor,
   readPluginRegistryDocument,
   readStoredInstallMethod,
 } from "./registry";
@@ -1906,11 +1907,17 @@ function shownStagedRoot(
   return marketplace === undefined ? source.subpath : undefined;
 }
 
+/**
+ * The registry row of an install: the entry, plus its saved install method (B3) and the commit
+ * this build installed it at (`installMethodSha`) when it has a method.
+ */
 function registryRow(
   entry: AgentPluginInstallEntry,
   installMethod: SavedInstallMethod | undefined
-): AgentPluginInstallEntry & { installMethod?: SavedInstallMethod } {
-  return installMethod !== undefined ? { ...entry, installMethod } : entry;
+): AgentPluginInstallEntry & { installMethod?: SavedInstallMethod; installMethodSha?: string } {
+  return installMethod !== undefined
+    ? { ...entry, installMethod, ...installMethodShaFor(installMethod, entry.lockedSha) }
+    : entry;
 }
 
 interface Discovered {
@@ -7322,6 +7329,7 @@ export class AgentPluginInstallService {
               } = rawManifest;
               return {
                 ...rawRecord,
+                ...installMethodShaFor(readStoredInstallMethod(rawRecord), updated.lockedSha),
                 lockedSha: updated.lockedSha,
                 updatedAt: updated.updatedAt,
                 manifest: { ...preservedManifest, ...updated.manifest },

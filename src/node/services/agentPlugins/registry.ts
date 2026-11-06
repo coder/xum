@@ -129,6 +129,31 @@ export function readStoredInstallMethod(rawRow: unknown): SavedInstallMethod | u
   return undefined;
 }
 
+/**
+ * True when a row that saved a method no longer vouches for its commit (B3). This build writes
+ * `installMethodSha` (the `lockedSha` of its last install or update with that method) next to
+ * `installMethod`, and older builds keep it unchanged, so a value that differs from `lockedSha`
+ * means that an older build moved the commit. A missing or malformed value counts as a mismatch.
+ * Crash recovery leaves the field alone, because it cannot tell which build promoted the tree. A
+ * row without a saved method has nothing to compare.
+ */
+export function installMethodMoved(rawRow: unknown): boolean {
+  if (readStoredInstallMethod(rawRow) === undefined) return false;
+  const { installMethodSha, lockedSha } = rawRow as {
+    installMethodSha?: unknown;
+    lockedSha?: unknown;
+  };
+  return typeof installMethodSha !== "string" || installMethodSha !== lockedSha;
+}
+
+/** The field an install or an update writes beside `lockedSha`, for a row with a saved method. */
+export function installMethodShaFor(
+  installMethod: SavedInstallMethod | undefined,
+  lockedSha: string
+): { installMethodSha?: string } {
+  return installMethod !== undefined ? { installMethodSha: lockedSha } : {};
+}
+
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(registryFile: string): Promise<{
   byName: Map<string, AgentPluginImportedComponents | undefined>;
@@ -140,6 +165,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
   /** Install time by plugin name: it binds the install's approved copies (approvedCopies.ts). */
   installedAtByName: Map<string, string>;
   methodByName: Map<string, SavedInstallMethod>;
+  /** Rows whose saved method an older build moved to a commit (installMethodMoved). */
+  methodMovedByName: Set<string>;
   hasUnidentifiedEntries: boolean;
 } | null> {
   try {
@@ -148,6 +175,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
     const consentByName = new Map<string, ComponentConsent>();
     const installedAtByName = new Map<string, string>();
     const methodByName = new Map<string, SavedInstallMethod>();
+    const methodMovedByName = new Set<string>();
     let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
       const name = registryRowName(raw);
@@ -172,6 +200,7 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         installedAtByName.set(name, parsed.data.installedAt);
         const method = readStoredInstallMethod(raw);
         if (method !== undefined) methodByName.set(name, method);
+        if (installMethodMoved(raw)) methodMovedByName.add(name);
       }
     }
     if (hasUnidentifiedEntries) {
@@ -182,7 +211,14 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         }
       );
     }
-    return { byName, consentByName, installedAtByName, methodByName, hasUnidentifiedEntries };
+    return {
+      byName,
+      consentByName,
+      installedAtByName,
+      methodByName,
+      methodMovedByName,
+      hasUnidentifiedEntries,
+    };
   } catch (error) {
     log.warn("Plugin component imports unavailable; suppressing skills and MCP servers", {
       registryFile,

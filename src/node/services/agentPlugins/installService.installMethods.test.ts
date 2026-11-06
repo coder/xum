@@ -559,6 +559,30 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect((await service.previewUpdate({ name: "egm" })).changes).toEqual([]);
   });
 
+  test("install and update write installMethodSha with lockedSha, only for a row with a saved method", async () => {
+    await installAs("claude-plugin");
+    const installed = await rawRow();
+    expect(installed.installMethodSha).toBe(installed.lockedSha);
+
+    await write({ "README.md": "more\n" });
+    const next = await commit("readme");
+    await updateWithReview();
+    const updated = await rawRow();
+    expect([updated.lockedSha, updated.installMethodSha]).toEqual([next, next]);
+
+    // A row without a saved method has no installMethodSha, at install or after an update.
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    await installAs("agent-plugin");
+    await editRow((row) => {
+      delete row.installMethod;
+      delete row.installMethodSha;
+    });
+    await write({ "README.md": "again\n" });
+    await commit("readme again");
+    await updateWithReview();
+    expect((await rawRow()).installMethodSha).toBeUndefined();
+  });
+
   test("an update whose commit fits the saved method keeps it", async () => {
     await installAs("claude-plugin");
     await write({ "README.md": "more\n" });
@@ -825,5 +849,7 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     await service.list();
     expect((await rawRow()).lockedSha).toBe(next);
     expect((await rawRow()).installMethod).toBe("claude-plugin");
+    // Recovery cannot tell which build promoted the tree, so it leaves installMethodSha alone.
+    expect((await rawRow()).installMethodSha).toBe(review.fromSha);
   });
 });

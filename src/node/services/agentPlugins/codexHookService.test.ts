@@ -690,9 +690,8 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
     expect(await stop()).toEqual({ kind: "none" });
   });
 
-  test("a plugin saved as cursor-plugin still runs its Cursor hook behind a Codex manifest", async () => {
-    // The fixed order reads the Codex manifest first, which declares no Cursor hook. The gate
-    // before each call re-reads the plugin through the saved method, as the registration did.
+  /** A Cursor install behind a Codex manifest, trusted at `sha`; `installedSha` is what the row vouches for. */
+  async function installCursorBehindCodexManifest(installedSha: string): Promise<void> {
     await fs.mkdir(path.join(root(), ".codex-plugin"), { recursive: true });
     await fs.writeFile(
       path.join(root(), ".codex-plugin", "plugin.json"),
@@ -705,15 +704,29 @@ describe("CodexPluginHookService with a Cursor plugin", () => {
         plugins: [
           createRawPluginInstallRow(
             { ...createTestPluginInstallEntry("ralph"), lockedSha: sha },
-            { installMethod: "cursor-plugin" }
+            { installMethod: "cursor-plugin", installMethodSha: installedSha }
           ),
         ],
       })
     );
     await trustRalph(sha, "cursor-plugin");
+  }
+
+  test("a plugin saved as cursor-plugin still runs its Cursor hook behind a Codex manifest", async () => {
+    // The fixed order reads the Codex manifest first, which declares no Cursor hook. The gate
+    // before each call re-reads the plugin through the saved method, as the registration did.
+    await installCursorBehindCodexManifest("a".repeat(40));
     await service.ensureWorkspaceHooks(args());
     expect((await stop()).kind).toBe("continue");
     await writeHooks(`${followup} # changed`);
+    expect(await stop()).toEqual({ kind: "none" });
+  });
+
+  test("a Cursor hook of a saved method that an older build moved does not run", async () => {
+    // The older build moved the trust of this hook to a commit it never reviewed (B3): the plugin
+    // loads nothing, so the hook never runs although its trust is bound to the locked commit.
+    await installCursorBehindCodexManifest("b".repeat(40));
+    await service.ensureWorkspaceHooks(args());
     expect(await stop()).toEqual({ kind: "none" });
   });
 

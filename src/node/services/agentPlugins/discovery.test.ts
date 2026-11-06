@@ -3067,7 +3067,12 @@ describe("named manifest choice (install methods)", () => {
       if (name === "unmanaged") continue;
       const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
       rows.push(
-        name in saved ? createRawPluginInstallRow(entry, { installMethod: saved[name] }) : entry
+        name in saved
+          ? createRawPluginInstallRow(entry, {
+              installMethod: saved[name],
+              installMethodSha: entry.lockedSha,
+            })
+          : entry
       );
     }
     const registryPath = path.join(home, "plugins.json");
@@ -3092,5 +3097,64 @@ describe("named manifest choice (install methods)", () => {
       skills: [],
       mcpServers: [],
     });
+  });
+
+  test("the container scan loads nothing of a saved method that an older build moved, unless the fixed order loads that manifest", async () => {
+    using tmp = new DisposableTempDir("named-manifest-moved");
+    const home = tmp.path;
+    const container = path.join(home, "plugins");
+    const stale = "b".repeat(40);
+    // [saved method, installMethodSha (a "current" one is the row's lockedSha), manifests it has]
+    const layouts: Record<string, [string, unknown, string[] | undefined]> = {
+      current: ["claude-plugin", "current", undefined],
+      "moved-claude": ["claude-plugin", stale, undefined],
+      "moved-cursor": ["cursor-plugin", stale, undefined],
+      unrecorded: ["claude-plugin", undefined, undefined],
+      malformed: ["claude-plugin", 7, undefined],
+      // The fixed order loads the Claude manifest here too, so the older build reviewed it.
+      "claude-only": ["claude-plugin", stale, [".claude-plugin/plugin.json"]],
+      // An agent-plugin resolves like the fixed order.
+      "moved-codex": ["agent-plugin", stale, undefined],
+    };
+    const rows: unknown[] = [];
+    for (const [name, [method, sha, only]] of Object.entries(layouts)) {
+      await writeEgmLayout(path.join(container, name), only);
+      for (const relative of [".codex-plugin", ".claude-plugin", ".cursor-plugin"]) {
+        const file = path.join(container, name, relative, "plugin.json");
+        const manifest = await fs.readFile(file, "utf8").catch(() => undefined);
+        if (manifest === undefined) continue;
+        await fs.writeFile(file, JSON.stringify({ ...JSON.parse(manifest), name }));
+      }
+      const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
+      rows.push(
+        createRawPluginInstallRow(entry, {
+          installMethod: method,
+          ...(sha === undefined
+            ? {}
+            : { installMethodSha: sha === "current" ? entry.lockedSha : sha }),
+        })
+      );
+    }
+    const registryPath = path.join(home, "plugins.json");
+    await fs.writeFile(registryPath, JSON.stringify({ plugins: rows }));
+
+    const { plugins, diagnostics } = await discoverAgentPlugins([
+      { path: container, scope: "global", registryPath },
+    ]);
+    expect(plugins.map((plugin) => plugin.name).sort()).toEqual([
+      "claude-only",
+      "current",
+      "moved-codex",
+    ]);
+    const closed = diagnostics
+      .filter((diagnostic) => diagnostic.message.includes("An older Xum version updated"))
+      .map((diagnostic) => [path.basename(diagnostic.path), diagnostic.severity])
+      .sort();
+    expect(closed).toEqual([
+      ["malformed", "error"],
+      ["moved-claude", "error"],
+      ["moved-cursor", "error"],
+      ["unrecorded", "error"],
+    ]);
   });
 });

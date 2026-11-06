@@ -1633,6 +1633,32 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
+/**
+ * Whether an older build's move of a saved method matters (B3): the saved manifest is not the
+ * manifest that the fixed order loads from the installed tree. The older build loaded and
+ * reviewed the fixed-order manifest, so for any other saved manifest nobody reviewed its
+ * components, Cursor hooks or OAuth servers at the new commit. `agent-plugin` resolves like the
+ * fixed order (B1), so it never matters.
+ */
+export async function movedMethodMatters(
+  pluginDir: string,
+  saved: SavedInstallMethod
+): Promise<boolean> {
+  if (saved === "agent-plugin") return false;
+  let rootReal: string;
+  try {
+    rootReal = await pluginFs().realpath(pluginDir);
+  } catch {
+    return true;
+  }
+  const selected = await selectManifest(rootReal, undefined, { kind: "fixed-order" });
+  if (selected === null || "error" in selected) return true;
+  const fixedOrderMethod = AGENT_PLUGIN_MANIFEST_TABLE.find(
+    (spec) => spec.relative === selected.relative
+  )?.method;
+  return fixedOrderMethod !== saved;
+}
+
 function normalizeSelectedManifest(manifestRelative: string, raw: unknown): NormalizedManifest {
   const spec = AGENT_PLUGIN_MANIFEST_TABLE.find((entry) => entry.relative === manifestRelative);
   assert(spec !== undefined, `normalizeSelectedManifest: unknown manifest ${manifestRelative}`);
@@ -2059,6 +2085,10 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
   }
 }
 
+/** The diagnostic of a plugin that an older build moved to a commit with its saved manifest unreviewed. */
+const MOVED_METHOD_DIAGNOSTIC =
+  "An older Xum version updated this plugin after its install method was saved, so this version has not reviewed that manifest at this commit. The plugin loads nothing until it is reset or installed again.";
+
 function managedManifestChoice(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   entryName: string
@@ -2398,6 +2428,23 @@ export async function discoverAgentPlugins(
           // registry that cannot be read, read the fixed order.
           choice: managedManifestChoice(snapshot.imports, entryName),
         });
+        // A saved method that an older build moved to a commit loads nothing until it is reset or
+        // reinstalled: its components were never reviewed at that commit (B3).
+        const savedMethod = snapshot.imports?.methodByName.get(entryName);
+        if (
+          plugin &&
+          savedMethod !== undefined &&
+          snapshot.imports?.methodMovedByName.has(entryName) &&
+          (await movedMethodMatters(path.join(canonicalPath, entryName), savedMethod))
+        ) {
+          diagnostics.push({
+            path: path.join(container.path, entryName),
+            scope: container.scope,
+            severity: "error",
+            message: MOVED_METHOD_DIAGNOSTIC,
+          });
+          plugin = null;
+        }
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {
           Object.assign(
