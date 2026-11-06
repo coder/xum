@@ -20,7 +20,7 @@ import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken }
 import * as treeHash from "./treeHash";
 import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -6991,6 +6991,174 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  describe("workspace enumeration for override pruning", () => {
+    const configFile = () => path.join(muxRoot, "config.json");
+    // The lexical install location, not preview.targetPath (display text: `~/...` under HOME).
+    const installPath = () => path.join(pluginsDir(), "demo-plugin");
+    const registerLocalWorkspace = async (workspaceId: string) => {
+      const workspacePath = path.join(muxRoot, "checkouts", workspaceId);
+      await fsPromises.mkdir(workspacePath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(workspacePath, {
+          workspaces: [
+            {
+              path: workspacePath,
+              id: workspaceId,
+              name: workspaceId,
+              runtimeConfig: { type: "local" },
+            },
+          ],
+        });
+        return cfg;
+      });
+    };
+    const rejectionMessage = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+    const serviceRecordingPrunes = (pruned: string[]) =>
+      new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub((workspaceId: string) => {
+          pruned.push(workspaceId);
+          return Promise.resolve();
+        }),
+      });
+
+    test.each(["corrupt", "unreadable"] as const)(
+      "a fresh install refuses when config.json is %s",
+      async (damage) => {
+        const pruned: string[] = [];
+        const serviceWithOverrides = serviceRecordingPrunes(pruned);
+        await registerLocalWorkspace("ws-1");
+        const preview = await serviceWithOverrides.preview({ input: remoteDir });
+        let cause: string;
+        if (damage === "corrupt") {
+          await fsPromises.writeFile(configFile(), "{ not json");
+          cause = await rejectionMessage(
+            Promise.resolve().then(() => JSON.parse("{ not json") as unknown)
+          );
+        } else {
+          // EISDIR stands in for EACCES, which a root test runner would bypass.
+          await fsPromises.rm(configFile());
+          await fsPromises.mkdir(configFile());
+          cause = await rejectionMessage(fsPromises.readFile(configFile()));
+        }
+
+        const refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+        expect(refusal).toMatch(/workspace enumeration failed.*config\.json/);
+        expect(refusal).toContain(cause);
+        expect(pruned).toEqual([]);
+        expect(await registry()).toEqual([]);
+        expect(await pathExists(installPath())).toBe(false);
+      }
+    );
+
+    test("a fresh install advises a retry when enumeration fails for another reason", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+        Promise.reject(new Error("registry walk failed"))
+      );
+      try {
+        const refusal = await rejectionMessage(
+          serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+        );
+        expect(refusal).toMatch(/workspace enumeration failed/);
+        expect(refusal).toMatch(/retry/i);
+        expect(refusal).not.toMatch(/config\.json|repair/i);
+      } finally {
+        metadataSpy.mockRestore();
+      }
+    });
+
+    test("a fresh install refuses when one workspace's overrides cannot be checked", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: overridesServiceStub(() =>
+          Promise.reject(new Error("EBUSY: resource busy"))
+        ),
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+
+      await expect(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/ws-1/);
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(installPath())).toBe(false);
+    });
+
+    test("the reinstall gate keeps its tombstone when config.json does not parse", async () => {
+      const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
+      const tombstone = { prefix: `plugin:${instanceId}:`, workspaceIds: ["ws-1"] };
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      await fsPromises.writeFile(
+        registryFile(),
+        JSON.stringify({ plugins: [], pendingOverridePrunes: [tombstone] })
+      );
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await fsPromises.writeFile(configFile(), "{ not json");
+
+      await expect(
+        serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
+      ).rejects.toThrow(/could not verify .*\(workspace enumeration failed\).*config\.json/);
+      const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+        pendingOverridePrunes?: unknown;
+      };
+      expect(doc.pendingOverridePrunes).toEqual([tombstone]);
+    });
+
+    test("an uninstall refuses and names config.json when it does not parse", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await fsPromises.writeFile(configFile(), "{ not json");
+
+      await expect(
+        serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/config\.json/);
+      expect(await registry()).toHaveLength(1);
+      expect(await pathExists(installPath())).toBe(true);
+    });
+
+    test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
+      const serviceWithOverrides = new AgentPluginInstallService(config, {
+        workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
+      });
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fsPromises.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = { path: legacyPath };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      await fsPromises.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      await expect(config.getAllWorkspaceMetadata({ throwOnError: true })).rejects.toThrow();
+      expect(await pathExists(installPath())).toBe(true);
+
+      await serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await registry()).toEqual([]);
+      expect(await pathExists(installPath())).toBe(false);
+    });
+  });
+
   test("a failed trash deletion after update releases the dir for staging reclamation", async () => {
     // The journal is consumed before the replaced tree is deleted, so a
     // failed deletion (e.g. a file locked on Windows) has no other cleaner
@@ -7699,7 +7867,7 @@ describe("AgentPluginInstallService", () => {
     await serviceWithMcp.install({ source: preview.source, expectedSha: preview.lockedSha });
 
     stops = 0;
-    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementationOnce(() =>
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
       Promise.reject(new Error("metadata enumeration failed"))
     );
     try {
