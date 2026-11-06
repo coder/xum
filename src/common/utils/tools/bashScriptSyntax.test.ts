@@ -64,6 +64,17 @@ describe("describeCutOffBashScript", () => {
     ["parenthesis after a nested bracket pair in a subscript", `declare -A a; a[b[x]y(]=1\n`],
     // Bash rejects this, but a ( inside an open [ is not modelled: a miss.
     ["unmodelled parenthesis after a leading open bracket", `[x(]\n`],
+    // A `)` that ends a command, not a word, leaves a following # a comment.
+    ["comment after a case pattern", `case $x in\n a) # it's fine\n  ;;\nesac\n`],
+    ["comment after a space past a command substitution", `x=$(date) # it's fine\n`],
+    ["hash right after an arithmetic command", `((i=1))#'cut\n`],
+    ["hash right after a subshell", `(cd /)#'cut\n`],
+    ["hash right after a command substitution closes an arithmetic command", `((x=$(a)))#'cut\n`],
+    ["word that goes on after a command substitution", `x=$(date)y='ok'\n`],
+    ["comment inside an array assignment", `x=(a # it's a comment\n b)\n`],
+    // Bash rejects these, but `x=((` and a process substitution's word are not modelled: misses.
+    ["unmodelled hash after an assignment of ((", `x=((1))#'cut\n`],
+    ["unmodelled hash after a process substitution", `cat <(echo hi)#'cut\n`],
   ])("accepts a complete script: %s", (_name, script) => {
     expect(describeCutOffBashScript(script)).toBeNull();
   });
@@ -151,6 +162,24 @@ describe("describeCutOffBashScript", () => {
     ["command substitution inside a double quote", "unclosed $(", `echo "$(ls`],
     ["command substitution whose ) is in a comment", "unclosed $(", `echo $(ls # )`],
     ["subshell", "unclosed (", `( cd x`],
+    [
+      "hash right after a command substitution",
+      "unterminated single quote",
+      `value=$(printf ok)#'cut`,
+    ],
+    [
+      "apostrophe in a hash word after a command substitution",
+      "unterminated single quote",
+      `x=$(date)# comment with apostrophe's\n`,
+    ],
+    [
+      "hash right after an argument's substitution",
+      "unterminated single quote",
+      `echo $(date)#'cut\n`,
+    ],
+    ["hash right after arithmetic expansion", "unterminated single quote", `x=$((1))#'cut\n`],
+    ["hash right after an array assignment", "unterminated single quote", `x=(a b)#'cut\n`],
+    ["hash right after an array append", "unterminated single quote", `x+=(a b)#'cut\n`],
     [
       "double quote after an arithmetic shift",
       "unterminated double quote",

@@ -18,7 +18,7 @@ type CutOffShellConstruct =
   | "subshell"
   | "parameter-expansion";
 
-type Frame = "code" | "paren" | "command" | "arith" | "double" | "param" | "quotedParam";
+type Frame = "code" | "paren" | "array" | "command" | "arith" | "double" | "param" | "quotedParam";
 
 // "complete" ends the scan early without a finding: an unterminated heredoc, or
 // syntax the scanner does not model.
@@ -32,6 +32,7 @@ interface PendingHeredoc {
 
 const CLOSERS: Partial<Record<Frame, string>> = {
   paren: ")",
+  array: ")",
   command: ")",
   arith: ")",
   double: '"',
@@ -41,6 +42,7 @@ const CLOSERS: Partial<Record<Frame, string>> = {
 
 const OPEN_FRAME_CONSTRUCTS: Record<Exclude<Frame, "code">, CutOffShellConstruct> = {
   paren: "subshell",
+  array: "subshell",
   command: "command-substitution",
   arith: "subshell",
   double: "double-quote",
@@ -49,7 +51,10 @@ const OPEN_FRAME_CONSTRUCTS: Record<Exclude<Frame, "code">, CutOffShellConstruct
 };
 
 // Frames where shell syntax (comments, heredocs, subshells) is parsed.
-const CODE_FRAMES = new Set<Frame>(["code", "paren", "command"]);
+const CODE_FRAMES = new Set<Frame>(["code", "paren", "array", "command"]);
+// Frames that are part of a word, so the word goes on after their `)`; a
+// subshell or `((...))` is a command and ends there.
+const WORD_FRAMES = new Set<Frame>(["array", "command"]);
 // Frames inside a double-quoted string, where `$'` and a nested `${` stay quoted.
 const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 
@@ -75,6 +80,9 @@ class ShellScanner {
   private index = 0;
   private readonly stack: Frame[] = ["code"];
   private readonly heredocs: PendingHeredoc[] = [];
+  // Index just past the `)` of a word frame, where the word continues. Only
+  // that one character is affected: the scan never returns to an index.
+  private wordContinuesAt = -1;
 
   constructor(private readonly text: string) {}
 
@@ -101,6 +109,9 @@ class ShellScanner {
     } else if (char === CLOSERS[frame]) {
       this.stack.pop();
       this.index += 1;
+      if (WORD_FRAMES.has(frame)) {
+        this.wordContinuesAt = this.index;
+      }
     } else {
       return this.stepOpener(frame, char);
     }
@@ -207,7 +218,7 @@ class ShellScanner {
       // A `(` inside `a[...]` is subscript text; bash's word rules there are not modelled.
       return "complete";
     }
-    this.push("paren", 1);
+    this.push(this.opensArray() ? "array" : "paren", 1);
     this.pushArithmetic();
     return undefined;
   }
@@ -219,6 +230,12 @@ class ShellScanner {
     if (this.text[this.index] === "(") {
       this.push("arith", 1);
     }
+  }
+
+  // `x=(a b)` assigns an array. Bash reads `x=((...))` as something else, which
+  // is not modelled, so it keeps the subshell reading.
+  private opensArray(): boolean {
+    return this.text[this.index - 1] === "=" && this.text[this.index + 1] !== "(";
   }
 
   // Whether the current word has a `[` that no `]` has closed yet.
@@ -262,6 +279,9 @@ class ShellScanner {
 
   // An escaped blank or operator (`foo\ #`) is part of the word, not a boundary.
   private atWordStart(): boolean {
+    if (this.index === this.wordContinuesAt) {
+      return false;
+    }
     const previous = this.index - 1;
     return previous < 0 || (WORD_BOUNDARY.test(this.text[previous]) && !this.isEscaped(previous));
   }
