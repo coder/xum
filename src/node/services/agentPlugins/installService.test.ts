@@ -7008,7 +7008,9 @@ describe("AgentPluginInstallService", () => {
         let cause: string;
         if (damage === "corrupt") {
           await fsPromises.writeFile(configFile(), "{ not json");
-          cause = await rejectionMessage(Promise.resolve().then(() => JSON.parse("{ not json")));
+          cause = await rejectionMessage(
+            Promise.resolve().then(() => JSON.parse("{ not json") as unknown)
+          );
         } else {
           // EISDIR stands in for EACCES, which a root test runner would bypass.
           await fsPromises.rm(configFile());
