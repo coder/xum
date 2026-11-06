@@ -105,12 +105,12 @@ describe("formatToolInputIssues received arguments", () => {
   });
 
   test("keeps a key with a newline or quote on one line and bounds its length", () => {
-    const input = { 'two\nlines"': 1, [`k${"e".repeat(70)}`]: true };
+    const input = { 'two\nlines"': 1, [`k${"e".repeat(70)}`]: true, ["x".repeat(60)]: 2 };
 
     const message = formatToolInputIssues(issuesFor(aliasSchema, input), input);
 
     expect(message).toEndWith(
-      `Received arguments: two\\nlines\\"=number, k${"e".repeat(58)}…=boolean`
+      `Received arguments: two\\nlines\\"=number, k${"e".repeat(58)}…=boolean, ${"x".repeat(60)}=number`
     );
     expect(message).not.toContain("\n");
   });
