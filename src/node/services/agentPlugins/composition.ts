@@ -95,6 +95,8 @@ function summarizePlugin(plugin: AgentPluginInfo): WorkspaceCompositionPlugin {
     scope: plugin.scope,
     rootPath: plugin.rootPath,
     components,
+    manifestPath: plugin.manifestPath,
+    ...(plugin.installMethod !== undefined ? { installMethod: plugin.installMethod } : {}),
     ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
   };
 }
