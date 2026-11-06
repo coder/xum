@@ -15,7 +15,7 @@ export interface PluginAgentFile {
   frontmatter: unknown;
   /**
    * Cursor `readonly: true` or a Claude read-only search list: the agent runs on Explore's tools
-   * (no file edits, shell stays).
+   * (no file edits). The shell stays unless `keepsShell` is false.
    */
   readonly: boolean;
   /** The mapped tools leave the bash tools enabled. */

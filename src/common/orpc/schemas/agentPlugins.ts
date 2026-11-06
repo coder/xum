@@ -341,7 +341,8 @@ export const AgentPluginInstallPreviewSchema = z.object({
   agents: z.array(z.string()),
   /**
    * The files of `agents` with Cursor `readonly: true` or a Claude read-only search list: they
-   * run on Explore's tools, so the review says file edits are removed and the shell stays.
+   * run on Explore's tools, so the review says file edits are removed. The shell stays unless the
+   * agent is also in `shellRemovedAgents`.
    */
   readonlyAgents: z.array(z.string()),
   /**

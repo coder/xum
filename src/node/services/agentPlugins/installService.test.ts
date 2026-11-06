@@ -2394,7 +2394,7 @@ describe("AgentPluginInstallService", () => {
     expect((await service.list())[0].reviewRequiredCount).toBe(0);
   });
 
-  test("the install preview names the read-only agents whose shell was removed", async () => {
+  test("the install preview names the read-only agents whose shell was removed, and only those", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
     const agent = (extra: string) =>
       `---\nname: a\ndescription: Reviews code\n${extra}---\nReview.\n`;
@@ -2403,8 +2403,11 @@ describe("AgentPluginInstallService", () => {
     await write("searcher.md", "tools: [Read, Grep, Glob]\n");
     await write("no-shell.md", "tools: [Read, Grep, Glob]\ndisallowedTools: [Bash]\n");
     await write("cursor-no-shell.md", "readonly: true\ndisallowedTools: [Bash]\n");
-    await commitAll(remoteDir, "add read-only agents, two without a shell");
+    // Not read-only, and no bash tool either: the review says nothing about a removed shell.
+    await write("editor.md", "tools: [Read, Edit]\n");
+    await commitAll(remoteDir, "add read-only agents, two without a shell, and an editor");
     const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toContain("editor.md");
     expect(preview.readonlyAgents).toEqual(["cursor-no-shell.md", "no-shell.md", "searcher.md"]);
     expect(preview.shellRemovedAgents).toEqual(["cursor-no-shell.md", "no-shell.md"]);
   });
