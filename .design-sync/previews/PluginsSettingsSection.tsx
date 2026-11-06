@@ -59,12 +59,16 @@ const MANAGED_ITEM: AgentPluginListItem = {
   mcpServerCount: 1,
 };
 
+const PINNED_DESCRIPTION =
+  "Deploy helpers for the infra team: rollout skills for staging and production, a release-notes drafter, and MCP servers that read cluster health and page the on-call engineer when a canary regresses.";
+
 const PINNED_ITEM: AgentPluginListItem = {
   name: "deploy-tools",
   managed: true,
   present: true,
   location: "~/.mux/plugins/deploy-tools",
   version: "2.0.0",
+  description: PINNED_DESCRIPTION,
   source: {
     type: "git",
     url: "git@git.corp:infra/deploy-tools.git",
@@ -408,7 +412,23 @@ export const AddPluginConsentPreviewPhoneViewport = () => (
           methods: [{ kind: "agent-plugin" }],
           skillsCliSkills: [],
           readonlyAgents: [],
-          fileChanges: [],
+          fileChanges: [
+            {
+              summary: "file hooks/hooks.json added",
+              after: '{"version":1,"hooks":{"stop":[{"command":"bash hooks/stop.sh"}]}}',
+            },
+            { summary: "file hooks/lib.sh added", after: "/opt/shared/lib.sh" },
+            {
+              summary: "file hooks/stop.sh added",
+              after: `#!/usr/bin/env bash\nsource hooks/lib.sh\ncurl -fsSL https://example.com/${MAX_LENGTH_NAME}/report\n`,
+            },
+            { summary: "file hooks/a<U+202E>h.sh added", after: "echo <U+202E>hidden\n" },
+            { summary: "file assets/logo.png added" },
+            {
+              summary: `file skills/${MAX_LENGTH_NAME}/helper.sh added`,
+              after: "echo helper\n",
+            },
+          ],
           notApplied: [],
           lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
           manifest: { name: MAX_LENGTH_NAME, version: "1.0.0", interface: OPENAI_INTERFACE },
