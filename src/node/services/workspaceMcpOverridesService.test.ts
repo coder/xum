@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as fsPromisesModule from "node:fs/promises";
+import * as nodeFs from "node:fs";
 import { parse as jsoncParse, type ParseError as JsoncParseError } from "jsonc-parser";
 import * as os from "os";
 import * as path from "path";
@@ -10,6 +11,7 @@ import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import {
+  ALL_WORKSPACES_TARGET,
   boundContainerMutation,
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
@@ -148,6 +150,45 @@ describe("WorkspaceMcpOverridesService", () => {
       });
     }
   });
+
+  /**
+   * Holds the global write lock, starts `start` and returns once it has asked for that lock
+   * (a call-through spy on runExclusive). A read or a fork copy asks for it only after it
+   * observed the legacy value it will migrate, so the caller can then change the world while
+   * `start` waits behind the writer. A fixed sleep assumed that much progress and failed, or
+   * passed without testing the race, when the run was slow.
+   *
+   * A `start` that never asks for the lock settles instead: the caller's next assertion then
+   * reports what it did without the lock.
+   */
+  async function startBehindWriterLock<T>(
+    service: WorkspaceMcpOverridesService,
+    start: () => Promise<T>
+  ): Promise<{ release: () => Promise<void>; result: Promise<T> }> {
+    const release = await service.acquireExclusiveLock();
+    const internals = service as unknown as {
+      runExclusive: (fn: () => Promise<unknown>, options?: object) => Promise<unknown>;
+    };
+    const realRunExclusive = internals.runExclusive.bind(service);
+    let requested: () => void = () => undefined;
+    const requestedLock = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    const spy = spyOn(internals, "runExclusive").mockImplementation((fn, options) => {
+      requested();
+      return realRunExclusive(fn, options);
+    });
+    try {
+      const result = start();
+      await Promise.race([requestedLock, result]);
+      return { release, result };
+    } catch (error) {
+      await release();
+      throw error;
+    } finally {
+      spy.mockRestore();
+    }
+  }
 
   describe("sub-agent inheritance", () => {
     async function registerChild(
@@ -329,9 +370,9 @@ describe("WorkspaceMcpOverridesService", () => {
 
       // A writer holds the lock while the read runs: the read observes the
       // legacy value and queues behind the lock for its migration.
-      const release = await service.acquireExclusiveLock();
-      const read = service.getOverridesForWorkspace(workspaceId);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const { release, result: read } = await startBehindWriterLock(service, () =>
+        service.getOverridesForWorkspace(workspaceId)
+      );
       expect(await pathExists(filePath)).toBe(false);
       // The writer persists a disable exactly like setOverridesForWorkspace:
       // document written, legacy value cleared, epoch bumped.
@@ -372,9 +413,9 @@ describe("WorkspaceMcpOverridesService", () => {
       });
       const movedPath = path.join(path.dirname(workspacePath), "renamed");
 
-      const release = await service.acquireExclusiveLock();
-      const read = service.getOverridesForWorkspace(workspaceId);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const { release, result: read } = await startBehindWriterLock(service, () =>
+        service.getOverridesForWorkspace(workspaceId)
+      );
       // Rename lands while the read waits: checkout moved, registry updated.
       await fs.rename(workspacePath, movedPath);
       await config.editConfig((cfg) => {
@@ -1681,13 +1722,13 @@ describe("WorkspaceMcpOverridesService", () => {
       const targetPath = path.join(config.srcDir, "fork-legacy-cleared-target", "branch");
       await fs.mkdir(targetPath, { recursive: true });
 
-      const release = await service.acquireExclusiveLock();
-      const copy = service.copyOverridesToForkedCheckout(source.workspaceId, {
-        runtime: createRuntime({ type: "local" }, { projectPath: targetPath }),
-        workspacePath: targetPath,
-        runtimeConfig: undefined,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const { release, result: copy } = await startBehindWriterLock(service, () =>
+        service.copyOverridesToForkedCheckout(source.workspaceId, {
+          runtime: createRuntime({ type: "local" }, { projectPath: targetPath }),
+          workspacePath: targetPath,
+          runtimeConfig: undefined,
+        })
+      );
       // The clearing save completes while the fork waits for the lock (a
       // sibling process here: config edit + epoch bump).
       await config.editConfig((cfg) => {
@@ -4136,6 +4177,172 @@ describe("WorkspaceMcpOverridesService", () => {
     await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(service.acquireWorkspaceLock(healthy.workspaceId)).rejects.toThrow();
+  });
+
+  describe("plugin sweeps with an unrelated malformed legacy entry", () => {
+    const pluginKey = "plugin:0123456789abcdef:echo";
+    const overridesFile = (workspacePath: string) =>
+      path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const writeEnable = async (workspacePath: string) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(workspacePath),
+        JSON.stringify({ enabledServers: [pluginKey, "other"] })
+      );
+    };
+    const enabledServers = async (workspacePath: string) =>
+      (
+        JSON.parse(await fs.readFile(overridesFile(workspacePath), "utf8")) as {
+          enabledServers?: string[];
+        }
+      ).enabledServers;
+    // Id-less legacy entry: its stable id lives only in a metadata.json that does not parse.
+    // Its own runtime config keeps its checkout under this test's root.
+    const registerMalformedLegacyEntry = async () => {
+      const legacyPath = path.join(config.srcDir, "legacy-project", "old-branch");
+      await fs.mkdir(legacyPath, { recursive: true });
+      const legacyEntry: unknown = {
+        path: legacyPath,
+        runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+      };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/legacy-project", { workspaces: [legacyEntry as never] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "old-branch");
+      await fs.mkdir(sessionDir, { recursive: true });
+      await fs.writeFile(path.join(sessionDir, "metadata.json"), "{ not json");
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        config.getAllWorkspaceMetadata({ probeCheckouts: false, throwOnError: true })
+      ).rejects.toThrow();
+      return legacyPath;
+    };
+    const sweepOutcome = (service: WorkspaceMcpOverridesService, workspaceIds: string[]) =>
+      service.prunePluginOverrideKeysForWorkspaces(workspaceIds, "plugin:0123456789abcdef:").then(
+        (failures) => failures.map((failure) => failure.workspaceId).sort(),
+        () => "refused" as const
+      );
+
+    it("prunes every requested workspace, the legacy entry's checkout included", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await writeEnable(legacyPath);
+      const legacyId = (await config.getAllWorkspaceMetadata({ probeCheckouts: false }))
+        .map((metadata) => metadata.id)
+        .find((id) => id !== healthy.workspaceId);
+      if (legacyId === undefined) throw new Error("the lenient walk lists the legacy entry");
+
+      // Registry-only under the locks, the lenient walk too: a checkout probe can stall on a mount.
+      // Config probes through fs.promises, which Bun keeps apart from the fs/promises module.
+      const accessSpy = spyOn(nodeFs.promises, "access");
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId, legacyId])).toEqual([]);
+        expect(accessSpy.mock.calls.map(([target]) => String(target))).not.toContain(
+          healthy.workspacePath
+        );
+      } finally {
+        accessSpy.mockRestore();
+      }
+      expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
+      expect(await enabledServers(legacyPath)).toEqual(["other"]);
+    });
+
+    it("evicts every cache instead of publishing from the degraded registry", async () => {
+      // The child's parent is the legacy entry, whose stable id lives only in its unreadable
+      // metadata.json: resolving the child from the lenient walk would read that parent as gone.
+      const service = new WorkspaceMcpOverridesService(config);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(legacyPath),
+        JSON.stringify({ enabledServers: ["parent-server"] })
+      );
+      const child = await registerWorkspace("child-of-legacy");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
+          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
+        }
+        return cfg;
+      });
+
+      const published: Array<[string, unknown]> = [];
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [child.workspaceId],
+        "plugin:0123456789abcdef:",
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+        }
+      );
+      expect(failures).toEqual([]);
+      expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
+    });
+
+    // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
+    // which reads the same registry first.
+    const beforeSweepRead = (change: () => void) => {
+      const real = config.getAllWorkspaceMetadata.bind(config);
+      let changed = false;
+      return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
+          if (!changed && new Error().stack?.includes("loadSweepMetadata")) {
+            changed = true;
+            change();
+          }
+          return real(...args);
+        }
+      );
+    };
+
+    it.each(["before the sweep", "after the lock derivation"] as const)(
+      "refuses when config.json breaks %s and leaves the overrides as they were",
+      async (when) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        const corrupt = () => nodeFs.writeFileSync(path.join(tempDir, "config.json"), "{ not json");
+        if (when === "before the sweep") corrupt();
+        const spy = beforeSweepRead(when === "before the sweep" ? () => undefined : corrupt);
+        try {
+          expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
+
+    it("fails a requested workspace that the sweep's lenient walk does not list", async () => {
+      // The lock derivation lists the workspace. By the sweep's own read it is gone from
+      // config.json, so only the sweep's own check can fail it.
+      const service = new WorkspaceMcpOverridesService(config);
+      const healthy = await registerWorkspace("healthy-beside-legacy");
+      await writeEnable(healthy.workspacePath);
+      await registerMalformedLegacyEntry();
+      const configPath = path.join(tempDir, "config.json");
+      const spy = beforeSweepRead(() => {
+        const document = JSON.parse(nodeFs.readFileSync(configPath, "utf8")) as {
+          projects: Array<[string, unknown]>;
+        };
+        document.projects = document.projects.filter(
+          ([projectPath]) => projectPath !== "/fake/healthy-beside-legacy"
+        );
+        nodeFs.writeFileSync(configPath, JSON.stringify(document));
+      });
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([healthy.workspaceId]);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+    });
   });
 
   it("aliases sharing one checkout contend for one lock", async () => {
