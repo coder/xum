@@ -4612,12 +4612,15 @@ describe("AgentPluginInstallService", () => {
     const installSignedIn = async (
       servers: Record<string, unknown>,
       signedInUrls: string[],
-      onStop?: () => Promise<void>
+      hooks: { onStop?: () => Promise<void>; mcpConfigService?: MCPConfigService } = {}
     ) => {
       const updater = new AgentPluginInstallService(config, {
         mcpServerManager: {
-          stopServersWithKeyPrefix: () => onStop?.() ?? Promise.resolve(),
+          stopServersWithKeyPrefix: () => hooks.onStop?.() ?? Promise.resolve(),
         } as unknown as MCPServerManager,
+        ...(hooks.mcpConfigService !== undefined
+          ? { mcpConfigService: hooks.mcpConfigService }
+          : {}),
       });
       await writeServers(servers);
       const preview = await updater.preview({ input: remoteDir });
@@ -4729,8 +4732,10 @@ describe("AgentPluginInstallService", () => {
       const { update, oauth } = await installSignedIn(
         { docs: oauthEntry(docsUrl, "client-a") },
         [docsUrl],
-        async () => {
-          if (armed && atFirstStop === "not read") atFirstStop = await pendingRecord();
+        {
+          onStop: async () => {
+            if (armed && atFirstStop === "not read") atFirstStop = await pendingRecord();
+          },
         }
       );
       armed = true;
@@ -4763,14 +4768,44 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     }, 20_000);
 
-    test("an uninstall refuses while the pending sign-out record is corrupt, and leaves the install", async () => {
-      const { updater, oauth } = await installSignedIn({ docs: oauthEntry(docsUrl, "client-a") }, [
-        docsUrl,
-      ]);
+    test("an uninstall refuses at once while the pending sign-out record is corrupt, and changes nothing", async () => {
+      const mcpConfigService = new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({ xumHome: muxRoot }),
+      });
+      let armed = false;
+      let stops = 0;
+      const { updater, oauth } = await installSignedIn(
+        { docs: oauthEntry(docsUrl, "client-a") },
+        [docsUrl],
+        {
+          mcpConfigService,
+          onStop: async () => {
+            if (armed) stops++;
+          },
+        }
+      );
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "docs"
+      );
+      expect(await mcpConfigService.setServerEnabled(key, true)).toEqual({
+        success: true,
+        data: undefined,
+      });
       await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
-      await expect(
-        updater.uninstall({ name: "demo-plugin", deletePluginData: false })
-      ).rejects.toThrow(/Sign out of plugin MCP servers/);
+      armed = true;
+      const failure = await updater
+        .uninstall({ name: "demo-plugin", deletePluginData: false })
+        .then(
+          () => undefined,
+          (error: unknown) => error as Error
+        );
+      // The record's own error, naming the Settings recovery step, before anything moves.
+      expect(failure?.message).toMatch(
+        /^The pending plugin sign-out record .*Sign out of plugin MCP servers/
+      );
+      expect(stops).toBe(0);
+      expect((await mcpConfigService.listServers())[key]?.disabled).toBe(false);
       expect(await registry()).toHaveLength(1);
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
       await oauth.dispose();
