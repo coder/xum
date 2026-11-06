@@ -3,7 +3,14 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DockerRuntime, getContainerName, type DockerRuntimeConfig } from "./DockerRuntime";
-import type { ExecOptions, ExecStream, InitLogger, WorkspaceInitParams } from "./Runtime";
+import { CONTAINER_CLI_ENV } from "./containerCli";
+import {
+  RuntimeError,
+  type ExecOptions,
+  type ExecStream,
+  type InitLogger,
+  type WorkspaceInitParams,
+} from "./Runtime";
 
 const noopInitLogger: InitLogger = {
   logStep: () => {
@@ -256,6 +263,103 @@ describe("DockerRuntime.forkWorkspace", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("aborted");
+  });
+});
+
+describe("DockerRuntime.resolvePath of ~ in a container the runtime has not made ready", () => {
+  // Task.create and the agent discovery routes build one DockerRuntime per call for an existing
+  // container and read agent files before ensureReady ran. The container user is then unknown,
+  // and /root (mode 700) is not the home of a non-root user.
+  let originalCli: string | undefined;
+  let cliDir: string;
+  let cliBinaryPath: string;
+
+  /** Stands in for the container CLI. The container user's HOME is whatever `home` holds. */
+  async function writeFakeCli(): Promise<void> {
+    cliBinaryPath = path.join(cliDir, "fake-container-cli");
+    await fs.writeFile(
+      cliBinaryPath,
+      [
+        "#!/bin/sh",
+        'dir=$(dirname "$0")',
+        'echo "$*" >> "$dir/calls.log"',
+        'if [ -f "$dir/failure" ]; then',
+        '  cat "$dir/failure" >&2',
+        '  exit "$(cat "$dir/failure-exit")"',
+        "fi",
+        'cat "$dir/home"',
+        "",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+  }
+
+  async function failProbe(exitCode: number, stderr: string): Promise<void> {
+    await fs.writeFile(path.join(cliDir, "failure"), stderr);
+    await fs.writeFile(path.join(cliDir, "failure-exit"), String(exitCode));
+  }
+
+  async function probeCount(): Promise<number> {
+    const log = await fs.readFile(path.join(cliDir, "calls.log"), "utf8").catch(() => "");
+    return log.split("\n").filter((line) => line.includes("echo $HOME")).length;
+  }
+
+  function existingContainerRuntime(): DockerRuntime {
+    return new DockerRuntime({ image: "codercom/example-base:ubuntu", containerName: "mux-test" });
+  }
+
+  beforeEach(async () => {
+    originalCli = process.env[CONTAINER_CLI_ENV];
+    cliDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-docker-home-"));
+    await fs.writeFile(path.join(cliDir, "home"), "/home/coder\n");
+    await writeFakeCli();
+    process.env[CONTAINER_CLI_ENV] = cliBinaryPath;
+  });
+
+  afterEach(async () => {
+    if (originalCli === undefined) {
+      delete process.env[CONTAINER_CLI_ENV];
+    } else {
+      process.env[CONTAINER_CLI_ENV] = originalCli;
+    }
+    await fs.rm(cliDir, { recursive: true, force: true });
+  });
+
+  it("resolves ~ to the container user's home, probing once", async () => {
+    const runtime = existingContainerRuntime();
+
+    expect(await runtime.resolvePath("~/.xum/agents")).toBe("/home/coder/.xum/agents");
+    expect(await runtime.resolvePath("~")).toBe("/home/coder");
+    expect(await probeCount()).toBe(1);
+  });
+
+  it("keeps resolving a path that does not start with ~ without asking the container", async () => {
+    const runtime = existingContainerRuntime();
+
+    expect(await runtime.resolvePath("/var/mux")).toBe("/var/mux");
+    expect(await runtime.resolvePath("repo")).toBe("/src/repo");
+    expect(await probeCount()).toBe(0);
+  });
+
+  it("reports an unreachable container as a transport failure and probes again later", async () => {
+    const runtime = existingContainerRuntime();
+    await failProbe(1, "Error response from daemon: container mux-test is not running\n");
+
+    const failure = await runtime.resolvePath("~/.xum/agents").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RuntimeError);
+    expect((failure as RuntimeError).type).toBe("network");
+
+    await fs.rm(path.join(cliDir, "failure"));
+    expect(await runtime.resolvePath("~/.xum/agents")).toBe("/home/coder/.xum/agents");
+  });
+
+  it("does not guess /root when the home probe fails for another reason", async () => {
+    const runtime = existingContainerRuntime();
+    await failProbe(127, "exec: sh: not found\n");
+
+    const failure = await runtime.resolvePath("~").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(RuntimeError);
+    expect((failure as RuntimeError).type).toBe("exec");
   });
 });
 
