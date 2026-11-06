@@ -5742,6 +5742,7 @@ export class AgentPluginInstallService {
       const { plugin } = await discoverAgentPluginAt({
         pluginDir: this.targetPathFor(name),
         scope: "global",
+        choice: await this.installedChoice(name),
       });
       // mutation-equivalent: a null plugin throws a TypeError, and the catch also returns []
       if (plugin?.mcpConfigPath === undefined) return [];

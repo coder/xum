@@ -863,6 +863,31 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(loggedOut).toEqual([serverUrl]);
   });
 
+  test("an uninstall signs out the remote servers of a tree through its saved method", async () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    await write({
+      ".mcp.json": JSON.stringify({ mcpServers: { remote: { type: "http", url: serverUrl } } }),
+    });
+    await commit("a remote MCP server");
+    await installAs("claude-plugin");
+    await breakCodexManifest();
+
+    const loggedOut: string[] = [];
+    service.setMcpOauthService({
+      logout: (input: { serverUrl: string }) => {
+        loggedOut.push(input.serverUrl);
+        return Promise.resolve({ success: true });
+      },
+      credentialKey: (url: string) => url,
+    } as unknown as McpOauthService);
+    await (
+      service as unknown as { settledSignOutPasses: () => Promise<void> }
+    ).settledSignOutPasses();
+    loggedOut.length = 0;
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([serverUrl]);
+  });
+
   test("a restart saves the approved copies of a tree through its saved method", async () => {
     await installAs("claude-plugin");
     const copiesFile = getApprovedCopiesPath(
