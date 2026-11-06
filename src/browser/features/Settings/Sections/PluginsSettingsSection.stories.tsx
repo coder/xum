@@ -2241,6 +2241,48 @@ export const AddPluginInstallAsMethodCountsPhoneViewport: Story = {
   },
 };
 
+/**
+ * The agents of the Claude Code choice at phone width: a file name wraps whole to the next line,
+ * never in the middle of the name, down to a 320 px screen. Play-only: the story above snapshots
+ * this panel (Pixel budget).
+ */
+export const AddPluginAgentNamesPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: PIXEL_DISABLED,
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={egmOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement, "google/elephant-goldfish-model");
+    await userEvent.click(canvas.getByRole("radio", { name: /^Claude Code plugin/ }));
+    await canvas.findByText("Agents (9)");
+    const wrapper = canvasElement.firstElementChild;
+    if (!(wrapper instanceof HTMLElement)) throw new Error("Phone wrapper not found");
+    for (const width of ["390px", "320px"]) {
+      wrapper.style.width = width;
+      await waitFor(() => {
+        for (const name of EGM_AGENTS) {
+          const lines = new Set(
+            Array.from(canvas.getByText(name).getClientRects()).map((rect) => Math.round(rect.top))
+          );
+          if (lines.size !== 1)
+            throw new Error(`The agent ${name} is split across lines at ${width}`);
+        }
+      });
+    }
+  },
+};
+
 const INSTALLED_AS_OPTIONS: MockORPCClientOptions = {
   agentPlugins: { items: [EGM_INSTALLED, SKILLS_INSTALLED] },
 };

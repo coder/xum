@@ -1129,7 +1129,7 @@ const PreviewDisclosures: React.FC<{
           {props.preview.agents.map((agent, index) => (
             <React.Fragment key={agent}>
               {index > 0 && ", "}
-              <span className="text-foreground font-mono break-all">{agent}</span>
+              <span className="text-foreground font-mono break-words">{agent}</span>
               <ReadonlyAgentNote preview={props.preview} agent={agent} />
             </React.Fragment>
           ))}{" "}
@@ -1151,7 +1151,7 @@ const PreviewDisclosures: React.FC<{
           Workflows ({props.preview.workflows.length})
         </h4>
         <p className="text-xs">
-          <span className="text-foreground font-mono break-all">
+          <span className="text-foreground font-mono break-words">
             {props.preview.workflows.join(", ")}
           </span>{" "}
           <span className="text-muted">
