@@ -16,9 +16,9 @@ const PLUGIN_NAME = "fixture-comp-plugin";
 const PLUGIN_SOURCE = `plugin:${PLUGIN_NAME}`;
 
 // The inspector also scans the runtime user's global roots (HOME and the Xum home). A host with many
-// installed skills adds a shell containment probe per skill and root, which took this file over
-// 120-240 s per test, while an empty home takes seconds. Pointing both at an empty folder makes the
-// file independent of the host.
+// installed skills adds a shell containment probe per skill and root (about 990 in the first test),
+// so three tests ran into their 120 s and 240 s limits, while an empty home takes seconds. Pointing
+// both at an empty folder makes the file independent of the host.
 let hostHome: DisposableTempDir | undefined;
 let previousHome: string | undefined;
 let previousXumRoot: string | undefined;

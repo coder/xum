@@ -116,7 +116,7 @@ function overridesServiceStub(
 
 async function initRemote(dir: string): Promise<void> {
   // An empty --template keeps the host's init.templateDir hooks out of the fixture: they add about
-  // ten processes to every commit and exist only on some machines.
+  // twenty processes to every commit and exist only on some machines.
   using proc = execFileAsync("git", ["init", "--quiet", "--template=", "-b", "main", dir]);
   await proc.result;
   await git(dir, "config", "user.email", "test@example.com");
