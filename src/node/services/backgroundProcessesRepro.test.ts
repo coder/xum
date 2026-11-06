@@ -189,7 +189,8 @@ describe("terminating a background process that already exited", () => {
       exited.then(() => "settled"),
       Bun.sleep(150).then(() => "held"),
     ]);
-    // Target assertion: reading an empty marker must not count as the exit.
+    // The exit stays pending while the marker is empty. A reader that took the empty marker for
+    // the exit would reject `exited` inside expectExited, so the race throws before this line.
     expect(raced).toBe("held");
     await fs.writeFile(gate, "");
     expect((await exited).processId).toBe(spawned.processId);
