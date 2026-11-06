@@ -3,6 +3,7 @@ import type { HeldInput } from "@/common/orpc/types";
 import type { DisplayedMessage, DisplayedUserMessage, QueuedMessage } from "@/common/types/message";
 import type { RuntimeStatusEvent } from "@/common/types/stream";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 /** The longest preview kept per line; the bar truncates visually well before this. */
 const PREVIEW_MAX_CHARS = 160;
@@ -14,6 +15,15 @@ const TOOL_DETAIL_KEYS = ["display_name", "title", "path", "file_path"] as const
 function oneLine(text: string): string {
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > PREVIEW_MAX_CHARS ? `${line.slice(0, PREVIEW_MAX_CHARS - 1)}…` : line;
+}
+
+/**
+ * A row's text as a preview line: invisible tag characters become readable marks, since a preview is
+ * the second place a user checks what a message really says. Parse structure out of the row's own
+ * `content` before calling this; the mark is not reversible.
+ */
+function previewLine(text: string): string {
+  return oneLine(revealUnicodeTags(text));
 }
 
 /** A short plain-text name for what a tool call works on (bash display_name, file path, task title). */
@@ -258,7 +268,7 @@ const ROW_BUILDERS: RowBuilders = {
     kind: "user",
     // Machine-authored user rows (wakes, continuations) are Xum's, not the user's.
     label: isHumanUserMessage(message) ? "You" : "Xum",
-    preview: oneLine(message.content),
+    preview: previewLine(message.content),
   }),
   assistant: (message) => {
     // Another agent's message: name its sender and show its text, as the transcript's card does,
@@ -270,10 +280,15 @@ const ROW_BUILDERS: RowBuilders = {
         id: message.id,
         kind: "assistant",
         label: `From ${peer.fromTitle ?? peer.fromWorkspaceId}`,
-        preview: oneLine(envelope?.message ?? message.content),
+        preview: previewLine(envelope?.message ?? message.content),
       };
     }
-    return { id: message.id, kind: "assistant", label: "Agent", preview: oneLine(message.content) };
+    return {
+      id: message.id,
+      kind: "assistant",
+      label: "Agent",
+      preview: previewLine(message.content),
+    };
   },
   tool: (message) => ({
     id: message.id,

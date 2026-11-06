@@ -1,5 +1,6 @@
 import { ArrowRightLeft, ChevronRight, CircleAlert } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import type { SubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
 
 export function SubagentFailureMessageContent(props: { failure: SubagentFailureEnvelope }) {
@@ -31,13 +32,13 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
                 : "Subagent task failed"}
           </span>
           <span className="text-muted text-xs [overflow-wrap:anywhere]">
-            {props.failure.agentType}
+            {revealUnicodeTags(props.failure.agentType)}
           </span>
         </div>
         <p className="text-muted mt-1 leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap">
           {isSuperseded
             ? "The workspace continues with the new input. This delegated turn won’t return a report."
-            : props.failure.errorMessage}
+            : revealUnicodeTags(props.failure.errorMessage)}
         </p>
         <details className="group mt-2">
           <summary className="text-muted hover:text-foreground focus-visible:ring-ring flex w-fit cursor-pointer list-none items-center gap-1 rounded-sm text-xs focus-visible:ring-2 focus-visible:outline-none [&::-webkit-details-marker]:hidden">
@@ -57,7 +58,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
             </dl>
             {isSuperseded && (
               <p className="text-muted mt-2 text-xs leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap">
-                {props.failure.errorMessage}
+                {revealUnicodeTags(props.failure.errorMessage)}
               </p>
             )}
           </div>

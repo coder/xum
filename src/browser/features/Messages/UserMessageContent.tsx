@@ -24,6 +24,7 @@ import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
 import { formatArtifactInteractionMarkdown } from "./artifactInteractionMarkdown";
 import { stripReviewBlocksForDisplay } from "@/common/types/review";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 interface UserMessageContentProps {
   content: string;
@@ -144,7 +145,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
     if (!shouldHighlightPrefix) {
       return (
         <MarkdownRenderer
-          content={textContent}
+          content={revealUnicodeTags(textContent)}
           className={markdownClassName}
           style={markdownStyles[props.variant]}
           inlineSkillSnapshots={props.inlineSkillSnapshots}
@@ -197,7 +198,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
         {hasSpaceAfterPrefix && <span>&nbsp;</span>}
         {remainingContent.trim() && (
           <MarkdownRenderer
-            content={remainingContent.trim()}
+            content={revealUnicodeTags(remainingContent.trim())}
             className={markdownClassName}
             style={markdownStyles[props.variant]}
             inlineSkillSnapshots={props.inlineSkillSnapshots}

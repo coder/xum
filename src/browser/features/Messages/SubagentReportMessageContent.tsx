@@ -2,6 +2,7 @@ import { useState, type ReactElement } from "react";
 import { Bot, Braces, ChevronRight, CircleCheck, Radio } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import type { SubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ModelDisplay, ThinkingLevelLabel } from "./ModelDisplay";
@@ -93,7 +94,7 @@ export function SubagentReportMessageContent(
       {reportExpanded && (
         <>
           <MarkdownRenderer
-            content={props.report.reportMarkdown}
+            content={revealUnicodeTags(props.report.reportMarkdown)}
             className="mt-2 text-sm leading-relaxed text-[var(--color-user-text)]"
           />
 
@@ -117,7 +118,7 @@ export function SubagentReportMessageContent(
               </button>
               {structuredOutputExpanded && (
                 <pre className="bg-code-bg mt-2 max-h-[40vh] max-w-full overflow-auto rounded-sm p-2 font-mono text-xs leading-relaxed whitespace-pre text-[var(--color-user-text)]">
-                  {structuredOutputJson}
+                  {revealUnicodeTags(structuredOutputJson)}
                 </pre>
               )}
             </div>

@@ -54,10 +54,10 @@ export const RGI_SUBDIVISION_FLAG_PATTERN = `\u{1f3f4}(?:${["gbeng", "gbsct", "g
  * shows. They are deprecated and no chat or code text holds them legitimately.
  *
  * The one legitimate use is an RGI subdivision flag, whose tags ARE the emoji. Marking those would
- * replace a rendered flag with `<U+E0067>...` and, because Copy and Edit consume the displayed
- * text, corrupt what the user copies or re-sends. The flag branch is listed first so the
- * alternation consumes the whole flag before the tag branch can reach its members. Any other tag
- * sequence -- `usca`, say -- is not a flag any font draws, so it stays a payload and is revealed.
+ * replace a rendered flag with `<U+E0067>...` for no gain: the sequence already draws, so it is not
+ * a hidden payload. The flag branch is listed first so the alternation consumes the whole flag
+ * before the tag branch can reach its members. Any other tag sequence -- `usca`, say -- is not a
+ * flag any font draws, so it stays a payload and is revealed.
  */
 const TAG_OR_RGI_SUBDIVISION_FLAG = new RegExp(
   `(${RGI_SUBDIVISION_FLAG_PATTERN})|[\u{E0000}\u{E0020}-\u{E007F}]`,
@@ -71,9 +71,13 @@ const BLACK_FLAG = String.fromCodePoint(0x1f3f4);
  * Each tag character in `text` becomes its visible `<U+XXXX>` mark, leaving everything else
  * byte-identical. Needed wherever text is shown but still travels to a model provider: the tags
  * are invisible in the transcript yet provider-visible, so a smuggled instruction would be sent
- * and read by the model while the user could neither see nor copy it. Scoped to tags rather than
- * to all default-ignorables on purpose - variation selectors and joiners sit inside everyday emoji
- * and marking those would mangle ordinary text.
+ * and read by the model while the user could neither see nor copy it.
+ *
+ * Scoped to tags rather than to all default-ignorables on purpose - variation selectors and joiners
+ * sit inside everyday emoji and marking those would mangle ordinary text. And call it only at the
+ * point where text becomes pixels: the mark is irreversible, so revealing text that Copy, an editor
+ * draft or a provider request still reads would substitute 8 ASCII characters per invisible one and
+ * persist them as if the user had typed that.
  */
 export function revealUnicodeTags(text: string): string {
   return text.replace(TAG_OR_RGI_SUBDIVISION_FLAG, (matched) =>

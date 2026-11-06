@@ -1,5 +1,6 @@
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { useStartHere } from "@/browser/hooks/useStartHere";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import type { DisplayedMessage } from "@/common/types/message";
 import { copyToClipboard } from "@/browser/utils/clipboard";
@@ -53,7 +54,12 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
   const liveApi = useLiveAPI();
   const forkError = usePopoverError();
 
+  // `content` is the stored text: Copy and Start Here (which writes a compaction boundary into
+  // chat.jsonl) must keep its bytes. `displayedContent` reveals invisible tag characters and feeds
+  // the rendered row only — the mark cannot be reversed, so it must never round-trip a copy or a
+  // re-send.
   const content = message.content;
+  const displayedContent = revealUnicodeTags(content);
   const isStreaming = message.isStreaming;
   const isCompacted = message.isCompacted;
   const isBeforeLatestContextBoundary = message.isBeforeLatestContextBoundary === true;
@@ -161,11 +167,11 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
   // Render appropriate content based on state
   const renderContent = () => {
     // Empty streaming state
-    if (isStreaming && !content) {
+    if (isStreaming && !displayedContent) {
       return <div className="font-primary text-secondary italic">Waiting for response...</div>;
     }
 
-    if (!content) {
+    if (!displayedContent) {
       return null;
     }
 
@@ -173,7 +179,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       return (
         <div className="relative">
           <pre className="text-text bg-code-bg m-0 rounded-sm p-2 pb-8 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap">
-            {content}
+            {displayedContent}
           </pre>
           <div className="absolute right-2 bottom-2">
             <Button
@@ -199,7 +205,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     // renders parseIncompleteMarkdown=false, matching the prior static render exactly.
     const contentElement = (
       <TypewriterMarkdown
-        content={content}
+        content={displayedContent}
         isComplete={!isStreaming}
         streamKey={message.historyId}
         streamSource={message.streamPresentation?.source}

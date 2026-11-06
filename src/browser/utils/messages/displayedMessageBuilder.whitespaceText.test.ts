@@ -140,43 +140,40 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
   // Tag characters (U+E0020-U+E007F) are default-ignorables, so they paint nothing -- but they map
   // onto ASCII and the provider request path keeps them (`dropEmptyText` is trim()-based, and
   // OpenAI/Google skip that filter entirely). Dropping the row would hide instructions the model
-  // still received, so the row stays and the tags render as visible marks.
+  // still received, so the row stays; the render leaves are what reveal the tags as visible marks.
   const tags = (ascii: string) =>
     [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
 
-  test("keeps a tag-only row and renders its hidden payload", () => {
+  test("keeps a tag-only row that would otherwise draw nothing", () => {
     const displayed = rows([{ type: "text", text: tags("AB") }, FAILED_BASH]);
 
     expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
-    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
-      "<U+E0041><U+E0042>"
-    );
   });
 
-  test("marks only the tags inside otherwise-visible text", () => {
-    const displayed = rows([{ type: "text", text: `continue${tags("XY")}` }, FAILED_BASH]);
+  test("leaves row content byte-identical so Copy and Edit cannot corrupt it", () => {
+    // The defect this pins: the row's content is the field Copy and Edit read, and a revealed
+    // `<U+XXXX>` mark is irreversible, so editing such a row persisted 8 ASCII characters per
+    // invisible character in place of the user's text. The reveal belongs to the render leaves.
+    const text = `continue${tags("XY")}`;
+    const displayed = rows([{ type: "text", text }, FAILED_BASH]);
 
-    // Everything but the tag code points is untouched.
-    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
-      "continue<U+E0058><U+E0059>"
-    );
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(text);
   });
 
-  test("user rows reveal tags the same way", () => {
+  test("leaves user row content byte-identical as well", () => {
+    const text = tags("AB");
     const displayed = buildDisplayedMessagesForMessage({
-      message: createMuxMessage("u1", "user", "", undefined, [{ type: "text", text: tags("AB") }]),
+      message: createMuxMessage("u1", "user", "", undefined, [{ type: "text", text }]),
       hasActiveStream: false,
       isContextBoundaryMessage: () => false,
     });
 
     expect(displayed[0]?.type).toBe("user");
-    expect(displayed[0]?.type === "user" ? displayed[0].content : null).toBe("<U+E0041><U+E0042>");
+    expect(displayed[0]?.type === "user" ? displayed[0].content : null).toBe(text);
   });
 
-  test("leaves a subdivision-flag emoji intact", () => {
-    // A subdivision flag IS black flag + a tag sequence + cancel: its tags are the emoji, and
-    // copy/Edit read the displayed content, so marking them would drop the flag AND corrupt what
-    // the user copies or re-sends.
+  test("keeps a subdivision-flag emoji byte-identical", () => {
+    // A subdivision flag IS black flag + a tag sequence + cancel: its tags are the emoji.
     const subdivisionFlag = (region: string) => `\u{1F3F4}${tags(region)}\u{E007F}`;
     for (const region of ["gbeng", "gbsct", "gbwls"]) {
       const flag = subdivisionFlag(region);
@@ -185,24 +182,21 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
     }
   });
 
-  test("reveals a non-RGI tag sequence, which no font draws as a flag", () => {
+  test("keeps a row for a payload disguised as a non-RGI flag, which no font draws", () => {
     // Only gbeng/gbsct/gbwls are RGI. A black flag plus other tags renders as a plain black flag,
-    // so its tags are a hidden payload and must not be exempted as if they were an emoji.
+    // so its tags are a hidden payload: the row must stay visible rather than look like an emoji.
     const disguised = `\u{1F3F4}${tags("usca")}\u{E007F}`;
     const displayed = rows([{ type: "text", text: disguised }, FAILED_BASH]);
 
-    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
-      `\u{1F3F4}<U+E0075><U+E0073><U+E0063><U+E0061><U+E007F>`
-    );
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
   });
 
-  test("reveals a payload hidden alongside a real subdivision flag", () => {
+  test("keeps a row for a payload hidden alongside a real subdivision flag", () => {
     const flag = `\u{1F3F4}${tags("gbeng")}\u{E007F}`;
-    const displayed = rows([{ type: "text", text: `${flag}${tags("AB")}` }, FAILED_BASH]);
+    const text = `${flag}${tags("AB")}`;
+    const displayed = rows([{ type: "text", text }, FAILED_BASH]);
 
-    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
-      `${flag}<U+E0041><U+E0042>`
-    );
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(text);
   });
 
   test("keeps a message that is nothing but a subdivision flag", () => {

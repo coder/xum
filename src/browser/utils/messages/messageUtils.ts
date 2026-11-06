@@ -14,6 +14,9 @@ export interface EditableUserMessageDraftContent {
 
 /**
  * Returns the text and staged attachments that should be placed into ChatInput when editing.
+ *
+ * The draft becomes the next provider request and replaces the stored row, so it must be the stored
+ * bytes: a revealed `<U+XXXX>` mark from the transcript would be persisted as if the user typed it.
  */
 export function getEditableUserMessageDraftContent(
   message: Extract<DisplayedMessage, { type: "user" }>

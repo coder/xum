@@ -1,6 +1,7 @@
 import { useState, type ReactElement, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/common/lib/utils";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
 interface CollapsibleMachineMessageProps {
@@ -46,9 +47,11 @@ export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps)
         <span className="sr-only">{expanded ? "Hide details" : "Show details"}</span>
       </button>
       {expanded && (
+        // The quote attribute keeps `props.content` byte-for-byte: it is the text "Quote in input"
+        // re-sends, and a revealed mark must never re-enter history. Only the drawn text is escaped.
         <TranscriptQuoteRoot text={props.content} className="mt-1.5 w-full">
           <pre className="text-muted bg-muted/5 border-border max-h-[40vh] overflow-y-auto rounded-md border p-2 text-xs leading-relaxed whitespace-pre-wrap">
-            {props.content}
+            {revealUnicodeTags(props.content)}
           </pre>
         </TranscriptQuoteRoot>
       )}
