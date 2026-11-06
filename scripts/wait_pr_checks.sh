@@ -186,7 +186,7 @@ CHECK_PR_CHECKS_ONCE() {
   }
 
   jq_defs=$(visual_check_jq_defs)
-  filtered_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check | not) ]")
+  filtered_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check | not) ] | drop_superseded_cancelled")
   ignored_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check) ]")
   filtered_count=$(echo "$filtered_checks" | jq 'length')
   checks=$(echo "$filtered_checks" | jq -r "$jq_defs if length == 0 then \"(no non-visual-review checks reported)\" else .[] | check_line end")
