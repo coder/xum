@@ -738,20 +738,6 @@ function isRetryableLockError(error: unknown): boolean {
 type SweptOutcome =
   | { ok: true; swept: SweptWorkspace; owesEpoch: boolean }
   | { ok: false; error: unknown; owesEpoch: boolean };
-function idsByCheckoutKey(
-  ids: readonly string[],
-  keysOf: (id: string) => readonly string[]
-): Map<string, string[]> {
-  const index = new Map<string, string[]>();
-  for (const id of ids) {
-    for (const key of keysOf(id)) {
-      const sharing = index.get(key);
-      if (sharing) sharing.push(id);
-      else index.set(key, [id]);
-    }
-  }
-  return index;
-}
 /**
  * Group IDs whose checkouts share a lock key: aliases of one checkout (an
  * isolation:none child and its parent) address one override document, and
@@ -762,25 +748,20 @@ function groupByCheckout(
   ids: readonly string[],
   keysOf: (id: string) => readonly string[]
 ): string[][] {
-  const index = idsByCheckoutKey(ids, keysOf);
-  const grouped = new Set<string>();
-  const groups: string[][] = [];
+  const groupOfKey = new Map<string, Set<string>>();
+  const groupOfId = new Map<string, Set<string>>();
   for (const id of ids) {
-    if (grouped.has(id)) continue;
-    grouped.add(id);
-    const group = [id];
-    // The array iterator also visits members pushed while it runs.
-    for (const member of group) {
-      for (const other of keysOf(member).flatMap((key) => index.get(key) ?? [])) {
-        if (!grouped.has(other)) {
-          grouped.add(other);
-          group.push(other);
-        }
-      }
+    // Merge into a NEW set: no loop below iterates the set it grows.
+    const group = new Set([id]);
+    for (const key of keysOf(id)) {
+      for (const member of groupOfKey.get(key) ?? []) group.add(member);
     }
-    groups.push(group);
+    for (const member of group) {
+      groupOfId.set(member, group);
+      for (const key of keysOf(member)) groupOfKey.set(key, group);
+    }
   }
-  return groups;
+  return [...new Set(groupOfId.values())].map((group) => [...group]);
 }
 /**
  * Lock files and checkouts touched at once by a batch (see withWorkspaceLocks).
