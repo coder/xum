@@ -127,6 +127,10 @@ export class ServerLockfile {
   /**
    * Check if a process with the given PID is still running.
    * Uses signal 0 which tests existence without actually sending a signal.
+   *
+   * This cannot tell the server from an unrelated process that reused its pid: such a lock reads
+   * as live, and startServer() refuses while it does. read() never deleted a lock whose pid is
+   * alive, so that held before it stopped deleting stale ones too.
    */
   private isProcessAlive(pid: number): boolean {
     try {
