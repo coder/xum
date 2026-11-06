@@ -1,5 +1,14 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { LanguageModel, ModelMessage, Tool } from "ai";
+import {
+  InvalidToolInputError,
+  type LanguageModel,
+  type ModelMessage,
+  type StreamTextTransform,
+  type TextStreamPart,
+  type Tool,
+  type ToolSet,
+  type streamText,
+} from "ai";
 
 import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
@@ -20,9 +29,12 @@ import {
   settleAutoThinkingEscalation,
   stageAutoThinkingEscalation,
   startFirstStepRebuild,
+  StepPreparation,
   stripReasoningBeforeReplayBoundary,
   thinkingChangeVoidsPrefixSwap,
 } from "./StepPreparation";
+import type { StepPreparationDeps } from "./StepPreparation";
+import type { StreamRequestConfig } from "./types";
 
 /** A staged swap whose prefix was prepared at this thinking level. */
 function swapPreparedAt(level: string): ContinuousPrefixSwap {
@@ -530,5 +542,55 @@ describe("prefixSwapInvalidationReason", () => {
     expect(prefixSwapInvalidationReason(running.signal)).toEqual(
       new Error("Prefix swap invalidated")
     );
+  });
+});
+
+describe("StepPreparation.createStreamResult", () => {
+  function captureStreamOptions(): { transform?: StreamTextTransform<ToolSet> } {
+    const captured: { transform?: StreamTextTransform<ToolSet> } = {};
+    const streamTextOverride = ((options: Parameters<typeof streamText>[0]) => {
+      captured.transform = options.experimental_transform as StreamTextTransform<ToolSet>;
+      return {};
+    }) as unknown as typeof streamText;
+    const deps = { streamTextOverride, createStopWhenCondition: () => [] };
+    const request = { model: {}, modelString: "local:qwen", messages: [] };
+    new StepPreparation(deps as unknown as StepPreparationDeps).createStreamResult(
+      request as unknown as StreamRequestConfig,
+      new AbortController()
+    );
+    return captured;
+  }
+
+  test("logs a rejected tool call with the request's model when there is no step tracker", async () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const transform = captureStreamOptions().transform!({
+      tools: {},
+      stopStream: () => undefined,
+    });
+    const error = new InvalidToolInputError({
+      toolName: "bash",
+      toolInput: '{"command":"cd"}',
+      cause: undefined,
+    });
+    const writer = transform.writable.getWriter();
+    void writer.write({
+      type: "tool-call",
+      toolCallId: "cut",
+      toolName: "bash",
+      input: { command: "cd" },
+      dynamic: true,
+      invalid: true,
+      error,
+    } as TextStreamPart<ToolSet>);
+    await transform.readable.getReader().read();
+
+    expect(warn).toHaveBeenCalledWith("Rejected a tool call with invalid input", {
+      toolName: "bash",
+      model: "local:qwen",
+      workspaceId: undefined,
+      argumentsBytes: 16,
+      arguments: '{"command":"cd"}',
+    });
+    warn.mockRestore();
   });
 });

@@ -780,7 +780,10 @@ export class StepPreparation {
       prepareStep: (step) => this.prepareStepMessages(context, step),
       onChunk: request.onChunk,
       tools: agentToolsDisabled ? undefined : request.tools,
-      experimental_transform: summarizeInvalidToolInputErrors(),
+      experimental_transform: summarizeInvalidToolInputErrors({
+        model: request.modelString,
+        workspaceId: stepTracker?.workspaceId,
+      }),
       stopWhen: this.deps.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
       providerOptions: request.providerOptions as any, // Pass provider-specific options (thinking/reasoning config)

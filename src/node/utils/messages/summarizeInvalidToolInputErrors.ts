@@ -9,11 +9,20 @@ import {
   formatToolInputIssues,
   isToolInputIssueArray,
 } from "@/common/utils/tools/formatToolInputIssues";
+import { log } from "@/node/services/log";
+
+const LOGGED_ARGUMENTS_MAX_CHARS = 2048;
+
+export interface RejectedToolCallLogContext {
+  model?: string;
+  workspaceId?: string;
+}
 
 /**
  * The SDK's InvalidToolInputError message echoes the entire submitted input
  * and buries the zod issue at the end, so the model retries blind. Render only
- * the issues (with received string lengths) when the cause chain
+ * the issues (with received string lengths and, for a missing property, a
+ * bounded preview of the received arguments) when the cause chain
  * (InvalidToolInputError -> TypeValidationError -> ZodError) exposes them.
  */
 export function describeInvalidToolInput(toolName: string, input: unknown, error: unknown): string {
@@ -39,9 +48,9 @@ export function describeInvalidToolInput(toolName: string, input: unknown, error
  * stream, so only a transform changes what the model sees on its same-turn
  * retry. The consumer then persists the same summary for later turns.
  */
-export function summarizeInvalidToolInputErrors<
-  TOOLS extends ToolSet,
->(): StreamTextTransform<TOOLS> {
+export function summarizeInvalidToolInputErrors<TOOLS extends ToolSet>(
+  context: RejectedToolCallLogContext = {}
+): StreamTextTransform<TOOLS> {
   return () => {
     const summaries = new Map<string, string>();
     return new TransformStream<TextStreamPart<TOOLS>, TextStreamPart<TOOLS>>({
@@ -52,6 +61,7 @@ export function summarizeInvalidToolInputErrors<
           part.invalid === true &&
           part.error != null
         ) {
+          logRejectedToolCall(part.toolName, part.input, part.error, context);
           summaries.set(
             part.toolCallId,
             describeInvalidToolInput(part.toolName, part.input, part.error)
@@ -67,4 +77,41 @@ export function summarizeInvalidToolInputErrors<
       },
     });
   };
+}
+
+/**
+ * Records what Xum received for a rejected call, so a log alone shows whether
+ * the provider, the SDK or the model cut a tool argument short.
+ */
+function logRejectedToolCall(
+  toolName: string,
+  input: unknown,
+  error: unknown,
+  context: RejectedToolCallLogContext
+): void {
+  const received = receivedArgumentsText(input, error);
+  log.warn("Rejected a tool call with invalid input", {
+    toolName,
+    model: context.model,
+    workspaceId: context.workspaceId,
+    argumentsBytes: Buffer.byteLength(received, "utf8"),
+    arguments:
+      received.length > LOGGED_ARGUMENTS_MAX_CHARS
+        ? `${received.slice(0, LOGGED_ARGUMENTS_MAX_CHARS)}…`
+        : received,
+  });
+}
+
+// InvalidToolInputError keeps the argument text exactly as the SDK received it from
+// the provider; re-serializing the parsed input would hide whitespace and escaping.
+function receivedArgumentsText(input: unknown, error: unknown): string {
+  if (InvalidToolInputError.isInstance(error)) {
+    return error.toolInput;
+  }
+  if (typeof input === "string") {
+    return input;
+  }
+  const serialized: string | undefined = JSON.stringify(input);
+  // mutation-equivalent: JSON.stringify never returns "", so ?? and || agree
+  return serialized ?? "";
 }
