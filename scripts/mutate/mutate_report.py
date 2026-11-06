@@ -313,34 +313,47 @@ def run_baseline(worker: Path, test: str, limit: float) -> tuple[bool, float, bo
     """Like run_test, but cut off by silence, not by total time.
 
     (passed, seconds, timed_out). A baseline runs until it ends, goes quiet for BASELINE_STALL seconds
-    (a hang) or has run for `limit` seconds (the time left before the run's deadline). Mutants keep
-    their own bound, scaled from this run's seconds (see run_mutant).
+    (a hang) or has run for `limit` seconds (the time left before the run's deadline). Its output goes
+    through a pipe that a thread drains and drops: only the time of the last byte is kept, so a baseline
+    that loops printing fills no disk. Mutants keep their own bound, scaled from this run's seconds
+    (see run_mutant).
     """
 
     started = time.monotonic()
-    with tempfile.TemporaryFile() as output:
-        proc = subprocess.Popen(
-            ["bun", "test", f"./{test}"],
-            cwd=worker,
-            start_new_session=True,
-            stdout=output,
-            stderr=output,
-        )
-        size, last_output = -1, started
+    proc = subprocess.Popen(
+        ["bun", "test", f"./{test}"],
+        cwd=worker,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    last_output = [started]
+
+    def drain() -> None:
+        assert proc.stdout is not None
+        while proc.stdout.read1(65536):
+            last_output[0] = time.monotonic()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
         while True:
             try:
                 code = proc.wait(timeout=min(1.0, BASELINE_STALL / 4))
             except subprocess.TimeoutExpired:
                 now = time.monotonic()
-                grown = os.fstat(output.fileno()).st_size
-                if grown != size:
-                    size, last_output = grown, now
-                if now - last_output >= BASELINE_STALL or now - started >= limit:
+                if now - last_output[0] >= BASELINE_STALL or now - started >= limit:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
                     return False, now - started, True
             else:
                 return code == 0, time.monotonic() - started, False
+    finally:
+        # The group is dead or done, so the pipe closes and the reader ends. A grandchild that left the
+        # group could hold it open: the reader is a daemon thread, so the run does not wait for it.
+        reader.join(timeout=1)
+        if not reader.is_alive() and proc.stdout is not None:
+            proc.stdout.close()
 
 
 def run_mutant(worker: Path, site: Site, tests: list[str], timeouts: dict[str, float], deadline: float) -> str:
