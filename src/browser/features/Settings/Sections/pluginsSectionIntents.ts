@@ -1,4 +1,5 @@
 import type { AgentPluginUpdateReview } from "@/common/orpc/schemas/agentPlugins";
+import type { BackupPluginInstall } from "@/common/orpc/schemas/backup";
 
 /**
  * Intents for the Settings → Plugins section, published by command-palette
@@ -28,7 +29,24 @@ export type PluginsSectionIntent =
   /** Show the in-place update review for a capability-changing update the palette previewed. */
   | { type: "review-update"; review: AgentPluginUpdateReview }
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
-  | { type: "refresh" };
+  | { type: "refresh" }
+  /**
+   * Reinstall the plugins a settings backup lists, one install review each (Settings → Backup).
+   * Only the plugins this machine lacks: nothing installs until the user confirms each preview.
+   */
+  | { type: "install-from-backup"; plugins: BackupPluginInstall[] };
+
+/** Whether an intent opens the Add plugin panel. */
+export function opensAddPanel(intent: PluginsSectionIntent | null): boolean {
+  return intent?.type === "open-add-panel" || intent?.type === "install-from-backup";
+}
+
+/** The backup plugins an intent asks to reinstall; undefined for any other intent. */
+export function backupPluginsOf(
+  intent: PluginsSectionIntent | null
+): readonly BackupPluginInstall[] | undefined {
+  return intent?.type === "install-from-backup" ? intent.plugins : undefined;
+}
 
 let pendingIntent: PluginsSectionIntent | null = null;
 const listeners = new Set<(intent: PluginsSectionIntent) => void>();

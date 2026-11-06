@@ -35,12 +35,15 @@ import type {
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
+import type { BackupPluginInstall } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
+  backupPluginsOf,
   consumePendingPluginsSectionIntent,
+  opensAddPanel,
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
@@ -61,6 +64,14 @@ import {
   offersSkillsCli,
 } from "./PluginInstallMethods";
 import { MarketplaceListing } from "./PluginMarketplaceListing";
+import {
+  BackupQueueHeader,
+  backupPreviewRequest,
+  installSource,
+  selectedComponents,
+  useInstallQueue,
+  type PluginPreviewRequest,
+} from "./pluginBackupQueue";
 
 /**
  * Settings → Plugins (global scope only).
@@ -648,10 +659,104 @@ function focusFirstControlOnMount(view: HTMLDivElement | null): void {
   first?.focus();
 }
 
+/** The Add plugin form's source fields; Enter previews like the Preview button. */
+const PluginSourceForm: React.FC<{
+  input: string;
+  setInput: (value: string) => void;
+  gitRef: string;
+  setRef: (value: string) => void;
+  subpath: string;
+  setSubpath: (value: string) => void;
+  busy: boolean;
+  error: string | null;
+  onPreview: () => void;
+  onClose: () => void;
+}> = (props) => {
+  const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") props.onPreview();
+  };
+  return (
+    <>
+      <div>
+        <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
+          Git URL or owner/repo
+        </label>
+        <input
+          id="plugin-source"
+          type="text"
+          autoFocus
+          placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
+          value={props.input}
+          onChange={(e) => props.setInput(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      <div>
+        <label htmlFor="plugin-ref" className="text-muted mb-1 block text-xs">
+          Branch, tag, or commit SHA (optional — defaults to the default branch)
+        </label>
+        <input
+          id="plugin-ref"
+          type="text"
+          placeholder="e.g., main, v1.2.0, or a full 40-character SHA"
+          value={props.gitRef}
+          onChange={(e) => props.setRef(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      {/* Full URLs (GitLab, self-hosted, SSH, file) cannot carry a folder
+          in the source field, so monorepo folders need their own field. */}
+      <div>
+        <label htmlFor="plugin-subpath" className="text-muted mb-1 block text-xs">
+          Plugin folder in the repository (optional — for monorepos)
+        </label>
+        <input
+          id="plugin-subpath"
+          type="text"
+          placeholder="e.g., packages/my-plugin"
+          value={props.subpath}
+          onChange={(e) => props.setSubpath(e.target.value)}
+          onKeyDown={previewOnEnter}
+          spellCheck={false}
+          className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+        />
+      </div>
+      {props.error && (
+        <div
+          role="alert"
+          className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+        >
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="min-w-0 break-words">{props.error}</span>
+        </div>
+      )}
+      <div className="flex gap-2">
+        <Button
+          size="sm"
+          onClick={props.onPreview}
+          disabled={props.busy || props.input.trim().length === 0}
+        >
+          {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          {props.busy ? "Fetching…" : "Preview"}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={props.onClose} disabled={props.busy}>
+          Cancel
+        </Button>
+      </div>
+    </>
+  );
+};
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
+  /** Plugins a settings backup lists, each reviewed and installed (or skipped) in turn. */
+  backupPlugins?: readonly BackupPluginInstall[];
 }> = (props) => {
   const { api } = useAPI();
   const [input, setInput] = useState("");
@@ -675,18 +780,13 @@ const AddPluginPanel: React.FC<{
    */
   const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
-  /** `method`: the Install as choice; null takes the first method that fits. */
-  const handlePreview = async (method: AgentPluginInstallMethod | null) => {
-    if (!api || input.trim().length === 0 || busy) return;
+  /** `item`: the backed-up plugin this request reinstalls, which decides the preselected components. */
+  const runPreview = async (request: PluginPreviewRequest, item: BackupPluginInstall | null) => {
+    if (!api || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await api.agentPlugins.preview({
-        input: input.trim(),
-        ref: optionalField(ref),
-        subpath: optionalField(subpath),
-        method,
-      });
+      const result = await api.agentPlugins.preview(request);
       if (!result.success) {
         setError(result.error);
       } else if (result.data.kind === "marketplace") {
@@ -694,12 +794,11 @@ const AddPluginPanel: React.FC<{
       } else {
         const next = result.data.preview;
         setPreview(next);
-        setPreviewedEntry(method !== null && "entry" in method ? method.entry : null);
+        setPreviewedEntry(
+          request.method !== null && "entry" in request.method ? request.method.entry : null
+        );
         // An accepted preview starts a new consent decision; failed attempts retain choices.
-        setSelected({
-          skills: next.skills.map((skill) => skill.name),
-          mcpServers: next.mcpServers.map((server) => server.serverName),
-        });
+        setSelected(selectedComponents(next, item));
       }
     } catch (err) {
       setError(getErrorMessage(err));
@@ -708,8 +807,36 @@ const AddPluginPanel: React.FC<{
     }
   };
 
-  const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") void handlePreview(null);
+  /**
+   * Opens the form on a backed-up plugin and previews it. The fields stay editable, so a
+   * preview that fails (a repository that moved, a host that is down) can be fixed by hand.
+   */
+  const startBackupItem = (item: BackupPluginInstall) => {
+    const request = backupPreviewRequest(item);
+    setInput(request.input);
+    setRef(item.lockedSha);
+    setSubpath(request.subpath ?? "");
+    setPreview(null);
+    setMarketplace(null);
+    setPreviewedEntry(null);
+    setCliChosen(false);
+    return runPreview(request, item);
+  };
+
+  const queue = useInstallQueue({
+    plugins: props.backupPlugins,
+    start: startBackupItem,
+    onInstalled: props.onInstalled,
+    onClose: props.onClose,
+  });
+
+  /** `method`: the Install as choice; null takes the first method that fits. */
+  const handlePreview = async (method: AgentPluginInstallMethod | null) => {
+    if (input.trim().length === 0) return;
+    await runPreview(
+      { input: input.trim(), ref: optionalField(ref), subpath: optionalField(subpath), method },
+      queue.item
+    );
   };
 
   /** Back from a preview: to the marketplace entries when they led here, else to the source. */
@@ -725,7 +852,7 @@ const AddPluginPanel: React.FC<{
     setError(null);
     try {
       const result = await api.agentPlugins.install({
-        source: preview.source,
+        source: installSource(preview.source, queue.item),
         method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
@@ -735,7 +862,7 @@ const AddPluginPanel: React.FC<{
         // Mounted composers cache contributed slash-command/skill
         // descriptors; an install adds them without a remount.
         publishAgentPluginsMutated();
-        props.onInstalled();
+        await queue.installed();
       } else {
         setError(result.error);
       }
@@ -748,6 +875,7 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
+      <BackupQueueHeader queue={queue} busy={busy} />
       {preview === null && marketplace !== null ? (
         <MarketplaceListing
           listing={marketplace}
@@ -764,78 +892,18 @@ const AddPluginPanel: React.FC<{
           onPickMethod={(method) => void handlePreview(method)}
         />
       ) : preview === null ? (
-        <>
-          <div>
-            <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
-              Git URL or owner/repo
-            </label>
-            <input
-              id="plugin-source"
-              type="text"
-              autoFocus
-              placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          <div>
-            <label htmlFor="plugin-ref" className="text-muted mb-1 block text-xs">
-              Branch, tag, or commit SHA (optional — defaults to the default branch)
-            </label>
-            <input
-              id="plugin-ref"
-              type="text"
-              placeholder="e.g., main, v1.2.0, or a full 40-character SHA"
-              value={ref}
-              onChange={(e) => setRef(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          {/* Full URLs (GitLab, self-hosted, SSH, file) cannot carry a folder
-              in the source field, so monorepo folders need their own field. */}
-          <div>
-            <label htmlFor="plugin-subpath" className="text-muted mb-1 block text-xs">
-              Plugin folder in the repository (optional — for monorepos)
-            </label>
-            <input
-              id="plugin-subpath"
-              type="text"
-              placeholder="e.g., packages/my-plugin"
-              value={subpath}
-              onChange={(e) => setSubpath(e.target.value)}
-              onKeyDown={previewOnEnter}
-              spellCheck={false}
-              className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-            />
-          </div>
-          {error && (
-            <div
-              role="alert"
-              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-            >
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="min-w-0 break-words">{error}</span>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              onClick={() => void handlePreview(null)}
-              disabled={busy || input.trim().length === 0}
-            >
-              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-              {busy ? "Fetching…" : "Preview"}
-            </Button>
-            <Button variant="ghost" size="sm" onClick={props.onClose} disabled={busy}>
-              Cancel
-            </Button>
-          </div>
-        </>
+        <PluginSourceForm
+          input={input}
+          setInput={setInput}
+          gitRef={ref}
+          setRef={setRef}
+          subpath={subpath}
+          setSubpath={setSubpath}
+          busy={busy}
+          error={error}
+          onPreview={() => void handlePreview(null)}
+          onClose={queue.close}
+        />
       ) : (
         <div ref={focusFirstControlOnMount} className="space-y-3">
           <InstallMethodPicker
@@ -1696,7 +1764,13 @@ export const PluginsSettingsSection: React.FC = () => {
   // (same-route navigation preserves the mounted component, so no re-init
   // happens).
   const [initialIntent] = useState(() => consumePendingPluginsSectionIntent());
-  const [addOpen, setAddOpen] = useState(initialIntent?.type === "open-add-panel");
+  const [addOpen, setAddOpen] = useState(opensAddPanel(initialIntent));
+  // A new id remounts the Add plugin panel, so a backup reinstall starts from its first plugin
+  // and a closed one leaves nothing behind for the next plain add.
+  const [addSession, setAddSession] = useState<{
+    id: number;
+    backup?: readonly BackupPluginInstall[];
+  }>(() => ({ id: 0, backup: backupPluginsOf(initialIntent) }));
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
@@ -1740,11 +1814,16 @@ export const PluginsSettingsSection: React.FC = () => {
   const closeAddPanel = () => {
     addButtonFocus.arm();
     setAddOpen(false);
+    setAddSession((session) => ({ id: session.id + 1 }));
   };
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
     setAddOpen(true);
+  };
+  const openBackupInstall = (plugins: readonly BackupPluginInstall[]) => {
+    setAddSession((session) => ({ id: session.id + 1, backup: plugins }));
+    openAddPanel();
   };
 
   const refresh = async () => {
@@ -1832,6 +1911,9 @@ export const PluginsSettingsSection: React.FC = () => {
       switch (intent.type) {
         case "open-add-panel":
           openAddPanel();
+          break;
+        case "install-from-backup":
+          openBackupInstall(intent.plugins);
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
@@ -1997,6 +2079,8 @@ export const PluginsSettingsSection: React.FC = () => {
         {addOpen && (
           <div className="mb-4">
             <AddPluginPanel
+              key={addSession.id}
+              backupPlugins={addSession.backup}
               onInstalled={() => {
                 closeAddPanel();
                 setInstallSucceeded(true);
