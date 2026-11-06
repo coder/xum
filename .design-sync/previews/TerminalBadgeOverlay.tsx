@@ -70,11 +70,12 @@ export const HighOpacityLargeFont = () => (
   />
 );
 
-// Story pins the phone viewport (mobile1, 320px); the preview pins the width instead.
+// Story pins the phone viewport (mobile1, 375px in .storybook/preview.tsx) and the surface fills
+// it; the preview pins that width instead. The badge truncates relative to the surface width.
 export const LongNamesTruncatePhone = () => (
   <BadgeSurface
     config={{}}
-    width={320}
+    width={375}
     workspaceName="extremely-long-workspace-branch-name-that-should-truncate"
     tabName="very-long-osc-title-from-a-build-process"
   />

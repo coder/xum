@@ -281,9 +281,18 @@ needed; the cap is per-file 5 MB on both `_ds_bundle.js` and each `_preview/*.js
 - **AboutDialog viewport:** its primary story, BlockedPhone, is a fixed, portaled dialog,
   so an inner wrapper can't make it phone-width. `cfg.overrides.AboutDialog.viewport`
   captures it at the story's `mobile1` viewport (375x667) instead.
-- **ForceDeleteModal viewport:** same reason as AboutDialog. The capture is the `Phone`
-  story at its `phone390` viewport (390x844), the state that exercises the long descendant
-  id, footer wrapping and hidden shortcut hints.
+- **Portaled single-mode cards capture their phone story at its viewport:** AboutDialog
+  (BlockedPhone, mobile1 375x667), ForceDeleteModal (Phone, phone390 390x844), PRStackBadge
+  (PhoneWidth, 375x667: the menu sizes itself from `window.innerWidth`) and SkillIndicator
+  (UnavailableProjectSourcesPhone, 390x844). Their dialogs, menus and popovers portal to
+  `body`, so only the capture viewport can reproduce the phone layout.
+- **Phone widths in column/grid previews** copy the story's own fixed-width wrapper where it
+  has one (the test runner applies no viewport, so most phone stories force a width):
+  ChatInputToast and LegacyPlanImportNotice 375, PromptCacheHealth, PluginsSettingsSection
+  and TimelinePanelView 390, WorkflowPhaseFlow 351 (`min(430px, 90vw)` at 390). Otherwise they
+  use the story viewport's width: TerminalBadgeOverlay 375 (mobile1), BackupSection 414
+  (mobile2). Viewport sizes: mobile1 375x667 and mobile2 414x896 in
+  `.storybook/preview.tsx`; phone390 390x844 in the stories that define it.
 - **BranchSelector seeding:** the preview writes the branch through `createLRUCache` with
   BranchSelector's own options, so the cache index and persisted-state subscribers stay in
   sync. `createLRUCache` rides `window.Xum` via `PREVIEW_SUPPORT_LINES`.
