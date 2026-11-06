@@ -110,10 +110,10 @@ describe("summarizeInvalidToolInputErrors", () => {
 });
 
 describe("summarizeInvalidToolInputErrors logging", () => {
-  test("logs the argument text exactly as received, with its byte length and context", async () => {
+  test("logs only metadata, never the argument text", async () => {
     const error = new InvalidToolInputError({
       toolName: "bash",
-      toolInput: '{"command": "cd é"}',
+      toolInput: '{"command": "cd é", "token": "sk-secret"}',
       cause: new Error("invalid"),
     });
     const rejected = rejectedCall("cut", { command: "cd é" }, undefined);
@@ -128,38 +128,15 @@ describe("summarizeInvalidToolInputErrors logging", () => {
       "Rejected a tool call with invalid input",
       {
         toolName: "bash",
+        toolCallId: "cut",
         model: "local:qwen",
         workspaceId: "ws-1",
-        argumentsBytes: 20,
-        arguments: '{"command": "cd é"}',
+        argumentsBytes: 42,
       },
     ]);
   });
 
-  test("caps the logged arguments but reports the full byte length", async () => {
-    const input = { text: "x".repeat(5000) };
-    const rejected = rejectedCall("big", input, new Error("invalid"));
-
-    await runTransform([rejected.call, rejected.toolError]);
-
-    const fields = warn.mock.calls[0]?.[1] as { arguments: string; argumentsBytes: number };
-    expect(fields.argumentsBytes).toBe(5011);
-    expect(fields.arguments).toHaveLength(513);
-    expect(fields.arguments).toStartWith('{"text":"xxx');
-    expect(fields.arguments).toEndWith("x…");
-  });
-
-  test("keeps arguments at the cap whole", async () => {
-    const toolInput = "y".repeat(512);
-    const error = new InvalidToolInputError({ toolName: "note", toolInput, cause: undefined });
-    const rejected = rejectedCall("edge", {}, error);
-
-    await runTransform([{ ...rejected.call, error }, rejected.toolError]);
-
-    expect(warn.mock.calls[0]?.[1]).toMatchObject({ arguments: toolInput });
-  });
-
-  test("falls back to the input when the error carries no argument text", async () => {
+  test("measures the argument text the SDK received, falling back to the input", async () => {
     const withoutArgumentText = (toolCallId: string, input: unknown) => ({
       ...rejectedCall(toolCallId, input, undefined).call,
       error: new Error("No such tool"),
@@ -171,11 +148,9 @@ describe("summarizeInvalidToolInputErrors logging", () => {
       withoutArgumentText("missing", undefined),
     ]);
 
-    expect(warn.mock.calls.map((call) => (call[1] as { arguments: string }).arguments)).toEqual([
-      "{not json",
-      '{"a":1}',
-      "",
-    ]);
+    expect(
+      warn.mock.calls.map((call) => (call[1] as { argumentsBytes: number }).argumentsBytes)
+    ).toEqual([9, 7, 0]);
   });
 
   test("does not log calls that passed validation", async () => {

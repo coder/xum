@@ -11,11 +11,6 @@ import {
 } from "@/common/utils/tools/formatToolInputIssues";
 import { log } from "@/node/services/log";
 
-// A bounded sample, not a full record: a cut-off script shows within its first
-// few words. Other rejected-input logs keep less (the input depth guard logs
-// only inputLength; historyService logs 100 characters of a malformed line).
-const LOGGED_ARGUMENTS_MAX_CHARS = 512;
-
 export interface RejectedToolCallLogContext {
   model?: string;
   workspaceId?: string;
@@ -64,7 +59,7 @@ export function summarizeInvalidToolInputErrors<TOOLS extends ToolSet>(
           part.invalid === true &&
           part.error != null
         ) {
-          logRejectedToolCall(part.toolName, part.input, part.error, context);
+          logRejectedToolCall(part, context);
           summaries.set(
             part.toolCallId,
             describeInvalidToolInput(part.toolName, part.input, part.error)
@@ -83,30 +78,27 @@ export function summarizeInvalidToolInputErrors<TOOLS extends ToolSet>(
 }
 
 /**
- * Records what Xum received for a rejected call, so a log alone shows whether
- * the provider, the SDK or the model cut a tool argument short.
+ * Records that a call was rejected and how much argument text arrived, so a log
+ * shows a cut-off call. The text itself stays out: warnings persist to the shared
+ * log, and arguments can carry credentials or file content. With API Debug Logs
+ * on, devtools.jsonl holds the provider's raw tool-call arguments for the same
+ * toolCallId.
  */
 function logRejectedToolCall(
-  toolName: string,
-  input: unknown,
-  error: unknown,
+  part: { toolName: string; toolCallId: string; input: unknown; error?: unknown },
   context: RejectedToolCallLogContext
 ): void {
-  const received = receivedArgumentsText(input, error);
   log.warn("Rejected a tool call with invalid input", {
-    toolName,
+    toolName: part.toolName,
+    toolCallId: part.toolCallId,
     model: context.model,
     workspaceId: context.workspaceId,
-    argumentsBytes: Buffer.byteLength(received, "utf8"),
-    arguments:
-      received.length > LOGGED_ARGUMENTS_MAX_CHARS
-        ? `${received.slice(0, LOGGED_ARGUMENTS_MAX_CHARS)}…`
-        : received,
+    argumentsBytes: Buffer.byteLength(receivedArgumentsText(part.input, part.error), "utf8"),
   });
 }
 
 // InvalidToolInputError keeps the argument text exactly as the SDK received it from
-// the provider; re-serializing the parsed input would hide whitespace and escaping.
+// the provider, so its length is what arrived; re-serializing would change it.
 function receivedArgumentsText(input: unknown, error: unknown): string {
   if (InvalidToolInputError.isInstance(error)) {
     return error.toolInput;
