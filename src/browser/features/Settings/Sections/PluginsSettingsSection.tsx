@@ -1727,6 +1727,27 @@ const ComponentReviewRow: React.FC<{
   );
 };
 
+/** The badge of a managed row whose plugin is not loaded: gone from disk, or closed (B3). */
+function UnavailableBadge(props: { item: AgentPluginListItem }) {
+  if (!props.item.managed || props.item.present) return null;
+  return (
+    <Badge tone="error">
+      {props.item.closedReason !== undefined ? "needs reinstall" : "missing"}
+    </Badge>
+  );
+}
+
+/** Why a managed plugin loads nothing after an older Xum version updated it (B3). */
+function ClosedReasonNote(props: { reason: string | undefined }) {
+  if (props.reason === undefined) return null;
+  return (
+    <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
+      <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
+      <span className="min-w-0 break-words">{props.reason}</span>
+    </p>
+  );
+}
+
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [items, setItems] = useState<AgentPluginListItem[] | null>(null);
@@ -2125,11 +2146,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       </span>
                       {item.version && <span className="text-muted text-xs">v{item.version}</span>}
                       {!item.managed && <Badge tone="muted">unmanaged</Badge>}
-                      {item.managed && !item.present && (
-                        <Badge tone="error">
-                          {item.closedReason !== undefined ? "needs reinstall" : "missing"}
-                        </Badge>
-                      )}
+                      <UnavailableBadge item={item} />
                       {check?.status === "update-available" && (
                         <Badge tone="accent">update available</Badge>
                       )}
@@ -2209,12 +2226,7 @@ export const PluginsSettingsSection: React.FC = () => {
                     <p className="text-muted mt-1 text-xs">{item.description}</p>
                   )}
                   {item.interface && <PluginInterfaceDetails info={item.interface} />}
-                  {item.closedReason !== undefined && (
-                    <p className="text-warning mt-1 flex items-start gap-1 text-[11px]">
-                      <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                      <span className="min-w-0 break-words">{item.closedReason}</span>
-                    </p>
-                  )}
+                  <ClosedReasonNote reason={item.closedReason} />
                   <div className="text-muted mt-2 space-y-0.5 text-[11px]">
                     {/* break-all: locations/sources can contain unbreakable
                         64-char tokens (max-length plugin names) that would

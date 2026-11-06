@@ -609,7 +609,8 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
 
     const row = await service.list().then((rows) => rows.find((item) => item.name === "egm"));
     expect(row).toMatchObject({ managed: true, present: false });
-    expect(row?.closedReason).toContain("An older Xum version updated this plugin");
+    const reason = row?.closedReason ?? "";
+    expect(reason).toContain("An older Xum version updated this plugin");
 
     // Xum writes nothing to repair it: no registry field, no hook trust, no sign-out record.
     const registryBefore = await fsPromises.readFile(registryFile(), "utf8");
@@ -617,8 +618,8 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     await commit("another upstream commit");
     const review = await service.previewUpdate({ name: "egm" });
     expect(review.changes).toEqual([]);
-    expect(review.refused).toBe(row?.closedReason);
-    await expect(service.update({ name: "egm" })).rejects.toThrow(row?.closedReason as string);
+    expect(review.refused).toBe(reason);
+    await expect(service.update({ name: "egm" })).rejects.toThrow(reason);
     expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(registryBefore);
     expect(await fsPromises.readdir(xumRoot)).not.toContain("plugin-hook-trust");
 

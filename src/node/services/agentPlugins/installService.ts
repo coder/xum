@@ -2140,6 +2140,10 @@ export class AgentPluginInstallService {
     return manifestChoiceFor(await this.savedInstallMethod(name));
   }
 
+  private async closedReasonField(name: string): Promise<{ closedReason?: string }> {
+    return (await this.closedAfterOlderBuild(name)) ? { closedReason: MOVED_METHOD_MESSAGE } : {};
+  }
+
   /**
    * True when an older build moved this plugin to a commit whose saved manifest nobody reviewed
    * (B3). Discovery loads nothing of such a plugin. Xum writes no hook trust, sign-in or registry
@@ -5829,12 +5833,11 @@ export class AgentPluginInstallService {
     // Registry entries whose directory vanished (self-heal display; uninstall still works), and
     // plugins that an older build moved, which discovery leaves out (B3).
     for (const entry of managedByName.values()) {
-      const closed = await this.closedAfterOlderBuild(entry.name);
       items.push({
         name: entry.name,
         managed: true,
         present: false,
-        ...(closed ? { closedReason: MOVED_METHOD_MESSAGE } : {}),
+        ...(await this.closedReasonField(entry.name)),
         location: shortenHome(this.targetPathFor(entry.name)),
         ...(entry.manifest?.version !== undefined ? { version: entry.manifest.version } : {}),
         ...(entry.manifest?.description !== undefined
