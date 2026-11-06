@@ -40,6 +40,14 @@ describe("describeCutOffBashScript", () => {
     ["heredoc whose body follows a multi-line $(", `cat <<EOF; y=$(\necho hi\n)\nit's\nEOF\n`],
     ["no-break space before a hash is part of the word", `(echo a\u00a0#)`],
     ["carriage return before a hash is part of the word", `(echo a\r#)`],
+    // A ( inside an open [ is part of an array subscript, not a subshell.
+    ["parenthesis inside an array subscript", `declare -A a; a[foo(]=x\n`],
+    ["command substitution inside an array subscript", `declare -A a; a[$(echo b)]=1\n`],
+    ["closing parenthesis inside an array subscript", `declare -A a; a[x)y]=z\n`],
+    ["parenthesis inside an array subscript at the start of the script", `x[(]=1\n`],
+    ["parenthesis after a nested bracket pair in a subscript", `declare -A a; a[b[x]y(]=1\n`],
+    // Bash rejects this, but a ( inside an open [ is not modelled: a miss.
+    ["unmodelled parenthesis after a leading open bracket", `[x(]\n`],
   ])("accepts a complete script: %s", (_name, script) => {
     expect(describeCutOffBashScript(script)).toBeNull();
   });
@@ -112,6 +120,8 @@ describe("describeCutOffBashScript", () => {
     ["command substitution inside a double quote", "unclosed $(", `echo "$(ls`],
     ["command substitution whose ) is in a comment", "unclosed $(", `echo $(ls # )`],
     ["subshell", "unclosed (", `( cd x`],
+    ["subshell after a closed array subscript", "unclosed (", `a[x]=1; (cd x`],
+    ["subshell right after a closed bracket in the same word", "unclosed (", `a[x](cd y`],
     ["process substitution", "unclosed (", `diff <(sort a`],
     ["parameter expansion", "unclosed ${", `echo \${x`],
     ["parameter expansion inside a double quote", "unclosed ${", `echo "\${x:-$(ls)`],

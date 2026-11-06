@@ -52,7 +52,7 @@ const CODE_FRAMES = new Set<Frame>(["code", "paren", "command", "backtick"]);
 const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 
 // Bash splits words only on these blanks, not on CR, NBSP or other Unicode spaces.
-const COMMENT_PREFIX = /[ \t\n;&|()<>]/;
+const WORD_BOUNDARY = /[ \t\n;&|()<>]/;
 // `<<[-]WORD` starts a heredoc whose body begins on the next line. A here-string
 // (`<<<`) never matches a word, because the word cannot start with `<`.
 const HEREDOC_OPERATOR = /<<(?:(-?)[ \t]*((?:'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`])+))?/y;
@@ -182,7 +182,7 @@ class ShellScanner {
 
   private stepCode(frame: Frame, char: string): Verdict | undefined {
     if (char === "(") {
-      this.push("paren", 1);
+      return this.stepParen();
     } else if (char === "#" || char === "c") {
       return this.stepWordStart(frame, char);
     } else if (char === "<") {
@@ -193,6 +193,35 @@ class ShellScanner {
       this.index += 1;
     }
     return undefined;
+  }
+
+  private stepParen(): Verdict | undefined {
+    if (this.inOpenSubscript()) {
+      // A `(` inside `a[...]` is subscript text; bash's word rules there are not modelled.
+      return "complete";
+    }
+    this.push("paren", 1);
+    return undefined;
+  }
+
+  // Whether the current word has a `[` that no `]` has closed yet.
+  private inOpenSubscript(): boolean {
+    let closed = 0;
+    for (let position = this.index - 1; position >= 0; position -= 1) {
+      const char = this.text[position];
+      if (WORD_BOUNDARY.test(char)) {
+        return false;
+      }
+      if (char === "]") {
+        closed += 1;
+      } else if (char === "[") {
+        if (closed === 0) {
+          return true;
+        }
+        closed -= 1;
+      }
+    }
+    return false;
   }
 
   private stepWordStart(frame: Frame, char: string): Verdict | undefined {
@@ -215,7 +244,7 @@ class ShellScanner {
   }
 
   private atWordStart(): boolean {
-    return this.index === 0 || COMMENT_PREFIX.test(this.text[this.index - 1]);
+    return this.index === 0 || WORD_BOUNDARY.test(this.text[this.index - 1]);
   }
 
   private skipComment(frame: Frame): void {
