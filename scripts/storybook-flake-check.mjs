@@ -28,6 +28,7 @@ import { parseArgs } from "node:util";
 // Deep file imports: the package only exports its CLI + storyapi, but these are the
 // exact modules `pixel-storybook` runs. Re-check them when bumping the pinned version.
 import * as pixelConfig from "../node_modules/@coder/pixel-storybook/build/config.js";
+import { mapLimit } from "../node_modules/@coder/pixel-storybook/build/concurrency.js";
 import * as pixelCrawler from "../node_modules/@coder/pixel-storybook/build/crawler/storybook.js";
 import * as pixelShots from "../node_modules/@coder/pixel-storybook/build/shots/shots.js";
 import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.js";
@@ -128,33 +129,54 @@ if (baseItems.length === 0) {
 console.log(`Capturing ${baseItems.length} Pixel variant(s) x ${runs} runs...`);
 
 /**
+ * Each capture owns a browser (see captureRepeatedly), so this caps the browsers open at once.
+ * Pixel's own cap of 32 pages in one browser would open 32 browsers on a big host.
+ */
+const PARALLEL_CAPTURES = Math.min(pixelConfig.config.shotConcurrency, 12);
+
+/**
  * Capture every item `count` times.
- * @returns {Promise<{ renders: Map<string, Map<string, Buffer>>, renderFailures: Set<string> }>}
- *   renders: shot id -> image hash -> image; renderFailures: ids whose play threw or timed out
+ * @returns {Promise<{ renders: Map<string, Map<string, Buffer>>, renderFailures: Set<string>, captureErrors: Map<string, string> }>}
+ *   renders: shot id -> image hash -> image; renderFailures: ids whose play threw or timed out,
+ *   or whose capture threw; captureErrors: shot id -> the first line of what the capture threw
  */
 async function captureRepeatedly(items, count, label) {
   const renders = new Map();
   const renderFailures = new Set();
+  const captureErrors = new Map();
   const originalLog = console.log;
+  const onShot = (item) => {
+    if (item.render?.status !== "rendered") renderFailures.add(item.id);
+    if (!item.image) return;
+    const variants = renders.get(item.id) ?? new Map();
+    variants.set(pixelUtils.hashBuffer(item.image), item.image);
+    renders.set(item.id, variants);
+  };
   for (let run = 0; run < count; run++) {
     // Fresh shot items per run: takeScreenShots mutates them (image, timings, logs).
     const fresh = items.map((item) => ({ ...item }));
     // Pixel logs several lines per shot; keep our own summary readable by default.
     if (!values.verbose) console.log = () => undefined;
     try {
-      await pixelShots.takeScreenShots(fresh, undefined, (item) => {
-        if (item.render?.status !== "rendered") renderFailures.add(item.id);
-        if (!item.image) return;
-        const variants = renders.get(item.id) ?? new Map();
-        variants.set(pixelUtils.hashBuffer(item.image), item.image);
-        renders.set(item.id, variants);
+      // One call per variant, not one for the whole batch. Pixel swallows a page.goto timeout and
+      // then evaluates on the page that is still loading, so a story that took over 30 s to load
+      // on a saturated runner threw "Execution context was destroyed" out of the whole call. That
+      // aborted the batch and named no story. A throw from one variant's call names it, and it
+      // counts as a render failure that the confirmation pass checks again.
+      await mapLimit(fresh, PARALLEL_CAPTURES, async (item) => {
+        try {
+          await pixelShots.takeScreenShots([item], undefined, onShot);
+        } catch (error) {
+          renderFailures.add(item.id);
+          captureErrors.set(item.id, String(error).split("\n")[0]);
+        }
       });
     } finally {
       console.log = originalLog;
     }
     console.log(`  ${label} run ${run + 1}/${count} done`);
   }
-  return { renders, renderFailures };
+  return { renders, renderFailures, captureErrors };
 }
 
 const sweep = await captureRepeatedly(baseItems, runs, "sweep");
@@ -171,6 +193,7 @@ const candidates = new Set([
 // (scroll locks, async data, arrival order) reproduce here too; that load noise does not.
 const flaky = [];
 const brokenRenders = [];
+let confirmErrors = new Map();
 if (candidates.size > 0) {
   console.log(`Confirming ${candidates.size} candidate(s)...`);
   const confirm = await captureRepeatedly(
@@ -178,6 +201,7 @@ if (candidates.size > 0) {
     Math.max(runs, 6),
     "confirm"
   );
+  confirmErrors = confirm.captureErrors;
   for (const id of candidates) {
     const variants = confirm.renders.get(id);
     if (confirm.renderFailures.has(id)) {
@@ -192,7 +216,8 @@ if (candidates.size > 0) {
 server.close();
 
 for (const id of brokenRenders) {
-  console.log(`BROKEN ${id}: play threw or timed out (or story errored) during confirmation`);
+  const reason = confirmErrors.get(id) ?? "play threw or timed out (or story errored)";
+  console.log(`BROKEN ${id}: ${reason} during confirmation`);
 }
 if (flaky.length === 0 && brokenRenders.length === 0) {
   console.log(`All ${renders.size} variant(s) were pixel-identical across ${runs} runs.`);
