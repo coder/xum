@@ -4527,6 +4527,104 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(after.enabledServers).toEqual(["other"]);
   });
 
+  it("prunePluginOverrideKeysForWorkspaces is not cut off while its workspaces keep finishing", async () => {
+    // At 7,550 workspaces on a starved core the sweep outlasted its fixed 30 s
+    // budget although every checkout answered: up to 1,170 workspaces failed
+    // with "exceeded the plugin-prune budget" and so did the install. Here each
+    // stat of a workspace's document costs 1 s of clock, so 50 workspaces need
+    // 50 s to prune and 50 s more to publish.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspaces: Array<{ workspaceId: string; workspacePath: string }> = [];
+    for (let index = 0; index < 50; index++) {
+      workspaces.push(await registerWorkspace(`progress-${index}`));
+    }
+    const docPath = (workspacePath: string) => path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const last = workspaces[49];
+    await fs.mkdir(path.dirname(docPath(last.workspacePath)), { recursive: true });
+    await fs.writeFile(
+      docPath(last.workspacePath),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    const canonicalDocs = new Set(workspaces.map((workspace) => docPath(workspace.workspacePath)));
+    const realNow = Date.now;
+    const realStat = fsPromisesModule.stat;
+    let skewMs = 0;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (canonicalDocs.has(target)) {
+        skewMs += 1_000;
+        // Real time too: a deadline the old fixed budget had already spent fires first.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+    }) as typeof fsPromisesModule.stat);
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        workspaces.map((workspace) => workspace.workspaceId),
+        "plugin:0123456789abcdef:",
+        { publish: () => Promise.resolve() }
+      );
+    } finally {
+      statSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+
+    expect(failures.map((failure) => String(failure.error))).toEqual([]);
+    const after = jsoncParse(await fs.readFile(docPath(last.workspacePath), "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(after.enabledServers).toEqual(["other"]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces fails a stalled checkout on its own bound while the others finish", async () => {
+    // A checkout on a dead mount fails only its own workspace, and soon: the
+    // sweep holds every workspace lock while it waits.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspaces: Array<{ workspaceId: string; workspacePath: string }> = [];
+    for (let index = 0; index < 6; index++) {
+      workspaces.push(await registerWorkspace(`stalled-${index}`));
+    }
+    const docPath = (workspacePath: string) => path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const stalled = workspaces[2];
+    const pruned = workspaces[5];
+    await fs.mkdir(path.dirname(docPath(pruned.workspacePath)), { recursive: true });
+    await fs.writeFile(
+      docPath(pruned.workspacePath),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+    const realStat = fsPromisesModule.stat;
+    const statSpy = spyOn(fsPromisesModule, "stat").mockImplementation((async (
+      target: string,
+      ...rest: unknown[]
+    ) => {
+      if (target === docPath(stalled.workspacePath)) return new Promise(() => undefined);
+      return (realStat as (...args: unknown[]) => Promise<unknown>)(target, ...rest);
+    }) as typeof fsPromisesModule.stat);
+    const startedAt = Date.now();
+    let failures: Array<{ workspaceId: string; error: unknown }>;
+    try {
+      failures = await service.prunePluginOverrideKeysForWorkspaces(
+        workspaces.map((workspace) => workspace.workspaceId),
+        "plugin:0123456789abcdef:"
+      );
+    } finally {
+      statSpy.mockRestore();
+    }
+
+    expect(failures.map((failure) => failure.workspaceId)).toEqual([stalled.workspaceId]);
+    expect(Date.now() - startedAt).toBeLessThan(15_000);
+    const after = jsoncParse(await fs.readFile(docPath(pruned.workspacePath), "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(after.enabledServers).toEqual(["other"]);
+  }, 60_000);
+
   it("prunePluginOverrideKeysForWorkspaces names only the workspace whose lock stayed busy", async () => {
     // One workspace held by a rename for the whole lock budget must not fail
     // the check of every other workspace (the install error named all 7,549).

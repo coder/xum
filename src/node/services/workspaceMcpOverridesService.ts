@@ -420,12 +420,14 @@ async function canonicalizeHostPath(
  */
 const REALPATH_TIMEOUT_MS = 2_000;
 /**
- * Per-descendant budget for the host-side ownership probe + resolution in
- * publishEffectiveOverrides. LocalBaseRuntime.stat/readFile have no timeout
- * and ignore abort signals, so a worktree on a disconnected NFS/FUSE mount
- * would otherwise wedge the publication — and every later writer — under
- * the exclusive lock. On timeout the descendant (and its subtree) is
- * evicted instead: its next serve re-reads on its own.
+ * Per-checkout budget for host-side I/O under the exclusive lock: the
+ * ownership probe + resolution of one descendant in publishEffectiveOverrides,
+ * and one workspace's prune in a plugin-key sweep. LocalBaseRuntime.stat/
+ * readFile have no timeout and ignore abort signals, so a worktree on a
+ * disconnected NFS/FUSE mount would otherwise wedge the publication — and
+ * every later writer — under the exclusive lock. On timeout the descendant
+ * (and its subtree) is evicted instead: its next serve re-reads on its own. A
+ * swept workspace fails instead (its tombstone is kept).
  */
 const HOST_DESCENDANT_TIMEOUT_MS = 5_000;
 
@@ -793,12 +795,22 @@ export const MCP_OVERRIDES_READ_TIMEOUT_MS = 30_000;
 interface PublicationBudget {
   remaining(): number;
   exhausted(): boolean;
+  /**
+   * Work finished: restart the window. A plugin-key sweep calls it per
+   * workspace, so it runs out only once NO workspace finished for a whole
+   * window. Its work grows with the registry: a fixed window failed installs
+   * at 7,550 workspaces on a starved core although every checkout answered.
+   */
+  progress(): void;
 }
 function createPublicationBudget(timeoutMs = PUBLICATION_TIMEOUT_MS): PublicationBudget {
-  const deadlineAt = Date.now() + timeoutMs;
+  let deadlineAt = Date.now() + timeoutMs;
   return {
     remaining: () => Math.max(1, deadlineAt - Date.now()),
     exhausted: () => Date.now() >= deadlineAt,
+    progress: () => {
+      deadlineAt = Date.now() + timeoutMs;
+    },
   };
 }
 async function mapWithConcurrency<T, R>(
@@ -4640,9 +4652,12 @@ export class WorkspaceMcpOverridesService {
         this.runExclusive(async () => {
           // ONE budget for the whole sweep — the registry scan, every target's
           // prune and the cache fan-out afterwards: this runs under every
-          // selected workspace lock AND the global lock, and a single checkout
-          // on a stalled NFS/FUSE mount must not hold unrelated settings writes
-          // past their acquisition timeout. Timed-out targets become
+          // selected workspace lock AND the global lock, and checkouts on a
+          // stalled NFS/FUSE mount must not hold unrelated settings writes
+          // past their acquisition timeout. Each finished workspace restarts
+          // its window (the work grows with the registry), and each prune has
+          // its own bound, so a stalled checkout fails alone and a sweep where
+          // nothing finishes for a whole window stops. Timed-out targets become
           // per-workspace failures (the caller keeps their tombstones); a
           // rewrite already in flight is joined before the locks are released.
           const budget = createPublicationBudget();
@@ -4860,7 +4875,7 @@ export class WorkspaceMcpOverridesService {
         const step = sweep.snapshot.scoped();
         const result = await withDeadline(
           this.pruneResolvedWorkspace(this.resolveWorkspace(metadata), keyPrefix, step),
-          sweep.budget.remaining(),
+          Math.min(HOST_DESCENDANT_TIMEOUT_MS, sweep.budget.remaining()),
           `pruning workspace ${metadata.id} exceeded the plugin-prune budget`,
           () => step.cancel()
         );
@@ -4868,6 +4883,7 @@ export class WorkspaceMcpOverridesService {
         owesEpoch ||= result.owesEpoch;
         ownFileRewritten ||= result.rewrote;
       }
+      sweep.budget.progress();
       // Publication reads the first entry, matching getWorkspaceMetadata's lookup.
       return {
         ok: true,
@@ -4933,6 +4949,7 @@ export class WorkspaceMcpOverridesService {
           budget,
           hasSnapshot
         );
+        budget.progress();
       } catch (error) {
         failures.push({ workspaceId, error });
       }
