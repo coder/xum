@@ -255,7 +255,15 @@ describe("ServerLockfile", () => {
   });
 
   describe.skipIf(process.platform !== "linux")("a lock with a process identity (Linux)", () => {
-    const stopped = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf-8").split(") ")[1][0];
+    const state = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf-8").split(") ")[1][0];
+    /** SIGSTOP takes effect asynchronously: wait until the kernel shows the process as stopped. */
+    async function stop(pid: number) {
+      process.kill(pid, "SIGSTOP");
+      for (let waited = 0; state(pid) !== "T"; waited += 10) {
+        if (waited > 5_000) throw new Error(`pid ${pid} did not stop (state ${state(pid)})`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
 
     test("the backend's own process is live, with no network", async () => {
       const backendProcess = unrelatedProcess();
@@ -280,9 +288,8 @@ describe("ServerLockfile", () => {
         identity: identityOf(backendProcess.pid),
       });
 
-      process.kill(backendProcess.pid, "SIGSTOP");
+      await stop(backendProcess.pid);
       try {
-        expect(stopped(backendProcess.pid)).toBe("T");
         const started = Date.now();
         expect((await lockfile.read())?.pid).toBe(backendProcess.pid);
         expect(Date.now() - started).toBeLessThan(1_500); // a probe would wait 2 s

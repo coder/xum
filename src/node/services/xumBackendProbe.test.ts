@@ -56,6 +56,14 @@ describe("probeXumBackend", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
+  test("an answer that starts and then stalls means no backend, not silent", async () => {
+    const stalling = await serve((_req, res) => {
+      res.writeHead(200, { "content-length": "100" });
+      res.write('{"mode":"server",');
+    });
+    expect(await probeXumBackend(stalling, 150)).toBe("no");
+  });
+
   test("a connection that is closed without an answer means no backend, not silent", async () => {
     const closing = await serve((req) => req.socket.destroy());
     expect(await probeXumBackend(closing, 1_000)).toBe("no");

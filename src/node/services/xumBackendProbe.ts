@@ -30,20 +30,21 @@ function clientFor(url: URL): typeof http | typeof https | null {
   return url.protocol === "http:" ? http : null;
 }
 
-/** `GET <baseUrl>/version` as a URL, or null when `baseUrl` cannot be used. */
-function versionUrl(baseUrl: string): URL | null {
+/** `GET <baseUrl>/version`: its URL and client, or null when `baseUrl` cannot be used. */
+function versionRequest(baseUrl: string): { url: URL; client: typeof http | typeof https } | null {
   let url: URL;
   try {
     url = new URL(baseUrl);
   } catch {
     return null;
   }
-  if (clientFor(url) == null || url.username !== "" || url.password !== "") return null;
+  const client = clientFor(url);
+  if (client == null || url.username !== "" || url.password !== "") return null;
   // The base URL can carry a path prefix (a reverse proxy mount), so append rather than resolve.
   url.pathname = `${url.pathname.replace(/\/+$/, "")}/version`;
   url.search = "";
   url.hash = "";
-  return url;
+  return { url, client };
 }
 
 /** Whether a response is a 200 with a `/version` answer of a xum server, read within a size cap. */
@@ -75,14 +76,16 @@ export function probeXumBackend(
   baseUrl: string,
   timeoutMs: number = XUM_BACKEND_PROBE_TIMEOUT_MS
 ): Promise<BackendProbe> {
-  const url = versionUrl(baseUrl);
-  const client = url == null ? null : clientFor(url);
-  if (url == null || client == null) return Promise.resolve("no");
+  const target = versionRequest(baseUrl);
+  if (target == null) return Promise.resolve("no");
+  const { url, client } = target;
   return new Promise<BackendProbe>((resolve) => {
     const timeout = AbortSignal.timeout(timeoutMs);
     let connected = false;
     let responded = false;
-    const request = client.get(url, { signal: timeout }, (response) => {
+    // agent: false is a new connection for this request only, so the socket below is never one that
+    // an agent kept from an earlier request.
+    const request = client.get(url, { signal: timeout, agent: false }, (response) => {
       responded = true;
       void isVersionResponse(response).then((isVersion) => {
         resolve(isVersion ? "answers" : "no");
@@ -90,8 +93,7 @@ export function probeXumBackend(
       });
     });
     request.on("socket", (socket) => {
-      if (socket.connecting) socket.once("connect", () => (connected = true));
-      else connected = true; // a socket that the agent kept from an earlier request
+      socket.once("connect", () => (connected = true));
     });
     // Only the timeout of a connection that was made and never answered is "silent": a reset or
     // a close is an answer, and a connect that times out is no listener.

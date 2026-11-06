@@ -58,6 +58,8 @@ async function readLockFile(filePath: string): Promise<ServerLockData | null> {
  */
 function judgeByIdentity(data: ServerLockData): "stale" | "live" | "undecided" {
   const identity = data.identity === undefined ? undefined : parseProcessIdentity(data.identity);
+  // mutation-equivalent: peek() answers this process's own pid before it calls this, so the
+  // second argument (whether this process may still write the lock) is never read.
   const verdict = judgeHolder({ pid: data.pid, identity }, false);
   if (verdict.dead) return "stale";
   // judgeHolder reports "running" for a pid it only saw alive (no identity, or no Linux PID

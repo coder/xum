@@ -224,7 +224,11 @@ describe("ServerService.startServer", () => {
 
       process.kill(backend.pid, "SIGSTOP");
       try {
-        await expect(start()).rejects.toThrow(/already running/i);
+        const refused = await start().then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(refused instanceof Error ? refused.message : "").toMatch(/already running/i);
         expect(
           ServerLockDataSchema.parse(JSON.parse(await fs.readFile(lockPath, "utf-8"))).token
         ).toBe("frozen-token");
