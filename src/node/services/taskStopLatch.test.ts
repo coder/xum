@@ -14,7 +14,13 @@ const PARENT = "parent-a";
 const ATTEMPT = "att_00000000000000a1";
 
 function ownedAttempt(receiptEligible = true): OwnedTaskAttempt {
-  return { generation: 1, source: "test", attemptId: ATTEMPT, receiptEligible };
+  return {
+    generation: 1,
+    source: "test",
+    attemptId: ATTEMPT,
+    receiptEligible,
+    inheritedReport: false,
+  };
 }
 
 function send(state: AdmittedSend["state"], attemptId = ATTEMPT): AdmittedSend {
@@ -26,7 +32,7 @@ function streamEnd(outcome: StreamEndDecision["outcome"]): StreamEndDecision {
     attempt: undefined,
     attemptId: ATTEMPT,
     messageId: "msg-1",
-    reportedAtEvent: false,
+    inheritedReport: false,
     outcome,
     turn: undefined,
   };

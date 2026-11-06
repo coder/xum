@@ -19,8 +19,8 @@ const TASK = "task-a";
 const ATTEMPT = "att_00000000000000a1";
 const OTHER = "att_00000000000000b2";
 
-function attempt(attemptId: string = ATTEMPT): OwnedTaskAttempt {
-  return { attemptId, receiptEligible: true } as unknown as OwnedTaskAttempt;
+function attempt(attemptId: string = ATTEMPT, inheritedReport = false): OwnedTaskAttempt {
+  return { attemptId, receiptEligible: true, inheritedReport } as unknown as OwnedTaskAttempt;
 }
 
 function send(attemptId: string, state: string): AdmittedSend {
@@ -244,7 +244,7 @@ describe("StreamEndLedger decisions", () => {
     expect(t.ledger.findStreamEndDecision(TASK, ATTEMPT)).toBeUndefined();
   });
 
-  test("a report that lands after the stream ended turns a nonreport decision indeterminate", () => {
+  test("a report of the owned attempt on the row turns a nonreport decision indeterminate", () => {
     const t = harness();
     const owned = attempt();
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
@@ -259,15 +259,32 @@ describe("StreamEndLedger decisions", () => {
     expect(otherDecision?.outcome).toBe("nonreport");
   });
 
-  test("a row that already read reported at the stream end (a reactivated execution) continues", () => {
+  test("a report that landed before the stream's end event still counts for an attempt this process began", () => {
+    const t = harness();
+    const owned = attempt();
+    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("indeterminate");
+  });
+
+  test("an attempt that began on a reported row (reactivated) inherits the report and continues", () => {
     const t = harness();
     t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
-    const owned = attempt();
+    const owned = attempt(ATTEMPT, true);
     const decision = t.ledger.registerStreamEndDecision(TASK, "m1", owned, undefined);
     expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
     expect(decision?.outcome).toBe("nonreport");
     // Its next reawaken may still prove a no-report receipt.
     expect(owned.receiptEligible).toBe(true);
+  });
+
+  test("an unowned stream whose row already read reported at the stream end continues", () => {
+    const t = harness();
+    t.state.config = configWithRow({ taskStatus: "reported", taskAttemptId: ATTEMPT });
+    const decision = t.ledger.registerStreamEndDecision(TASK, "m1", undefined, ATTEMPT);
+    expect(t.ledger.resolveStreamEndDecision(TASK, decision, "nonreport")).toBe(true);
+    expect(decision?.outcome).toBe("nonreport");
   });
 
   test("a reported row resolves the attempt's decision indeterminate", () => {

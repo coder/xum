@@ -1025,6 +1025,20 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   // as "the attempt continues" (#7003). The gate holds the handler in the gap, as a loaded host
   // does by chance.
   const REPORTED_AT = "2026-10-01T00:00:02.000Z";
+  async function editChildRow(
+    config: Config,
+    childId: string,
+    editRow: (row: WorkspaceConfigEntry) => void
+  ) {
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === childId) editRow(workspace);
+        }
+      }
+      return cfg;
+    });
+  }
   /**
    * Queues a follow-up behind a child's stream, ends the stream with its handler held after the
    * admission read, lets `editRow` change the child's row in that gap, then releases the handler
@@ -1057,14 +1071,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       ).toEqual(Ok(undefined));
       stack.endStream(0, {}, true);
       await inGap.promise;
-      await config.editConfig((cfg) => {
-        for (const project of cfg.projects.values()) {
-          for (const workspace of project.workspaces) {
-            if (workspace.id === childId) editRow(workspace);
-          }
-        }
-        return cfg;
-      });
+      await editChildRow(config, childId, editRow);
       gap.resolve();
       await until(
         () => completions.length > 1 || stack.heldTexts().length > 0,
@@ -1090,6 +1097,39 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(stack.completions).toHaveLength(1);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
+      expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  // The report lands while the stream runs, before its end event: the row already reads reported
+  // when the decision is registered, yet the attempt began before that report.
+  test("a report of the attempt that landed before its stream's end event refuses the held follow-up as indeterminate", async () => {
+    const childId = "holdbeforeend001";
+    const stack = await createStack(childId);
+    const { config, taskService, workspaceService, completions, sendOptions } = stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      const onCanceled = mock((_reason: string) => undefined);
+      expect(
+        await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
+      ).toEqual(Ok(undefined));
+      await editChildRow(config, childId, (row) => {
+        row.taskStatus = "reported";
+        row.reportedAt = REPORTED_AT;
+      });
+      stack.endStream(0, {}, true);
+      await until(
+        () => completions.length > 1 || stack.heldTexts().length > 0,
+        "the follow-up dispatched or held"
+      );
+      await yieldMacrotasks(10);
+      expect(completions).toHaveLength(1);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
     } finally {
       await stack.cleanup();

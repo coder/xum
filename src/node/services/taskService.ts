@@ -892,6 +892,12 @@ export interface OwnedTaskAttempt {
    * the snapshot. False → this attempt can never produce a cross-process receipt.
    */
   receiptEligible: boolean;
+  /**
+   * The row already read a completed report when this attempt began: a reactivated or reawakened
+   * task keeps its predecessor's terminal status while the new attempt runs. A reported row says
+   * nothing about this attempt then. In-memory only, taken in beginOwnedTaskAttempt.
+   */
+  readonly inheritedReport: boolean;
 }
 
 /** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
@@ -1101,11 +1107,12 @@ export interface StreamEndDecision {
   readonly attemptId: string;
   readonly messageId: string;
   /**
-   * The row already read a completed report for this attempt when the stream ended: a reactivated
-   * execution inherits one. Only a report that lands AFTER the stream ended contradicts a
-   * `nonreport` decision (see StreamEndLedger.resolveStreamEndDecision).
+   * The row's completed report predates this attempt (OwnedTaskAttempt.inheritedReport; for an
+   * attempt this process does not own, a report the row already read at the stream end). Only a
+   * report that is not inherited contradicts a `nonreport` decision (see
+   * StreamEndLedger.resolveStreamEndDecision).
    */
-  readonly reportedAtEvent: boolean;
+  readonly inheritedReport: boolean;
   outcome: "pending" | "nonreport" | "published" | "indeterminate";
   /**
    * The session's turn generation the stream ended in (undefined when none was live, or once it
