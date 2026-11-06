@@ -6657,7 +6657,7 @@ describe("AgentPluginInstallService", () => {
 
         await expect(
           serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
-        ).rejects.toThrow(/workspace enumeration failed/);
+        ).rejects.toThrow(/workspace enumeration failed.*config\.json/);
         expect(pruned).toEqual([]);
         expect(await registry()).toEqual([]);
         expect(await pathExists(preview.targetPath)).toBe(false);
@@ -6678,11 +6678,28 @@ describe("AgentPluginInstallService", () => {
 
       await expect(
         serviceWithOverrides.install({ source: preview.source, expectedSha: preview.lockedSha })
-      ).rejects.toThrow(/could not verify .*\(workspace enumeration failed\)/);
+      ).rejects.toThrow(/could not verify .*\(workspace enumeration failed\).*config\.json/);
       const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
         pendingOverridePrunes?: unknown;
       };
       expect(doc.pendingOverridePrunes).toEqual([tombstone]);
+    });
+
+    test("an uninstall refuses and names config.json when it does not parse", async () => {
+      const serviceWithOverrides = serviceRecordingPrunes([]);
+      await registerLocalWorkspace("ws-1");
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      await serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await fsPromises.writeFile(configFile(), "{ not json");
+
+      await expect(
+        serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
+      ).rejects.toThrow(/config\.json/);
+      expect(await registry()).toHaveLength(1);
+      expect(await pathExists(preview.targetPath)).toBe(true);
     });
 
     test("an unrelated malformed legacy workspace entry does not abort an uninstall", async () => {
