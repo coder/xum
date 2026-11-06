@@ -657,7 +657,7 @@ describe("Mermaid layout stability", () => {
       const natural = viewBoxOf(dialog());
       expect(natural.height).toBeGreaterThan(100);
       const box = boxOf(dialog());
-      expect(Number.parseInt(box.width)).toBeLessThanOrEqual(231);
+      expect(Number.parseInt(box.width ?? "0")).toBeLessThanOrEqual(231);
       expect(box.height).toBe("100px");
     });
 
