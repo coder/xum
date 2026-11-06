@@ -54,9 +54,12 @@ export function describeInvalidToolInput(toolName: string, input: unknown, error
  * rule tells a parameter name from a key that holds a credential. Clauses that
  * list keys become [redacted], label path segments after the first become
  * [withheld], an SDK message that echoes the input keeps only its error name,
- * and only the first line is kept, capped at 500 characters. Segment 0 is
- * schema-declared for every mux tool, but a dynamic or MCP tool whose whole
- * argument object is a free-form map would put model text there.
+ * and only the first line is kept, capped at 500 characters. The split on
+ * "; " and the first-dot rule are sound only because formatToolInputIssues
+ * escapes `;`, `:` and line breaks in every path segment, so a model key cannot
+ * forge a clause or a label end; do not drop that encoding. The residual is a
+ * dynamic or MCP tool whose whole argument object is a free-form map: segment 0
+ * is then model text, and it is logged.
  */
 export function redactRejectedToolCallError(error: unknown): unknown {
   if (typeof error !== "string" || !error.startsWith(INVALID_TOOL_INPUT_PREFIX)) {

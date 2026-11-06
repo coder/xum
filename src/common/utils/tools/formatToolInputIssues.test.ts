@@ -177,6 +177,40 @@ describe("formatToolInputIssues received arguments", () => {
   });
 });
 
+describe("formatToolInputIssues path labels", () => {
+  const recordSchema = z.object({ answers: z.record(z.string(), z.string()) });
+  const withKey = (key: string) => {
+    const input = { answers: { [key]: 5 } };
+    return formatToolInputIssues(issuesFor(recordSchema, input), input);
+  };
+
+  test.each([
+    ["semicolon", "safe; ghp_x", "answers.safe%3B ghp_x"],
+    ["colon", "evil: ghp_x", "answers.evil%3A ghp_x"],
+    ["bare separators", "a;b:c", "answers.a%3Bb%3Ac"],
+    ["newline", "a\nb", "answers.a%0Ab"],
+    ["carriage return", "a\rb", "answers.a%0Db"],
+    ["an escape already in the key", "%3B", "answers.%253B"],
+    ["a dot", "happy.path", "answers.happy.path"],
+  ])("escapes structure characters in a record key: %s", (_name, key, label) => {
+    expect(withKey(key)).toBe(`${label}: Invalid input: expected string, received number`);
+  });
+
+  test("leaves parameter names and array indices as they are", () => {
+    const issues = [{ path: ["questions", 0, "header"], message: "Required" }];
+
+    expect(formatToolInputIssues(issues, {})).toBe("questions.0.header: Required");
+  });
+
+  test("a record key cannot add an issue clause or end the label early", () => {
+    const summary = withKey("a; b: c");
+    const clauses = summary.split("; ");
+
+    expect(clauses).toHaveLength(1);
+    expect(clauses[0].slice(0, clauses[0].indexOf(": "))).toBe("answers.a%3B b%3A c");
+  });
+});
+
 describe("formatToolInputIssues unrecognized keys", () => {
   const strictSchema = TOOL_DEFINITIONS.desktop_click.schema;
   const unrecognized = (extra: Record<string, unknown>) => {

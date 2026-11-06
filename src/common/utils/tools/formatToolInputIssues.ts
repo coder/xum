@@ -37,6 +37,16 @@ const DISPLAYABLE_KEY_MAX_CHARS = 40;
 // is a display rule: a lowercase-led credential still fits it, so the log copy
 // is redacted separately (redactRejectedToolCallError).
 const DISPLAYABLE_KEY = /^[a-z][a-z_]*(?:[A-Z][a-z_]*)*$/;
+// A path segment can be model text (a record key). Escaping the characters the
+// rendered line uses as structure keeps such a key from forging a clause that
+// redactRejectedToolCallError would then log as-is.
+const PATH_SEGMENT_ESCAPES: Record<string, string> = {
+  "%": "%25",
+  ";": "%3B",
+  ":": "%3A",
+  "\r": "%0D",
+  "\n": "%0A",
+};
 
 /**
  * Render zod issues as one concise line: "<path>: <message>[ (received N characters)]".
@@ -120,7 +130,7 @@ function describeReceivedValue(value: unknown): string {
 }
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {
-  const label = issue.path.length > 0 ? issue.path.map(String).join(".") : "input";
+  const label = issue.path.length > 0 ? issue.path.map(encodePathSegment).join(".") : "input";
   if (issue.code === "unrecognized_keys") {
     // mutation-equivalent: keys is an array or undefined, so ?? and || agree
     return `${label}: ${describeUnrecognizedKeys(issue.keys ?? [])}`;
@@ -135,6 +145,10 @@ function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {
     }
   }
   return text;
+}
+
+function encodePathSegment(segment: PropertyKey): string {
+  return String(segment).replace(/[%;:\r\n]/g, (char) => PATH_SEGMENT_ESCAPES[char]);
 }
 
 function resolvePath(input: unknown, path: readonly PropertyKey[]): unknown {

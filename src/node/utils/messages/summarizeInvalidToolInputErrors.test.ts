@@ -210,6 +210,7 @@ describe("redactRejectedToolCallError", () => {
   const SECRET_VALUE = "ghp_live_zzzzzzz";
 
   const unparsable = `{"${SECRET_KEY}": "${SECRET_VALUE}"`;
+  const recordSchema = z.object({ answers: z.record(z.string(), z.string()) });
 
   function rejection(input: unknown, cause: unknown): [unknown, InvalidToolInputError] {
     const toolInput = typeof input === "string" ? input : JSON.stringify(input);
@@ -235,11 +236,19 @@ describe("redactRejectedToolCallError", () => {
     ],
     [
       "a record schema puts the key in the issue label",
-      zodRejection(z.object({ answers: z.record(z.string(), z.string()) }), {
-        answers: { [SECRET_KEY]: 5 },
-      }),
+      zodRejection(recordSchema, { answers: { [SECRET_KEY]: 5 } }),
       "Invalid input for tool bash: answers.[withheld]: Invalid input: expected string, received number",
     ],
+    ...[
+      ["a record key with a semicolon", `safe; ${SECRET_KEY}`],
+      ["a record key with a colon", `evil: ${SECRET_KEY}`],
+      ["a record key with a newline", `a\n${SECRET_KEY}`],
+      ["a record key with a dot", `happy.${SECRET_KEY}`],
+    ].map(([name, key]): [string, [unknown, InvalidToolInputError], string] => [
+      name,
+      zodRejection(recordSchema, { answers: { [key]: 5 } }),
+      "Invalid input for tool bash: answers.[withheld]: Invalid input: expected string, received number",
+    ]),
     [
       "the SDK fallback echoes the validated value",
       rejection(
@@ -260,6 +269,7 @@ describe("redactRejectedToolCallError", () => {
     const summary = describeInvalidToolInput("bash", input, error);
 
     expect(summary).toContain(SECRET_KEY);
+    expect(redactRejectedToolCallError(summary)).not.toContain(SECRET_KEY);
     expect(redactRejectedToolCallError(summary)).toBe(logged);
   });
 
