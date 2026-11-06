@@ -2089,6 +2089,40 @@ async function resolveAgentPluginContainerPath(containerPath: string): Promise<s
 const MOVED_METHOD_DIAGNOSTIC =
   "An older Xum version updated this plugin after its install method was saved, so this version has not reviewed that manifest at this commit. The plugin loads nothing until it is reset or installed again.";
 
+/**
+ * discoverPluginAt for a plugin of a managed container. It loads the manifest its install saved
+ * (B2); anything else, and a registry that cannot be read, read the fixed order. A saved method
+ * that an older build moved to a commit loads nothing until it is reset or reinstalled: its saved
+ * manifest was never reviewed at that commit (B3).
+ */
+async function discoverManagedPluginAt(
+  args: Omit<Parameters<typeof discoverPluginAt>[0], "choice"> & {
+    imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined;
+  }
+): Promise<AgentPluginInfo | null> {
+  const { imports, ...rest } = args;
+  const plugin = await discoverPluginAt({
+    ...rest,
+    choice: managedManifestChoice(imports, args.dirName),
+  });
+  const saved = imports?.methodByName.get(args.dirName);
+  if (
+    plugin === null ||
+    saved === undefined ||
+    imports?.methodMovedByName.has(args.dirName) !== true ||
+    !(await movedMethodMatters(args.pluginDir, saved))
+  ) {
+    return plugin;
+  }
+  args.diagnostics.push({
+    path: path.join(args.containerPath, args.dirName),
+    scope: args.scope,
+    severity: "error",
+    message: MOVED_METHOD_DIAGNOSTIC,
+  });
+  return null;
+}
+
 function managedManifestChoice(
   imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined,
   entryName: string
@@ -2418,33 +2452,14 @@ export async function discoverAgentPlugins(
       const instancePath = path.join(container.path, entryName);
       let plugin = snapshot.plugins.get(entryName);
       if (plugin === undefined) {
-        plugin = await discoverPluginAt({
+        plugin = await discoverManagedPluginAt({
           pluginDir: path.join(canonicalPath, entryName),
           containerPath: container.path,
           dirName: entryName,
           scope: container.scope,
           diagnostics,
-          // A managed plugin loads the manifest its install saved (B2); anything else, and a
-          // registry that cannot be read, read the fixed order.
-          choice: managedManifestChoice(snapshot.imports, entryName),
+          imports: snapshot.imports,
         });
-        // A saved method that an older build moved to a commit loads nothing until it is reset or
-        // reinstalled: its components were never reviewed at that commit (B3).
-        const savedMethod = snapshot.imports?.methodByName.get(entryName);
-        if (
-          plugin &&
-          savedMethod !== undefined &&
-          snapshot.imports?.methodMovedByName.has(entryName) &&
-          (await movedMethodMatters(path.join(canonicalPath, entryName), savedMethod))
-        ) {
-          diagnostics.push({
-            path: path.join(container.path, entryName),
-            scope: container.scope,
-            severity: "error",
-            message: MOVED_METHOD_DIAGNOSTIC,
-          });
-          plugin = null;
-        }
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {
           Object.assign(
