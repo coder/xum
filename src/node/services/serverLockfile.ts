@@ -27,6 +27,15 @@ export type ServerLockData = z.infer<typeof ServerLockDataSchema>;
  */
 const ownedLocks = new Map<string, string>();
 
+/** The lock in `filePath`, or null if it is missing or not a valid lock. */
+async function readLockFile(filePath: string): Promise<ServerLockData | null> {
+  try {
+    return ServerLockDataSchema.parse(JSON.parse(await fs.readFile(filePath, "utf-8")));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Manages the server lockfile at ~/.xum/server.lock
  *
@@ -118,21 +127,12 @@ export class ServerLockfile {
    *   port now. The probe carries no token (see answersAsXumBackend).
    */
   async peek(): Promise<ServerLockData | null> {
-    const data = await this.readData();
+    const data = await readLockFile(this.lockPath);
     if (data == null || !this.isProcessAlive(data.pid)) return null;
     if (data.pid === process.pid) {
       return ownedLocks.get(this.lockPath) === data.startedAt ? data : null;
     }
     return (await answersAsXumBackend(data.baseUrl)) ? data : null;
-  }
-
-  private async readData(): Promise<ServerLockData | null> {
-    try {
-      const content = await fs.readFile(this.lockPath, "utf-8");
-      return ServerLockDataSchema.parse(JSON.parse(content));
-    } catch {
-      return null;
-    }
   }
 
   /**
@@ -141,8 +141,10 @@ export class ServerLockfile {
    * starter's acquire(), and deleting that lock would leave the running backend undiscoverable.
    *
    * No unlink can test who owns the file it removes, so this renames the lock out of the way
-   * first, then reads whose it was. A lock that was not ours goes back, unless an even newer one
-   * was written meanwhile (link() fails on an existing path).
+   * first, then reads whose it was. A lock that was not ours is renamed back, unless a newer one
+   * was written meanwhile. (A backend that acquires between that check and the rename back is
+   * overwritten by the older live lock: both backends run, and readers find the older one.)
+   * Only rename() is used, because the lock's folder can be on a file system without hard links.
    */
   async release(): Promise<void> {
     const startedAt = ownedLocks.get(this.lockPath);
@@ -154,16 +156,19 @@ export class ServerLockfile {
     } catch {
       return; // no lock there (or none we can move): nothing of ours to delete
     }
-    try {
-      const taken = ServerLockDataSchema.parse(JSON.parse(await fs.readFile(aside, "utf-8")));
-      if (taken.pid !== process.pid || taken.startedAt !== startedAt) {
-        await fs.link(aside, this.lockPath);
-      }
-    } catch {
-      // Unreadable, or a newer lock took the path: ours is gone either way.
-    } finally {
+    const taken = await readLockFile(aside);
+    const isOurs = taken?.pid === process.pid && taken.startedAt === startedAt;
+    const newerExists = await fs.access(this.lockPath).then(
+      () => true,
+      () => false
+    );
+    if (isOurs || newerExists || taken == null) {
       await fs.unlink(aside).catch(() => undefined);
+      return;
     }
+    // Someone else's lock, and the path is free: put it back. If that fails, `aside` stays, so
+    // the lock is not lost.
+    await fs.rename(aside, this.lockPath).catch(() => undefined);
   }
 
   /**

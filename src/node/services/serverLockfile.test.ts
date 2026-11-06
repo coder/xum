@@ -294,6 +294,70 @@ describe("ServerLockfile", () => {
       expect(leftovers).toEqual([]);
     });
 
+    test("keeps a newer lock that is written while the old one is held aside", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+      const newer = {
+        pid: foreign.pid,
+        baseUrl: "http://127.0.0.1:3",
+        token: "newer-token",
+        startedAt: new Date().toISOString(),
+      };
+
+      // release() reads the lock it took aside: a third backend acquires right then.
+      const realReadFile = fs.readFile;
+      const read = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof realReadFile>
+      ) => {
+        const content = await realReadFile(...args);
+        if (String(args[0]).endsWith(".release")) {
+          await fs.writeFile(lockfile.getLockPath(), JSON.stringify(newer));
+        }
+        return content;
+      }) as typeof realReadFile);
+      try {
+        await lockfile.release();
+      } finally {
+        read.mockRestore();
+      }
+
+      expect(JSON.parse(await fs.readFile(lockfile.getLockPath(), "utf-8"))).toEqual(newer);
+      expect(await fs.readdir(tempDir)).toEqual(["server.lock"]);
+    });
+
+    test("keeps another backend's lock aside when it cannot be put back", async () => {
+      const foreign = unrelatedProcess();
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
+
+      const realRename = fs.rename;
+      const rename = spyOn(fs, "rename").mockImplementation((async (
+        ...args: Parameters<typeof realRename>
+      ) => {
+        if (args[1] === lockfile.getLockPath()) throw new Error("rename failed");
+        return realRename(...args);
+      }) as typeof realRename);
+      try {
+        await lockfile.release();
+      } finally {
+        rename.mockRestore();
+      }
+
+      const aside = path.join(tempDir, `server.lock.${process.pid}.release`);
+      expect(await fs.readdir(tempDir)).toEqual([path.basename(aside)]);
+      expect(JSON.parse(await fs.readFile(aside, "utf-8"))).toEqual(theirs);
+    });
+
+    test("removes a lock file that is not a valid lock", async () => {
+      await lockfile.acquire("http://127.0.0.1:1", "own-token");
+      await fs.writeFile(lockfile.getLockPath(), "not json");
+
+      await lockfile.release();
+
+      expect(await fs.readdir(tempDir)).toEqual([]);
+    });
+
     test("does not delete a lock that this process never acquired", async () => {
       const foreign = unrelatedProcess();
       const theirs = await writeForeignLock({ pid: foreign.pid, baseUrl: "http://127.0.0.1:2" });
