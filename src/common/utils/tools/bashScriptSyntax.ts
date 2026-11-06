@@ -7,7 +7,7 @@
  * unterminated heredoc) is left to bash, because rejecting a complete script
  * would cost more than running a fragment.
  */
-export type CutOffShellConstruct =
+type CutOffShellConstruct =
   | "single-quote"
   | "double-quote"
   | "backtick"
@@ -250,7 +250,7 @@ class ShellScanner {
 }
 
 /** Returns the shell construct still open at the end of `script`, or null when nothing is. */
-export function findCutOffShellConstruct(script: string): CutOffShellConstruct | null {
+function findCutOffShellConstruct(script: string): CutOffShellConstruct | null {
   return new ShellScanner(script).scan();
 }
 

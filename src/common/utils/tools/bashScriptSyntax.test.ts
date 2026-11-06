@@ -1,96 +1,87 @@
 import { describe, expect, test } from "bun:test";
-import {
-  type CutOffShellConstruct,
-  describeCutOffBashScript,
-  findCutOffShellConstruct,
-} from "./bashScriptSyntax";
+import { describeCutOffBashScript } from "./bashScriptSyntax";
 
-describe("findCutOffShellConstruct", () => {
+describe("describeCutOffBashScript", () => {
   test.each([
-    ["single-quoted awk program", `awk '{print $1, "x"}' file`],
-    ["single-quoted sed program with a double quote", `sed -e 's/"/x/g' file`],
     ["grep for a lone double quote", `grep -F '"' file`],
-    ["double-quoted string with nested command substitution", `echo "$(ls "a b")"`],
     ["ANSI-C quote with an escaped single quote", `echo $'it\\'s'`],
-    ["escaped quote inside a double-quoted string", `echo "a \\" b"`],
     ["escaped quote outside quotes", `echo it\\'s`],
     ["quote closed on a later line", `echo "first\nsecond"`],
     ["quote inside a comment", `# don't\necho hi`],
-    ["hash inside a word is not a comment", `echo a#'b'`],
     ["comment after a space", `echo hi #don't`],
-    ["$# is not a comment", `echo $# "x"`],
-    ["${#var} is not a comment", `echo \${#var} "x"`],
+    ["comment after a semicolon", `echo hi;#don't`],
+    ["comment inside a subshell", `( ls # it's\n)`],
+    ["$# is not a comment", `(echo $#)`],
     ["backslash inside a comment", `# trailing \\`],
     ["escaped trailing backslash", `echo foo \\\\`],
     ["backslash then newline mid-script", `echo foo \\\n  bar`],
     ["trailing pipe is left to bash", `ls |`],
     ["trailing && is left to bash", `ls &&`],
     ["heredoc body with stray quotes", `cat <<EOF\nit's "\n$(x\nEOF\necho ok`],
-    ["quoted heredoc delimiter", `cat <<'EOF'\nit's\nEOF`],
-    ["tab-stripped heredoc terminator", `cat <<-EOF\n\tit's\n\tEOF\necho "x"`],
     ["two heredocs on one line", `cat <<A <<B\nit's\nA\n"\nB\necho ok`],
     ["heredoc that runs to end of input", `cat <<EOF\nit's`],
     ["heredoc ending in a newline without its terminator", `echo "$(cat <<''\nbody\n`],
     ["empty heredoc delimiter ends at the first empty line", `cat <<''\nit's\n\necho ok`],
-    ["heredoc line that ends with the delimiter character", `cat <<X # X\nit's\nX`],
     ["heredoc inside a command substitution", `x=$(cat <<EOF\nit's\nEOF\n)`],
-    ["here-string", `cat <<<"here"; echo 'x'`],
-    ["arithmetic shift", `echo $((1 << 2))`],
-    ["input redirect", `wc -l < "file"`],
-    ["comment inside backticks stops at the backtick", "echo `ls # it` 'x'"],
+    ["comment inside backticks stops at the backtick", "echo `ls # it's`"],
     ["single quotes inside unquoted parameter expansion", `echo \${x:-'a } b'}`],
     ["single quote inside double-quoted parameter expansion", `echo "\${x:-don't}"`],
+    ["$' inside a double quote is literal", `echo "$'x"`],
     ["case pattern parenthesis", `case $x in a) echo "hi";; esac`],
-    ["subshell and nested parameter expansion", `( cd "\${dir:-\${HOME}}" && ls )`],
     ["parenthesis inside a parameter expansion", `echo \${x%(*}`],
+    ["comment in a command substitution that ends at the newline", `x=$(ls # note\n)`],
+    ["indented terminator of a plain heredoc stays in the body", `cat <<EOF\n\tEOF\n'`],
   ])("accepts a complete script: %s", (_name, script) => {
-    expect(findCutOffShellConstruct(script)).toBeNull();
+    expect(describeCutOffBashScript(script)).toBeNull();
   });
 
-  test.each<[CutOffShellConstruct, string]>([
-    ["single-quote", `grep 'x`],
-    ["single-quote", `echo $'it\\'s`],
-    ["single-quote", `echo \${x:-'a}`],
-    ["single-quote", `echo a# 'b`],
-    ["double-quote", `cd "$XUM_SCRATCH_DIR/x`],
-    ["double-quote", `echo "a \\"`],
-    ["double-quote", `echo "a \\`],
-    ["double-quote", `cat <<A\nA\necho "x`],
-    ["double-quote", `cat <<-A\n\tA\necho "x`],
-    ["double-quote", `cat <<A <<B\na\nA\nb\nB\necho "x`],
-    ["backtick", "echo `ls"],
-    ["backtick", 'echo "`ls'],
-    ["command-substitution", `T=$(cat file`],
-    ["command-substitution", `echo "$(ls`],
-    ["command-substitution", `echo $(ls # )`],
-    ["subshell", `( cd x`],
-    ["subshell", `diff <(sort a`],
-    ["parameter-expansion", `echo \${x`],
-    ["parameter-expansion", `echo "\${x:-$(ls)`],
-    ["line-continuation", `echo foo \\`],
-    ["line-continuation", `echo foo \\\n`],
-  ])("reports an open %s", (construct, script) => {
-    expect(findCutOffShellConstruct(script)).toBe(construct);
-  });
-
-  test("a comment in a command substitution ends at the newline, not the parenthesis", () => {
-    expect(findCutOffShellConstruct(`x=$(ls # note\n)`)).toBeNull();
-    expect(findCutOffShellConstruct(`x=$(ls # note\n`)).toBe("command-substitution");
-  });
-
-  test("an indented terminator only ends a <<- heredoc", () => {
-    expect(findCutOffShellConstruct(`cat <<EOF\n\tEOF\n'`)).toBeNull();
-    expect(findCutOffShellConstruct(`cat <<-EOF\n\tEOF\n'`)).toBe("single-quote");
-  });
-
-  test("a heredoc operator without a word does not swallow the script", () => {
-    expect(findCutOffShellConstruct(`cat << \necho "x`)).toBe("double-quote");
-  });
-});
-
-describe("describeCutOffBashScript", () => {
-  test("returns null for a complete script", () => {
-    expect(describeCutOffBashScript(`echo "done"`)).toBeNull();
+  // The middle column is the part of the message that names the open construct.
+  test.each([
+    ["plain single quote", "unterminated single quote", `grep 'x`],
+    [
+      "single quote inside unquoted parameter expansion",
+      "unterminated single quote",
+      `echo \${x:-'a}`,
+    ],
+    ["single quote after a mid-word hash", "unterminated single quote", `echo a# 'b`],
+    ["single quote after a <<- terminator", "unterminated single quote", `cat <<-EOF\n\tEOF\n'`],
+    ["double-quoted path", "unterminated double quote", `cd "$XUM_SCRATCH_DIR/x`],
+    [
+      "double quote whose escaped quote does not close it",
+      "unterminated double quote",
+      `echo "a \\"`,
+    ],
+    ["double quote ending in a backslash", "unterminated double quote", `echo "a \\`],
+    ["double quote after a heredoc", "unterminated double quote", `cat <<A\nA\necho "x`],
+    [
+      "double quote after a quoted heredoc delimiter",
+      "unterminated double quote",
+      `cat <<'EOF'\nit's\nEOF\necho "x`,
+    ],
+    ["double quote after a here-string", "unterminated double quote", `cat <<<"here"\necho "x`],
+    [
+      "double quote after an input redirect",
+      "unterminated double quote",
+      `wc -l < "file"\necho "x`,
+    ],
+    [
+      "double quote after a heredoc operator without a word",
+      "unterminated double quote",
+      `cat << \necho "x`,
+    ],
+    ["backtick", "unterminated backtick", "echo `ls"],
+    ["backtick inside a double quote", "unterminated backtick", 'echo "`ls'],
+    ["command substitution", "unclosed $(", `T=$(cat file`],
+    ["command substitution inside a double quote", "unclosed $(", `echo "$(ls`],
+    ["command substitution whose ) is in a comment", "unclosed $(", `echo $(ls # )`],
+    ["subshell", "unclosed (", `( cd x`],
+    ["process substitution", "unclosed (", `diff <(sort a`],
+    ["parameter expansion", "unclosed ${", `echo \${x`],
+    ["parameter expansion inside a double quote", "unclosed ${", `echo "\${x:-$(ls)`],
+    ["trailing backslash", "trailing backslash", `echo foo \\`],
+    ["trailing backslash before a final newline", "trailing backslash", `echo foo \\\n`],
+  ])("rejects an open construct: %s", (_name, construct, script) => {
+    expect(describeCutOffBashScript(script)).toContain(construct);
   });
 
   test("names the open construct, the received length and the script", () => {

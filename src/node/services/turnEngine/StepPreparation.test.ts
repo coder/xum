@@ -34,7 +34,7 @@ import {
   thinkingChangeVoidsPrefixSwap,
 } from "./StepPreparation";
 import type { StepPreparationDeps } from "./StepPreparation";
-import type { StreamRequestConfig } from "./types";
+import type { StepMessageTracker, StreamRequestConfig } from "./types";
 
 /** A staged swap whose prefix was prepared at this thinking level. */
 function swapPreparedAt(level: string): ContinuousPrefixSwap {
@@ -546,7 +546,9 @@ describe("prefixSwapInvalidationReason", () => {
 });
 
 describe("StepPreparation.createStreamResult", () => {
-  function captureStreamOptions(): { transform?: StreamTextTransform<ToolSet> } {
+  function captureStreamOptions(stepTracker?: StepMessageTracker): {
+    transform?: StreamTextTransform<ToolSet>;
+  } {
     const captured: { transform?: StreamTextTransform<ToolSet> } = {};
     const streamTextOverride = ((options: Parameters<typeof streamText>[0]) => {
       captured.transform = options.experimental_transform as StreamTextTransform<ToolSet>;
@@ -556,14 +558,15 @@ describe("StepPreparation.createStreamResult", () => {
     const request = { model: {}, modelString: "local:qwen", messages: [] };
     new StepPreparation(deps as unknown as StepPreparationDeps).createStreamResult(
       request as unknown as StreamRequestConfig,
-      new AbortController()
+      new AbortController(),
+      stepTracker
     );
     return captured;
   }
 
-  test("logs a rejected tool call with the request's model when there is no step tracker", async () => {
+  test("logs a rejected tool call with the request's model and workspace", async () => {
     const warn = spyOn(log, "warn").mockImplementation(() => undefined);
-    const transform = captureStreamOptions().transform!({
+    const transform = captureStreamOptions({ workspaceId: "ws-1" }).transform!({
       tools: {},
       stopStream: () => undefined,
     });
@@ -584,13 +587,11 @@ describe("StepPreparation.createStreamResult", () => {
     } as TextStreamPart<ToolSet>);
     await transform.readable.getReader().read();
 
-    expect(warn).toHaveBeenCalledWith("Rejected a tool call with invalid input", {
-      toolName: "bash",
-      model: "local:qwen",
-      workspaceId: undefined,
-      argumentsBytes: 16,
-      arguments: '{"command":"cd"}',
-    });
+    // The logged fields are owned by summarizeInvalidToolInputErrors.test.ts.
+    expect(warn).toHaveBeenCalledWith(
+      "Rejected a tool call with invalid input",
+      expect.objectContaining({ model: "local:qwen", workspaceId: "ws-1" })
+    );
     warn.mockRestore();
   });
 });

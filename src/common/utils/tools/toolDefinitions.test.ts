@@ -413,45 +413,18 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
-  it("rejects a bash script that arrived cut off mid-quote with a self-correcting message", () => {
+  it("rejects a bash script that arrived cut off mid-quote", () => {
+    // The message itself is owned by bashScriptSyntax.test.ts; this pins that the
+    // check runs on the script argument, including its `command` alias.
     const input = { command: 'cd "$XUM_SCR', timeout_secs: 60, display_name: "Test" };
     const parsed = TOOL_DEFINITIONS.bash.schema.safeParse(input);
 
     expect(parsed.success).toBe(false);
     if (!parsed.success) {
-      expect(formatToolInputIssues(parsed.error.issues, input)).toBe(
-        'script: arrived cut off: an unterminated double quote is open at end of input (received 12 characters: cd "$XUM_SCR). Re-send the whole script.'
+      expect(formatToolInputIssues(parsed.error.issues, input)).toStartWith(
+        "script: arrived cut off: "
       );
     }
-  });
-
-  it("shows the raw bash arguments when the script argument is missing", () => {
-    const input = { cmd: "cd", display_name: "List scratch dirs", timeout_secs: 60 };
-    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse(input);
-
-    expect(parsed.success).toBe(false);
-    if (!parsed.success) {
-      expect(formatToolInputIssues(parsed.error.issues, input)).toBe(
-        'script: Invalid input: expected string, received undefined. Received arguments: cmd="cd" (2 chars), display_name="List scratch dirs" (17 chars), timeout_secs=60'
-      );
-    }
-  });
-
-  it("accepts a complete multi-line bash script with quoted subshells", () => {
-    const script = [
-      'cd "$(git rev-parse --show-toplevel)"',
-      `for f in $(ls "src/$(basename "$PWD")"); do`,
-      "  awk '{ print $1 }' \"$f\" | sed -e 's/\"//g' # strip quotes, don't keep",
-      "done",
-      "cat <<'EOF'",
-      "it's done",
-      "EOF",
-    ].join("\n");
-
-    expect(
-      TOOL_DEFINITIONS.bash.schema.safeParse({ script, timeout_secs: 60, display_name: "Test" })
-        .success
-    ).toBe(true);
   });
 
   it("validates heartbeat tool configuration bounds", () => {

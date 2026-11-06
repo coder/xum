@@ -143,7 +143,7 @@ describe("summarizeInvalidToolInputErrors logging", () => {
     await runTransform([rejected.call, rejected.toolError]);
 
     const fields = warn.mock.calls[0]?.[1] as { arguments: string; argumentsBytes: number };
-    expect(fields.argumentsBytes).toBe(JSON.stringify(input).length);
+    expect(fields.argumentsBytes).toBe(5011);
     expect(fields.arguments).toHaveLength(2049);
     expect(fields.arguments).toStartWith('{"text":"xxx');
     expect(fields.arguments).toEndWith("x…");
