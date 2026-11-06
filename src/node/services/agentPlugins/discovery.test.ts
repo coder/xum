@@ -3056,7 +3056,7 @@ describe("named manifest choice (install methods)", () => {
       "as-codex": "agent-plugin",
       "as-unknown": "windsurf-plugin",
     };
-    for (const name of [...Object.keys(saved), "as-legacy", "unmanaged"]) {
+    for (const name of [...Object.keys(saved), "as-legacy", "as-invalid", "unmanaged"]) {
       await writeEgmLayout(path.join(container, name));
       // The manifest name is the directory name, as an install leaves it.
       for (const relative of [".codex-plugin", ".claude-plugin", ".cursor-plugin"]) {
@@ -3066,6 +3066,17 @@ describe("named manifest choice (install methods)", () => {
       }
       if (name === "unmanaged") continue;
       const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
+      if (name === "as-invalid") {
+        // A newer build wrote a source kind this build does not know: the full row schema fails,
+        // but the row still names its plugin and the manifest that its install reviewed.
+        rows.push(
+          createRawPluginInstallRow(
+            { ...entry, source: { type: "future-kind" } } as unknown as typeof entry,
+            { installMethod: "claude-plugin", installMethodSha: entry.lockedSha }
+          )
+        );
+        continue;
+      }
       rows.push(
         name in saved
           ? createRawPluginInstallRow(entry, {
@@ -3090,6 +3101,8 @@ describe("named manifest choice (install methods)", () => {
       "as-codex": ["from codex", "agent-plugin"],
       "as-unknown": ["from codex", undefined],
       "as-legacy": ["from codex", undefined],
+      // The row fails the schema, yet it still loads the manifest of its saved method.
+      "as-invalid": ["from claude", "claude-plugin"],
       unmanaged: ["from codex", undefined],
     });
     // The unknown value did not invalidate its row: its imported components still load.

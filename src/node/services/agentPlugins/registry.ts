@@ -188,7 +188,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
       // Only a complete, valid legacy install may grant import-all. A missing
       // selection on a truncated row is corruption, not legacy consent.
       const parsed = AgentPluginInstallEntrySchema.safeParse(raw);
-      if (!parsed.success || byName.has(name)) {
+      const duplicate = byName.has(name);
+      if (!parsed.success || duplicate) {
         log.warn(
           `Ignoring component imports for invalid or duplicate plugin registry entry '${name}'`
         );
@@ -198,6 +199,16 @@ export async function readPluginComponentImports(registryFile: string): Promise<
         byName.set(name, parsed.data.importedComponents);
         consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
         installedAtByName.set(name, parsed.data.installedAt);
+      }
+      // The saved method needs only the row's identity, not a full schema pass: a row that a newer
+      // build made invalid (an unknown source kind) still names the manifest that its install
+      // reviewed, and loading another one would run hooks that were trusted for that other manifest
+      // during a downgrade. Imports and consent fail closed on their own. Two rows of one name leave
+      // no way to tell which method is meant, so the choice is cleared.
+      if (duplicate) {
+        methodByName.delete(name);
+        methodMovedByName.delete(name);
+      } else {
         const method = readStoredInstallMethod(raw);
         if (method !== undefined) methodByName.set(name, method);
         if (installMethodMoved(raw)) methodMovedByName.add(name);
