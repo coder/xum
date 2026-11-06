@@ -10,8 +10,9 @@ import { isIosStandaloneWebApp } from "@/browser/utils/env";
  * full width, keeping only the area around the time and status.
  *
  * A numeric viewport width equal to the screen's does lay the page out across all 466pt (with the
- * height pinned too, see `sync`), but iOS still treats the column as obscured, which breaks four
- * things this module puts back (measured on the iOS 27.2 Duo simulator, from the installed web clip):
+ * height pinned too, see `CoverColumnViewport`), but iOS still treats the column as obscured, which
+ * breaks four things this module puts back (measured on the iOS 27.2 Duo simulator, from the
+ * installed web clip):
  * - WebKit hit-tests nothing past 382pt: a touch there reaches the page with the root as its target,
  *   and no click follows. The column touch bridge finds the element under the finger and replays
  *   the touch's pointer, touch and mouse events and its click on it.
@@ -58,11 +59,13 @@ export function getCoverColumnWidth(geometry: CoverColumnGeometry): number {
   return isPhonePortrait && isStatusColumn && geometry.reportedRightInset === 0 ? column : 0;
 }
 
+interface ViewportSize {
+  width: number;
+  height: number;
+}
+
 /** Lays the page out at device width, or at a fixed size. */
-function setViewportSize(
-  meta: HTMLMetaElement,
-  size: { width: number; height: number } | null
-): void {
+function setViewportSize(meta: HTMLMetaElement, size: ViewportSize | null): void {
   const width = size ? `width=${size.width}, height=${size.height}` : "width=device-width";
   meta.content = meta.content.replace(VIEWPORT_HEIGHT, "").replace(VIEWPORT_WIDTH, width);
 }
@@ -214,23 +217,84 @@ function retargetTouches(list: TouchList, target: Element): Touch[] {
   );
 }
 
+function isColumnTouch(event: PointerEvent, column: number): boolean {
+  return (
+    column > 0 &&
+    event.isPrimary &&
+    event.pointerType === "touch" &&
+    event.clientX >= window.innerWidth
+  );
+}
+
+/** The innermost element a drag by (dx, dy) would scroll, and whether along the x axis. */
+function findDragScroller(
+  from: EventTarget | null,
+  dx: number,
+  dy: number
+): { element: Element; horizontal: boolean } | null {
+  const horizontal = Math.abs(dx) > Math.abs(dy);
+  const element = findScroller(from, horizontal, horizontal ? dx : dy);
+  return element == null ? null : { element, horizontal };
+}
+
+/** Moves a column scroll with the finger, which iOS does not. */
+function dragColumnScroll(scroll: ColumnScroll, touch: Touch, time: number): void {
+  const finger = scroll.horizontal ? touch.clientX : touch.clientY;
+  setScrollPosition(scroll, scroll.origin - (finger - scroll.start));
+  scroll.samples.push({ time, finger });
+}
+
+function listen<K extends keyof WindowEventMap>(
+  type: K,
+  listener: (event: WindowEventMap[K]) => void,
+  options?: AddEventListenerOptions
+): () => void {
+  window.addEventListener(type, listener, options);
+  return () => window.removeEventListener(type, listener, options);
+}
+
+const CAPTURE = { capture: true } as const;
+const ACTIVE_CAPTURE = { capture: true, passive: false } as const;
+
 /**
  * Replays touches that start in the column on the element under them, which WebKit does not find
  * (see the module comment), and blocks sideways pans of the page everywhere.
  */
-function createColumnTouchBridge(getColumn: () => number) {
-  const replayed = new WeakSet<Event>();
-  let gesture: ColumnGesture | null = null;
-  let pan: PanState | null = null;
-  let stopGlide: () => void = () => undefined;
+class ColumnTouchBridge {
+  private readonly getColumn: () => number;
+  private readonly replayed = new WeakSet<Event>();
+  private gesture: ColumnGesture | null = null;
+  private pan: PanState | null = null;
+  private stopGlide: () => void = () => undefined;
+
+  constructor(getColumn: () => number) {
+    this.getColumn = getColumn;
+  }
+
+  install(): () => void {
+    const removers = [
+      listen("pointerdown", (event) => this.onPointerDown(event), CAPTURE),
+      ...(["pointermove", "pointerup", "pointercancel"] as const).map((type) =>
+        listen(type, (event) => this.onPointerFollowUp(event), CAPTURE)
+      ),
+      listen("touchstart", (event) => this.onTouchStart(event), CAPTURE),
+      listen("touchmove", (event) => this.onTouchMove(event), ACTIVE_CAPTURE),
+      listen("touchend", (event) => this.onTouchEnd(event), ACTIVE_CAPTURE),
+      listen("touchcancel", (event) => this.onTouchEnd(event), ACTIVE_CAPTURE),
+    ];
+    return () => {
+      this.stopGlide();
+      for (const remove of removers) remove();
+    };
+  }
 
   /** Dispatches a copy on the gesture's element; false when the page cancelled the copy. */
-  function dispatchCopy(copy: Event, target: Element): boolean {
-    replayed.add(copy);
+  private dispatchCopy(copy: Event, target: Element): boolean {
+    this.replayed.add(copy);
     return target.dispatchEvent(copy);
   }
 
-  function replayPointer(type: string, source: PointerEvent, target: Element): void {
+  private replayPointer(type: string, source: PointerEvent, target: Element): void {
     const copy = new window.PointerEvent(type, {
       bubbles: true,
       cancelable: true,
@@ -249,10 +313,10 @@ function createColumnTouchBridge(getColumn: () => number) {
       button: source.button,
       buttons: source.buttons,
     });
-    dispatchCopy(copy, target);
+    this.dispatchCopy(copy, target);
   }
 
-  function replayTouch(event: TouchEvent, column: ColumnGesture): void {
+  private replayTouch(event: TouchEvent, gesture: ColumnGesture): void {
     // The page must not see the original either: its target is the root.
     event.stopImmediatePropagation();
     const copy = new window.TouchEvent(event.type, {
@@ -260,37 +324,35 @@ function createColumnTouchBridge(getColumn: () => number) {
       cancelable: true,
       composed: true,
       view: window,
-      touches: retargetTouches(event.touches, column.target),
-      targetTouches: retargetTouches(event.targetTouches, column.target),
-      changedTouches: retargetTouches(event.changedTouches, column.target),
+      touches: retargetTouches(event.touches, gesture.target),
+      targetTouches: retargetTouches(event.targetTouches, gesture.target),
+      changedTouches: retargetTouches(event.changedTouches, gesture.target),
     });
-    if (!dispatchCopy(copy, column.target)) column.ended = true;
+    if (!this.dispatchCopy(copy, gesture.target)) gesture.ended = true;
   }
 
-  function dispatchMouse(type: string, column: ColumnGesture): boolean {
+  private dispatchMouse(type: string, gesture: ColumnGesture): boolean {
     const event = new window.MouseEvent(type, {
       bubbles: true,
       cancelable: true,
       composed: true,
       view: window,
-      clientX: column.x,
-      clientY: column.y,
+      clientX: gesture.x,
+      clientY: gesture.y,
       button: 0,
       buttons: type === "mousedown" ? 1 : 0,
       detail: 1,
     });
-    return dispatchCopy(event, column.target);
+    return this.dispatchCopy(event, gesture.target);
   }
 
-  function onPointerDown(event: PointerEvent): void {
-    const column = getColumn();
-    const isColumnTouch =
-      column > 0 && event.pointerType === "touch" && event.clientX >= window.innerWidth;
-    if (replayed.has(event) || !event.isPrimary || !isColumnTouch) return;
+  private onPointerDown(event: PointerEvent): void {
+    const column = this.getColumn();
+    if (this.replayed.has(event) || !isColumnTouch(event, column)) return;
     const target = hitTestColumn(event.clientX, event.clientY, column);
     if (target == null) return;
-    stopGlide();
-    gesture = {
+    this.stopGlide();
+    this.gesture = {
       target,
       x: event.clientX,
       y: event.clientY,
@@ -301,122 +363,169 @@ function createColumnTouchBridge(getColumn: () => number) {
     };
     // Radix reads a root-targeted pointerdown as a press outside every open layer and closes it.
     event.stopImmediatePropagation();
-    replayPointer(event.type, event, target);
+    this.replayPointer(event.type, event, target);
   }
 
-  function onPointerFollowUp(event: PointerEvent): void {
-    if (replayed.has(event) || gesture?.pointerId !== event.pointerId) return;
+  private onPointerFollowUp(event: PointerEvent): void {
+    const gesture = this.gesture;
+    if (this.replayed.has(event) || gesture?.pointerId !== event.pointerId) return;
     event.stopImmediatePropagation();
     if (gesture.scroll != null) return;
     if (event.type === "pointercancel") gesture.ended = true;
     gesture.pointer = event;
-    replayPointer(event.type, event, gesture.target);
+    this.replayPointer(event.type, event, gesture.target);
   }
 
-  /** Starts scrolling a column drag, which iOS does not scroll; false when nothing would. */
-  function startColumnScroll(column: ColumnGesture, touch: Touch): boolean {
-    const dx = touch.clientX - column.x;
-    const dy = touch.clientY - column.y;
-    const horizontal = Math.abs(dx) > Math.abs(dy);
-    const element = findScroller(column.target, horizontal, horizontal ? dx : dy);
-    if (element == null) return false;
-    const finger = horizontal ? touch.clientX : touch.clientY;
-    column.scroll = { element, horizontal, origin: 0, start: finger, samples: [] };
-    column.scroll.origin = getScrollPosition(column.scroll);
+  /** Starts scrolling a column drag, which iOS does not scroll; null when nothing would. */
+  private startColumnScroll(gesture: ColumnGesture, touch: Touch): ColumnScroll | null {
+    const scroller = findDragScroller(
+      gesture.target,
+      touch.clientX - gesture.x,
+      touch.clientY - gesture.y
+    );
+    if (scroller == null) return null;
     // A native scroll cancels the touch's pointer, so the press does not turn into a drag.
-    replayPointer("pointercancel", column.pointer, column.target);
-    return true;
+    this.replayPointer("pointercancel", gesture.pointer, gesture.target);
+    const start = scroller.horizontal ? touch.clientX : touch.clientY;
+    const scroll: ColumnScroll = { ...scroller, origin: 0, start, samples: [] };
+    scroll.origin = getScrollPosition(scroll);
+    return scroll;
   }
 
-  function moveColumnGesture(column: ColumnGesture, touch: Touch, event: TouchEvent): void {
+  private moveColumnGesture(gesture: ColumnGesture, touch: Touch, event: TouchEvent): void {
     // iOS neither scrolls nor clicks for a touch in the column, and would only pan the page.
     if (event.cancelable) event.preventDefault();
-    if (Math.hypot(touch.clientX - column.x, touch.clientY - column.y) > TAP_SLOP_PX) {
-      column.ended = true;
+    if (Math.hypot(touch.clientX - gesture.x, touch.clientY - gesture.y) > TAP_SLOP_PX) {
+      gesture.ended = true;
     }
-    const scrolling = column.scroll != null || (column.ended && startColumnScroll(column, touch));
-    const scroll = column.scroll;
-    if (!scrolling || scroll == null) return;
-    const finger = scroll.horizontal ? touch.clientX : touch.clientY;
-    setScrollPosition(scroll, scroll.origin - (finger - scroll.start));
-    scroll.samples.push({ time: event.timeStamp, finger });
+    if (gesture.ended && gesture.scroll == null) {
+      gesture.scroll = this.startColumnScroll(gesture, touch);
+    }
+    if (gesture.scroll != null) dragColumnScroll(gesture.scroll, touch, event.timeStamp);
   }
 
-  function onTouchStart(event: TouchEvent): void {
-    if (replayed.has(event)) return;
+  private onTouchStart(event: TouchEvent): void {
+    if (this.replayed.has(event)) return;
     const touch = event.touches.length === 1 ? event.touches[0] : undefined;
-    pan = touch ? { x: touch.clientX, y: touch.clientY, block: null } : null;
-    if (gesture != null) replayTouch(event, gesture);
+    this.pan = touch ? { x: touch.clientX, y: touch.clientY, block: null } : null;
+    if (this.gesture != null) this.replayTouch(event, this.gesture);
   }
 
-  function blockPagePan(touch: Touch, event: TouchEvent): void {
+  private blockPagePan(touch: Touch, event: TouchEvent): void {
+    const pan = this.pan;
     if (pan == null) return;
     if (pan.block === null) {
       const dx = touch.clientX - pan.x;
       const dy = touch.clientY - pan.y;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
-      const horizontal = Math.abs(dx) > Math.abs(dy);
-      pan.block = findScroller(event.target, horizontal, horizontal ? dx : dy) == null;
+      pan.block = findDragScroller(event.target, dx, dy) == null;
     }
     if (pan.block && event.cancelable) event.preventDefault();
   }
 
-  function onTouchMove(event: TouchEvent): void {
+  private onTouchMove(event: TouchEvent): void {
     const touch = event.touches[0];
-    if (replayed.has(event) || touch == null || getColumn() === 0) return;
-    if (gesture == null) {
-      blockPagePan(touch, event);
+    if (this.replayed.has(event) || touch == null || this.getColumn() === 0) return;
+    if (this.gesture == null) {
+      this.blockPagePan(touch, event);
       return;
     }
-    moveColumnGesture(gesture, touch, event);
-    replayTouch(event, gesture);
+    this.moveColumnGesture(this.gesture, touch, event);
+    this.replayTouch(event, this.gesture);
   }
 
-  function finishColumnGesture(column: ColumnGesture, event: TouchEvent): void {
-    if (column.scroll != null) {
-      stopGlide = glide(column.scroll, getReleaseVelocity(column.scroll, event.timeStamp));
+  private finishColumnGesture(gesture: ColumnGesture, event: TouchEvent): void {
+    if (gesture.scroll != null) {
+      this.stopGlide = glide(gesture.scroll, getReleaseVelocity(gesture.scroll, event.timeStamp));
       return;
     }
-    if (column.ended || event.type === "touchcancel") return;
+    if (gesture.ended || event.type === "touchcancel") return;
     // Focus follows an unprevented mousedown, as it does for a native tap. It runs inside the
     // touchend, so iOS still opens the keyboard for it.
-    const field = column.target.closest<HTMLElement>(TEXT_ENTRY);
-    if (dispatchMouse("mousedown", column)) field?.focus();
-    dispatchMouse("mouseup", column);
-    dispatchMouse("click", column);
+    const field = gesture.target.closest<HTMLElement>(TEXT_ENTRY);
+    if (this.dispatchMouse("mousedown", gesture)) field?.focus();
+    this.dispatchMouse("mouseup", gesture);
+    this.dispatchMouse("click", gesture);
   }
 
-  function onTouchEnd(event: TouchEvent): void {
-    if (replayed.has(event) || event.touches.length > 0) return;
-    const column = gesture;
-    gesture = null;
-    pan = null;
-    if (column == null) return;
+  private onTouchEnd(event: TouchEvent): void {
+    if (this.replayed.has(event) || event.touches.length > 0) return;
+    const gesture = this.gesture;
+    this.gesture = null;
+    this.pan = null;
+    if (gesture == null) return;
     // WebKit's own click for a column tap lands on an element left of the column, or nowhere.
     if (event.cancelable) event.preventDefault();
-    replayTouch(event, column);
-    finishColumnGesture(column, event);
+    this.replayTouch(event, gesture);
+    this.finishColumnGesture(gesture, event);
+  }
+}
+
+// The software keyboard changes innerHeight and the layout height, so the key leaves them out.
+function readGeometryKey(): string {
+  return `${window.screen.width}:${window.innerWidth}:${window.matchMedia("(orientation: portrait)").matches}`;
+}
+
+function isPagePannedSideways(): boolean {
+  const zoomed = (window.visualViewport?.scale ?? 1) > 1;
+  return window.scrollX !== 0 && !zoomed;
+}
+
+/** The viewport size that lays the page out across the column, kept in step with the display. */
+class CoverColumnViewport {
+  /** The column's width while the page is laid out across it, else 0. */
+  column = 0;
+  private readonly meta: HTMLMetaElement;
+  // A numeric width alone keeps the device's aspect ratio (466x827 here) and leaves the page room
+  // to scroll down, so the height is pinned to the device-width layout's height too.
+  private size: ViewportSize | null = null;
+  private geometryKey = "";
+  private healing = false;
+
+  constructor(meta: HTMLMetaElement) {
+    this.meta = meta;
   }
 
-  const capture = { capture: true } as const;
-  const active = { capture: true, passive: false } as const;
-  const followUps = ["pointermove", "pointerup", "pointercancel"] as const;
-  window.addEventListener("pointerdown", onPointerDown, capture);
-  for (const type of followUps) window.addEventListener(type, onPointerFollowUp, capture);
-  window.addEventListener("touchstart", onTouchStart, capture);
-  window.addEventListener("touchmove", onTouchMove, active);
-  window.addEventListener("touchend", onTouchEnd, active);
-  window.addEventListener("touchcancel", onTouchEnd, active);
+  sync(): void {
+    const root = document.documentElement;
+    setViewportSize(this.meta, null);
+    this.column = getCoverColumnWidth({
+      screenWidth: window.screen.width,
+      layoutWidth: root.clientWidth,
+      layoutHeight: root.clientHeight,
+      reportedRightInset: readReportedRightInset(),
+    });
+    this.size = this.column > 0 ? { width: window.screen.width, height: root.clientHeight } : null;
+    setViewportSize(this.meta, this.size);
+    if (this.size) root.style.setProperty(IOS_COVER_COLUMN_PROPERTY, `${this.column}px`);
+    else root.style.removeProperty(IOS_COVER_COLUMN_PROPERTY);
+    this.geometryKey = readGeometryKey();
+  }
 
-  return () => {
-    stopGlide();
-    window.removeEventListener("pointerdown", onPointerDown, capture);
-    for (const type of followUps) window.removeEventListener(type, onPointerFollowUp, capture);
-    window.removeEventListener("touchstart", onTouchStart, capture);
-    window.removeEventListener("touchmove", onTouchMove, active);
-    window.removeEventListener("touchend", onTouchEnd, active);
-    window.removeEventListener("touchcancel", onTouchEnd, active);
-  };
+  // Re-laying the page out fires resize too, so only a change of display or orientation syncs.
+  onResize(): void {
+    if (readGeometryKey() !== this.geometryKey) this.sync();
+  }
+
+  // iOS holds a sideways pan against scrollTo; laying the page out at device width clamps the pan
+  // back to 0. iOS applies that only from the next frame it draws, so the size returns two frames
+  // later (about 50ms on the simulator): in the same task the layout never reaches iOS.
+  healPan(): void {
+    if (this.size == null || this.healing || !isPagePannedSideways()) return;
+    this.healing = true;
+    setViewportSize(this.meta, null);
+    window.requestAnimationFrame(() =>
+      window.requestAnimationFrame(() => {
+        this.healing = false;
+        setViewportSize(this.meta, this.size);
+      })
+    );
+  }
+
+  dispose(): void {
+    setViewportSize(this.meta, null);
+    document.documentElement.style.removeProperty(IOS_COVER_COLUMN_PROPERTY);
+  }
 }
 
 /**
@@ -426,62 +535,15 @@ function createColumnTouchBridge(getColumn: () => number) {
 export function installIosCoverColumn(): () => void {
   const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
   if (!isIosStandaloneWebApp() || meta == null) return () => undefined;
-  const root = document.documentElement;
-  let column = 0;
-  // A numeric width alone keeps the device's aspect ratio (466x827 here) and leaves the page room
-  // to scroll down, so the height is pinned to the device-width layout's height too.
-  let size: { width: number; height: number } | null = null;
-  let geometryKey = "";
-  // The software keyboard changes innerHeight and the layout height, so the key leaves them out.
-  const readGeometryKey = () =>
-    `${window.screen.width}:${window.innerWidth}:${window.matchMedia("(orientation: portrait)").matches}`;
-
-  const sync = () => {
-    setViewportSize(meta, null);
-    column = getCoverColumnWidth({
-      screenWidth: window.screen.width,
-      layoutWidth: root.clientWidth,
-      layoutHeight: root.clientHeight,
-      reportedRightInset: readReportedRightInset(),
-    });
-    size = column > 0 ? { width: window.screen.width, height: root.clientHeight } : null;
-    setViewportSize(meta, size);
-    if (size) root.style.setProperty(IOS_COVER_COLUMN_PROPERTY, `${column}px`);
-    else root.style.removeProperty(IOS_COVER_COLUMN_PROPERTY);
-    geometryKey = readGeometryKey();
-  };
-
-  // Re-laying the page out fires resize too, so only a change of display or orientation syncs.
-  const onResize = () => {
-    if (readGeometryKey() !== geometryKey) sync();
-  };
-
-  // iOS holds a sideways pan against scrollTo; laying the page out at device width clamps the pan
-  // back to 0. iOS applies that only from the next frame it draws, so the size returns two frames
-  // later (about 50ms on the simulator): in the same task the layout never reaches iOS.
-  let healing = false;
-  const onScroll = () => {
-    const zoomed = (window.visualViewport?.scale ?? 1) > 1;
-    if (size == null || healing || window.scrollX === 0 || zoomed) return;
-    healing = true;
-    setViewportSize(meta, null);
-    window.requestAnimationFrame(() =>
-      window.requestAnimationFrame(() => {
-        healing = false;
-        setViewportSize(meta, size);
-      })
-    );
-  };
-
-  sync();
-  const removeBridge = createColumnTouchBridge(() => column);
-  window.addEventListener("resize", onResize);
-  window.addEventListener("scroll", onScroll);
+  const viewport = new CoverColumnViewport(meta);
+  viewport.sync();
+  const removers = [
+    new ColumnTouchBridge(() => viewport.column).install(),
+    listen("resize", () => viewport.onResize()),
+    listen("scroll", () => viewport.healPan()),
+  ];
   return () => {
-    removeBridge();
-    window.removeEventListener("resize", onResize);
-    window.removeEventListener("scroll", onScroll);
-    setViewportSize(meta, null);
-    root.style.removeProperty(IOS_COVER_COLUMN_PROPERTY);
+    for (const remove of removers) remove();
+    viewport.dispose();
   };
 }
