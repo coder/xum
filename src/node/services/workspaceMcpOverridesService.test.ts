@@ -4245,24 +4245,64 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
     });
 
-    it("refuses while config.json is corrupt and leaves the overrides as they were", async () => {
+    // Runs `change` once, right before the sweep's own registry read: after the lock derivation,
+    // which reads the same registry first.
+    const beforeSweepRead = (change: () => void) => {
+      const real = config.getAllWorkspaceMetadata.bind(config);
+      let changed = false;
+      return spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        (...args: Parameters<Config["getAllWorkspaceMetadata"]>) => {
+          if (!changed && new Error().stack?.includes("loadSweepMetadata")) {
+            changed = true;
+            change();
+          }
+          return real(...args);
+        }
+      );
+    };
+
+    it.each(["before the sweep", "after the lock derivation"] as const)(
+      "refuses when config.json breaks %s and leaves the overrides as they were",
+      async (when) => {
+        const service = new WorkspaceMcpOverridesService(config);
+        const healthy = await registerWorkspace("healthy-beside-legacy");
+        await writeEnable(healthy.workspacePath);
+        await registerMalformedLegacyEntry();
+        const corrupt = () => nodeFs.writeFileSync(path.join(tempDir, "config.json"), "{ not json");
+        if (when === "before the sweep") corrupt();
+        const spy = beforeSweepRead(when === "before the sweep" ? () => undefined : corrupt);
+        try {
+          expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+        } finally {
+          spy.mockRestore();
+        }
+        expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
+      }
+    );
+
+    it("fails a requested workspace that the sweep's lenient walk does not list", async () => {
+      // The lock derivation lists the workspace. By the sweep's own read it is gone from
+      // config.json, so only the sweep's own check can fail it.
       const service = new WorkspaceMcpOverridesService(config);
       const healthy = await registerWorkspace("healthy-beside-legacy");
       await writeEnable(healthy.workspacePath);
       await registerMalformedLegacyEntry();
-      await fs.writeFile(path.join(tempDir, "config.json"), "{ not json");
-
-      expect(await sweepOutcome(service, [healthy.workspaceId])).toBe("refused");
+      const configPath = path.join(tempDir, "config.json");
+      const spy = beforeSweepRead(() => {
+        const document = JSON.parse(nodeFs.readFileSync(configPath, "utf8")) as {
+          projects: Array<[string, unknown]>;
+        };
+        document.projects = document.projects.filter(
+          ([projectPath]) => projectPath !== "/fake/healthy-beside-legacy"
+        );
+        nodeFs.writeFileSync(configPath, JSON.stringify(document));
+      });
+      try {
+        expect(await sweepOutcome(service, [healthy.workspaceId])).toEqual([healthy.workspaceId]);
+      } finally {
+        spy.mockRestore();
+      }
       expect(await enabledServers(healthy.workspacePath)).toEqual([pluginKey, "other"]);
-    });
-
-    it("fails a requested workspace that the lenient walk does not list", async () => {
-      const service = new WorkspaceMcpOverridesService(config);
-      const healthy = await registerWorkspace("healthy-beside-legacy");
-      await registerMalformedLegacyEntry();
-
-      const outcome = await sweepOutcome(service, [healthy.workspaceId, "ws-not-registered"]);
-      expect(outcome === "refused" || outcome.includes("ws-not-registered")).toBe(true);
     });
   });
 
