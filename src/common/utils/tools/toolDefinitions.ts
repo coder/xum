@@ -2349,7 +2349,10 @@ export const TOOL_DEFINITIONS = {
             .nullish()
             .describe(
               "Seconds: foreground kill deadline, or background max lifetime. " +
-                `Omitted: foreground gets a ${BASH_DEFAULT_TIMEOUT_SECS}s kill deadline, and a background process lives until it is stopped or the workspace is removed. ` +
+                // Scoped to background starts on purpose: a foreground command the user sends to
+                // background keeps the deadline it already had, so this must not promise an open
+                // lifetime for every background process.
+                `Omitted: foreground gets a ${BASH_DEFAULT_TIMEOUT_SECS}s kill deadline; a command started in the background has no kill deadline. ` +
                 "Start small; raise on retry."
             ),
           run_in_background: z
