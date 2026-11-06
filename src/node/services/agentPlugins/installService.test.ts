@@ -7098,8 +7098,8 @@ describe("AgentPluginInstallService", () => {
     describe("a refusal says why the override cleanup failed", () => {
       // Retry advice alone left a user stuck on a file that stays too large,
       // and the reason was only in the log. Each cause gets its own advice.
-      const gates = ["fresh install", "reinstall gate"] as const;
-      type Gate = (typeof gates)[number];
+      type Gate = "fresh install" | "reinstall gate";
+      const gates: Gate[] = ["fresh install", "reinstall gate"];
       const realOverridesService = () => new WorkspaceMcpOverridesService(config);
       const serviceWith = (overrides: WorkspaceMcpOverridesService) =>
         new AgentPluginInstallService(config, { workspaceMcpOverridesService: overrides });
