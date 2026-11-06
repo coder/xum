@@ -2111,7 +2111,7 @@ export const MOVED_METHOD_MESSAGE =
 /**
  * discoverPluginAt for a plugin of a managed container. It loads the manifest its install saved
  * (B2); anything else, and a registry that cannot be read, read the fixed order. A saved method
- * that an older build moved to a commit loads nothing until it is reset or reinstalled: its saved
+ * that an older build moved to a commit loads nothing until it is reinstalled: its saved
  * manifest was never reviewed at that commit (B3).
  */
 async function discoverManagedPluginAt(
