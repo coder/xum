@@ -21,8 +21,8 @@ interface Fake {
   // XUM_DEV_SERVER_NO_AUTH=1.
   token: string;
   // Acts out a nodemon restart right after readiness. At the first /health the old backend dies:
-  // its port and socket close, and its lock stays and names a dead pid. 3 s later the next backend
-  // deletes that lock, and 1 s after that it listens again and writes its own.
+  // its port and socket close, and its lock stays and names a dead pid. 4 s later the next backend
+  // listens again and writes its own lock over it (ServerLockfile.read never deletes a stale lock).
   restartAfterFirstHealth?: boolean;
   // Arms the `ss` stub of swapLockSs at the first /health.
   swapLockDuringCheck?: boolean;
@@ -97,7 +97,6 @@ const listen = (server, ...args) => new Promise((resolve) => server.listen(...ar
     tcp.close();
     unix.close();
     writeLock(spawnSync("true").pid, new Date(stamp + 1));
-    setTimeout(() => fs.rmSync(lockPath), 3000);
     setTimeout(async () => {
       fs.rmSync(socketPath, { force: true });
       await listen(tcp, backendPort, fake.backendHost);
@@ -411,10 +410,9 @@ test.skipIf(!isLinux)(
   90_000
 );
 
-// A nodemon restart frees the backend's port and leaves a lock that names a dead pid, then the
-// next backend deletes that lock for a moment (see run_token in verify-xum.sh). Launch must wait
-// for the new backend, not refuse its port as unseen or the missing lock as a backend without a
-// token.
+// A nodemon restart frees the backend's port and leaves a lock that names a dead pid until the
+// next backend writes its own (see run_token in verify-xum.sh). Launch must wait for the new
+// backend, not refuse its port as unseen or the dead lock's backend as one without a token.
 test.skipIf(!isLinux)(
   "launch waits out a restart right after readiness",
   () => {
