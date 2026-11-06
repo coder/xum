@@ -302,7 +302,14 @@ describe("turn.stop", () => {
       addConsumer((ctx) => {
         ctx.continueReasons.push(stopReason("Keep looping.", { loopLimit: row.loopLimit }));
       });
-      const { h, streams } = await setup();
+      // The session files stay in memory. Each turn writes its history and session state durably
+      // (about 19 fsyncs a turn), and 51 turns then waited 5 s or more on a loaded disk. The test
+      // counts continuations: the disk does not change that count.
+      const history = await createTestHistoryService({ files: SessionFilesMemory });
+      unregisters.push(() => void history.cleanup());
+      const { h, streams } = await setup({
+        session: { config: history.config, historyService: history.historyService },
+      });
 
       await h.session.sendMessage("fix the tests", options);
       await settle(h);
