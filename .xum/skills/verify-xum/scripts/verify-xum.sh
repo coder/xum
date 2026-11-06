@@ -50,7 +50,7 @@ VERIFY_XUM_HOME=${VERIFY_XUM_HOME:-$HOME/.cache/verify-xum}
 CHECKOUT_GIT_DIR=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-dir)
 LAUNCH_GUARD="$CHECKOUT_GIT_DIR/verify-xum.lock.guard"
 CURRENT_RUN_LINK="$CHECKOUT_GIT_DIR/verify-xum.current"
-READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-300}
+READY_TIMEOUT=${VERIFY_XUM_READY_TIMEOUT:-600}
 DISCARD_BASE_URL=http://127.0.0.1:9/v1
 
 die() {
@@ -426,6 +426,21 @@ seed() {
   [[ -d $VERIFY_XUM_WORKTREE ]] || die "no worktree at $VERIFY_XUM_WORKTREE"
 }
 
+# Vite transforms a module on its first request, on one thread, and a cold first page load asks for
+# about 900 of them: about 45 CPU seconds, most of it in Babel, where React Compiler runs. That
+# outlasts `idle`'s 25 s wait, so the page stays on "Loading Xum". For that whole time Chrome also
+# holds dozens of queued module requests, and a host network change fails them (ERR_NETWORK_CHANGED,
+# then "<name> failed to load." or a page that stays on "Loading Xum"). Walking the module graph
+# here, over HTTP and before `ready`, moves that cost into the launch, so the first `open` gets
+# cached modules. The walk prints to stderr: stdout stays the run's `export` lines. env -i keeps
+# the live Xum's token out of its environment.
+warm_vite_modules() {
+  before_launch_deadline
+  env -i PATH="$PATH" HOME="$HOME" bun "$CHECKOUT/scripts/warmViteModules.ts" \
+    "$VERIFY_XUM_URL" "$(launch_seconds_left)" >&2 \
+    || die "the module walk failed (reason above), so the first page load would not be reliable"
+}
+
 # nodemon waits for a file change after the backend crashes, and none comes during a launch. A
 # crash before the first rebuild is expected (a stale dist/): the rebuild restarts it.
 backend_crashed_after_rebuild() {
@@ -621,6 +636,7 @@ cmd_launch() {
   write_state
 
   seed
+  warm_vite_modules
   write_state
   trap - EXIT
   cat "$VERIFY_XUM_RUN/state.env"
@@ -850,9 +866,14 @@ SETTLED_OR_CHUNK_FAILED_JS="(() => {
 
 cmd_idle() {
   load_run "${1:-}"
-  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null
+  # A failed module of the first-load graph leaves the boot screen up with no message, so the wait
+  # times out. Say what to try, because the bare "Wait timed out" does not.
+  agent-browser --session "$AGENT_BROWSER_SESSION" wait --fn "$SETTLED_OR_CHUNK_FAILED_JS" >/dev/null || {
+    echo "verify-xum: the page did not settle. If it shows only 'Loading Xum', a module request failed: run agent-browser reload (SKILL.md Gotchas)." >&2
+    exit 1
+  }
   if [[ $(agent-browser --session "$AGENT_BROWSER_SESSION" eval "$CHUNK_LOAD_FAILED_JS") == true ]]; then
-    echo "verify-xum: the page shows '<name> failed to load.': a module fetch from Vite failed. Run agent-browser reload, then repeat the step." >&2
+    echo "verify-xum: the page shows '<name> failed to load.': a module fetch failed (usually a host network change). Run agent-browser reload, then repeat the step." >&2
     exit 3
   fi
 }
