@@ -255,9 +255,9 @@ describe("readPluginComponentImports saved methods of rows that fail the schema"
 
   test("a row that a newer build made invalid keeps its saved method, and imports and consent stay closed", async () => {
     using tmp = new DisposableTempDir("plugin-registry-invalid-row-method");
-    const newerSource = { ...legacy, source: { type: "future-kind", url: "x" } };
+    const newerSource = { source: { type: "future-kind", url: "x" } };
     const result = await readRows(path.join(tmp.path, "plugins.json"), [
-      createRawPluginInstallRow(newerSource, saved),
+      createRawPluginInstallRow(legacy, { ...newerSource, ...saved }),
     ]);
     expect(result.methodByName.get("demo")).toBe("claude-plugin");
     expect(result.byName.get("demo")).toEqual({ skills: [], mcpServers: [] });
@@ -265,7 +265,7 @@ describe("readPluginComponentImports saved methods of rows that fail the schema"
     expect(result.methodMovedByName.has("demo")).toBe(false);
 
     const moved = await readRows(path.join(tmp.path, "plugins.json"), [
-      createRawPluginInstallRow(newerSource, { installMethod: "claude-plugin" }),
+      createRawPluginInstallRow(legacy, { ...newerSource, installMethod: "claude-plugin" }),
     ]);
     expect(moved.methodMovedByName.has("demo")).toBe(true);
   });
@@ -274,14 +274,14 @@ describe("readPluginComponentImports saved methods of rows that fail the schema"
     using tmp = new DisposableTempDir("plugin-registry-duplicate-row-method");
     const result = await readRows(path.join(tmp.path, "plugins.json"), [
       createRawPluginInstallRow(legacy, saved),
-      createRawPluginInstallRow({ ...legacy, source: { type: "future-kind" } }, saved),
+      createRawPluginInstallRow(legacy, { source: { type: "future-kind" }, ...saved }),
     ]);
     expect(result.methodByName.has("demo")).toBe(false);
     expect(result.methodMovedByName.has("demo")).toBe(false);
     expect(result.byName.get("demo")).toEqual({ skills: [], mcpServers: [] });
 
     const invalidFirst = await readRows(path.join(tmp.path, "plugins.json"), [
-      createRawPluginInstallRow({ ...legacy, source: { type: "future-kind" } }, saved),
+      createRawPluginInstallRow(legacy, { source: { type: "future-kind" }, ...saved }),
       createRawPluginInstallRow(legacy, saved),
     ]);
     expect(invalidFirst.methodByName.has("demo")).toBe(false);

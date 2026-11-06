@@ -926,11 +926,24 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
   const claudeServer = "https://claude.example.com/mcp";
   const codexServer = "https://codex.example.com/mcp";
 
+  /** What an older build does when the user reviews the manifest that it loads: it records consent. */
+  async function olderBuildReviewsFixedOrderManifest(): Promise<void> {
+    const reviewed = await reviewedComponentConsent({
+      pluginDir: installedDir(),
+      method: "agent-plugin",
+    });
+    await editRow((row) => {
+      const consent = row.componentConsent as { mcpServers: Record<string, string> };
+      Object.assign(consent.mcpServers, reviewed.mcpServers);
+    });
+  }
+
   test("an uninstall signs out the servers of both manifests: an older build loads the fixed-order one", async () => {
     const loggedOut = await installWithServerPerManifest({
       claude: claudeServer,
       codex: codexServer,
     });
+    await olderBuildReviewsFixedOrderManifest();
     await service.uninstall({ name: "egm", deletePluginData: true });
     expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
   });
@@ -940,9 +953,40 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
       claude: claudeServer,
       codex: codexServer,
     });
+    await olderBuildReviewsFixedOrderManifest();
     await fsPromises.writeFile(path.join(xumRoot, "plugin-sign-outs-pending.json"), "{ not json");
     await service.signOutPluginServers();
     expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
+  });
+
+  test("a server of a manifest that nobody reviewed stays signed in: an uninstall and the recovery skip it", async () => {
+    // The fixed-order manifest names an URL that has nothing to do with the plugin.
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await fsPromises.writeFile(path.join(xumRoot, "plugin-sign-outs-pending.json"), "{ not json");
+    await service.signOutPluginServers();
+    expect(loggedOut).toEqual([claudeServer]);
+
+    loggedOut.length = 0;
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([claudeServer]);
+  });
+
+  test("a server whose fingerprint differs from the reviewed one stays signed in", async () => {
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await olderBuildReviewsFixedOrderManifest();
+    // The definition changed since the review: the row's fingerprint no longer matches it.
+    await editRow((row) => {
+      const consent = row.componentConsent as { mcpServers: Record<string, string> };
+      consent.mcpServers.codex = "0".repeat(64);
+    });
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([claudeServer]);
   });
 
   test("a server that both manifests declare is signed out once", async () => {
@@ -950,6 +994,7 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
       claude: claudeServer,
       codex: claudeServer,
     });
+    await olderBuildReviewsFixedOrderManifest();
     await service.uninstall({ name: "egm", deletePluginData: true });
     expect(loggedOut).toEqual([claudeServer]);
   });

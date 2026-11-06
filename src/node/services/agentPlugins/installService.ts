@@ -175,6 +175,7 @@ import {
   PLUGIN_REGISTRY_FILE_NAME,
   installMethodMoved,
   installMethodShaFor,
+  readPluginComponentImports,
   readPluginRegistryDocument,
   readStoredInstallMethod,
 } from "./registry";
@@ -1982,6 +1983,28 @@ function shownStagedRoot(
   marketplace: MarketplaceEntryContext | undefined
 ): string | undefined {
   return marketplace === undefined ? source.subpath : undefined;
+}
+
+/**
+ * The URLs of the remote servers among `servers`. With `reviewed` (the row's consent records by
+ * server name), only a server whose current fingerprint the row holds counts: nobody reviewed
+ * the others, so no sign-in of them can have come from this plugin, and a manifest must not be
+ * able to name an unrelated URL and have an uninstall sign the user out of it.
+ */
+function remoteServerUrls(
+  servers: Record<string, MCPServerInfo>,
+  reviewed?: Readonly<Record<string, string>>
+): string[] {
+  return Object.values(servers).flatMap((info) => {
+    if (info.transport === "stdio") return [];
+    if (reviewed === undefined) return [info.url];
+    const name = info.plugin?.serverName;
+    const consented =
+      name !== undefined && Object.hasOwn(reviewed, name) ? reviewed[name] : undefined;
+    return consented !== undefined && consented === info.plugin?.consentFingerprint
+      ? [info.url]
+      : [];
+  });
 }
 
 /**
@@ -5730,6 +5753,12 @@ export class AgentPluginInstallService {
    * One credential once, whatever URL spelling reached it: the first URL stays. Without the
    * sign-in service no key exists, and the URL itself stands in for it.
    */
+  /** The row's reviewed fingerprints of the MCP servers by name; none when the row has none. */
+  private async reviewedServerFingerprints(name: string): Promise<Record<string, string>> {
+    const imports = await readPluginComponentImports(this.registryFile);
+    return imports?.consentByName.get(name)?.mcpServers ?? {};
+  }
+
   private uniqueByCredential(urls: readonly string[]): string[] {
     const seen = new Set<string>();
     return urls.filter((url) => {
@@ -5744,9 +5773,11 @@ export class AgentPluginInstallService {
    * The remote servers of one tree for a sign-out, through the saved method and through the fixed
    * order. An older build ignores the saved method, loads the fixed-order manifest and can store
    * sign-ins for a server that only that manifest declares (B3). Those sign-ins outlive the plugin
-   * (they are keyed by URL), so a sign-out that listed only the saved manifest would leave them. A
-   * fixed-order manifest that cannot be read lists none: only an older build loads it, and it must
-   * not keep a healthy plugin from being signed out or removed.
+   * (they are keyed by URL), so a sign-out that listed only the saved manifest would leave them.
+   * This build never reviewed that manifest, so only a server whose fingerprint the row's consent
+   * holds counts (the older build's review put it there): an unreviewed server never ran, and its
+   * URL may be an unrelated service's. A fixed-order manifest that cannot be read lists none: only
+   * an older build loads it, and it must not keep a healthy plugin from being signed out or removed.
    */
   private async pluginTreeServerUrlsAnyBuild(
     dirName: string,
@@ -5755,9 +5786,12 @@ export class AgentPluginInstallService {
   ): Promise<string[]> {
     const saved = await this.pluginTreeServerUrls(dirName, installed, choice);
     if (choice.kind === "fixed-order") return saved;
-    const fixedOrder = await this.pluginTreeServerUrls(dirName, false, {
-      kind: "fixed-order",
-    }).catch((error: unknown) => {
+    const fixedOrder = await this.pluginTreeServerUrls(
+      dirName,
+      false,
+      { kind: "fixed-order" },
+      await this.reviewedServerFingerprints(dirName)
+    ).catch((error: unknown) => {
       log.warn("Could not list the MCP servers of the fixed-order manifest of a plugin", {
         plugin: dirName,
         error: getErrorMessage(error),
@@ -5789,11 +5823,23 @@ export class AgentPluginInstallService {
       saved.kind === "fixed-order" ? [saved] : [saved, { kind: "fixed-order" }];
     const urls: string[] = [];
     // Each manifest on its own: one that cannot be read lists none, and must not hide the other's.
-    for (const choice of choices) urls.push(...(await this.serverUrlsOfManifest(name, choice)));
+    // The fixed-order one, which only an older build loads, counts only for the servers that the
+    // row's consent holds (pluginTreeServerUrlsAnyBuild).
+    for (const choice of choices) {
+      const reviewed =
+        saved.kind !== "fixed-order" && choice.kind === "fixed-order"
+          ? await this.reviewedServerFingerprints(name)
+          : undefined;
+      urls.push(...(await this.serverUrlsOfManifest(name, choice, reviewed)));
+    }
     return this.uniqueByCredential(urls);
   }
 
-  private async serverUrlsOfManifest(name: string, choice: ManifestChoice): Promise<string[]> {
+  private async serverUrlsOfManifest(
+    name: string,
+    choice: ManifestChoice,
+    reviewed?: Readonly<Record<string, string>>
+  ): Promise<string[]> {
     try {
       const { plugin } = await discoverAgentPluginAt({
         pluginDir: this.targetPathFor(name),
@@ -5806,9 +5852,7 @@ export class AgentPluginInstallService {
         xumHome: this.config.rootDir,
         instanceId: this.instanceIdFor(name),
       });
-      return Object.values(servers).flatMap((info) =>
-        info.transport === "stdio" ? [] : [info.url]
-      );
+      return remoteServerUrls(servers, reviewed);
     } catch (error) {
       log.warn("Could not list the MCP servers of a plugin that is being uninstalled", {
         plugin: name,
@@ -5822,7 +5866,8 @@ export class AgentPluginInstallService {
   private async pluginTreeServerUrls(
     dirName: string,
     installed: boolean,
-    choice: ManifestChoice
+    choice: ManifestChoice,
+    reviewed?: Readonly<Record<string, string>>
   ): Promise<string[]> {
     // Plugin trees are directories (or links to one), dot-prefixed names included, as discovery
     // scans them. Skip stray files such as .DS_Store and dangling links: neither loads. Any other
@@ -5853,9 +5898,7 @@ export class AgentPluginInstallService {
     const error = loaded.diagnostics.find((d) => d.severity === "error");
     if (error !== undefined)
       throw new Error(`Xum cannot read the MCP servers of plugin '${dirName}': ${error.message}`);
-    return Object.values(loaded.servers).flatMap((info) =>
-      info.transport === "stdio" ? [] : [info.url]
-    );
+    return remoteServerUrls(loaded.servers, reviewed);
   }
 
   /** Logouts a pass started that have not settled yet (see signOutFailure). */
