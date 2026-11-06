@@ -3115,6 +3115,9 @@ describe("named manifest choice (install methods)", () => {
       "claude-only": ["claude-plugin", stale, [".claude-plugin/plugin.json"]],
       // An agent-plugin resolves like the fixed order.
       "moved-codex": ["agent-plugin", stale, undefined],
+      // The fixed order stops at the broken Codex manifest and loads nothing, so no manifest that
+      // the older build could have reviewed is left: the saved one is not it.
+      "broken-codex": ["claude-plugin", stale, undefined],
     };
     const rows: unknown[] = [];
     for (const [name, [method, sha, only]] of Object.entries(layouts)) {
@@ -3124,6 +3127,12 @@ describe("named manifest choice (install methods)", () => {
         const manifest = await fs.readFile(file, "utf8").catch(() => undefined);
         if (manifest === undefined) continue;
         await fs.writeFile(file, JSON.stringify({ ...JSON.parse(manifest), name }));
+      }
+      if (name === "broken-codex") {
+        await fs.writeFile(
+          path.join(container, name, ".codex-plugin", "plugin.json"),
+          "{ not json"
+        );
       }
       const entry = createTestPluginInstallEntry(name, { skills: [], mcpServers: [] });
       rows.push(
@@ -3151,6 +3160,7 @@ describe("named manifest choice (install methods)", () => {
       .map((diagnostic) => [path.basename(diagnostic.path), diagnostic.severity])
       .sort();
     expect(closed).toEqual([
+      ["broken-codex", "error"],
       ["malformed", "error"],
       ["moved-claude", "error"],
       ["moved-cursor", "error"],
