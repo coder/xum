@@ -1055,9 +1055,10 @@ is_dev_server_sandbox_root() {
 # CLI speaks only TCP and reads server.lock itself, so this first checks that the backend that
 # server.lock names carries this run's id and is what listens on its port. The port can be free
 # otherwise (see backend_curl), and the CLI would send the token to whoever bound it. The CLI's own
-# read of server.lock ignores a lock whose pid has died or whose baseUrl does not answer as a xum
-# backend (ServerLockfile.read), so a restart after this check is caught there. What is left is
-# the moment between that read and the CLI's connect.
+# read of server.lock ignores a lock whose backend is gone (ServerLockfile.read: on Linux the pid
+# no longer has the start time the lock records; elsewhere the pid is dead or nothing at baseUrl
+# answers as a xum backend), so a restart after this check is caught there. What is left is the
+# moment between that read and the CLI's connect.
 cmd_cli() {
   load_run ""
   local lock pid port listeners
