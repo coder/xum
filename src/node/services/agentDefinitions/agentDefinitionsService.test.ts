@@ -13,6 +13,7 @@ import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import { multiProjectOf } from "@/node/runtime/testMultiProjectRuntime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { agentConsentFingerprint } from "@/node/services/agentPlugins/componentConsent";
@@ -2022,6 +2023,110 @@ base: a
           ).toContain(ROOT);
         });
       }
+
+      test("an all-local multi-project workspace reads a host plugin folder like a local workspace", async () => {
+        using project = new DisposableTempDir("agent-defs-multi-local-project");
+        using other = new DisposableTempDir("agent-defs-multi-local-other");
+        using global = new DisposableTempDir("agent-defs-multi-local-global");
+        const container = path.join(project.path, ".xum", "plugins");
+        const pluginDir = await writePlugin(container, "egm", {
+          "persona.md": foreignAgent(PERSONA_BODY),
+        });
+        const runtime = multiProjectOf(
+          new LocalRuntime(project.path),
+          new LocalRuntime(other.path)
+        );
+        const options = { roots: localRoots(project.path, global.path, container), runtimeFactory };
+
+        const listed = await discoverAgentDefinitions(runtime, project.path, options);
+        expect(listed.find((agent) => agent.id === "persona")?.unavailableReason).toBeUndefined();
+        const pkg = await readAgentDefinition(runtime, project.path, "persona", {
+          ...options,
+          refuseUnreachablePluginFolder: true,
+        });
+        expect(pkg.body).toContain(`Read ${await fs.realpath(pluginDir)}/agents/persona.md first.`);
+        expect(pkg.body).not.toContain(ROOT);
+      });
+
+      test("a multi-project workspace with an SSH project, first or not, still cannot read a host plugin folder", async () => {
+        using project = new DisposableTempDir("agent-defs-multi-ssh-project");
+        using global = new DisposableTempDir("agent-defs-multi-ssh-global");
+        const container = path.join(project.path, ".xum", "plugins");
+        await writePlugin(container, "egm", { "persona.md": foreignAgent(PERSONA_BODY) });
+        const local = new LocalRuntime(project.path);
+        const ssh = remoteDouble(project.path, "ssh");
+        const options = { roots: localRoots(project.path, global.path, container), runtimeFactory };
+
+        for (const runtime of [multiProjectOf(local, ssh), multiProjectOf(ssh, local)]) {
+          const listed = await discoverAgentDefinitions(runtime, project.path, options);
+          const persona = listed.find((agent) => agent.id === "persona");
+          expect(persona?.unavailableReason).toContain("folder-unreachable");
+          expect(persona?.unavailableReason).toContain("(runtime: multi-project ssh)");
+          const refusal = await refusalOf(
+            readAgentDefinition(runtime, project.path, "persona", {
+              ...options,
+              refuseUnreachablePluginFolder: true,
+            })
+          );
+          expect(refusal.reason).toBe("folder-unreachable");
+          expect(refusal.detail).toBe("multi-project ssh");
+        }
+      });
+
+      test("an egm-shaped agent runs on Explore with the bash tools and its plugin folder locally, and is hidden on SSH", async () => {
+        using hostHome = new DisposableTempDir("agent-defs-egm-home");
+        using checkout = new DisposableTempDir("agent-defs-egm-checkout");
+        const pluginDir = await writePlugin(path.join(hostHome.path, "plugins"), "egm", {
+          "reviewer.md": foreignAgent(
+            `Read ${ROOT}/agents/persona.md first.`,
+            "tools: [Read, Grep, Glob]\nmodel: inherit\ncolor: yellow\n"
+          ),
+        });
+        const roots = {
+          projectRoots: [],
+          globalRoot: path.join(hostHome.path, "agents"),
+          globalPluginRoots: [path.join(hostHome.path, "plugins")],
+        };
+        const options = { roots, runtimeFactory };
+        const sampleTools = [
+          "agent_report",
+          "file_read",
+          "attach_file",
+          "bash",
+          "bash_output",
+          "file_edit_replace_string",
+          "task",
+          "web_fetch",
+        ];
+        const exploreTools = ["agent_report", "file_read", "attach_file", "bash", "bash_output"];
+
+        const local = new LocalRuntime(checkout.path);
+        const listed = await discoverAgentDefinitions(local, checkout.path, options);
+        const reviewer = listed.find((agent) => agent.id === "reviewer");
+        expect(reviewer?.base).toBe("explore");
+        expect(reviewer?.unavailableReason).toBeUndefined();
+        expect(
+          await effectiveToolsOf(local, checkout.path, roots, "reviewer", sampleTools)
+        ).toEqual(exploreTools);
+        const pkg = await readAgentDefinition(local, checkout.path, "reviewer", {
+          ...options,
+          refuseUnreachablePluginFolder: true,
+        });
+        expect(pkg.body).toContain(`Read ${await fs.realpath(pluginDir)}/agents/persona.md first.`);
+
+        const ssh = remoteDouble(checkout.path, "ssh");
+        const hidden = await discoverAgentDefinitions(ssh, checkout.path, options);
+        expect(hidden.find((agent) => agent.id === "reviewer")?.unavailableReason).toContain(
+          "folder-unreachable"
+        );
+        const refusal = await refusalOf(
+          readAgentDefinition(ssh, checkout.path, "reviewer", {
+            ...options,
+            refuseUnreachablePluginFolder: true,
+          })
+        );
+        expect(refusal.reason).toBe("folder-unreachable");
+      });
 
       test("an unreachable plugin agent keeps its ID: the list hides the built-in agent and a spawn does not start it", async () => {
         using hostHome = new DisposableTempDir("agent-defs-unreachable-shadow-home");

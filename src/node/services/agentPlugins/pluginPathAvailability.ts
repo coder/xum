@@ -2,12 +2,14 @@ import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 
 /**
  * True when commands run directly on the Xum host. Positive check on purpose:
- * SSH/Docker (RemoteRuntime), devcontainers (exec inside the container) and
- * multi-project wrappers (which can wrap SSH runtimes) all fail it, so a host
- * path is never reported for a runtime Xum cannot prove shares the host
- * filesystem.
+ * SSH/Docker (RemoteRuntime) and devcontainers (exec inside the container) fail it, so a host
+ * path is never reported for a runtime Xum cannot prove shares the host filesystem. A
+ * multi-project wrapper passes only when every project's runtime does, because its projects can
+ * be SSH or Docker workspaces.
  */
 function execsOnHost(runtime: Runtime): boolean {
+  const wrapped = runtime.wrappedRuntimes;
+  if (wrapped !== undefined) return wrapped.length > 0 && wrapped.every(execsOnHost);
   // "local" is a LocalBaseRuntime that is not a DevcontainerRuntime (see Runtime.location).
   return runtime.location === "local";
 }
@@ -47,7 +49,16 @@ export function toAgentBodyPath(pluginPath: string, sourceRuntime: Runtime): str
  * How a message names the workspace's runtime: its type (`ssh`, `docker`, `devcontainer`) when the
  * runtime gives one, else its location family.
  */
-export function describeWorkspaceRuntime(runtime: Pick<Runtime, "mode" | "location">): string {
+export function describeWorkspaceRuntime(
+  runtime: Pick<Runtime, "mode" | "location" | "wrappedRuntimes">
+): string {
+  const wrapped = runtime.wrappedRuntimes;
+  if (wrapped !== undefined) {
+    const offHost = wrapped.find((projectRuntime) => !execsOnHost(projectRuntime));
+    return offHost === undefined
+      ? "multi-project"
+      : `multi-project ${describeWorkspaceRuntime(offHost)}`;
+  }
   // mutation-equivalent: a runtime's mode and location are never "", so ?? and || agree
   return runtime.mode ?? runtime.location ?? "unknown";
 }

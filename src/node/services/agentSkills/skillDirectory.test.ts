@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { multiProjectOf } from "@/node/runtime/testMultiProjectRuntime";
 import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
@@ -46,6 +47,22 @@ describe("resolveSkillDirectory for off-host workspaces", () => {
   it("reports a path read through the remote runtime itself (SSH/Docker project skills)", () => {
     const skill = resolvedSkill(remoteRuntime, "/workspace/.xum/skills/demo");
     expect(bodyFor(skill, remoteRuntime)).toBe("sh /workspace/.xum/skills/demo/scripts/x.sh");
+  });
+
+  it("reports a host path in a multi-project workspace whose projects all run on the host", () => {
+    const skill = resolvedSkill(hostRuntime, "/host/plugins/p/skills/demo");
+    const workspace = multiProjectOf(hostRuntime, new LocalRuntime("/host/other"));
+    expect(bodyFor(skill, workspace)).toBe("sh /host/plugins/p/skills/demo/scripts/x.sh");
+  });
+
+  it("withholds a host path from a multi-project workspace with a project that runs elsewhere", () => {
+    const skill = resolvedSkill(hostRuntime, "/host/plugins/p/skills/demo");
+    for (const workspace of [
+      multiProjectOf(hostRuntime, remoteRuntime),
+      multiProjectOf(remoteRuntime, hostRuntime),
+    ]) {
+      expect(resolveSkillDirectory(skill, workspace).available).toBe(false);
+    }
   });
 
   it("withholds a project skill that was read from another checkout, and keeps a global one", () => {

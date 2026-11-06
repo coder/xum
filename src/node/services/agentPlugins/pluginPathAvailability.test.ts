@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { multiProjectOf } from "@/node/runtime/testMultiProjectRuntime";
 import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 
 import {
   describeWorkspaceRuntime,
@@ -17,6 +20,12 @@ const devcontainer = new DevcontainerRuntime({
   srcBaseDir: "/host/src",
   configPath: ".devcontainer/devcontainer.json",
 });
+
+const worktree = new WorktreeRuntime("/host/src", {
+  projectPath: "/host/project",
+  workspaceName: "ws",
+});
+const ssh = Object.create(remote, { mode: { value: "ssh" } }) as Runtime;
 
 describe("isPluginPathUsableFrom", () => {
   test("a host plugin is usable on any runtime that runs on the host", () => {
@@ -43,6 +52,33 @@ describe("isPluginPathUsableFrom", () => {
     Object.defineProperty(unknown, "location", { value: undefined });
     expect(isPluginPathUsableFrom(host, unknown)).toBe(false);
     expect(isPluginPathUsableFrom(unknown, unknown)).toBe(false);
+  });
+});
+
+describe("isPluginPathUsableFrom in a multi-project workspace", () => {
+  test("a host plugin is usable when every project runs on the host", () => {
+    expect(isPluginPathUsableFrom(host, multiProjectOf(host))).toBe(true);
+    expect(isPluginPathUsableFrom(host, multiProjectOf(host, worktree, otherHost))).toBe(true);
+  });
+
+  test("a host plugin is not usable when any project runs elsewhere, whichever project is first", () => {
+    for (const elsewhere of [remote, ssh, devcontainer]) {
+      expect(isPluginPathUsableFrom(host, multiProjectOf(elsewhere))).toBe(false);
+      expect(isPluginPathUsableFrom(host, multiProjectOf(host, elsewhere))).toBe(false);
+      expect(isPluginPathUsableFrom(host, multiProjectOf(elsewhere, host))).toBe(false);
+    }
+  });
+
+  test("a wrapper inside a wrapper is on the host only when every leaf runtime is", () => {
+    const allOnHost = multiProjectOf(multiProjectOf(host, worktree), host);
+    const innerSsh = multiProjectOf(multiProjectOf(host, ssh), host);
+    expect(isPluginPathUsableFrom(host, allOnHost)).toBe(true);
+    expect(isPluginPathUsableFrom(host, innerSsh)).toBe(false);
+  });
+
+  test("a wrapper that wraps nothing is not proven to run on the host", () => {
+    const empty = Object.create(host, { wrappedRuntimes: { value: [] } }) as Runtime;
+    expect(isPluginPathUsableFrom(host, empty)).toBe(false);
   });
 });
 
@@ -81,5 +117,18 @@ describe("describeWorkspaceRuntime", () => {
     expect(describeWorkspaceRuntime(devcontainer)).toBe("devcontainer");
     expect(describeWorkspaceRuntime(remote)).toBe("remote");
     expect(describeWorkspaceRuntime({})).toBe("unknown");
+  });
+
+  test("names a multi-project workspace by the first project runtime that is not on the host", () => {
+    expect(describeWorkspaceRuntime(multiProjectOf(host, ssh))).toBe("multi-project ssh");
+    expect(describeWorkspaceRuntime(multiProjectOf(ssh, host))).toBe("multi-project ssh");
+    expect(describeWorkspaceRuntime(multiProjectOf(host, devcontainer, ssh))).toBe(
+      "multi-project devcontainer"
+    );
+    expect(describeWorkspaceRuntime(multiProjectOf(remote))).toBe("multi-project remote");
+    expect(describeWorkspaceRuntime(multiProjectOf(host, worktree))).toBe("multi-project");
+    expect(describeWorkspaceRuntime(multiProjectOf(multiProjectOf(host, ssh), host))).toBe(
+      "multi-project multi-project ssh"
+    );
   });
 });
