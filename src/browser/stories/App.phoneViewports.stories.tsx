@@ -75,6 +75,29 @@ function IPhone17ProMaxDecorator(Story: ComponentType) {
   );
 }
 
+// The folded iPhone Duo's cover display, measured at 2.95 px per pt: the display iOS draws its
+// status and camera column on.
+const DUO_COVER = {
+  width: 466,
+  height: 678,
+} as const;
+
+function DuoCoverDecorator(Story: ComponentType) {
+  return (
+    <div
+      style={{
+        // Clamped like the 17 Pro Max frame above, so nothing clips at a narrower capture.
+        width: `min(100vw, ${DUO_COVER.width}px)`,
+        // Only the harness reaches 678: Storybook's own narrow viewports are shorter.
+        height: `min(100vh, ${DUO_COVER.height}px)`,
+        overflow: "hidden",
+      }}
+    >
+      <Story />
+    </div>
+  );
+}
+
 const MESSAGES = [
   createUserMessage(
     "msg-1",
@@ -163,6 +186,39 @@ export const IPhone16e: AppStory = {
     pixel: {
       matrix: { themes: ["dark", "light"], viewports: ["phone"] },
     },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+  },
+};
+
+/**
+ * The folded iPhone Duo's cover display: 466x678 pt, where iOS keeps an 84 pt status and camera
+ * column on the right edge. iOS 27.1 reports it as `env(safe-area-inset-right)`; on iOS 27.2
+ * iosCoverColumn.ts measures it and sets `--ios-cover-column`. Pixel can report neither, so a
+ * snapshot of this frame would show nothing of the layout it stands for: the reserve is asserted for
+ * both in .storybook/test-runner.ts (DUO_BAND_STORY).
+ */
+export const DuoCoverDisplay: AppStory = {
+  // The assertion sizes the frame to 466x678 itself; this only pins a narrow portrait viewport so a
+  // local reviewer sees the phone layout rather than the desktop layout inside a small box.
+  globals: { viewport: { value: "mobile2", isRotated: false } },
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-duo-cover",
+          workspaceName: "duo-cover",
+          projectName: "mux",
+          messages: [...MESSAGES],
+        })
+      }
+    />
+  ),
+  decorators: [DuoCoverDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
