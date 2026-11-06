@@ -5590,6 +5590,15 @@ export class AgentPluginInstallService {
   }
 
   /**
+   * Throws the pending record's own error when an uninstall that will record sign-outs cannot
+   * read it. It runs before anything stops or moves: a failure at the commit would roll the tree
+   * back but not the global MCP enablement.
+   */
+  private async assertPendingSignOutsReadable(urls: readonly string[]): Promise<void> {
+    if (urls.length > 0) await this.readPendingSignOuts();
+  }
+
+  /**
    * A server that fails to load is not listed. A tree Xum cannot read lists none: it must stay
    * removable.
    */
@@ -5838,6 +5847,7 @@ export class AgentPluginInstallService {
       const serverKeyPrefix = buildPluginServerKey(instanceId, "");
       // Read before the tree moves: its servers' stored sign-ins are keyed by URL and outlive it.
       const signOutUrls = await this.installedServerUrls(entry.name);
+      await this.assertPendingSignOutsReadable(signOutUrls);
 
       // Enumerate pruning targets BEFORE committing anything: if this fails,
       // the uninstall aborts with the install fully intact (retryable from

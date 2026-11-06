@@ -4805,7 +4805,11 @@ describe("AgentPluginInstallService", () => {
         /^The pending plugin sign-out record .*Sign out of plugin MCP servers/
       );
       expect(stops).toBe(0);
-      expect((await mcpConfigService.listServers())[key]?.disabled).toBe(false);
+      // The record fences plugin discovery, so read the global enablement from its file.
+      const globalConfig = jsonc.parse(
+        await fsPromises.readFile(path.join(muxRoot, "mcp.jsonc"), "utf8")
+      ) as { enabledPluginServers?: string[] };
+      expect(globalConfig.enabledPluginServers).toEqual([key]);
       expect(await registry()).toHaveLength(1);
       expect(await oauth.hasAuthTokens({ serverUrl: docsUrl })).toBe(true);
       await oauth.dispose();
