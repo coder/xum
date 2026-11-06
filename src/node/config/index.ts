@@ -1665,13 +1665,15 @@ type ConfigTreeField = {
 }[keyof Workspace & keyof WorkspaceMetadata];
 
 /**
- * Task-tree fields: the parent link, the agent, the task state and how the task holds its
- * checkout. For a legacy row, buildWorkspaceMetadata takes them from the config row alone and
- * ignores any value in the row's legacy metadata.json. No Xum build wrote them into that file:
- * sub-agents (#1219) came after config.json became the store. Read from the file, a value would
- * hold only until the read-time migration (a migrated row reads the row alone), so a sub-agent's
- * MCP inheritance would flip after one read, and a stray file could attach any legacy row to a
- * parent. TaskService already reads these fields from config rows only.
+ * Fields a legacy row takes from its config row alone, as a current-format row does: the task tree
+ * (the parent link, the agent, the task state, how the task holds its checkout), the archive and
+ * pin marks, the sub-project and the tags. The row's legacy metadata.json supplies identity only.
+ * The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
+ * createdAt, #303 stopped every write in v0.3.0, and parentWorkspaceId came later (#1219), in
+ * config.json only. Read from the file, a value would hold only until the read-time migration (a
+ * migrated row reads the row alone): a stray file could attach a legacy row to a parent, or detach
+ * one, for a single read. Nothing is copied from the file either. TaskService already reads these
+ * fields from config rows only.
  */
 const CONFIG_TREE_FIELDS = [
   "parentWorkspaceId",
@@ -1692,6 +1694,11 @@ const CONFIG_TREE_FIELDS = [
   "taskSticky",
   "taskExecutionId",
   "taskExecutionStatus",
+  "archivedAt",
+  "unarchivedAt",
+  "pinnedAt",
+  "subProjectPath",
+  "tags",
 ] as const satisfies readonly ConfigTreeField[];
 
 /** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
@@ -5085,21 +5092,13 @@ export class Config {
             metadata.aiSettings ??= workspace.aiSettings;
             metadata.heartbeat ??= workspace.heartbeat;
 
-            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS).
+            // Tree/task metadata comes from config alone (see CONFIG_TREE_FIELDS), the grouping
+            // and the interrupted-creation mark too.
             takeTreeFieldsFromConfig(metadata, workspace);
-            metadata.bestOf = isLegacyTaskVariantGroup(metadata.bestOf)
-              ? undefined
-              : (normalizeWorkspaceBestOf(metadata.bestOf) ??
-                normalizeWorkspaceBestOf(workspace.bestOf));
-            metadata.delegatedCreationInterrupted ??=
+            metadata.bestOf = normalizeWorkspaceBestOf(workspace.bestOf);
+            metadata.delegatedCreationInterrupted =
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
-            // Preserve archived timestamps from config
-            metadata.archivedAt ??= workspace.archivedAt;
-            metadata.unarchivedAt ??= workspace.unarchivedAt;
-            // Preserve sub-project assignment from config.
-            metadata.subProjectPath ??= workspace.subProjectPath;
             metadata.forkFamilyBaseName ??= workspace.forkFamilyBaseName;
-            metadata.tags ??= workspace.tags;
 
             // Persisted config identity fields win over metadata.json values. The queued
             // migration below uses ??= (it must never clobber concurrent edits), so any
