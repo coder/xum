@@ -1,5 +1,6 @@
 import * as path from "path";
 import { EventEmitter } from "events";
+import type { Stats } from "fs";
 import * as fs from "fs/promises";
 import { StringDecoder } from "string_decoder";
 import assert from "@/common/utils/assert";
@@ -37,7 +38,15 @@ import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInp
  * header, an update needs its step), so any cut point loses or corrupts the
  * newest run in some layout. Steps whose run was already evicted are dropped.
  * The DevTools panel therefore shows a bounded recent window rather than the
- * full history; the on-disk file is left untouched (compaction is a follow-up).
+ * full history.
+ *
+ * The file is cut down to the same window: once more than twice the byte budget
+ * of it is lines that replay no longer keeps (evicted runs, superseded
+ * updates), it is rewritten as one line per retained run and step (updates
+ * merged in, log order kept). Disk use and the next replay therefore stay
+ * within the retained bytes plus twice the budget instead of growing with
+ * every run ever logged.
+ * Lines of evicted runs, including ones still streaming, do not survive it.
  *
  * The run bound alone does not cap memory: a single streamed step carries the
  * raw provider payload (a live heap held two 15-16 MB arrays of raw OpenAI SSE
@@ -53,6 +62,8 @@ const MAX_RETAINED_BYTES_PER_WORKSPACE = 64 * 1024 * 1024;
 /** FIFO cap on remembered evicted run ids; see WorkspaceData.evictedRunIds. */
 const MAX_TRACKED_EVICTED_RUNS = 4 * MAX_RETAINED_RUNS_PER_WORKSPACE;
 const LOAD_CHUNK_BYTES = 1024 * 1024;
+/** Suffix of the temporary files that compaction writes beside devtools.jsonl. */
+const COMPACTING_SUFFIX = ".compacting";
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
@@ -93,6 +104,13 @@ interface WorkspaceData {
   replayComplete: boolean;
   /** Incremented on each clear(); appendToFile drops writes queued under an older generation. */
   clearGeneration: number;
+  /**
+   * Length of devtools.jsonl in the units of the retention bytes: the lines
+   * replayed plus every line appended since.
+   */
+  fileBytes: number;
+  /** After a failed compaction, the file length at which the next attempt may run. */
+  compactionRetryAtBytes: number;
 }
 
 export interface DevToolsServiceOptions {
@@ -137,6 +155,58 @@ async function* readLines(filePath: string): AsyncGenerator<string> {
   }
 }
 
+/** Write one log line; returns its length in the units of the retention bytes. */
+async function writeLogLine(handle: fs.FileHandle, entry: DevToolsLogEntry): Promise<number> {
+  const line = `${JSON.stringify(entry)}\n`;
+  const buffer = Buffer.from(line, "utf-8");
+  // A nearly full disk can accept part of a write without an error.
+  for (let offset = 0; offset < buffer.length; ) {
+    const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset);
+    if (bytesWritten <= 0) {
+      throw new Error(`Wrote ${offset} of ${buffer.length} bytes of a devtools.jsonl line`);
+    }
+    offset += bytesWritten;
+  }
+  return line.length;
+}
+
+/** Whether two stats of a path show the same file, unchanged in between. */
+function isSameFileVersion(before: Stats, after: Stats): boolean {
+  return (
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.size === after.size &&
+    before.mtimeMs === after.mtimeMs
+  );
+}
+
+/**
+ * Write the retained runs and steps, each step after its run, keeping both in
+ * the order replay inserted them: the replay audit reads steps in log order
+ * across overlapping runs. Returns the bytes written.
+ */
+async function writeRetainedEntries(handle: fs.FileHandle, data: WorkspaceData): Promise<number> {
+  const runs = data.runs.values();
+  const writtenRunIds = new Set<string>();
+  let bytes = 0;
+  const writeRunsThrough = async (runId: string | null): Promise<void> => {
+    while (runId === null || !writtenRunIds.has(runId)) {
+      const next = runs.next();
+      if (next.done) {
+        return;
+      }
+      bytes += await writeLogLine(handle, { type: "run", run: next.value });
+      writtenRunIds.add(next.value.id);
+    }
+  };
+  for (const step of data.steps.values()) {
+    await writeRunsThrough(step.runId);
+    bytes += await writeLogLine(handle, { type: "step", step });
+  }
+  await writeRunsThrough(null);
+  return bytes;
+}
+
 function jsonLength(value: unknown): number {
   const json = JSON.stringify(value);
   return json === undefined ? 0 : json.length;
@@ -179,6 +249,23 @@ function removeRun(data: WorkspaceData, runId: string): DevToolsStep[] {
   data.retainedBytes -= data.runBytes.get(runId) ?? 0;
   data.runBytes.delete(runId);
   return removedSteps;
+}
+
+function createWorkspaceData(): WorkspaceData {
+  return {
+    runs: new Map<string, DevToolsRun>(),
+    steps: new Map<string, DevToolsStep>(),
+    runBytes: new Map<string, number>(),
+    stepBytes: new Map<string, number>(),
+    retainedBytes: 0,
+    loaded: false,
+    evictedStepIds: new Set<string>(),
+    evictedRunIds: new Set<string>(),
+    replayComplete: false,
+    clearGeneration: 0,
+    fileBytes: 0,
+    compactionRetryAtBytes: 0,
+  };
 }
 
 function evictRun(data: WorkspaceData, runId: string): void {
@@ -624,6 +711,8 @@ export class DevToolsService extends EventEmitter {
     data.clearGeneration += 1;
     data.loaded = true;
     data.replayComplete = true;
+    data.fileBytes = 0;
+    data.compactionRetryAtBytes = 0;
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
@@ -769,18 +858,7 @@ export class DevToolsService extends EventEmitter {
       return data;
     }
 
-    data = {
-      runs: new Map<string, DevToolsRun>(),
-      steps: new Map<string, DevToolsStep>(),
-      runBytes: new Map<string, number>(),
-      stepBytes: new Map<string, number>(),
-      retainedBytes: 0,
-      loaded: false,
-      evictedStepIds: new Set<string>(),
-      evictedRunIds: new Set<string>(),
-      replayComplete: false,
-      clearGeneration: 0,
-    };
+    data = createWorkspaceData();
     this.workspaces.set(workspaceId, data);
     return data;
   }
@@ -878,6 +956,7 @@ export class DevToolsService extends EventEmitter {
 
     try {
       for await (const line of readLines(filePath)) {
+        data.fileBytes += line.length + 1;
         this.replayLogLine(workspaceId, data, line);
       }
       data.replayComplete = true;
@@ -900,6 +979,9 @@ export class DevToolsService extends EventEmitter {
     data.evictedStepIds.clear();
     data.evictedRunIds.clear();
     data.loaded = true;
+    if (this.shouldCompact(data)) {
+      await this.enqueueWrite(workspaceId, () => this.compactSessionFile(workspaceId, data));
+    }
     await this.finalizeStaleStepsForLoadedWorkspace(workspaceId, data);
   }
 
@@ -1064,7 +1146,104 @@ export class DevToolsService extends EventEmitter {
       await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
         fs.appendFile(filePath, `${json}\n`, "utf-8")
       );
+      data.fileBytes += json.length + 1;
+      if (this.shouldCompact(data)) {
+        await this.compactSessionFile(workspaceId, data);
+      }
     });
+  }
+
+  /** Whether more than twice the byte budget of devtools.jsonl is lines that replay no longer keeps. */
+  private shouldCompact(data: WorkspaceData): boolean {
+    return (
+      data.fileBytes - data.retainedBytes > 2 * this.maxRetainedBytesPerWorkspace &&
+      data.fileBytes > data.compactionRetryAtBytes
+    );
+  }
+
+  /**
+   * Rewrite devtools.jsonl as what replaying it keeps. It replays the file
+   * instead of using this process's memory, which lacks rows other backends
+   * appended and already holds entries whose appends are queued behind this
+   * one; those then land once, after the rewrite. The replay and the rewrite
+   * run outside the session lock, which guards the workspace's other session
+   * files too and which other processes give up on after
+   * TARGET_MUTATION_LOCK_TIMEOUT_MS. Under the lock, the rewrite replaces the
+   * file only if the file is unchanged since the replay started; otherwise
+   * the next attempt waits for more growth. Never rejects: the caller's own
+   * line is already written, and a rejection would roll it back.
+   */
+  private async compactSessionFile(workspaceId: string, data: WorkspaceData): Promise<void> {
+    if (this.workspaces.get(workspaceId) !== data) {
+      return;
+    }
+    const filePath = this.getSessionFilePath(workspaceId);
+    // One per process: another backend can be rewriting the same file.
+    const tempPath = `${filePath}${COMPACTING_SUFFIX}-${process.pid}`;
+    let replaced = false;
+    try {
+      const replayedVersion = await fs.stat(filePath);
+      const replayed = createWorkspaceData();
+      for await (const line of readLines(filePath)) {
+        this.replayLogLine(workspaceId, replayed, line);
+      }
+      const handle = await fs.open(tempPath, "w");
+      let bytes: number;
+      try {
+        bytes = await writeRetainedEntries(handle, replayed);
+      } finally {
+        await handle.close();
+      }
+      await this.commitToSessionFileUnlessRemoved(workspaceId, async () => {
+        if (!isSameFileVersion(replayedVersion, await fs.stat(filePath))) {
+          throw new Error("devtools.jsonl changed while it was being compacted");
+        }
+        await fs.rename(tempPath, filePath);
+        replaced = true;
+        await this.removeAbandonedRewrites(workspaceId, filePath);
+      });
+      if (replaced) {
+        data.fileBytes = bytes;
+        data.compactionRetryAtBytes = 0;
+      }
+    } catch (error) {
+      // Keep appending to the full file; retrying on every append would rewrite
+      // the whole window each time while the disk is full.
+      data.compactionRetryAtBytes = data.fileBytes + 2 * this.maxRetainedBytesPerWorkspace;
+      log.warn("DevTools: failed to compact devtools.jsonl, keeping the full file", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    if (!replaced) {
+      await fs.rm(tempPath, { force: true }).catch((rmError: unknown) => {
+        log.warn("DevTools: failed to remove the partial devtools.jsonl rewrite", {
+          workspaceId,
+          error: getErrorMessage(rmError),
+        });
+      });
+    }
+  }
+
+  /**
+   * Remove the rewrites that a crashed backend left, or that another backend
+   * is still writing, which can no longer replace the file just rewritten.
+   */
+  private async removeAbandonedRewrites(workspaceId: string, filePath: string): Promise<void> {
+    const directory = path.dirname(filePath);
+    const prefix = `${path.basename(filePath)}${COMPACTING_SUFFIX}`;
+    try {
+      for (const name of await fs.readdir(directory)) {
+        if (name.startsWith(prefix)) {
+          await fs.rm(path.join(directory, name), { force: true });
+        }
+      }
+    } catch (error) {
+      log.warn("DevTools: failed to remove an abandoned devtools.jsonl rewrite", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /**
