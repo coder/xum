@@ -120,9 +120,9 @@ async function seedHistory(env: TestEnvironment, workspaceId: string) {
 }
 
 /** Header row (expand · badge · name · status) and card for a rendered tool call. */
-function toolCard(root: HTMLElement, toolName: string, index = 0) {
-  const name = within(root).getAllByText(toolName, { exact: true })[index];
-  if (!name?.parentElement?.parentElement) throw new Error(`Tool row ${toolName} not found`);
+function toolCard(root: HTMLElement, rowLabel: string, index = 0) {
+  const name = within(root).getAllByText(rowLabel, { exact: true })[index];
+  if (!name?.parentElement?.parentElement) throw new Error(`Tool row ${rowLabel} not found`);
   return { header: name.parentElement, card: name.parentElement.parentElement, name };
 }
 
@@ -194,8 +194,14 @@ describeIntegration("MCP tool call identity in chat", () => {
         if (nestedBadge.querySelector("img")?.getAttribute("src") !== PNG_A)
           throw new Error("Nested icon not resolved");
       });
+      // The built-in row is located by its script, not by the tool name: bash args
+      // without timeout_secs validate now, so this row renders the real bash card
+      // (labelled with the command) instead of the generic fallback that printed
+      // the raw tool name.
       expect(
-        within(toolCard(root, "bash").header).queryByRole("button", { name: /Server information/ })
+        within(toolCard(root, "ls").header).queryByRole("button", {
+          name: /Server information/,
+        })
       ).toBeNull();
       // Every distinct ref on screen travels in ONE bulk lookup; rows sharing a
       // ref (top-level + nested A) coalesce, and the singular lookup is unused.
