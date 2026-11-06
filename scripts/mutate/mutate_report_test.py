@@ -196,6 +196,25 @@ def test_a_slow_baseline_that_keeps_printing_is_not_dropped_but_a_silent_one_is(
     assert "printed nothing" in reasons["hung.test.ts"]
 
 
+def test_a_baseline_that_prints_a_lot_keeps_none_of_it(tmp_path, monkeypatch):
+    # The runner needs only to see that output arrives. A baseline that loops printing would fill
+    # the disk if its output were kept in a file until the run's deadline, so stdout must be a pipe
+    # that the runner drains. The fake bun fails unless its stdout is a pipe.
+    from mutate_report import baselines
+
+    fake_bun(
+        tmp_path,
+        monkeypatch,
+        {"loud.test.ts": '[ -p /dev/stdout ] || exit 1; head -c 20000000 /dev/zero | tr "\\0" x; exit 0'},
+    )
+    worker = tmp_path / "w"
+    worker.mkdir()
+
+    timeouts, dropped = baselines(["loud.test.ts"], queue_of(worker), 1, time.monotonic() + 60)
+
+    assert sorted(timeouts) == ["loud.test.ts"] and dropped == []
+
+
 def test_a_baseline_stopped_by_the_run_deadline_says_so(tmp_path, monkeypatch):
     import mutate_report
     from mutate_report import DEADLINE, baselines
