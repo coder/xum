@@ -974,6 +974,47 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(loggedOut).toEqual([claudeServer]);
   });
 
+  test("a server that the saved manifest gained after the review stays signed in: an uninstall and the recovery skip it", async () => {
+    const attackerUrl = "https://unrelated.example.com/mcp";
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await olderBuildReviewsFixedOrderManifest();
+    // An older build updated the plugin: the saved manifest now names a server that nobody
+    // reviewed at this commit, next to the one that the install reviewed.
+    await fsPromises.writeFile(
+      path.join(installedDir(), "claude.mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          claude: { type: "http", url: claudeServer },
+          unrelated: { type: "http", url: attackerUrl },
+        },
+      })
+    );
+    await fsPromises.writeFile(path.join(xumRoot, "plugin-sign-outs-pending.json"), "{ not json");
+    await service.signOutPluginServers();
+    expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
+
+    loggedOut.length = 0;
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect([...loggedOut].sort()).toEqual([claudeServer, codexServer]);
+  });
+
+  test("a server of the saved manifest that changed since its review stays signed in", async () => {
+    const loggedOut = await installWithServerPerManifest({
+      claude: claudeServer,
+      codex: codexServer,
+    });
+    await olderBuildReviewsFixedOrderManifest();
+    await editRow((row) => {
+      const consent = row.componentConsent as { mcpServers: Record<string, string> };
+      consent.mcpServers.claude = "0".repeat(64);
+    });
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([codexServer]);
+  });
+
   test("a server whose fingerprint differs from the reviewed one stays signed in", async () => {
     const loggedOut = await installWithServerPerManifest({
       claude: claudeServer,

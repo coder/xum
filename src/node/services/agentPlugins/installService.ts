@@ -5778,23 +5778,27 @@ export class AgentPluginInstallService {
    * order. An older build ignores the saved method, loads the fixed-order manifest and can store
    * sign-ins for a server that only that manifest declares (B3). Those sign-ins outlive the plugin
    * (they are keyed by URL), so a sign-out that listed only the saved manifest would leave them.
-   * This build never reviewed that manifest, so only a server whose fingerprint the row's consent
-   * holds counts (the older build's review put it there): an unreviewed server never ran, and its
-   * URL may be an unrelated service's. A fixed-order manifest that cannot be read lists none: only
-   * an older build loads it, and it must not keep a healthy plugin from being signed out or removed.
+   * For a plugin with a saved method, only a server whose fingerprint the row's consent holds
+   * counts, from either manifest. After an older build moved the commit, a manifest has not been
+   * reviewed at that commit, and its URL may be an unrelated service's: a manifest must not be able
+   * to name one and have an uninstall sign the user out of it. A sign-in of a server that changed
+   * or appeared since its review stays until the next sign-in or the Settings sign-out (RFC risks).
+   * A fixed-order manifest that cannot be read lists none: only an older build loads it, and it must
+   * not keep a healthy plugin from being signed out or removed.
    */
   private async pluginTreeServerUrlsAnyBuild(
     dirName: string,
     installed: boolean,
     choice: ManifestChoice
   ): Promise<string[]> {
-    const saved = await this.pluginTreeServerUrls(dirName, installed, choice);
-    if (choice.kind === "fixed-order") return saved;
+    if (choice.kind === "fixed-order") return this.pluginTreeServerUrls(dirName, installed, choice);
+    const reviewed = await this.reviewedServerFingerprints(dirName);
+    const saved = await this.pluginTreeServerUrls(dirName, installed, choice, reviewed);
     const fixedOrder = await this.pluginTreeServerUrls(
       dirName,
       false,
       { kind: "fixed-order" },
-      await this.reviewedServerFingerprints(dirName)
+      reviewed
     ).catch((error: unknown) => {
       log.warn("Could not list the MCP servers of the fixed-order manifest of a plugin", {
         plugin: dirName,
@@ -5827,13 +5831,11 @@ export class AgentPluginInstallService {
       saved.kind === "fixed-order" ? [saved] : [saved, { kind: "fixed-order" }];
     const urls: string[] = [];
     // Each manifest on its own: one that cannot be read lists none, and must not hide the other's.
-    // The fixed-order one, which only an older build loads, counts only for the servers that the
-    // row's consent holds (pluginTreeServerUrlsAnyBuild).
+    // With a saved method, a server counts only when the row's consent holds its fingerprint
+    // (pluginTreeServerUrlsAnyBuild).
+    const reviewed =
+      saved.kind === "fixed-order" ? undefined : await this.reviewedServerFingerprints(name);
     for (const choice of choices) {
-      const reviewed =
-        saved.kind !== "fixed-order" && choice.kind === "fixed-order"
-          ? await this.reviewedServerFingerprints(name)
-          : undefined;
       urls.push(...(await this.serverUrlsOfManifest(name, choice, reviewed)));
     }
     return this.uniqueByCredential(urls);
