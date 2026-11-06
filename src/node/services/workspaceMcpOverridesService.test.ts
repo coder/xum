@@ -11,6 +11,7 @@ import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import {
+  ALL_WORKSPACES_TARGET,
   boundContainerMutation,
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
@@ -4208,6 +4209,40 @@ describe("WorkspaceMcpOverridesService", () => {
       }
       expect(await enabledServers(healthy.workspacePath)).toEqual(["other"]);
       expect(await enabledServers(legacyPath)).toEqual(["other"]);
+    });
+
+    it("evicts every cache instead of publishing from the degraded registry", async () => {
+      // The child's parent is the legacy entry, whose stable id lives only in its unreadable
+      // metadata.json: resolving the child from the lenient walk would read that parent as gone.
+      const service = new WorkspaceMcpOverridesService(config);
+      const legacyPath = await registerMalformedLegacyEntry();
+      await fs.mkdir(path.join(legacyPath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        overridesFile(legacyPath),
+        JSON.stringify({ enabledServers: ["parent-server"] })
+      );
+      const child = await registerWorkspace("child-of-legacy");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === child.workspaceId);
+          if (workspace) workspace.parentWorkspaceId = "legacy-stable-id";
+        }
+        return cfg;
+      });
+
+      const published: Array<[string, unknown]> = [];
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [child.workspaceId],
+        "plugin:0123456789abcdef:",
+        {
+          publish: (persisted, workspaceId) => {
+            published.push([workspaceId, persisted]);
+            return Promise.resolve();
+          },
+        }
+      );
+      expect(failures).toEqual([]);
+      expect(published).toEqual([[ALL_WORKSPACES_TARGET, null]]);
     });
 
     it("refuses while config.json is corrupt and leaves the overrides as they were", async () => {
