@@ -4366,9 +4366,10 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await served(service, healthy.workspaceId)).toBe("refused");
     });
 
-    it("logs the legacy entry's load failure with its stack once across reads", async () => {
+    it("logs the legacy entry's load failure and the lenient walk once across reads", async () => {
       // Each override read walks the registry again (the tool-call gate reads on every call).
       const errorSpy = spyOn(log, "error");
+      const warnSpy = spyOn(log, "warn");
       try {
         const service = new WorkspaceMcpOverridesService(config);
         const healthy = await registerWorkspace("healthy-beside-legacy");
@@ -4378,8 +4379,10 @@ describe("WorkspaceMcpOverridesService", () => {
           expect(await served(service, healthy.workspaceId)).not.toBe("refused");
         }
         expect(errorSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
       } finally {
         errorSpy.mockRestore();
+        warnSpy.mockRestore();
       }
     });
 

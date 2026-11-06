@@ -29,6 +29,7 @@ import {
 } from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
+import { rememberLogKey } from "@/node/utils/logDedupe";
 import { resolveCoderSSHHost } from "@/constants/coder";
 
 const MCP_OVERRIDE_FILENAMES = ["mcp.local.jsonc", "mcp.local.json"] as const;
@@ -476,6 +477,10 @@ async function boundedRealpath(target: string): Promise<string | undefined> {
  * appear hung for tens of minutes. Host realpaths are memoized too: sharer
  * detection canonicalizes every host-local workspace's override path.
  */
+/** Strict-walk failures already warned about, per Config (see loadAllMetadataTolerant). */
+const warnedLenientWalks = new WeakMap<Config, Set<string>>();
+const MAX_WARNED_LENIENT_WALKS = 16;
+
 class ConfigSnapshot {
   private readonly store: {
     legacy?: ProjectsConfig;
@@ -614,10 +619,18 @@ class ConfigSnapshot {
       const fallbackIds = new Set<string>();
       this.store.fallbackIds = fallbackIds;
       // A count, not the ids: an install sweep can request thousands.
-      log.warn(
-        "[MCP] Resolving workspace MCP overrides from a lenient registry walk: another entry's metadata is unreadable",
-        { workspaceCount: workspaceIds.length, error: getErrorMessage(error) }
-      );
+      const fields = { workspaceCount: workspaceIds.length, error: getErrorMessage(error) };
+      // Every override read on such a host gets here (the tool-call gate reads on every call):
+      // warn once per distinct failure and Config, then log at debug.
+      let warned = warnedLenientWalks.get(this.config);
+      if (warned === undefined) {
+        warned = new Set();
+        warnedLenientWalks.set(this.config, warned);
+      }
+      const message =
+        "[MCP] Resolving workspace MCP overrides from a lenient registry walk: another entry's metadata is unreadable";
+      if (rememberLogKey(warned, fields.error, MAX_WARNED_LENIENT_WALKS)) log.warn(message, fields);
+      else log.debug(message, fields);
       return this.config.getAllWorkspaceMetadata({ probeCheckouts: false, fallbackIds });
     }));
   }

@@ -6,7 +6,7 @@ import * as fs from "fs";
 import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
-import { Config } from "./config";
+import { Config, MAX_LOGGED_METADATA_LOAD_FAILURES } from "./config";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -6591,6 +6591,63 @@ describe("Config", () => {
       const probed = await config.getAllWorkspaceMetadata({ persistMigrations: false });
       expect(probed.map((metadata) => metadata.id)).toContain("half-migrated-id");
       expect((await config.findWorkspaceMetadata("half-migrated-id"))?.id).toBe("half-migrated-id");
+    });
+
+    describe("metadata load failure logs", () => {
+      // Id-less legacy rows whose metadata.json does not parse: every lenient build fails them
+      // again (a degraded build is not memoized), and MCP override reads build once per read.
+      const registerBroken = async (names: readonly string[]) => {
+        for (const name of names) {
+          fs.mkdirSync(path.join(config.srcDir, "project", name), { recursive: true });
+          fs.mkdirSync(path.join(config.sessionsDir, name), { recursive: true });
+          fs.writeFileSync(path.join(config.sessionsDir, name, "metadata.json"), "{ not json");
+        }
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/fake/project", {
+            workspaces: names.map((name) => ({ path: path.join(config.srcDir, "project", name) })),
+          });
+          return cfg;
+        });
+      };
+      const breakAs = (name: string, raw: string) =>
+        fs.writeFileSync(path.join(config.sessionsDir, name, "metadata.json"), raw);
+      const build = () => config.getAllWorkspaceMetadata({ probeCheckouts: false });
+
+      it("logs each distinct failure with its stack once", async () => {
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // The two rows fail with the same message.
+          await registerBroken(["broken-a", "broken-b"]);
+          await build();
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(2);
+          // A new failure of one row logs again.
+          breakAs("broken-a", "[");
+          await build();
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(3);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("forgets the oldest logged failure past its cap", async () => {
+        // A row whose message changes on every build must not grow the dedupe set without bound.
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await registerBroken(["broken-a"]);
+          for (let failure = 0; failure <= MAX_LOGGED_METADATA_LOAD_FAILURES; failure++) {
+            breakAs("broken-a", `x${failure}`);
+            await build();
+          }
+          expect(errorSpy).toHaveBeenCalledTimes(MAX_LOGGED_METADATA_LOAD_FAILURES + 1);
+          breakAs("broken-a", "x0");
+          await build();
+          expect(errorSpy).toHaveBeenCalledTimes(MAX_LOGGED_METADATA_LOAD_FAILURES + 2);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
     });
   });
 

@@ -10,6 +10,7 @@ import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
+import { rememberLogKey } from "@/node/utils/logDedupe";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
 import { ProvidersConfigStore } from "./providersConfigStore";
 import { FileLeaseManager } from "./fileLeaseManager";
@@ -1388,6 +1389,8 @@ const aliasConflictBackupFailures = new Map<string, { message: string }>();
 // keeps changing cannot grow it without bound.
 const loggedAliasBackupFailures = new Map<string, Set<string>>();
 const MAX_LOGGED_ALIAS_BACKUP_FAILURES = 16;
+/** Distinct workspace metadata load failures one Config remembers (see logMetadataLoadFailure). */
+export const MAX_LOGGED_METADATA_LOAD_FAILURES = 64;
 
 /** Record `signature` for `configFile`; true when it was not recorded before. */
 function rememberAliasBackupFailure(configFile: string, signature: string): boolean {
@@ -1396,14 +1399,7 @@ function rememberAliasBackupFailure(configFile: string, signature: string): bool
     seen = new Set();
     loggedAliasBackupFailures.set(configFile, seen);
   }
-  if (seen.has(signature)) return false;
-  seen.add(signature);
-  // A Set iterates in insertion order: drop the oldest signature first.
-  for (const oldest of seen) {
-    if (seen.size <= MAX_LOGGED_ALIAS_BACKUP_FAILURES) break;
-    seen.delete(oldest);
-  }
-  return true;
+  return rememberLogKey(seen, signature, MAX_LOGGED_ALIAS_BACKUP_FAILURES);
 }
 
 /**
@@ -1613,6 +1609,10 @@ export interface WorkspaceMetadataOptions {
    * alone, because the entry's own legacy metadata.json could not be read or parsed. Defaults
    * fill the name and runtime that file holds, so the entry's checkout path may be wrong:
    * callers that read files in that checkout must not trust such an entry.
+   *
+   * A row with no legacy metadata.json at all is not listed: no file holds another name or
+   * runtime, and the build persists the defaults as the row's own (the read-time migration), so
+   * every reader, the runtime included, resolves the same checkout from them.
    */
   fallbackIds?: Set<string>;
   /**
@@ -2500,9 +2500,10 @@ export class Config {
     Map<string, WorkspaceMetadataMemoEntry>
   >();
   /**
-   * Metadata load failures already logged with their stack. A degraded entry fails the same way
-   * on every lenient build, and MCP override reads build once per read (the tool-call gate reads
-   * on every call), so each distinct failure logs its stack once and a one-line debug after.
+   * Metadata load failures already logged with their stack, by checkout path and message. A
+   * degraded entry fails the same way on every lenient build, and MCP override reads build once
+   * per read (the tool-call gate reads on every call), so each distinct failure logs its stack
+   * once and a one-line debug after. Capped (MAX_LOGGED_METADATA_LOAD_FAILURES).
    */
   private readonly loggedMetadataLoadFailures = new Set<string>();
   private workspaceIndex = new Map<
@@ -4779,14 +4780,13 @@ export class Config {
   /** See loggedMetadataLoadFailures. */
   private logMetadataLoadFailure(workspacePath: string, error: unknown): void {
     const key = `${workspacePath}\0${getErrorMessage(error)}`;
-    if (this.loggedMetadataLoadFailures.has(key)) {
+    if (!rememberLogKey(this.loggedMetadataLoadFailures, key, MAX_LOGGED_METADATA_LOAD_FAILURES)) {
       log.debug("Failed to load/migrate workspace metadata (stack logged before)", {
         workspacePath,
         error: getErrorMessage(error),
       });
       return;
     }
-    this.loggedMetadataLoadFailures.add(key);
     log.error(`Failed to load/migrate workspace metadata:`, error);
   }
 
