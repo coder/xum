@@ -235,6 +235,14 @@ function launch(fake: Fake, stubs: Record<string, string> = {}) {
     stderr: r.stderr,
     seconds: (Date.now() - started) / 1000,
     left: serverPids().length,
+    // Runs another verify-xum.sh command in the same checkout and home.
+    command: (...args: string[]) =>
+      spawnSync("bash", [path.join(repo, SKILL_SCRIPT), ...args], {
+        cwd: repo,
+        env: { ...env, VERIFY_XUM_HOME: path.join(tmp, "home") },
+        encoding: "utf8",
+        timeout: 60_000,
+      }),
   };
 }
 
@@ -429,6 +437,30 @@ test.skipIf(!isLinux)(
     expect(r.stderr).not.toContain("ss shows nothing listening");
     expect(r.stderr).toContain("returned error: 404");
     expect(r.left).toBe(0);
+  },
+  90_000
+);
+
+// A run that an older verify-xum.sh launched has no VERIFY_XUM_BACKEND_SOCKET in its state.env.
+// Doctor must say so, not stop on set -u.
+test.skipIf(!isLinux)(
+  "doctor names a run without a backend socket",
+  () => {
+    const r = launch(loopback);
+    expect(r.stderr).toContain("returned error: 404");
+    const home = path.join(tmp, "home");
+    const [run] = fs.readdirSync(home);
+    const stateEnv = path.join(home, run, "state.env");
+    const lines = fs.readFileSync(stateEnv, "utf8").split("\n");
+    expect(lines.some((line) => line.startsWith("export VERIFY_XUM_BACKEND_SOCKET="))).toBe(true);
+    fs.writeFileSync(
+      stateEnv,
+      lines.filter((line) => !line.startsWith("export VERIFY_XUM_BACKEND_SOCKET=")).join("\n")
+    );
+    const doctor = r.command("doctor", path.join(home, run));
+    expect(doctor.status).toBe(1);
+    expect(doctor.stderr).toContain("names no Unix socket for the backend");
+    expect(doctor.stderr).not.toContain("unbound variable");
   },
   90_000
 );

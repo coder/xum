@@ -302,7 +302,8 @@ probe_before_launch_deadline() {
 # at that name.
 require_private_socket() {
   local dir
-  [[ $VERIFY_XUM_BACKEND_SOCKET == /* ]] \
+  # Unset in the state.env of a run that an older verify-xum.sh launched.
+  [[ ${VERIFY_XUM_BACKEND_SOCKET-} == /* ]] \
     || die "run $VERIFY_XUM_RUN names no Unix socket for the backend (an older verify-xum.sh launched it). Run verify-xum.sh cleanup, then launch again."
   dir=$(dirname "$VERIFY_XUM_BACKEND_SOCKET")
   require_private_dir "$dir"
