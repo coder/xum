@@ -1015,6 +1015,32 @@ describe("AgentPluginInstallService method choice (egm layout)", () => {
     expect(loggedOut).toEqual([codexServer]);
   });
 
+  test("a saved Agent Plugin has no other manifest: an uninstall signs out every server of its tree", async () => {
+    await write({
+      ".mcp.json": JSON.stringify({ mcpServers: { remote: { type: "http", url: codexServer } } }),
+    });
+    await commit("a remote MCP server");
+    await installAs("agent-plugin");
+    const loggedOut: string[] = [];
+    service.setMcpOauthService({
+      logout: (input: { serverUrl: string }) => {
+        loggedOut.push(input.serverUrl);
+        return Promise.resolve({ success: true });
+      },
+      credentialKey: (url: string) => url,
+    } as unknown as McpOauthService);
+    await (
+      service as unknown as { settledSignOutPasses: () => Promise<void> }
+    ).settledSignOutPasses();
+    // The server changed after its review: with one manifest, the sign-out still covers it.
+    await editRow((row) => {
+      const consent = row.componentConsent as { mcpServers: Record<string, string> };
+      consent.mcpServers.remote = "0".repeat(64);
+    });
+    await service.uninstall({ name: "egm", deletePluginData: true });
+    expect(loggedOut).toEqual([codexServer]);
+  });
+
   test("a server whose fingerprint differs from the reviewed one stays signed in", async () => {
     const loggedOut = await installWithServerPerManifest({
       claude: claudeServer,

@@ -2001,6 +2001,15 @@ function remoteServerUrls(
   });
 }
 
+/**
+ * Whether an older build can load another manifest of the tree than the saved one (B3): the saved
+ * method is a Claude or Cursor manifest. A saved Agent Plugin resolves like the fixed order (B1), so
+ * both builds load one manifest, and a plugin with no saved method has no other manifest either.
+ */
+function hasOtherManifest(choice: ManifestChoice): boolean {
+  return choice.kind === "method" && choice.method !== "agent-plugin";
+}
+
 /** The row's consent record for this server is the fingerprint that the server has now. */
 function holdsFingerprint(
   reviewed: Readonly<Record<string, string>>,
@@ -5791,7 +5800,7 @@ export class AgentPluginInstallService {
     installed: boolean,
     choice: ManifestChoice
   ): Promise<string[]> {
-    if (choice.kind === "fixed-order") return this.pluginTreeServerUrls(dirName, installed, choice);
+    if (!hasOtherManifest(choice)) return this.pluginTreeServerUrls(dirName, installed, choice);
     const reviewed = await this.reviewedServerFingerprints(dirName);
     const saved = await this.pluginTreeServerUrls(dirName, installed, choice, reviewed);
     const fixedOrder = await this.pluginTreeServerUrls(
@@ -5827,14 +5836,16 @@ export class AgentPluginInstallService {
     const saved = await this.installedChoice(name).catch(
       (): ManifestChoice => ({ kind: "fixed-order" })
     );
-    const choices: ManifestChoice[] =
-      saved.kind === "fixed-order" ? [saved] : [saved, { kind: "fixed-order" }];
+    const choices: ManifestChoice[] = hasOtherManifest(saved)
+      ? [saved, { kind: "fixed-order" }]
+      : [saved];
     const urls: string[] = [];
     // Each manifest on its own: one that cannot be read lists none, and must not hide the other's.
     // With a saved method, a server counts only when the row's consent holds its fingerprint
     // (pluginTreeServerUrlsAnyBuild).
-    const reviewed =
-      saved.kind === "fixed-order" ? undefined : await this.reviewedServerFingerprints(name);
+    const reviewed = hasOtherManifest(saved)
+      ? await this.reviewedServerFingerprints(name)
+      : undefined;
     for (const choice of choices) {
       urls.push(...(await this.serverUrlsOfManifest(name, choice, reviewed)));
     }
