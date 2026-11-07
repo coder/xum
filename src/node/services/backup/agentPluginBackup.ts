@@ -57,9 +57,9 @@ export const PLUGIN_BACKUP_DIR = "agent-plugins";
 export const PLUGIN_BACKUP_MANIFEST_PATH = `${PLUGIN_BACKUP_DIR}/${BACKUP_MANIFEST_FILE}`;
 
 /** The managed registry rows this build can read, by name. */
-async function readManagedInstalls(rootDir: string): Promise<Map<string, AgentPluginInstallEntry>> {
+async function readManagedInstalls(muxRoot: string): Promise<Map<string, AgentPluginInstallEntry>> {
   const { rawEntries } = await readPluginRegistryDocument(
-    path.join(rootDir, PLUGIN_REGISTRY_FILE_NAME),
+    path.join(muxRoot, PLUGIN_REGISTRY_FILE_NAME),
     "lenient"
   );
   return new Map(parseRegistryEntriesLenient(rawEntries).map((entry) => [entry.name, entry]));
@@ -77,7 +77,7 @@ function methodOf(generated: GeneratedFrom | undefined): BackupPluginMethod | un
 }
 
 async function entryOf(
-  rootDir: string,
+  muxRoot: string,
   install: AgentPluginInstallEntry
 ): Promise<BackupPluginEntry | null> {
   // Another machine cannot use a path on this one, and the list would publish it (the home folder
@@ -89,7 +89,7 @@ async function entryOf(
     return null;
   }
   const method = methodOf(
-    await readInstalledGeneratedFrom(path.join(rootDir, "plugins", install.name))
+    await readInstalledGeneratedFrom(path.join(muxRoot, "plugins", install.name))
   );
   // Only the fields the schema names: consent, install times and auto-update stay local.
   const parsed = BackupPluginEntrySchema.safeParse({
@@ -111,9 +111,9 @@ async function entryOf(
 }
 
 /** Every managed install as a portable entry, sorted by name; null when there is none. */
-export async function collectPluginBackup(rootDir: string): Promise<BackupPluginManifest | null> {
-  const installs = [...(await readManagedInstalls(rootDir)).values()];
-  const entries = await Promise.all(installs.map((install) => entryOf(rootDir, install)));
+export async function collectPluginBackup(muxRoot: string): Promise<BackupPluginManifest | null> {
+  const installs = [...(await readManagedInstalls(muxRoot)).values()];
+  const entries = await Promise.all(installs.map((install) => entryOf(muxRoot, install)));
   const plugins = entries
     .filter((entry) => entry !== null)
     .sort((a, b) => a.name.localeCompare(b.name))
@@ -156,13 +156,13 @@ export async function readPriorPluginList(sourceDir: string): Promise<PluginList
  * so a list pushed earlier disappears from the next tree.
  */
 export async function exportPluginBackup(options: {
-  rootDir: string;
+  muxRoot: string;
   destination: string;
   contents: BackupContents;
   prior: PluginListRead | null;
 }): Promise<{ files: BackupFile[]; pluginRemoval?: BackupPluginRemoval }> {
   const manifest = options.contents.includePlugins
-    ? await collectPluginBackup(options.rootDir)
+    ? await collectPluginBackup(options.muxRoot)
     : null;
   const pluginRemoval = pluginRemovalOf(options.prior, manifest);
   if (manifest === null) return { files: [], pluginRemoval };
@@ -207,7 +207,7 @@ export interface PluginListRead {
   warnings: string[];
 }
 
-function skippedList(reason: string): PluginListRead {
+function unreadableList(reason: string): PluginListRead {
   return { plugins: [], warnings: [`The plugin list was not read: ${reason}.`] };
 }
 
@@ -256,11 +256,11 @@ function parsePluginList(text: string): PluginListRead {
   try {
     json = JSON.parse(text);
   } catch {
-    return skippedList("it is not valid JSON");
+    return unreadableList("it is not valid JSON");
   }
   const envelope = PluginListEnvelopeSchema.safeParse(json);
   if (!envelope.success) {
-    return skippedList("only a version 1 list with a plugins array can be read here");
+    return unreadableList("only a version 1 list with a plugins array can be read here");
   }
   return readPluginRows(envelope.data.plugins);
 }
@@ -278,33 +278,33 @@ async function readPluginBackup(sourceDir: string): Promise<PluginListRead> {
     text = await readManifestText(sourceDir);
   } catch (error) {
     if (isFilesystemError(error)) throw error;
-    return skippedList(getErrorMessage(error));
+    return unreadableList(getErrorMessage(error));
   }
   return parsePluginList(text);
 }
 
 /** `installed`: that name at that commit. Another commit, or a folder the installer does not manage: `conflict`. */
 async function statusOf(
-  rootDir: string,
+  muxRoot: string,
   plugin: BackupPluginEntry,
   local: AgentPluginInstallEntry | undefined
 ): Promise<BackupPluginStatus> {
   if (local !== undefined) return local.lockedSha === plugin.lockedSha ? "installed" : "conflict";
-  const folder = await lstatIfExists(path.join(rootDir, "plugins", plugin.name));
+  const folder = await lstatIfExists(path.join(muxRoot, "plugins", plugin.name));
   return folder === null ? "missing" : "conflict";
 }
 
 async function planPluginRows(
-  rootDir: string,
+  muxRoot: string,
   listed: readonly BackupPluginEntry[]
 ): Promise<BackupPluginRow[]> {
   // No rows, nothing to compare: a backup without a list never reads this machine's registry.
   if (listed.length === 0) return [];
-  const local = await readManagedInstalls(rootDir);
+  const local = await readManagedInstalls(muxRoot);
   return await Promise.all(
     listed.map(async (plugin) => ({
       ...plugin,
-      status: await statusOf(rootDir, plugin, local.get(plugin.name)),
+      status: await statusOf(muxRoot, plugin, local.get(plugin.name)),
     }))
   );
 }
@@ -331,13 +331,13 @@ export async function readPluginSidecar(
  * offer the user can take through the install review (see the note at the top of this file).
  */
 export async function readPluginRestore(options: {
-  rootDir: string;
+  muxRoot: string;
   sourceDir: string;
   contents: BackupContents;
 }): Promise<BackupPluginReport> {
   const { skipped, list } = await readPluginSidecar(options.sourceDir, options.contents);
   return {
-    rows: await planPluginRows(options.rootDir, list.plugins),
+    rows: await planPluginRows(options.muxRoot, list.plugins),
     skipped,
     warnings: list.warnings,
   };

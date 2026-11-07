@@ -8,7 +8,7 @@ import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
 } from "@/common/orpc/schemas/agentPlugins";
-import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
+import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
 
 /**
  * Reinstalling the plugins a settings backup lists, one install review at a time. The backup
@@ -30,7 +30,7 @@ export interface PluginPreviewRequest {
  * the plugin tracks, so the review shows the code that was backed up. A marketplace entry names
  * its own folder in the marketplace, so a subpath would look for the entry inside that folder.
  */
-export function backupPreviewRequest(item: BackupPluginRow): PluginPreviewRequest {
+export function backupPreviewRequest(item: BackupPluginEntry): PluginPreviewRequest {
   return {
     input: item.source.url,
     ref: item.lockedSha,
@@ -49,7 +49,7 @@ export function backupPreviewRequest(item: BackupPluginRow): PluginPreviewReques
  */
 export function installSource(
   preview: AgentPluginInstallPreview,
-  item: BackupPluginRow | null
+  item: BackupPluginEntry | null
 ): AgentPluginGitSource {
   const pinned =
     item !== null && preview.source.refType === "commit" && preview.lockedSha === item.lockedSha;
@@ -63,7 +63,7 @@ export function installSource(
  */
 export function selectedComponents(
   preview: AgentPluginInstallPreview,
-  item: BackupPluginRow | null
+  item: BackupPluginEntry | null
 ): AgentPluginImportedComponents {
   const offered = {
     skills: preview.skills.map((skill) => skill.name),
@@ -77,12 +77,12 @@ export function selectedComponents(
   };
 }
 
-const NO_PLUGINS: readonly BackupPluginRow[] = [];
+const NO_PLUGINS: readonly BackupPluginEntry[] = [];
 
 /** Starts the first plugin when the panel opens; StrictMode runs mount effects twice. */
 function useStartFirst(
-  plugins: readonly BackupPluginRow[],
-  start: (item: BackupPluginRow) => Promise<void>
+  plugins: readonly BackupPluginEntry[],
+  start: (item: BackupPluginEntry) => Promise<void>
 ): void {
   const started = useRef(false);
   useEffect(() => {
@@ -96,7 +96,7 @@ function useStartFirst(
 
 export interface InstallQueue {
   /** The plugin under review; null when the panel is not reinstalling a backup. */
-  item: BackupPluginRow | null;
+  item: BackupPluginEntry | null;
   position: number;
   total: number;
   /** Leave this plugin out and review the next one. */
@@ -114,8 +114,8 @@ export interface InstallQueue {
  * which is the ordinary add flow.
  */
 export function useInstallQueue(options: {
-  plugins: readonly BackupPluginRow[] | undefined;
-  start: (item: BackupPluginRow) => Promise<void>;
+  plugins: readonly BackupPluginEntry[] | undefined;
+  start: (item: BackupPluginEntry) => Promise<void>;
   onInstalled: () => void;
   onClose: () => void;
 }): InstallQueue {

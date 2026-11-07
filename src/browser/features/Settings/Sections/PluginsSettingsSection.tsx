@@ -35,7 +35,7 @@ import type {
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
-import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
+import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
@@ -756,7 +756,7 @@ const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
   /** Plugins a settings backup lists, each reviewed and installed (or skipped) in turn. */
-  backupPlugins?: readonly BackupPluginRow[];
+  backupPlugins?: readonly BackupPluginEntry[];
 }> = (props) => {
   const { api } = useAPI();
   const [input, setInput] = useState("");
@@ -781,7 +781,7 @@ const AddPluginPanel: React.FC<{
   const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
   /** `item`: the backed-up plugin this request reinstalls, which decides the preselected components. */
-  const runPreview = async (request: PluginPreviewRequest, item: BackupPluginRow | null) => {
+  const runPreview = async (request: PluginPreviewRequest, item: BackupPluginEntry | null) => {
     if (!api || busy) return;
     setBusy(true);
     setError(null);
@@ -811,7 +811,7 @@ const AddPluginPanel: React.FC<{
    * Opens the form on a backed-up plugin and previews it. The fields stay editable, so a
    * preview that fails (a repository that moved, a host that is down) can be fixed by hand.
    */
-  const startBackupItem = (item: BackupPluginRow) => {
+  const startBackupItem = (item: BackupPluginEntry) => {
     const request = backupPreviewRequest(item);
     setInput(request.input);
     setRef(item.lockedSha);
@@ -1769,7 +1769,7 @@ export const PluginsSettingsSection: React.FC = () => {
   // and a closed one leaves nothing behind for the next plain add.
   const [addSession, setAddSession] = useState<{
     id: number;
-    backup?: readonly BackupPluginRow[];
+    backup?: readonly BackupPluginEntry[];
   }>(() => ({ id: 0, backup: backupPluginsOf(initialIntent) }));
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
@@ -1821,7 +1821,7 @@ export const PluginsSettingsSection: React.FC = () => {
     setInstallSucceeded(false);
     setAddOpen(true);
   };
-  const openBackupInstall = (plugins: readonly BackupPluginRow[]) => {
+  const openBackupInstall = (plugins: readonly BackupPluginEntry[]) => {
     setAddSession((session) => ({ id: session.id + 1, backup: plugins }));
     openAddPanel();
   };
@@ -1913,7 +1913,7 @@ export const PluginsSettingsSection: React.FC = () => {
           openAddPanel();
           break;
         case "install-from-backup":
-          openBackupInstall(intent.plugins);
+          openBackupInstall(intent.entries);
           break;
         case "manage-components":
           setComponentsTarget(intent.name);

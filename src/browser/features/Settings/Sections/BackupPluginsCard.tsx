@@ -4,6 +4,7 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import type {
   BackupOperationError,
+  BackupPluginEntry,
   BackupPluginRemoval,
   BackupPluginReport,
   BackupPluginRow,
@@ -11,9 +12,11 @@ import type {
 } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
-/** The plugins this machine lacks: the only ones a reinstall offers. */
-function missingPlugins(report: BackupPluginReport): BackupPluginRow[] {
-  return report.rows.filter((plugin) => plugin.status === "missing");
+/** The plugins this machine lacks, as the entries a reinstall offers (the status is spent). */
+function missingPlugins(report: BackupPluginReport): BackupPluginEntry[] {
+  return report.rows
+    .filter((row) => row.status === "missing")
+    .map(({ status: _status, ...entry }) => entry);
 }
 
 /**
@@ -29,7 +32,7 @@ export function reviewBackedUpPlugins(options: {
 }): void {
   const missing = missingPlugins(options.report);
   if (!options.enabled || missing.length === 0) return;
-  publishPluginsSectionIntent({ type: "install-from-backup", plugins: missing });
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: missing });
   options.openPlugins();
 }
 

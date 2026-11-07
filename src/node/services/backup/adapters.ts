@@ -600,7 +600,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The plugin list is a few kilobytes of URLs and commit ids, so it is written before the
       // shelf measures what is left of the tree's budgets. It joins the same secret scan.
       const plugins = await exportPluginBackup({
-        rootDir: muxRoot,
+        muxRoot,
         destination,
         contents: exportOptions.contents,
         prior: priorPlugins,
@@ -749,7 +749,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        plugins: await readPluginRestore({ rootDir: muxRoot, sourceDir, contents }),
+        plugins: await readPluginRestore({ muxRoot, sourceDir, contents }),
         symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
       };
     },
@@ -913,7 +913,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       );
       // Only reported, never written: a plugin comes back through the install review, which is
       // the consent a restore cannot give on the user's behalf (agentPluginBackup.ts).
-      const plugins = await readPluginRestore({ rootDir: muxRoot, sourceDir, contents });
+      const plugins = await readPluginRestore({ muxRoot, sourceDir, contents });
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];

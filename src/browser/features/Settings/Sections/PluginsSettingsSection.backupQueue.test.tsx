@@ -102,7 +102,7 @@ function renderWithBackup(plugins: BackupPluginRow[], previews: Record<string, P
   });
   const installSpy = spyOn(api.agentPlugins, "install");
   const listSpy = spyOn(api.agentPlugins, "listForSettings");
-  publishPluginsSectionIntent({ type: "install-from-backup", plugins });
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: plugins });
   const view = render(
     <APIProvider client={api}>
       <TooltipProvider>

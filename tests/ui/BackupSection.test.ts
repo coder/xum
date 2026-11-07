@@ -1443,9 +1443,10 @@ describe("BackupSection", () => {
       await waitFor(() => expect(canvas.getByTestId("settings-route").textContent).toBe("plugins"));
       const intent = consumePendingPluginsSectionIntent();
       expect(intent?.type).toBe("install-from-backup");
-      expect(
-        intent?.type === "install-from-backup" ? intent.plugins.map((p) => p.name) : []
-      ).toEqual(["alpha", "delta"]);
+      const entries = intent?.type === "install-from-backup" ? intent.entries : [];
+      expect(entries.map((entry) => entry.name)).toEqual(["alpha", "delta"]);
+      // The statuses were only the reason these two were picked; the queue never reads them.
+      expect(entries.some((entry) => "status" in entry)).toBe(false);
       // Reviewing is only navigation: the install review is where consent happens.
       expect(install).not.toHaveBeenCalled();
     });
