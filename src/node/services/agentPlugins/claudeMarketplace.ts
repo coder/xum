@@ -259,7 +259,8 @@ function readMarketplaceHeader(
   };
 }
 
-function isLocalGitUrl(url: string): boolean {
+/** True for a path or `file://` URL: a repository only this machine can reach. */
+export function isLocalGitUrl(url: string): boolean {
   return (
     url.startsWith("file://") ||
     url.startsWith("~") ||

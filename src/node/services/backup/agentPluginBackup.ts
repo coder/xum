@@ -19,6 +19,7 @@ import {
   EMPTY_BACKUP_PLUGIN_REPORT,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isLocalGitUrl } from "@/node/services/agentPlugins/claudeMarketplace";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
 import type { GeneratedFrom } from "@/node/services/agentPlugins/manifest";
 import {
@@ -84,6 +85,14 @@ async function entryOf(
   rootDir: string,
   install: AgentPluginInstallEntry
 ): Promise<BackupPluginEntry | null> {
+  // Another machine cannot use a path on this one, and the list would publish it (the home folder
+  // names the user). The plugin is logged by name only, so its absence from the backup is explained.
+  if (isLocalGitUrl(install.source.url)) {
+    log.info("Leaving a plugin out of the settings backup: its source is on this machine", {
+      plugin: install.name,
+    });
+    return null;
+  }
   const method = methodOf(
     await readInstalledGeneratedFrom(path.join(rootDir, "plugins", install.name))
   );

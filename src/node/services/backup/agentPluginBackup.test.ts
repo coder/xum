@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Config } from "@/node/config";
+import { log } from "@/node/services/log";
 import { resolveBackupContents } from "@/common/config/schemas/settingsBackup";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
@@ -225,6 +226,34 @@ describe("backup of the managed plugin list", () => {
 
       const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
       expect(sidecar.plugins.map((p) => p.name)).toEqual(["alpha"]);
+    });
+
+    it("leaves out a plugin installed from a path or file URL on this machine, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      const local = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      await writeRegistry(muxRoot, [
+        registryRow("alpha"),
+        registryRow("abs-path", { source: local("/home/someone/plugins/abs-path") }),
+        registryRow("file-url", { source: local("file:///home/someone/plugins/file-url") }),
+        registryRow("home-path", { source: local("~/plugins/home-path") }),
+        registryRow("drive-path", { source: local("C:\\plugins\\drive-path") }),
+        registryRow("ssh-host", { source: local("git@github.com:example/ssh-host.git") }),
+      ]);
+      const { payload, managed, request } = await prepare();
+
+      const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((p) => p.name)).toEqual(["alpha", "ssh-host"]);
+      expect(
+        await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8")
+      ).not.toContain("someone");
+      expect(exported.secretFiles).toEqual([]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("its source is on this machine"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged.sort()).toEqual(["abs-path", "drive-path", "file-url", "home-path"]);
+      info.mockRestore();
     });
 
     it("holds a list that looks like a secret for the push review", async () => {
