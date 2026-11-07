@@ -68,14 +68,16 @@ describe("AgentSandboxService", () => {
       path.join(rootDir, "config.json"),
       JSON.stringify({
         projects: [[OTHER, { workspaces: [], agentSandbox: { enabled: true, network: 42 } }]],
-        agentSandbox: { enabled: true, extraReadPaths: "~/.npmrc" },
+        agentSandbox: { network: "loopback", extraReadPaths: "~/.npmrc" },
       })
     );
     service = new AgentSandboxService(new Config(rootDir));
 
     await service.start();
 
-    expect(agentSandboxSettingsFor(OTHER)?.network).toBe("allowlist");
-    expect(agentSandboxSettingsFor(undefined)?.extraReadPaths).toEqual([]);
+    // The global setting is off, so only the project's salvaged `enabled` turns it on, and the
+    // global network survives its broken sibling field.
+    expect(agentSandboxSettingsFor(OTHER)?.network).toBe("loopback");
+    expect(agentSandboxSettingsFor(undefined)).toBeNull();
   });
 });
