@@ -200,6 +200,8 @@ export class TurnResources {
       .exec(`rm -rf ${shellQuote(tempDirBasename)}`, {
         cwd: tempDirParent,
         timeout: 10,
+        // Xum code, not agent code: removes Xum's own folder under ~/.xum-tmp.
+        sandbox: "off",
       })
       .then(async (result) => {
         await result.exitCode;

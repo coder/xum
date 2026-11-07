@@ -260,6 +260,8 @@ printf '%s\n' "$TARGET_DIR_RESOLUTION"
   const result = await execBuffered(runtime, script, {
     cwd: "/",
     timeout: 10,
+    // Xum code, not agent code: a fixed read-only probe, and the sandbox refuses a cwd of /.
+    sandbox: "off",
   });
 
   // Callers read a failed probe as an escaped skill and skip it; an unreachable
