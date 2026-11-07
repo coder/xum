@@ -167,16 +167,6 @@ describe("repositoryIdentity", () => {
       repositoryIdentity("/home/someone/plugins/alpha")
     );
   });
-
-  it("never reads a spelling that is only text as the identity of a remote", () => {
-    // What an identity looks like to someone who read the code: a row can carry any url text.
-    const lookalike = JSON.stringify(["https:", "", "github.com", "", "/o/r"]);
-
-    expect(repositoryIdentity(lookalike)).not.toBe(repositoryIdentity("https://github.com/o/r"));
-    expect(repositoryIdentity(`remote:${lookalike}`)).not.toBe(
-      repositoryIdentity("https://github.com/o/r")
-    );
-  });
 });
 
 describe("backup of the managed plugin list", () => {

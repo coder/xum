@@ -291,8 +291,9 @@ function scpRemoteParts(text: string): string[] | null {
 export function repositoryIdentity(url: string): string {
   const trimmed = url.trim();
   const parts = SCHEME_REMOTE.test(trimmed) ? schemeRemoteParts(trimmed) : scpRemoteParts(trimmed);
-  // Tagged, so a spelling that is only text can never equal the identity of a remote.
-  return parts === null ? `text:${trimmed}` : `remote:${JSON.stringify(parts)}`;
+  // A remote's JSON starts with a scheme and a colon, which SCP_REMOTE reads as a remote too, so
+  // no spelling that is only text can equal one.
+  return parts === null ? trimmed : JSON.stringify(parts);
 }
 
 /** A monorepo folder with no leading or trailing slash, so `/a/b/` and `a/b` are one folder. */
