@@ -5,7 +5,7 @@ import {
 } from "@/common/config/schemas/agentSandbox";
 import type { AgentSandboxState, AgentSandboxSupport } from "@/common/orpc/schemas/agentSandbox";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import {
   anyAgentSandboxEnabled,
   setAgentSandboxTargets,
@@ -68,21 +68,9 @@ export class AgentSandboxService {
    */
   private async apply(): Promise<void> {
     const config = this.config.loadConfigOrDefault();
-    const byProject = new Map<string, ResolvedAgentSandboxSettings>();
-    for (const [projectPath, project] of config.projects) {
-      // A sub-project without an override of its own follows its parent's.
-      const override =
-        project.agentSandbox ??
-        (project.parentProjectPath === undefined
-          ? undefined
-          : config.projects.get(project.parentProjectPath)?.agentSandbox);
-      if (override !== undefined) {
-        byProject.set(projectPath, resolveAgentSandboxSettings(config.agentSandbox, override));
-      }
-    }
     setAgentSandboxTargets({
       fallback: resolveAgentSandboxSettings(config.agentSandbox, undefined),
-      byProject,
+      byProject: projectAgentSandboxSettings(config),
     });
     if (!anyAgentSandboxEnabled() || !isAgentSandboxSupported()) return;
     try {
@@ -91,6 +79,25 @@ export class AgentSandboxService {
       log.warn("The agent sandbox could not start", { reason: getErrorMessage(error) });
     }
   }
+}
+
+/** The resolved setting of each project with an override. */
+function projectAgentSandboxSettings(
+  config: ProjectsConfig
+): Map<string, ResolvedAgentSandboxSettings> {
+  const byProject = new Map<string, ResolvedAgentSandboxSettings>();
+  for (const [projectPath, project] of config.projects) {
+    // A sub-project without an override of its own follows its parent's.
+    const parentOverride =
+      project.parentProjectPath === undefined
+        ? undefined
+        : config.projects.get(project.parentProjectPath)?.agentSandbox;
+    const override = project.agentSandbox ?? parentOverride;
+    if (override !== undefined) {
+      byProject.set(projectPath, resolveAgentSandboxSettings(config.agentSandbox, override));
+    }
+  }
+  return byProject;
 }
 
 function agentSandboxSupport(): AgentSandboxSupport {

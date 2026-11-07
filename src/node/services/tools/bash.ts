@@ -37,7 +37,12 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
-import { requestSandboxApproval, SANDBOX_APPROVAL_DENIED, withSandboxDenials } from "./bashSandbox";
+import {
+  requestSandboxApproval,
+  SANDBOX_APPROVAL_DENIED,
+  sandboxExecOptions,
+  withSandboxDenials,
+} from "./bashSandbox";
 import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
@@ -1120,8 +1125,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           wall_duration_ms: 0,
         });
       }
-      // The user approved this one call: it runs outside the sandbox, with full access.
-      const sandboxOptOut = approval === "approved" ? ({ sandbox: "off" } as const) : {};
+      const sandboxOptOut = sandboxExecOptions(approval);
 
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
@@ -1193,7 +1197,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
-            ...(monitorConfig ? { monitor: monitorConfig } : {}),
+            monitor: monitorConfig,
             timeoutSecs: backgroundTimeoutSecs(timeout_secs),
             ...sandboxOptOut,
           }
@@ -1856,9 +1860,8 @@ File will be automatically cleaned up when stream ends.`;
       }
 
       // Format result based on exit code and truncation state
-      const sandboxDenials = (await execStream.sandboxDenials?.(exitCode !== 0)) ?? [];
       return withNotice(
-        withSandboxDenials(
+        await withSandboxDenials(
           formatResult(
             exitCode,
             lines,
@@ -1869,7 +1872,8 @@ File will be automatically cleaned up when stream ends.`;
             effectiveTimeout,
             stoppedAtFileLimit
           ),
-          sandboxDenials
+          execStream,
+          exitCode !== 0
         )
       );
     },

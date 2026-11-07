@@ -1,6 +1,7 @@
 import type { BashSandboxApprovalEvent } from "@/common/types/stream";
 import type { BashToolResult } from "@/common/types/tools";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { clockOf } from "@/node/utils/hostClock";
 import { emitChatEventBestEffort } from "./toolUtils";
@@ -18,6 +19,13 @@ export function agentSandboxApplies(config: ToolConfiguration): boolean {
   }
 }
 
+export type SandboxApproval = "not-asked" | "approved" | "denied";
+
+/** The exec options of a bash call: an approved call runs outside the sandbox, with full access. */
+export function sandboxExecOptions(approval: SandboxApproval): Pick<ExecOptions, "sandbox"> {
+  return approval === "approved" ? { sandbox: "off" } : {};
+}
+
 /**
  * Asks the user whether one bash call may run outside the sandbox. "not-asked" when the call
  * did not ask (no reason) or no sandbox applies, so the field changes nothing. A call with no
@@ -29,7 +37,7 @@ export async function requestSandboxApproval(
   toolCallId: string,
   reason: string | null | undefined,
   abortSignal: AbortSignal | undefined
-): Promise<"not-asked" | "approved" | "denied"> {
+): Promise<SandboxApproval> {
   if (reason == null || !agentSandboxApplies(config)) return "not-asked";
   const workspaceId = config.workspaceId;
   if (config.noInteractiveUser === true || workspaceId === undefined) return "denied";
@@ -57,9 +65,15 @@ export async function requestSandboxApproval(
 
 /**
  * Adds what the sandbox blocked to a foreground bash result, with a note that tells the model
- * what it may do about it.
+ * what it may do about it. `failed`: the command exited non-zero, so the denials are worth the
+ * wait for the sandbox log.
  */
-export function withSandboxDenials(result: BashToolResult, denials: string[]): BashToolResult {
+export async function withSandboxDenials(
+  result: BashToolResult,
+  execStream: Pick<ExecStream, "sandboxDenials">,
+  failed: boolean
+): Promise<BashToolResult> {
+  const denials = (await execStream.sandboxDenials?.(failed)) ?? [];
   if (denials.length === 0 || !("exitCode" in result) || "backgroundProcessId" in result) {
     return result;
   }

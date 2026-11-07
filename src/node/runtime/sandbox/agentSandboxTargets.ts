@@ -104,43 +104,35 @@ export function buildAgentSandboxPolicy(
 ): AgentSandboxPolicy {
   const home = realpathOfNearest(os.homedir());
   const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
-  const scratchDir =
-    input.scratchDir !== undefined && input.scratchDir.length > 0
-      ? realpathOfNearest(input.scratchDir)
-      : undefined;
   const extraWriteRoots = settings.extraWritePaths.map(expandSandboxPath);
   const extraWorkspaceRoots = (input.workspaceRoots ?? []).map((root) =>
     workspaceRootOrThrow(realpathOfNearest(root), home)
   );
-  const workspaceRoots = dedupe([
-    cwd,
-    ...extraWorkspaceRoots,
-    ...(scratchDir === undefined ? [] : [scratchDir]),
-  ]);
+  const workspaceRoots = dedupe([cwd, ...extraWorkspaceRoots, ...realpathIfSet(input.scratchDir)]);
   const writeRoots = dedupe([
     ...workspaceRoots,
     ...tempWritePaths(),
     ...CACHE_WRITE_PATHS.map(expandSandboxPath),
     ...extraWriteRoots,
   ]);
-  const gitCommonDir = findGitCommonDir(cwd);
-  const outsideRoots = gitCommonDir === undefined ? undefined : realpathOfNearest(gitCommonDir);
+  // Zero or one folder: the main git folder of a worktree.
+  const gitCommonDirs = realpathIfSet(findGitCommonDir(cwd));
   const denyWrite = dedupe([
     ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
-    ...(outsideRoots === undefined
-      ? []
-      : PROTECTED_GIT_COMMON_DIR_PATHS.map((name) => path.join(outsideRoots, name))),
+    ...gitCommonDirs.flatMap((dir) =>
+      PROTECTED_GIT_COMMON_DIR_PATHS.map((name) => path.join(dir, name))
+    ),
   ]);
   const allowRead = dedupe([
     ...writeRoots,
-    ...(outsideRoots === undefined ? [] : [outsideRoots]),
+    ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
     ...pathFoldersUnderHome(input.pathEnv, home),
     ...settings.extraReadPaths.map(expandSandboxPath),
   ]);
   return {
     writeRoots,
-    ...(outsideRoots === undefined ? {} : { gitCommonDir: outsideRoots }),
+    ...(gitCommonDirs.length > 0 ? { gitCommonDir: gitCommonDirs[0] } : {}),
     denyWrite,
     denyRead: dedupe([
       ...DENY_READ_ROOTS.map(realpathOfNearest),
@@ -151,6 +143,10 @@ export function buildAgentSandboxPolicy(
     allowedHosts: [...settings.allowedHosts],
     allowLocalBinding: true,
   };
+}
+
+function realpathIfSet(target: string | undefined): string[] {
+  return target === undefined || target.length === 0 ? [] : [realpathOfNearest(target)];
 }
 
 /** `root`, unless it is `/`, `~` or a parent of `~`: the sandbox would open the whole home. */
@@ -179,18 +175,14 @@ function protectedPathsUnder(root: string): string[] {
 function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string[] {
   if (pathEnv === undefined) return [];
   const tooBroad = new Set([home, path.join(home, ".local"), realpathOfNearest(getXumHome())]);
-  const folders: string[] = [];
-  for (const entry of pathEnv.split(path.delimiter)) {
-    if (!path.isAbsolute(entry)) continue;
+  const opens = (folder: string) => isPathAtOrUnder(folder, home) && !tooBroad.has(folder);
+  return pathEnv.split(path.delimiter).flatMap((entry) => {
+    if (!path.isAbsolute(entry)) return [];
     const folder = realpathOfNearest(entry);
-    if (!isPathAtOrUnder(folder, home) || tooBroad.has(folder)) continue;
-    folders.push(folder);
+    if (!opens(folder)) return [];
     const parent = path.dirname(folder);
-    if (path.basename(folder) === "bin" && !tooBroad.has(parent) && isPathAtOrUnder(parent, home)) {
-      folders.push(parent);
-    }
-  }
-  return folders;
+    return path.basename(folder) === "bin" && opens(parent) ? [folder, parent] : [folder];
+  });
 }
 
 /**
@@ -250,26 +242,32 @@ export function agentSandboxPolicyAllows(
   target: string,
   access: "read" | "write"
 ): boolean {
-  if (access === "write") {
-    const inRoot =
-      policy.writeRoots.some((root) => isPathAtOrUnder(target, root)) ||
-      (policy.gitCommonDir !== undefined && isPathAtOrUnder(target, policy.gitCommonDir));
-    if (!inRoot) return false;
-    if (policy.denyWrite.some((denied) => isPathAtOrUnder(target, denied))) return false;
-    if (
-      policy.denyRead.some(
-        (denied) => isNestedDeny(denied, policy) && isPathAtOrUnder(target, denied)
-      )
-    ) {
-      return false;
-    }
-    return true;
-  }
-  const deniedByRoot = policy.denyRead.some((denied) => isPathAtOrUnder(target, denied));
-  if (!deniedByRoot) return true;
-  const reopened = policy.allowRead.some((allowed) => isPathAtOrUnder(target, allowed));
-  if (!reopened) return false;
-  return !policy.denyRead.some(
+  return access === "write" ? writeAllowed(policy, target) : readAllowed(policy, target);
+}
+
+function writeAllowed(policy: AgentSandboxPolicy, target: string): boolean {
+  const roots =
+    policy.gitCommonDir === undefined
+      ? policy.writeRoots
+      : [...policy.writeRoots, policy.gitCommonDir];
+  return (
+    isUnderAny(target, roots) &&
+    !isUnderAny(target, policy.denyWrite) &&
+    !isUnderNestedDeny(policy, target)
+  );
+}
+
+function readAllowed(policy: AgentSandboxPolicy, target: string): boolean {
+  if (!isUnderAny(target, policy.denyRead)) return true;
+  return isUnderAny(target, policy.allowRead) && !isUnderNestedDeny(policy, target);
+}
+
+function isUnderAny(target: string, roots: readonly string[]): boolean {
+  return roots.some((root) => isPathAtOrUnder(target, root));
+}
+
+function isUnderNestedDeny(policy: AgentSandboxPolicy, target: string): boolean {
+  return policy.denyRead.some(
     (denied) => isNestedDeny(denied, policy) && isPathAtOrUnder(target, denied)
   );
 }

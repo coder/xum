@@ -238,32 +238,37 @@ export function srtUnquote(quoted: string): string[] {
   const args: string[] = [];
   let index = 0;
   while (index < quoted.length) {
-    let arg = "";
-    let sawQuote = false;
-    while (index < quoted.length && quoted[index] !== " ") {
-      const char = quoted[index];
-      if (char === "'") {
-        const end = quoted.indexOf("'", index + 1);
-        if (end === -1) throw new Error("unterminated quote");
-        arg += quoted.slice(index + 1, end);
-        index = end + 1;
-        sawQuote = true;
-      } else if (char === '"') {
-        const end = quoted.indexOf('"', index + 1);
-        if (end === -1) throw new Error("unterminated quote");
-        arg += quoted.slice(index + 1, end);
-        index = end + 1;
-        sawQuote = true;
-      } else {
-        arg += char;
-        index += 1;
-      }
-    }
-    if (arg.length > 0 || sawQuote) args.push(arg);
-    index += 1;
+    const read = readSrtWord(quoted, index);
+    if (read.word !== undefined) args.push(read.word);
+    index = read.next + 1;
   }
   if (srtQuote(args) !== quoted) throw new Error("not in srt's quoting");
   return args;
+}
+
+/** The word that starts at `start` (undefined for an empty run of spaces) and where it ends. */
+function readSrtWord(quoted: string, start: number): { word: string | undefined; next: number } {
+  let word = "";
+  let sawQuote = false;
+  let index = start;
+  while (index < quoted.length && quoted[index] !== " ") {
+    const char = quoted[index];
+    if (char === "'" || char === '"') {
+      const end = quoted.indexOf(char, index + 1);
+      if (end === -1) throw new Error("unterminated quote");
+      word += quoted.slice(index + 1, end);
+      index = end + 1;
+      sawQuote = true;
+    } else {
+      word += char;
+      index += 1;
+    }
+  }
+  return { word: word.length > 0 || sawQuote ? word : undefined, next: index };
+}
+
+function failSrtWrap(why: string): never {
+  throw new AgentSandboxStartError(`unexpected srt wrap (${why})`);
 }
 
 /**
@@ -272,31 +277,40 @@ export function srtUnquote(quoted: string): string[] {
  * it can edit the profile and keep its own child env; any other shape fails closed.
  */
 export function parseSrtMacosArgv(argv: readonly string[], script: string): SrtMacosSpawnPlan {
-  const fail = (why: string): never => {
-    throw new AgentSandboxStartError(`unexpected srt wrap (${why})`);
-  };
-  if (argv.length !== 3 || argv[1] !== "-c") fail("argv shape");
-  let words: string[] = [];
-  try {
-    words = srtUnquote(argv[2]);
-  } catch (error) {
-    fail(getErrorMessage(error));
+  if (argv.length !== 3 || argv[1] !== "-c") failSrtWrap("argv shape");
+  const words = unquoteSrtWrap(argv[2]);
+  if (words[0] !== "env") failSrtWrap("no env prefix");
+  const { assignments, rest } = splitEnvAssignments(words.slice(1));
+  if (rest.length !== 6 || rest[1] !== "-p" || rest[4] !== "-c") {
+    failSrtWrap("sandbox-exec arguments");
   }
-  if (words[0] !== "env") fail("no env prefix");
-  const assignments: Array<[string, string]> = [];
-  let index = 1;
-  for (; index < words.length && words[index] !== SANDBOX_EXEC_PATH; index++) {
-    const word = words[index];
-    // srt writes `-u NAME` only for credential env denies, which Xum does not configure.
-    if (word === "-u") fail("env -u");
-    const eq = word.indexOf("=");
-    if (eq <= 0) fail("env argument");
-    assignments.push([word.slice(0, eq), word.slice(eq + 1)]);
-  }
-  const rest = words.slice(index);
-  if (rest.length !== 6 || rest[1] !== "-p" || rest[4] !== "-c") fail("sandbox-exec arguments");
-  if (rest[5] !== script) fail("wrapped command");
+  if (rest[5] !== script) failSrtWrap("wrapped command");
   return { assignments, profile: rest[2], shell: rest[3] };
+}
+
+function unquoteSrtWrap(quoted: string): string[] {
+  try {
+    return srtUnquote(quoted);
+  } catch (error) {
+    return failSrtWrap(getErrorMessage(error));
+  }
+}
+
+/** The `NAME=value` words before sandbox-exec, and the words from sandbox-exec on. */
+function splitEnvAssignments(words: string[]): {
+  assignments: Array<[string, string]>;
+  rest: string[];
+} {
+  const execIndex = words.indexOf(SANDBOX_EXEC_PATH);
+  const envWords = execIndex === -1 ? words : words.slice(0, execIndex);
+  const assignments = envWords.map((word): [string, string] => {
+    // srt writes `-u NAME` only for credential env denies, which Xum does not configure.
+    if (word === "-u") failSrtWrap("env -u");
+    const eq = word.indexOf("=");
+    if (eq <= 0) failSrtWrap("env argument");
+    return [word.slice(0, eq), word.slice(eq + 1)];
+  });
+  return { assignments, rest: execIndex === -1 ? [] : words.slice(execIndex) };
 }
 
 /**
