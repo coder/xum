@@ -316,6 +316,33 @@ type DreamStreamTurn<T> =
   /** The cross-process lock could not be taken: `stream` never started. */
   | { outcome: "lock-failed"; error: string };
 
+/**
+ * Usage captured while a stream holds a queue turn, recorded once the turn is released.
+ * `recordHeadlessUsage` takes the session directory's lock, and a stall there must not hold every
+ * later run behind the same queue (see runDreamStreamExclusively and the analyzer queue). Best
+ * effort, in capture order: telemetry never fails a pass.
+ */
+function createDeferredUsageRecorder(label: string, workspaceId: string) {
+  const captured: Array<() => Promise<void>> = [];
+  return {
+    /** For `recordUsage`: queues `record` and returns at once. */
+    defer: (record: () => Promise<void>): Promise<void> => {
+      captured.push(record);
+      return Promise.resolve();
+    },
+    flush: async (): Promise<void> => {
+      for (const record of captured.splice(0)) {
+        await record().catch((error: unknown) => {
+          log.warn(`[${label}] could not record usage`, {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+      }
+    },
+  };
+}
+
 /** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
 function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -1073,11 +1100,8 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
-      // The stream's usage is recorded after its queue slot is released, not inside it:
-      // recordHeadlessUsage takes the session directory's lock, and a stall there must not hold
-      // every later workspace's dream. An array, not a `let`, because TS cannot narrow
-      // assignments made inside the callback.
-      const recordings: Array<() => Promise<void>> = [];
+      // The stream's usage is recorded after its queue slot is released, not inside it.
+      const usageRecorder = createDeferredUsageRecorder("MemoryConsolidation", workspaceId);
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1100,8 +1124,8 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: (usage, providerMetadata) => {
-            recordings.push(async () => {
+          recordUsage: (usage, providerMetadata) =>
+            usageRecorder.defer(async () => {
               const recorded = await self.sessionUsageService?.recordHeadlessUsage(
                 workspaceId,
                 modelString,
@@ -1120,9 +1144,7 @@ export class MemoryConsolidationService extends EventEmitter {
               if (recorded) {
                 self.emit("analyticsIngest", { workspaceId });
               }
-            });
-            return Promise.resolve();
-          },
+            }),
         });
       const turn = yield* Effect.promise(async () =>
         self.runDreamStreamExclusively(removalSignal, consolidate)
@@ -1145,17 +1167,7 @@ export class MemoryConsolidationService extends EventEmitter {
         return Err(`consolidation stream failed: ${result.streamError}`);
       }
 
-      // Best-effort, like the in-stream call it replaced: telemetry never fails the pass.
-      yield* Effect.promise(async () => {
-        for (const recordUsage of recordings) {
-          await recordUsage().catch((error: unknown) => {
-            log.warn("[MemoryConsolidation] could not record dream usage", {
-              workspaceId,
-              error: getErrorMessage(error),
-            });
-          });
-        }
-      });
+      yield* Effect.promise(usageRecorder.flush);
 
       const record: MemoryConsolidationRecord = {
         lastRunAt: Date.now(),
@@ -1401,46 +1413,55 @@ export class MemoryConsolidationService extends EventEmitter {
       // One analyzer at a time per owner store. The chunk timeouts start inside runMemoryHarvest,
       // so they bound the run and never the wait behind another one.
       const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId);
+      // Each clean chunk's usage is recorded after the owner's turn is released, not inside it.
+      const usageRecorder = createDeferredUsageRecorder("MemoryHarvest", metadata.workspaceId);
       const harvest = yield* Effect.tryPromise({
-        try: async () =>
-          self.analyzerStreams.run(ownerId, opts.removalSignal, async () =>
-            runMemoryHarvest({
-              model: modelResult.data.model,
-              pricingModel: modelResult.data.metadataModel,
-              memoryService: self.memoryService,
-              metaService: self.metaService,
-              ctx,
-              messages: epoch.data.messages,
-              summary: epoch.data.summary,
-              resume: opts.progress,
-              // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
-              // must not make the retry write the earlier chunks' memory again.
-              onChunkComplete: async (reached) => {
-                adopt(reached);
-                await Effect.runPromise(savePending(reached));
-              },
-              // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
-              abortSignal: opts.removalSignal,
-              recordUsage: async (usage, providerMetadata) => {
-                const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-                  metadata.workspaceId,
-                  modelString,
-                  usage,
-                  providerMetadata,
-                  {
-                    analyticsSource: "memory_harvest",
-                    // Creation-time identity (see ModelFactoryLike).
-                    metadataModel: modelResult.data.metadataModel,
-                  }
-                );
-                // Same as consolidation above: request an ingest pass so harvest
-                // spend reaches dashboard totals promptly.
-                if (recorded) {
-                  self.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
-                }
-              },
-            })
-          ),
+        try: async () => {
+          try {
+            return await self.analyzerStreams.run(ownerId, opts.removalSignal, async () =>
+              runMemoryHarvest({
+                model: modelResult.data.model,
+                pricingModel: modelResult.data.metadataModel,
+                memoryService: self.memoryService,
+                metaService: self.metaService,
+                ctx,
+                messages: epoch.data.messages,
+                summary: epoch.data.summary,
+                resume: opts.progress,
+                // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
+                // must not make the retry write the earlier chunks' memory again.
+                onChunkComplete: async (reached) => {
+                  adopt(reached);
+                  await Effect.runPromise(savePending(reached));
+                },
+                // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
+                abortSignal: opts.removalSignal,
+                recordUsage: (usage, providerMetadata) =>
+                  usageRecorder.defer(async () => {
+                    const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                      metadata.workspaceId,
+                      modelString,
+                      usage,
+                      providerMetadata,
+                      {
+                        analyticsSource: "memory_harvest",
+                        // Creation-time identity (see ModelFactoryLike).
+                        metadataModel: modelResult.data.metadataModel,
+                      }
+                    );
+                    // Same as consolidation above: request an ingest pass so harvest
+                    // spend reaches dashboard totals promptly.
+                    if (recorded) {
+                      self.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
+                    }
+                  }),
+              })
+            );
+          } finally {
+            // Also after a failed chunk: the chunks that finished before it were billed.
+            await usageRecorder.flush();
+          }
+        },
         catch: (error) => error,
       });
       // Removal reached this run while it was still queued: no chunk was read.
