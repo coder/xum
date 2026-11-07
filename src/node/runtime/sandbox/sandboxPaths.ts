@@ -101,6 +101,8 @@ export const HOME_READ_PATHS: readonly string[] = [
   ...PLUGIN_ROOTS,
   // Xum's own helper scripts (tool_env and the like).
   `${XUM_HOME_TOKEN}/bin`,
+  // The global tool hooks (hooks.ts): Xum runs them in the sandbox, so it must read them.
+  ...["tool_env", "tool_hook", "tool_pre", "tool_post"].map((name) => `${XUM_HOME_TOKEN}/${name}`),
 ];
 
 // Denied after the allows, so no open folder or extraReadPaths entry exposes them.

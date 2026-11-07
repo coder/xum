@@ -13,6 +13,7 @@ import { createBashTool } from "@/node/services/tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
+  agentSandboxPolicyAllows,
   buildAgentSandboxPolicy,
   setAgentSandboxTargets,
   type AgentSandboxPolicy,
@@ -316,6 +317,38 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           await new Promise<void>((resolve) => socketServer.close(() => resolve()));
         }
       });
+    });
+
+    it("lets commands read the global tool hooks but not the secrets next to them", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const previousRoot = process.env.XUM_ROOT;
+      // A Xum home under ~ (never created): ~ is a denied root, so only the carve-outs open.
+      const xumHome = path.join(
+        await fs.realpath(os.homedir()),
+        `.xum-sandbox-test-${process.pid}`
+      );
+      process.env.XUM_ROOT = xumHome;
+      try {
+        const policy = buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace });
+        const reads = (name: string) =>
+          agentSandboxPolicyAllows(policy, path.join(xumHome, name), "read");
+
+        expect(["tool_env", "tool_hook", "tool_pre", "tool_post"].map(reads)).toEqual([
+          true,
+          true,
+          true,
+          true,
+        ]);
+        expect(["config.json", "providers.jsonc", "server.lock"].map(reads)).toEqual([
+          false,
+          false,
+          false,
+        ]);
+      } finally {
+        if (previousRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousRoot;
+      }
     });
 
     it("hides the server token from sandboxed commands only", async () => {
