@@ -10,7 +10,7 @@ export const SANDBOX_APPROVAL_DENIED =
   "The user did not approve running this command outside the sandbox. Do not retry it outside the sandbox; find a way that works inside it, or ask the user.";
 
 /** Whether the macOS agent sandbox applies to the commands of this tool configuration. */
-export function agentSandboxApplies(config: ToolConfiguration): boolean {
+function agentSandboxApplies(config: ToolConfiguration): boolean {
   try {
     return config.runtime.agentSandboxPolicy?.({ cwd: config.cwd }) != null;
   } catch {

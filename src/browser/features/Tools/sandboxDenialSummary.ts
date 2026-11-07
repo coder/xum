@@ -1,10 +1,5 @@
 import type { BashToolResult } from "@/common/types/tools";
 
-/**
- * The footer line of a bash card whose command the sandbox blocked. The backend reports each
- * denial as "<kind> <target>" ("write /Users/me/.zshrc", "network paste.example.net"); the line
- * names the first one. Paths stay as reported: the browser does not know the backend's home.
- */
 const DENIAL_KINDS = {
   write: {
     blocked: "a write to",
@@ -24,6 +19,11 @@ function isDenialKind(kind: string): kind is keyof typeof DENIAL_KINDS {
   return Object.hasOwn(DENIAL_KINDS, kind);
 }
 
+/**
+ * The footer line of a bash card whose command the sandbox blocked. The backend reports each
+ * denial as "<kind> <target>" ("write /Users/me/.zshrc", "network paste.example.net"); the line
+ * names the first one. Paths stay as reported: the browser does not know the backend's home.
+ */
 export function describeSandboxDenials(result: BashToolResult | undefined): string | null {
   const denials = result && "sandboxDenials" in result ? result.sandboxDenials : undefined;
   const [first, ...others] = denials ?? [];

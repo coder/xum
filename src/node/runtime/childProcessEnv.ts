@@ -16,7 +16,7 @@ const CHILD_ENV_KEYS_TO_STRIP = [
 ] as const;
 
 // A sandboxed command can reach the API on loopback. Without the token it cannot answer a card.
-export const SANDBOXED_CHILD_ENV_KEYS_TO_STRIP = [
+const SANDBOXED_CHILD_ENV_KEYS_TO_STRIP = [
   ...CHILD_ENV_KEYS_TO_STRIP,
   "XUM_SERVER_AUTH_TOKEN",
   "MUX_SERVER_AUTH_TOKEN",

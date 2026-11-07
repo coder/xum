@@ -46,6 +46,7 @@ import {
   agentSandboxDenialsAfterExit,
   wrapForAgentSandbox,
   type AgentSandboxWrap,
+  type WrapForAgentSandboxOptions,
 } from "./sandbox/macosSandbox";
 import {
   agentSandboxSettingsFor,
@@ -519,7 +520,7 @@ export abstract class LocalBaseRuntime implements Runtime {
   protected async wrapForSandbox(
     cwd: string,
     script: string,
-    options: Parameters<typeof wrapForAgentSandbox>[3]
+    options: WrapForAgentSandboxOptions
   ): Promise<AgentSandboxWrap | null> {
     if (this.location !== "local") return null;
     try {
@@ -543,7 +544,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     workspacePath: string,
     script: string,
     initLogger: InitLogger,
-    options: Parameters<typeof wrapForAgentSandbox>[3]
+    options: WrapForAgentSandboxOptions
   ): Promise<{ ok: true; sandboxed: AgentSandboxWrap | null } | { ok: false }> {
     try {
       return { ok: true, sandboxed: await this.wrapForSandbox(workspacePath, script, options) };

@@ -70,13 +70,13 @@ export const PROTECTED_GIT_COMMON_DIR_PATHS: readonly string[] = ["hooks", "conf
 export const DENY_READ_ROOTS: readonly string[] = ["/Users", "/Volumes"];
 
 /** Global skill and plugin roots (agentSkillsService.ts): skill scripts run from them. */
-export const GLOBAL_SKILL_ROOTS: readonly string[] = [
+const GLOBAL_SKILL_ROOTS: readonly string[] = [
   `${XUM_HOME_TOKEN}/skills`,
   "~/.agents/skills",
   "~/.claude/skills",
   "~/.mux/skills",
 ];
-export const PLUGIN_ROOTS: readonly string[] = [`${XUM_HOME_TOKEN}/plugins`, "~/.agents/plugins"];
+const PLUGIN_ROOTS: readonly string[] = [`${XUM_HOME_TOKEN}/plugins`, "~/.agents/plugins"];
 
 // Open under ~ for each command, with the workspace, its scratch folder, the main .git of a
 // worktree, all write paths and extraReadPaths.
@@ -127,7 +127,7 @@ export function expandSandboxPath(entry: string): string {
 }
 
 /** `~/x`, `<xumHome>/x` or an absolute path, without resolving symlinks. */
-export function expandSandboxPathSpelling(entry: string): string {
+function expandSandboxPathSpelling(entry: string): string {
   if (entry === "~") return os.homedir();
   if (entry.startsWith("~/")) return path.join(os.homedir(), entry.slice(2));
   if (entry === XUM_HOME_TOKEN) return getXumHome();
