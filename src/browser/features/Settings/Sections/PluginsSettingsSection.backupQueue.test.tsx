@@ -14,7 +14,10 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIContext, APIProvider, type UseAPIResult } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
+import type {
+  AgentPluginInstallMethod,
+  AgentPluginInstallPreview,
+} from "@/common/orpc/schemas/agentPlugins";
 import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
 import {
@@ -85,10 +88,13 @@ function previewOf(
   };
 }
 
-/** A repository's preview, or one that depends on the ref the user asked for. */
+/** A repository's preview, or one that depends on the ref and the method the user asked for. */
 type PreviewOf =
   | AgentPluginInstallPreview
-  | ((ref: string | null | undefined) => AgentPluginInstallPreview);
+  | ((
+      ref: string | null | undefined,
+      method: AgentPluginInstallMethod | null | undefined
+    ) => AgentPluginInstallPreview);
 
 /** A client whose preview answers from `previews` by repository name, and the spies on it. */
 function previewingClient(previews: Record<string, PreviewOf>) {
@@ -101,7 +107,8 @@ function previewingClient(previews: Record<string, PreviewOf>) {
             success: true as const,
             data: {
               kind: "plugin" as const,
-              preview: typeof found[1] === "function" ? found[1](input.ref) : found[1],
+              preview:
+                typeof found[1] === "function" ? found[1](input.ref, input.method) : found[1],
             },
           }
         : { success: false as const, error: `Could not fetch ${input.input}` }
@@ -324,6 +331,87 @@ test("preselects only the components the backup kept that the preview still offe
   expect(installSpy.mock.calls[0]?.[0].importedComponents).toEqual({
     skills: ["keep"],
     mcpServers: [],
+  });
+});
+
+/**
+ * A repository that fits two install methods, with the same skills and commit under both: only
+ * the method the user asks for changes, so what a preview records can come only from the backup.
+ */
+const AGENT_PLUGIN: AgentPluginInstallMethod = { kind: "agent-plugin" };
+const SKILLS: AgentPluginInstallMethod = { kind: "skills" };
+function withTwoMethods(method: AgentPluginInstallMethod | null | undefined) {
+  return previewOf("alpha", {
+    method: method ?? AGENT_PLUGIN,
+    methods: [AGENT_PLUGIN, SKILLS],
+    skills: [{ name: "keep" }, { name: "other" }],
+  });
+}
+
+const BACKED_UP_CHOICE = { skills: ["keep"], mcpServers: [] };
+
+async function pickInstallAs(view: RenderResult, label: RegExp) {
+  fireEvent.click(await view.findByRole("radio", { name: label }));
+  await waitFor(() =>
+    expect(view.getByRole("radio", { name: label }).getAttribute("aria-checked")).toBe("true")
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+}
+
+test("another install method starts from its own components and records its own source", async () => {
+  const { view, installSpy } = renderWithBackup(
+    [backedUp("alpha", { importedComponents: BACKED_UP_CHOICE })],
+    { alpha: (_ref, method) => withTwoMethods(method) }
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  await pickInstallAs(view, /Skills/);
+
+  await clickButton(view, /^Install$/);
+
+  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+  expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
+    method: SKILLS,
+    // The preview's own pin, not the branch the backup tracked with the first method.
+    source: { ref: PINNED, refType: "commit" },
+    importedComponents: { skills: ["keep", "other"], mcpServers: [] },
+  });
+});
+
+test("the backup's choices return when the user picks the first method again", async () => {
+  const { view, installSpy } = renderWithBackup(
+    [backedUp("alpha", { importedComponents: BACKED_UP_CHOICE })],
+    { alpha: (_ref, method) => withTwoMethods(method) }
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  await pickInstallAs(view, /Skills/);
+  await pickInstallAs(view, /Agent Plugin/);
+
+  await clickButton(view, /^Install$/);
+
+  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+  expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
+    method: AGENT_PLUGIN,
+    source: { ref: "main", refType: "branch" },
+    importedComponents: BACKED_UP_CHOICE,
+  });
+});
+
+test("a plugin backed up with a method keeps its choices only for that method", async () => {
+  const { view, installSpy } = renderWithBackup(
+    [backedUp("alpha", { method: SKILLS, importedComponents: BACKED_UP_CHOICE })],
+    { alpha: (_ref, method) => withTwoMethods(method) }
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(view.getByRole("radio", { name: /Skills/ }).getAttribute("aria-checked")).toBe("true");
+  await pickInstallAs(view, /Agent Plugin/);
+
+  await clickButton(view, /^Install$/);
+
+  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+  expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
+    method: AGENT_PLUGIN,
+    source: { ref: PINNED, refType: "commit" },
+    importedComponents: { skills: ["keep", "other"], mcpServers: [] },
   });
 });
 

@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -11,6 +11,7 @@ import type {
   AgentPluginInstallPreview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
+import { methodKey } from "./PluginInstallMethods";
 
 /**
  * Reinstalling the plugins a settings backup lists, one install review at a time. The backup
@@ -86,6 +87,25 @@ export function usePreviewOnMount(
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see above: only the API decides when to run
   }, [api]);
+}
+
+/**
+ * Which previews of a backed-up plugin the backup still describes: those with the install method
+ * the first preview resolved (the backup's own method, or the first that fits). Another method of
+ * the Install as picker offers other components and tracks its source another way, so its preview
+ * starts from its own defaults. Switching back to the first method brings the backup's choices
+ * back. Gives the backup's plugin for a preview that keeps the method, and undefined for another.
+ * Call it from handlers only: the first preview it sees fixes the method.
+ */
+export function useSeedForPreview(
+  seed: BackupPluginEntry | undefined
+): (preview: Pick<AgentPluginInstallPreview, "method">) => BackupPluginEntry | undefined {
+  const firstMethod = useRef<string | null>(null);
+  return (preview) => {
+    const method = methodKey(preview.method);
+    firstMethod.current ??= method;
+    return firstMethod.current === method ? seed : undefined;
+  };
 }
 
 /**

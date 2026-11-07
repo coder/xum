@@ -68,6 +68,7 @@ import {
   seededForm,
   selectedComponents,
   usePreviewOnMount,
+  useSeedForPreview,
   type PreviewResult,
 } from "./pluginBackupQueue";
 
@@ -765,6 +766,7 @@ const AddPluginPanel: React.FC<{
 }> = (props) => {
   const { api } = useAPI();
   const form = seededForm(props.seed);
+  const seedFor = useSeedForPreview(props.seed);
   const [input, setInput] = useState(form.input);
   const [ref, setRef] = useState(form.ref);
   const [subpath, setSubpath] = useState(form.subpath);
@@ -797,7 +799,7 @@ const AddPluginPanel: React.FC<{
       setPreview(next);
       setPreviewedEntry(entryOfMethod(method));
       // An accepted preview starts a new consent decision; failed attempts retain choices.
-      setSelected(selectedComponents(next, props.seed));
+      setSelected(selectedComponents(next, seedFor(next)));
     }
   };
 
@@ -844,7 +846,7 @@ const AddPluginPanel: React.FC<{
     setError(null);
     try {
       const result = await api.agentPlugins.install({
-        source: installSource(preview, props.seed),
+        source: installSource(preview, seedFor(preview)),
         method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
