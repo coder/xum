@@ -18,6 +18,7 @@ import { assertNever } from "@/common/utils/assertNever";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
+  memoryToolDefinitionChars,
 } from "@/node/services/memoryConsolidation";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import { redactSecretLike } from "@/node/services/memorySecretRedaction";
@@ -180,7 +181,7 @@ function renderToolResult(part: MuxToolPart): string {
  * command actually did, and a tool result is the strongest evidence of it. Nested `code_execution`
  * calls are not rendered; the outer result is what the model saw.
  */
-export function renderToolPart(part: MuxToolPart): string {
+function renderToolPart(part: MuxToolPart): string {
   const input = boundToolText(stringifyToolValue(part.input), HARVEST_MAX_TOOL_INPUT_CHARS);
   return `TOOL CALL ${part.toolName}: ${input}\n${renderToolResult(part)}`;
 }
@@ -559,8 +560,9 @@ async function analyzeChunk(args: {
 }
 
 /**
- * The characters the first step of each chunk from the resume cursor on sends: the system prompt plus
- * that chunk's prompt. It is the input of the cost estimate, which adds what the model reads.
+ * The characters the first step of each chunk from the resume cursor on sends: the system prompt,
+ * the memory tool's definition and that chunk's prompt. It is the input of the cost estimate,
+ * which adds what the model reads.
  */
 export function harvestChunkInputChars(args: {
   messages: HarvestEpoch["messages"];
@@ -573,11 +575,13 @@ export function harvestChunkInputChars(args: {
   // A run whose budget is spent skips every chunk (see runMemoryHarvest): it makes no model call,
   // so it costs nothing and a lowered ceiling must not refuse it.
   if (budgetUsed >= MEMORY_ANALYZER_OP_BUDGET) return [];
+  const fixedChars =
+    MEMORY_ANALYZER_SYSTEM_PROMPT.length + memoryToolDefinitionChars(ANALYZER_TOOL_DESCRIPTION);
   return chunks.flatMap(({ transcript }, index) =>
     index < startChunk
       ? []
       : [
-          MEMORY_ANALYZER_SYSTEM_PROMPT.length +
+          fixedChars +
             buildChunkPrompt({
               summary: args.summary,
               index,

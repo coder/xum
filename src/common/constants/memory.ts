@@ -80,7 +80,7 @@ export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 /**
- * Memory analyzer (the harvest of one closed compaction epoch): mutating memory
+ * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
  * commands for the whole epoch. All of its transcript chunks, and a retry of the
  * epoch, spend one budget, so a long epoch cannot out-write a short one.
  */
@@ -90,14 +90,14 @@ export const MEMORY_ANALYZER_MAX_STEPS = 12;
 /**
  * Output cap of one model call (one step) of the analyzer and of the organizer. The dream's cost
  * estimate prices each step's output at this many tokens, and the cap makes that a limit the run
- * cannot exceed, so the estimate stays an upper bound however long a reply the model tries to
- * write. A memory command longer than this is cut off and fails to parse; the model sees the
+ * cannot exceed, so the estimate never has to guess at output however long a reply the model tries
+ * to write. A memory command longer than this is cut off and fails to parse; the model sees the
  * failure and can write it in smaller pieces.
  */
 export const MEMORY_MAX_OUTPUT_TOKENS_PER_STEP = 4_096;
 /**
- * Smallest dream cost ceiling a user can set, in USD. A run's cost estimate is an upper bound
- * that rarely falls below a cent, so a lower ceiling would only refuse every run.
+ * Smallest dream cost ceiling a user can set, in USD. A run's cost estimate is deliberately high
+ * and rarely falls below a cent, so a lower ceiling would only refuse every run.
  */
 export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
 /**

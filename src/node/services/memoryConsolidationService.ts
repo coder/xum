@@ -79,11 +79,14 @@ import {
   type HarvestEpoch,
   type HarvestProgress,
 } from "@/node/services/memoryHarvest";
-import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
+import {
+  memoryToolDefinitionChars,
+  runMemoryConsolidation,
+} from "@/node/services/memoryConsolidation";
 import {
   checkCostCeiling,
-  estimateAnalyzerUpperBoundUsd,
-  estimateOrganizerUpperBoundUsd,
+  estimateAnalyzerUsd,
+  estimateOrganizerUsd,
 } from "@/node/services/memoryCostEstimate";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -1204,10 +1207,10 @@ export class MemoryConsolidationService extends EventEmitter {
       // Estimated before the stream, so a run the ceiling refuses costs nothing and leaves no
       // record: nothing then debounces it, and raising the ceiling lets the next trigger run.
       const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
-      const estimatedUsd = estimateOrganizerUpperBoundUsd({
+      const estimatedUsd = estimateOrganizerUsd({
         pricingModel: modelResult.data.metadataModel,
         serviceTier: modelResult.data.serviceTier,
-        systemPromptChars: agentBody.length,
+        fixedInputChars: agentBody.length + memoryToolDefinitionChars(),
         memoryChars: memoryBytes,
       });
       const ceiling = checkCostCeiling({
@@ -1512,8 +1515,9 @@ export class MemoryConsolidationService extends EventEmitter {
         ops: existing?.ops ?? [],
         budgetUsed: existing?.budgetUsed,
         nextChunkOps: existing?.nextChunkOps,
-        // Kept across an attempt that fails before it reads a chunk (a ceiling refusal): its
-        // failure record would otherwise drop what the earlier attempt's chunks read.
+        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot
+        // be loaded, or the ceiling refuses it): its failure record would otherwise drop what the
+        // earlier attempt's chunks read.
         readThroughRowId: existing?.readThroughRowId,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
@@ -1685,7 +1689,7 @@ export class MemoryConsolidationService extends EventEmitter {
       // Estimated before any model call, so a job the ceiling refuses costs nothing. Only the
       // chunks still to analyze count: a retry resumes after the chunks that landed.
       const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
-      opts.attemptState.estimatedUsd = estimateAnalyzerUpperBoundUsd({
+      opts.attemptState.estimatedUsd = estimateAnalyzerUsd({
         pricingModel: modelResult.data.metadataModel,
         serviceTier: modelResult.data.serviceTier,
         chunkInputChars: harvestChunkInputChars({

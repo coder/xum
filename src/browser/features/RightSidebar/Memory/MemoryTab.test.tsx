@@ -407,7 +407,7 @@ describe("MemoryTab", () => {
 
   test("wraps the harvest line and a manual run's error instead of truncating them", async () => {
     const error =
-      "consolidation not started: estimate 4.06 USD (an upper bound) is over the ceiling";
+      "consolidation not started: estimate 4.06 USD (deliberately high, not a bill) is over the ceiling";
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
         ...DEFAULT_CONSOLIDATION_STATUS,
@@ -506,16 +506,16 @@ describe("MemoryTab", () => {
           nextChunk: 0,
           ops: [],
           estimatedUsd: 3.2,
-          error: "estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling",
+          error: "estimate 3.20 USD (deliberately high, not a bill) is over the 1.00 USD ceiling",
         },
       },
     });
     const { findByRole, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     expect((await findByRole("alert")).textContent).toContain(
-      "Harvest error: estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling"
+      "Harvest error: estimate 3.20 USD (deliberately high, not a bill) is over the 1.00 USD ceiling"
     );
-    await findByText("Harvest: failed: 0 edits / 0 rejected · est. up to $3.20");
+    await findByText("Harvest: failed: 0 edits / 0 rejected · high est. $3.20");
   });
 
   test("tells the user that the cost ceiling stopped the dream, and shows nothing without a refusal", async () => {
@@ -524,7 +524,7 @@ describe("MemoryTab", () => {
         ...DEFAULT_CONSOLIDATION_STATUS,
         latestRefusal: {
           at: Date.now() - 60_000,
-          reason: "estimate 4.06 USD (an upper bound) is over the 1.00 USD ceiling",
+          reason: "estimate 4.06 USD (deliberately high, not a bill) is over the 1.00 USD ceiling",
           estimatedUsd: 4.06,
         },
       },
@@ -554,7 +554,7 @@ describe("MemoryTab", () => {
     });
     const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
-    await findByText(/^Workspace: .*1 change · est\. up to \$0\.42$/);
+    await findByText(/^Workspace: .*1 change · high est\. \$0\.42$/);
     const globalLine = await findByText(/^Global: /);
     expect(globalLine.textContent).not.toContain("est.");
   });
@@ -569,9 +569,9 @@ describe("MemoryTab", () => {
     });
     const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
-    await findByText(/^Workspace: .*est\. up to under \$0\.01$/);
+    await findByText(/^Workspace: .*high est\. under \$0\.01$/);
     // A cent is not under a cent.
-    await findByText(/^Global: .*est\. up to \$0\.01$/);
+    await findByText(/^Global: .*high est\. \$0\.01$/);
   });
 
   test("shows usage stats for used files and omits them for never-used files", async () => {

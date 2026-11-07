@@ -11,17 +11,13 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
-import {
-  checkCostCeiling,
-  estimateAnalyzerUpperBoundUsd,
-  estimateOrganizerUpperBoundUsd,
-} from "./memoryCostEstimate";
+import { checkCostCeiling, estimateAnalyzerUsd, estimateOrganizerUsd } from "./memoryCostEstimate";
 
 const UNPRICED_MODEL = "ollama:no-such-model";
 
-describe("estimateAnalyzerUpperBoundUsd", () => {
+describe("estimateAnalyzerUsd", () => {
   const priced = (chunkInputChars: number[], memoryChars = 0) =>
-    estimateAnalyzerUpperBoundUsd({ pricingModel: defaultModel, chunkInputChars, memoryChars });
+    estimateAnalyzerUsd({ pricingModel: defaultModel, chunkInputChars, memoryChars });
 
   it("costs a job of two chunks as the two chunks run apart", () => {
     expect(priced([8_000, 20_000])).toBeCloseTo((priced([8_000]) ?? 0) + (priced([20_000]) ?? 0));
@@ -49,8 +45,7 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
       expect(stats?.cache_read_input_token_cost).toBeLessThan(input);
       const [small, large] = [40_000, 80_000];
       const estimate = (chars: number) =>
-        estimateAnalyzerUpperBoundUsd({ pricingModel, chunkInputChars: [chars], memoryChars: 0 }) ??
-        0;
+        estimateAnalyzerUsd({ pricingModel, chunkInputChars: [chars], memoryChars: 0 }) ?? 0;
 
       const perToken =
         (estimate(large) - estimate(small)) / ((large - small) / APPROX_CHARS_PER_TOKEN);
@@ -61,7 +56,7 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
 
   it("has no estimate for a model with no known price", () => {
     expect(
-      estimateAnalyzerUpperBoundUsd({
+      estimateAnalyzerUsd({
         pricingModel: UNPRICED_MODEL,
         chunkInputChars: [8_000],
         memoryChars: 0,
@@ -70,12 +65,12 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
   });
 });
 
-describe("estimateOrganizerUpperBoundUsd", () => {
+describe("estimateOrganizerUsd", () => {
   it("grows with the memory the run may read", () => {
     const estimate = (memoryChars: number) =>
-      estimateOrganizerUpperBoundUsd({
+      estimateOrganizerUsd({
         pricingModel: defaultModel,
-        systemPromptChars: 5_000,
+        fixedInputChars: 5_000,
         memoryChars,
       }) ?? 0;
     expect(estimate(0)).toBeGreaterThan(0);
@@ -85,7 +80,7 @@ describe("estimateOrganizerUpperBoundUsd", () => {
 
 describe("output of each step", () => {
   // With no prompt at all, a run is only its output: every step writes the cap, and each later
-  // step reads all earlier output back as input. The sum is a requirement of the bound, not a
+  // step reads all earlier output back as input. The sum is a requirement of the estimate, not a
   // reading of the code: S steps of output at the output rate, plus the earlier outputs
   // (0 + 1 + ... + S-1 of them) at the input rate.
   const MODEL = "openai:gpt-6.1-sol";
@@ -98,9 +93,9 @@ describe("output of each step", () => {
     const outputUsd = steps * cap * output;
     const readBackUsd = ((steps * (steps - 1)) / 2) * cap * input;
 
-    const estimate = estimateOrganizerUpperBoundUsd({
+    const estimate = estimateOrganizerUsd({
       pricingModel: MODEL,
-      systemPromptChars: 0,
+      fixedInputChars: 0,
       memoryChars: 0,
     });
 
@@ -113,16 +108,16 @@ describe("service tier", () => {
   // 0.5x, Ultrafast 6x. A reported "default" or "auto" bills at Standard.
   const MODEL = "openai:gpt-6.1-sol";
   const analyzer = (serviceTier?: ServiceTier) =>
-    estimateAnalyzerUpperBoundUsd({
+    estimateAnalyzerUsd({
       pricingModel: MODEL,
       chunkInputChars: [8_000, 20_000],
       memoryChars: 30_000,
       serviceTier,
     }) ?? 0;
   const organizer = (serviceTier?: ServiceTier) =>
-    estimateOrganizerUpperBoundUsd({
+    estimateOrganizerUsd({
       pricingModel: MODEL,
-      systemPromptChars: 12_000,
+      fixedInputChars: 12_000,
       memoryChars: 30_000,
       serviceTier,
     }) ?? 0;
@@ -141,9 +136,9 @@ describe("service tier", () => {
 
   it("applies the tier to the long-context rates too (a prompt over the 272k threshold)", () => {
     const longPrompt = (serviceTier?: ServiceTier) =>
-      estimateOrganizerUpperBoundUsd({
+      estimateOrganizerUsd({
         pricingModel: MODEL,
-        systemPromptChars: 12_000,
+        fixedInputChars: 12_000,
         memoryChars: 400_000 * APPROX_CHARS_PER_TOKEN,
         serviceTier,
       }) ?? 0;
@@ -168,15 +163,16 @@ describe("calibration against a recorded dream", () => {
   it("prices the same workload at no less than its recorded cost", () => {
     const recordedUsd = getTotalCost(createDisplayUsage(RECORDED_USAGE, MODEL)) ?? 0;
     const estimate =
-      estimateOrganizerUpperBoundUsd({
+      estimateOrganizerUsd({
         pricingModel: MODEL,
-        systemPromptChars: SYSTEM_PROMPT_CHARS,
+        fixedInputChars: SYSTEM_PROMPT_CHARS,
         memoryChars,
       }) ?? 0;
 
     expect(recordedUsd).toBeGreaterThan(0);
-    // An upper bound must not fall under what the run billed. It is not held near that bill: the
-    // recorded run was 93% cache hits, and the estimate takes none, so it sits about ten times over.
+    // A deliberately high estimate must not fall under what this run billed. It is not held near
+    // that bill: the recorded run was 93% cache hits, and the estimate takes none, so it sits
+    // about ten times over.
     expect(estimate).toBeGreaterThanOrEqual(recordedUsd);
   });
 });

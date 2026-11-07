@@ -16,6 +16,7 @@ import { Config } from "@/node/config";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
+  memoryToolDefinitionChars,
   runMemoryConsolidation,
   type MemoryConsolidationOp,
 } from "./memoryConsolidation";
@@ -1091,6 +1092,52 @@ describe("runMemoryConsolidation", () => {
     });
 
     expect(received).toEqual([MEMORY_MAX_OUTPUT_TOKENS_PER_STEP]);
+  });
+
+  // Every step resends the tool definition, and the cost estimate counts it from this measure.
+  it("measures the memory tool definition as the model receives it", async () => {
+    using fixture = await createFixture();
+    const received: string[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: (options) => {
+        for (const tool of options.tools ?? []) {
+          if (tool.type !== "function") continue;
+          received.push(
+            JSON.stringify({
+              name: tool.name,
+              description: tool.description,
+              parameters: tool.inputSchema,
+            })
+          );
+        }
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        });
+      },
+    });
+
+    await runMemoryConsolidation({
+      model,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+    });
+
+    expect(received).toHaveLength(1);
+    expect(memoryToolDefinitionChars()).toBe(received[0].length);
   });
 
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {

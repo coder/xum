@@ -65,8 +65,10 @@ export function MemoryDreamCostCeilingSetting() {
         </label>
         <div className="text-muted mt-0.5 text-xs">
           A dream run whose estimated cost is over this many US dollars does not start. The estimate
-          is an upper bound, not a bill: it assumes every step resends the whole prompt and every
-          memory file, so the real cost is usually lower. Leave empty for no ceiling.
+          is deliberately high, not a bill: it assumes every step resends the whole prompt, every
+          memory file and the tool definition at the uncached rate, and writes as much as it may, so
+          the real cost is usually lower. It can still fall under the bill for text that splits into
+          more tokens than usual, such as code or non-Latin scripts. Leave empty for no ceiling.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">

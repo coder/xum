@@ -76,6 +76,26 @@ function systemPromptText(options: LanguageModelV3CallOptions): string {
     .join("\n");
 }
 
+/**
+ * What a first step sends: the system prompt, the user prompt and the memory tool's definition,
+ * which goes out with every step.
+ */
+function firstStepChars(options: LanguageModelV3CallOptions): number {
+  const toolDefinitionChars = (options.tools ?? []).reduce(
+    (total, tool) =>
+      tool.type !== "function"
+        ? total
+        : total +
+          JSON.stringify({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema,
+          }).length,
+    0
+  );
+  return systemPromptText(options).length + userPromptText(options).length + toolDefinitionChars;
+}
+
 /** What the tool calls returned to the model, as the next step's prompt carries it. */
 function toolResultsText(options: LanguageModelV3CallOptions | undefined): string {
   return JSON.stringify(options?.prompt.filter((message) => message.role === "tool") ?? []);
@@ -625,7 +645,7 @@ describe("runMemoryHarvest", () => {
     fixture.messages = manyChunkMessages();
     const { model, calls } = scriptedModel([]);
     await runHarvest(fixture, model);
-    const sent = calls.map((call) => systemPromptText(call).length + userPromptText(call).length);
+    const sent = calls.map(firstStepChars);
 
     expect(sent).toHaveLength(3);
     expect(
@@ -1331,7 +1351,7 @@ describe("runMemoryHarvest", () => {
       };
       const { model, calls } = scriptedModel([]);
       await runHarvest(fixture, model, { resume });
-      const sent = calls.map((call) => systemPromptText(call).length + userPromptText(call).length);
+      const sent = calls.map(firstStepChars);
 
       expect(
         harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary, resume })

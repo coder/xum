@@ -33,6 +33,7 @@ import {
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
+import { estimateOrganizerUsd } from "./memoryCostEstimate";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MEMORY_ANALYZER_SYSTEM_PROMPT } from "./memoryHarvest";
 import { HistoryService } from "./historyService";
@@ -338,6 +339,8 @@ interface Fixture extends Disposable {
   setEnabled: (enabled: boolean) => void;
   /** When true, scripted runs emit a fatal stream error instead of finishing. */
   setStreamFailing: (failing: boolean) => void;
+  /** When true, creating the run's model returns an error: a run fails before it reads a chunk. */
+  setModelUnavailable: (unavailable: boolean) => void;
   addWorkspace: (
     id: string,
     opts?: { archivedAt?: string; parentWorkspaceId?: string }
@@ -375,6 +378,7 @@ async function createFixture(options?: {
 
   let enabled = true;
   let streamFailing = false;
+  let modelUnavailable = false;
   const modelCalls: number[] = [];
   const modelPrompts: string[] = [];
   const capturePrompt = (prompt: string) => modelPrompts.push(prompt);
@@ -387,6 +391,7 @@ async function createFixture(options?: {
       createModelWithPinnedMetadata: async (modelString: string) => {
         modelCalls.push(Date.now());
         if (options?.modelGate) await options.modelGate;
+        if (modelUnavailable) return Err({ type: "api_key_not_found" });
         return Ok({
           model:
             options?.modelFactory?.() ??
@@ -417,6 +422,9 @@ async function createFixture(options?: {
     },
     setStreamFailing: (value) => {
       streamFailing = value;
+    },
+    setModelUnavailable: (value) => {
+      modelUnavailable = value;
     },
     addWorkspace: async (id, opts) => {
       await config.editConfig((cfg) => {
@@ -2454,6 +2462,35 @@ describe("MemoryConsolidationService", () => {
           expect((await harvestRecords(fixture))["open:open-new"]?.status).toBe("completed");
         });
 
+        it("keeps the rows its chunks read through a retry that fails before it reads a chunk", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+
+          // The retry cannot load its model, so it fails with nothing read of its own.
+          fixture.setModelUnavailable(true);
+          await fixture.service.maybeRunArchivePass("ws-dream");
+          fixture.setModelUnavailable(false);
+
+          const failed = (await harvestRecords(fixture))["open:bulk-11"];
+          expect(failed?.error).toContain("could not create model");
+          expect(failed).toMatchObject({
+            status: "failed",
+            attemptCount: 2,
+            nextChunk: 1,
+            readThroughRowId: "bulk-4",
+          });
+          // The failure record is what the next run's floor comes from: it still skips chunk 1.
+          const before = scripted.prompts.length;
+          await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+          const closing = scripted.prompts
+            .slice(before)
+            .filter((run) => run.closing)
+            .map((run) => run.prompt)
+            .join("\n");
+          expectRowsFromFive(closing);
+        });
+
         it("starts the compaction that closes the epoch behind the chunks it read", async () => {
           const scripted = archiveFailingAtItsSecondChunk();
           using fixture = await createFixture({ modelFactory: scripted.factory });
@@ -2954,6 +2991,30 @@ describe("MemoryConsolidationService", () => {
       expect(harvest?.status).toBe("completed");
       expect(harvest?.estimatedUsd).toBeGreaterThan(0);
       expect((await fixture.service.getRecord("ws-dream"))?.estimatedUsd).toBeGreaterThan(0);
+    });
+
+    it("counts the memory tool's definition, which every step resends, in the organizer's estimate", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      const agentBody = (await resolveDreamAgentBody(fixture.xumHome)) ?? "";
+      const memoryChars = await fixture.memoryService.measureVisibleBytes({
+        runtime: null,
+        checkoutCwd: "",
+        workspaceId: "ws-dream",
+        projectPath: "/projects/demo",
+      });
+      const pricingModel = resolveDreamModelString(fixture.config, "ws-dream");
+      const forSystemPromptAndMemory = estimateOrganizerUsd({
+        pricingModel,
+        fixedInputChars: agentBody.length,
+        memoryChars,
+      });
+
+      const run = await fixture.service.maybeRun("ws-dream", "manual");
+
+      expect(run.success).toBe(true);
+      const recorded = run.success ? run.data.estimatedUsd : undefined;
+      expect(recorded).toBeGreaterThan(forSystemPromptAndMemory ?? Infinity);
     });
 
     it("starts no analyzer stream over the ceiling, and records the reason and the estimate", async () => {

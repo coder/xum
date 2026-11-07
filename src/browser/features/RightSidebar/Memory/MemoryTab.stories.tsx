@@ -214,7 +214,8 @@ export const Editor: Story = {
   },
 };
 
-const CEILING_REASON = "estimate 4.06 USD (an upper bound) is over the 1.00 USD ceiling";
+const CEILING_REASON =
+  "estimate 4.06 USD (deliberately high, not a bill) is over the 1.00 USD ceiling";
 
 // A touch screen cannot open the tooltip that also holds the reason, so the line itself must show
 // all of it: a truncated alert read "Dream stopped 2 minutes ago: estimate 4.06 USD (an up…".

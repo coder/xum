@@ -92,8 +92,9 @@ export const MemoryConsolidationRecordSchema = z.object({
   /** Token cost of the run (absent for records persisted before telemetry). */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**
-   * Upper-bound USD estimate made before the run (not its bill). Optional so older binaries
-   * parse the record and for models with no known price.
+   * Deliberately high USD estimate made before the run (not its bill, and it can still fall under
+   * one for text that tokenizes densely). Optional so older binaries parse the record and for
+   * models with no known price.
    */
   estimatedUsd: z.number().optional(),
 });
@@ -134,10 +135,10 @@ export const CompactionCompletionMetadataSchema = z.object({
 const PersistedCountSchema = z.number().int().nonnegative();
 
 /**
- * One analyzer run over a closed compaction epoch (the "harvest"). The two candidate counts keep
- * their names and stay required so older binaries still parse the record: they hold the memory
- * edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are optional for
- * the same reason, and for records written before the analyzer.
+ * One analyzer run over a closed or open compaction epoch (the "harvest"). The two candidate
+ * counts keep their names and stay required so older binaries still parse the record: they hold
+ * the memory edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are
+ * optional for the same reason, and for records written before the analyzer.
  */
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
@@ -187,8 +188,9 @@ export const MemoryHarvestRecordSchema = z.object({
   readThroughRowId: z.string().nullish(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**
-   * Upper-bound USD estimate of the attempt's chunks still to analyze, made before the attempt
-   * (not its bill). Optional so older binaries parse the record and for models with no known price.
+   * Deliberately high USD estimate of the attempt's chunks still to analyze, made before the
+   * attempt (not its bill, and it can still fall under one for text that tokenizes densely).
+   * Optional so older binaries parse the record and for models with no known price.
    */
   estimatedUsd: z.number().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),

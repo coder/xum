@@ -185,7 +185,7 @@ export const UserPreferencesSchema = z.object({
     .object({
       /**
        * Most one dream run (an analyzer job or an organizer run) may cost, in USD, by its own
-       * upper-bound estimate. Absent means no ceiling.
+       * deliberately high estimate (not a hard cap on the bill). Absent means no ceiling.
        */
       dreamCostCeilingUsd: z
         .number()

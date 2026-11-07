@@ -1,18 +1,24 @@
 /**
- * Upper-bound cost estimates for the dream's two model runs, and the ceiling check that refuses a
- * run before it starts.
+ * Deliberately high cost estimates for the dream's two model runs, and the ceiling check that
+ * refuses a run before it starts.
  *
- * These are not bills, but they never fall under one: every assumption errs high. The run takes
- * every step its cap allows, its prompt already holds every visible memory file, and each step
- * writes as many tokens as the output cap lets it. That cap is on both streams, so it is a limit
- * of the run, not a guess; output costs several times what input does, and the next step reads
- * it back as input. The estimate also takes nothing it cannot guarantee. A provider's prompt
- * cache may miss, expire or be off for the route, so every input token of every step, the first
- * prompt and each resent prefix, prices at the uncached input rate. A model whose table lists a
- * cache-write rate (Anthropic bills about 1.25x input) prices the first step's prompt at the
- * higher of the two, since that step may be the one that writes the prefix to the cache. Real
- * runs stop earlier, read less, write less and hit the cache, so the bill usually falls well
- * under the estimate (the one run recorded on this host billed 93% of its input as cache reads).
+ * These are not bills, and not bounds either: every assumption errs high, but one can err low.
+ * The run takes every step its cap allows, its prompt already holds every visible memory file,
+ * and each step writes as many tokens as the output cap lets it. That cap is on both streams, so
+ * it is a limit of the run, not a guess; output costs several times what input does, and the next
+ * step reads it back as input. The estimate also takes no discount it cannot be sure of. A
+ * provider's prompt cache may miss, expire or be off for the route, so every input token of every
+ * step, the first prompt and each resent prefix, prices at the uncached input rate. A model whose
+ * table lists a cache-write rate (Anthropic bills about 1.25x input) prices the first step's
+ * prompt at the higher of the two, since that step may be the one that writes the prefix to the
+ * cache. Real runs stop earlier, read less, write less and hit the cache, so the bill usually
+ * falls well under the estimate (the one run recorded on this host billed 93% of its input as
+ * cache reads).
+ *
+ * What can still put a bill over the estimate is the token count of the prompt: text is counted
+ * as APPROX_CHARS_PER_TOKEN characters per token, and text that tokenizes denser (code, other
+ * scripts, encoded data) bills more tokens than that. The system prompt and the memory tool's
+ * definition, which every step resends, are counted from the real ones by the callers.
  */
 import {
   MEMORY_ANALYZER_MAX_STEPS,
@@ -68,10 +74,11 @@ function estimateRunUsd(
 }
 
 /**
- * Estimate of an analyzer job: each chunk (the characters its first step sends, system prompt
- * included) runs up to the analyzer's step cap over the chunk and `memoryChars` of memory read.
+ * Estimate of an analyzer job: each chunk (the characters its first step sends, system prompt and
+ * tool definition included) runs up to the analyzer's step cap over the chunk and `memoryChars` of
+ * memory read.
  */
-export function estimateAnalyzerUpperBoundUsd(args: {
+export function estimateAnalyzerUsd(args: {
   pricingModel: string;
   chunkInputChars: readonly number[];
   memoryChars: number;
@@ -92,18 +99,18 @@ export function estimateAnalyzerUpperBoundUsd(args: {
 }
 
 /**
- * Estimate of an organizer run: up to the organizer's step cap over its system prompt and
- * `memoryChars` of memory read.
+ * Estimate of an organizer run: up to the organizer's step cap over `fixedInputChars` (its system
+ * prompt and its tool definition) and `memoryChars` of memory read.
  */
-export function estimateOrganizerUpperBoundUsd(args: {
+export function estimateOrganizerUsd(args: {
   pricingModel: string;
-  systemPromptChars: number;
+  fixedInputChars: number;
   memoryChars: number;
   serviceTier?: ServiceTier;
 }): number | undefined {
   return estimateRunUsd(
     args.pricingModel,
-    args.systemPromptChars + args.memoryChars,
+    args.fixedInputChars + args.memoryChars,
     MEMORY_CONSOLIDATION_MAX_STEPS,
     args.serviceTier
   );
@@ -148,6 +155,6 @@ export function checkCostCeiling(args: {
   if (args.estimatedUsd <= args.ceilingUsd) return { allowed: true };
   return {
     allowed: false,
-    reason: `estimate ${formatEstimateUsd(args.estimatedUsd)} USD (an upper bound) is over the ${ceiling}`,
+    reason: `estimate ${formatEstimateUsd(args.estimatedUsd)} USD (deliberately high, not a bill) is over the ${ceiling}`,
   };
 }

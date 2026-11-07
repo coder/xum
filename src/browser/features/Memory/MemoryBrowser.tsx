@@ -504,10 +504,10 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
-/** The cost estimate recorded before a run: an upper bound, so it reads "up to", never as a bill. */
+/** The recorded pre-run estimate is deliberately high, so it reads "high est.", never as a bill. */
 function formatEstimate(estimatedUsd: number | undefined): string {
   if (estimatedUsd === undefined) return "";
-  return ` · est. up to ${estimatedUsd < 0.01 ? "under $0.01" : formatCostWithDollar(estimatedUsd)}`;
+  return ` · high est. ${estimatedUsd < 0.01 ? "under $0.01" : formatCostWithDollar(estimatedUsd)}`;
 }
 
 function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
