@@ -147,6 +147,17 @@ const PLUGINS_IN_BACKUP: BackupPluginRow[] = [
     lockedSha: "0123456789abcdef0123456789abcdef01234567",
     status: "conflict",
   },
+  {
+    name: "docs-helper",
+    source: {
+      type: "git",
+      url: "https://github.com/example/docs-helper.git",
+      ref: "main",
+      refType: "branch",
+    },
+    lockedSha: "89abcdef0123456789abcdef0123456789abcdef",
+    status: "folderMissing",
+  },
 ];
 
 /**
@@ -165,6 +176,7 @@ export const PluginsInBackup: Story = {
     await canvas.findByText("Not installed");
     await canvas.findByText("Installed");
     await canvas.findByText("Name in use");
+    await canvas.findByText("Folder missing");
     await canvas.findByRole("button", { name: /Review and install \(1\)/ });
   },
 };

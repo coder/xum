@@ -39,6 +39,7 @@ export function reviewBackedUpPlugins(options: {
 const STATUS_BADGE: Record<BackupPluginStatus, { label: string; tone: string }> = {
   missing: { label: "Not installed", tone: "text-accent-text border-accent/40" },
   installed: { label: "Installed", tone: "text-success-text border-success/40" },
+  folderMissing: { label: "Folder missing", tone: "text-warning border-warning/40" },
   conflict: { label: "Name in use", tone: "text-warning border-warning/40" },
 };
 

@@ -341,15 +341,25 @@ async function readPluginBackup(sourceDir: string): Promise<PluginListRead> {
   return parsePluginList(text);
 }
 
-/** `installed`: that name at that commit. Another commit, or a folder the installer does not manage: `conflict`. */
+async function hasPluginFolder(muxRoot: string, name: string): Promise<boolean> {
+  // lstat, so an unreadable plugins folder throws instead of reading as a plugin that is gone.
+  return (await lstatIfExists(path.join(muxRoot, "plugins", name))) !== null;
+}
+
+/**
+ * `installed`: that name at that commit, with its folder. `folderMissing`: the registry lists it
+ * but the folder is gone, so it is not installed and a reinstall would collide with the row.
+ * Another commit, or a folder the installer does not manage: `conflict`.
+ */
 async function statusOf(
   muxRoot: string,
   plugin: BackupPluginEntry,
   local: AgentPluginInstallEntry | undefined
 ): Promise<BackupPluginStatus> {
-  if (local !== undefined) return local.lockedSha === plugin.lockedSha ? "installed" : "conflict";
-  const folder = await lstatIfExists(path.join(muxRoot, "plugins", plugin.name));
-  return folder === null ? "missing" : "conflict";
+  if (local !== undefined && local.lockedSha !== plugin.lockedSha) return "conflict";
+  const folder = await hasPluginFolder(muxRoot, plugin.name);
+  if (local === undefined) return folder ? "conflict" : "missing";
+  return folder ? "installed" : "folderMissing";
 }
 
 async function planPluginRows(

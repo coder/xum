@@ -1317,7 +1317,11 @@ describe("BackupSection", () => {
     const SHA_MISSING = "ab".repeat(20);
     const SHA_INSTALLED = "cd".repeat(20);
 
-    function pluginRow(name: string, status: "missing" | "installed" | "conflict", extra = {}) {
+    function pluginRow(
+      name: string,
+      status: "missing" | "installed" | "folderMissing" | "conflict",
+      extra = {}
+    ) {
       return {
         name,
         source: {
@@ -1403,6 +1407,7 @@ describe("BackupSection", () => {
             pluginRow("beta", "installed"),
             pluginRow("gamma", "conflict"),
             pluginRow("delta", "missing"),
+            pluginRow("epsilon", "folderMissing"),
           ]),
         },
       });
@@ -1418,6 +1423,7 @@ describe("BackupSection", () => {
       expect(canvas.getAllByText("Not installed")).toHaveLength(2);
       expect(canvas.getAllByText("Installed")).toHaveLength(1);
       expect(canvas.getAllByText("Name in use")).toHaveLength(1);
+      expect(canvas.getAllByText("Folder missing")).toHaveLength(1);
       expect(canvas.getByRole("button", { name: /Review and install \(2\)/ })).toBeTruthy();
     });
 
@@ -1430,6 +1436,7 @@ describe("BackupSection", () => {
             pluginRow("beta", "installed"),
             pluginRow("gamma", "conflict"),
             pluginRow("delta", "missing"),
+            pluginRow("epsilon", "folderMissing"),
           ]),
         },
       });

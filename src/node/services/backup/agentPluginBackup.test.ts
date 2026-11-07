@@ -395,11 +395,14 @@ describe("backup of the managed plugin list", () => {
         registryRow("same-one"),
         registryRow("moved-one"),
         registryRow("unmanaged-one"),
+        registryRow("gone-one"),
       ]);
       await useLocalRegistry([
         registryRow("same-one"),
         registryRow("moved-one", { lockedSha: shaOf("z") }),
+        registryRow("gone-one"),
       ]);
+      await writeFixtureFile(muxRoot, "plugins/same-one/plugin.json", "{}");
       await writeFixtureFile(muxRoot, "plugins/unmanaged-one/plugin.json", "{}");
 
       const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
@@ -412,6 +415,8 @@ describe("backup of the managed plugin list", () => {
         "same-one": "installed",
         "moved-one": "conflict",
         "unmanaged-one": "conflict",
+        // Listed in the registry at the same commit, but its folder is gone: not installed.
+        "gone-one": "folderMissing",
       });
       expect(preview.plugins.skipped).toBe(false);
     });
@@ -724,6 +729,25 @@ describe("backup of the managed plugin list", () => {
           expect((error as { code?: string }).code).toBe("EACCES");
           // Validation reads only the list: it needs nothing from this machine's plugins folder.
           await payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS });
+        } finally {
+          await fs.chmod(plugins, 0o700);
+        }
+      }
+    );
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "fails the preview, not reads a plugin as installed, when its folder cannot be checked",
+      async () => {
+        const { payload, request } = await backupOf([registryRow("alpha")]);
+        await useLocalRegistry([registryRow("alpha")]);
+        const plugins = path.join(muxRoot, "plugins");
+        await fs.mkdir(path.join(plugins, "alpha"), { recursive: true });
+        await fs.chmod(plugins, 0o000);
+        try {
+          const error = await captureRejection(
+            payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+          );
+          expect((error as { code?: string }).code).toBe("EACCES");
         } finally {
           await fs.chmod(plugins, 0o700);
         }
