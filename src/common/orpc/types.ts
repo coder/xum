@@ -123,6 +123,7 @@ export function isBashOutputEvent(msg: WorkspaceChatMessage): msg is BashOutputE
   return (msg as { type?: string }).type === "bash-output";
 }
 
+// dry-duplicate-ok: one type guard per chat event type, the pattern of this file
 export function isBashSandboxApprovalEvent(
   msg: WorkspaceChatMessage
 ): msg is BashSandboxApprovalEvent {
