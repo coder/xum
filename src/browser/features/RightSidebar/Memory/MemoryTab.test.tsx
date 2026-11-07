@@ -350,6 +350,106 @@ describe("MemoryTab", () => {
     expect(statusBlock!.getAttribute("title")).toBeNull();
   });
 
+  test("labels an analyzer harvest by the memory edits it made and the ones rejected", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 3,
+          skippedCandidates: 1,
+          nextChunk: 2,
+          ops: [],
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 3 edits / 1 rejected");
+  });
+
+  test("says on the harvest line when a completed run read only part of its epoch", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(
+      "Harvest: completed: 8 edits / 0 rejected · edit budget spent: chunks 2-3 of 3 were not read"
+    );
+  });
+
+  test("wraps the harvest line instead of truncating it", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const harvestLine = await findByText(/^Harvest: completed/);
+
+    // happy-dom does no layout, so the class list is the only signal that a line wraps: a
+    // truncated one hides the end of the note on a phone, where no tooltip opens. The story
+    // `HarvestNoteAtPhoneWidth` measures the wrap in a browser.
+    expect(harvestLine.classList.contains("break-words")).toBe(true);
+    expect(harvestLine.classList.contains("truncate")).toBe(false);
+  });
+
+  test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 2,
+          skippedCandidates: 1,
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 2 accepted / 1 skipped");
+  });
+
   test("renders failed harvest errors inline for keyboard and screen reader access", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
