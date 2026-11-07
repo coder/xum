@@ -108,6 +108,28 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
     }
 
 
+def gate_verdicts(bodies, head):
+    """check_codex_comments.sh's verdict for each body posted alone by Codex, with no review
+    threads (0 clean, 10 still running, 1 blocking) and the bodies it would show, computed by
+    its own jq classifier in one process."""
+    program = """include "codex_comments";
+      (([] | codex_resolved_finding_commits($bot)) + {clean_security_receipt: false}) as $cleared
+      | .[]
+      | [{author: {login: $bot}, authorAssociation: "MEMBER", isMinimized: false, body: .}]
+      | codex_blocking_comments($bot; $head; []; $cleared) as $blocking
+      | ($blocking | codex_pending_count($bot; $head; []; $cleared)) as $pending
+      | {exit: (if ($blocking | length) == 0 then 0
+          elif $pending == ($blocking | length) then 10 else 1 end),
+        shown: [$blocking[].body]}"""
+    result = subprocess.run(
+        ["jq", "-c", "-L", str(SCRIPTS / "lib"), "--arg", "bot", BOT, "--arg", "head", head, program],
+        input=json.dumps(bodies), text=True, capture_output=True, timeout=60, check=True,
+    )
+    verdicts = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(verdicts) == len(bodies), result.stderr
+    return verdicts
+
+
 class CodexGateTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="codex-comments-test-")
@@ -775,30 +797,14 @@ else:
             resolved = thread("[P2] Advisory", resolved=True, discussion=advisory)
             self.assert_gate(10, snapshot([comment(findings)], [resolved]))
 
-        # Only that exact fold is read; anything around it still blocks.
+        # Only that exact fold is read; anything around it still blocks (text inserted into its
+        # tag lines: test_text_inserted_around_the_fold_never_reads_as_a_board).
         clean = collapsed(FIXTURES["summary"]["body"], COMPLETED_LABEL)
         self.assert_gate(0, snapshot([comment(clean)]))
         finding = "[P1] Validate the caller before reading credentials"
         for case, body in (
             ("unknown summary status", clean.replace(COMPLETED_LABEL, "⚠️ Findings")),
             ("failed summary status", clean.replace(COMPLETED_LABEL, "❌ Failed")),
-            ("text in the summary line", clean.replace("</strong>: ", "</strong>: " + finding + " ")),
-            (
-                "text after the summary label",
-                clean.replace(
-                    COMPLETED_LABEL + "</summary>", COMPLETED_LABEL + " " + finding + "</summary>", 1
-                ),
-            ),
-            (
-                "text on the details line",
-                clean.replace(
-                    "<details>\n<summary><strong>", "<details> " + finding + "\n<summary><strong>", 1
-                ),
-            ),
-            (
-                "text after the summary line",
-                clean.replace("</summary>\n", "</summary> " + finding + "\n", 1),
-            ),
             ("text before the table", clean.replace("</summary>\n", "</summary>\n\n" + finding + "\n", 1)),
             ("no closing tag", clean.removesuffix("\n\n</details>")),
             ("two closing tags", clean + "\n\n</details>"),
@@ -808,11 +814,58 @@ else:
             with self.subTest(case):
                 self.assertNotEqual(body, clean)
                 self.assert_gate(1, snapshot([comment(body)]))
-        # Text before the marker is not Codex's board: it fails at once instead of reading as
-        # a review that is still running.
-        running = collapsed(FIXTURES["summary"]["body"], RUNNING_LABEL)
-        with self.subTest("text before the metadata marker"):
-            self.assert_gate(1, snapshot([comment(finding + "\n" + running)]))
+
+    def test_text_inserted_around_the_fold_never_reads_as_a_board(self):
+        # Each regex position that tolerated extra text let a hidden finding pass (verifier
+        # mutants on #7975). So a finding goes into every character gap of the fold's three tag
+        # lines, and onto a line of its own before the marker, before the fold and after it.
+        # Every such body must block at once and show the finding: never read completed (0) or
+        # running (10). One jq process applies the gate's own classifier to all of them, since
+        # a gate run per body took minutes; the real gate checks one body per position kind.
+        finding = "[P1] Validate the caller before reading credentials"
+        cases, gate_cases = [], []
+        for label, exact in ((COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
+            fold = collapsed(FIXTURES["summary"]["body"], label)
+            opening = fold.index("\n<details>\n<summary><strong>") + 1
+            summary = opening + len("<details>\n")
+            summary_end = fold.index("</summary>\n", summary) + len("</summary>")
+            closing = len(fold) - len("</details>")
+            self.assertEqual(fold[closing - 2 :], "\n\n</details>")
+            inserted = {
+                f"{label}, {line} gap {gap - start}": fold[:gap] + finding + fold[gap:]
+                for line, start, end in (
+                    ("details line", opening, summary - 1),
+                    ("summary line", summary, summary_end),
+                    ("closing line", closing, len(fold)),
+                )
+                for gap in range(start, end + 1)
+            }
+            inserted[f"{label}, line before the marker"] = finding + "\n" + fold
+            inserted[f"{label}, line before the fold"] = fold[:opening] + finding + "\n" + fold[opening:]
+            inserted[f"{label}, line after the fold"] = fold + "\n" + finding
+            cases.append((f"{label}, exact fold", fold, exact))
+            cases += [(case, body, 1) for case, body in inserted.items()]
+            gate_cases += [(f"{label}, exact fold", fold, exact)] + [
+                (case, inserted[case], 1)
+                for case in (
+                    f"{label}, details line gap 0",
+                    f"{label}, summary line gap 20",
+                    f"{label}, closing line gap {len('</details>')}",
+                    f"{label}, line before the marker",
+                )
+            ]
+        verdicts = gate_verdicts([body for _, body, _ in cases], board_head(cases[0][1]))
+        for (case, body, expected), verdict in zip(cases, verdicts):
+            with self.subTest(case):
+                self.assertEqual(verdict["exit"], expected, body)
+                if expected == 1:
+                    self.assertIn(finding, "".join(verdict["shown"]))
+        # The real gate agrees with the classifier on each kind of position.
+        for case, body, expected in gate_cases:
+            with self.subTest("gate: " + case):
+                result = self.assert_gate(expected, snapshot([comment(body)]))
+                if expected == 1:
+                    self.assertIn(finding, result.stdout)
 
     def test_a_collapsed_running_board_waits_out_an_earlier_failure_notice(self):
         # coder/xum#7966: CI saw Codex's collapsed running board beside the failure notice of
