@@ -2157,6 +2157,57 @@ describe("MemoryConsolidationService", () => {
       await Promise.all([firstRun, otherRun]);
     });
 
+    it("starts the owner's next analyzer while the previous one's usage is still being recorded", async () => {
+      // Recording usage takes the session directory's lock: a stall there must not hold every later
+      // analyzer of the owner, and the usage of both chunks must still be recorded afterwards.
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory, withSessionUsage: true });
+      const first = await seedCompactionEpoch(fixture);
+      const second = await seedCompactionEpoch(
+        fixture,
+        "ws-dream",
+        2,
+        first.summaryHistorySequence
+      );
+      held.release(1);
+      held.release(2);
+      const usageEntered = gate();
+      const usageStalled = gate();
+      const recordedAnalyzers: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation(
+        async (workspaceId, _model, _usage, _providerMetadata, options) => {
+          if (options?.analyticsSource !== "memory_harvest") return undefined;
+          recordedAnalyzers.push(workspaceId);
+          usageEntered.open();
+          await usageStalled.opened;
+          return undefined;
+        }
+      );
+
+      try {
+        const firstRun = fixture.service.maybeHarvestThenSweep(first);
+        await usageEntered.opened;
+        const secondRun = fixture.service.maybeHarvestThenSweep(second);
+        await held.modelCreated(2);
+        // Only promise work is left between the second run's model and its stream, so a run that
+        // has not started after many loop turns is waiting behind the first one's usage.
+        const started = held.streamStarted(2).then(() => true);
+        const gaveUp = (async () => {
+          for (let turn = 0; turn < 50; turn++) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+          return false;
+        })();
+        expect(await Promise.race([started, gaveUp])).toBe(true);
+
+        usageStalled.open();
+        await Promise.all([firstRun, secondRun]);
+        expect(recordedAnalyzers).toEqual(["ws-dream", "ws-dream"]);
+      } finally {
+        usageStalled.open();
+      }
+    });
+
     it("lets removal cancel an analyzer that is still waiting its turn, without wedging the queue", async () => {
       const held = heldAnalyzers();
       using fixture = await createFixture({ modelFactory: held.factory });
