@@ -1482,17 +1482,15 @@ describe("buildHarvestChunks", () => {
 
     interface Row {
       id: string;
+      sequence: number | null;
+      role: string;
       parts?: string;
       segment?: string;
       text: string;
       truncated: boolean;
     }
 
-    const textPart = (text: string): MuxMessage["parts"][number] => ({
-      type: "text",
-      text,
-      state: "done",
-    });
+    const textPart = (text: string): MuxMessage["parts"][number] => ({ type: "text", text });
 
     function rowsOf(...messages: MuxMessage[]): Row[] {
       return transcriptsOf(messages).flatMap((chunk) => JSON.parse(chunk) as Row[]);
