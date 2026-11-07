@@ -6631,7 +6631,8 @@ describe("Config", () => {
         // One differing value per field in the row and in the file: dropping any field from the
         // set lets the file's value through on the first build.
         type TreeField = (typeof CONFIG_TREE_FIELDS)[number];
-        const rowValues = {
+        // Every field required, so a field added to the set needs a value here too.
+        const rowValues: Required<Pick<Workspace, TreeField>> = {
           parentWorkspaceId: "row-parent",
           agentType: "row-agent-type",
           agentId: "row-agent",
@@ -6650,8 +6651,8 @@ describe("Config", () => {
           taskSticky: true,
           taskExecutionId: "row-execution",
           taskExecutionStatus: "completed",
-        } as const satisfies Record<TreeField, unknown>;
-        const fileValues = {
+        };
+        const fileValues: Required<Pick<Workspace, TreeField>> = {
           parentWorkspaceId: "file-parent",
           agentType: "file-agent-type",
           agentId: "file-agent",
@@ -6670,7 +6671,7 @@ describe("Config", () => {
           taskSticky: false,
           taskExecutionId: "file-execution",
           taskExecutionStatus: "running",
-        } as const satisfies Record<TreeField, unknown>;
+        };
         await register(rowValues, { id: "legacy-task-id", tree: fileValues });
         const loadedRow = config
           .loadConfigOrDefault()
