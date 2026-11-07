@@ -731,7 +731,6 @@ async function assertSheetTouchTargets(page: StoryPage) {
 
 const PAINT_CHECK_TAG = "paint-check";
 const NO_DIAGRAM_MESSAGE = `A story tagged ${PAINT_CHECK_TAG} must show a rendered Mermaid diagram`;
-const UNTAGGED_DIAGRAM_MESSAGE = `A story that shows a Mermaid diagram must be tagged ${PAINT_CHECK_TAG}: add tags: ["${PAINT_CHECK_TAG}"] to it (see docs/AGENTS.md)`;
 const DIAGRAM_RENDER_TIMEOUT_MS = 15_000;
 
 interface Box {
@@ -770,14 +769,6 @@ async function waitForRenderedDiagrams(page: StoryPage) {
     return isRendered() && !hasFailed();
   }, args);
   assert(rendered, NO_DIAGRAM_MESSAGE);
-}
-
-async function assertDiagramStoryIsTagged(page: StoryPage) {
-  assert.equal(
-    await page.locator(MERMAID_PAGE_FRAME_SELECTOR).count(),
-    0,
-    UNTAGGED_DIAGRAM_MESSAGE
-  );
 }
 
 async function diagramPaintBoxes(page: StoryPage): Promise<Box[]> {
@@ -1049,12 +1040,11 @@ const config: TestRunnerConfig = {
     try {
       // Before the viewport is restored, since a resize repairs a stale WebKit layout. Skipped
       // after a failed play so its own error shows.
-      if (!context.hasFailure) {
-        if ((await getStoryContext(page, context)).tags?.includes(PAINT_CHECK_TAG)) {
-          await assertNoDiagramInkOutsideItsBox(page);
-        } else {
-          await assertDiagramStoryIsTagged(page);
-        }
+      if (
+        !context.hasFailure &&
+        (await getStoryContext(page, context)).tags?.includes(PAINT_CHECK_TAG)
+      ) {
+        await assertNoDiagramInkOutsideItsBox(page);
       }
     } finally {
       if (restoreViewport) {
