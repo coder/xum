@@ -299,6 +299,9 @@ export { perfCaptures } from "./perfCaptures";
 // Re-export agent resource limit schemas
 export { agentResourceLimits } from "./agentResourceLimits";
 
+// Re-export macOS agent sandbox schemas
+export { agentSandbox } from "./agentSandbox";
+
 // Re-export "Report slowness" bundle schemas
 export { perfReports } from "./perfReports";
 
