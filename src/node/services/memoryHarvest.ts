@@ -254,10 +254,11 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
     const group = groups.at(-1);
     // The newline that joins the piece to the row's text counts too.
     const joinedChars = groupChars + 1 + piece.text.length;
+    // A segment's row stays its own: the first segment is a whole row's text, so it never fits
+    // behind another piece, and no piece fits behind a segment, as the group starts with it.
     const fits =
       group !== undefined &&
       group[0].segment === undefined &&
-      piece.segment === undefined &&
       joinedChars <= HARVEST_MAX_ROW_TEXT_CHARS;
     if (fits) {
       group.push(piece);
