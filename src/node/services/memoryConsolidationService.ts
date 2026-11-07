@@ -293,6 +293,19 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
   }
 }
 
+/** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
+function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => resolve(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void turn.then(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    });
+  });
+}
+
 export const HARVEST_MAX_ATTEMPTS = 3;
 
 /** Completed, or failed with retries exhausted: nothing may retry it. */
@@ -325,6 +338,15 @@ export class MemoryConsolidationService extends EventEmitter {
    * active run via the stored promise.
    */
   private readonly inFlight = new Map<string, Promise<Result<MemoryConsolidationRecord, string>>>();
+
+  /**
+   * Tail of the service-wide dream-stream queue (see runDreamStreamExclusively).
+   * `inFlight` is per owner workspace, so two workspaces of one project (or any
+   * two, through global memory) could otherwise run the organizer over the same
+   * files at once. Never rejects: each link settles when its stream is done or
+   * its wait was cancelled.
+   */
+  private dreamStreamTail: Promise<void> = Promise.resolve();
 
   /**
    * Per-run removal controllers (r60): workspace removal must abort and
@@ -866,6 +888,34 @@ export class MemoryConsolidationService extends EventEmitter {
     return result;
   }
 
+  /**
+   * Run one dream stream once every earlier queued one has settled, so at most
+   * one consolidation stream runs at a time across ALL workspaces (harvests are
+   * not queued here). Returns null, without starting `stream`, when `signal`
+   * aborts first: removal must cancel a run that is still waiting its turn.
+   * Waiting happens after maybeRun's synchronous in-flight reservation, so that
+   * per-workspace try-lock keeps its call-order semantics.
+   */
+  private async runDreamStreamExclusively<T>(
+    signal: AbortSignal,
+    stream: () => Promise<T>
+  ): Promise<T | null> {
+    const previous = this.dreamStreamTail;
+    let release!: () => void;
+    const turnDone = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Linked before the first await so queue order is call order. A cancelled
+    // waiter still releases its link, which lets successors pass it.
+    this.dreamStreamTail = previous.then(() => turnDone);
+    try {
+      if (!(await waitForTurnOrAbort(previous, signal))) return null;
+      return await stream();
+    } finally {
+      release();
+    }
+  }
+
   /** The actual run; only ever invoked by maybeRun while holding the lock. */
   private runLockedEffect(
     workspaceId: string,
@@ -936,7 +986,7 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
-      const result = yield* Effect.promise(async () =>
+      const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
           pricingModel: modelResult.data.metadataModel,
@@ -948,6 +998,9 @@ export class MemoryConsolidationService extends EventEmitter {
           finalPass: trigger === "archive",
           // Hard timeout: a wedged provider stream must not hold the in-flight
           // lock forever (and stall the sequential launch sweep behind it).
+          // Created when this run's turn in the queue arrives (the call happens
+          // inside runDreamStreamExclusively), so it bounds the stream and
+          // never the wait behind other workspaces.
           // Combined with the removal controller (r60): workspace removal must
           // abort the stream AND flip the tool-level pre-commit checks so a
           // detached mutation cannot land after the session directory is gone.
@@ -975,8 +1028,12 @@ export class MemoryConsolidationService extends EventEmitter {
               self.emit("analyticsIngest", { workspaceId });
             }
           },
-        })
+        });
+      const result = yield* Effect.promise(async () =>
+        self.runDreamStreamExclusively(removalSignal, consolidate)
       );
+      // Removal reached this run while it was still queued: no stream started.
+      if (result === null) return Err("workspace is being removed; consolidation refused");
       // A stream failure (provider error or the run timeout) means the pass did
       // NOT cover the memory state: skip the journal record so the debounce and
       // launch sweep retry later instead of reporting a successful consolidation
@@ -1271,8 +1328,12 @@ export class MemoryConsolidationService extends EventEmitter {
       }
 
       const trigger = this.isWorkspaceCurrentlyArchived(workspaceId) ? "archive" : "compaction";
+      // Debounced like every other automatic trigger: each organizer pass costs
+      // a full read of the memory files, and a compaction is no reason to pay
+      // that again within the window. A debounced sweep returns its skip
+      // quietly (only "already in flight" loops); the harvested candidates wait
+      // in the workspace inbox for the next run. Archive stays undebounced.
       const result = await this.maybeRun(workspaceId, trigger, {
-        skipWorkspaceDebounce: true,
         skipHarvestRecovery: true,
         ...(actingWorkspaceId !== workspaceId ? { actingWorkspaceId } : {}),
       });

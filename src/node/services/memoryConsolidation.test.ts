@@ -3,6 +3,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
 
 import {
   MEMORY_CONSOLIDATION_OP_BUDGET,
@@ -11,7 +12,11 @@ import {
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
-import { createConsolidationMemoryTool, type MemoryConsolidationOp } from "./memoryConsolidation";
+import {
+  createConsolidationMemoryTool,
+  runMemoryConsolidation,
+  type MemoryConsolidationOp,
+} from "./memoryConsolidation";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MemoryService, projectMemoryDirName, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir, mockToolCallOptions } from "./tools/testHelpers";
@@ -718,5 +723,34 @@ describe("consolidation memory tool rails", () => {
     expect(fixture.journal).toHaveLength(1);
     expect(fixture.journal[0]?.applied).toBe(false);
     expect(fixture.journal[0]?.note).toBeDefined();
+  });
+});
+
+describe("runMemoryConsolidation", () => {
+  it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
+    // A real provider stream ends silently when its request is aborted: no error part reaches
+    // consumeStream, so the pass used to read as clean and be journaled as a success.
+    using fixture = await createFixture();
+    const model = new MockLanguageModelV3({
+      doStream: (options) =>
+        new Promise((_resolve, reject) => {
+          options.abortSignal?.addEventListener("abort", () =>
+            reject(new Error("stalled provider call aborted"))
+          );
+        }),
+    });
+
+    const result = await runMemoryConsolidation({
+      model,
+      agentBody: "Consolidate the memory directories.",
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      abortSignal: AbortSignal.timeout(50),
+    });
+
+    expect(result.streamError).toContain("cut short");
+    expect(result.usage).toBeUndefined();
   });
 });
