@@ -242,23 +242,42 @@ describe("backup of the managed plugin list", () => {
       expect(sidecar.plugins.map((p) => p.name)).toEqual(["alpha"]);
     });
 
-    it("leaves out a plugin installed from a path or file URL on this machine, and logs it", async () => {
+    it("leaves out a plugin installed from a path, a file URL or a host on this machine, and logs it", async () => {
       const info = spyOn(log, "info").mockImplementation(() => undefined);
       const local = (url: string) => ({ type: "git", url, ref: "main", refType: "branch" });
+      const keptUrls = {
+        alpha: undefined,
+        "ssh-host": "git@github.com:example/ssh-host.git",
+        "name-has-localhost": "https://github.com/example/localhost.git",
+        "host-starts-with-localhost": "ssh://git@localhost.example.com/example/repo.git",
+      } as const;
+      const leftOutUrls = {
+        "abs-path": "/home/someone/plugins/abs-path",
+        "file-url": "file:///home/someone/plugins/file-url",
+        "home-path": "~/plugins/home-path",
+        "drive-path": "C:\\plugins\\drive-path",
+        "ssh-localhost": "ssh://user@localhost/home/someone/repo.git",
+        "git-loopback": "git://127.0.0.1/someone/repo.git",
+        "scp-localhost": "localhost:someone/repo.git",
+        "scp-user-localhost": "user@localhost:someone/repo.git",
+        "ipv6-loopback": "ssh://user@[::1]/someone/repo.git",
+        "scp-ipv6-loopback": "git@[::1]:someone/repo.git",
+        "all-zeros": "http://0.0.0.0/someone/repo.git",
+      };
       await writeRegistry(muxRoot, [
-        registryRow("alpha"),
-        registryRow("abs-path", { source: local("/home/someone/plugins/abs-path") }),
-        registryRow("file-url", { source: local("file:///home/someone/plugins/file-url") }),
-        registryRow("home-path", { source: local("~/plugins/home-path") }),
-        registryRow("drive-path", { source: local("C:\\plugins\\drive-path") }),
-        registryRow("ssh-host", { source: local("git@github.com:example/ssh-host.git") }),
+        ...Object.entries(keptUrls).map(([name, url]) =>
+          registryRow(name, url === undefined ? {} : { source: local(url) })
+        ),
+        ...Object.entries(leftOutUrls).map(([name, url]) =>
+          registryRow(name, { source: local(url) })
+        ),
       ]);
       const { payload, managed, request } = await prepare();
 
       const exported = await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
 
       const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
-      expect(sidecar.plugins.map((p) => p.name)).toEqual(["alpha", "ssh-host"]);
+      expect(sidecar.plugins.map((p) => p.name)).toEqual(Object.keys(keptUrls).sort());
       expect(
         await fs.readFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "utf-8")
       ).not.toContain("someone");
@@ -266,7 +285,7 @@ describe("backup of the managed plugin list", () => {
       const logged = info.mock.calls
         .filter(([message]) => String(message).includes("its source is on this machine"))
         .map(([, fields]) => (fields as { plugin: string }).plugin);
-      expect(logged.sort()).toEqual(["abs-path", "drive-path", "file-url", "home-path"]);
+      expect(logged.sort()).toEqual(Object.keys(leftOutUrls).sort());
       info.mockRestore();
     });
 

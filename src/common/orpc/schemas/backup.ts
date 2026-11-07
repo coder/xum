@@ -87,8 +87,8 @@ export const BackupPluginMethodSchema = z.object({ kind: z.literal("skills") });
  * read as a git option (a leading dash, or whitespace before it, since the preview trims its
  * input), as a UNC share (`//host/share`, which Windows opens over SMB and so sends the user's
  * credentials), or carry whitespace, control or bidi characters or a credential. A local path
- * is not refused here: the export leaves those out (agentPluginBackup.ts), and the user sees the
- * URL before any preview runs.
+ * or a loopback host is not refused here: the export leaves those out (agentPluginBackup.ts), and
+ * the user sees the URL before any preview runs.
  */
 const BackupPluginUrlSchema = z
   .string()

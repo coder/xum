@@ -15,7 +15,7 @@ import {
   type BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isLocalGitUrl } from "@/node/services/agentPlugins/claudeMarketplace";
+import { pointsAtThisMachine } from "@/node/services/agentPlugins/claudeMarketplace";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
 import type { GeneratedFrom } from "@/node/services/agentPlugins/manifest";
 import {
@@ -77,9 +77,10 @@ async function entryOf(
   muxRoot: string,
   install: AgentPluginInstallEntry
 ): Promise<BackupPluginEntry | null> {
-  // Another machine cannot use a path on this one, and the list would publish it (the home folder
-  // names the user). The plugin is logged by name only, so its absence from the backup is explained.
-  if (isLocalGitUrl(install.source.url)) {
+  // Another machine cannot use a path or a loopback host on this one, and the list would publish it
+  // (the home folder names the user). The plugin is logged by name only, so its absence from the
+  // backup is explained.
+  if (pointsAtThisMachine(install.source.url)) {
     log.info("Leaving a plugin out of the settings backup: its source is on this machine", {
       plugin: install.name,
     });

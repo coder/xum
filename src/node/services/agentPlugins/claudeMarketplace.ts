@@ -309,7 +309,7 @@ function isLoopbackHost(rawHost: string): boolean {
  * machine (git would reach it with the user's own SSH keys). Fails closed: a remote-looking URL
  * whose host Xum cannot read counts as this machine.
  */
-function pointsAtThisMachine(url: string): boolean {
+export function pointsAtThisMachine(url: string): boolean {
   if (isLocalGitUrl(url)) return true;
   const host = gitUrlHost(url);
   return host === undefined || isLoopbackHost(host);
