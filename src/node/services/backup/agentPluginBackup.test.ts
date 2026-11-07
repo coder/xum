@@ -287,43 +287,6 @@ describe("backup of the managed plugin list", () => {
       expect(preview.pluginListSkipped).toBe(false);
     });
 
-    it("names the listed plugins that a push from this machine would remove from the backup", async () => {
-      const { payload, request } = await backupOf([
-        registryRow("missing-one"),
-        registryRow("moved-one"),
-        registryRow("same-one"),
-        registryRow("unmanaged-one"),
-        registryRow("unexportable-one"),
-      ]);
-      await useLocalRegistry([
-        registryRow("moved-one", { lockedSha: shaOf("z") }),
-        registryRow("same-one"),
-        // Installed, but its row would not be exported (the push leaves out a row with no full commit id).
-        registryRow("unexportable-one", { lockedSha: "abc123" }),
-        registryRow("local-only"),
-      ]);
-      await writeFixtureFile(muxRoot, "plugins/unmanaged-one/plugin.json", "{}");
-
-      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
-
-      expect(preview.pluginsDroppedByPush).toEqual([
-        "missing-one",
-        "unexportable-one",
-        "unmanaged-one",
-      ]);
-    });
-
-    it("names no plugin to drop when this machine has all of them, or the flag is off", async () => {
-      const { payload, request } = await backupOf([registryRow("alpha")]);
-
-      const withAll = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
-      await useLocalRegistry([]);
-      const flagOff = await payload.previewRestore({ ...request, contents: PLUGINS_OFF });
-
-      expect(withAll.pluginsDroppedByPush).toEqual([]);
-      expect(flagOff.pluginsDroppedByPush).toEqual([]);
-    });
-
     it("hands back the pin and the source a reinstall needs", async () => {
       const { payload, request } = await backupOf([
         registryRow("alpha", {
@@ -372,8 +335,6 @@ describe("backup of the managed plugin list", () => {
       expect(restored.pluginInstalls?.map((row) => [row.name, row.status])).toEqual([
         ["alpha", "missing"],
       ]);
-      // Nothing was installed, so a push right after the restore would still remove it.
-      expect(restored.pluginsDroppedByPush).toEqual(["alpha"]);
       expect(await fs.readFile(path.join(muxRoot, "plugins.json"), "utf-8")).toBe(registryBefore);
       expect(await exists(path.join(muxRoot, "plugins"))).toBe(false);
       expect(restored.changedFiles.some((file) => file.includes("plugin"))).toBe(false);
@@ -644,9 +605,166 @@ describe("backup of the managed plugin list", () => {
         ["alpha", "missing"],
         ["beta", "missing"],
       ]);
-      expect(restored.data.pluginsDroppedByPush).toEqual(["alpha", "beta"]);
       expect(await exists(path.join(second, "plugins.json"))).toBe(false);
       expect(await exists(path.join(second, "plugins"))).toBe(false);
+    });
+
+    describe("push approval", () => {
+      /** The second machine's install set, then its push (with the approval a user would give). */
+      async function pushFromSecondMachine(
+        rows: unknown[],
+        options: { approvedPluginRemovalDigest?: string; plugins?: boolean } = {}
+      ) {
+        const root = await secondMachine();
+        await writeRegistry(root, rows);
+        return await serviceFor(root).push(
+          { ...settings, includePlugins: options.plugins ?? true },
+          { approvedPluginRemovalDigest: options.approvedPluginRemovalDigest }
+        );
+      }
+
+      async function listedNames(): Promise<string[]> {
+        const clone = path.join(tempDir, "inspect");
+        await fs.rm(clone, { recursive: true, force: true });
+        await runGit(["clone", "--quiet", originPath, clone]);
+        const text = await fs
+          .readFile(path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH), "utf-8")
+          .catch(() => null);
+        if (text === null) return [];
+        return (JSON.parse(text) as { plugins: Array<{ name: string }> }).plugins.map(
+          (p) => p.name
+        );
+      }
+
+      /** Another machine's push, as far as this one can tell: the list in the repository changes. */
+      async function keepOnlyInBackup(names: string[]) {
+        const clone = path.join(tempDir, "tamper");
+        await runGit(["clone", "--quiet", originPath, clone]);
+        const file = path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH);
+        const list = JSON.parse(await fs.readFile(file, "utf-8")) as {
+          plugins: Array<{ name: string }>;
+        };
+        list.plugins = list.plugins.filter((plugin) => names.includes(plugin.name));
+        await fs.writeFile(file, JSON.stringify(list), "utf-8");
+        await commitAll(clone, "shrink the plugin list");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+      }
+
+      function removalOf(result: Awaited<ReturnType<BackupService["push"]>>) {
+        if (result.success) throw new Error("expected the push to be refused");
+        expect(result.error.code).toBe("PLUGIN_REMOVAL_APPROVAL_REQUIRED");
+        if (result.error.pluginRemoval == null) throw new Error("the refusal names no removal");
+        return result.error.pluginRemoval;
+      }
+
+      it("refuses a push that leaves a listed plugin out, and names it", async () => {
+        await pushFromFirstMachine([registryRow("alpha"), registryRow("beta")]);
+
+        const refused = await pushFromSecondMachine([registryRow("gamma"), registryRow("beta")]);
+
+        expect(removalOf(refused)).toMatchObject({ names: ["alpha"], wholeList: false });
+        expect(await listedNames()).toEqual(["alpha", "beta"]);
+      });
+
+      it("pushes once the approval of that removal comes back with it", async () => {
+        await pushFromFirstMachine([registryRow("alpha"), registryRow("beta")]);
+        const refused = removalOf(await pushFromSecondMachine([registryRow("beta")]));
+
+        const pushed = await pushFromSecondMachine([registryRow("beta")], {
+          approvedPluginRemovalDigest: refused.approval,
+        });
+
+        expect(pushed.success).toBe(true);
+        expect(await listedNames()).toEqual(["beta"]);
+      });
+
+      it("asks again when the removal changed since it was approved", async () => {
+        await pushFromFirstMachine([registryRow("alpha"), registryRow("beta")]);
+        const approved = removalOf(await pushFromSecondMachine([registryRow("gamma")]));
+        await keepOnlyInBackup(["alpha"]);
+
+        const again = await pushFromSecondMachine([registryRow("gamma")], {
+          approvedPluginRemovalDigest: approved.approval,
+        });
+
+        expect(removalOf(again).names).toEqual(["alpha"]);
+        expect(removalOf(again).approval).not.toBe(approved.approval);
+        expect(await listedNames()).toEqual(["alpha"]);
+      });
+
+      it("refuses a flag-off push that deletes the whole list, and deletes it once approved", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+
+        const refused = removalOf(
+          await pushFromSecondMachine([registryRow("alpha")], { plugins: false })
+        );
+        expect(refused).toMatchObject({ names: ["alpha"], wholeList: true });
+        expect(await listedNames()).toEqual(["alpha"]);
+
+        const pushed = await pushFromSecondMachine([registryRow("alpha")], {
+          plugins: false,
+          approvedPluginRemovalDigest: refused.approval,
+        });
+        expect(pushed.success).toBe(true);
+        expect(await listedNames()).toEqual([]);
+      });
+
+      it("guards a list it cannot read, which it cannot name, when the push writes none", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const clone = path.join(tempDir, "tamper");
+        await runGit(["clone", "--quiet", originPath, clone]);
+        await fs.writeFile(path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH), "[]", "utf-8");
+        await commitAll(clone, "break the plugin list");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+
+        const refused = removalOf(await pushFromSecondMachine([], { plugins: false }));
+
+        expect(refused).toMatchObject({ names: [], wholeList: true });
+      });
+
+      it("treats a machine with nothing installed as removing the whole list", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+
+        const refused = removalOf(await pushFromSecondMachine([]));
+
+        expect(refused).toMatchObject({ names: ["alpha"], wholeList: true });
+      });
+
+      it("needs no approval for a first list, an unchanged list or a list that only grows", async () => {
+        expect((await pushFromSecondMachine([registryRow("alpha")])).success).toBe(true);
+        expect((await pushFromSecondMachine([registryRow("alpha")])).success).toBe(true);
+        expect(
+          (await pushFromSecondMachine([registryRow("alpha"), registryRow("beta")])).success
+        ).toBe(true);
+        expect(await listedNames()).toEqual(["alpha", "beta"]);
+      });
+
+      it("needs no approval to push with the flag off to a backup with no list", async () => {
+        expect(
+          (await pushFromSecondMachine([registryRow("alpha")], { plugins: false })).success
+        ).toBe(true);
+        expect(await listedNames()).toEqual([]);
+      });
+
+      it("still reports a secret after the removal is approved", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const secretRow = registryRow("beta", {
+          source: {
+            type: "git",
+            url: `https://github.com/example/ghp_${"a".repeat(36)}.git`,
+            ref: "main",
+            refType: "branch",
+          },
+        });
+        const refused = removalOf(await pushFromSecondMachine([secretRow]));
+
+        const next = await pushFromSecondMachine([secretRow], {
+          approvedPluginRemovalDigest: refused.approval,
+        });
+
+        expect(next.success).toBe(false);
+        if (!next.success) expect(next.error.code).toBe("SECRET_DETECTED");
+      });
     });
 
     it("reports the same rows from a preview", async () => {
@@ -656,7 +774,6 @@ describe("backup of the managed plugin list", () => {
 
       if (!preview.success) throw new Error(preview.error.message);
       expect(preview.data.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
-      expect(preview.data.pluginsDroppedByPush).toEqual(["alpha"]);
     });
 
     it("restores the settings when the plugin list is unreadable, and reports the warning", async () => {

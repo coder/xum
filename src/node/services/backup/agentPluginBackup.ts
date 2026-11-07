@@ -13,6 +13,7 @@ import {
   type BackupPluginEntry,
   type BackupPluginInstall,
   type BackupPluginManifest,
+  type BackupPluginRemoval,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
@@ -29,6 +30,7 @@ import {
   isFilesystemError,
   MAX_BACKUP_FILE_BYTES,
   resolveContainedPath,
+  sha256,
   type BackupFile,
 } from "./payload";
 
@@ -117,24 +119,56 @@ export function serializePluginBackupManifest(manifest: BackupPluginManifest): B
 }
 
 /**
- * Writes the sidecar into the managed copy and returns the files the push now publishes, for the
- * secret scan. Off, or with nothing installed, it writes nothing: the core write already cleared
- * the managed path, so a list pushed earlier disappears from the next tree.
+ * The names a push removes from the backup's list, and whether it removes the whole list. Undefined
+ * when the backup has no list or every listed plugin stays. A list the backup has but this build
+ * cannot read names nothing, so only a push that writes no list (`written` null) reports it.
+ */
+function pluginRemovalOf(
+  prior: PluginListRead | null,
+  written: BackupPluginManifest | null
+): BackupPluginRemoval | undefined {
+  if (prior === null) return undefined;
+  const kept = new Set(written?.plugins.map((plugin) => plugin.name));
+  const names = prior.plugins.map((plugin) => plugin.name).filter((name) => !kept.has(name));
+  const wholeList = written === null;
+  if (!wholeList && names.length === 0) return undefined;
+  names.sort();
+  // JSON, not a delimiter: a name is repository-controlled text.
+  const approval = sha256(Buffer.from(JSON.stringify({ names, wholeList }), "utf-8"));
+  return { names, wholeList, approval };
+}
+
+/**
+ * The list the checked-out backup carries, or null when it has none. A push rewrites the managed
+ * path, so read it before the core write clears it.
+ */
+export async function readPriorPluginList(sourceDir: string): Promise<PluginListRead | null> {
+  return (await pluginBackupExists(sourceDir)) ? await readPluginBackup(sourceDir) : null;
+}
+
+/**
+ * Writes the sidecar into the managed copy. Returns the files the push now publishes, for the
+ * secret scan, and what it removes from the list the checked-out backup carried (`prior`). Off,
+ * or with nothing installed, it writes nothing: the core write already cleared the managed path,
+ * so a list pushed earlier disappears from the next tree.
  */
 export async function exportPluginBackup(options: {
   rootDir: string;
   destination: string;
   contents: BackupContents;
-}): Promise<BackupFile[]> {
-  if (!options.contents.includePlugins) return [];
-  const manifest = await collectPluginBackup(options.rootDir);
-  if (manifest === null) return [];
+  prior: PluginListRead | null;
+}): Promise<{ files: BackupFile[]; pluginRemoval?: BackupPluginRemoval }> {
+  const manifest = options.contents.includePlugins
+    ? await collectPluginBackup(options.rootDir)
+    : null;
+  const pluginRemoval = pluginRemovalOf(options.prior, manifest);
+  if (manifest === null) return { files: [], pluginRemoval };
   const content = serializePluginBackupManifest(manifest);
   const sidecar = path.join(options.destination, PLUGIN_BACKUP_DIR);
   await fs.mkdir(sidecar, { recursive: true, mode: 0o700 });
   await writeFileAtomic(path.join(sidecar, BACKUP_MANIFEST_FILE), content, { mode: 0o600 });
   await assertManagedTreeWithinLimits(options.destination);
-  return [{ path: PLUGIN_BACKUP_MANIFEST_PATH, content }];
+  return { files: [{ path: PLUGIN_BACKUP_MANIFEST_PATH, content }], pluginRemoval };
 }
 
 /** Anything at the sidecar path counts, so a malformed one is still reported while the flag is off. */
@@ -165,7 +199,7 @@ const PluginRowNameSchema = z.object({ name: z.string() });
 const MAX_PLUGIN_LIST_WARNINGS = 10;
 
 /** What this build could read of the checked-out list, and what it had to leave out. */
-interface PluginListRead {
+export interface PluginListRead {
   plugins: BackupPluginEntry[];
   warnings: string[];
 }
@@ -278,20 +312,6 @@ async function planPluginInstalls(
 }
 
 /**
- * The names in the backup's list that a push from this machine would remove: they are listed
- * there, and this machine's export would not include them. A restore installs nothing, so right
- * after one the push still rewrites the list from the local installs only.
- */
-async function namesDroppedByPush(
-  rootDir: string,
-  listed: readonly BackupPluginEntry[]
-): Promise<string[]> {
-  if (listed.length === 0) return [];
-  const exported = new Set((await collectPluginBackup(rootDir))?.plugins.map((p) => p.name));
-  return listed.map((plugin) => plugin.name).filter((name) => !exported.has(name));
-}
-
-/**
  * What a preview or restore reports of the backup's plugin list. Writes nothing: the rows are an
  * offer the user can take through the install review (see the note at the top of this file).
  * With the flag off the list is only checked for existence, so a malformed one never blocks a
@@ -306,14 +326,12 @@ export async function readPluginRestore(options: {
   pluginInstalls: BackupPluginInstall[];
   pluginListSkipped: boolean;
   pluginListWarnings: string[];
-  pluginsDroppedByPush: string[];
 }> {
   if (!options.contents.includePlugins) {
     return {
       pluginInstalls: [],
       pluginListSkipped: await pluginBackupExists(options.sourceDir),
       pluginListWarnings: [],
-      pluginsDroppedByPush: [],
     };
   }
   const list = await readPluginBackup(options.sourceDir);
@@ -321,6 +339,5 @@ export async function readPluginRestore(options: {
     pluginInstalls: await planPluginInstalls(options.rootDir, list.plugins),
     pluginListSkipped: false,
     pluginListWarnings: list.warnings,
-    pluginsDroppedByPush: await namesDroppedByPush(options.rootDir, list.plugins),
   };
 }

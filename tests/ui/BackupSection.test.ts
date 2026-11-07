@@ -1534,55 +1534,124 @@ describe("BackupSection", () => {
       expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
     });
 
-    test("warns beside Back up now which listed plugins a push would remove from the backup", async () => {
-      const { view } = renderBackupSection({
-        backupPreview: {
-          ...PREVIEW_BASE,
-          pluginInstalls: [pluginRow("alpha", "missing"), pluginRow("beta", "missing")],
-          pluginsDroppedByPush: ["alpha", "beta"],
+    describe("removal approval", () => {
+      const REFUSED = (names: string[], approval: string, wholeList = false) => ({
+        success: false as const,
+        error: {
+          code: "PLUGIN_REMOVAL_APPROVAL_REQUIRED" as const,
+          message: "This backup would remove plugins from the backup's plugin list",
+          pluginRemoval: { names, wholeList, approval },
         },
       });
-      const canvas = within(view.container);
-      await canvas.findByText("Settings backup");
+      const PUSHED = {
+        success: true as const,
+        data: { commit: "abc1234", changed: true, credential: "ssh" as const, redactions: [] },
+      };
 
-      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      async function openCard(names: string[], approval: string, wholeList = false) {
+        const { client, view } = renderBackupSection();
+        const canvas = within(view.container);
+        await canvas.findByText("Settings backup");
+        const push = jest
+          .spyOn(client.backup, "push")
+          .mockResolvedValueOnce(REFUSED(names, approval, wholeList));
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+        await canvas.findByText("Remove plugins from the backup?");
+        return { push, canvas };
+      }
 
-      const warning = await canvas.findByText(/Backing up now removes 2 plugins/);
-      expect(warning.textContent).toContain("alpha, beta");
-    });
+      test("sends no approval until the user confirms the removal the backup named", async () => {
+        const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");
 
-    test("warns in the singular for one plugin, and keeps the warning after a restore", async () => {
-      const { view } = renderBackupSection({
-        backupRestore: {
-          ...RESTORE_BASE,
-          pluginInstalls: [pluginRow("alpha", "missing")],
-          pluginsDroppedByPush: ["alpha"],
-        },
+        expect(push).toHaveBeenCalledTimes(1);
+        expect(push.mock.calls[0]?.[0]).toMatchObject({ approvedPluginRemovalDigest: undefined });
+        expect(canvas.getAllByRole("listitem").map((item) => item.textContent)).toEqual(
+          expect.arrayContaining(["alpha", "beta"])
+        );
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+
+        await canvas.findByText(/Backed up settings at abc1234/);
+        expect(push).toHaveBeenLastCalledWith(
+          expect.objectContaining({ approvedPluginRemovalDigest: "digest-a" })
+        );
+        expect(canvas.queryByText("Remove plugins from the backup?")).toBeNull();
       });
-      const canvas = within(view.container);
-      await canvas.findByText("Settings backup");
 
-      await confirmRestore(canvas);
+      test("shows the new removal and sends its digest when the backup changed since", async () => {
+        const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");
+        push.mockResolvedValueOnce(REFUSED(["alpha"], "digest-b"));
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        await waitFor(() => expect(canvas.queryByText("beta")).toBeNull());
+        expect(canvas.getByText("alpha")).toBeTruthy();
 
-      const warning = await canvas.findByText(/Backing up now removes 1 plugin from the backup/);
-      expect(warning.textContent).toContain("is not installed here: alpha");
-    });
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
 
-    test("shows no push warning when a preview lists nothing to remove", async () => {
-      const { view } = renderBackupSection({
-        backupPreview: {
-          ...PREVIEW_BASE,
-          pluginInstalls: [pluginRow("beta", "installed")],
-          pluginsDroppedByPush: [],
-        },
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({ approvedPluginRemovalDigest: "digest-b" })
+          )
+        );
       });
-      const canvas = within(view.container);
-      await canvas.findByText("Settings backup");
 
-      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      test("says the whole list goes when the push writes none", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-a", true);
 
-      await canvas.findByText("Plugins in this backup");
-      expect(canvas.queryByText(/Backing up now removes/)).toBeNull();
+        expect(canvas.getByText(/The whole list is removed from the backup/)).toBeTruthy();
+      });
+
+      test("keeps the confirmed removal through a secret-scan refusal, which then needs its own override", async () => {
+        const { push, canvas } = await openCard(["alpha"], "digest-a");
+        push.mockResolvedValueOnce({
+          success: false,
+          error: {
+            code: "SECRET_DETECTED",
+            message: "Potential secrets",
+            files: ["AGENTS.md"],
+            secretApproval: "secret-a",
+          },
+        });
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        const override = await canvas.findByRole("checkbox", { name: "Override secret scan" });
+        fireEvent.click(override);
+        await waitFor(() => expect(override.getAttribute("data-state")).toBe("checked"));
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              approvedPluginRemovalDigest: "digest-a",
+              approvedSecretDigest: "secret-a",
+            })
+          )
+        );
+      });
+
+      test("confirms from the keyboard only while the card is showing", async () => {
+        const chord = { key: "z", code: "KeyZ", ctrlKey: true, altKey: true };
+        const { client, view } = renderBackupSection();
+        const canvas = within(view.container);
+        await canvas.findByText("Settings backup");
+        const push = jest.spyOn(client.backup, "push").mockResolvedValueOnce(REFUSED(["a"], "d1"));
+
+        fireEvent.keyDown(window, chord);
+        expect(push).not.toHaveBeenCalled();
+
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+        await canvas.findByText("Remove plugins from the backup?");
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.keyDown(window, chord);
+
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({ approvedPluginRemovalDigest: "d1" })
+          )
+        );
+      });
     });
 
     test("offers the plugins right after a restore, which installed none of them", async () => {

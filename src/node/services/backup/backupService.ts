@@ -20,6 +20,7 @@ import {
   type BackupFileChange,
   type BackupOperationError,
   type BackupPluginInstall,
+  type BackupPluginRemoval,
   type BackupProjectImport,
   type BackupProjectImportResult,
 } from "@/common/orpc/schemas/backup";
@@ -85,6 +86,8 @@ export interface BackupPayloadStore {
     secretApproval: string;
     /** Artifact shelf files left out of the export, with the reason (M5c). */
     shelfSkipped?: string[];
+    /** What this export removes from the checked-out backup's plugin list; absent when nothing. */
+    pluginRemoval?: BackupPluginRemoval;
   }>;
   previewRestore(options: {
     repositoryRoot: string;
@@ -102,7 +105,6 @@ export interface BackupPayloadStore {
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
     pluginListWarnings?: string[];
-    pluginsDroppedByPush?: string[];
     symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
@@ -140,7 +142,6 @@ export interface BackupPayloadStore {
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
     pluginListWarnings?: string[];
-    pluginsDroppedByPush?: string[];
     symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
@@ -320,7 +321,8 @@ export class BackupServiceError extends Error {
     public readonly code: BackupErrorCode,
     message: string,
     public readonly files?: string[],
-    public readonly secretApproval?: string
+    public readonly secretApproval?: string,
+    public readonly pluginRemoval?: BackupPluginRemoval
   ) {
     super(message);
     this.name = "BackupServiceError";
@@ -334,6 +336,7 @@ function toOperationError(error: unknown): BackupOperationError {
       message: error.message,
       files: error.files,
       secretApproval: error.secretApproval,
+      pluginRemoval: error.pluginRemoval,
     };
   }
 
@@ -591,7 +594,6 @@ export class BackupService {
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
         pluginListWarnings?: string[];
-        pluginsDroppedByPush?: string[];
         symlinkSkipped?: string[];
         pushError: string | null;
       },
@@ -641,16 +643,23 @@ export class BackupService {
         pluginInstalls: restorePreview.pluginInstalls,
         pluginListSkipped: restorePreview.pluginListSkipped,
         pluginListWarnings: restorePreview.pluginListWarnings,
-        pluginsDroppedByPush: restorePreview.pluginsDroppedByPush,
         symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
   }
 
-  pushWithApproval(input: SettingsBackupInput & { approvedSecretDigest?: string | null }) {
-    const { approvedSecretDigest, ...settings } = input;
-    return this.push(settings, { approvedSecretDigest: approvedSecretDigest ?? undefined });
+  pushWithApproval(
+    input: SettingsBackupInput & {
+      approvedSecretDigest?: string | null;
+      approvedPluginRemovalDigest?: string | null;
+    }
+  ) {
+    const { approvedSecretDigest, approvedPluginRemovalDigest, ...settings } = input;
+    return this.push(settings, {
+      approvedSecretDigest: approvedSecretDigest ?? undefined,
+      approvedPluginRemovalDigest: approvedPluginRemovalDigest ?? undefined,
+    });
   }
 
   restoreWithApproval(
@@ -668,7 +677,7 @@ export class BackupService {
 
   async push(
     settings: SettingsBackupInput,
-    options: { approvedSecretDigest?: string } = {}
+    options: { approvedSecretDigest?: string; approvedPluginRemovalDigest?: string } = {}
   ): Promise<
     Result<
       {
@@ -681,7 +690,7 @@ export class BackupService {
       BackupOperationError
     >
   > {
-    const approvedSecretDigest = options.approvedSecretDigest;
+    const { approvedSecretDigest, approvedPluginRemovalDigest } = options;
     return this.withRepoLock(settings, async (normalized) => {
       const repository = await this.prepareRepository(normalized);
       const exported = await this.withLocalPayload(() =>
@@ -691,6 +700,22 @@ export class BackupService {
           contents: resolveBackupContents(normalized),
         })
       );
+      // The list is rewritten from this machine's installs, so a plugin only the backup lists
+      // (a restore installs none) disappears from it. Removing is the user's call, bound to
+      // exactly the removed names like the secret override below. Checked first, so a refusal
+      // for secrets never hides a removal the user has not seen: each approval then survives the
+      // other's round trip.
+      const removal = exported.pluginRemoval;
+      if (removal !== undefined && approvedPluginRemovalDigest !== removal.approval) {
+        throw new BackupServiceError(
+          "PLUGIN_REMOVAL_APPROVAL_REQUIRED",
+          "This backup would remove plugins from the backup's plugin list",
+          undefined,
+          undefined,
+          removal
+        );
+      }
+
       // Approval is bound to the exact flagged bytes, so an override the user granted for
       // one payload cannot publish a different one another window wrote in between.
       if (exported.secretFiles.length > 0 && approvedSecretDigest !== exported.secretApproval) {
@@ -736,7 +761,6 @@ export class BackupService {
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
         pluginListWarnings?: string[];
-        pluginsDroppedByPush?: string[];
         symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
@@ -860,7 +884,6 @@ export class BackupService {
               pluginInstalls: restored.pluginInstalls,
               pluginListSkipped: restored.pluginListSkipped,
               pluginListWarnings: restored.pluginListWarnings,
-              pluginsDroppedByPush: restored.pluginsDroppedByPush,
               symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,

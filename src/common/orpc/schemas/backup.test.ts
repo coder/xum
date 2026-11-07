@@ -110,7 +110,6 @@ describe("backup output schemas", () => {
   const pluginFields = {
     pluginInstalls: [{ ...entry(), status: "missing" }],
     pluginListWarnings: ["Left out row 2"],
-    pluginsDroppedByPush: ["pstack"],
   };
 
   test("preview keeps the plugin list fields", () => {

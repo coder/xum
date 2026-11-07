@@ -49,7 +49,7 @@ import {
   writeShelfBackup,
   type ShelfRestoreEntry,
 } from "./artifactShelfBackup";
-import { exportPluginBackup, readPluginRestore } from "./agentPluginBackup";
+import { exportPluginBackup, readPluginRestore, readPriorPluginList } from "./agentPluginBackup";
 import { BackupRepoCache } from "./gitRepo";
 import {
   MAX_BACKUP_FILE_COUNT,
@@ -528,6 +528,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async exportTo(exportOptions) {
       const payload = await buildPayload(exportOptions.contents);
       const destination = await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath);
+      // The checked-out backup's plugin list, read before the core write clears the managed path:
+      // a push that leaves one of its plugins out removes it from the backup.
+      const priorPlugins = await readPriorPluginList(destination);
       // Owner-only like the safety snapshot: the export copies allowlisted sources that may
       // themselves be owner-only, and it lands here before the secret scan has said anything
       // about it. Git records only the exec bit, so the modes never reach the remote.
@@ -587,14 +590,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       }
       // The plugin list is a few kilobytes of URLs and commit ids, so it is written before the
       // shelf measures what is left of the tree's budgets. It joins the same secret scan.
-      scanFiles = [
-        ...scanFiles,
-        ...(await exportPluginBackup({
-          rootDir: muxRoot,
-          destination,
-          contents: exportOptions.contents,
-        })),
-      ];
+      const plugins = await exportPluginBackup({
+        rootDir: muxRoot,
+        destination,
+        contents: exportOptions.contents,
+        prior: priorPlugins,
+      });
+      scanFiles = [...scanFiles, ...plugins.files];
       // The shelf sidecar goes last, into whatever the core payload and bundle left of the
       // managed tree's budgets: an entry that does not fit is skipped and reported rather
       // than failing the whole push over agent output.
@@ -635,6 +637,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         secretFiles,
         secretApproval: backupSecretApprovalDigest(scanFiles, secretFiles),
         shelfSkipped,
+        pluginRemoval: plugins.pluginRemoval,
       };
     },
 

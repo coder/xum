@@ -118,6 +118,17 @@ export const BackupPluginInstallSchema = BackupPluginEntrySchema.extend({
   status: BackupPluginInstallStatusSchema,
 });
 
+/**
+ * What a push removes from the backup's plugin list: the listed plugins this machine's export
+ * leaves out, and `wholeList` when the backup has a list and the push writes none. The push
+ * refuses until it carries the `approval` of exactly this removal (a changed list asks again).
+ */
+export const BackupPluginRemovalSchema = z.object({
+  names: z.array(z.string()),
+  wholeList: z.boolean(),
+  approval: z.string(),
+});
+
 export const BackupOperationErrorSchema = z.object({
   code: z.enum([
     "AUTH_FAILED",
@@ -127,6 +138,7 @@ export const BackupOperationErrorSchema = z.object({
     "SECRET_DETECTED",
     "COMMAND_APPROVAL_REQUIRED",
     "PROJECT_IMPORT_APPROVAL_REQUIRED",
+    "PLUGIN_REMOVAL_APPROVAL_REQUIRED",
     "IO_ERROR",
     "GIT_ERROR",
   ]),
@@ -146,6 +158,11 @@ export const BackupOperationErrorSchema = z.object({
    * the fresh list instead of failing opaquely.
    */
   projectImports: z.array(BackupProjectImportSchema).nullish(),
+  /**
+   * On PLUGIN_REMOVAL_APPROVAL_REQUIRED: what the push would remove from the backup's plugin
+   * list. Echo `approval` back as `approvedPluginRemovalDigest` to push anyway.
+   */
+  pluginRemoval: BackupPluginRemovalSchema.nullish(),
   /**
    * Set when a restore fails after its safety snapshot completed: files may already have
    * been overwritten, and the snapshot is the only recovery path, so a failure report
@@ -203,11 +220,6 @@ export const backup = {
         pluginListSkipped: z.boolean().optional(),
         /** What this build could not read of the plugin list (the list or a row); the rest still shows. */
         pluginListWarnings: z.array(z.string()).optional(),
-        /**
-         * Plugins in the backup's list that this machine does not have installed: a push now would
-         * remove them from the backup, because it rewrites the list from the local installs.
-         */
-        pluginsDroppedByPush: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -222,6 +234,7 @@ export const backup = {
   push: {
     input: SettingsBackupInputSchema.extend({
       approvedSecretDigest: z.string().nullish(),
+      approvedPluginRemovalDigest: z.string().nullish(),
     }),
     output: BackupResult(
       z.object({
@@ -257,8 +270,6 @@ export const backup = {
         pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
         pluginListSkipped: z.boolean().optional(),
         pluginListWarnings: z.array(z.string()).optional(),
-        /** As in the preview: a push right after this restore would remove them from the backup. */
-        pluginsDroppedByPush: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -281,3 +292,4 @@ export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResult
 export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
 export type BackupPluginManifest = z.infer<typeof BackupPluginManifestSchema>;
 export type BackupPluginInstall = z.infer<typeof BackupPluginInstallSchema>;
+export type BackupPluginRemoval = z.infer<typeof BackupPluginRemovalSchema>;

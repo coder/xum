@@ -783,6 +783,7 @@ export const KEYBINDS = {
   // Not Ctrl+Alt+P (PIN_WORKSPACE) or Ctrl+Alt+L (the lock-screen key on several desktops).
   SETTINGS_BACKUP_TOGGLE_PLUGINS: { key: "x", code: "KeyX", ctrl: true, alt: true },
   SETTINGS_BACKUP_REVIEW_PLUGINS: { key: "y", code: "KeyY", ctrl: true, alt: true },
+  SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL: { key: "z", code: "KeyZ", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },

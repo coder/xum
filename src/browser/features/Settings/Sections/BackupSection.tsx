@@ -29,8 +29,9 @@ import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import {
   BackupPluginsCard,
   NO_PLUGIN_BACKUP,
-  PluginPushWarning,
+  PluginRemovalCard,
   reviewBackedUpPlugins,
+  usePluginRemovalPrompt,
   type PluginBackupReport,
 } from "./BackupPluginsCard";
 
@@ -62,6 +63,7 @@ const BACKUP_SHORTCUTS = [
   ["toggleOverride", KEYBINDS.SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN],
   ["toggleApproveCommands", KEYBINDS.SETTINGS_BACKUP_APPROVE_COMMANDS],
   ["reviewPlugins", KEYBINDS.SETTINGS_BACKUP_REVIEW_PLUGINS],
+  ["confirmPluginRemoval", KEYBINDS.SETTINGS_BACKUP_CONFIRM_PLUGIN_REMOVAL],
 ] as const;
 
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
@@ -372,6 +374,7 @@ export function BackupSection() {
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
+  const pluginRemoval = usePluginRemovalPrompt({ busy, push: handlePush });
   // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
   // waits for it: the draft's untouched fields would overwrite changes made on the server.
   const [reading, setReading] = useState(false);
@@ -432,6 +435,7 @@ export function BackupSection() {
           setShelfSkipped([]);
           setSymlinkSkipped(undefined);
           setPluginBackup(NO_PLUGIN_BACKUP);
+          pluginRemoval.clear();
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -545,6 +549,7 @@ export function BackupSection() {
       setShelfSkipped([]);
       setSymlinkSkipped(undefined);
       setPluginBackup(NO_PLUGIN_BACKUP);
+      pluginRemoval.clear();
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -671,9 +676,11 @@ export function BackupSection() {
         // a payload another window changed in between. Sent only while the control is visible.
         approvedSecretDigest:
           overrideSecretScan && secretScanBlocked ? (secretScanApproval ?? undefined) : undefined,
+        approvedPluginRemovalDigest: pluginRemoval.approvedDigest(),
       });
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
+        pluginRemoval.record(result.error);
         const blocked = result.error.code === "SECRET_DETECTED";
         setSecretScanBlocked(blocked);
         // A new digest means new bytes, so a previous approval no longer describes them.
@@ -687,6 +694,7 @@ export function BackupSection() {
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setSecretScanApproval(null);
+      pluginRemoval.clear();
       // The push replaced the remote bundle the candidates and the skipped flag described;
       // their tokens no longer match anything, so a restore would only be refused.
       setProjectImports([]);
@@ -812,6 +820,7 @@ export function BackupSection() {
     push: handlePush,
     restore: openRestoreConfirmation,
     reviewPlugins,
+    confirmPluginRemoval: pluginRemoval.confirm,
     toggleOverride: () => {
       // Mirrors the checkbox's own render condition so the shortcut is never advertised
       // while the control is hidden, and never inert while it is visible.
@@ -1115,7 +1124,11 @@ export function BackupSection() {
       {actionError ? <div className="text-error text-xs">{actionError}</div> : null}
       {statusMessage ? <div className="text-success-text text-xs">{statusMessage}</div> : null}
 
-      <PluginPushWarning names={pluginBackup.pluginsDroppedByPush} />
+      <PluginRemovalCard
+        removal={pluginRemoval.removal}
+        busy={busy}
+        onConfirm={() => void pluginRemoval.confirm()}
+      />
 
       <section className="border-border-light flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center">
         <Button

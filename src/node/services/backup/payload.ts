@@ -206,7 +206,7 @@ export interface RestoreBackupPayloadResult {
   localOnlyFiles: string[];
 }
 
-function sha256(content: Buffer): string {
+export function sha256(content: Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
