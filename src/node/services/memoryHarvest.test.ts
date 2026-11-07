@@ -9,7 +9,10 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import { MEMORY_ANALYZER_OP_BUDGET } from "@/common/constants/memory";
+import {
+  MEMORY_ANALYZER_OP_BUDGET,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+} from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
@@ -748,6 +751,23 @@ describe("runMemoryHarvest", () => {
       );
       expect(file.success && file.data.content).toBe(text);
       expect(calls[0]?.tools?.map((entry) => entry.name)).toEqual(["memory"]);
+    });
+
+    // The cost estimate prices each step's output at the cap, so a step the model could write past
+    // it would bill over the estimate.
+    it("caps the output of every step at the cap the cost estimate assumes", async () => {
+      using fixture = createFixture();
+      const { model, calls } = scriptedModel(
+        chunkScript([createFile("/memories/workspace/testing.md", "Run `make test`.\n")])
+      );
+
+      await runHarvest(fixture, model);
+
+      expect(calls).toHaveLength(2);
+      expect(calls.map((call) => call.maxOutputTokens)).toEqual([
+        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+      ]);
     });
 
     it("reads global and project memory but rejects, and journals, a write to either", async () => {

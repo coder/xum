@@ -4,7 +4,9 @@
  *
  * These are not bills, but they never fall under one: every assumption errs high. The run takes
  * every step its cap allows, its prompt already holds every visible memory file, and each step
- * writes a long reply. The estimate also takes nothing it cannot guarantee. A provider's prompt
+ * writes as many tokens as the output cap lets it. That cap is on both streams, so it is a limit
+ * of the run, not a guess; output costs several times what input does, and the next step reads
+ * it back as input. The estimate also takes nothing it cannot guarantee. A provider's prompt
  * cache may miss, expire or be off for the route, so every input token of every step, the first
  * prompt and each resent prefix, prices at the uncached input rate. A model whose table lists a
  * cache-write rate (Anthropic bills about 1.25x input) prices the first step's prompt at the
@@ -15,19 +17,13 @@
 import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_CONSOLIDATION_MAX_STEPS,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
-
-/**
- * Output of one step: a memory command carries the text it writes, and output costs several
- * times what input does, so ignoring it would let the estimate fall under the bill. The next
- * step reads it back as input.
- */
-const ESTIMATED_OUTPUT_TOKENS_PER_STEP = 1_000;
 
 /**
  * Price of a run of `steps` steps over a prompt of `promptChars` characters, or undefined when
@@ -48,13 +44,13 @@ function estimateRunUsd(
   let total = 0;
   for (let step = 1; step <= steps; step++) {
     // Every token goes out again with each step, uncached: the prompt plus all earlier output.
-    const inputTokens = promptTokens + (step - 1) * ESTIMATED_OUTPUT_TOKENS_PER_STEP;
+    const inputTokens = promptTokens + (step - 1) * MEMORY_MAX_OUTPUT_TOKENS_PER_STEP;
     const stepUsd = (cacheWriteTokens: number) =>
       getTotalCost(
         createDisplayUsage(
           {
             inputTokens,
-            outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
+            outputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
             inputTokenDetails: { cacheWriteTokens },
           },
           pricingModel,

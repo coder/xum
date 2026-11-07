@@ -36,6 +36,7 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -509,6 +510,8 @@ export async function runMemoryConsolidation(args: {
       finalPassPrompt,
     tools: { memory: memoryTool },
     stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
+    // The cost estimate prices each step's output at this cap, so the stream must keep to it.
+    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     abortSignal: args.abortSignal,
   });
 

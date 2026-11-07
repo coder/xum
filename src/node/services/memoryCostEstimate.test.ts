@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { defaultModel } from "@/common/utils/ai/models";
-import { MEMORY_ANALYZER_MAX_STEPS } from "@/common/constants/memory";
+import {
+  MEMORY_ANALYZER_MAX_STEPS,
+  MEMORY_CONSOLIDATION_MAX_STEPS,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+} from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
@@ -76,6 +80,31 @@ describe("estimateOrganizerUpperBoundUsd", () => {
       }) ?? 0;
     expect(estimate(0)).toBeGreaterThan(0);
     expect(estimate(100_000)).toBeGreaterThan(estimate(0));
+  });
+});
+
+describe("output of each step", () => {
+  // With no prompt at all, a run is only its output: every step writes the cap, and each later
+  // step reads all earlier output back as input. The sum is a requirement of the bound, not a
+  // reading of the code: S steps of output at the output rate, plus the earlier outputs
+  // (0 + 1 + ... + S-1 of them) at the input rate.
+  const MODEL = "openai:gpt-6.1-sol";
+  it("prices every step's output at the output cap, and reads it back as input", () => {
+    const stats = getModelStats(MODEL);
+    const input = stats?.input_cost_per_token ?? 0;
+    const output = stats?.output_cost_per_token ?? 0;
+    const steps = MEMORY_CONSOLIDATION_MAX_STEPS;
+    const cap = MEMORY_MAX_OUTPUT_TOKENS_PER_STEP;
+    const outputUsd = steps * cap * output;
+    const readBackUsd = ((steps * (steps - 1)) / 2) * cap * input;
+
+    const estimate = estimateOrganizerUpperBoundUsd({
+      pricingModel: MODEL,
+      systemPromptChars: 0,
+      memoryChars: 0,
+    });
+
+    expect(estimate).toBeCloseTo(outputUsd + readBackUsd, 9);
   });
 });
 
