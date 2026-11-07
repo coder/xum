@@ -176,31 +176,45 @@ test("keeps tracking the backup's branch when the user fixed the URL and the pre
   });
 });
 
+const ALPHA_URL = "https://github.com/example/alpha.git";
+
 test.each([
-  ["another commit than the pinned one", { lockedSha: LATEST }],
-  ["a branch whose tip is the pinned commit", { lockedSha: PINNED }],
-])(
-  "records what the user previewed, not the backup's branch, after editing the ref to %s",
-  async (_label, resolved) => {
-    // The pinned commit until the user asks for "develop", then that branch as resolved here.
-    const developBranch = (ref: string | null | undefined) =>
-      ref !== "develop"
-        ? previewOf("alpha")
-        : previewOf("alpha", {
-            source: {
-              type: "git",
-              url: "https://github.com/example/alpha.git",
-              ref: "develop",
-              refType: "branch",
-            },
-            ...resolved,
-          });
-    const { view, installSpy } = renderWithBackup([backedUp("alpha")], { alpha: developBranch });
+  {
+    label: "another commit than the pinned one",
+    typed: LATEST,
+    resolved: {
+      source: { type: "git", url: ALPHA_URL, ref: LATEST, refType: "commit" },
+      lockedSha: LATEST,
+    },
+  },
+  {
+    label: "another branch",
+    typed: "develop",
+    resolved: {
+      source: { type: "git", url: ALPHA_URL, ref: "develop", refType: "branch" },
+      lockedSha: LATEST,
+    },
+  },
+  {
+    label: "a branch whose tip is the pinned commit",
+    typed: "develop",
+    resolved: {
+      source: { type: "git", url: ALPHA_URL, ref: "develop", refType: "branch" },
+      lockedSha: PINNED,
+    },
+  },
+] as const)(
+  "records what the user previewed, not the backup's branch, after editing the ref to $label",
+  async ({ typed, resolved }) => {
+    // The pinned commit until the user asks for another ref, then what that ref resolves to here.
+    const resolve = (ref: string | null | undefined) =>
+      ref === typed ? previewOf("alpha", resolved) : previewOf("alpha");
+    const { view, installSpy } = renderWithBackup([backedUp("alpha")], { alpha: resolve });
     await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
     await clickButton(view, /^Back$/);
     const refField = await view.findByLabelText(/Branch, tag, or commit SHA/);
     // Replaces the pinned commit the form was filled with.
-    await userEvent.type(refField, "develop", {
+    await userEvent.type(refField, typed, {
       initialSelectionStart: 0,
       initialSelectionEnd: PINNED.length,
     });
@@ -211,7 +225,7 @@ test.each([
 
     await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
     expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
-      source: { ref: "develop", refType: "branch" },
+      source: { ref: resolved.source.ref, refType: resolved.source.refType },
       expectedSha: resolved.lockedSha,
     });
   }
