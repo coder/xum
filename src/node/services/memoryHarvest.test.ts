@@ -3,20 +3,19 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
-import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage, type MuxMessage, type MuxToolPart } from "@/common/types/message";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import { MEMORY_ANALYZER_OP_BUDGET } from "@/common/constants/memory";
+import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { buildHarvestChunks, runMemoryHarvest } from "./memoryHarvest";
-
-const INBOX_PATH = "/memories/workspace/harvest/summary-1.md";
+import { buildHarvestChunks, runMemoryHarvest, type HarvestProgress } from "./memoryHarvest";
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -40,13 +39,15 @@ function toolFinishChunk(): LanguageModelV3StreamPart {
   };
 }
 
-function harvestToolCall(candidates: unknown[]): LanguageModelV3StreamPart {
-  return {
-    type: "tool-call",
-    toolCallId: "candidates-1",
-    toolName: "submit_memory_candidates",
-    input: JSON.stringify({ candidates }),
-  };
+function memoryToolCall(
+  input: Record<string, unknown>,
+  id = "memory-call"
+): LanguageModelV3StreamPart {
+  return { type: "tool-call", toolCallId: id, toolName: "memory", input: JSON.stringify(input) };
+}
+
+function createFile(path: string, text: string): Record<string, unknown> {
+  return { command: "create", path, file_text: text };
 }
 
 function userPromptText(options: LanguageModelV3CallOptions): string {
@@ -60,48 +61,63 @@ function userPromptText(options: LanguageModelV3CallOptions): string {
   return parts.join("\n");
 }
 
-function modelFromChunks(chunks: LanguageModelV3StreamPart[]): MockLanguageModelV3 {
-  let streamCount = 0;
-  return new MockLanguageModelV3({
-    doStream: () => {
-      streamCount++;
-      return Promise.resolve({
-        stream: simulateReadableStream({ chunks: streamCount === 1 ? chunks : [finishChunk(1)] }),
-      });
-    },
-  });
+/** What the tool calls returned to the model, as the next step's prompt carries it. */
+function toolResultsText(options: LanguageModelV3CallOptions | undefined): string {
+  return JSON.stringify(options?.prompt.filter((message) => message.role === "tool") ?? []);
 }
 
-function modelFromStreamSequence(
-  chunksByStream: LanguageModelV3StreamPart[][]
-): MockLanguageModelV3 {
-  let streamCount = 0;
-  return new MockLanguageModelV3({
-    doStream: () => {
-      const chunks = chunksByStream[streamCount] ?? [finishChunk(1)];
-      streamCount++;
-      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
-    },
-  });
+/** 12 rows of 7,000 characters: three transcript chunks (5 + 5 + 2 rows). */
+function manyChunkMessages(): MuxMessage[] {
+  return Array.from({ length: 12 }, (_, index) =>
+    createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+      historySequence: index,
+    })
+  );
 }
 
-function failingModel(): MockLanguageModelV3 {
-  return new MockLanguageModelV3({
-    doStream: () =>
-      Promise.resolve({
-        stream: new ReadableStream<LanguageModelV3StreamPart>({
-          pull(controller) {
-            controller.error(new Error("provider exploded"));
-          },
-        }),
-      }),
+interface ScriptedModel {
+  model: MockLanguageModelV3;
+  calls: LanguageModelV3CallOptions[];
+}
+
+/**
+ * One scripted stream per model call (a tool-call step, then the step after its result, ...). An
+ * `Error` entry makes that call's stream fail like a provider outage.
+ */
+function scriptedModel(streams: Array<LanguageModelV3StreamPart[] | Error>): ScriptedModel {
+  const calls: LanguageModelV3CallOptions[] = [];
+  const model = new MockLanguageModelV3({
+    doStream: (options) => {
+      calls.push(options);
+      const script = streams[calls.length - 1] ?? [finishChunk(1)];
+      if (script instanceof Error) {
+        const failure = script;
+        return Promise.resolve({
+          stream: new ReadableStream<LanguageModelV3StreamPart>({
+            pull(controller) {
+              controller.error(failure);
+            },
+          }),
+        });
+      }
+      return Promise.resolve({ stream: simulateReadableStream({ chunks: script }) });
+    },
   });
+  return { model, calls };
+}
+
+/** One chunk's model calls: a step that issues `commands` together, then a step that ends the chunk. */
+function chunkScript(commands: Array<Record<string, unknown>>): LanguageModelV3StreamPart[][] {
+  return [
+    [...commands.map((input, index) => memoryToolCall(input, `call-${index}`)), toolFinishChunk()],
+    [finishChunk(1)],
+  ];
 }
 
 interface Fixture extends Disposable {
   memoryService: MemoryService;
+  metaService: MemoryMetaService;
   ctx: MemoryScopeContext;
-  metadata: CompactionCompletionMetadata;
   messages: MuxMessage[];
   summary: MuxMessage;
 }
@@ -126,14 +142,8 @@ function createFixture(): Fixture {
 
   return {
     memoryService,
+    metaService,
     ctx,
-    metadata: {
-      workspaceId: "ws-harvest",
-      summaryMessageId: "summary-1",
-      summaryHistorySequence: 2,
-      compactionEpoch: 1,
-      compactionRequestMessageId: "compact-request",
-    },
     messages: [
       createMuxMessage("m1", "user", "Please remember that I prefer concise tests.", {
         historySequence: 0,
@@ -146,28 +156,22 @@ function createFixture(): Fixture {
   };
 }
 
+type HarvestExtras = Partial<Parameters<typeof runMemoryHarvest>[0]>;
+
 async function runHarvest(
   fixture: Fixture,
-  model: MockLanguageModelV3
+  model: MockLanguageModelV3,
+  extras: HarvestExtras = {}
 ): Promise<Awaited<ReturnType<typeof runMemoryHarvest>>> {
   return runMemoryHarvest({
     model,
-    agentBody: "Harvest durable memories from the transcript.",
     memoryService: fixture.memoryService,
+    metaService: fixture.metaService,
     ctx: fixture.ctx,
-    completionMetadata: fixture.metadata,
     messages: fixture.messages,
     summary: fixture.summary,
+    ...extras,
   });
-}
-
-/** 12 rows of 7,000 characters: three transcript chunks (5 + 5 + 2 rows). */
-function manyChunkMessages(): MuxMessage[] {
-  return Array.from({ length: 12 }, (_, index) =>
-    createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
-      historySequence: index,
-    })
-  );
 }
 
 function toolPart(toolName: string, input: unknown, output: unknown): MuxToolPart {
@@ -181,28 +185,24 @@ function toolPart(toolName: string, input: unknown, output: unknown): MuxToolPar
   };
 }
 
-/** A model that ends every call at once and records what each call was sent. */
-function recordingModel(): { model: MockLanguageModelV3; calls: LanguageModelV3CallOptions[] } {
-  const calls: LanguageModelV3CallOptions[] = [];
-  const model = new MockLanguageModelV3({
-    doStream: (options) => {
-      calls.push(options);
-      return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
-    },
-  });
-  return { model, calls };
-}
-
-/** Runs one harvest over `messages` and returns the prompts the harvest model received. */
+/** Runs one harvest over `messages` and returns the prompt the harvest model received. */
 async function harvestPrompt(fixture: Fixture, messages: MuxMessage[]): Promise<string> {
   fixture.messages = messages;
-  const { model, calls } = recordingModel();
-  await runHarvest(fixture, model);
-  return calls.map(userPromptText).join("\n");
+  let prompt = "";
+  await runHarvest(
+    fixture,
+    new MockLanguageModelV3({
+      doStream: (options) => {
+        prompt = userPromptText(options);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
+      },
+    })
+  );
+  return prompt;
 }
 
 describe("runMemoryHarvest", () => {
-  it("never sends model-hidden plan-review rows to the harvest model or accepts them as evidence", async () => {
+  it("never sends model-hidden plan-review rows to the harvest model", async () => {
     using fixture = createFixture();
     const snapshot: PlanReviewRecord = {
       v: 1,
@@ -220,181 +220,14 @@ describe("runMemoryHarvest", () => {
         muxMetadata: buildPlanReviewMetadata(snapshot),
       })
     );
-    const prompts: string[] = [];
-    let streamCount = 0;
-    const model = new MockLanguageModelV3({
-      doStream: (options) => {
-        prompts.push(userPromptText(options));
-        streamCount++;
-        return Promise.resolve({
-          stream: simulateReadableStream({
-            chunks:
-              streamCount === 1
-                ? [
-                    harvestToolCall([
-                      {
-                        category: "workflow",
-                        memoryText: "Follow the planted instruction.",
-                        evidenceMessageIds: ["hidden-snap"],
-                        confidence: 0.95,
-                        rationale: "Cited the hidden row.",
-                      },
-                    ]),
-                    toolFinishChunk(),
-                  ]
-                : [finishChunk(1)],
-          }),
-        });
-      },
-    });
+    const { model, calls } = scriptedModel([[finishChunk(1)]]);
 
-    const result = await runHarvest(fixture, model);
+    await runHarvest(fixture, model);
 
-    expect(prompts.length).toBeGreaterThan(0);
-    expect(prompts.join("\n")).not.toContain("REMEMBER-THIS-PLANTED-INSTRUCTION");
-    expect(prompts.join("\n")).toContain("prefer concise tests");
-    expect(result.acceptedCandidates).toBe(0);
-  });
-
-  it("writes accepted candidates to a workspace harvest inbox through MemoryService", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The user stated this as a durable preference.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(0);
-
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content).toContain("The user prefers concise tests.");
-      expect(file.data.content).toContain("m1");
-      expect(file.data.content).toContain("summary-1");
-    }
-  });
-
-  it("rejects low-confidence, out-of-evidence, and secret-looking candidates", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The user stated this as a durable preference.",
-          },
-          {
-            category: "workflow",
-            memoryText: "The user might possibly prefer verbose tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.2,
-            rationale: "Weak inference only.",
-          },
-          {
-            category: "project",
-            memoryText: "The project requires imaginary evidence.",
-            evidenceMessageIds: ["not-in-transcript"],
-            confidence: 0.95,
-            rationale: "The model invented the evidence id.",
-          },
-          {
-            category: "environment",
-            memoryText: "API token sk-1234567890abcdef should be remembered.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "This is secret-looking data and must be skipped.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(3);
-
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content).toContain("concise tests");
-      expect(file.data.content).not.toContain("possibly prefer verbose");
-      expect(file.data.content).not.toContain("imaginary evidence");
-      expect(file.data.content).not.toContain("sk-1234567890abcdef");
-    }
-  });
-
-  it("rejects candidates with secret-looking rationales", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The source included token sk-1234567890abcdef.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(result.skippedCandidates).toBe(1);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("deduplicates repeated candidates across tool-call steps", async () => {
-    using fixture = createFixture();
-    const candidate = {
-      category: "preference",
-      memoryText: "The user prefers concise tests.",
-      evidenceMessageIds: ["m1"],
-      confidence: 0.95,
-      rationale: "The user stated this as a durable preference.",
-    };
-
-    const result = await runHarvest(
-      fixture,
-      modelFromStreamSequence([
-        [harvestToolCall([candidate, candidate]), toolFinishChunk()],
-        [harvestToolCall([candidate]), toolFinishChunk()],
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(2);
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content.match(/## preference/g)).toHaveLength(1);
-    }
+    const prompts = calls.map(userPromptText).join("\n");
+    expect(calls.length).toBeGreaterThan(0);
+    expect(prompts).not.toContain("REMEMBER-THIS-PLANTED-INSTRUCTION");
+    expect(prompts).toContain("prefer concise tests");
   });
 
   describe("tool results", () => {
@@ -486,7 +319,7 @@ describe("runMemoryHarvest", () => {
           )
         ),
       ];
-      const { model, calls } = recordingModel();
+      const { model, calls } = scriptedModel([]);
 
       const result = await runHarvest(fixture, model);
 
@@ -498,6 +331,7 @@ describe("runMemoryHarvest", () => {
       );
       expect(positions.every((position) => position >= 0)).toBe(true);
       expect(positions).toEqual([...positions].sort((a, b) => a - b));
+      expect(result.nextChunk).toBe(calls.length);
     });
 
     it("splits a long message into rows of one id, each saying which parts it holds", async () => {
@@ -514,7 +348,7 @@ describe("runMemoryHarvest", () => {
         ),
         createMuxMessage("u1", "user", "short follow-up", { historySequence: 1 }),
       ];
-      const { model, calls } = recordingModel();
+      const { model, calls } = scriptedModel([]);
 
       await runHarvest(fixture, model);
 
@@ -540,7 +374,7 @@ describe("runMemoryHarvest", () => {
           [toolPart("bash", { script: "echo done" }, { output: "AFTER-THE-LONG-TEXT" })]
         ),
       ];
-      const { model, calls } = recordingModel();
+      const { model, calls } = scriptedModel([]);
 
       await runHarvest(fixture, model);
 
@@ -688,52 +522,6 @@ describe("runMemoryHarvest", () => {
     });
   });
 
-  it("accepts a candidate that cites a message spanning chunks, from any chunk that holds a row of it", async () => {
-    using fixture = createFixture();
-    fixture.messages = [
-      createMuxMessage("early", "user", "short opening", { historySequence: 0 }),
-      createMuxMessage(
-        "long",
-        "assistant",
-        "A long turn.",
-        { historySequence: 1 },
-        // 30 results of 1.5 KB: the message runs from the first chunk into the second.
-        Array.from({ length: 30 }, (_, index) =>
-          toolPart("bash", { script: `step ${index}` }, { output: "x".repeat(1_500) })
-        )
-      ),
-    ];
-    const total = buildHarvestChunks(fixture.messages).length;
-    expect(total).toBe(2);
-    // Submits from the last chunk only, which holds a later piece of `long` and nothing of `early`.
-    const model = new MockLanguageModelV3({
-      doStream: (options) => {
-        const isFirstStep = !options.prompt.some((message) => message.role === "tool");
-        const inLastChunk = userPromptText(options).includes(`Transcript chunk ${total}/${total}`);
-        const candidate = (evidenceId: string) => ({
-          category: "workflow",
-          memoryText: `Remember the lesson cited from ${evidenceId}.`,
-          evidenceMessageIds: [evidenceId],
-          confidence: 0.95,
-          rationale: "Cited by id.",
-        });
-        return Promise.resolve({
-          stream: simulateReadableStream({
-            chunks:
-              isFirstStep && inLastChunk
-                ? [harvestToolCall([candidate("long"), candidate("early")]), toolFinishChunk()]
-                : [finishChunk(1)],
-          }),
-        });
-      },
-    });
-
-    const result = await runHarvest(fixture, model);
-
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(1);
-  });
-
   it("serializes transcript evidence as JSON instead of breakable pseudo-XML", async () => {
     using fixture = createFixture();
     fixture.messages = [
@@ -777,6 +565,21 @@ describe("runMemoryHarvest", () => {
     expect(streamCalls).toBeGreaterThan(1);
   });
 
+  it("keeps the compaction summary in the prompt of every chunk", async () => {
+    using fixture = createFixture();
+    fixture.summary = createMuxMessage("summary-1", "assistant", "SUMMARY-ONLY-FACT", {
+      historySequence: 2,
+      compactionBoundary: true,
+    });
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
+  });
+
   it("redacts a credential in the compaction summary from every chunk's prompt", async () => {
     using fixture = createFixture();
     const githubToken = `ghp_${"a1B2".repeat(9)}`;
@@ -787,7 +590,7 @@ describe("runMemoryHarvest", () => {
       { historySequence: 2, compactionBoundary: true }
     );
     fixture.messages = manyChunkMessages();
-    const { model, calls } = recordingModel();
+    const { model, calls } = scriptedModel([]);
 
     await runHarvest(fixture, model);
 
@@ -800,81 +603,544 @@ describe("runMemoryHarvest", () => {
     }
   });
 
-  it("keys inbox cleanup by compaction boundary id instead of epoch", async () => {
+  describe("analyzer", () => {
+    it("creates a workspace memory file through the memory tool, its only tool", async () => {
+      using fixture = createFixture();
+      const text = "---\ndescription: How tests run here\n---\nRun `make test`.\n";
+      const { model, calls } = scriptedModel(
+        chunkScript([createFile("/memories/workspace/testing.md", text)])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toBeUndefined();
+      expect(result.nextChunk).toBe(1);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/testing.md", applied: true },
+      ]);
+      const file = await fixture.memoryService.readFileWithSha(
+        fixture.ctx,
+        "/memories/workspace/testing.md"
+      );
+      expect(file.success && file.data.content).toBe(text);
+      expect(calls[0]?.tools?.map((entry) => entry.name)).toEqual(["memory"]);
+    });
+
+    it("reads global and project memory but rejects, and journals, a write to either", async () => {
+      using fixture = createFixture();
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        "/memories/global/env.md",
+        "GLOBAL-FACT the dev box has 64 GB\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model, calls } = scriptedModel([
+        [
+          memoryToolCall({ command: "view", path: "/memories/global/env.md" }, "read"),
+          memoryToolCall(createFile("/memories/global/new.md", "g\n"), "write-global"),
+          memoryToolCall(createFile("/memories/project/new.md", "p\n"), "write-project"),
+          toolFinishChunk(),
+        ],
+        [finishChunk(1)],
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(toolResultsText(calls[1])).toContain("GLOBAL-FACT");
+      expect(result.ops).toHaveLength(2);
+      expect(new Set(result.ops.map((op) => op.path))).toEqual(
+        new Set(["/memories/global/new.md", "/memories/project/new.md"])
+      );
+      for (const op of result.ops) {
+        expect(op.applied).toBe(false);
+        expect(op.note).toContain("/memories/workspace/...");
+      }
+      for (const rejected of ["/memories/global/new.md", "/memories/project/new.md"]) {
+        expect(await fixture.memoryService.readFileWithSha(fixture.ctx, rejected)).toMatchObject({
+          success: false,
+        });
+      }
+    });
+
+    it("rejects a write that carries a credential and accepts text that only mentions tokens", async () => {
+      using fixture = createFixture();
+      const notesPath = "/memories/workspace/notes.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        notesPath,
+        "line one\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      const { model } = scriptedModel(
+        chunkScript([
+          createFile("/memories/workspace/creds.md", `GITHUB_TOKEN=${githubToken}\n`),
+          {
+            command: "str_replace",
+            path: notesPath,
+            old_str: "line one",
+            new_str: "password: hunter2-correct-horse",
+          },
+          {
+            command: "insert",
+            path: notesPath,
+            insert_line: 0,
+            insert_text: `Authorization: Bearer ${githubToken}\n`,
+          },
+          createFile("/memories/workspace/budget.md", "The token budget resets each turn.\n"),
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.ops.filter((op) => op.applied).map((op) => op.path)).toEqual([
+        "/memories/workspace/budget.md",
+      ]);
+      const rejected = result.ops.filter((op) => !op.applied);
+      expect(rejected).toHaveLength(3);
+      for (const op of rejected) expect(op.note).toContain("credential");
+      // The journal is persisted in the sidecar record: it must not carry the value either.
+      expect(JSON.stringify(result.ops)).not.toContain(githubToken);
+      expect(JSON.stringify(result.ops)).not.toContain("hunter2");
+      const notes = await fixture.memoryService.readFileWithSha(fixture.ctx, notesPath);
+      expect(notes.success && notes.data.content).toBe("line one\n");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/creds.md")
+      ).toMatchObject({ success: false });
+    });
+
+    it("cannot delete or rename a memory file, only add to and edit it", async () => {
+      using fixture = createFixture();
+      const keepPath = "/memories/workspace/keep.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        keepPath,
+        "keep me\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model } = scriptedModel(
+        chunkScript([
+          { command: "delete", path: keepPath },
+          { command: "rename", old_path: keepPath, new_path: "/memories/workspace/moved.md" },
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.ops.map((op) => [op.command, op.applied])).toEqual([
+        ["delete", false],
+        ["rename", false],
+      ]);
+      const kept = await fixture.memoryService.readFileWithSha(fixture.ctx, keepPath);
+      expect(kept.success && kept.data.content).toBe("keep me\n");
+    });
+
+    it("shares one mutation budget across the chunks of an epoch", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const files = (chunk: number, count: number) =>
+        Array.from({ length: count }, (_, index) =>
+          createFile(`/memories/workspace/c${chunk}-${index}.md`, `fact ${chunk}-${index}\n`)
+        );
+      // 2 edits over the budget in all, split so no single chunk exceeds it on its own.
+      const { model } = scriptedModel([
+        ...chunkScript(files(1, MEMORY_ANALYZER_OP_BUDGET - 3)),
+        ...chunkScript(files(2, 5)),
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.nextChunk).toBe(3);
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      const rejected = result.ops.filter((op) => !op.applied);
+      expect(rejected).toHaveLength(2);
+      for (const op of rejected) expect(op.note).toContain("budget exhausted");
+    });
+
+    it("skips the model call of every chunk after the budget is spent, and says so", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: number[] = [];
+      const { model, calls } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/spent-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress.nextChunk);
+          return Promise.resolve();
+        },
+      });
+
+      // Chunk 1 ran its two steps; chunks 2 and 3 could write nothing, so they cost nothing.
+      expect(calls).toHaveLength(2);
+      expect(result.streamError).toBeUndefined();
+      // The cursor moves past them: a retry would find the same spent budget.
+      expect(result.nextChunk).toBe(3);
+      // A model read only the first.
+      expect(result.readChunks).toBe(1);
+      expect(result.nextChunkOps).toBe(0);
+      expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      expect(result.note).toContain("chunks 2-3 of 3");
+      expect(reached).toEqual([1]);
+    });
+
+    it("does not call the model at all when a retry resumes with the budget already spent", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model, {
+        resume: { nextChunk: 1, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET },
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.nextChunk).toBe(3);
+      expect(result.readChunks).toBe(1);
+      expect(result.note).toContain("chunks 2-3 of 3");
+    });
+
+    it("leaves no note when the last chunk is the one that spends the budget", async () => {
+      using fixture = createFixture();
+      const { model } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/exact-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.nextChunk).toBe(1);
+      expect(result.readChunks).toBe(1);
+      expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      expect(result.note).toBeUndefined();
+    });
+
+    it("counts the edits an earlier attempt applied against the epoch's budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const spent: MemoryConsolidationOp[] = Array.from(
+        { length: MEMORY_ANALYZER_OP_BUDGET - 1 },
+        (_, index) => ({
+          command: "create",
+          path: `/memories/workspace/earlier-${index}.md`,
+          applied: true,
+        })
+      );
+      const { model } = scriptedModel(
+        chunkScript([
+          createFile("/memories/workspace/last.md", "last\n"),
+          createFile("/memories/workspace/late.md", "late\n"),
+        ])
+      );
+
+      const result = await runHarvest(fixture, model, { resume: { nextChunk: 2, ops: spent } });
+
+      // One edit was left of the earlier attempt's budget: the first lands, the second is over.
+      expect(result.ops).toHaveLength(spent.length + 2);
+      const fromRetry = result.ops.slice(spent.length);
+      expect(fromRetry.filter((op) => op.applied)).toHaveLength(1);
+      expect(fromRetry.find((op) => !op.applied)?.note).toContain("budget exhausted");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/last.md")
+      ).toMatchObject({ success: true });
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/late.md")
+      ).toMatchObject({ success: false });
+    });
+  });
+
+  describe("retry budget", () => {
+    const failingEdit = (index: number) => ({
+      command: "str_replace",
+      path: `/memories/workspace/missing-${index}.md`,
+      old_str: "a",
+      new_str: "b",
+    });
+
+    it("spends budget on a command that failed to apply and resumes the spent amount", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: HarvestProgress[] = [];
+      const first = scriptedModel([
+        ...chunkScript([failingEdit(0), failingEdit(1), failingEdit(2)]),
+        new Error("provider exploded"),
+      ]);
+
+      const failed = await runHarvest(fixture, first.model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress);
+          return Promise.resolve();
+        },
+      });
+
+      // Three dispatches failed: nothing applied, but the budget is three spent.
+      expect(failed.ops.filter((op) => op.applied)).toHaveLength(0);
+      expect(reached.map((progress) => progress.budgetUsed)).toEqual([3]);
+      expect(failed.budgetUsed).toBe(3);
+
+      const creates = Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+        createFile(`/memories/workspace/retry-${index}.md`, `fact ${index}\n`)
+      );
+      const retry = scriptedModel(chunkScript(creates));
+      const resumed = await runHarvest(fixture, retry.model, { resume: failed });
+
+      expect(resumed.ops.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET - 3);
+      expect(resumed.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+    });
+
+    it("falls back to the applied ops when an older record has no budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const applied: MemoryConsolidationOp[] = Array.from({ length: 3 }, (_, index) => ({
+        command: "create",
+        path: `/memories/workspace/older-${index}.md`,
+        applied: true,
+      }));
+      const creates = Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+        createFile(`/memories/workspace/later-${index}.md`, `fact ${index}\n`)
+      );
+      const { model } = scriptedModel(chunkScript(creates));
+
+      const result = await runHarvest(fixture, model, { resume: { nextChunk: 2, ops: applied } });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(3 + MEMORY_ANALYZER_OP_BUDGET - 3);
+    });
+  });
+
+  it("reports each clean chunk's usage to cost telemetry and sums it for the record", async () => {
     using fixture = createFixture();
-    const oldBoundaryInbox = "/memories/workspace/harvest/old-summary.md";
-    const saved = await fixture.memoryService.saveFile(
-      fixture.ctx,
-      oldBoundaryInbox,
-      "older boundary candidate\n",
-      null,
-      "agent"
+    fixture.messages = manyChunkMessages();
+    const recorded: number[] = [];
+    const { model } = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.outputTokens ?? 0);
+        return Promise.resolve();
+      },
+    });
+
+    expect(recorded).toEqual([5, 5, 5]);
+    expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
+  });
+
+  it("sums the usage of the chunks that reported one and none when no chunk did", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    // A telemetry sink that throws on the second chunk leaves that chunk without usage.
+    let reports = 0;
+    const flaky = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+
+    const partial = await runHarvest(fixture, flaky.model, {
+      recordUsage: () => {
+        if (++reports === 2) throw new Error("usage sink failed");
+        return Promise.resolve();
+      },
+    });
+
+    expect(partial.streamError).toBeUndefined();
+    expect(partial.nextChunk).toBe(3);
+    expect(partial.usage).toEqual({ inputTokens: 2, outputTokens: 10 });
+
+    const silent = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+    const none = await runHarvest(fixture, silent.model, {
+      recordUsage: () => {
+        throw new Error("usage sink failed");
+      },
+    });
+
+    expect(none.nextChunk).toBe(3);
+    expect(none.usage).toBeUndefined();
+  });
+
+  describe("resume cursor", () => {
+    it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: HarvestProgress[] = [];
+      const first = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/one.md", "chunk one fact\n")]),
+        new Error("provider exploded"),
+      ]);
+
+      const failed = await runHarvest(fixture, first.model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress);
+          return Promise.resolve();
+        },
+      });
+
+      expect(failed.streamError).toContain("provider exploded");
+      expect(failed.nextChunk).toBe(1);
+      expect(failed.ops).toEqual([
+        { command: "create", path: "/memories/workspace/one.md", applied: true },
+      ]);
+      // The cursor is reported while the run is still going, before the failing chunk starts.
+      expect(reached.map((progress) => progress.nextChunk)).toEqual([1]);
+
+      const retry = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/two.md", "chunk two fact\n")]),
+        [finishChunk(1)],
+      ]);
+      const resumed = await runHarvest(fixture, retry.model, {
+        resume: { nextChunk: failed.nextChunk, ops: failed.ops },
+      });
+
+      expect(resumed.streamError).toBeUndefined();
+      expect(resumed.nextChunk).toBe(3);
+      const retryPrompts = retry.calls.map(userPromptText);
+      expect(retryPrompts[0]).toContain("Transcript chunk 2/3");
+      expect(retryPrompts.join("\n")).not.toContain("Transcript chunk 1/3");
+      // Chunking is deterministic for an epoch: chunk 2 reads the same on the retry.
+      expect(retryPrompts[0]).toBe(userPromptText(first.calls[2]));
+      expect(resumed.ops.map((op) => op.path)).toEqual([
+        "/memories/workspace/one.md",
+        "/memories/workspace/two.md",
+      ]);
+    });
+
+    it("keeps the edits of a chunk that failed after writing", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model } = scriptedModel([
+        [
+          memoryToolCall(createFile("/memories/workspace/partial.md", "landed\n")),
+          toolFinishChunk(),
+        ],
+        new Error("provider exploded"),
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toContain("provider exploded");
+      expect(result.nextChunk).toBe(0);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/partial.md", applied: true },
+      ]);
+    });
+  });
+
+  describe("replaying a chunk that failed after writing", () => {
+    it("tells the retry which edits of that chunk already landed, by command and path only", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const landedText = "UNIQUE-FACT-TEXT chunk two wrote this\n";
+      const first = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/one.md", "chunk one fact\n")]),
+        [memoryToolCall(createFile("/memories/workspace/two.md", landedText)), toolFinishChunk()],
+        new Error("provider exploded"),
+      ]);
+      const failed = await runHarvest(fixture, first.model);
+      expect(failed.nextChunk).toBe(1);
+      // Only the failed chunk's edit counts as landed in it; chunk one's belongs to a finished chunk.
+      expect(failed.nextChunkOps).toBe(1);
+
+      const retry = scriptedModel([]);
+      await runHarvest(fixture, retry.model, { resume: failed });
+
+      const prompts = retry.calls.map(userPromptText);
+      expect(prompts[0]).toContain("Transcript chunk 2/3");
+      expect(prompts[0]).toContain("already applied");
+      expect(prompts[0]).toContain("do not repeat");
+      expect(prompts[0]).toContain("/memories/workspace/two.md");
+      expect(prompts[0]).not.toContain("/memories/workspace/one.md");
+      expect(prompts[0]).not.toContain("UNIQUE-FACT-TEXT");
+      // The note covers the replayed chunk only.
+      expect(prompts[1]).toContain("Transcript chunk 3/3");
+      expect(prompts[1]).not.toContain("/memories/workspace/two.md");
+    });
+
+    it("keeps the landed edits listed when the retry fails again", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const first = scriptedModel([
+        [memoryToolCall(createFile("/memories/workspace/a.md", "a\n")), toolFinishChunk()],
+        new Error("provider exploded"),
+      ]);
+      const failedOnce = await runHarvest(fixture, first.model);
+      const second = scriptedModel([
+        [memoryToolCall(createFile("/memories/workspace/b.md", "b\n")), toolFinishChunk()],
+        new Error("provider exploded again"),
+      ]);
+      const failedTwice = await runHarvest(fixture, second.model, { resume: failedOnce });
+      expect(failedTwice.nextChunk).toBe(0);
+      expect(failedTwice.nextChunkOps).toBe(2);
+
+      const third = scriptedModel([]);
+      await runHarvest(fixture, third.model, { resume: failedTwice });
+
+      const prompt = userPromptText(third.calls[0]);
+      expect(prompt).toContain("/memories/workspace/a.md");
+      expect(prompt).toContain("/memories/workspace/b.md");
+    });
+  });
+
+  describe("chunk timeout", () => {
+    it("gives each chunk its own timeout instead of one for the whole epoch", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      // Counted at the source: how long a timeout signal takes to fire depends on the runtime,
+      // and a signal that never fires would pass a run that shares one across its chunks.
+      const timeoutSpy = spyOn(AbortSignal, "timeout");
+      try {
+        const { model } = scriptedModel([]);
+
+        const result = await runHarvest(fixture, model, { chunkTimeoutMs: 500 });
+
+        expect(result.nextChunk).toBe(3);
+        expect(timeoutSpy.mock.calls).toEqual([[500], [500], [500]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
+    it.each(["its timeout", "workspace removal"])(
+      "stops at a chunk cut short by %s and keeps the chunks before it",
+      async (cause) => {
+        using fixture = createFixture();
+        fixture.messages = manyChunkMessages();
+        const removal = new AbortController();
+        let calls = 0;
+        // Chunk 1 finishes; chunk 2 hangs until its signal aborts, as a stalled provider does.
+        const model = new MockLanguageModelV3({
+          doStream: (options) => {
+            calls++;
+            if (calls === 1) {
+              return Promise.resolve({
+                stream: simulateReadableStream({ chunks: [finishChunk(1)] }),
+              });
+            }
+            if (cause === "workspace removal") queueMicrotask(() => removal.abort());
+            return new Promise((_resolve, reject) => {
+              options.abortSignal?.addEventListener("abort", () =>
+                reject(new Error("stalled provider call aborted"))
+              );
+            });
+          },
+        });
+
+        const result = await runHarvest(fixture, model, {
+          chunkTimeoutMs: 100,
+          abortSignal: removal.signal,
+        });
+
+        expect(result.streamError).toBeDefined();
+        expect(result.nextChunk).toBe(1);
+      }
     );
-    expect(saved.success).toBe(true);
-    fixture.metadata = {
-      ...fixture.metadata,
-      summaryMessageId: "new-summary",
-      compactionEpoch: 1,
-    };
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.inboxPath).toBe("/memories/workspace/harvest/new-summary.md");
-    expect(
-      await fixture.memoryService.readFileWithSha(fixture.ctx, oldBoundaryInbox)
-    ).toMatchObject({
-      success: true,
-    });
-    expect(
-      await fixture.memoryService.readFileWithSha(fixture.ctx, result.inboxPath)
-    ).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("removes a stale inbox when a clean retry accepts no candidates", async () => {
-    using fixture = createFixture();
-    const saved = await fixture.memoryService.saveFile(
-      fixture.ctx,
-      INBOX_PATH,
-      "stale candidate\n",
-      null,
-      "agent"
-    );
-    expect(saved.success).toBe(true);
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("does not create an inbox when the model submits no candidates", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(result.skippedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("reports stream failures without writing an inbox", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(fixture, failingModel());
-
-    expect(result.streamError).toContain("provider exploded");
-    expect(result.acceptedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
   });
 });
 

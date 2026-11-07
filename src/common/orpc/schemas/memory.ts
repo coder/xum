@@ -105,16 +105,54 @@ export const CompactionCompletionMetadataSchema = z.object({
   preservedTailMessageCount: z.number().optional(),
 });
 
+/**
+ * A persisted count that feeds a limit: whole and not negative. A negative `budgetUsed` would add
+ * to the epoch's edit budget instead of spending it (-100 allowed 108 edits), a negative
+ * `attemptCount` would widen `HARVEST_MAX_ATTEMPTS` the same way, and a negative or fractional
+ * chunk cursor starts the run at a chunk that does not exist. A record that fails this is dropped
+ * on load, like any invalid record, so the epoch restarts with a fresh budget that is still
+ * bounded by the limit. The record's other fields cannot be trusted either.
+ */
+const PersistedCountSchema = z.number().int().nonnegative();
+
+/**
+ * One analyzer run over a closed compaction epoch (the "harvest"). The two candidate counts keep
+ * their names and stay required so older binaries still parse the record: they hold the memory
+ * edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are optional for
+ * the same reason, and for records written before the analyzer.
+ */
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
   startedAt: z.number(),
+  /**
+   * When the run last finished a chunk. A pending record counts as stale a timeout after this, not
+   * after `startedAt`, so a run of many chunks is not stale while its chunks keep finishing.
+   * Optional so older binaries parse the record and for records that never reached a chunk.
+   */
+  progressAt: z.number().optional(),
   completedAt: z.number().optional(),
-  attemptCount: z.number(),
+  attemptCount: PersistedCountSchema,
   boundaryKey: z.string(),
   compactionEpoch: z.number(),
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
+  /** First transcript chunk not yet analyzed; a retry resumes here. */
+  nextChunk: PersistedCountSchema.optional(),
+  /** Every memory command the analyzer ran for this epoch, across attempts. */
+  ops: z.array(MemoryConsolidationOpSchema).optional(),
+  /**
+   * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
+   * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
+   */
+  budgetUsed: PersistedCountSchema.optional(),
+  /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
+  nextChunkOps: PersistedCountSchema.optional(),
   error: z.string().optional(),
+  /**
+   * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
+   * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
+   */
+  note: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });

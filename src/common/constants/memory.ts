@@ -79,6 +79,14 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Memory analyzer (the harvest of one closed compaction epoch): mutating memory
+ * commands for the whole epoch. All of its transcript chunks, and a retry of the
+ * epoch, spend one budget, so a long epoch cannot out-write a short one.
+ */
+export const MEMORY_ANALYZER_OP_BUDGET = 8;
+/** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
+export const MEMORY_ANALYZER_MAX_STEPS = 12;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */
