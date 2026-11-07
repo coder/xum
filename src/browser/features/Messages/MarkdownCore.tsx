@@ -13,6 +13,7 @@ import { MATH_CLASS_NAMES, SHIKI_THEME, useKatexPlugins, withKatex } from "./mat
 import { normalizeMarkdown } from "./MarkdownStyles";
 import { repairIncompleteMarkdownTail } from "./repairIncompleteMarkdownTail";
 import { markdownComponents } from "./MarkdownComponents";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX, remarkInlineSkillLinks } from "./inlineSkillMarkdown";
 
 interface MarkdownCoreProps {
@@ -235,6 +236,39 @@ const rehypeFootnoteLinks: Plugin<[], Root> = () => (tree) => {
   visit(tree);
 };
 
+/**
+ * Where a mark must not be written into drawn text: fenced and inline code are drawn from the very
+ * string their Copy button hands to the clipboard (MarkdownComponents.CodeBlock), so a mark placed
+ * on that text would be copied as if the user had typed it. That component reveals its own drawn
+ * lines instead, keeping the action's bytes raw. Math code is handed to KaTeX, which tokenizes it.
+ */
+function isOpaqueToReveal(node: Element): boolean {
+  return node.tagName === "code" || node.tagName === "pre" || node.tagName === "svg";
+}
+
+/**
+ * Unicode tag characters are default-ignorables that map one-to-one onto ASCII, so a run of them
+ * spells a message the model received and no renderer shows. At this point the markdown has been
+ * parsed and sanitized, so replacing them in text nodes cannot change any markdown structure, and
+ * every surface that draws through this pipeline (live rows, the static first paint, hover cards)
+ * reveals by construction rather than by each caller remembering to. Callers pass raw bytes: the
+ * mark is irreversible, so text still read by Copy, an editor draft or a provider request must never
+ * be revealed upstream, and actions inside this tree read the raw text node value.
+ */
+const rehypeRevealUnicodeTags: Plugin<[], Root> = () => {
+  return (tree) => {
+    const visit = (node: Root | RootContent | ElementContent) => {
+      if (node.type === "text") {
+        node.value = revealUnicodeTags(node.value);
+        return;
+      }
+      if (node.type === "element" && isOpaqueToReveal(node)) return;
+      if ("children" in node) node.children.forEach(visit);
+    };
+    visit(tree);
+  };
+};
+
 const HARDEN_OPTIONS: HardenOptions = {
   // SECURITY: Treat markdown content as untrusted. We rely on rehype-harden to
   // block dangerous URL schemes (e.g. javascript:, file:, vbscript:, data: in
@@ -264,6 +298,9 @@ function rehypePluginsAfterRawHtml(hardenOptions: HardenOptions): Pluggable[] {
     [rehypeSanitize, sanitizeSchema], // Sanitize HTML to prevent XSS (strips dangerous elements/attributes)
     rehypeFootnoteLinks,
     [harden, hardenOptions], // Additional URL filtering for links and images
+    // Last, so it also reaches text that came out of raw HTML: invisible tag characters become
+    // readable marks in the drawn text only.
+    rehypeRevealUnicodeTags,
   ];
 }
 

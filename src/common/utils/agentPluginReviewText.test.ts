@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
 
-import { containsUnicodeTags, revealUnicodeTags } from "./agentPluginReviewText";
+import {
+  containsUnicodeTags,
+  revealUnicodeTags,
+  revealUnicodeTagsAsHtml,
+} from "./agentPluginReviewText";
 
 /** Tag characters (U+E0020-U+E007F) carry ASCII one-to-one, so a run of them spells hidden text. */
 const tags = (ascii: string) =>
@@ -17,6 +22,18 @@ describe("revealUnicodeTags", () => {
     expect(revealUnicodeTags(`${LANGUAGE_TAG}${tags("en")}keep`)).toBe(
       "<U+E0001><U+E0065><U+E006E>keep"
     );
+  });
+
+  test("escapes the marks for text drawn as markup", () => {
+    // A highlighter emits HTML and the block inserts it verbatim: an unescaped mark would parse as
+    // an unknown element and paint nothing, hiding the payload again.
+    expect(revealUnicodeTagsAsHtml(`x = ${tags("A")};`)).toBe("x = &lt;U+E0041&gt;;");
+    const domWindow = new GlobalWindow();
+    domWindow.document.body.innerHTML = revealUnicodeTagsAsHtml(`<span>x = ${tags("A")};</span>`);
+    expect(domWindow.document.body.textContent).toBe("x = <U+E0041>;");
+    // The unescaped mark in the same position draws nothing, which is the failure this guards.
+    domWindow.document.body.innerHTML = `<span>x = ${revealUnicodeTags(tags("A"))};</span>`;
+    expect(domWindow.document.body.textContent).toBe("x = ;");
   });
 
   test("marks the cancel tag and a tag run alike", () => {

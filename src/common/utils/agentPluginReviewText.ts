@@ -93,6 +93,19 @@ export function revealUnicodeTags(text: string): string {
 }
 
 /**
+ * The same marks with the brackets escaped, for text that is drawn as markup rather than as a React
+ * child. A highlighter's output is HTML: an unescaped `<U+E0058>` there parses as an unknown element
+ * and paints nothing, which would hide the payload all over again.
+ */
+export function revealUnicodeTagsAsHtml(text: string): string {
+  return text.replace(TAG_OR_RGI_SUBDIVISION_FLAG, (matched) =>
+    matched.startsWith(BLACK_FLAG)
+      ? matched
+      : markControl(matched).replace("<", "&lt;").replace(">", "&gt;")
+  );
+}
+
+/**
  * Whether `text` hides an ASCII payload in tag characters. RGI subdivision flags are not a payload:
  * they are the England/Scotland/Wales emoji, which a font draws.
  */

@@ -36,7 +36,9 @@ export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps)
         className="text-muted hover:bg-muted/10 hover:text-foreground focus-visible:ring-ring focus-visible:ring-offset-background flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
       >
         {props.icon}
-        <span className="truncate">{props.summary}</span>
+        {/* The summary interpolates a monitor's display name or another workspace's title, both of
+            which a model or a peer can influence, so it reveals like the expanded body does. */}
+        <span className="truncate">{revealUnicodeTags(props.summary)}</span>
         <ChevronRight
           aria-hidden="true"
           className={cn(

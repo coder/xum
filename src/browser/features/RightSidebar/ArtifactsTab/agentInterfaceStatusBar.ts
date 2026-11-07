@@ -280,7 +280,9 @@ const ROW_BUILDERS: RowBuilders = {
       return {
         id: message.id,
         kind: "assistant",
-        label: `From ${peer.fromTitle ?? peer.fromWorkspaceId}`,
+        // A peer's workspace title is another agent's text, not ours: reveal it as the row's preview
+        // does, so the peek cannot show a sender whose name hides a payload.
+        label: `From ${previewLine(peer.fromTitle ?? peer.fromWorkspaceId)}`,
         preview: previewLine(envelope?.message ?? message.content),
       };
     }

@@ -48,7 +48,9 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
           agent message
         </span>
         <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
-        <span className="truncate">Message from {fromTitle ?? fromWorkspaceId ?? "agent"}</span>
+        <span className="truncate">
+          Message from {revealUnicodeTags(fromTitle ?? fromWorkspaceId ?? "agent")}
+        </span>
         <ChevronRight
           aria-hidden="true"
           className={cn("size-3 shrink-0", expanded && "rotate-90")}
@@ -59,10 +61,7 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
         (envelope != null ? (
           <TranscriptQuoteRoot text={envelope.message} className="mt-1.5 w-full">
             <div className="border-border bg-muted/5 rounded-md border p-2">
-              <MarkdownRenderer
-                content={revealUnicodeTags(envelope.message)}
-                className="text-sm leading-relaxed"
-              />
+              <MarkdownRenderer content={envelope.message} className="text-sm leading-relaxed" />
             </div>
           </TranscriptQuoteRoot>
         ) : (

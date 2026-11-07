@@ -131,7 +131,7 @@ describe("ReasoningMessage", () => {
       expect(container.querySelector("strong")?.textContent).toBe("read<U+E0058><U+E0059>");
     });
 
-    test("reveals a payload in the expanded trace", () => {
+    test("hands the expanded trace its raw bytes and lets the markdown layer reveal", () => {
       const message = createReasoningMessage(`Summary line\nstep one${tags("AB")}`);
 
       const { getByText, queryByText } = render(<ReasoningMessage message={message} />);
@@ -141,8 +141,13 @@ describe("ReasoningMessage", () => {
 
       fireEvent.click(getByText("Summary line"));
 
-      // The markdown stand-in echoes the content it was handed, which is what reaches the renderer.
-      expect(queryByText(/step one<U\+E0041><U\+E0042>/)).not.toBeNull();
+      // The markdown stand-in echoes the content it was handed. Revealing happens inside the
+      // markdown tree (MarkdownCore.test.tsx), never upstream of it: a code fence inside the trace
+      // offers a Copy of exactly the string it was given, and marks injected here would travel with
+      // it. Structure is still parsed from the raw bytes, so the trace reaches the renderer intact.
+      const trace = queryByText(/step one/);
+      expect(trace?.textContent).toContain(`step one${tags("AB")}`);
+      expect(trace?.textContent).not.toContain("<U+");
     });
 
     test("leaves ordinary reasoning text untouched", () => {

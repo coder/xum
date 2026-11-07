@@ -126,7 +126,7 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
 
     return (
       <TypewriterMarkdown
-        content={revealUnicodeTags(normalizedContent)}
+        content={normalizedContent}
         isComplete={!isStreaming}
         preserveLineBreaks
         streamKey={message.historyId}

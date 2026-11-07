@@ -55,9 +55,9 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
   const forkError = usePopoverError();
 
   // `content` is the stored text: Copy and Start Here (which writes a compaction boundary into
-  // chat.jsonl) must keep its bytes. `displayedContent` reveals invisible tag characters and feeds
-  // the rendered row only — the mark cannot be reversed, so it must never round-trip a copy or a
-  // re-send.
+  // chat.jsonl) must keep its bytes. The markdown row reveals invisible tag characters itself, in its
+  // own text nodes (MarkdownCore), because the mark is irreversible and this string is also what
+  // Copy and a re-send read; the non-markdown sinks below reveal it explicitly.
   const content = message.content;
   const displayedContent = revealUnicodeTags(content);
   const isStreaming = message.isStreaming;
@@ -205,7 +205,7 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     // renders parseIncompleteMarkdown=false, matching the prior static render exactly.
     const contentElement = (
       <TypewriterMarkdown
-        content={displayedContent}
+        content={content}
         isComplete={!isStreaming}
         streamKey={message.historyId}
         streamSource={message.streamPresentation?.source}

@@ -94,7 +94,7 @@ export function SubagentReportMessageContent(
       {reportExpanded && (
         <>
           <MarkdownRenderer
-            content={revealUnicodeTags(props.report.reportMarkdown)}
+            content={props.report.reportMarkdown}
             className="mt-2 text-sm leading-relaxed text-[var(--color-user-text)]"
           />
 
