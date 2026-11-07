@@ -631,6 +631,29 @@ async function seedCompactionEpoch(
   };
 }
 
+/** Closes the epoch the way a compaction does, without a row of its own to analyze. */
+async function closeEpochWithoutNewRows(fixture: Fixture): Promise<CompactionCompletionMetadata> {
+  await fixture.historyService.appendToHistory(
+    "ws-dream",
+    createMuxMessage("compact-request", "user", "Please compact", {
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    })
+  );
+  const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+    compactionBoundary: true,
+    compacted: "user",
+    compactionEpoch: 1,
+  });
+  await fixture.historyService.appendToHistory("ws-dream", summary);
+  return {
+    workspaceId: "ws-dream",
+    summaryMessageId: "summary-1",
+    summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+    compactionEpoch: 1,
+    compactionRequestMessageId: "compact-request",
+  };
+}
+
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
     () => true,
@@ -690,6 +713,16 @@ async function editHarvestRecord(
   };
   edit(sidecar.harvestsByWorkspace[workspaceId][boundaryKey]);
   await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+}
+
+/** Another backend on the same root holding the dream lock: this process sees its token as live. */
+function holdForeignDreamLock(fixture: Fixture) {
+  return acquireCrossProcessLock({
+    lockPath: dreamStreamLockPath(fixture.xumHome),
+    acquireTimeoutMs: 1_000,
+    staleMs: 60_000,
+    timeoutMessage: "test holder",
+  });
 }
 
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
@@ -2101,12 +2134,14 @@ describe("MemoryConsolidationService", () => {
 
     /**
      * Models whose analyzer streams each hold until `release(id)`, numbered in the order they
-     * start, with a log of when each starts and ends. The sweep's dream stream is not held.
-     * `modelCreated(n)` and `streamStarted(n)` resolve on the events themselves, so a test waits
-     * on what happened, not on how long it took.
+     * start, with a log of when each starts and ends. A dream stream is not held, unless
+     * `holdDream`: then the first one holds until `releaseDream()` and logs `dream-start` and
+     * `dream-end` (a later one, such as a sweep, passes). `modelCreated(n)` and `streamStarted(n)`
+     * resolve on the events themselves, so a test waits on what happened, not on how long it took.
      */
-    function heldAnalyzers() {
+    function heldAnalyzers(config?: { holdDream?: boolean }) {
       const events: string[] = [];
+      const dream = { started: gate(), released: gate() };
       const gates = {
         created: new Map<number, Gate>(),
         started: new Map<number, Gate>(),
@@ -2128,6 +2163,11 @@ describe("MemoryConsolidationService", () => {
         return new MockLanguageModelV3({
           doStream: async (options) => {
             if (!userPromptText(options).includes("just-compacted transcript epoch")) {
+              if (config?.holdDream !== true) return inner.doStream(options);
+              events.push("dream-start");
+              dream.started.open();
+              await dream.released.opened;
+              events.push("dream-end");
               return inner.doStream(options);
             }
             const id = ++analyzerStreams;
@@ -2145,6 +2185,8 @@ describe("MemoryConsolidationService", () => {
         modelCreated: (id: number) => gateFor("created", id).opened,
         streamStarted: (id: number) => gateFor("started", id).opened,
         release: (id: number) => gateFor("released", id).open(),
+        dreamStarted: dream.started.opened,
+        releaseDream: () => dream.released.open(),
       };
     }
 
@@ -2211,23 +2253,19 @@ describe("MemoryConsolidationService", () => {
       expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]?.status).toBe("completed");
     });
 
-    it("does not make a workspace wait for the analyzer of an unrelated one", async () => {
+    it("runs the chunks of two unrelated workspaces one after the other, like every memory-writing stream", async () => {
+      // The dream's exclusion is service-wide: its lock file is one for the root, so a chunk of
+      // another owner cannot hold it beside this one. Each owner still has its own job queue.
       const held = heldAnalyzers();
       using fixture = await createFixture({ modelFactory: held.factory });
       await fixture.addWorkspace("ws-other");
       const first = await seedCompactionEpoch(fixture);
       const other = await seedCompactionEpoch(fixture, "ws-other");
 
-      const firstRun = fixture.service.maybeHarvestThenSweep(first);
-      await held.streamStarted(1);
-      const otherRun = fixture.service.maybeHarvestThenSweep(other);
-      // The first stream is still held: the other workspace's analyzer starts anyway.
-      await held.streamStarted(2);
-      expect(held.events).toEqual(["start-1", "start-2"]);
+      await runSecondBehindFirst(fixture, held, first, other);
 
-      held.release(1);
-      held.release(2);
-      await Promise.all([firstRun, otherRun]);
+      expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      expect((await harvestRecords(fixture, "ws-other"))["summary-1"]?.status).toBe("completed");
     });
 
     it("starts the owner's next analyzer while the previous one's usage is still being recorded", async () => {
@@ -2352,6 +2390,71 @@ describe("MemoryConsolidationService", () => {
       expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
     });
 
+    /**
+     * An archive pass held in its analyzer, and the compaction that `closeEpoch` makes for the
+     * same epoch, started behind it: past its model creation, so only its turn is left to wait
+     * for. The compaction's job reads the earlier records before that wait, and the archive's
+     * rows reach them only as its analyzer finishes chunks. Returns once both ended.
+     */
+    async function compactionBehindHeldArchive(
+      closeEpoch: (fixture: Fixture) => Promise<CompactionCompletionMetadata>
+    ) {
+      const releaseArchive = gate();
+      const secondModel = gate();
+      const models = archivePassModels({ holdFirstAnalyzer: releaseArchive.opened });
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          if (++modelsCreated === 2) secondModel.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const archive = fixture.service.maybeRunArchivePass("ws-dream");
+      await models.firstAnalyzerStarted;
+      const compaction = fixture.service.maybeHarvestThenSweep(await closeEpoch(fixture));
+      await secondModel.opened;
+      await settle();
+      expect(models.runs.filter((run) => run.kind === "analyzer")).toHaveLength(1);
+
+      releaseArchive.open();
+      expect((await archive).success).toBe(true);
+      await compaction;
+      return {
+        analyzerPrompts: models.runs
+          .filter((run) => run.kind === "analyzer")
+          .map((run) => run.prompt),
+        records: await harvestRecords(fixture),
+      };
+    }
+
+    it("starts a compaction that waited behind the archive of its epoch after the rows that archive read", async () => {
+      // seedCompactionEpoch adds one more row, "remember that I prefer concise tests".
+      const { analyzerPrompts, records } = await compactionBehindHeldArchive((fixture) =>
+        seedCompactionEpoch(fixture)
+      );
+
+      expect(analyzerPrompts).toHaveLength(2);
+      const closing = analyzerPrompts[1] ?? "";
+      expect(closing).toContain("remember that I prefer concise tests");
+      expect(closing).not.toContain("We settled on bun");
+      expect(closing).not.toContain("never npm");
+      expect(records["summary-1"]?.status).toBe("completed");
+    });
+
+    it("makes no analyzer call for a compaction that waited behind the archive that read all of its epoch", async () => {
+      const { analyzerPrompts, records } =
+        await compactionBehindHeldArchive(closeEpochWithoutNewRows);
+
+      expect(analyzerPrompts).toHaveLength(1);
+      expect(records["summary-1"]).toMatchObject({
+        status: "completed",
+        nextChunk: 0,
+        analyzedFloorRowId: "open-2",
+      });
+    });
+
     it("keeps a failed run's landed edits in the sidecar before the next run's turn, so that run seeds its budget with them", async () => {
       // The failed record is saved after the turn is released, so what the run spent before its
       // chunk failed reaches the sidecar in that save alone. Holding it here makes the order
@@ -2423,6 +2526,192 @@ describe("MemoryConsolidationService", () => {
         released[0]?.open();
         released[1]?.open();
       }
+    });
+
+    // The analyzer and the dream edit the same /memories/workspace files, and a model's `insert`
+    // takes a line offset from an earlier read: the two streams must never run at once.
+    describe("with the dream stream's exclusion", () => {
+      it("does not start a chunk while a dream stream of its owner holds the exclusion", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+
+        const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+        await held.dreamStarted;
+        const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+        await held.modelCreated(2);
+        await settle();
+        expect(held.events).toEqual(["dream-start"]);
+
+        held.releaseDream();
+        await held.streamStarted(1);
+        expect(held.events.slice(0, 3)).toEqual(["dream-start", "dream-end", "start-1"]);
+        await Promise.all([dreamRun, harvestRun]);
+        expect(held.events).toEqual(["dream-start", "dream-end", "start-1", "end-1"]);
+        expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      });
+
+      it("does not start a dream stream while a chunk of its owner is streaming", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+
+        const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+        await held.streamStarted(1);
+        const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+        await held.modelCreated(2);
+        // A dream with no exclusion to wait for still has disk work (its lock) before its stream,
+        // which no count of loop turns bounds. The stream starting is the event waited for; the
+        // bound only ends the wait of a dream that is held back, as it should be.
+        let giveUp: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const startedEarly = await Promise.race([
+            held.dreamStarted.then(() => true),
+            new Promise<boolean>((resolve) => {
+              giveUp = setTimeout(() => resolve(false), 250);
+            }),
+          ]);
+          expect(startedEarly).toBe(false);
+        } finally {
+          clearTimeout(giveUp);
+        }
+        expect(held.events).toEqual(["start-1"]);
+
+        held.release(1);
+        await held.dreamStarted;
+        expect(held.events.slice(0, 3)).toEqual(["start-1", "end-1", "dream-start"]);
+        held.releaseDream();
+        await Promise.all([harvestRun, dreamRun]);
+      });
+
+      it("starts a chunk's timeout when it gets the exclusion, not while it waits behind a dream stream", async () => {
+        const held = heldAnalyzers({ holdDream: true });
+        const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+        const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+          held.events.push("timeout");
+          return realTimeout(ms);
+        });
+        try {
+          using fixture = await createFixture({ modelFactory: held.factory });
+          const epoch = await seedCompactionEpoch(fixture);
+          held.release(1);
+
+          const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
+          await held.dreamStarted;
+          const harvestRun = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(2);
+          await settle();
+          // The dream's own timeout only: a chunk that waits has none running.
+          expect(held.events).toEqual(["timeout", "dream-start"]);
+
+          held.releaseDream();
+          await held.streamStarted(1);
+          expect(held.events.slice(0, 5)).toEqual([
+            "timeout",
+            "dream-start",
+            "dream-end",
+            "timeout",
+            "start-1",
+          ]);
+          await Promise.all([dreamRun, harvestRun]);
+        } finally {
+          timeoutSpy.mockRestore();
+        }
+      });
+
+      it("waits for a dream stream in another process before starting a chunk", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          const run = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(1);
+          await settle();
+          expect(held.events).toEqual([]);
+
+          await releaseForeign();
+          await held.streamStarted(1);
+          await run;
+          expect(held.events).toEqual(["start-1", "end-1"]);
+          expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+        } finally {
+          await releaseForeign();
+        }
+      });
+
+      it("lets removal cancel a chunk that is waiting for the exclusion, without wedging the queue", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        await fixture.addWorkspace("ws-other");
+        const epoch = await seedCompactionEpoch(fixture);
+        const other = await seedCompactionEpoch(fixture, "ws-other");
+        held.release(1);
+        held.release(2);
+        const releaseForeign = await holdForeignDreamLock(fixture);
+        try {
+          const run = fixture.service.maybeHarvestThenSweep(epoch);
+          await held.modelCreated(1);
+          await settle();
+
+          await fixture.service.cancelInFlightConsolidation("ws-dream");
+          await run;
+          // No model call was made, and the run ended as a failed stream does: resumable.
+          expect(held.events).toEqual([]);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            nextChunk: 0,
+            error: expect.stringContaining("did not start") as string,
+          });
+
+          // The cancelled chunk gave its place in the queue back and never took the lock.
+          await releaseForeign();
+          await fixture.service.maybeHarvestThenSweep(other);
+          expect(held.events).toEqual(["start-1", "end-1"]);
+          expect((await harvestRecords(fixture, "ws-other"))["summary-1"]?.status).toBe(
+            "completed"
+          );
+        } finally {
+          await releaseForeign();
+        }
+      });
+
+      it("fails the job, without a model call, when the exclusion's lock cannot be taken, and a retry runs it", async () => {
+        const held = heldAnalyzers();
+        using fixture = await createFixture({ modelFactory: held.factory });
+        const epoch = await seedCompactionEpoch(fixture);
+        held.release(1);
+        const lockPath = dreamStreamLockPath(fixture.xumHome);
+        const { writeFile } = fsPromises;
+        // The lock's temp file cannot be written: a filesystem error, not contention.
+        const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
+          if (typeof file === "string" && file.startsWith(`${lockPath}.tmp-`)) {
+            throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+          }
+          return writeFile(file, data);
+        });
+        try {
+          await fixture.service.maybeHarvestThenSweep(epoch);
+        } finally {
+          writeSpy.mockRestore();
+        }
+        expect(held.events).toEqual([]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          attemptCount: 1,
+          nextChunk: 0,
+          error: expect.stringContaining("consolidation lock") as string,
+        });
+
+        await fixture.service.maybeHarvestThenSweep(epoch);
+        expect(held.events).toEqual(["start-1", "end-1"]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          attemptCount: 2,
+        });
+      });
     });
   });
 
@@ -2550,16 +2839,6 @@ describe("MemoryConsolidationService", () => {
       }
     });
 
-    /** Another backend on the same root holding the dream lock: this process sees its token as live. */
-    function holdForeignDreamLock(fixture: Fixture) {
-      return acquireCrossProcessLock({
-        lockPath: dreamStreamLockPath(fixture.xumHome),
-        acquireTimeoutMs: 1_000,
-        staleMs: 60_000,
-        timeoutMessage: "test holder",
-      });
-    }
-
     it("waits for a dream stream in another process before starting its own", async () => {
       const held = heldStreams();
       using fixture = await createFixture({ modelFactory: held.factory });
@@ -2576,6 +2855,99 @@ describe("MemoryConsolidationService", () => {
       } finally {
         await releaseForeign();
       }
+    });
+
+    /**
+     * A second backend on the same root: its own in-process queue and run table, the same sidecar
+     * and the same dream lock. It counts the provider streams it starts.
+     */
+    function secondBackend(fixture: Fixture) {
+      const counts = { modelsCreated: 0, streams: 0 };
+      const service = new MemoryConsolidationService(
+        fixture.config,
+        fixture.memoryService,
+        fixture.metaService,
+        fixture.historyService,
+        {
+          createModelWithPinnedMetadata: (modelString: string) => {
+            counts.modelsCreated++;
+            const inner = scriptedModel();
+            return Promise.resolve(
+              Ok({
+                model: new MockLanguageModelV3({
+                  doStream: (options) => {
+                    counts.streams++;
+                    return inner.doStream(options);
+                  },
+                }),
+                metadataModel: modelString,
+              })
+            );
+          },
+        },
+        {
+          isExperimentEnabled: (id) =>
+            id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+        }
+      );
+      return { service, counts };
+    }
+
+    /**
+     * Both backends get the same trigger for one workspace before either has journaled, so both
+     * pass the debounce check; this backend's run streams first and the other waits on the lock.
+     */
+    async function runBehindAnotherBackend(secondTrigger: "compaction" | "manual") {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const second = secondBackend(fixture);
+
+      const first = fixture.service.maybeRun("ws-dream", "compaction");
+      await until(() => held.events.includes("start-1"));
+      const behind = second.service.maybeRun("ws-dream", secondTrigger);
+      await until(() => second.counts.modelsCreated === 1);
+      expect(second.counts.streams).toBe(0);
+
+      held.release(1);
+      return { first: await first, behind: await behind, secondStreams: second.counts.streams };
+    }
+
+    it("skips an automatic run whose turn comes after another backend's run covered the workspace", async () => {
+      const { first, behind, secondStreams } = await runBehindAnotherBackend("compaction");
+      expect(first.success).toBe(true);
+      expectDebounced(behind);
+      expect(secondStreams).toBe(0);
+    });
+
+    it("still runs a manual trigger that waited behind another backend's run", async () => {
+      const { first, behind, secondStreams } = await runBehindAnotherBackend("manual");
+      expect(first.success).toBe(true);
+      expect(behind.success).toBe(true);
+      expect(secondStreams).toBe(1);
+    });
+
+    it("journals a run's success before it frees the dream lock", async () => {
+      // The next run in any process rechecks the debounce from disk the moment it gets the lock,
+      // so the record has to be there by then.
+      using fixture = await createFixture();
+      const lockPath = dreamStreamLockPath(fixture.xumHome);
+      const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+      const journaledAtRelease: boolean[] = [];
+      const { rm } = fsPromises;
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation(async (target, options) => {
+        if (target === lockPath) {
+          const raw = await fsPromises.readFile(sidecarPath, "utf-8").catch(() => "{}");
+          const file = JSON.parse(raw) as { workspaces?: Record<string, unknown> };
+          journaledAtRelease.push(file.workspaces?.["ws-dream"] !== undefined);
+        }
+        return rm(target, options);
+      });
+      try {
+        expect((await fixture.service.maybeRun("ws-dream", "compaction")).success).toBe(true);
+      } finally {
+        rmSpy.mockRestore();
+      }
+      expect(journaledAtRelease).toEqual([true]);
     });
 
     it("cancels a run that is waiting for another process's dream stream when its workspace is removed", async () => {
@@ -2842,31 +3214,6 @@ describe("MemoryConsolidationService", () => {
     describe("rows an earlier archive analyzed", () => {
       const analyzerRuns = (models: ReturnType<typeof archivePassModels>) =>
         models.runs.filter((run) => run.kind === "analyzer");
-
-      /** Closes the epoch the way a compaction does, without a row of its own to analyze. */
-      async function closeEpochWithoutNewRows(
-        fixture: Fixture
-      ): Promise<CompactionCompletionMetadata> {
-        await fixture.historyService.appendToHistory(
-          "ws-dream",
-          createMuxMessage("compact-request", "user", "Please compact", {
-            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
-          })
-        );
-        const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
-          compactionBoundary: true,
-          compacted: "user",
-          compactionEpoch: 1,
-        });
-        await fixture.historyService.appendToHistory("ws-dream", summary);
-        return {
-          workspaceId: "ws-dream",
-          summaryMessageId: "summary-1",
-          summaryHistorySequence: summary.metadata?.historySequence ?? -1,
-          compactionEpoch: 1,
-          compactionRequestMessageId: "compact-request",
-        };
-      }
 
       it("sends the compaction that closes the epoch only the rows after them", async () => {
         const models = archivePassModels();
@@ -3734,23 +4081,39 @@ describe("MemoryConsolidationService", () => {
       });
 
       it("does not wait for the archive pass of a workspace outside the owner's task tree", async () => {
+        // The other pass is held before it takes any turn: every analyzer chunk and dream shares
+        // one stream exclusion, so holding its stream would hold up the owner for that reason.
         let releaseOther!: () => void;
-        const models = archivePassModels({
-          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseOther = resolve)),
-        });
+        const otherHeld = new Promise<void>((resolve) => (releaseOther = resolve));
+        let otherReading!: () => void;
+        const otherReached = new Promise<void>((resolve) => (otherReading = resolve));
+        const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });
         await fixture.addWorkspace("ws-other");
         await appendRows(fixture, openRowTexts, "ws-other");
+        const readHistory = fixture.historyService.getHistoryFromLatestBoundary.bind(
+          fixture.historyService
+        );
+        spyOn(fixture.historyService, "getHistoryFromLatestBoundary").mockImplementation(
+          async (...args: Parameters<typeof readHistory>) => {
+            if (args[0] === "ws-other") {
+              otherReading();
+              await otherHeld;
+            }
+            return readHistory(...args);
+          }
+        );
         const wait = ownerWaitsForSubAgents();
         try {
           const other = fixture.service.maybeRunArchivePass("ws-other");
-          await models.firstAnalyzerStarted;
+          await otherReached;
 
-          // Settles while the other workspace's analysis is held: no wait on it.
+          // Settles while the other workspace's pass is held: no wait on it. Only the owner's
+          // dream runs (its own open epoch is empty).
           const owner = fixture.service.maybeRunArchivePass("ws-dream");
           expect(await whatComesFirst(wait, owner)).toBe("owner finished");
           expect((await owner).success).toBe(true);
-          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+          expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
           releaseOther();
           await other;
         } finally {

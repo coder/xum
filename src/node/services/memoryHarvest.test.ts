@@ -22,6 +22,7 @@ import {
   buildHarvestChunks,
   runMemoryHarvest,
   selectOpenEpoch,
+  type ChunkStreamGate,
   type HarvestProgress,
 } from "./memoryHarvest";
 
@@ -179,6 +180,9 @@ function createFixture(): Fixture {
   };
 }
 
+/** A gate with nothing to wait for: the chunk's stream starts at once. */
+const openGate: ChunkStreamGate = async (stream) => ({ started: true, value: await stream() });
+
 type HarvestExtras = Partial<Parameters<typeof runMemoryHarvest>[0]>;
 
 async function runHarvest(
@@ -193,6 +197,7 @@ async function runHarvest(
     ctx: fixture.ctx,
     messages: fixture.messages,
     summary: fixture.summary,
+    streamGate: openGate,
     ...extras,
   });
 }
@@ -1563,6 +1568,109 @@ describe("runMemoryHarvest", () => {
       const prompt = userPromptText(third.calls[0]);
       expect(prompt).toContain("/memories/workspace/a.md");
       expect(prompt).toContain("/memories/workspace/b.md");
+    });
+  });
+
+  describe("stream gate", () => {
+    it("takes the gate once per chunk, and holds it for no step between the chunks", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      let holding = false;
+      let turns = 0;
+      const heldDuring: boolean[] = [];
+      const streamGate: ChunkStreamGate = async (stream) => {
+        turns++;
+        holding = true;
+        try {
+          return { started: true, value: await stream() };
+        } finally {
+          holding = false;
+        }
+      };
+      const { model } = scriptedModel([]);
+
+      await runHarvest(fixture, model, {
+        streamGate,
+        // The service saves the cursor here: disk work that must not hold up the other streams.
+        onChunkComplete: () => {
+          heldDuring.push(holding);
+          return Promise.resolve();
+        },
+      });
+
+      expect(turns).toBe(3);
+      expect(heldDuring).toEqual([false, false, false]);
+    });
+
+    it("starts a chunk's timeout when the gate lets it stream, not while it waits", async () => {
+      using fixture = createFixture();
+      // Counted at the source (see "gives each chunk its own timeout"): a timeout created while
+      // the chunk waits would already be running down.
+      const timeoutSpy = spyOn(AbortSignal, "timeout");
+      try {
+        let open!: () => void;
+        const turn = new Promise<void>((resolve) => {
+          open = resolve;
+        });
+        let markWaiting!: () => void;
+        const waiting = new Promise<void>((resolve) => {
+          markWaiting = resolve;
+        });
+        const streamGate: ChunkStreamGate = async (stream) => {
+          markWaiting();
+          await turn;
+          return { started: true, value: await stream() };
+        };
+        const { model, calls } = scriptedModel([]);
+
+        const running = runHarvest(fixture, model, { streamGate, chunkTimeoutMs: 500 });
+        await waiting;
+        expect(timeoutSpy).not.toHaveBeenCalled();
+        expect(calls).toHaveLength(0);
+
+        open();
+        await running;
+        expect(timeoutSpy.mock.calls).toEqual([[500]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
+
+    it("ends the run at a chunk the gate does not start, with no model call, and a retry resumes there", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      let turns = 0;
+      // Chunk one streams; the gate then fails (its lock cannot be taken, or removal cancelled the wait).
+      const refusingAfterFirst: ChunkStreamGate = async (stream) => {
+        if (++turns === 2) return { started: false, reason: "the gate refused" };
+        return { started: true, value: await stream() };
+      };
+      const first = scriptedModel(chunkScript([createFile("/memories/workspace/one.md", "one\n")]));
+
+      const failed = await runHarvest(fixture, first.model, { streamGate: refusingAfterFirst });
+
+      expect(failed.streamError).toContain("chunk 2/3 did not start");
+      expect(failed.streamError).toContain("the gate refused");
+      // Only chunk one's two steps reached the model, and its edit is kept.
+      expect(first.calls).toHaveLength(2);
+      expect(failed.nextChunk).toBe(1);
+      expect(failed.readChunks).toBe(1);
+      expect(failed.nextChunkOps).toBe(0);
+      expect(failed.ops).toEqual([
+        { command: "create", path: "/memories/workspace/one.md", applied: true },
+      ]);
+
+      const retry = scriptedModel([]);
+      const resumed = await runHarvest(fixture, retry.model, { resume: failed });
+
+      expect(resumed.streamError).toBeUndefined();
+      expect(resumed.nextChunk).toBe(3);
+      // The retry starts at chunk two and does not write chunk one's edit again.
+      const prompts = retry.calls.map(userPromptText);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain("Transcript chunk 2/3");
+      expect(prompts[0]).not.toContain("already applied");
+      expect(resumed.ops).toEqual(failed.ops);
     });
   });
 
