@@ -11,6 +11,7 @@ import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelp
 import assert from "@/common/utils/assert";
 import { assertNever } from "@/common/utils/assertNever";
 import { redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { DATA_URL_PATTERN, MEDIA_STUB } from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
 const HARVEST_MAX_STEPS = 4;
@@ -71,11 +72,9 @@ export interface MemoryHarvestResult {
   streamError?: string;
 }
 
-const MEDIA_STUB = "[media]";
 // Tool-output attachment shapes: persisted `media`/`display_file` parts and the AI SDK's
 // model-output `image-data`/`file-data` forms. Their bytes never go to the harvest model.
 const MEDIA_PART_TYPES = new Set(["media", "display_file", "image-data", "file-data"]);
-const DATA_URL_PATTERN = /data:[\w.+-]+\/[\w.+-]+(?:;[\w=.+-]+)*;base64,[A-Za-z0-9+/=_-]+/gi;
 
 function sanitizeToolValue(value: unknown, depth: number): unknown {
   if (depth > MAX_TOOL_VALUE_DEPTH) return "[nested data omitted]";
