@@ -217,6 +217,24 @@ describe("MarkdownCore", () => {
     expect(view.container.textContent).not.toContain(tags("AB"));
   });
 
+  // An attribute is the other place the same bytes can hide: alt text is announced by a screen reader
+  // and, for a broken image, painted as the fallback label, and it never passes through a text node.
+  test("reveals a tag payload in an image's alt text", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore
+          content={`![${tags("AB")}](https://x.test/missing.png)`}
+          renderSynchronously
+        />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.querySelector("img")).not.toBeNull());
+    expect(view.container.querySelector("img")?.getAttribute("alt")).toBe("<U+E0041><U+E0042>");
+    // The markdown the provider sent is untouched, and nothing copies an alt value out of a selection
+    // (transcriptContextMenu excludes img), so no action can carry the mark.
+    expect(view.container.textContent).not.toContain(tags("AB"));
+  });
+
   // KaTeX typesets math after the pipeline's reveal pass, and it receives the formula as a code
   // element that pass deliberately leaves raw, so rendered math needs its own reveal
   // (rehypeRevealRenderedMath). The TeX the transcript copies out of a selected formula stays raw:

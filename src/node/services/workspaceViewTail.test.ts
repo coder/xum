@@ -177,6 +177,11 @@ describe("readWorkspaceViewTail", () => {
       msg("braille", "assistant", "", stream, part("\u2800\u2800")),
       msg("tags", "assistant", "", stream, part(tagRun("AB"))),
       msg("real", "assistant", "", stream, part("done")),
+      // A user row is always drawn live, whatever its text holds, so only the pre-existing emptiness
+      // gate applies there: filtering a U+200B user row would lose a row the app then inserts.
+      msg("u-zwsp", "user", "\u200b"),
+      msg("u-nl", "user", "\n"),
+      msg("u-real", "user", "ship it"),
     ]);
 
     const { rows } = (await read())!;
@@ -188,6 +193,9 @@ describe("readWorkspaceViewTail", () => {
       ["braille", null],
       ["tags", tagRun("AB")],
       ["real", "done"],
+      ["u-zwsp", "\u200b"],
+      ["u-nl", null],
+      ["u-real", "ship it"],
     ]);
   });
 

@@ -70,9 +70,16 @@ function drawableText(message: MuxMessage, metadata: Record<string, unknown>): s
   const texts = message.parts.map((part) => (part.type === "text" ? part.text : null));
   if (texts.length === 0 || texts.includes(null)) return null;
   const text = texts.join("");
-  // The same predicate the live row builder uses: a persisted part of only a newline, a
-  // default-ignorable, a control character or a blank braille cell earns no row there, so drawing one
-  // here would paint a gap pre-hydration that vanishes the moment the app takes the transcript over.
+  if (message.role === "user") {
+    // A user row is drawn by the live builder whatever its text holds (buildUserDisplayedMessages
+    // always returns one: the bubble also carries a command prefix, attachments and reviews), so this
+    // keeps the pre-existing emptiness gate. Applying the assistant predicate here would drop a row
+    // pre-hydration that the live transcript then inserts — the mismatch this check exists to avoid.
+    return text.trim().length > 0 ? text : null;
+  }
+  // Assistant rows share the live row builder's predicate (paintableText): a persisted part of only a
+  // newline, a default-ignorable, a control character or a blank braille cell earns no row there, so
+  // drawing one here would paint a gap pre-hydration that vanishes when the app takes over.
   return isPaintableText(text) ? text : null;
 }
 

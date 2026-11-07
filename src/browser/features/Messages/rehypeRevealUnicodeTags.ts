@@ -18,6 +18,27 @@ function isOpaqueToReveal(node: Element): boolean {
 }
 
 /**
+ * Element properties the sanitizer accepts that are drawn or announced as text. An attribute value is
+ * a second place the same bytes can hide: an image's alt text is what a screen reader reads and what
+ * a broken image paints as its fallback label, and it never appears as a text node.
+ */
+const REVEALED_TEXT_PROPERTIES = [
+  "alt",
+  "title",
+  "abbr",
+  "ariaLabel",
+  "ariaLabelledBy",
+  "ariaDescribedBy",
+];
+
+function revealTextProperties(node: Element): void {
+  for (const name of REVEALED_TEXT_PROPERTIES) {
+    const value = node.properties[name];
+    if (typeof value === "string") node.properties[name] = revealUnicodeTags(value);
+  }
+}
+
+/**
  * Unicode tag characters are default-ignorables that map one-to-one onto ASCII, so a run of them
  * spells a message the model received and no renderer shows. At this point the markdown has been
  * parsed and sanitized, so replacing them in text nodes cannot change any markdown structure, and
@@ -25,6 +46,10 @@ function isOpaqueToReveal(node: Element): boolean {
  * reveals by construction rather than by each caller remembering to. Callers pass raw bytes: the
  * mark is irreversible, so text still read by Copy, an editor draft or a provider request must never
  * be revealed upstream, and actions inside this tree read the raw text node value.
+ *
+ * Nothing that copies out of the rendered transcript reads these properties either: image elements are
+ * in the clipboard's excluded selector (transcriptContextMenu.CLIPBOARD_EXCLUDED_SELECTOR), so an alt
+ * value marked here cannot reach a copy.
  */
 export const rehypeRevealUnicodeTags: Plugin<[], Root> = () => {
   return (tree) => {
@@ -33,7 +58,10 @@ export const rehypeRevealUnicodeTags: Plugin<[], Root> = () => {
         node.value = revealUnicodeTags(node.value);
         return;
       }
-      if (node.type === "element" && isOpaqueToReveal(node)) return;
+      if (node.type === "element") {
+        if (isOpaqueToReveal(node)) return;
+        revealTextProperties(node);
+      }
       if ("children" in node) node.children.forEach(visit);
     };
     visit(tree);

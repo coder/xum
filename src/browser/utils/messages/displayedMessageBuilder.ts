@@ -491,10 +491,12 @@ function hasDisplayRow(
 ): boolean {
   if (part.type === "reasoning" || isDynamicToolPart(part)) return true;
   if (part.type !== "text") return false;
-  return (
-    hasDisplayText(displayTextOfTextPart(part, muxMetadata)) ||
-    (hasActiveStream && partIndex === partCount - 1)
-  );
+  // The streaming tail first: it is kept whatever it holds, and the paintability test is an anchored
+  // regex over the whole accumulated part. Every within-part delta rebuilds these rows, so testing the
+  // text first would rescan a long run of invisible deltas each time and make an invisible stream
+  // quadratic for a row this branch was always going to keep.
+  if (hasActiveStream && partIndex === partCount - 1) return true;
+  return hasDisplayText(displayTextOfTextPart(part, muxMetadata));
 }
 
 /** The string a text part will be shown as, after the row builder's own display projection. */
