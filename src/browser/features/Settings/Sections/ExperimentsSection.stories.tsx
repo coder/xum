@@ -61,7 +61,7 @@ export const MemorySettingsEnabled: Story = {
     // nested panel under the parent row.
     await canvas.findByLabelText("Toggle Memory Consolidation");
     // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
-    await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue(null);
+    await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue("");
   },
 };
 
