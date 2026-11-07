@@ -1543,6 +1543,58 @@ describe("MemoryConsolidationService", () => {
     expect(record?.note).toContain("chunks 2-3 of 3");
   });
 
+  it("resumes at the first chunk nobody read when saving the completed record failed after a budget skip", async () => {
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            return Promise.resolve({
+              stream:
+                prompt.includes("just-compacted transcript epoch") && !afterToolResult
+                  ? spendEveryEditStream()
+                  : noChangesStream(),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+    const service = fixture.service as unknown as {
+      saveHarvestRecordEffect: (
+        workspaceId: string,
+        boundaryKey: string,
+        record: MemoryHarvestRecordPayload,
+        projectPath: string
+      ) => Effect.Effect<void>;
+    };
+    const save = service.saveHarvestRecordEffect.bind(service);
+    let failedOnce = false;
+    spyOn(service, "saveHarvestRecordEffect").mockImplementation(
+      (workspaceId, boundaryKey, record, projectPath) => {
+        if (record.status !== "completed" || failedOnce) {
+          return save(workspaceId, boundaryKey, record, projectPath);
+        }
+        failedOnce = true;
+        return Effect.promise(() => Promise.reject(new Error("disk full")));
+      }
+    );
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+    // The failed record resumes at the first chunk nobody read, not past the skipped ones.
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+    });
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("completed");
+    // The retry meets the spent budget again and says which chunks it skipped.
+    expect(record?.note).toContain("chunks 2-3 of 3");
+  });
+
   it("keeps the edits of a chunk that wrote and then failed in the failed record", async () => {
     using fixture = await createFixture({
       modelFactory: () =>
