@@ -11,5 +11,6 @@ export const MERMAID_PAGE_FRAME_SELECTOR = ".mermaid-container:not(.mermaid-moda
 
 export const MERMAID_PAGE_DIAGRAM_SELECTOR = `${MERMAID_PAGE_FRAME_SELECTOR} > svg`;
 
-/** What a diagram that failed to render shows, in place of its frame. */
-export const MERMAID_ERROR_PREFIX = "Mermaid Error:";
+/** Set on the error block that a diagram shows, in place of its frame, when it fails to render. */
+export const MERMAID_ERROR_ATTRIBUTE = "data-mermaid-error";
+export const MERMAID_ERROR_SELECTOR = `[${MERMAID_ERROR_ATTRIBUTE}]`;
