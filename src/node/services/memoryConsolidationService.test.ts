@@ -24,6 +24,7 @@ import { Config } from "@/node/config";
 import {
   dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
+  harvestResumeState,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
@@ -31,6 +32,7 @@ import {
   resolveHeadlessAgentSettings,
   resolveHeadlessAgentBody,
   resolveHeadlessAgentDefinition,
+  staleExhaustedHarvestFailure,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MEMORY_ANALYZER_SYSTEM_PROMPT } from "./memoryHarvest";
@@ -5000,5 +5002,120 @@ describe("MemoryConsolidationService", () => {
       return cfg;
     });
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:explicit-dream");
+  });
+});
+
+describe("staleExhaustedHarvestFailure", () => {
+  const pendingRecord = (overrides: Partial<MemoryHarvestRecordPayload> = {}) =>
+    ({
+      status: "pending",
+      startedAt: Date.now() - 10 * 60 * 1000,
+      attemptCount: HARVEST_MAX_ATTEMPTS,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 2,
+      skippedCandidates: 1,
+      nextChunk: 3,
+      ...overrides,
+    }) satisfies MemoryHarvestRecordPayload;
+
+  it("fails a stale pending record that used its last attempt, keeping what it had read", () => {
+    const before = Date.now();
+    const failed = staleExhaustedHarvestFailure(pendingRecord());
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      attemptCount: HARVEST_MAX_ATTEMPTS,
+      acceptedCandidates: 2,
+      skippedCandidates: 1,
+      nextChunk: 3,
+      error: "stale pending harvest exceeded retry attempts",
+    });
+    expect(failed?.completedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  it("keeps the error an earlier attempt already recorded", () => {
+    expect(staleExhaustedHarvestFailure(pendingRecord({ error: "stream timed out" }))?.error).toBe(
+      "stream timed out"
+    );
+  });
+
+  it("leaves a record that a retry or a live run still owns", () => {
+    expect(staleExhaustedHarvestFailure(undefined)).toBeUndefined();
+    // Alive: its last sign of life is inside the timeout.
+    expect(
+      staleExhaustedHarvestFailure(pendingRecord({ progressAt: Date.now() - 1000 }))
+    ).toBeUndefined();
+    // Stale, but an attempt is left.
+    expect(
+      staleExhaustedHarvestFailure(pendingRecord({ attemptCount: HARVEST_MAX_ATTEMPTS - 1 }))
+    ).toBeUndefined();
+    for (const status of ["completed", "failed"] as const) {
+      expect(staleExhaustedHarvestFailure(pendingRecord({ status }))).toBeUndefined();
+    }
+  });
+});
+
+describe("harvestResumeState", () => {
+  it("starts a first attempt at the first chunk with nothing read and no floor", () => {
+    const { progress, attemptState } = harvestResumeState(undefined);
+
+    expect(progress).toEqual({
+      nextChunk: 0,
+      ops: [],
+      budgetUsed: undefined,
+      nextChunkOps: undefined,
+      readThroughRowId: undefined,
+      usage: undefined,
+    });
+    expect(attemptState.analyzedFloorRowId).toBeUndefined();
+  });
+
+  it("resumes a retry from the cursor, budget, read-through row and floor of the record", () => {
+    const ops = [{ command: "create" as const, path: "/memory/a.md", applied: true }];
+    const usage = { inputTokens: 10, outputTokens: 4 };
+    const { progress, attemptState } = harvestResumeState({
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 1,
+      skippedCandidates: 0,
+      nextChunk: 2,
+      ops,
+      budgetUsed: 5,
+      nextChunkOps: 1,
+      readThroughRowId: "row-9",
+      usage,
+      analyzedFloorRowId: "row-3",
+    });
+
+    expect(progress).toEqual({
+      nextChunk: 2,
+      ops,
+      budgetUsed: 5,
+      nextChunkOps: 1,
+      readThroughRowId: "row-9",
+      usage,
+    });
+    expect(attemptState.analyzedFloorRowId).toBe("row-3");
+  });
+
+  it("keeps a null floor (an attempt that found no earlier run) apart from an absent one", () => {
+    const record = {
+      status: "failed",
+      startedAt: 1,
+      attemptCount: 1,
+      boundaryKey: "summary-1",
+      compactionEpoch: 1,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+    } satisfies MemoryHarvestRecordPayload;
+
+    expect(
+      harvestResumeState({ ...record, analyzedFloorRowId: null }).attemptState.analyzedFloorRowId
+    ).toBeNull();
+    expect(harvestResumeState(record).attemptState.analyzedFloorRowId).toBeUndefined();
   });
 });
