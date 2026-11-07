@@ -49,7 +49,8 @@ export function MemoryDreamCostCeilingSetting() {
         </div>
         {parsed === null && (
           <div role="alert" className="text-error mt-1 text-xs">
-            Enter a number of at least ${MEMORY_DREAM_COST_CEILING_MIN_USD}, or leave empty for no ceiling.
+            Enter a number of at least ${MEMORY_DREAM_COST_CEILING_MIN_USD}, or leave empty for no
+            ceiling.
           </div>
         )}
       </div>

@@ -1502,12 +1502,13 @@ describe("MemoryConsolidationService", () => {
 
     // Chunk 1 spent all of the epoch's edits, so chunks 2 and 3 made no model call.
     expect(chunkLabels).toEqual(["1/3"]);
-    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record).toMatchObject({
       status: "completed",
       nextChunk: 3,
       budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
-      note: expect.stringContaining("chunks 2-3 of 3"),
     });
+    expect(record?.note).toContain("chunks 2-3 of 3");
   });
 
   it("keeps the edits of a chunk that wrote and then failed in the failed record", async () => {
