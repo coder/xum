@@ -235,6 +235,37 @@ describe("consolidation memory tool rails", () => {
     expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("original");
   });
 
+  it("a read stalled in filesystem I/O returns once the pass is cancelled", async () => {
+    // Only mutations re-check the signal inside MemoryService, and the provider loop waits for
+    // the tool result: a read that never settles would hold the run past its timeout.
+    using fixture = await createFixture();
+    const controller = new AbortController();
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      abortSignal: controller.signal,
+    });
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    spyOn(fixture.memoryService, "view").mockImplementation(() => {
+      markReadStarted();
+      return new Promise(() => undefined);
+    });
+
+    const pending = execute(tool, { command: "view", path: "/memories/" });
+    await readStarted;
+    controller.abort();
+
+    const result = await pending;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cancelled");
+  });
+
   it("applies in-scope mutations and journals them", async () => {
     using fixture = await createFixture();
     const result = await execute(fixture.tool, {
@@ -462,6 +493,31 @@ describe("consolidation memory tool rails", () => {
         await fsPromises.readFile(path.join(fixture.globalMemoryDir, "notes.md"), "utf-8")
       ).toBe("line one\n");
       expect(await pathExists(path.join(fixture.globalMemoryDir, "creds.md"))).toBe(false);
+    });
+
+    it("rejects a credential that has no keyword beside it", async () => {
+      // A check on the words `token`, `secret` and `password` lets these shapes through: the
+      // guard has to read the credential shapes themselves.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+
+      const notes = [
+        `The deploy user authenticates as ${githubToken}.\n`,
+        "The notifier posts as xoxb-1234567890-abcdefghij.\n",
+        "The cache lives at redis://:hunter2pw@cache:6379/0.\n",
+      ];
+
+      for (const [index, note] of notes.entries()) {
+        const result = await execute(fixture.tool, {
+          command: "create",
+          path: `/memories/global/note-${index}.md`,
+          file_text: note,
+        });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(JSON.stringify(fixture.journal)).not.toContain("hunter2pw");
+      expect(fixture.getMutationCount()).toBe(0);
     });
 
     it("accepts text that only talks about tokens and passwords", async () => {

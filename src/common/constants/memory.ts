@@ -81,8 +81,9 @@ export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 /**
  * Memory analyzer (the harvest of one closed or open compaction epoch): mutating memory
- * commands for the whole epoch. All of its transcript chunks, and a retry of the
- * epoch, spend one budget, so a long epoch cannot out-write a short one.
+ * commands for the whole epoch. All of its transcript chunks, a retry of the epoch, and
+ * every later run of the same epoch (an archive after new rows, the compaction that
+ * closes it) spend one budget, so a long epoch cannot out-write a short one.
  */
 export const MEMORY_ANALYZER_OP_BUDGET = 8;
 /** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */

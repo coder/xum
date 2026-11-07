@@ -109,6 +109,60 @@ describe("redactSecretLike", () => {
     expect(redacted).toContain("[redacted]");
   });
 
+  // The value's escaped quote is not its end: what follows it was leaking to the harvest model.
+  // Each input is the form `JSON.stringify` makes, once for a tool value and once more for a tool
+  // that printed JSON.
+  it.each([
+    [
+      "a JSON-stringified quote",
+      JSON.stringify({ password: 'abc"DEF-SUFFIX' }),
+      String.raw`{"password":[redacted]}`,
+    ],
+    [
+      "an escaped backslash before the closing quote",
+      JSON.stringify({ password: "abc\\", user: "alice" }),
+      String.raw`{"password":[redacted],"user":"alice"}`,
+    ],
+    [
+      "an escaped quote and the keys after it",
+      JSON.stringify({ password: 'a"b"c', user: "alice" }),
+      String.raw`{"password":[redacted],"user":"alice"}`,
+    ],
+    [
+      "a quote inside JSON printed by a tool",
+      JSON.stringify({ out: JSON.stringify({ password: 'abc"DEF-SUFFIX', user: "alice" }) }),
+      String.raw`{"out":"{\"password\":[redacted],\"user\":\"alice\"}"}`,
+    ],
+    [
+      "an escaped backslash inside JSON printed by a tool",
+      JSON.stringify({ out: JSON.stringify({ password: "abc\\", user: "alice" }) }),
+      String.raw`{"out":"{\"password\":[redacted],\"user\":\"alice\"}"}`,
+    ],
+    [
+      "a backslash and a quote inside JSON printed by a tool",
+      JSON.stringify({ out: JSON.stringify({ password: 'a\\"b', user: "alice" }) }),
+      String.raw`{"out":"{\"password\":[redacted],\"user\":\"alice\"}"}`,
+    ],
+    [
+      "an escaped apostrophe",
+      String.raw`password = 'it\'s-secret' next`,
+      "password = [redacted] next",
+    ],
+    ["a Windows path", String.raw`password: "C:\Users\me" next`, "password: [redacted] next"],
+    [
+      "an unterminated value that ends in an escaped quote",
+      String.raw`{"password":"abc\"DEF`,
+      '{"password":[redacted]',
+    ],
+    [
+      "an unterminated value that ends in a backslash",
+      `{"password": "abc${"\\"}`,
+      '{"password": [redacted]',
+    ],
+  ])("redacts the whole value with %s", (_label, text, expected) => {
+    expect(redactSecretLike(text)).toBe(expected);
+  });
+
   it("leaves ordinary text and token counts readable", () => {
     const text =
       "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo, bearer scheme, account name";
@@ -148,6 +202,14 @@ describe("redactSecretLike", () => {
     ["account_key", "account_key".repeat(9_000)],
     ["bearer", "bearer".repeat(16_000)],
     ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
+    ["a quoted value of backslashes", `token:"${"\\".repeat(100_000)}`],
+    ["a quoted value of escaped quotes", `token:"${'\\"'.repeat(50_000)}`],
+    [
+      "an escaped quoted value of backslash runs",
+      String.raw`token:\"` + String.raw`\\\"`.repeat(25_000),
+    ],
+    ["a quoted value that ends in a backslash run", `token:"a${"\\".repeat(100_000)}`],
+    ["many opening quotes", 'token:"a'.repeat(12_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     const started = performance.now();

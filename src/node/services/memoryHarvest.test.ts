@@ -457,6 +457,69 @@ describe("runMemoryHarvest", () => {
       expect(prompt).toContain("TOOL RESULT (session_history): [session_history result omitted]");
     });
 
+    describe("a data URL in a tool's output", () => {
+      const line = "QUJD".repeat(19); // one 76-character line of a wrapped payload
+      const wrapped = [line, line, line, "QUI="].join("\n");
+      const svg =
+        "data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%3E%3C%2Fsvg%3E";
+
+      async function promptOfOutput(output: unknown): Promise<string> {
+        using fixture = createFixture();
+        return harvestPrompt(fixture, [
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            toolPart("bash", { script: "cat" }, output),
+          ]),
+        ]);
+      }
+
+      it.each([
+        ["a percent-encoded SVG", svg, "%3Csvg"],
+        ["a text URL with a charset", "data:text/plain;charset=utf-8,hello%20world%21", "hello%20"],
+        ["base64 without a media type", `data:;base64,${"QUJD".repeat(10)}`, "QUJD"],
+        ["an upper-case scheme", `DATA:IMAGE/PNG;BASE64,${"QUJD".repeat(10)}`, "QUJD"],
+        ["a wrapped base64 payload", `data:image/png;base64,${wrapped}`, "QUJD"],
+        [
+          "a base64 payload wrapped with CRLF",
+          `data:image/png;base64,${wrapped.replaceAll("\n", "\r\n")}`,
+          "QUJD",
+        ],
+      ])(
+        "drops the whole payload of %s, and keeps the text around it",
+        async (_label, url, leak) => {
+          const prompt = await promptOfOutput(`before ${url}\nafter the url`);
+
+          expect(prompt).toContain("before [media]");
+          expect(prompt).toContain("after the url");
+          expect(prompt).not.toContain(leak);
+        }
+      );
+
+      it("drops a wrapped payload inside a structured value, where a line break is escaped", async () => {
+        const prompt = await promptOfOutput({
+          image: `data:image/png;base64,${wrapped}`,
+          note: "kept",
+        });
+
+        expect(prompt).toContain("[media]");
+        expect(prompt).toContain("kept");
+        expect(prompt).not.toContain("QUJD");
+      });
+
+      it("keeps a line of prose after an unwrapped payload", async () => {
+        const prompt = await promptOfOutput(`data:image/png;base64,${line}\nnext line is prose`);
+
+        expect(prompt).toContain("[media]");
+        expect(prompt).toContain("next line is prose");
+        expect(prompt).not.toContain("QUJD");
+      });
+
+      it("does not take prose that mentions data for a data URL", async () => {
+        const text = "the data: a, b and data:, here; metadata is fine";
+
+        expect(await promptOfOutput(text)).toContain(text);
+      });
+    });
+
     it("never sends a secret-shaped value from a tool to the harvest model", async () => {
       using fixture = createFixture();
       const githubToken = `ghp_${"a1B2".repeat(9)}`;
@@ -480,6 +543,20 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain(githubToken);
       expect(prompt).not.toContain(apiKey);
       expect(prompt).not.toContain("a1B2a1B2");
+    });
+
+    it("redacts a whole quoted secret that holds an escaped quote, in a structured value", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "env" }, { config: { password: 'abc"DEF-SUFFIX' }, ok: true }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("[redacted]");
+      expect(prompt).not.toContain("DEF-SUFFIX");
+      expect(prompt).toContain("ok");
     });
 
     it("redacts a secret that straddles the cap on a tool's output, not just the part inside it", async () => {
@@ -714,6 +791,81 @@ describe("runMemoryHarvest", () => {
       ]);
 
       expect(open.messages.map((row) => row.id)).toEqual(["real"]);
+    });
+  });
+
+  describe("a credential in a text part", () => {
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    const slackToken = "xoxb-1234567890-abcdefghij";
+    // Past the 8,000-character row limit a text part is cut into segments, one row each.
+    const ROW_TEXT_LIMIT = 8_000;
+    const TEXT_PART_LIMIT = 128_000;
+
+    async function promptOfText(text: string, role: "user" | "assistant"): Promise<string> {
+      using fixture = createFixture();
+      return harvestPrompt(fixture, [createMuxMessage("t1", role, text, { historySequence: 0 })]);
+    }
+
+    it.each(["user", "assistant"] as const)(
+      "is redacted from a short %s message, whatever the text around it",
+      async (role) => {
+        const prompt = await promptOfText(
+          `Use ${githubToken} for the deploy and ${slackToken}.`,
+          role
+        );
+
+        expect(prompt).toContain("for the deploy");
+        expect(prompt).toContain("[redacted]");
+        expect(prompt).not.toContain(githubToken);
+        expect(prompt).not.toContain(slackToken);
+      }
+    );
+
+    it("is redacted past the first row of a long part", async () => {
+      const prompt = await promptOfText(
+        `${"x".repeat(ROW_TEXT_LIMIT + 2_000)} ${githubToken} END-OF-TEXT`,
+        "assistant"
+      );
+
+      expect(prompt).toContain("END-OF-TEXT");
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("is redacted whole when it straddles two segments of one part", async () => {
+      // The token starts 10 characters before the first segment ends.
+      const prompt = await promptOfText(
+        `${"x".repeat(ROW_TEXT_LIMIT - 11)} ${githubToken} tail`,
+        "user"
+      );
+
+      expect(prompt).toContain("tail");
+      // Redacting each segment alone would leave the 10 readable characters of the token's start.
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("is redacted whole when it straddles the part's cap", async () => {
+      const prompt = await promptOfText(
+        `${"x".repeat(TEXT_PART_LIMIT - 11)} ${githubToken} tail`,
+        "user"
+      );
+
+      expect(prompt).toContain("[truncated");
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("keeps the count of cut characters of a part in which redaction shrank the text", () => {
+      using fixture = createFixture();
+      const text = `${githubToken} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
+      );
+
+      // Of the 1,041 characters past the cap, the 30 that redaction took out of the token now fit
+      // under it.
+      expect(rows.at(-1)?.text).toEndWith("[truncated 1011 more chars for memory harvest]");
+      expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
     });
   });
 
@@ -1231,6 +1383,28 @@ describe("runMemoryHarvest", () => {
     });
   });
 
+  it("adds the usage of the chunks it runs to the usage of the attempt it resumes", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const reached: HarvestProgress[] = [];
+    const { model } = scriptedModel([[finishChunk(5)], [finishChunk(5)]]);
+
+    const result = await runHarvest(fixture, model, {
+      resume: { nextChunk: 1, ops: [], usage: { inputTokens: 7, outputTokens: 11 } },
+      onChunkComplete: (progress) => {
+        reached.push(progress);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 21 });
+    // What the service persists after each chunk carries the running total, not the chunk's own.
+    expect(reached.map((progress) => progress.usage)).toEqual([
+      { inputTokens: 8, outputTokens: 16 },
+      { inputTokens: 9, outputTokens: 21 },
+    ]);
+  });
+
   describe("resume cursor", () => {
     it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
       using fixture = createFixture();
@@ -1409,6 +1583,43 @@ describe("runMemoryHarvest", () => {
 
         expect(result.streamError).toBeDefined();
         expect(result.nextChunk).toBe(1);
+      }
+    );
+
+    it.each(["its timeout", "workspace removal"])(
+      "is not held past %s by a memory read that never returns",
+      async (cause) => {
+        using fixture = createFixture();
+        const removal = new AbortController();
+        const chunkTimeout = new AbortController();
+        // Bun 1.3.14 never fires AbortSignal.timeout once streamText has added and removed a
+        // listener, so the test fires the chunk's timeout itself.
+        const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation(
+          () => chunkTimeout.signal
+        );
+        let markReadStarted!: () => void;
+        const readStarted = new Promise<void>((resolve) => {
+          markReadStarted = resolve;
+        });
+        spyOn(fixture.memoryService, "view").mockImplementation(() => {
+          markReadStarted();
+          return new Promise(() => undefined);
+        });
+        try {
+          const { model } = scriptedModel([
+            [memoryToolCall({ command: "view", path: "/memories/" }), toolFinishChunk()],
+          ]);
+
+          const running = runHarvest(fixture, model, { abortSignal: removal.signal });
+          await readStarted;
+          (cause === "its timeout" ? chunkTimeout : removal).abort();
+          const result = await running;
+
+          expect(result.streamError).toContain("cut short");
+          expect(result.nextChunk).toBe(0);
+        } finally {
+          timeoutSpy.mockRestore();
+        }
       }
     );
   });
