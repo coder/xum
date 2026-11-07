@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { tool } from "ai";
 
 import { CONFIG_FILE_REGISTRY } from "@/common/config/schemaRegistry";
@@ -15,6 +17,7 @@ import {
   readConfigDocumentUnvalidated,
   writeConfigDocument,
 } from "@/node/services/tools/shared/configReadWrite";
+import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 
 /** Recursively check if any value in the tree is the redaction sentinel placeholder. */
 function containsRedactedSentinel(value: unknown): boolean {
@@ -22,6 +25,43 @@ function containsRedactedSentinel(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsRedactedSentinel);
   if (value != null && typeof value === "object") {
     return Object.values(value as Record<string, unknown>).some(containsRedactedSentinel);
+  }
+  return false;
+}
+
+function agentSandboxOf(value: unknown): unknown {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>).agentSandbox
+    : undefined;
+}
+
+/**
+ * Each project's agentSandbox values, keyed the way Config loads project paths, so an alias of
+ * a path ("/repo/") cannot replace the setting of "/repo". A key whose entries have no value
+ * maps to [], so adding or removing a project without a setting changes nothing.
+ */
+function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
+  const projects = (document as { projects?: unknown } | null)?.projects;
+  const byProject = new Map<string, unknown[]>();
+  if (!Array.isArray(projects)) return byProject;
+  for (const entry of projects) {
+    if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
+    const key = stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
+    byProject.set(key, [...(byProject.get(key) ?? []), agentSandboxOf(entry[1])]);
+  }
+  for (const [key, values] of byProject) {
+    if (values.every((value) => value === undefined)) byProject.set(key, []);
+  }
+  return byProject;
+}
+
+/** Whether `next` changes agentSandbox by value, globally or in any project (added, edited or removed). */
+export function changesAgentSandbox(current: unknown, next: unknown): boolean {
+  if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
+  const before = projectAgentSandboxes(current);
+  const after = projectAgentSandboxes(next);
+  for (const key of new Set([...before.keys(), ...after.keys()])) {
+    if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
   return false;
 }
@@ -76,6 +116,14 @@ export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration)
                 ),
                 message: issue.message,
               })),
+            };
+          }
+
+          // The sandbox confines the agent, so the agent must not be able to turn it off.
+          if (changesAgentSandbox(currentDocument, mutationResult.document)) {
+            return {
+              success: false,
+              error: "Refusing to change agentSandbox. Only the user can change it in Settings.",
             };
           }
 

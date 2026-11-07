@@ -243,6 +243,100 @@ describe("mux_config_write", () => {
     ]);
   });
 
+  describe("agentSandbox guard", () => {
+    const initialConfig = {
+      agentSandbox: { enabled: true, network: "allowlist" },
+      projects: [["/test/proj", { workspaces: [], agentSandbox: { enabled: true } }]],
+      taskSettings: { maxParallelAgentTasks: 4 },
+    };
+    const cases: Array<{
+      name: string;
+      operations: Array<{ op: "set"; path: Array<string | number>; value: unknown }>;
+      refused: boolean;
+    }> = [
+      {
+        name: "refuses turning the global sandbox off",
+        operations: [{ op: "set", path: ["agentSandbox", "enabled"], value: false }],
+        refused: true,
+      },
+      {
+        name: "refuses opening the global network",
+        operations: [{ op: "set", path: ["agentSandbox", "network"], value: "open" }],
+        refused: true,
+      },
+      {
+        name: "refuses a project override change",
+        operations: [
+          { op: "set", path: ["projects", 0, 1, "agentSandbox"], value: { enabled: false } },
+        ],
+        refused: true,
+      },
+      {
+        name: "refuses dropping a project that has an override",
+        operations: [{ op: "set", path: ["projects"], value: [] }],
+        refused: true,
+      },
+      {
+        name: "refuses an aliased project entry without the override",
+        operations: [
+          {
+            op: "set",
+            path: ["projects"],
+            value: [
+              ["/test/proj", { workspaces: [], agentSandbox: { enabled: true } }],
+              ["/test/proj/", { workspaces: [] }],
+            ],
+          },
+        ],
+        refused: true,
+      },
+      {
+        name: "allows an unrelated change",
+        operations: [{ op: "set", path: ["taskSettings", "maxParallelAgentTasks"], value: 8 }],
+        refused: false,
+      },
+      {
+        name: "allows adding a project without an override",
+        operations: [
+          { op: "set", path: ["projects", 1], value: ["/test/other", { workspaces: [] }] },
+        ],
+        refused: false,
+      },
+      {
+        name: "allows setting agentSandbox to the same value",
+        operations: [
+          {
+            op: "set",
+            path: ["agentSandbox"],
+            value: { enabled: true, network: "allowlist" },
+          },
+        ],
+        refused: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      it(testCase.name, async () => {
+        using xumHome = new TestTempDir("mux-config-write");
+        const configPath = path.join(xumHome.path, "config.json");
+        const before = JSON.stringify(initialConfig, null, 2);
+        await fs.writeFile(configPath, before, "utf-8");
+
+        const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+        const result = (await tool.execute!(
+          { file: "config", operations: testCase.operations, confirm: true },
+          mockToolCallOptions
+        )) as XumConfigWriteResult;
+
+        expect(result.success).toBe(!testCase.refused);
+        if (testCase.refused) {
+          expect(result.success ? "" : result.error).toContain("agentSandbox");
+          expect(await fs.readFile(configPath, "utf-8")).toBe(before);
+        }
+      });
+    }
+  });
+
   it("returns validation issues and does not write when schema validation fails", async () => {
     using xumHome = new TestTempDir("mux-config-write");
 
