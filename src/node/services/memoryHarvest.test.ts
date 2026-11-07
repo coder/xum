@@ -16,6 +16,7 @@ import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
 import {
+  buildHarvestChunks,
   harvestChunkInputChars,
   runMemoryHarvest,
   selectOpenEpoch,
@@ -1270,5 +1271,127 @@ describe("runMemoryHarvest", () => {
         expect(result.nextChunk).toBe(1);
       }
     );
+  });
+});
+
+describe("buildHarvestChunks", () => {
+  const CHUNK_LIMIT = 40_000;
+
+  /** `count` one-part user messages whose texts hold `totalChars` characters between them. */
+  function messagesHolding(totalChars: number, count: number): MuxMessage[] {
+    return Array.from({ length: count }, (_, index) =>
+      createMuxMessage(
+        `m${index}`,
+        "user",
+        "x".repeat(Math.floor(totalChars / count) + (index < totalChars % count ? 1 : 0)),
+        { historySequence: index }
+      )
+    );
+  }
+
+  /** The text size that makes a chunk of `count` rows exactly `chunkChars` long, whatever a row's frame is. */
+  function textCharsFillingChunk(count: number, chunkChars: number): number {
+    const oneCharEach = buildHarvestChunks(messagesHolding(count, count));
+    expect(oneCharEach).toHaveLength(1);
+    return chunkChars - oneCharEach[0].length + count;
+  }
+
+  it("fits a chunk that is exactly the limit and splits one that is a character over", () => {
+    const count = 7;
+    const fitting = textCharsFillingChunk(count, CHUNK_LIMIT);
+
+    const exact = buildHarvestChunks(messagesHolding(fitting, count));
+    expect(exact.map((chunk) => chunk.length)).toEqual([CHUNK_LIMIT]);
+
+    const over = buildHarvestChunks(messagesHolding(fitting + 1, count));
+    expect(over.map((chunk) => (JSON.parse(chunk) as unknown[]).length)).toEqual([count - 1, 1]);
+  });
+
+  it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
+    // A fixed spread of sizes: long and short texts, some with tool parts.
+    const messages = Array.from({ length: 240 }, (_, index) =>
+      createMuxMessage(
+        `m${index}`,
+        "assistant",
+        `turn ${index} ${"t".repeat((index * 7_919) % 6_000)}`,
+        { historySequence: index },
+        index % 3 === 0
+          ? Array.from({ length: (index % 6) + 1 }, (_, tool) =>
+              toolPart(
+                "bash",
+                { script: `step ${tool}` },
+                { output: "o".repeat((index * 131) % 2_500) }
+              )
+            )
+          : []
+      )
+    );
+
+    const chunks = buildHarvestChunks(messages);
+
+    const rowsOf = chunks.map((chunk) => JSON.parse(chunk) as Array<{ id: string }>);
+    expect(chunks.length).toBeGreaterThan(10);
+    chunks.forEach((chunk, index) => {
+      expect(chunk).toBe(JSON.stringify(rowsOf[index], null, 2));
+      expect(chunk.length <= CHUNK_LIMIT || rowsOf[index].length === 1).toBe(true);
+      const nextFirst = rowsOf[index + 1]?.[0];
+      if (nextFirst !== undefined) {
+        expect(JSON.stringify([...rowsOf[index], nextFirst], null, 2).length).toBeGreaterThan(
+          CHUNK_LIMIT
+        );
+      }
+    });
+    const ids = rowsOf.flat().map((row) => row.id);
+    expect([...new Set(ids)]).toEqual(messages.map((message) => message.id));
+  });
+
+  describe("on an epoch of thousands of tool-heavy messages", () => {
+    const toolHeavy = () =>
+      Array.from({ length: 2_000 }, (_, index) =>
+        createMuxMessage(
+          `a${index}`,
+          "assistant",
+          `turn ${index}`,
+          { historySequence: index },
+          Array.from({ length: 40 }, (_, tool) =>
+            toolPart("bash", { script: `step ${tool}` }, { output: "ok" })
+          )
+        )
+      );
+
+    it("stringifies each row once, not the whole chunk again for every row", () => {
+      const messages = toolHeavy();
+      const stringify = JSON.stringify;
+      let stringified = 0;
+      const spy = spyOn(JSON, "stringify").mockImplementation(((
+        ...args: Parameters<typeof stringify>
+      ) => {
+        const out = stringify(...args);
+        stringified += out?.length ?? 0;
+        return out;
+      }) as typeof JSON.stringify);
+      let chunks: string[];
+      try {
+        chunks = buildHarvestChunks(messages);
+      } finally {
+        spy.mockRestore();
+      }
+
+      const outputChars = chunks.reduce((total, chunk) => total + chunk.length, 0);
+      // Stringifying the chunk so far again for each row came to several times its final size.
+      expect(stringified).toBeLessThan(outputChars * 2);
+    });
+
+    it("chunks in well under half a second", () => {
+      const messages = toolHeavy();
+      // The best of three, so another process's burst on a shared machine does not fail the test.
+      const elapsed = Array.from({ length: 3 }, () => {
+        const start = performance.now();
+        buildHarvestChunks(messages);
+        return performance.now() - start;
+      });
+
+      expect(Math.min(...elapsed)).toBeLessThan(500);
+    });
   });
 });

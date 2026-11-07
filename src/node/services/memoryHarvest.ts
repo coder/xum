@@ -231,19 +231,31 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
   });
 }
 
+// The frame of `JSON.stringify(rows, null, 2)`: each row is indented one level inside the array.
+const CHUNK_OPEN = "[\n";
+const CHUNK_CLOSE = "\n]";
+const ROW_SEPARATOR = ",\n";
+const ROW_INDENT = "  ";
+const CHUNK_FRAME_CHARS = CHUNK_OPEN.length + CHUNK_CLOSE.length;
+
 /**
  * Splits the epoch into transcript chunks. Pure over `messages`, so a retry of the same epoch
  * rebuilds the same chunks and the resume cursor (`HarvestProgress.nextChunk`) points at the same one.
  * A chunk holds whole rows; a message with many parts spans several rows and so several chunks.
  */
-function buildHarvestChunks(messages: MuxMessage[]): string[] {
+export function buildHarvestChunks(messages: MuxMessage[]): string[] {
   const chunks: string[] = [];
-  let currentRows: HarvestEvidenceRow[] = [];
+  // Each row as it sits in the chunk's `JSON.stringify(rows, null, 2)`, and their total length with
+  // the separators. Counting as rows arrive keeps the build linear: stringifying the whole chunk
+  // again for every new row took seconds on an epoch of thousands of tool-heavy messages.
+  let currentRows: string[] = [];
+  let currentRowChars = 0;
 
   function flush(): void {
     if (currentRows.length === 0) return;
-    chunks.push(JSON.stringify(currentRows, null, 2));
+    chunks.push(`${CHUNK_OPEN}${currentRows.join(ROW_SEPARATOR)}${CHUNK_CLOSE}`);
     currentRows = [];
+    currentRowChars = 0;
   }
 
   for (const message of messages) {
@@ -252,11 +264,18 @@ function buildHarvestChunks(messages: MuxMessage[]): string[] {
     // content to the Dream model and into persistent memory either.
     if (isModelHiddenMessage(message)) continue;
     for (const row of formatMessageForHarvest(message)) {
-      const nextTranscript = JSON.stringify([...currentRows, row], null, 2);
-      if (currentRows.length > 0 && nextTranscript.length > HARVEST_MAX_TRANSCRIPT_CHARS) {
+      const rowJson = `${ROW_INDENT}${JSON.stringify(row, null, 2).replaceAll("\n", `\n${ROW_INDENT}`)}`;
+      let grownChars =
+        currentRows.length === 0
+          ? rowJson.length
+          : currentRowChars + ROW_SEPARATOR.length + rowJson.length;
+      // A chunk always takes its first row, however long.
+      if (currentRows.length > 0 && CHUNK_FRAME_CHARS + grownChars > HARVEST_MAX_TRANSCRIPT_CHARS) {
         flush();
+        grownChars = rowJson.length;
       }
-      currentRows.push(row);
+      currentRowChars = grownChars;
+      currentRows.push(rowJson);
     }
   }
 
