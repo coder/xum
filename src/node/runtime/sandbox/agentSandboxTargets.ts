@@ -186,6 +186,8 @@ function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string
   });
 }
 
+/* eslint-disable local/no-sync-fs-methods -- Runtime.agentSandboxPolicy() is synchronous, so
+   the file tools can check a path before each access; these are a few small reads per command. */
 /**
  * The main git folder of a worktree whose `.git` file points elsewhere, or undefined for a
  * repository whose `.git` folder is inside the workspace (or no repository). Read from the
@@ -231,6 +233,7 @@ function isFile(target: string): boolean {
     return false;
   }
 }
+/* eslint-enable local/no-sync-fs-methods */
 
 /**
  * Whether `policy` lets a sandboxed command read or write the real path `target`, by the same

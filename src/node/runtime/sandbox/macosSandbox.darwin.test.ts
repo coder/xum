@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -95,8 +95,18 @@ function git(cwd: string, ...args: string[]): string {
  * A file directly in ~, which the built policy never opens for writes (temp folders are write
  * roots, so they cannot show a denied write). The tests remove it if the sandbox lets it through.
  */
-function homeProbePath(): string {
-  return path.join(fs.realpathSync(os.homedir()), `.xum-sandbox-test-${process.pid}-${Date.now()}`);
+async function homeProbePath(): Promise<string> {
+  return path.join(
+    await fs.realpath(os.homedir()),
+    `.xum-sandbox-test-${process.pid}-${Date.now()}`
+  );
+}
+
+async function exists(target: string): Promise<boolean> {
+  return fs.access(target).then(
+    () => true,
+    () => false
+  );
 }
 
 const GIT_IDENTITY = "-c user.name=sandbox -c user.email=sandbox@example.com";
@@ -106,14 +116,14 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
   () => {
     let root: string;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       // Real path: Seatbelt matches real paths only, and os.tmpdir() is under the /var symlink.
-      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "xum-sandbox-test-")));
+      root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "xum-sandbox-test-")));
     });
 
-    afterEach(() => {
+    afterEach(async () => {
       setAgentSandboxTargets(null);
-      fs.rmSync(root, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
     });
 
     afterAll(async () => {
@@ -123,8 +133,8 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
     it("writes only inside the write roots", async () => {
       const workspace = path.join(root, "ws");
       const outside = path.join(root, "outside");
-      fs.mkdirSync(workspace);
-      fs.mkdirSync(outside);
+      await fs.mkdir(workspace);
+      await fs.mkdir(outside);
 
       const result = await runSandboxed(
         explicitPolicy(workspace),
@@ -133,19 +143,19 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       );
 
       expect(result.stdout).toContain("WRITE_DENIED");
-      expect(fs.readFileSync(path.join(workspace, "inside.txt"), "utf8")).toBe("in\n");
-      expect(fs.existsSync(path.join(outside, "escaped.txt"))).toBe(false);
+      expect(await fs.readFile(path.join(workspace, "inside.txt"), "utf8")).toBe("in\n");
+      expect(await exists(path.join(outside, "escaped.txt"))).toBe(false);
     });
 
     it("closes a denied root, reopens a carve-out and closes a nested deny again", async () => {
       const workspace = path.join(root, "ws");
       const home = path.join(root, "home");
       const carveOut = path.join(home, "tools");
-      fs.mkdirSync(workspace);
-      fs.mkdirSync(carveOut, { recursive: true });
-      fs.writeFileSync(path.join(home, "private.txt"), "private");
-      fs.writeFileSync(path.join(carveOut, "tool.txt"), "tool");
-      fs.writeFileSync(path.join(carveOut, "token"), "token");
+      await fs.mkdir(workspace);
+      await fs.mkdir(carveOut, { recursive: true });
+      await fs.writeFile(path.join(home, "private.txt"), "private");
+      await fs.writeFile(path.join(carveOut, "tool.txt"), "tool");
+      await fs.writeFile(path.join(carveOut, "token"), "token");
 
       const result = await runSandboxed(
         explicitPolicy(workspace, {
@@ -170,7 +180,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
     it("lets git commit in a worktree but not write hooks or config", async () => {
       const repo = path.join(root, "repo");
       const worktree = path.join(root, "wt");
-      fs.mkdirSync(repo);
+      await fs.mkdir(repo);
       git(repo, "init", "-q");
       git(repo, ...GIT_IDENTITY.split(" "), "commit", "-q", "--allow-empty", "-m", "init");
       git(repo, "worktree", "add", "-q", worktree);
@@ -190,13 +200,13 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(git(worktree, "log", "-1", "--format=%s")).toBe("change");
       expect(result.stdout).toContain("HOOK_DENIED");
       expect(result.stdout).toContain("CONFIG_DENIED");
-      expect(fs.existsSync(path.join(commonDir, "hooks", "pre-commit"))).toBe(false);
-      expect(fs.readFileSync(path.join(commonDir, "config"), "utf8")).not.toContain("evil");
+      expect(await exists(path.join(commonDir, "hooks", "pre-commit"))).toBe(false);
+      expect(await fs.readFile(path.join(commonDir, "config"), "utf8")).not.toContain("evil");
     });
 
     it("keeps .git/hooks and .git/config of a repository in the workspace read-only", async () => {
       const repo = path.join(root, "repo");
-      fs.mkdirSync(repo);
+      await fs.mkdir(repo);
       git(repo, "init", "-q");
 
       const result = await runSandboxed(
@@ -212,13 +222,15 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.stdout).toContain("HOOK_DENIED");
       expect(result.stdout).toContain("CONFIG_DENIED");
       expect(result.stdout).toContain("WROTE");
-      expect(fs.existsSync(path.join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
-      expect(fs.readFileSync(path.join(repo, ".git", "config"), "utf8")).not.toContain("hooksPath");
+      expect(await exists(path.join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
+      expect(await fs.readFile(path.join(repo, ".git", "config"), "utf8")).not.toContain(
+        "hooksPath"
+      );
     });
 
     it("runs the toolchains that work outside it", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
+      await fs.mkdir(workspace);
       // git and bun (this test's runner) must work; the others only when installed here.
       const candidates = ["node", "go", "python3", "uv"].filter((tool) => {
         try {
@@ -250,7 +262,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     it("cuts the keychain rules out of the profile and blocks the keychain", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
+      await fs.mkdir(workspace);
       const policy = explicitPolicy(workspace);
       const wrap = await wrapWithPolicy(policy, "true", { bashPath: "/bin/bash" });
       wrap.dispose();
@@ -281,7 +293,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
       it("refuses an unlisted host and a Unix socket, and reaches loopback", async () => {
         const workspace = path.join(root, "ws");
-        fs.mkdirSync(workspace);
+        await fs.mkdir(workspace);
         const socketPath = path.join(root, "s.sock");
         const socketServer = net.createServer((socket) => socket.end("socket-ok"));
         await new Promise<void>((resolve) => socketServer.listen(socketPath, resolve));
@@ -308,7 +320,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     it("hides the server token from sandboxed commands only", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
+      await fs.mkdir(workspace);
       setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
       const runtime = new LocalRuntime(workspace);
       const tokenSeen = async (sandbox: "off" | undefined) => {
@@ -327,8 +339,8 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     it("runs background bash in the sandbox", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
-      const escaped = homeProbePath();
+      await fs.mkdir(workspace);
+      const escaped = await homeProbePath();
       setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
       const runtime = new LocalRuntime(workspace);
 
@@ -346,22 +358,22 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           if (exitCode === null) await new Promise((resolve) => setTimeout(resolve, 100));
         }
         expect(exitCode).toBe(0);
-        expect(fs.readFileSync(path.join(workspace, "bg.txt"), "utf8")).toBe("bg\n");
-        expect(fs.existsSync(escaped)).toBe(false);
-        expect(fs.readFileSync(path.join(result.outputDir, "output.log"), "utf8")).toContain(
+        expect(await fs.readFile(path.join(workspace, "bg.txt"), "utf8")).toBe("bg\n");
+        expect(await exists(escaped)).toBe(false);
+        expect(await fs.readFile(path.join(result.outputDir, "output.log"), "utf8")).toContain(
           "WRITE_DENIED"
         );
       } finally {
         await result.handle.dispose();
-        fs.rmSync(result.outputDir, { recursive: true, force: true });
-        fs.rmSync(escaped, { force: true });
+        await fs.rm(result.outputDir, { recursive: true, force: true });
+        await fs.rm(escaped, { force: true });
       }
     });
 
     it("reports what it blocked in the bash result", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
-      const escaped = homeProbePath();
+      await fs.mkdir(workspace);
+      const escaped = await homeProbePath();
       setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
       const tool = createBashTool(createTestToolConfig(workspace));
 
@@ -377,7 +389,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           mockToolCallOptions
         )) as BashToolResult;
       } finally {
-        fs.rmSync(escaped, { force: true });
+        await fs.rm(escaped, { force: true });
       }
 
       expect(result.success).toBe(false);
@@ -386,7 +398,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     it("waits for the log only when the command failed", async () => {
       const workspace = path.join(root, "ws");
-      fs.mkdirSync(workspace);
+      await fs.mkdir(workspace);
       const result = await runSandboxed(explicitPolicy(workspace), workspace, "true");
       const started = Date.now();
       expect(await agentSandboxDenialsAfterExit(result.commandId, false)).toEqual([]);

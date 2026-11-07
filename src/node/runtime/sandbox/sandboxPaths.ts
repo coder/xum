@@ -145,6 +145,7 @@ export function realpathOfNearest(target: string): string {
   let current = absolute;
   for (;;) {
     try {
+      // eslint-disable-next-line local/no-sync-fs-methods -- the policy is built synchronously (agentSandboxPolicy).
       return path.join(fs.realpathSync(current), ...missing.reverse());
     } catch {
       const parent = path.dirname(current);

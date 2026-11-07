@@ -14,6 +14,7 @@ export const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
 /** Whether this backend can sandbox agent commands: macOS with Seatbelt's sandbox-exec. */
 export function isAgentSandboxSupported(): boolean {
+  // eslint-disable-next-line local/no-sync-fs-methods -- a cheap check on a sync path (exec, settings).
   return process.platform === "darwin" && fs.existsSync(SANDBOX_EXEC_PATH);
 }
 
