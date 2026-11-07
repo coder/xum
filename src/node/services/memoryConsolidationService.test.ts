@@ -1528,6 +1528,99 @@ describe("MemoryConsolidationService", () => {
       }
     });
 
+    /**
+     * A second backend on the same root: its own in-process queue and run table, the same sidecar
+     * and the same dream lock. It counts the provider streams it starts.
+     */
+    function secondBackend(fixture: Fixture) {
+      const counts = { modelsCreated: 0, streams: 0 };
+      const service = new MemoryConsolidationService(
+        fixture.config,
+        fixture.memoryService,
+        fixture.metaService,
+        fixture.historyService,
+        {
+          createModelWithPinnedMetadata: (modelString: string) => {
+            counts.modelsCreated++;
+            const inner = scriptedModel();
+            return Promise.resolve(
+              Ok({
+                model: new MockLanguageModelV3({
+                  doStream: (options) => {
+                    counts.streams++;
+                    return inner.doStream(options);
+                  },
+                }),
+                metadataModel: modelString,
+              })
+            );
+          },
+        },
+        {
+          isExperimentEnabled: (id) =>
+            id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+        }
+      );
+      return { service, counts };
+    }
+
+    /**
+     * Both backends get the same trigger for one workspace before either has journaled, so both
+     * pass the debounce check; this backend's run streams first and the other waits on the lock.
+     */
+    async function runBehindAnotherBackend(secondTrigger: "compaction" | "manual") {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const second = secondBackend(fixture);
+
+      const first = fixture.service.maybeRun("ws-dream", "compaction");
+      await until(() => held.events.includes("start-1"));
+      const behind = second.service.maybeRun("ws-dream", secondTrigger);
+      await until(() => second.counts.modelsCreated === 1);
+      expect(second.counts.streams).toBe(0);
+
+      held.release(1);
+      return { first: await first, behind: await behind, secondStreams: second.counts.streams };
+    }
+
+    it("skips an automatic run whose turn comes after another backend's run covered the workspace", async () => {
+      const { first, behind, secondStreams } = await runBehindAnotherBackend("compaction");
+      expect(first.success).toBe(true);
+      expectDebounced(behind);
+      expect(secondStreams).toBe(0);
+    });
+
+    it("still runs a manual trigger that waited behind another backend's run", async () => {
+      const { first, behind, secondStreams } = await runBehindAnotherBackend("manual");
+      expect(first.success).toBe(true);
+      expect(behind.success).toBe(true);
+      expect(secondStreams).toBe(1);
+    });
+
+    it("journals a run's success before it frees the dream lock", async () => {
+      // The next run in any process rechecks the debounce from disk the moment it gets the lock,
+      // so the record has to be there by then.
+      using fixture = await createFixture();
+      const lockPath = dreamStreamLockPath(fixture.xumHome);
+      const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+      const journaledAtRelease: boolean[] = [];
+      const { rm } = fsPromises;
+      const rmSpy = spyOn(fsPromises, "rm").mockImplementation(async (target, options) => {
+        if (target === lockPath) {
+          const raw = await fsPromises.readFile(sidecarPath, "utf-8").catch(() => "{}");
+          const file = JSON.parse(raw) as { workspaces?: Record<string, unknown> };
+          journaledAtRelease.push(file.workspaces?.["ws-dream"] !== undefined);
+        }
+        return rm(target, options);
+      });
+      try {
+        expect((await fixture.service.maybeRun("ws-dream", "compaction")).success).toBe(true);
+      } finally {
+        rmSpy.mockRestore();
+      }
+      expect(journaledAtRelease).toEqual([true]);
+    });
+
     it("cancels a run that is waiting for another process's dream stream when its workspace is removed", async () => {
       const held = heldStreams();
       using fixture = await createFixture({ modelFactory: held.factory });
