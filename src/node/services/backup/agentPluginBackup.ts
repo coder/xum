@@ -160,18 +160,50 @@ export async function collectPluginBackup(muxRoot: string): Promise<BackupPlugin
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
 }
 
+const SCHEME_REMOTE = /^(?:https?|ssh|git):\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/@]+)(?::\d*)?(?:\/(.*))?$/i;
+// `host:path`, not `scheme://...`, and not a drive path (`C:\...`: a host has two characters or more).
+const SCP_REMOTE = /^(?:[^@/:]+@)?([^:/@]{2,}):(?!\/\/)(.*)$/;
+
+/**
+ * The repository a clone URL names, without how it is spelled: https, http, ssh, git and scp forms
+ * of one host and path give one identity, whatever the user, port, host case, leading or trailing
+ * slash or `.git`. `owner/repo` shorthand is stored as https or as scp, depending on whether this
+ * session has an SSH agent (gitUrls.ts), so the same repository reads differently from one machine
+ * to the next. The path keeps its case: a host may tell `Repo` from `repo`, and a false "another
+ * repository" only asks the user to approve. A path or any other spelling is its own identity.
+ */
+export function repositoryIdentity(url: string): string {
+  const trimmed = url.trim();
+  const match = SCHEME_REMOTE.exec(trimmed) ?? SCP_REMOTE.exec(trimmed);
+  if (match === null) return trimmed;
+  const repoPath = (match[2] ?? "").replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
+  return `${match[1].toLowerCase()}/${repoPath}`;
+}
+
+/** A monorepo folder with no leading or trailing slash, so `/a/b/` and `a/b` are one folder. */
+function folderIdentity(subpath: string | undefined): string {
+  return (subpath ?? "").replace(/^\/+|\/+$/g, "");
+}
+
+/** The same repository and folder, wherever the commit or ref of either one points. */
+function isSameSource(
+  a: Pick<BackupPluginEntry["source"], "url" | "subpath">,
+  b: Pick<BackupPluginEntry["source"], "url" | "subpath">
+): boolean {
+  return (
+    repositoryIdentity(a.url) === repositoryIdentity(b.url) &&
+    folderIdentity(a.subpath) === folderIdentity(b.subpath)
+  );
+}
+
 /**
  * The same plugin in the backup and in this export: the same name from the same repository and
- * folder. A new commit or ref of that repository is an update of the plugin, which the user can
- * read in the install review. A name now installed from another source is another plugin: the
- * list would silently swap what the backup holds for it.
+ * folder (`isSameSource`). A new commit or ref of that repository is an update of the plugin,
+ * which the user can read in the install review. A name now installed from another source is
+ * another plugin: the list would silently swap what the backup holds for it.
  */
 function isSamePlugin(listed: BackupPluginEntry, written: BackupPluginEntry): boolean {
-  return (
-    listed.name === written.name &&
-    listed.source.url === written.source.url &&
-    listed.source.subpath === written.source.subpath
-  );
+  return listed.name === written.name && isSameSource(listed.source, written.source);
 }
 
 /**

@@ -8,7 +8,11 @@ import { resolveBackupContents } from "@/common/config/schemas/settingsBackup";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupService } from "./backupService";
-import { PLUGIN_BACKUP_DIR, PLUGIN_BACKUP_MANIFEST_PATH } from "./agentPluginBackup";
+import {
+  PLUGIN_BACKUP_DIR,
+  PLUGIN_BACKUP_MANIFEST_PATH,
+  repositoryIdentity,
+} from "./agentPluginBackup";
 import { captureRejection, commitAll, runGit, writeFixtureFile } from "./testHelpers";
 
 const DEFAULT_CONTENTS = resolveBackupContents({});
@@ -63,6 +67,58 @@ async function writeGeneratedPlugin(root: string, name: string, generatedFrom: u
     JSON.stringify({ name, extensions: { mux: { generatedFrom } } })
   );
 }
+
+describe("repositoryIdentity", () => {
+  const spellingsOfOneRepository = [
+    "https://github.com/o/r.git",
+    "https://github.com/o/r",
+    "https://github.com/o/r/",
+    "https://github.com/o/r.git/",
+    "https://GitHub.COM/o/r.git",
+    "HTTPS://github.com/o/r.git",
+    "http://github.com/o/r",
+    "git://github.com/o/r.git",
+    "ssh://git@github.com/o/r.git",
+    "ssh://other-user@github.com:2222/o/r",
+    "git@github.com:o/r.git",
+    "git@github.com:o/r",
+    "git@GITHUB.com:o/r.git",
+    "git@github.com:/o/r.git",
+    "github.com:o/r.git",
+    "  https://github.com/o/r.git ",
+  ];
+
+  it("gives every spelling of one repository the same identity", () => {
+    const identities = new Set(spellingsOfOneRepository.map(repositoryIdentity));
+
+    expect([...identities]).toEqual(["github.com/o/r"]);
+  });
+
+  it("tells another owner, repository or host apart", () => {
+    const others = [
+      "https://github.com/other/r.git",
+      "https://github.com/o/other.git",
+      "https://github.com/o/r2.git",
+      "https://github.com/o/r/sub.git",
+      "https://gitlab.com/o/r.git",
+      "https://github.com.example.com/o/r.git",
+      "git@gitlab.com:o/r.git",
+    ];
+
+    for (const other of others) {
+      expect(repositoryIdentity(other)).not.toBe(repositoryIdentity("https://github.com/o/r.git"));
+    }
+  });
+
+  it("keeps a path, or a spelling it does not know, as written", () => {
+    expect(repositoryIdentity("/home/someone/plugins/alpha")).toBe("/home/someone/plugins/alpha");
+    expect(repositoryIdentity("C:\\plugins\\alpha")).toBe("C:\\plugins\\alpha");
+    expect(repositoryIdentity("file:///home/someone/alpha")).toBe("file:///home/someone/alpha");
+    expect(repositoryIdentity("file:///home/someone/alpha")).not.toBe(
+      repositoryIdentity("file:///home/someone/beta")
+    );
+  });
+});
 
 describe("backup of the managed plugin list", () => {
   let tempDir: string;
@@ -920,6 +976,29 @@ describe("backup of the managed plugin list", () => {
 
         expect(pushed.success).toBe(true);
         expect((await listedRows())[0]).toMatchObject({ name: "alpha", lockedSha: shaOf("z") });
+      });
+
+      it("keeps a plugin without approval when the same repository is spelled another way", async () => {
+        await pushFromFirstMachine([
+          registryRow("alpha"),
+          registryRow("beta", {
+            source: gitSource("https://github.com/example/mono.git", "plugins/beta"),
+          }),
+        ]);
+
+        // The other machine has an SSH agent, so `example/alpha` shorthand became an scp URL there.
+        const pushed = await pushFromSecondMachine([
+          registryRow("alpha", { source: gitSource("git@GitHub.com:example/alpha") }),
+          registryRow("beta", {
+            source: gitSource("ssh://git@github.com:22/example/mono/", "/plugins/beta/"),
+          }),
+        ]);
+
+        expect(pushed.success).toBe(true);
+        expect((await listedRows()).map((row) => row.source.url)).toEqual([
+          "git@GitHub.com:example/alpha",
+          "ssh://git@github.com:22/example/mono/",
+        ]);
       });
 
       it("pushes once the approval of that removal comes back with it", async () => {
