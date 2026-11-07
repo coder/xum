@@ -3,7 +3,6 @@ import { describe, expect, it } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
-import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage, type MuxMessage, type MuxToolPart } from "@/common/types/message";
 import {
   buildPlanReviewMetadata,
@@ -16,7 +15,7 @@ import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { runMemoryHarvest, type HarvestProgress } from "./memoryHarvest";
+import { runMemoryHarvest, selectOpenEpoch, type HarvestProgress } from "./memoryHarvest";
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -119,7 +118,6 @@ interface Fixture extends Disposable {
   memoryService: MemoryService;
   metaService: MemoryMetaService;
   ctx: MemoryScopeContext;
-  metadata: CompactionCompletionMetadata;
   messages: MuxMessage[];
   summary: MuxMessage;
 }
@@ -146,13 +144,6 @@ function createFixture(): Fixture {
     memoryService,
     metaService,
     ctx,
-    metadata: {
-      workspaceId: "ws-harvest",
-      summaryMessageId: "summary-1",
-      summaryHistorySequence: 2,
-      compactionEpoch: 1,
-      compactionRequestMessageId: "compact-request",
-    },
     messages: [
       createMuxMessage("m1", "user", "Please remember that I prefer concise tests.", {
         historySequence: 0,
@@ -177,7 +168,6 @@ async function runHarvest(
     memoryService: fixture.memoryService,
     metaService: fixture.metaService,
     ctx: fixture.ctx,
-    completionMetadata: fixture.metadata,
     messages: fixture.messages,
     summary: fixture.summary,
     ...extras,
@@ -438,6 +428,95 @@ describe("runMemoryHarvest", () => {
 
     expect(calls).toHaveLength(3);
     for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
+  });
+
+  it("analyzes an epoch that has no compaction summary", async () => {
+    using fixture = createFixture();
+    const prompts: string[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: (options) => {
+        prompts.push(userPromptText(options));
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
+      },
+    });
+
+    const result = await runHarvest(fixture, model, { summary: undefined });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.nextChunk).toBe(1);
+    expect(prompts.join("\n")).toContain("prefer concise tests");
+    expect(prompts.join("\n")).not.toContain("The user prefers concise tests.");
+  });
+
+  describe("selectOpenEpoch", () => {
+    const summaryRow = (id: string, epoch: number, sequence: number) =>
+      createMuxMessage(id, "assistant", `summary ${epoch}`, {
+        historySequence: sequence,
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: epoch,
+      });
+    const userRow = (
+      id: string,
+      sequence: number,
+      metadata: Partial<MuxMessage["metadata"]> = {}
+    ) => createMuxMessage(id, "user", `row ${id}`, { historySequence: sequence, ...metadata });
+
+    it("keeps the rows after the latest boundary and drops the boundary itself", () => {
+      const open = selectOpenEpoch([
+        summaryRow("summary-2", 2, 5),
+        userRow("after-1", 6),
+        userRow("after-2", 7),
+      ]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["after-1", "after-2"]);
+      // The epoch that the next compaction would close.
+      expect(open.compactionEpoch).toBe(3);
+    });
+
+    it("takes every row of a chat that never compacted", () => {
+      const open = selectOpenEpoch([userRow("a", 0), userRow("b", 1)]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["a", "b"]);
+      expect(open.compactionEpoch).toBe(1);
+    });
+
+    it("starts after a context reset, which has no summary row", () => {
+      const reset = createMuxMessage("reset-1", "assistant", "", {
+        historySequence: 3,
+        contextBoundaryKind: "reset",
+      });
+
+      const open = selectOpenEpoch([userRow("before", 2), reset, userRow("after", 4)]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["after"]);
+    });
+
+    it("drops keep-recent tail copies and model-hidden rows, which the epoch's run never reads", () => {
+      const snapshot: PlanReviewRecord = {
+        v: 1,
+        kind: "snapshot",
+        recordId: "rec_snap",
+        snapshotId: "snap_1",
+        planPath: "/plans/p.md",
+        contentHash: "a".repeat(64),
+        content: "# Plan\n",
+      };
+      const hidden = createMuxMessage("hidden-snap", "user", formatPlanReviewEnvelope(snapshot), {
+        historySequence: 8,
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      });
+
+      const open = selectOpenEpoch([
+        summaryRow("summary-1", 1, 5),
+        userRow("tail-copy", 6, { synthetic: true, rlmPreservedTailCopy: true }),
+        userRow("real", 7),
+        hidden,
+      ]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["real"]);
+    });
   });
 
   describe("analyzer", () => {

@@ -114,6 +114,12 @@ export const CompactionCompletionMetadataSchema = z.object({
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
   startedAt: z.number(),
+  /**
+   * When the run last finished a chunk. A pending record counts as stale a timeout after this, not
+   * after `startedAt`, so a run of many chunks is not stale while its chunks keep finishing.
+   * Optional so older binaries parse the record and for records that never reached a chunk.
+   */
+  progressAt: z.number().optional(),
   completedAt: z.number().optional(),
   attemptCount: z.number(),
   boundaryKey: z.string(),

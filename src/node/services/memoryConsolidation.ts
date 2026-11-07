@@ -495,6 +495,11 @@ export async function runMemoryConsolidation(args: {
       streamErrors.push(getErrorMessage(error));
     },
   });
+  // An abort ends the stream without an error part, so a pass cut short by its timeout or by
+  // workspace removal would read as clean and be journaled as a success.
+  if (streamErrors.length === 0 && args.abortSignal?.aborted === true) {
+    streamErrors.push("memory consolidation was cut short by its timeout or by workspace removal");
+  }
   const summary =
     streamErrors.length === 0 ? (await stream.text).trim() : `stream error: ${streamErrors[0]}`;
 
