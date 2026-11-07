@@ -467,6 +467,58 @@ function harvestRecordIdentity(
 }
 
 /**
+ * Where an attempt at a job starts, from the record its earlier attempts left (none for the
+ * first). A retry resumes where the failed attempt stopped: its chunks already wrote to memory.
+ */
+export function harvestResumeState(existing: MemoryHarvestRecord | undefined): {
+  progress: HarvestProgress;
+  attemptState: HarvestAttemptState;
+} {
+  // A first attempt has no record: read each field off an empty one rather than check per field.
+  const earlier: Partial<MemoryHarvestRecord> = existing ?? {};
+  return {
+    progress: {
+      nextChunk: earlier.nextChunk ?? 0,
+      ops: earlier.ops ?? [],
+      budgetUsed: earlier.budgetUsed,
+      nextChunkOps: earlier.nextChunkOps,
+      // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
+      // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
+      readThroughRowId: earlier.readThroughRowId,
+      // What the earlier attempts cost: the cost ceiling is on the job, so a retry continues from it.
+      spentUsd: earlier.spentUsd,
+      usage: earlier.usage,
+    },
+    // A retry keeps the floor of the first attempt: the chunk cursor counts chunks of the rows
+    // after it.
+    attemptState: { analyzedFloorRowId: earlier.analyzedFloorRowId },
+  };
+}
+
+/**
+ * The failed record that replaces `record` when it is a pending one whose last allowed attempt
+ * went stale: nothing may retry it. Undefined for any other record. The rule of
+ * normalizeHarvestRecord, applied to the record a job just read.
+ */
+export function staleExhaustedHarvestFailure(
+  record: MemoryHarvestRecord | undefined
+): MemoryHarvestRecord | undefined {
+  if (
+    record?.status !== "pending" ||
+    !isStalePendingHarvestRecord(record) ||
+    record.attemptCount < HARVEST_MAX_ATTEMPTS
+  ) {
+    return undefined;
+  }
+  return {
+    ...record,
+    status: "failed",
+    completedAt: Date.now(),
+    error: record.error ?? "stale pending harvest exceeded retry attempts",
+  };
+}
+
+/**
  * Harvest-record key of the open epoch: its newest row's id. A compaction key is a message id too
  * and no message id starts with this prefix. The key changes when a row arrives, so an archive
  * that finds the same newest row has nothing new to analyze. A row id, unlike a history sequence,
@@ -1358,7 +1410,7 @@ export class MemoryConsolidationService extends EventEmitter {
       // that was ahead of this run may have journaled after the pre-queue check passed; and the
       // success record is saved here, before release, so that read sees it. The save is the
       // sidecar's brief in-process lock plus one atomic write. Usage recording is not part of the
-      // turn (see `recordings`).
+      // turn (see `usageRecorder`).
       const runTurn = async (): Promise<Result<MemoryConsolidationRecord, string>> => {
         if (await Effect.runPromise(self.isDebouncedEffect(workspaceId, trigger, options))) {
           return Err(DEBOUNCED_SKIP_REASON);
@@ -1677,42 +1729,11 @@ export class MemoryConsolidationService extends EventEmitter {
       const sidecar = yield* self.loadEffect();
       const existing = sidecar.harvestsByWorkspace[workspaceId]?.[boundaryKey];
       const existingAttemptCount = existing?.attemptCount ?? 0;
-      // A retry resumes where the failed attempt stopped: its chunks already wrote to memory.
-      const progress: HarvestProgress = {
-        nextChunk: existing?.nextChunk ?? 0,
-        ops: existing?.ops ?? [],
-        budgetUsed: existing?.budgetUsed,
-        nextChunkOps: existing?.nextChunkOps,
-        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
-        // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
-        readThroughRowId: existing?.readThroughRowId,
-        // What the earlier attempts cost: the cost ceiling is on the job, so a retry continues from it.
-        spentUsd: existing?.spentUsd,
-        usage: existing?.usage,
-      };
-      const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
-      // A retry keeps the floor of the first attempt: the chunk cursor above counts chunks of the
-      // rows after it.
-      const attemptState: HarvestAttemptState = {
-        analyzedFloorRowId: existing?.analyzedFloorRowId,
-      };
+      const { progress, attemptState } = harvestResumeState(existing);
 
-      if (
-        existing?.status === "pending" &&
-        stalePending &&
-        existingAttemptCount >= HARVEST_MAX_ATTEMPTS
-      ) {
-        yield* self.saveHarvestRecordEffect(
-          workspaceId,
-          boundaryKey,
-          {
-            ...existing,
-            status: "failed",
-            completedAt: Date.now(),
-            error: existing.error ?? "stale pending harvest exceeded retry attempts",
-          },
-          projectPath
-        );
+      const staleFailure = staleExhaustedHarvestFailure(existing);
+      if (staleFailure !== undefined) {
+        yield* self.saveHarvestRecordEffect(workspaceId, boundaryKey, staleFailure, projectPath);
       }
 
       if (existing?.status !== "completed" && existingAttemptCount < HARVEST_MAX_ATTEMPTS) {

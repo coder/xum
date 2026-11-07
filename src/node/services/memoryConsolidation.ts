@@ -44,7 +44,11 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { createSpendMeter } from "@/node/services/memoryDreamSpend";
-import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import {
+  memoryLogicalKey,
+  type MemoryMetaEntry,
+  type MemoryMetaService,
+} from "@/node/services/memoryMeta";
 import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
@@ -226,6 +230,136 @@ async function validateMutationForStaging(
   }
 }
 
+/** What one run may do to memory: the options `createConsolidationMemoryTool` resolves for its guard. */
+interface MutationRails {
+  memoryService: MemoryService;
+  metaService: MemoryMetaService;
+  ctx: MemoryScopeContext;
+  writableScopes: readonly WritableMemoryScope[];
+  /** Project memory stays unavailable without a single stable project identity, even when listed. */
+  projectAvailable: boolean;
+  deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
+  rejectSecretLike?: boolean;
+}
+
+/** Whether a run may modify `scope`. */
+function isWritableScope(
+  scope: MemoryScope | null,
+  rails: Pick<MutationRails, "writableScopes" | "projectAvailable">
+): boolean {
+  return (
+    scope !== null &&
+    scope !== "session" &&
+    rails.writableScopes.includes(scope) &&
+    (scope !== "project" || rails.projectAvailable)
+  );
+}
+
+function scopeRejection(
+  virtualPath: string,
+  rails: Pick<MutationRails, "writableScopes" | "projectAvailable">
+): string {
+  const modifiable = rails.writableScopes
+    .filter((scope) => scope !== "project" || rails.projectAvailable)
+    .map((scope) => `/memories/${scope}/...`);
+  const projectNote =
+    rails.writableScopes.includes("project") && !rails.projectAvailable
+      ? "project memory is available only for single-project runs; "
+      : "";
+  return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${PATH_LIST_FORMAT.format(modifiable)}.`;
+}
+
+/**
+ * Why a run that rejects credentials may not write what `input` adds, or null when it may. The
+ * note is journaled into the sidecar record, so it never quotes the rejected text.
+ */
+function secretRejection(target: MutationTarget, input: MemoryCommandInput): string | null {
+  const text = newTextOf(input);
+  if (text !== null && containsSecretLike(text)) {
+    return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
+  }
+  // A file name is text too: `sk-ant-....md` stores the key in the directory listing. A delete
+  // names an existing file and adds nothing, so it stays open; a rename adds only its new name.
+  const addedName = target.command === "rename" ? target.newPath : target.path;
+  if (target.command !== "delete" && addedName != null && containsSecretLike(addedName)) {
+    return "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password.";
+  }
+  return null;
+}
+
+/**
+ * The rails that need no I/O: writable scope, denied command and (opt-in) credential check, in
+ * that order. Throws on an invalid path (parseMemoryPath); the tool surfaces that as a tool error.
+ */
+function staticRejection(
+  rails: MutationRails,
+  target: MutationTarget,
+  input: MemoryCommandInput
+): string | null {
+  // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
+  for (const virtualPath of [target.path, target.newPath]) {
+    if (virtualPath == null) continue;
+    if (!isWritableScope(parseMemoryPath(virtualPath).scope, rails)) {
+      return scopeRejection(virtualPath, rails);
+    }
+  }
+  if (rails.deniedCommands?.includes(target.command) === true) {
+    return `This run may not use ${target.command}; it can only add to and edit memory.`;
+  }
+  return rails.rejectSecretLike === true ? secretRejection(target, input) : null;
+}
+
+/**
+ * Why a delete/rename of `key` may not run: it is pinned, or a file under it is (`entries` are the
+ * sidecar records by logical key). Deletes/renames may target a directory (MemoryService removes
+ * recursively), so without the subtree check `delete dir/` would silently destroy dir/pinned.md.
+ */
+function pinnedRejection(
+  entries: ReadonlyMap<string, MemoryMetaEntry>,
+  key: string,
+  path: string
+): string | null {
+  const subtreePrefix = `${key}/`;
+  for (const [entryKey, entry] of entries) {
+    if (entry.pinned !== true) continue;
+    if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
+      return `${path} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`;
+    }
+  }
+  return null;
+}
+
+/** The note that refuses `target` before it runs, or null when every rail lets it through. */
+async function mutationRejection(
+  rails: MutationRails,
+  target: MutationTarget,
+  input: MemoryCommandInput
+): Promise<string | null> {
+  const rejection = staticRejection(rails, target, input);
+  if (rejection !== null) return rejection;
+  // Pin protection: pinned files are editable but never deleted/renamed. This pre-check gives the
+  // model (and dry-run staging) early feedback; the AUTHORITATIVE check runs inside
+  // MemoryService's mutation lock against the owner the command's store is actually bound to
+  // (`rejectPinned` in the tool): the owner resolved here can differ from the command's when
+  // config.json is transiently unreadable in between.
+  if (target.command !== "delete" && target.command !== "rename") return null;
+  const { scope, relPath } = parseMemoryPath(target.path);
+  assert(
+    scope === "workspace" || scope === "project" || scope === "global",
+    "guard scope check must run first"
+  );
+  const entries = await rails.metaService.getEntries();
+  const key = memoryLogicalKey(scope, relPath, {
+    projectPath: rails.ctx.projectPath,
+    // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
+    workspaceId:
+      rails.ctx.workspaceId === ""
+        ? ""
+        : rails.memoryService.resolveWorkspaceMemoryOwnerId(rails.ctx.workspaceId),
+  });
+  return pinnedRejection(entries, key, target.path);
+}
+
 /**
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
@@ -291,82 +425,14 @@ export function createConsolidationMemoryTool(args: {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
   const writableScopes = args.writableScopes ?? DEFAULT_WRITABLE_SCOPES;
-  const projectAvailable = ctx.projectPath !== "";
-  const isWritableScope = (scope: MemoryScope | null): boolean =>
-    scope !== null &&
-    scope !== "session" &&
-    writableScopes.includes(scope) &&
-    (scope !== "project" || projectAvailable);
-
-  const scopeRejection = (virtualPath: string): string => {
-    const modifiable = writableScopes
-      .filter((scope) => scope !== "project" || projectAvailable)
-      .map((scope) => `/memories/${scope}/...`);
-    const projectNote =
-      writableScopes.includes("project") && !projectAvailable
-        ? "project memory is available only for single-project runs; "
-        : "";
-    return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${PATH_LIST_FORMAT.format(modifiable)}.`;
-  };
-
-  const guard = async (
-    target: MutationTarget,
-    input: MemoryCommandInput
-  ): Promise<string | null> => {
-    // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
-    for (const virtualPath of [target.path, target.newPath]) {
-      if (virtualPath == null) continue;
-      if (!isWritableScope(parseMemoryPath(virtualPath).scope)) return scopeRejection(virtualPath);
-    }
-    if (args.deniedCommands?.includes(target.command) === true) {
-      return `This run may not use ${target.command}; it can only add to and edit memory.`;
-    }
-    // The note is journaled into the sidecar record, so it never quotes the rejected text.
-    if (args.rejectSecretLike === true) {
-      const text = newTextOf(input);
-      if (text !== null && containsSecretLike(text)) {
-        return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
-      }
-      // A file name is text too: `sk-ant-....md` stores the key in the directory listing. A delete
-      // names an existing file and adds nothing, so it stays open; a rename adds only its new name.
-      const addedName = target.command === "rename" ? target.newPath : target.path;
-      if (target.command !== "delete" && addedName != null && containsSecretLike(addedName)) {
-        return "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password.";
-      }
-    }
-    // Pin protection: pinned files are editable but never deleted/renamed.
-    // Deletes/renames may target a directory (MemoryService removes
-    // recursively), so reject when the path itself OR anything under it is
-    // pinned — otherwise `delete dir/` would silently destroy dir/pinned.md.
-    // This pre-check gives the model (and dry-run staging) early feedback;
-    // the AUTHORITATIVE check runs inside MemoryService's mutation lock
-    // against the owner the command's store is actually bound to
-    // (`rejectPinned` below): the owner resolved here can differ from the
-    // command's when config.json is transiently unreadable in between.
-    if (target.command === "delete" || target.command === "rename") {
-      const { scope, relPath } = parseMemoryPath(target.path);
-      assert(
-        scope === "workspace" || scope === "project" || scope === "global",
-        "guard scope check must run first"
-      );
-      const entries = await metaService.getEntries();
-      const key = memoryLogicalKey(scope, relPath, {
-        projectPath: ctx.projectPath,
-        // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
-        workspaceId:
-          ctx.workspaceId === ""
-            ? ""
-            : memoryService.resolveWorkspaceMemoryOwnerId(ctx.workspaceId),
-      });
-      const subtreePrefix = `${key}/`;
-      for (const [entryKey, entry] of entries) {
-        if (entry.pinned !== true) continue;
-        if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
-          return `${target.path} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`;
-        }
-      }
-    }
-    return null;
+  const rails: MutationRails = {
+    memoryService,
+    metaService,
+    ctx,
+    writableScopes,
+    projectAvailable: ctx.projectPath !== "",
+    deniedCommands: args.deniedCommands,
+    rejectSecretLike: args.rejectSecretLike,
   };
 
   const memoryTool = tool({
@@ -395,7 +461,7 @@ export function createConsolidationMemoryTool(args: {
 
       let rejection: string | null;
       try {
-        rejection = await guard(target, input);
+        rejection = await mutationRejection(rails, target, input);
       } catch (error) {
         // parseMemoryPath throws on invalid paths; surface as a tool error.
         return { success: false, error: getErrorMessage(error) };
