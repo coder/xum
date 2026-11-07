@@ -114,6 +114,8 @@ export interface WrapForAgentSandboxOptions {
   abortSignal?: AbortSignal;
   /** Set only for MCP servers and a bash call the user approved to run outside the sandbox. */
   optOut?: boolean;
+  /** Workspace folders opened like cwd (ExecOptions.sandboxRoots). */
+  workspaceRoots?: readonly string[];
   /** The command's $XUM_SCRATCH_DIR, writable like the workspace. */
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
@@ -139,6 +141,7 @@ export async function wrapForAgentSandbox(
   }
   const policy = buildAgentSandboxPolicy(settings, {
     cwd,
+    workspaceRoots: options.workspaceRoots,
     scratchDir: options.scratchDir,
     pathEnv: options.pathEnv,
   });
@@ -362,6 +365,47 @@ export function agentSandboxDenialsFor(commandId: string): string[] {
     return summary === null ? [] : [summary];
   });
   return [...new Set(summaries)];
+}
+
+/**
+ * macOS writes denials to the system log, and srt's log stream reads them about a second after
+ * the command exits (measured ~1.5 s on macOS 27.2). There is no signal for "all denials of a
+ * command arrived", so a failed command waits up to this long for its first one.
+ */
+const DENIAL_WAIT_MS = 2_000;
+// Once one arrives, the rest of the same burst follow within this window.
+const DENIAL_SETTLE_MS = 300;
+
+/**
+ * The denials of a command that just exited. Only a failed command waits for the log (bounded):
+ * a command that succeeded gets the denials already read, so it never pays the wait.
+ */
+export function agentSandboxDenialsAfterExit(
+  commandId: string,
+  failed: boolean
+): Promise<string[]> {
+  const now = agentSandboxDenialsFor(commandId);
+  if (!failed || now.length > 0) return Promise.resolve(now);
+  return new Promise((resolve) => {
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      clearTimeout(deadline);
+      clearTimeout(settle);
+      unsubscribe?.();
+      resolve(agentSandboxDenialsFor(commandId));
+    };
+    const deadline = setTimeout(finish, DENIAL_WAIT_MS);
+    let unsubscribe: (() => void) | undefined;
+    try {
+      unsubscribe = SandboxManager.getSandboxViolationStore().subscribe(() => {
+        if (settle === undefined && agentSandboxDenialsFor(commandId).length > 0) {
+          settle = setTimeout(finish, DENIAL_SETTLE_MS);
+        }
+      });
+    } catch {
+      finish();
+    }
+  });
 }
 
 // The keychain services: the only Mach lookups worth reporting.

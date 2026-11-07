@@ -85,6 +85,8 @@ export class AgentSandboxStartError extends Error {
 export interface AgentSandboxPolicyInput {
   /** The command's working directory: the workspace. */
   cwd: string;
+  /** Workspace folders opened like cwd (ExecOptions.sandboxRoots). */
+  workspaceRoots?: readonly string[];
   /** The workspace's $XUM_SCRATCH_DIR, when it has one. */
   scratchDir?: string;
   /** The command's PATH: folders on it under ~ open for reads. */
@@ -101,18 +103,20 @@ export function buildAgentSandboxPolicy(
   input: AgentSandboxPolicyInput
 ): AgentSandboxPolicy {
   const home = realpathOfNearest(os.homedir());
-  const cwd = realpathOfNearest(input.cwd);
-  if (isPathAtOrUnder(home, cwd)) {
-    throw new AgentSandboxStartError(
-      `the working directory ${cwd} contains the home folder, so the sandbox would open all of it`
-    );
-  }
+  const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
   const scratchDir =
     input.scratchDir !== undefined && input.scratchDir.length > 0
       ? realpathOfNearest(input.scratchDir)
       : undefined;
   const extraWriteRoots = settings.extraWritePaths.map(expandSandboxPath);
-  const workspaceRoots = dedupe([cwd, ...(scratchDir === undefined ? [] : [scratchDir])]);
+  const extraWorkspaceRoots = (input.workspaceRoots ?? []).map((root) =>
+    workspaceRootOrThrow(realpathOfNearest(root), home)
+  );
+  const workspaceRoots = dedupe([
+    cwd,
+    ...extraWorkspaceRoots,
+    ...(scratchDir === undefined ? [] : [scratchDir]),
+  ]);
   const writeRoots = dedupe([
     ...workspaceRoots,
     ...tempWritePaths(),
@@ -147,6 +151,16 @@ export function buildAgentSandboxPolicy(
     allowedHosts: [...settings.allowedHosts],
     allowLocalBinding: true,
   };
+}
+
+/** `root`, unless it is `/`, `~` or a parent of `~`: the sandbox would open the whole home. */
+function workspaceRootOrThrow(root: string, home: string): string {
+  if (isPathAtOrUnder(home, root)) {
+    throw new AgentSandboxStartError(
+      `the working directory ${root} contains the home folder, so the sandbox would open all of it`
+    );
+  }
+  return root;
 }
 
 function protectedPathsUnder(root: string): string[] {

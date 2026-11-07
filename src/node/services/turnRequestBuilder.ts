@@ -3099,6 +3099,9 @@ export class TurnRequestBuilder {
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
       planFileOnly: agentIsPlanLike,
+      // Headless callers (`xum run`, ACP) turn off ask_user_question because no user can answer
+      // it; no user can answer a sandbox approval card there either.
+      noInteractiveUser: applyToolPolicyToNames(["ask_user_question"], toolPolicy).length === 0,
       emitChatEvent: (event) => {
         // Defensive: tools should only emit events for the workspace they belong to.
         if ("workspaceId" in event && event.workspaceId !== workspaceId) {

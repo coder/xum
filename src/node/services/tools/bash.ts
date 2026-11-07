@@ -38,6 +38,7 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
+import { requestSandboxApproval, SANDBOX_APPROVAL_DENIED, withSandboxDenials } from "./bashSandbox";
 import { skillFileBashHint } from "./skillFileHint";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
@@ -1055,7 +1056,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
     description: buildBashToolDescription(config.cwd, config.projects ?? []),
     inputSchema: TOOL_DEFINITIONS.bash.schema,
     execute: async (
-      { script, timeout_secs, run_in_background, display_name, monitor },
+      { script, timeout_secs, run_in_background, display_name, monitor, outside_sandbox_reason },
       { abortSignal, toolCallId }
     ): Promise<BashToolResult> => {
       // Validate script input
@@ -1147,6 +1148,25 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         });
       }
 
+      // One wait for both paths. It comes before exec(), so timeout_secs does not count it.
+      // Stop denies. With no user to ask (xum run, ACP), the request is denied at once.
+      const approval = await requestSandboxApproval(
+        config,
+        toolCallId,
+        outside_sandbox_reason,
+        abortSignal
+      );
+      if (approval === "denied") {
+        return withNotice({
+          success: false,
+          error: SANDBOX_APPROVAL_DENIED,
+          exitCode: -1,
+          wall_duration_ms: 0,
+        });
+      }
+      // The user approved this one call: it runs outside the sandbox, with full access.
+      const sandboxOptOut = approval === "approved" ? ({ sandbox: "off" } as const) : {};
+
       if (run_in_background) {
         if (!config.workspaceId || !config.backgroundProcessManager || !config.runtime) {
           return withNotice({
@@ -1219,6 +1239,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
             timeoutSecs: backgroundTimeoutSecs(timeout_secs),
+            ...sandboxOptOut,
           }
         );
 
@@ -1310,6 +1331,7 @@ ${scriptWithEnv}`;
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
+        ...sandboxOptOut,
       });
 
       let exitCodeResolved = false;
@@ -1878,16 +1900,20 @@ File will be automatically cleaned up when stream ends.`;
       }
 
       // Format result based on exit code and truncation state
+      const sandboxDenials = (await execStream.sandboxDenials?.(exitCode !== 0)) ?? [];
       return withNotice(
-        formatResult(
-          exitCode,
-          lines,
-          truncated,
-          overflowReason,
-          wall_duration_ms,
-          config.overflow_policy ?? "tmpfile",
-          effectiveTimeout,
-          stoppedAtFileLimit
+        withSandboxDenials(
+          formatResult(
+            exitCode,
+            lines,
+            truncated,
+            overflowReason,
+            wall_duration_ms,
+            config.overflow_policy ?? "tmpfile",
+            effectiveTimeout,
+            stoppedAtFileLimit
+          ),
+          sandboxDenials
         )
       );
     },

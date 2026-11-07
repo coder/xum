@@ -17,6 +17,7 @@ import type {
   BackgroundHandle,
   BackgroundMonitorProbeResult,
   BackgroundOutputRead,
+  ExecOptions,
   ExecStream,
   OutputReadOptions,
 } from "@/node/runtime/Runtime";
@@ -76,6 +77,11 @@ export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
  * NOTE: Local runtimes validate that cwd exists before spawning, so this must be a real directory.
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
+/**
+ * Xum's own record keeping (spawn records, output reads, the kill sequence), not agent code, so
+ * it runs outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox.
+ */
+const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
 // Upper bound on waiting for a killed migrated process to report its exit.
 const MIGRATED_PROCESS_EXIT_JOIN_MS = 5_000;
@@ -166,6 +172,8 @@ export interface SpawnOptions {
    * exclusive claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
    */
   recordDirClaimed?: boolean;
+  /** "off" only for a bash call the user approved to run outside the macOS agent sandbox. */
+  sandbox?: "off";
 }
 
 /**
@@ -217,6 +225,7 @@ export async function spawnProcess(
       await execBuffered(runtime, `rm -rf ${quotePath(outputDir)}`, {
         cwd: FALLBACK_CWD,
         timeout: 10,
+        ...XUM_INTERNAL,
       });
     } catch {
       // Best-effort: a leftover directory only over-refuses model-driven archives.
@@ -235,6 +244,7 @@ export async function spawnProcess(
         cwd: FALLBACK_CWD,
         pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
         timeout: 10,
+        ...XUM_INTERNAL,
       }
     );
   } catch (error) {
@@ -259,6 +269,7 @@ export async function spawnProcess(
     const rmResult = await execBuffered(runtime, `rm -f ${quotePath(exitCodePath)}`, {
       cwd: FALLBACK_CWD,
       timeout: 10,
+      ...XUM_INTERNAL,
     });
     if (rmResult.exitCode !== 0) {
       await removeOutputDirBestEffort();
@@ -302,6 +313,12 @@ export async function spawnProcess(
     const result = await execBuffered(runtime, spawnCommand, {
       cwd: FALLBACK_CWD,
       pathEnv: { ...options.pathEnv, [BACKGROUND_CWD_ENV]: options.cwd },
+      // The command starts in FALLBACK_CWD and cd's into the workspace, which the sandbox opens.
+      sandboxRoots: [
+        options.cwd,
+        ...(options.env?.XUM_SCRATCH_DIR ? [options.env.XUM_SCRATCH_DIR] : []),
+      ],
+      ...(options.sandbox ? { sandbox: options.sandbox } : {}),
     });
 
     if (result.exitCode !== 0) {
@@ -572,6 +589,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
     const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
       cwd: FALLBACK_CWD,
       timeout: 10,
+      ...XUM_INTERNAL,
     });
     this.assertProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
     return parseInt(sizeResult.stdout.trim(), 10) || 0;
@@ -595,7 +613,11 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
     const command =
       `{ tail -c +${offset + 1} ${filePath} 2>/dev/null || echo "${TAIL_FAILED_MARKER}$?" >&2; }` +
       ` | head -c ${length}`;
-    const stream = await this.runtime.exec(command, { cwd: FALLBACK_CWD, timeout: 30 });
+    const stream = await this.runtime.exec(command, {
+      cwd: FALLBACK_CWD,
+      timeout: 30,
+      ...XUM_INTERNAL,
+    });
     await stream.stdin.close();
     // Raw bytes, not execBuffered's text: the offset counts bytes, and a decoded U+FFFD or a
     // stripped byte-order mark has a different size than the bytes it came from.
@@ -621,6 +643,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
       {
         cwd: FALLBACK_CWD,
         timeout: 10,
+        ...XUM_INTERNAL,
       }
     );
     this.assertProbeSucceeded("getExitCode", result.exitCode);
@@ -706,6 +729,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       await execBuffered(this.runtime, terminateCmd, {
         cwd: FALLBACK_CWD,
         timeout: 15,
+        ...XUM_INTERNAL,
       });
       log.debug(`RuntimeBackgroundHandle: Terminated process group ${this.pid}`);
     } catch (error) {
@@ -736,6 +760,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       {
         cwd: FALLBACK_CWD,
         timeout: 10,
+        ...XUM_INTERNAL,
       }
     );
     if (result.exitCode !== 0) {
