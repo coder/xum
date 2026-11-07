@@ -840,9 +840,11 @@ function sweepClosure(
     if (hostLocalEntries.has(id) || !registeredIds.has(id)) {
       members.add(id);
     }
-    // mutation-equivalent: an array is never falsy, so ?? and || agree (the three below)
+    // mutation-equivalent: an array is never falsy, so ?? and || agree
     for (const child of childrenByParent.get(id) ?? []) queue.push(child.id);
+    // mutation-equivalent: an array is never falsy, so ?? and || agree
     for (const metadata of hostLocalEntries.get(id) ?? []) {
+      // mutation-equivalent: an array is never falsy, so ?? and || agree
       queue.push(...(idsByCheckout.get(checkoutOf(metadata)) ?? []));
     }
   }
