@@ -10,13 +10,13 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import { MEMORY_ANALYZER_OP_BUDGET } from "@/common/constants/memory";
+import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { redactSecretLike, runMemoryHarvest } from "./memoryHarvest";
-
-const INBOX_PATH = "/memories/workspace/harvest/summary-1.md";
+import { runMemoryHarvest, type HarvestProgress } from "./memoryHarvest";
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -40,13 +40,15 @@ function toolFinishChunk(): LanguageModelV3StreamPart {
   };
 }
 
-function harvestToolCall(candidates: unknown[]): LanguageModelV3StreamPart {
-  return {
-    type: "tool-call",
-    toolCallId: "candidates-1",
-    toolName: "submit_memory_candidates",
-    input: JSON.stringify({ candidates }),
-  };
+function memoryToolCall(
+  input: Record<string, unknown>,
+  id = "memory-call"
+): LanguageModelV3StreamPart {
+  return { type: "tool-call", toolCallId: id, toolName: "memory", input: JSON.stringify(input) };
+}
+
+function createFile(path: string, text: string): Record<string, unknown> {
+  return { command: "create", path, file_text: text };
 }
 
 function userPromptText(options: LanguageModelV3CallOptions): string {
@@ -60,46 +62,62 @@ function userPromptText(options: LanguageModelV3CallOptions): string {
   return parts.join("\n");
 }
 
-function modelFromChunks(chunks: LanguageModelV3StreamPart[]): MockLanguageModelV3 {
-  let streamCount = 0;
-  return new MockLanguageModelV3({
-    doStream: () => {
-      streamCount++;
-      return Promise.resolve({
-        stream: simulateReadableStream({ chunks: streamCount === 1 ? chunks : [finishChunk(1)] }),
-      });
-    },
-  });
+/** What the tool calls returned to the model, as the next step's prompt carries it. */
+function toolResultsText(options: LanguageModelV3CallOptions | undefined): string {
+  return JSON.stringify(options?.prompt.filter((message) => message.role === "tool") ?? []);
 }
 
-function modelFromStreamSequence(
-  chunksByStream: LanguageModelV3StreamPart[][]
-): MockLanguageModelV3 {
-  let streamCount = 0;
-  return new MockLanguageModelV3({
-    doStream: () => {
-      const chunks = chunksByStream[streamCount] ?? [finishChunk(1)];
-      streamCount++;
-      return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
-    },
-  });
+/** 12 rows of 7,000 characters: three transcript chunks (5 + 5 + 2 rows). */
+function manyChunkMessages(): MuxMessage[] {
+  return Array.from({ length: 12 }, (_, index) =>
+    createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+      historySequence: index,
+    })
+  );
 }
 
-function failingModel(): MockLanguageModelV3 {
-  return new MockLanguageModelV3({
-    doStream: () =>
-      Promise.resolve({
-        stream: new ReadableStream<LanguageModelV3StreamPart>({
-          pull(controller) {
-            controller.error(new Error("provider exploded"));
-          },
-        }),
-      }),
+interface ScriptedModel {
+  model: MockLanguageModelV3;
+  calls: LanguageModelV3CallOptions[];
+}
+
+/**
+ * One scripted stream per model call (a tool-call step, then the step after its result, ...). An
+ * `Error` entry makes that call's stream fail like a provider outage.
+ */
+function scriptedModel(streams: Array<LanguageModelV3StreamPart[] | Error>): ScriptedModel {
+  const calls: LanguageModelV3CallOptions[] = [];
+  const model = new MockLanguageModelV3({
+    doStream: (options) => {
+      calls.push(options);
+      const script = streams[calls.length - 1] ?? [finishChunk(1)];
+      if (script instanceof Error) {
+        const failure = script;
+        return Promise.resolve({
+          stream: new ReadableStream<LanguageModelV3StreamPart>({
+            pull(controller) {
+              controller.error(failure);
+            },
+          }),
+        });
+      }
+      return Promise.resolve({ stream: simulateReadableStream({ chunks: script }) });
+    },
   });
+  return { model, calls };
+}
+
+/** One chunk's model calls: a step that issues `commands` together, then a step that ends the chunk. */
+function chunkScript(commands: Array<Record<string, unknown>>): LanguageModelV3StreamPart[][] {
+  return [
+    [...commands.map((input, index) => memoryToolCall(input, `call-${index}`)), toolFinishChunk()],
+    [finishChunk(1)],
+  ];
 }
 
 interface Fixture extends Disposable {
   memoryService: MemoryService;
+  metaService: MemoryMetaService;
   ctx: MemoryScopeContext;
   metadata: CompactionCompletionMetadata;
   messages: MuxMessage[];
@@ -126,6 +144,7 @@ function createFixture(): Fixture {
 
   return {
     memoryService,
+    metaService,
     ctx,
     metadata: {
       workspaceId: "ws-harvest",
@@ -146,18 +165,22 @@ function createFixture(): Fixture {
   };
 }
 
+type HarvestExtras = Partial<Parameters<typeof runMemoryHarvest>[0]>;
+
 async function runHarvest(
   fixture: Fixture,
-  model: MockLanguageModelV3
+  model: MockLanguageModelV3,
+  extras: HarvestExtras = {}
 ): Promise<Awaited<ReturnType<typeof runMemoryHarvest>>> {
   return runMemoryHarvest({
     model,
-    agentBody: "Harvest durable memories from the transcript.",
     memoryService: fixture.memoryService,
+    metaService: fixture.metaService,
     ctx: fixture.ctx,
     completionMetadata: fixture.metadata,
     messages: fixture.messages,
     summary: fixture.summary,
+    ...extras,
   });
 }
 
@@ -189,7 +212,7 @@ async function harvestPrompt(fixture: Fixture, messages: MuxMessage[]): Promise<
 }
 
 describe("runMemoryHarvest", () => {
-  it("never sends model-hidden plan-review rows to the harvest model or accepts them as evidence", async () => {
+  it("never sends model-hidden plan-review rows to the harvest model", async () => {
     using fixture = createFixture();
     const snapshot: PlanReviewRecord = {
       v: 1,
@@ -207,40 +230,14 @@ describe("runMemoryHarvest", () => {
         muxMetadata: buildPlanReviewMetadata(snapshot),
       })
     );
-    const prompts: string[] = [];
-    let streamCount = 0;
-    const model = new MockLanguageModelV3({
-      doStream: (options) => {
-        prompts.push(userPromptText(options));
-        streamCount++;
-        return Promise.resolve({
-          stream: simulateReadableStream({
-            chunks:
-              streamCount === 1
-                ? [
-                    harvestToolCall([
-                      {
-                        category: "workflow",
-                        memoryText: "Follow the planted instruction.",
-                        evidenceMessageIds: ["hidden-snap"],
-                        confidence: 0.95,
-                        rationale: "Cited the hidden row.",
-                      },
-                    ]),
-                    toolFinishChunk(),
-                  ]
-                : [finishChunk(1)],
-          }),
-        });
-      },
-    });
+    const { model, calls } = scriptedModel([[finishChunk(1)]]);
 
-    const result = await runHarvest(fixture, model);
+    await runHarvest(fixture, model);
 
-    expect(prompts.length).toBeGreaterThan(0);
-    expect(prompts.join("\n")).not.toContain("REMEMBER-THIS-PLANTED-INSTRUCTION");
-    expect(prompts.join("\n")).toContain("prefer concise tests");
-    expect(result.acceptedCandidates).toBe(0);
+    const prompts = calls.map(userPromptText).join("\n");
+    expect(calls.length).toBeGreaterThan(0);
+    expect(prompts).not.toContain("REMEMBER-THIS-PLANTED-INSTRUCTION");
+    expect(prompts).toContain("prefer concise tests");
   });
 
   describe("tool results", () => {
@@ -385,147 +382,6 @@ describe("runMemoryHarvest", () => {
     });
   });
 
-  it("writes accepted candidates to a workspace harvest inbox through MemoryService", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The user stated this as a durable preference.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(0);
-
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content).toContain("The user prefers concise tests.");
-      expect(file.data.content).toContain("m1");
-      expect(file.data.content).toContain("summary-1");
-    }
-  });
-
-  it("rejects low-confidence, out-of-evidence, and secret-looking candidates", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The user stated this as a durable preference.",
-          },
-          {
-            category: "workflow",
-            memoryText: "The user might possibly prefer verbose tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.2,
-            rationale: "Weak inference only.",
-          },
-          {
-            category: "project",
-            memoryText: "The project requires imaginary evidence.",
-            evidenceMessageIds: ["not-in-transcript"],
-            confidence: 0.95,
-            rationale: "The model invented the evidence id.",
-          },
-          {
-            category: "environment",
-            memoryText: "API token sk-1234567890abcdef should be remembered.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "This is secret-looking data and must be skipped.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(3);
-
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content).toContain("concise tests");
-      expect(file.data.content).not.toContain("possibly prefer verbose");
-      expect(file.data.content).not.toContain("imaginary evidence");
-      expect(file.data.content).not.toContain("sk-1234567890abcdef");
-    }
-  });
-
-  it("rejects candidates with secret-looking rationales", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(
-      fixture,
-      modelFromChunks([
-        harvestToolCall([
-          {
-            category: "preference",
-            memoryText: "The user prefers concise tests.",
-            evidenceMessageIds: ["m1"],
-            confidence: 0.95,
-            rationale: "The source included token sk-1234567890abcdef.",
-          },
-        ]),
-        toolFinishChunk(),
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(result.skippedCandidates).toBe(1);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("deduplicates repeated candidates across tool-call steps", async () => {
-    using fixture = createFixture();
-    const candidate = {
-      category: "preference",
-      memoryText: "The user prefers concise tests.",
-      evidenceMessageIds: ["m1"],
-      confidence: 0.95,
-      rationale: "The user stated this as a durable preference.",
-    };
-
-    const result = await runHarvest(
-      fixture,
-      modelFromStreamSequence([
-        [harvestToolCall([candidate, candidate]), toolFinishChunk()],
-        [harvestToolCall([candidate]), toolFinishChunk()],
-      ])
-    );
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(1);
-    expect(result.skippedCandidates).toBe(2);
-    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
-    expect(file.success).toBe(true);
-    if (file.success) {
-      expect(file.data.content.match(/## preference/g)).toHaveLength(1);
-    }
-  });
-
   it("serializes transcript evidence as JSON instead of breakable pseudo-XML", async () => {
     using fixture = createFixture();
     fixture.messages = [
@@ -552,11 +408,7 @@ describe("runMemoryHarvest", () => {
 
   it("chunks oversized epochs before calling the model", async () => {
     using fixture = createFixture();
-    fixture.messages = Array.from({ length: 12 }, (_, index) =>
-      createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
-        historySequence: index,
-      })
-    );
+    fixture.messages = manyChunkMessages();
     let streamCalls = 0;
 
     const result = await runHarvest(
@@ -573,135 +425,298 @@ describe("runMemoryHarvest", () => {
     expect(streamCalls).toBeGreaterThan(1);
   });
 
-  it("keys inbox cleanup by compaction boundary id instead of epoch", async () => {
+  it("keeps the compaction summary in the prompt of every chunk", async () => {
     using fixture = createFixture();
-    const oldBoundaryInbox = "/memories/workspace/harvest/old-summary.md";
-    const saved = await fixture.memoryService.saveFile(
-      fixture.ctx,
-      oldBoundaryInbox,
-      "older boundary candidate\n",
-      null,
-      "agent"
+    fixture.summary = createMuxMessage("summary-1", "assistant", "SUMMARY-ONLY-FACT", {
+      historySequence: 2,
+      compactionBoundary: true,
+    });
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
+  });
+
+  describe("analyzer", () => {
+    it("creates a workspace memory file through the memory tool, its only tool", async () => {
+      using fixture = createFixture();
+      const text = "---\ndescription: How tests run here\n---\nRun `make test`.\n";
+      const { model, calls } = scriptedModel(
+        chunkScript([createFile("/memories/workspace/testing.md", text)])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toBeUndefined();
+      expect(result.nextChunk).toBe(1);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/testing.md", applied: true },
+      ]);
+      const file = await fixture.memoryService.readFileWithSha(
+        fixture.ctx,
+        "/memories/workspace/testing.md"
+      );
+      expect(file.success && file.data.content).toBe(text);
+      expect(calls[0]?.tools?.map((entry) => entry.name)).toEqual(["memory"]);
+    });
+
+    it("reads global and project memory but rejects, and journals, a write to either", async () => {
+      using fixture = createFixture();
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        "/memories/global/env.md",
+        "GLOBAL-FACT the dev box has 64 GB\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model, calls } = scriptedModel([
+        [
+          memoryToolCall({ command: "view", path: "/memories/global/env.md" }, "read"),
+          memoryToolCall(createFile("/memories/global/new.md", "g\n"), "write-global"),
+          memoryToolCall(createFile("/memories/project/new.md", "p\n"), "write-project"),
+          toolFinishChunk(),
+        ],
+        [finishChunk(1)],
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(toolResultsText(calls[1])).toContain("GLOBAL-FACT");
+      expect(result.ops).toHaveLength(2);
+      expect(new Set(result.ops.map((op) => op.path))).toEqual(
+        new Set(["/memories/global/new.md", "/memories/project/new.md"])
+      );
+      for (const op of result.ops) {
+        expect(op.applied).toBe(false);
+        expect(op.note).toContain("/memories/workspace/...");
+      }
+      for (const rejected of ["/memories/global/new.md", "/memories/project/new.md"]) {
+        expect(await fixture.memoryService.readFileWithSha(fixture.ctx, rejected)).toMatchObject({
+          success: false,
+        });
+      }
+    });
+
+    it("rejects a write that carries a credential and accepts text that only mentions tokens", async () => {
+      using fixture = createFixture();
+      const notesPath = "/memories/workspace/notes.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        notesPath,
+        "line one\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      const { model } = scriptedModel(
+        chunkScript([
+          createFile("/memories/workspace/creds.md", `GITHUB_TOKEN=${githubToken}\n`),
+          {
+            command: "str_replace",
+            path: notesPath,
+            old_str: "line one",
+            new_str: "password: hunter2-correct-horse",
+          },
+          {
+            command: "insert",
+            path: notesPath,
+            insert_line: 0,
+            insert_text: `Authorization: Bearer ${githubToken}\n`,
+          },
+          createFile("/memories/workspace/budget.md", "The token budget resets each turn.\n"),
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.ops.filter((op) => op.applied).map((op) => op.path)).toEqual([
+        "/memories/workspace/budget.md",
+      ]);
+      const rejected = result.ops.filter((op) => !op.applied);
+      expect(rejected).toHaveLength(3);
+      for (const op of rejected) expect(op.note).toContain("credential");
+      // The journal is persisted in the sidecar record: it must not carry the value either.
+      expect(JSON.stringify(result.ops)).not.toContain(githubToken);
+      expect(JSON.stringify(result.ops)).not.toContain("hunter2");
+      const notes = await fixture.memoryService.readFileWithSha(fixture.ctx, notesPath);
+      expect(notes.success && notes.data.content).toBe("line one\n");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/creds.md")
+      ).toMatchObject({ success: false });
+    });
+
+    it("shares one mutation budget across the chunks of an epoch", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const files = (chunk: number, count: number) =>
+        Array.from({ length: count }, (_, index) =>
+          createFile(`/memories/workspace/c${chunk}-${index}.md`, `fact ${chunk}-${index}\n`)
+        );
+      // 3 edits over the budget in all, split so no single chunk exceeds it on its own.
+      const { model } = scriptedModel([
+        ...chunkScript(files(1, MEMORY_ANALYZER_OP_BUDGET - 3)),
+        ...chunkScript(files(2, 5)),
+        ...chunkScript(files(3, 1)),
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.nextChunk).toBe(3);
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      const rejected = result.ops.filter((op) => !op.applied);
+      expect(rejected).toHaveLength(3);
+      for (const op of rejected) expect(op.note).toContain("budget exhausted");
+    });
+
+    it("counts the edits an earlier attempt applied against the epoch's budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const spent: MemoryConsolidationOp[] = Array.from(
+        { length: MEMORY_ANALYZER_OP_BUDGET },
+        (_, index) => ({
+          command: "create",
+          path: `/memories/workspace/earlier-${index}.md`,
+          applied: true,
+        })
+      );
+      const { model } = scriptedModel(
+        chunkScript([createFile("/memories/workspace/late.md", "late\n")])
+      );
+
+      const result = await runHarvest(fixture, model, { resume: { nextChunk: 2, ops: spent } });
+
+      expect(result.ops).toHaveLength(spent.length + 1);
+      expect(result.ops.at(-1)).toMatchObject({ applied: false });
+      expect(result.ops.at(-1)?.note).toContain("budget exhausted");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/late.md")
+      ).toMatchObject({ success: false });
+    });
+  });
+
+  describe("resume cursor", () => {
+    it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: HarvestProgress[] = [];
+      const first = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/one.md", "chunk one fact\n")]),
+        new Error("provider exploded"),
+      ]);
+
+      const failed = await runHarvest(fixture, first.model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress);
+          return Promise.resolve();
+        },
+      });
+
+      expect(failed.streamError).toContain("provider exploded");
+      expect(failed.nextChunk).toBe(1);
+      expect(failed.ops).toEqual([
+        { command: "create", path: "/memories/workspace/one.md", applied: true },
+      ]);
+      // The cursor is reported while the run is still going, before the failing chunk starts.
+      expect(reached.map((progress) => progress.nextChunk)).toEqual([1]);
+
+      const retry = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/two.md", "chunk two fact\n")]),
+        [finishChunk(1)],
+      ]);
+      const resumed = await runHarvest(fixture, retry.model, {
+        resume: { nextChunk: failed.nextChunk, ops: failed.ops },
+      });
+
+      expect(resumed.streamError).toBeUndefined();
+      expect(resumed.nextChunk).toBe(3);
+      const retryPrompts = retry.calls.map(userPromptText);
+      expect(retryPrompts[0]).toContain("Transcript chunk 2/3");
+      expect(retryPrompts.join("\n")).not.toContain("Transcript chunk 1/3");
+      // Chunking is deterministic for an epoch: chunk 2 reads the same on the retry.
+      expect(retryPrompts[0]).toBe(userPromptText(first.calls[2]));
+      expect(resumed.ops.map((op) => op.path)).toEqual([
+        "/memories/workspace/one.md",
+        "/memories/workspace/two.md",
+      ]);
+    });
+
+    it("keeps the edits of a chunk that failed after writing", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model } = scriptedModel([
+        [
+          memoryToolCall(createFile("/memories/workspace/partial.md", "landed\n")),
+          toolFinishChunk(),
+        ],
+        new Error("provider exploded"),
+      ]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toContain("provider exploded");
+      expect(result.nextChunk).toBe(0);
+      expect(result.ops).toEqual([
+        { command: "create", path: "/memories/workspace/partial.md", applied: true },
+      ]);
+    });
+  });
+
+  describe("chunk timeout", () => {
+    it("gives each chunk its own timeout instead of one for the whole epoch", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      // 3 chunks of 250 ms: 750 ms in all, over the 500 ms limit that applies to each chunk.
+      const model = new MockLanguageModelV3({
+        doStream: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return { stream: simulateReadableStream({ chunks: [finishChunk(1)] }) };
+        },
+      });
+
+      const result = await runHarvest(fixture, model, { chunkTimeoutMs: 500 });
+
+      expect(result.streamError).toBeUndefined();
+      expect(result.nextChunk).toBe(3);
+    });
+
+    it.each(["its timeout", "workspace removal"])(
+      "stops at a chunk cut short by %s and keeps the chunks before it",
+      async (cause) => {
+        using fixture = createFixture();
+        fixture.messages = manyChunkMessages();
+        const removal = new AbortController();
+        let calls = 0;
+        // Chunk 1 finishes; chunk 2 hangs until its signal aborts, as a stalled provider does.
+        const model = new MockLanguageModelV3({
+          doStream: (options) => {
+            calls++;
+            if (calls === 1) {
+              return Promise.resolve({
+                stream: simulateReadableStream({ chunks: [finishChunk(1)] }),
+              });
+            }
+            if (cause === "workspace removal") queueMicrotask(() => removal.abort());
+            return new Promise((_resolve, reject) => {
+              options.abortSignal?.addEventListener("abort", () =>
+                reject(new Error("stalled provider call aborted"))
+              );
+            });
+          },
+        });
+
+        const result = await runHarvest(fixture, model, {
+          chunkTimeoutMs: 100,
+          abortSignal: removal.signal,
+        });
+
+        expect(result.streamError).toBeDefined();
+        expect(result.nextChunk).toBe(1);
+      }
     );
-    expect(saved.success).toBe(true);
-    fixture.metadata = {
-      ...fixture.metadata,
-      summaryMessageId: "new-summary",
-      compactionEpoch: 1,
-    };
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.inboxPath).toBe("/memories/workspace/harvest/new-summary.md");
-    expect(
-      await fixture.memoryService.readFileWithSha(fixture.ctx, oldBoundaryInbox)
-    ).toMatchObject({
-      success: true,
-    });
-    expect(
-      await fixture.memoryService.readFileWithSha(fixture.ctx, result.inboxPath)
-    ).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("removes a stale inbox when a clean retry accepts no candidates", async () => {
-    using fixture = createFixture();
-    const saved = await fixture.memoryService.saveFile(
-      fixture.ctx,
-      INBOX_PATH,
-      "stale candidate\n",
-      null,
-      "agent"
-    );
-    expect(saved.success).toBe(true);
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("does not create an inbox when the model submits no candidates", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(fixture, modelFromChunks([finishChunk()]));
-
-    expect(result.streamError).toBeUndefined();
-    expect(result.acceptedCandidates).toBe(0);
-    expect(result.skippedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-
-  it("reports stream failures without writing an inbox", async () => {
-    using fixture = createFixture();
-
-    const result = await runHarvest(fixture, failingModel());
-
-    expect(result.streamError).toContain("provider exploded");
-    expect(result.acceptedCandidates).toBe(0);
-    expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
-      success: false,
-    });
-  });
-});
-
-describe("redactSecretLike", () => {
-  const FAKE = {
-    github: `gho_${"Q7w3".repeat(9)}`,
-    pat: `github_pat_${"A1b2".repeat(8)}`,
-    slack: "xoxb-1234567890-abcdefghij",
-    aws: "AKIAABCDEFGHIJKLMNOP",
-    openai: `sk-${"k3J9".repeat(6)}`,
-    bearer: "tok_live_abcdefghijklmnop",
-    jwt: `eyJ${"h".repeat(12)}.eyJ${"p".repeat(12)}.${"s".repeat(12)}`,
-  };
-
-  it.each([
-    ["a GitHub OAuth token", `token in env: ${FAKE.github}`, FAKE.github],
-    ["a fine-grained GitHub token", `using ${FAKE.pat}`, FAKE.pat],
-    ["a Slack token", `slack ${FAKE.slack}`, FAKE.slack],
-    ["an AWS access key id", `id ${FAKE.aws}`, FAKE.aws],
-    ["an OpenAI-style key", `key ${FAKE.openai}`, FAKE.openai],
-    ["a bearer header", `Authorization: Bearer ${FAKE.bearer}`, FAKE.bearer],
-    ["a JWT", `jwt ${FAKE.jwt}`, FAKE.jwt],
-    ["an env assignment", "DB_PASSWORD=hunter2 npm start", "hunter2"],
-    ["a quoted JSON pair with spaces", '{"client_secret": "two words here"}', "two words"],
-    [
-      "a JSON pair inside an escaped string",
-      String.raw`{"out":"{\"api_key\": \"abc123xyz\"}"}`,
-      "abc123xyz",
-    ],
-    ["a YAML pair", "password: s3cret-value\nname: demo", "s3cret-value"],
-    ["a basic auth header", "authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="],
-    [
-      "a PEM private key",
-      "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcdef\n-----END RSA PRIVATE KEY-----",
-      "MIIEowIBAAKCAQEA",
-    ],
-    [
-      "an unterminated PEM private key",
-      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg",
-      "MIIEvQIBADANBg",
-    ],
-    [
-      "an unterminated quoted value",
-      '{"password": "unterminated-secret-va',
-      "unterminated-secret-va",
-    ],
-  ])("redacts %s", (_label, text, secret) => {
-    const redacted = redactSecretLike(text);
-    expect(redacted).not.toContain(secret);
-    expect(redacted).toContain("[redacted]");
-  });
-
-  it("leaves ordinary text and token counts readable", () => {
-    const text = "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo";
-    expect(redactSecretLike(text)).toBe(text);
   });
 });

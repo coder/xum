@@ -130,6 +130,17 @@ function renderTab(width: string) {
             compactionEpoch: 3,
             acceptedCandidates: 2,
             skippedCandidates: 1,
+            nextChunk: 1,
+            ops: [
+              { command: "create", path: "/memories/workspace/build.md", applied: true },
+              { command: "str_replace", path: "/memories/workspace/build.md", applied: true },
+              {
+                command: "create",
+                path: "/memories/global/build.md",
+                applied: false,
+                note: "Consolidation may not modify /memories/global/build.md",
+              },
+            ],
           },
           projectAvailable: true,
         },
@@ -155,7 +166,7 @@ export const List: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText("preferences.md");
     await canvas.findByText(/Project:/);
-    await canvas.findByText(/Harvest: completed/);
+    await canvas.findByText("Harvest: completed: 2 edits / 1 rejected");
     await canvas.findByText("scratch.md");
   },
 };

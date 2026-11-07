@@ -105,6 +105,12 @@ export const CompactionCompletionMetadataSchema = z.object({
   preservedTailMessageCount: z.number().optional(),
 });
 
+/**
+ * One analyzer run over a closed compaction epoch (the "harvest"). The two candidate counts keep
+ * their names and stay required so older binaries still parse the record: they hold the memory
+ * edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are optional for
+ * the same reason, and for records written before the analyzer.
+ */
 export const MemoryHarvestRecordSchema = z.object({
   status: z.enum(["pending", "completed", "failed"]),
   startedAt: z.number(),
@@ -114,6 +120,10 @@ export const MemoryHarvestRecordSchema = z.object({
   compactionEpoch: z.number(),
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
+  /** First transcript chunk not yet analyzed; a retry resumes here. */
+  nextChunk: z.number().optional(),
+  /** Every memory command the analyzer ran for this epoch, across attempts. */
+  ops: z.array(MemoryConsolidationOpSchema).optional(),
   error: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),

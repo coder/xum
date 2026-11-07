@@ -22,6 +22,7 @@ import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -508,6 +509,14 @@ function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | nu
   return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
 }
 
+function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
+  if (record === null) return "never";
+  // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
+  return record.ops === undefined
+    ? `${record.status}: ${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+    : `${record.status}: ${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+}
+
 /**
  * Dream consolidation surface (memory-consolidation experiment, PRD #3534):
  * "last consolidated" line + manual run button. Self-contained — fetches its
@@ -568,9 +577,7 @@ function ConsolidationFooter(props: {
     status?.projectAvailable === false
       ? "unavailable"
       : formatConsolidationRecord(status?.projectRecord ?? null);
-  const harvestLabel = status?.latestHarvestRecord
-    ? `${status.latestHarvestRecord.status}: ${status.latestHarvestRecord.acceptedCandidates} accepted / ${status.latestHarvestRecord.skippedCandidates} skipped`
-    : "never";
+  const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
   // One consolidation pass can cover workspace, project, and global memory at

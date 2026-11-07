@@ -6,8 +6,12 @@
  * no chat history, no UI events) whose only tool is a guarded memory tool.
  *
  * Rails live HERE in code, not in the agent prompt:
- * - scope restriction: consolidates workspace + global, plus project when the
- *   run has a single stable project identity
+ * - scope restriction: by default consolidates workspace + global, plus project
+ *   when the run has a single stable project identity; a caller can narrow it
+ *   (`writableScopes`), as the harvest analyzer does to workspace only
+ * - secret check (opt-in): a create/str_replace/insert whose new text holds a
+ *   credential shape is rejected, so a model that copied tool output cannot
+ *   persist it
  * - pin protection: pinned files may be edited, never deleted or renamed —
  *   including via a delete/rename of an ancestor directory (subtree check)
  * - op budget: at most MEMORY_CONSOLIDATION_OP_BUDGET mutating commands per
@@ -32,6 +36,7 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
@@ -39,6 +44,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { containsSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
@@ -61,6 +67,12 @@ export interface MemoryConsolidationResult {
    */
   streamError?: string;
 }
+
+/** Scopes a consolidation run can be allowed to modify; the session scope is never one of them. */
+export type WritableMemoryScope = Exclude<MemoryScope, "session">;
+
+const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
+const PATH_LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 
 interface MutationTarget {
   command: MemoryConsolidationOp["command"];
@@ -85,6 +97,20 @@ function classifyMutation(input: MemoryCommandInput): MutationTarget | null {
   }
 }
 
+/** The text a mutating command would add to memory, or null when it adds none (delete, rename). */
+function newTextOf(input: MemoryCommandInput): string | null {
+  switch (input.command) {
+    case "create":
+      return input.file_text ?? null;
+    case "str_replace":
+      return input.new_str ?? null;
+    case "insert":
+      return input.insert_text ?? null;
+    default:
+      return null;
+  }
+}
+
 /**
  * Run-scoped mutation budget. Check + reservation happen in ONE synchronous
  * call (tryConsume): the AI SDK runs parallel tool calls concurrently, so an
@@ -99,8 +125,10 @@ export interface MutationBudget {
   tryConsume(): boolean;
 }
 
-export function createMutationBudget(limit: number): MutationBudget {
-  let used = 0;
+export function createMutationBudget(limit: number, alreadyUsed = 0): MutationBudget {
+  // `alreadyUsed` lets a retry of the same unit of work (an analyzer epoch) resume the budget the
+  // earlier attempt spent instead of getting a fresh one.
+  let used = alreadyUsed;
   return {
     limit,
     used: () => used,
@@ -226,19 +254,58 @@ export function createConsolidationMemoryTool(args: {
    * immediately before the first durable write.
    */
   abortSignal?: AbortSignal;
-}): { tool: Tool; getMutationCount: () => number } {
+  /**
+   * Scopes this run may modify (reads are never scope-limited). Default: workspace, global and
+   * project, which the dream pass uses. Project memory stays unavailable without a single stable
+   * project identity even when listed. The harvest analyzer narrows this to `["workspace"]`, so
+   * only the organizer promotes lessons to shared scopes.
+   */
+  writableScopes?: readonly WritableMemoryScope[];
+  /**
+   * Reject a create/str_replace/insert whose new text holds a credential shape (see
+   * `containsSecretLike`). For runs that read tool output and then write memory.
+   */
+  rejectSecretLike?: boolean;
+  /**
+   * Lead sentence of the tool description. The command reference is always appended. Default
+   * describes the dream pass ("you are consolidating").
+   */
+  description?: string;
+}): { tool: Tool; getMutationCount: () => number; isBudgetExhausted: () => boolean } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
+  const writableScopes = args.writableScopes ?? DEFAULT_WRITABLE_SCOPES;
+  const projectAvailable = ctx.projectPath !== "";
+  const isWritableScope = (scope: MemoryScope | null): boolean =>
+    scope !== null &&
+    scope !== "session" &&
+    writableScopes.includes(scope) &&
+    (scope !== "project" || projectAvailable);
 
-  const guard = async (target: MutationTarget): Promise<string | null> => {
+  const scopeRejection = (virtualPath: string): string => {
+    const modifiable = writableScopes
+      .filter((scope) => scope !== "project" || projectAvailable)
+      .map((scope) => `/memories/${scope}/...`);
+    const projectNote =
+      writableScopes.includes("project") && !projectAvailable
+        ? "project memory is available only for single-project runs; "
+        : "";
+    return `Consolidation may not modify ${virtualPath}: ${projectNote}this run can modify ${PATH_LIST_FORMAT.format(modifiable)}.`;
+  };
+
+  const guard = async (
+    target: MutationTarget,
+    input: MemoryCommandInput
+  ): Promise<string | null> => {
     // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
-    // Project memory is available only when the workspace has one stable project identity.
     for (const virtualPath of [target.path, target.newPath]) {
       if (virtualPath == null) continue;
-      const { scope } = parseMemoryPath(virtualPath);
-      if (scope === "workspace" || scope === "global") continue;
-      if (scope === "project" && ctx.projectPath !== "") continue;
-      return `Consolidation may not modify ${virtualPath}: project memory is available only for single-project runs; this run can modify /memories/workspace/... and /memories/global/....`;
+      if (!isWritableScope(parseMemoryPath(virtualPath).scope)) return scopeRejection(virtualPath);
+    }
+    // The note is journaled into the sidecar record, so it never quotes the rejected text.
+    const text = args.rejectSecretLike === true ? newTextOf(input) : null;
+    if (text !== null && containsSecretLike(text)) {
+      return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
     }
     // Pin protection: pinned files are editable but never deleted/renamed.
     // Deletes/renames may target a directory (MemoryService removes
@@ -276,9 +343,7 @@ export function createConsolidationMemoryTool(args: {
   };
 
   const memoryTool = tool({
-    description:
-      "Manage the persistent memory directory you are consolidating. " +
-      TOOL_DEFINITIONS.memory.description,
+    description: `${args.description ?? "Manage the persistent memory directory you are consolidating."} ${TOOL_DEFINITIONS.memory.description}`,
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     // toolCallId is threaded into the r2 refinement journal rows so callers
     // (refine, r11) can correlate this run's edits to their journaled ids.
@@ -297,7 +362,7 @@ export function createConsolidationMemoryTool(args: {
 
       let rejection: string | null;
       try {
-        rejection = await guard(target);
+        rejection = await guard(target, input);
       } catch (error) {
         // parseMemoryPath throws on invalid paths; surface as a tool error.
         return { success: false, error: getErrorMessage(error) };
@@ -346,7 +411,11 @@ export function createConsolidationMemoryTool(args: {
       return result;
     },
   });
-  return { tool: memoryTool, getMutationCount: () => budget.used() };
+  return {
+    tool: memoryTool,
+    getMutationCount: () => budget.used(),
+    isBudgetExhausted: () => budget.used() >= budget.limit,
+  };
 }
 
 /**
@@ -386,7 +455,7 @@ export async function runMemoryConsolidation(args: {
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
-  const { tool: memoryTool, getMutationCount } = createConsolidationMemoryTool({
+  const { tool: memoryTool, isBudgetExhausted } = createConsolidationMemoryTool({
     memoryService: args.memoryService,
     metaService: args.metaService,
     ctx: args.ctx,
@@ -456,7 +525,7 @@ export async function runMemoryConsolidation(args: {
     summary,
     // Derived from accepted mutations, not journal length: journaled guard
     // rejections must not report a budget the run never spent (MEM-RPT-01).
-    budgetExhausted: getMutationCount() >= MEMORY_CONSOLIDATION_OP_BUDGET,
+    budgetExhausted: isBudgetExhausted(),
     usage,
     streamError: streamErrors[0],
   };

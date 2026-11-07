@@ -350,6 +350,50 @@ describe("MemoryTab", () => {
     expect(statusBlock!.getAttribute("title")).toBeNull();
   });
 
+  test("labels an analyzer harvest by the memory edits it made and the ones rejected", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 3,
+          skippedCandidates: 1,
+          nextChunk: 2,
+          ops: [],
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 3 edits / 1 rejected");
+  });
+
+  test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 2,
+          skippedCandidates: 1,
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 2 accepted / 1 skipped");
+  });
+
   test("renders failed harvest errors inline for keyboard and screen reader access", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
