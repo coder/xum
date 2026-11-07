@@ -6,7 +6,7 @@ import * as fs from "fs";
 import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
-import { Config } from "./config";
+import { CONFIG_TREE_FIELDS, Config } from "./config";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -6625,6 +6625,68 @@ describe("Config", () => {
         await register(rowTree);
         const expected = { ...absent, ...rowTree };
         expect(await builds()).toEqual([expected, expected]);
+      });
+
+      it("takes every CONFIG_TREE_FIELDS value from the row in every build", async () => {
+        // One differing value per field in the row and in the file: dropping any field from the
+        // set lets the file's value through on the first build.
+        type TreeField = (typeof CONFIG_TREE_FIELDS)[number];
+        const rowValues = {
+          parentWorkspaceId: "row-parent",
+          agentType: "row-agent-type",
+          agentId: "row-agent",
+          workflowTask: { runId: "row-run", stepId: "row-step" },
+          taskStatus: "reported",
+          taskPendingGuidance: [{ id: "row-g", message: "row", queueDispatchMode: "turn-end" }],
+          taskLaunchError: "row launch error",
+          reportedAt: "2026-02-01T00:00:00.000Z",
+          taskModelString: "anthropic:row-model",
+          taskThinkingLevel: "high",
+          taskPrompt: "row prompt",
+          taskTrunkBranch: "row-trunk",
+          taskIsolation: "none",
+          sideChatParentWorkspaceId: "row-side-chat-parent",
+          taskDesktopOwnerWorkspaceId: "row-desktop-owner",
+          taskSticky: true,
+          taskExecutionId: "row-execution",
+          taskExecutionStatus: "completed",
+        } as const satisfies Record<TreeField, unknown>;
+        const fileValues = {
+          parentWorkspaceId: "file-parent",
+          agentType: "file-agent-type",
+          agentId: "file-agent",
+          workflowTask: { runId: "file-run", stepId: "file-step" },
+          taskStatus: "running",
+          taskPendingGuidance: [{ id: "file-g", message: "file", queueDispatchMode: "tool-end" }],
+          taskLaunchError: "file launch error",
+          reportedAt: "2026-03-01T00:00:00.000Z",
+          taskModelString: "anthropic:file-model",
+          taskThinkingLevel: "low",
+          taskPrompt: "file prompt",
+          taskTrunkBranch: "file-trunk",
+          taskIsolation: "fork",
+          sideChatParentWorkspaceId: "file-side-chat-parent",
+          taskDesktopOwnerWorkspaceId: "file-desktop-owner",
+          taskSticky: false,
+          taskExecutionId: "file-execution",
+          taskExecutionStatus: "running",
+        } as const satisfies Record<TreeField, unknown>;
+        await register(rowValues, { id: "legacy-task-id", tree: fileValues });
+        const loadedRow = config
+          .loadConfigOrDefault()
+          .projects.get(projectPath)
+          ?.workspaces.find((workspace) => workspace.path === workspacePath());
+        const fields = (source: object | undefined) =>
+          Object.fromEntries(
+            CONFIG_TREE_FIELDS.map((key) => [key, (source as Record<string, unknown>)[key]])
+          );
+        // The row keeps every value through the config load, so each one differs from the file's.
+        expect(fields(loadedRow)).toEqual(rowValues);
+        const first = fields(await build(config));
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        const restarted = fields(await build(new Config(tempDir)));
+        expect([first, restarted]).toEqual([rowValues, rowValues]);
       });
 
       it("reads a row's own shared-checkout isolation in every build", async () => {

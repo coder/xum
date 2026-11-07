@@ -1674,7 +1674,7 @@ type ConfigTreeField = {
  * one, for a single read. Nothing is copied from the file either. TaskService already reads these
  * fields from config rows only.
  */
-const CONFIG_TREE_FIELDS = [
+export const CONFIG_TREE_FIELDS = [
   "parentWorkspaceId",
   "agentType",
   "agentId",
