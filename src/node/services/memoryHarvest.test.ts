@@ -375,10 +375,9 @@ describe("runMemoryHarvest", () => {
       expect(prompt).toMatch(/"id": "u1",\s+"sequence": 1,\s+"role": "user",\s+"text"/);
     });
 
-    it("caps a single huge text part but keeps the parts after it", async () => {
+    it("shows the tail of a long text part, and the parts after it", async () => {
       using fixture = createFixture();
-
-      const prompt = await harvestPrompt(fixture, [
+      fixture.messages = [
         createMuxMessage(
           "a1",
           "assistant",
@@ -386,12 +385,18 @@ describe("runMemoryHarvest", () => {
           { historySequence: 0 },
           [toolPart("bash", { script: "echo done" }, { output: "AFTER-THE-LONG-TEXT" })]
         ),
-      ]);
+      ];
+      const { model, calls } = scriptedModel([]);
 
-      expect(prompt).toContain("HEAD-OF-REPLY");
-      expect(prompt).not.toContain("TAIL-OF-REPLY");
-      expect(prompt).toContain("[truncated for memory harvest]");
-      expect(prompt).toContain("AFTER-THE-LONG-TEXT");
+      await runHarvest(fixture, model);
+
+      const prompts = calls.map(userPromptText).join("\n");
+      const positions = ["HEAD-OF-REPLY", "TAIL-OF-REPLY", "AFTER-THE-LONG-TEXT"].map((marker) =>
+        prompts.indexOf(marker)
+      );
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+      expect(prompts).not.toContain("more chars for memory harvest");
     });
 
     it("caps a huge tool input", async () => {
@@ -1343,6 +1348,134 @@ describe("buildHarvestChunks", () => {
     });
     const ids = rowsOf.flat().map((row) => row.id);
     expect([...new Set(ids)]).toEqual(messages.map((message) => message.id));
+  });
+
+  describe("evidence rows", () => {
+    const ROW_TEXT_LIMIT = 8_000;
+    const TEXT_PART_LIMIT = 128_000;
+
+    interface Row {
+      id: string;
+      parts?: string;
+      segment?: string;
+      text: string;
+      truncated: boolean;
+    }
+
+    const textPart = (text: string): MuxMessage["parts"][number] => ({
+      type: "text",
+      text,
+      state: "done",
+    });
+
+    function rowsOf(...messages: MuxMessage[]): Row[] {
+      return buildHarvestChunks(messages).flatMap((chunk) => JSON.parse(chunk) as Row[]);
+    }
+
+    /** One assistant message whose parts are texts of the given lengths, in order. */
+    function messageOfTexts(...lengths: number[]): MuxMessage {
+      return createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+        ...lengths.map((length, index) => textPart(`${index}`.repeat(length))),
+      ]);
+    }
+
+    describe("a text part too long for one row", () => {
+      it("is split into segments of one row each that read back as the whole text, then the parts after it", () => {
+        const text = `HEAD ${"z".repeat(30_000)} TAIL`;
+        const rows = rowsOf(
+          createMuxMessage("a1", "assistant", text, { historySequence: 0 }, [
+            toolPart("bash", { script: "echo done" }, { output: "AFTER" }),
+          ])
+        );
+
+        const segments = rows.filter((row) => row.segment !== undefined);
+        expect(segments.map((row) => row.segment)).toEqual([
+          "1 of 4",
+          "2 of 4",
+          "3 of 4",
+          "4 of 4",
+        ]);
+        expect(segments.every((row) => row.parts === "1-1 of 2")).toBe(true);
+        expect(segments.map((row) => row.text).join("")).toBe(text);
+        expect(segments.every((row) => row.text.length <= ROW_TEXT_LIMIT)).toBe(true);
+        expect(rows.at(-1)).toMatchObject({ parts: "2-2 of 2", truncated: false });
+        expect(rows.at(-1)?.segment).toBeUndefined();
+        expect(rows.at(-1)?.text).toContain("AFTER");
+        expect(rows.every((row) => !row.truncated)).toBe(true);
+      });
+
+      it("starts at one character more than a row holds", () => {
+        const fits = rowsOf(messageOfTexts(ROW_TEXT_LIMIT));
+        expect(fits).toHaveLength(1);
+        expect(fits[0].segment).toBeUndefined();
+
+        const splits = rowsOf(messageOfTexts(ROW_TEXT_LIMIT + 1));
+        expect(splits.map((row) => [row.segment, row.text.length])).toEqual([
+          ["1 of 2", ROW_TEXT_LIMIT],
+          ["2 of 2", 1],
+        ]);
+      });
+
+      it("ends at the cap, with the cut part named in the last row", () => {
+        const atCap = rowsOf(messageOfTexts(TEXT_PART_LIMIT));
+        expect(atCap).toHaveLength(TEXT_PART_LIMIT / ROW_TEXT_LIMIT);
+        expect(atCap.some((row) => row.truncated)).toBe(false);
+
+        const over = rowsOf(messageOfTexts(TEXT_PART_LIMIT + 1_500));
+        expect(over).toHaveLength(TEXT_PART_LIMIT / ROW_TEXT_LIMIT);
+        expect(over.slice(0, -1).some((row) => row.truncated)).toBe(false);
+        expect(over.at(-1)?.truncated).toBe(true);
+        expect(over.at(-1)?.text).toEndWith("[truncated 1500 more chars for memory harvest]");
+      });
+
+      it("keep the message's id on every segment", () => {
+        const rows = rowsOf(messageOfTexts(ROW_TEXT_LIMIT * 2 + 5));
+        expect(new Set(rows.map((row) => row.id))).toEqual(new Set(["a1"]));
+      });
+    });
+
+    describe("parts packed into a row", () => {
+      it("fill it to exactly the row's limit, the joining newline counted", () => {
+        // 3999 + newline + 4000 is 8000.
+        expect(rowsOf(messageOfTexts(3_999, 4_000))).toHaveLength(1);
+        // 4000 + newline + 4000 is one over.
+        expect(rowsOf(messageOfTexts(4_000, 4_000))).toHaveLength(2);
+        // Three newlines join four parts of 2000: the fourth would make the row 8003.
+        expect(rowsOf(messageOfTexts(2_000, 2_000, 2_000, 2_000)).map((row) => row.parts)).toEqual([
+          "1-3 of 4",
+          "4-4 of 4",
+        ]);
+      });
+
+      it("leave out a part with no text, and number only the parts that have some", () => {
+        const [row] = rowsOf(
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            textPart("FIRST"),
+            textPart("   \n "),
+            textPart("SECOND"),
+          ])
+        );
+
+        expect(row.text).toBe("FIRST\nSECOND");
+        // One row: it says nothing about parts.
+        expect(row.parts).toBeUndefined();
+
+        const rows = rowsOf(
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            textPart("a".repeat(5_000)),
+            textPart(""),
+            textPart("b".repeat(5_000)),
+          ])
+        );
+        expect(rows.map((r) => r.parts)).toEqual(["1-1 of 2", "2-2 of 2"]);
+      });
+
+      it("give a message with no text at all one empty row", () => {
+        expect(rowsOf(createMuxMessage("u1", "user", "  \n", { historySequence: 0 }))).toEqual([
+          { id: "u1", sequence: 0, role: "user", text: "", truncated: false },
+        ]);
+      });
+    });
   });
 
   describe("on an epoch of thousands of tool-heavy messages", () => {
