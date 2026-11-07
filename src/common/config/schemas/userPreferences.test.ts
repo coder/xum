@@ -133,6 +133,26 @@ describe("UserPreferencesSchema", () => {
     });
   });
 
+  test("keeps a valid dream cost ceiling and reads an invalid one as no ceiling", () => {
+    expect(normalizeUserPreferences({ memory: { dreamCostCeilingUsd: 2.5 } })).toEqual({
+      memory: { dreamCostCeilingUsd: 2.5 },
+    });
+    expect(normalizeUserPreferences({ memory: { dreamCostCeilingUsd: 100_000 } })).toEqual({
+      memory: { dreamCostCeilingUsd: 100_000 },
+    });
+    // A hand-edited value below the smallest ceiling (or not a number) must not refuse every
+    // run, and must not take other preferences down with it.
+    // Nor may one past the largest ceiling: `String()` would show a huge one in exponent notation.
+    for (const stored of [0, -1, 0.001, 100_000.01, 1e21, "5", null]) {
+      expect(
+        normalizeUserPreferences({
+          memory: { dreamCostCeilingUsd: stored },
+          appearance: { vimEnabled: true },
+        })
+      ).toEqual({ appearance: { vimEnabled: true } });
+    }
+  });
+
   test("prunes empty nested preference groups", () => {
     expect(
       pruneUserPreferences({

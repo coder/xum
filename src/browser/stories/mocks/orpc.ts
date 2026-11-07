@@ -235,6 +235,8 @@ export interface MockORPCClientOptions {
   memoryFiles?: MemoryFileInfo[];
   /** Initial dream consolidation status for memory.consolidationStatus. */
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
+  /** When set, memory.consolidate (the manual run) fails with this error. */
+  memoryConsolidateError?: string;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
   /** Artifacts tab: listing for artifacts.list and read results keyed by relative path. */
@@ -562,6 +564,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     timelineEvents = [],
     memoryFiles = [],
     memoryConsolidationStatus,
+    memoryConsolidateError,
     memoryFileContents = new Map<string, string>(),
     artifacts = {
       listing: { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
@@ -2767,6 +2770,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: memoryConsolidationStatusState,
         }),
       consolidate: () => {
+        if (memoryConsolidateError !== undefined) {
+          return Promise.resolve({ success: false as const, error: memoryConsolidateError });
+        }
         const record: MemoryConsolidationRecordPayload = {
           lastRunAt: Date.now(),
           trigger: "manual",

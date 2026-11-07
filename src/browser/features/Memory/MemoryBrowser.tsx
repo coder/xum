@@ -22,10 +22,12 @@ import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
 import { MemoryFileEditor } from "./MemoryFileEditor";
 
 const SCOPE_LABELS: Record<MemoryScope, string> = {
@@ -502,10 +504,29 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
+/** The cost estimate recorded before a run: an upper bound, so it reads "up to", never as a bill. */
+function formatEstimate(estimatedUsd: number | undefined): string {
+  if (estimatedUsd === undefined) return "";
+  return ` · est. up to ${estimatedUsd < 0.01 ? "under $0.01" : formatCostWithDollar(estimatedUsd)}`;
+}
+
 function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
   if (record === null) return "never";
   const appliedCount = record.ops.filter((op) => op.applied).length;
-  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
+  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}${formatEstimate(record.estimatedUsd)}`;
+}
+
+function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
+  if (record === null) return "never";
+  // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
+  const counts =
+    record.ops === undefined
+      ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+      : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  // Why a completed run read only part of its epoch (its edit budget ran out), so a line that says
+  // "completed" does not read as "everything analyzed".
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${record.status}: ${counts}${formatEstimate(record.estimatedUsd)}${note}`;
 }
 
 /**
@@ -568,11 +589,10 @@ function ConsolidationFooter(props: {
     status?.projectAvailable === false
       ? "unavailable"
       : formatConsolidationRecord(status?.projectRecord ?? null);
-  const harvestLabel = status?.latestHarvestRecord
-    ? `${status.latestHarvestRecord.status}: ${status.latestHarvestRecord.acceptedCandidates} accepted / ${status.latestHarvestRecord.skippedCandidates} skipped`
-    : "never";
+  const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
+  const refusal = status?.latestRefusal ?? null;
   // One consolidation pass can cover workspace, project, and global memory at
   // once, so those scope records often share the exact same summary. Keep the
   // per-scope status lines below, but avoid repeating identical tooltip text.
@@ -581,6 +601,7 @@ function ConsolidationFooter(props: {
     status?.projectRecord?.summary,
     status?.globalRecord?.summary,
     status?.latestHarvestRecord?.error,
+    refusal?.reason,
   ]).join("\n");
 
   return (
@@ -601,13 +622,22 @@ function ConsolidationFooter(props: {
           <div className="counter-nums truncate">
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
-          <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
+          {/* Wrap, never truncate: a ceiling refusal's reason (the estimate and the ceiling) is the
+              point of the lines below, and a touch screen cannot open the tooltip that also holds
+              it. A manual run's error is the same refusal text, and the harvest line carries the
+              note that a run read only part of its epoch. */}
           {harvestError !== undefined && (
-            <div role="alert" className="text-error truncate">
+            <div role="alert" className="text-error break-words">
               Harvest error: {harvestError}
             </div>
           )}
-          {runError !== null && <div className="text-error truncate">{runError}</div>}
+          {refusal !== null && (
+            <div role="alert" className="text-error break-words">
+              Dream stopped {formatRelativeTime(refusal.at)}: {refusal.reason}
+            </div>
+          )}
+          {runError !== null && <div className="text-error break-words">{runError}</div>}
         </div>
       </TooltipIfPresent>
       <button

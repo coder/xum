@@ -33,6 +33,8 @@ interface FakeMemoryApiOptions {
   consolidationStatus?: MemoryConsolidationStatusPayload;
   consolidationStatusFailuresRemaining?: number;
   consolidateRecord?: MemoryConsolidationRecordPayload;
+  /** A manual run fails with this error instead of returning its record. */
+  consolidateError?: string;
 }
 
 const DEFAULT_CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
@@ -65,6 +67,7 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
     consolidationStatus: options.consolidationStatus ?? DEFAULT_CONSOLIDATION_STATUS,
     consolidationStatusFailuresRemaining: options.consolidationStatusFailuresRemaining ?? 0,
     consolidateRecord: options.consolidateRecord ?? DEFAULT_CONSOLIDATION_RECORD,
+    consolidateError: options.consolidateError,
     nextSaveConflict: false,
     listeners: new Set<(event: MemoryChangeEvent) => void>(),
   };
@@ -135,6 +138,9 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
       },
       consolidate: (_input: { workspaceId?: string | null }) => {
         state.consolidateCalls += 1;
+        if (state.consolidateError !== undefined) {
+          return Promise.resolve({ success: false as const, error: state.consolidateError });
+        }
         return Promise.resolve({ success: true as const, data: state.consolidateRecord });
       },
       onChange: (_input: { workspaceId?: string | null }, opts?: { signal?: AbortSignal }) => {
@@ -350,6 +356,113 @@ describe("MemoryTab", () => {
     expect(statusBlock!.getAttribute("title")).toBeNull();
   });
 
+  test("labels an analyzer harvest by the memory edits it made and the ones rejected", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 3,
+          skippedCandidates: 1,
+          nextChunk: 2,
+          ops: [],
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 3 edits / 1 rejected");
+  });
+
+  test("says on the harvest line when a completed run read only part of its epoch", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(
+      "Harvest: completed: 8 edits / 0 rejected · edit budget spent: chunks 2-3 of 3 were not read"
+    );
+  });
+
+  test("wraps the harvest line and a manual run's error instead of truncating them", async () => {
+    const error =
+      "consolidation not started: estimate 4.06 USD (an upper bound) is over the ceiling";
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+      consolidateError: error,
+    });
+    const { findByRole, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const harvestLine = await findByText(/^Harvest: completed/);
+    fireEvent.click(await findByRole("button", { name: "Consolidate now" }));
+    const runError = await findByText(error);
+
+    // happy-dom does no layout, so the class list is the only signal that a line wraps: a
+    // truncated one hides the end of the note and of the refusal's reason on a phone, where no
+    // tooltip opens. The story `DreamRefusedAtPhoneWidth` measures the wrap in a browser.
+    for (const line of [harvestLine, runError]) {
+      expect(line.classList.contains("break-words")).toBe(true);
+      expect(line.classList.contains("truncate")).toBe(false);
+    }
+  });
+
+  test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 2,
+          skippedCandidates: 1,
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText("Harvest: completed: 2 accepted / 1 skipped");
+  });
+
   test("renders failed harvest errors inline for keyboard and screen reader access", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
@@ -375,6 +488,90 @@ describe("MemoryTab", () => {
     expect((await findByRole("alert")).textContent).toContain(
       "Harvest error: harvest provider failed"
     );
+  });
+
+  test("shows why the cost ceiling stopped a harvest, with the estimate that was over it", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "failed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 0,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+          nextChunk: 0,
+          ops: [],
+          estimatedUsd: 3.2,
+          error: "estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling",
+        },
+      },
+    });
+    const { findByRole, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    expect((await findByRole("alert")).textContent).toContain(
+      "Harvest error: estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling"
+    );
+    await findByText("Harvest: failed: 0 edits / 0 rejected · est. up to $3.20");
+  });
+
+  test("tells the user that the cost ceiling stopped the dream, and shows nothing without a refusal", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestRefusal: {
+          at: Date.now() - 60_000,
+          reason: "estimate 4.06 USD (an upper bound) is over the 1.00 USD ceiling",
+          estimatedUsd: 4.06,
+        },
+      },
+    });
+    const { findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const alert = await findByRole("alert");
+    expect(alert.textContent).toContain("Dream stopped");
+    expect(alert.textContent).toContain("over the 1.00 USD ceiling");
+  });
+
+  test("shows no dream refusal alert when the status has none", async () => {
+    fake = createFakeMemoryApi([]);
+    const { findByText, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: /);
+    expect(queryByRole("alert")).toBeNull();
+  });
+
+  test("shows the estimate recorded for a dream run, and nothing for a record without one", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.42 },
+        globalRecord: DEFAULT_CONSOLIDATION_RECORD,
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .*1 change · est\. up to \$0\.42$/);
+    const globalLine = await findByText(/^Global: /);
+    expect(globalLine.textContent).not.toContain("est.");
+  });
+
+  test("shows an estimate under a cent as under $0.01, not as a rounded zero", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.004 },
+        globalRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.01 },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .*est\. up to under \$0\.01$/);
+    // A cent is not under a cent.
+    await findByText(/^Global: .*est\. up to \$0\.01$/);
   });
 
   test("shows usage stats for used files and omits them for never-used files", async () => {

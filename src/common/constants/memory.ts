@@ -79,6 +79,25 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
 export const MEMORY_CONSOLIDATION_OP_BUDGET = 8;
 /** Generous step ceiling for the consolidation stream (reads + budgeted mutations). */
 export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
+/**
+ * Memory analyzer (the harvest of one closed compaction epoch): mutating memory
+ * commands for the whole epoch. All of its transcript chunks, and a retry of the
+ * epoch, spend one budget, so a long epoch cannot out-write a short one.
+ */
+export const MEMORY_ANALYZER_OP_BUDGET = 8;
+/** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
+export const MEMORY_ANALYZER_MAX_STEPS = 12;
+/**
+ * Smallest dream cost ceiling a user can set, in USD. A run's cost estimate is an upper bound
+ * that rarely falls below a cent, so a lower ceiling would only refuse every run.
+ */
+export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
+/**
+ * Largest dream cost ceiling a user can set, in USD. Far above any run's estimate, so it is the
+ * same as no ceiling; the cap keeps the saved number short enough that `String()` never prints it
+ * in exponent notation (1e+21), which the ceiling field would then read as invalid.
+ */
+export const MEMORY_DREAM_COST_CEILING_MAX_USD = 100_000;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */
@@ -89,8 +108,10 @@ export const MEMORY_CONSOLIDATION_IDLE_MS = 24 * 60 * 60 * 1000;
  */
 export const MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP = 3;
 /**
- * Hard wall-clock ceiling per consolidation run. Without it a half-alive
+ * Hard wall-clock ceiling per consolidation stream. Without it a half-alive
  * provider stream (keepalives but no progress) would hold the workspace's
- * in-flight lock forever and block every future trigger.
+ * in-flight lock, and the service-wide dream queue, forever. It starts when the
+ * stream starts: time spent waiting behind another workspace's stream does not
+ * count.
  */
 export const MEMORY_CONSOLIDATION_TIMEOUT_MS = 5 * 60 * 1000;
