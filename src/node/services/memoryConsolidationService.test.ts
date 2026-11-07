@@ -2184,26 +2184,25 @@ describe("MemoryConsolidationService", () => {
         }
       );
 
+      let giveUp: ReturnType<typeof setTimeout> | undefined;
       try {
         const firstRun = fixture.service.maybeHarvestThenSweep(first);
         await usageEntered.opened;
         const secondRun = fixture.service.maybeHarvestThenSweep(second);
         await held.modelCreated(2);
-        // Only promise work is left between the second run's model and its stream, so a run that
-        // has not started after many loop turns is waiting behind the first one's usage.
+        // The stream starting is the event waited for. The bound only turns a run stuck behind
+        // the first one's usage into a failed assertion instead of a test timeout.
         const started = held.streamStarted(2).then(() => true);
-        const gaveUp = (async () => {
-          for (let turn = 0; turn < 50; turn++) {
-            await new Promise<void>((resolve) => setImmediate(resolve));
-          }
-          return false;
-        })();
+        const gaveUp = new Promise<boolean>((resolve) => {
+          giveUp = setTimeout(() => resolve(false), 2_000);
+        });
         expect(await Promise.race([started, gaveUp])).toBe(true);
 
         usageStalled.open();
         await Promise.all([firstRun, secondRun]);
         expect(recordedAnalyzers).toEqual(["ws-dream", "ws-dream"]);
       } finally {
+        clearTimeout(giveUp);
         usageStalled.open();
       }
     });
