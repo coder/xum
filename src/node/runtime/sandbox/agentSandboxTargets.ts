@@ -76,6 +76,7 @@ export interface AgentSandboxPolicy {
 }
 
 export class AgentSandboxStartError extends Error {
+  // dry-duplicate-ok: each named Error subclass sets its own message and name
   constructor(reason: string) {
     super(`The agent sandbox could not start: ${reason}`);
     this.name = "AgentSandboxStartError";
