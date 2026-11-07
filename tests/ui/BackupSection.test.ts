@@ -1595,6 +1595,22 @@ describe("BackupSection", () => {
         );
       });
 
+      test("puts the unreadable note after the names it does not cover", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-m", false, true);
+
+        const item = canvas.getByRole("listitem");
+        const note = canvas.getByText(/cannot read/);
+        // DOCUMENT_POSITION_FOLLOWING: the note comes after the list of names.
+        expect(item.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      });
+
+      test("says nothing about unreadable entries when the whole list goes", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-w", true, true);
+
+        expect(canvas.getByText(/The whole list is removed/)).toBeTruthy();
+        expect(canvas.queryByText(/cannot read/)).toBeNull();
+      });
+
       test("sends no approval until the user confirms the removal the backup named", async () => {
         const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");
 

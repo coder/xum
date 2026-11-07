@@ -114,7 +114,7 @@ export function PluginRemovalCard(props: {
       {removal.wholeList ? (
         <p className="text-muted text-xs">
           The backup has a plugin list, and backing up now writes none (plugin backup is off here,
-          or this machine has no managed plugin). The whole list is removed from the backup.
+          or this machine has no plugin it can back up). The whole list is removed from the backup.
         </p>
       ) : removal.names.length > 0 ? (
         <p className="text-muted text-xs">
@@ -134,8 +134,9 @@ export function PluginRemovalCard(props: {
       {/* After the list: the names are the readable plugins, not the entries this note means. */}
       {removal.unreadable && !removal.wholeList ? (
         <p className="text-muted text-xs">
-          The list in the backup also has entries this version of Xum cannot read, for example from
-          a newer Xum. Backing up now removes them too.
+          {removal.names.length > 0
+            ? "The list in the backup also has entries this version of Xum cannot read, for example from a newer Xum. Backing up now removes them too."
+            : "The list in the backup has entries this version of Xum cannot read, for example from a newer Xum. Backing up now removes them."}
         </p>
       ) : null}
       <Button
