@@ -314,7 +314,9 @@ function buildChunkPrompt(args: {
   const summarySection =
     args.summary === undefined
       ? ""
-      : `\nCompaction summary (${args.summary.id}):\n${args.summary.parts.map(partToText).join("\n")}\n`;
+      : // The summary is model-written text of the whole epoch, so a credential that a tool printed
+        // can come back through it; the transcript's own redaction never saw it.
+        `\nCompaction summary (${args.summary.id}):\n${redactSecretLike(args.summary.parts.map(partToText).join("\n"))}\n`;
   // Command and path only, never the text: the files hold it, and re-reading them is the way to
   // see it. Without this note the replay of a failed chunk would apply its edits a second time.
   const landedSection =

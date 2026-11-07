@@ -441,6 +441,29 @@ describe("runMemoryHarvest", () => {
     for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
   });
 
+  it("redacts a credential in the compaction summary from every chunk's prompt", async () => {
+    using fixture = createFixture();
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-FACT: deploys use bun. The user pasted GITHUB_TOKEN=${githubToken} into the chat.`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const prompt = userPromptText(call);
+      expect(prompt).toContain("SUMMARY-FACT: deploys use bun");
+      expect(prompt).toContain("[redacted]");
+      expect(prompt).not.toContain(githubToken);
+    }
+  });
+
   it("measures each chunk's input as exactly what the chunk's first step sends", async () => {
     using fixture = createFixture();
     fixture.messages = manyChunkMessages();
