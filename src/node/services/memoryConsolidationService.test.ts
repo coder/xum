@@ -232,6 +232,35 @@ function failingStream(): ReadableStream<LanguageModelV3StreamPart> {
   });
 }
 
+/** One analyzer step that issues MEMORY_ANALYZER_OP_BUDGET creates: the epoch's whole edit budget. */
+function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
+  return simulateReadableStream<LanguageModelV3StreamPart>({
+    chunks: [
+      ...Array.from(
+        { length: MEMORY_ANALYZER_OP_BUDGET },
+        (_, index): LanguageModelV3StreamPart => ({
+          type: "tool-call",
+          toolCallId: `spend-${index}`,
+          toolName: "memory",
+          input: JSON.stringify({
+            command: "create",
+            path: `/memories/workspace/spend-${index}.md`,
+            file_text: `fact ${index}\n`,
+          }),
+        })
+      ),
+      {
+        type: "finish",
+        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        usage: {
+          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+          outputTokens: { total: 1, text: 0, reasoning: 0 },
+        },
+      },
+    ],
+  });
+}
+
 interface ArchivePassRun {
   kind: "analyzer" | "dream";
   prompt: string;
@@ -1466,31 +1495,7 @@ describe("MemoryConsolidationService", () => {
             }
             chunkLabels.push(/Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "");
             return Promise.resolve({
-              stream: simulateReadableStream({
-                chunks: [
-                  ...Array.from(
-                    { length: MEMORY_ANALYZER_OP_BUDGET },
-                    (_, index): LanguageModelV3StreamPart => ({
-                      type: "tool-call",
-                      toolCallId: `spend-${index}`,
-                      toolName: "memory",
-                      input: JSON.stringify({
-                        command: "create",
-                        path: `/memories/workspace/spend-${index}.md`,
-                        file_text: `fact ${index}\n`,
-                      }),
-                    })
-                  ),
-                  {
-                    type: "finish",
-                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                    usage: {
-                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                      outputTokens: { total: 1, text: 0, reasoning: 0 },
-                    },
-                  },
-                ],
-              }),
+              stream: spendEveryEditStream(),
             });
           },
         }),
@@ -2274,31 +2279,7 @@ describe("MemoryConsolidationService", () => {
                 if (closing) return Promise.resolve({ stream: noChangesStream() });
                 // The archive's first chunk spends every edit of the epoch's budget.
                 return Promise.resolve({
-                  stream: simulateReadableStream({
-                    chunks: [
-                      ...Array.from(
-                        { length: MEMORY_ANALYZER_OP_BUDGET },
-                        (_, index): LanguageModelV3StreamPart => ({
-                          type: "tool-call",
-                          toolCallId: `spend-${index}`,
-                          toolName: "memory",
-                          input: JSON.stringify({
-                            command: "create",
-                            path: `/memories/workspace/spend-${index}.md`,
-                            file_text: `fact ${index}\n`,
-                          }),
-                        })
-                      ),
-                      {
-                        type: "finish",
-                        finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                        usage: {
-                          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                          outputTokens: { total: 1, text: 0, reasoning: 0 },
-                        },
-                      },
-                    ],
-                  }),
+                  stream: spendEveryEditStream(),
                 });
               },
             }),
@@ -2727,31 +2708,7 @@ describe("MemoryConsolidationService", () => {
                 return Promise.resolve({ stream: failingStream() });
               }
               return Promise.resolve({
-                stream: simulateReadableStream({
-                  chunks: [
-                    ...Array.from(
-                      { length: MEMORY_ANALYZER_OP_BUDGET },
-                      (_, index): LanguageModelV3StreamPart => ({
-                        type: "tool-call",
-                        toolCallId: `spend-${index}`,
-                        toolName: "memory",
-                        input: JSON.stringify({
-                          command: "create",
-                          path: `/memories/workspace/spend-${index}.md`,
-                          file_text: `fact ${index}\n`,
-                        }),
-                      })
-                    ),
-                    {
-                      type: "finish",
-                      finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                      usage: {
-                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                        outputTokens: { total: 1, text: 0, reasoning: 0 },
-                      },
-                    },
-                  ],
-                }),
+                stream: spendEveryEditStream(),
               });
             },
           }),
