@@ -210,7 +210,7 @@ describe("backup of the managed plugin list", () => {
       expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
     });
 
-    it("writes no list when nothing is installed", async () => {
+    it("writes no list when plugins.json does not exist", async () => {
       const { payload, managed, request } = await prepare();
 
       await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
@@ -287,6 +287,73 @@ describe("backup of the managed plugin list", () => {
         .map(([, fields]) => (fields as { plugin: string }).plugin);
       expect(logged.sort()).toEqual(Object.keys(leftOutUrls).sort());
       info.mockRestore();
+    });
+
+    describe("a registry this build cannot read whole", () => {
+      const registryFile = () => path.join(muxRoot, "plugins.json");
+
+      async function exportFailure(contents = DEFAULT_CONTENTS) {
+        const { payload, managed, request } = await prepare();
+        const error = await captureRejection(payload.exportTo({ ...request, contents }));
+        return { error: error as { code?: string; message: string }, managed };
+      }
+
+      it("refuses the push for a plugins.json that is not JSON, naming the file and the way out", async () => {
+        await fs.writeFile(registryFile(), "{ not json", "utf-8");
+
+        const { error, managed } = await exportFailure();
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain(registryFile());
+        expect(error.message).toContain('Turning off "Agent plugins"');
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
+
+      it("refuses the push for a plugins.json that is not a registry", async () => {
+        await fs.writeFile(registryFile(), JSON.stringify({ plugins: "none" }), "utf-8");
+
+        const { error } = await exportFailure();
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain(registryFile());
+      });
+
+      it("refuses the push when one entry is one this build cannot read, and counts them", async () => {
+        const futureRow = { name: "future", source: { type: "archive", url: "https://x/y.tgz" } };
+        await writeRegistry(muxRoot, [registryRow("alpha"), futureRow, registryRow("beta")]);
+
+        const { error } = await exportFailure();
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain(registryFile());
+        expect(error.message).toContain("1 of 3 entries");
+        expect(error.message).toContain('Turning off "Agent plugins"');
+      });
+
+      it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+        "refuses the push for a plugins.json it cannot read from disk",
+        async () => {
+          await writeRegistry(muxRoot, [registryRow("alpha")]);
+          await fs.chmod(registryFile(), 0o000);
+          try {
+            const { error } = await exportFailure();
+
+            expect(error.code).toBe("IO_ERROR");
+            expect(error.message).toContain(registryFile());
+          } finally {
+            await fs.chmod(registryFile(), 0o600);
+          }
+        }
+      );
+
+      it("still backs up without the plugin list once the flag is off", async () => {
+        await fs.writeFile(registryFile(), "{ not json", "utf-8");
+        const { payload, managed, request } = await prepare();
+
+        await payload.exportTo({ ...request, contents: PLUGINS_OFF });
+
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
     });
 
     it("holds a list that looks like a secret for the push review", async () => {
@@ -932,6 +999,61 @@ describe("backup of the managed plugin list", () => {
 
       if (!preview.success) throw new Error(preview.error.message);
       expect(preview.data.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
+    });
+
+    describe("with a registry this build cannot read", () => {
+      async function corruptSecondMachine(): Promise<string> {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const root = await secondMachine();
+        await fs.writeFile(path.join(root, "plugins.json"), "{ not json", "utf-8");
+        return root;
+      }
+
+      it("fails the push with an IO_ERROR that names the file, and leaves the backup as it was", async () => {
+        const root = await corruptSecondMachine();
+
+        const pushed = await serviceFor(root).push(settings);
+
+        expect(pushed.success).toBe(false);
+        if (pushed.success) return;
+        expect(pushed.error.code).toBe("IO_ERROR");
+        expect(pushed.error.message).toContain(path.join(root, "plugins.json"));
+        expect(pushed.error.message).toContain('Turning off "Agent plugins"');
+        const inspect = path.join(tempDir, "inspect-unchanged");
+        await runGit(["clone", "--quiet", originPath, inspect]);
+        const kept = JSON.parse(
+          await fs.readFile(path.join(inspect, "xum", PLUGIN_BACKUP_MANIFEST_PATH), "utf-8")
+        ) as { plugins: Array<{ name: string }> };
+        expect(kept.plugins.map((plugin) => plugin.name)).toEqual(["alpha"]);
+      });
+
+      it("pushes without the list once the flag is off, after the usual removal approval", async () => {
+        const root = await corruptSecondMachine();
+        const flagOff = { ...settings, includePlugins: false };
+
+        const refused = await serviceFor(root).push(flagOff);
+        expect(refused.success).toBe(false);
+        if (refused.success) return;
+        expect(refused.error.code).toBe("PLUGIN_REMOVAL_APPROVAL_REQUIRED");
+
+        const pushed = await serviceFor(root).push(flagOff, {
+          approvedPluginRemovalDigest: refused.error.pluginRemoval?.approval,
+        });
+        expect(pushed.success).toBe(true);
+      });
+
+      it("reports the failure as the push half of a preview, and still shows the restore half", async () => {
+        const root = await corruptSecondMachine();
+
+        const preview = await serviceFor(root).preview(settings);
+
+        if (!preview.success) throw new Error(preview.error.message);
+        expect(preview.data.pushError).toContain(path.join(root, "plugins.json"));
+        expect(preview.data.pushError).toContain('Turning off "Agent plugins"');
+        expect(preview.data.plugins.rows.map((row) => [row.name, row.status])).toEqual([
+          ["alpha", "missing"],
+        ]);
+      });
     });
 
     it("restores the settings when the plugin list is unreadable, and reports the warning", async () => {

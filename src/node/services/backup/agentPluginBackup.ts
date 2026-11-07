@@ -1,7 +1,10 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
-import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
+import {
+  AgentPluginInstallEntrySchema,
+  type AgentPluginInstallEntry,
+} from "@/common/config/schemas/agentPluginInstalls";
 import type { BackupContents } from "@/common/config/schemas/settingsBackup";
 import {
   BackupPluginEntrySchema,
@@ -26,6 +29,7 @@ import {
 import { log } from "@/node/services/log";
 import { formatZodIssues } from "@/node/utils/markdownFrontmatter";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { BackupServiceError } from "./backupService";
 import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
@@ -63,6 +67,34 @@ async function readManagedInstalls(muxRoot: string): Promise<Map<string, AgentPl
     "lenient"
   );
   return new Map(parseRegistryEntriesLenient(rawEntries).map((entry) => [entry.name, entry]));
+}
+
+const AGENT_PLUGINS_OFF_HINT = 'Turning off "Agent plugins" backs up without the plugin list.';
+
+/**
+ * The registry rows a push lists. A restore only compares names, so it reads what it can. A push
+ * writes the list, so a registry it cannot read whole would drop plugins from the backup without
+ * a word: the push fails instead, and names the file. A missing file is no plugins. The code is
+ * IO_ERROR, not INVALID_BACKUP: the file is on this machine, not in the backup repository.
+ */
+async function readInstallsToList(muxRoot: string): Promise<AgentPluginInstallEntry[]> {
+  const registryFile = path.join(muxRoot, PLUGIN_REGISTRY_FILE_NAME);
+  let rawEntries: unknown[];
+  try {
+    ({ rawEntries } = await readPluginRegistryDocument(registryFile, "strict"));
+  } catch (error) {
+    throw new BackupServiceError("IO_ERROR", `${getErrorMessage(error)} ${AGENT_PLUGINS_OFF_HINT}`);
+  }
+  const unreadable = rawEntries.filter(
+    (row) => !AgentPluginInstallEntrySchema.safeParse(row).success
+  ).length;
+  if (unreadable > 0) {
+    throw new BackupServiceError(
+      "IO_ERROR",
+      `The plugin registry (${registryFile}) has ${unreadable} of ${rawEntries.length} entries this version of Xum cannot read, for example plugins a newer Xum installed. Backing up would leave them out of the list. ${AGENT_PLUGINS_OFF_HINT}`
+    );
+  }
+  return parseRegistryEntriesLenient(rawEntries);
 }
 
 /**
@@ -119,7 +151,7 @@ async function entryOf(
 
 /** Every managed install as a portable entry, sorted by name; null when there is none. */
 export async function collectPluginBackup(muxRoot: string): Promise<BackupPluginManifest | null> {
-  const installs = [...(await readManagedInstalls(muxRoot)).values()];
+  const installs = await readInstallsToList(muxRoot);
   const entries = await Promise.all(installs.map((install) => entryOf(muxRoot, install)));
   const plugins = entries
     .filter((entry) => entry !== null)

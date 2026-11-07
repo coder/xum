@@ -420,4 +420,6 @@ The card names only the plugins that Xum could read from the list. When the list
 
 If Xum cannot read part of the list, for example a plugin that a newer Xum recorded, it leaves that part out and shows a warning on the card. The rest of the restore still runs.
 
+If Xum cannot read the registry of your installed plugins (`plugins.json` in your Xum folder), or the registry has entries this version of Xum cannot read, **Back up now** fails. The error names the file and how many entries Xum cannot read. Xum does not write a list that would leave those plugins out. Repair the file, or turn off **Agent plugins** to back up without the list. A missing `plugins.json` is not an error: it means no plugins.
+
 With **Agent plugins** off, a backup writes no list and removes the one already in the repository. **Back up now** asks first, and the card says that the whole list is removed. A restore skips the list and says that the backup has one.
