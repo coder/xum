@@ -140,6 +140,8 @@ export const MemoryHarvestRecordSchema = z.object({
    * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
    */
   budgetUsed: z.number().optional(),
+  /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
+  nextChunkOps: z.number().optional(),
   error: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**

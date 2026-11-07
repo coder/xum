@@ -350,13 +350,14 @@ function harvestProgressFields(
   progress: HarvestProgress
 ): Pick<
   MemoryHarvestRecord,
-  "nextChunk" | "ops" | "budgetUsed" | "acceptedCandidates" | "skippedCandidates"
+  "nextChunk" | "ops" | "budgetUsed" | "nextChunkOps" | "acceptedCandidates" | "skippedCandidates"
 > {
   const applied = progress.ops.filter((op) => op.applied).length;
   return {
     nextChunk: progress.nextChunk,
     ops: progress.ops,
     budgetUsed: progress.budgetUsed,
+    nextChunkOps: progress.nextChunkOps,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
   };
@@ -1399,6 +1400,7 @@ export class MemoryConsolidationService extends EventEmitter {
         nextChunk: existing?.nextChunk ?? 0,
         ops: existing?.ops ?? [],
         budgetUsed: existing?.budgetUsed,
+        nextChunkOps: existing?.nextChunkOps,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
       const attemptState: HarvestAttemptState = {};
@@ -1563,7 +1565,7 @@ export class MemoryConsolidationService extends EventEmitter {
         chunkInputChars: harvestChunkInputChars({
           messages,
           summary: epoch.data.summary,
-          fromChunk: opts.progress.nextChunk,
+          resume: opts.progress,
         }),
         memoryChars: memoryBytes,
       });
@@ -1580,6 +1582,7 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.nextChunk = reached.nextChunk;
         opts.progress.ops = reached.ops;
         opts.progress.budgetUsed = reached.budgetUsed;
+        opts.progress.nextChunkOps = reached.nextChunkOps;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(

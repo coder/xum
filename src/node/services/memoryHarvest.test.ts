@@ -457,7 +457,7 @@ describe("runMemoryHarvest", () => {
       harvestChunkInputChars({
         messages: fixture.messages,
         summary: fixture.summary,
-        fromChunk: 1,
+        resume: { nextChunk: 1, ops: [] },
       })
     ).toEqual(sent.slice(1));
   });
@@ -877,6 +877,78 @@ describe("runMemoryHarvest", () => {
       expect(result.ops).toEqual([
         { command: "create", path: "/memories/workspace/partial.md", applied: true },
       ]);
+    });
+  });
+
+  describe("replaying a chunk that failed after writing", () => {
+    it("tells the retry which edits of that chunk already landed, by command and path only", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const landedText = "UNIQUE-FACT-TEXT chunk two wrote this\n";
+      const first = scriptedModel([
+        ...chunkScript([createFile("/memories/workspace/one.md", "chunk one fact\n")]),
+        [memoryToolCall(createFile("/memories/workspace/two.md", landedText)), toolFinishChunk()],
+        new Error("provider exploded"),
+      ]);
+      const failed = await runHarvest(fixture, first.model);
+      expect(failed.nextChunk).toBe(1);
+      // Only the failed chunk's edit counts as landed in it; chunk one's belongs to a finished chunk.
+      expect(failed.nextChunkOps).toBe(1);
+
+      const retry = scriptedModel([]);
+      await runHarvest(fixture, retry.model, { resume: failed });
+
+      const prompts = retry.calls.map(userPromptText);
+      expect(prompts[0]).toContain("Transcript chunk 2/3");
+      expect(prompts[0]).toContain("already applied");
+      expect(prompts[0]).toContain("do not repeat");
+      expect(prompts[0]).toContain("/memories/workspace/two.md");
+      expect(prompts[0]).not.toContain("/memories/workspace/one.md");
+      expect(prompts[0]).not.toContain("UNIQUE-FACT-TEXT");
+      // The note covers the replayed chunk only.
+      expect(prompts[1]).toContain("Transcript chunk 3/3");
+      expect(prompts[1]).not.toContain("/memories/workspace/two.md");
+    });
+
+    it("keeps the landed edits listed when the retry fails again", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const first = scriptedModel([
+        [memoryToolCall(createFile("/memories/workspace/a.md", "a\n")), toolFinishChunk()],
+        new Error("provider exploded"),
+      ]);
+      const failedOnce = await runHarvest(fixture, first.model);
+      const second = scriptedModel([
+        [memoryToolCall(createFile("/memories/workspace/b.md", "b\n")), toolFinishChunk()],
+        new Error("provider exploded again"),
+      ]);
+      const failedTwice = await runHarvest(fixture, second.model, { resume: failedOnce });
+      expect(failedTwice.nextChunk).toBe(0);
+      expect(failedTwice.nextChunkOps).toBe(2);
+
+      const third = scriptedModel([]);
+      await runHarvest(fixture, third.model, { resume: failedTwice });
+
+      const prompt = userPromptText(third.calls[0]);
+      expect(prompt).toContain("/memories/workspace/a.md");
+      expect(prompt).toContain("/memories/workspace/b.md");
+    });
+
+    it("sizes the cost estimate by the same note", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const resume: HarvestProgress = {
+        nextChunk: 1,
+        ops: [{ command: "create", path: "/memories/workspace/two.md", applied: true }],
+        nextChunkOps: 1,
+      };
+      const { model, calls } = scriptedModel([]);
+      await runHarvest(fixture, model, { resume });
+      const sent = calls.map((call) => systemPromptText(call).length + userPromptText(call).length);
+
+      expect(
+        harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary, resume })
+      ).toEqual(sent);
     });
   });
 

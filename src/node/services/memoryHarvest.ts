@@ -55,6 +55,33 @@ export interface HarvestProgress {
    * field: the applied ops stand in for it.
    */
   budgetUsed?: number;
+  /**
+   * How many of the last `ops` came from chunk `nextChunk`, which an attempt began and did not
+   * finish. A retry replays that chunk and tells the model which of its edits already landed.
+   * Absent in an older record, and 0 when no attempt reached the chunk.
+   */
+  nextChunkOps?: number;
+}
+
+/** Where a run starts, read from the progress of an earlier attempt at the same epoch. */
+function resumePoint(
+  chunkCount: number,
+  resume: HarvestProgress | undefined
+): {
+  startChunk: number;
+  budgetUsed: number;
+  /** Ops of the start chunk that already landed, and the count of ops before them. */
+  landedInStartChunk: MemoryConsolidationOp[];
+  opsBeforeStartChunk: number;
+} {
+  const ops = resume?.ops ?? [];
+  const inStartChunk = Math.min(resume?.nextChunkOps ?? 0, ops.length);
+  return {
+    startChunk: Math.min(resume?.nextChunk ?? 0, chunkCount),
+    budgetUsed: resume?.budgetUsed ?? ops.filter((op) => op.applied).length,
+    landedInStartChunk: ops.slice(ops.length - inStartChunk).filter((op) => op.applied),
+    opsBeforeStartChunk: ops.length - inStartChunk,
+  };
 }
 
 export interface MemoryHarvestResult extends HarvestProgress {
@@ -271,6 +298,8 @@ function buildChunkPrompt(args: {
   index: number;
   total: number;
   transcript: string;
+  /** Edits of this chunk an earlier attempt already applied (see `HarvestProgress.nextChunkOps`). */
+  landedOps?: readonly MemoryConsolidationOp[];
 }): string {
   const earlierChunks =
     args.index === 0
@@ -286,10 +315,20 @@ function buildChunkPrompt(args: {
     args.summary === undefined
       ? ""
       : `\nCompaction summary (${args.summary.id}):\n${args.summary.parts.map(partToText).join("\n")}\n`;
+  // Command and path only, never the text: the files hold it, and re-reading them is the way to
+  // see it. Without this note the replay of a failed chunk would apply its edits a second time.
+  const landedSection =
+    args.landedOps === undefined || args.landedOps.length === 0
+      ? ""
+      : "\nAn earlier attempt at this chunk already applied these memory edits; do not repeat them. " +
+        `Read the files before you change them again:\n${JSON.stringify(
+          args.landedOps.map((op) => ({ command: op.command, path: op.path }))
+        )}\n`;
   return (
     intro +
     earlierChunks +
     summarySection +
+    landedSection +
     `\nTranscript chunk ${args.index + 1}/${args.total} as JSON evidence rows:\n${args.transcript}`
   );
 }
@@ -362,19 +401,19 @@ async function analyzeChunk(args: {
 }
 
 /**
- * The characters the first step of each chunk from `fromChunk` on sends: the system prompt plus
+ * The characters the first step of each chunk from the resume cursor on sends: the system prompt plus
  * that chunk's prompt. It is the input of the cost estimate, which adds what the model reads.
  */
 export function harvestChunkInputChars(args: {
   messages: HarvestEpoch["messages"];
   summary?: HarvestEpoch["summary"];
-  /** The resume cursor (`HarvestProgress.nextChunk`): chunks before it are already analyzed. */
-  fromChunk?: number;
+  /** Progress of an earlier attempt: chunks before its cursor are already analyzed. */
+  resume?: HarvestProgress;
 }): number[] {
   const chunks = buildHarvestChunks(args.messages);
-  const fromChunk = args.fromChunk ?? 0;
+  const { startChunk, landedInStartChunk } = resumePoint(chunks.length, args.resume);
   return chunks.flatMap((transcript, index) =>
-    index < fromChunk
+    index < startChunk
       ? []
       : [
           MEMORY_ANALYZER_SYSTEM_PROMPT.length +
@@ -383,6 +422,7 @@ export function harvestChunkInputChars(args: {
               index,
               total: chunks.length,
               transcript,
+              landedOps: index === startChunk ? landedInStartChunk : undefined,
             }).length,
         ]
   );
@@ -429,21 +469,22 @@ export async function runMemoryHarvest(args: {
 }): Promise<MemoryHarvestResult> {
   const chunks = buildHarvestChunks(args.messages);
   const priorOps = args.resume?.ops ?? [];
+  const resumed = resumePoint(chunks.length, args.resume);
   const journal: MemoryConsolidationOp[] = [];
   // One budget for the whole epoch, retries included: what an earlier attempt spent is spent.
-  const budget = createMutationBudget(
-    MEMORY_ANALYZER_OP_BUDGET,
-    args.resume?.budgetUsed ?? priorOps.filter((op) => op.applied).length
-  );
+  const budget = createMutationBudget(MEMORY_ANALYZER_OP_BUDGET, resumed.budgetUsed);
+  // Ops of the chunks that finished; the ones after them belong to the chunk in flight.
+  let finishedOps = resumed.opsBeforeStartChunk;
   const progressFor = (nextChunk: number): HarvestProgress => ({
     nextChunk,
     ops: [...priorOps, ...journal],
     budgetUsed: budget.used(),
+    nextChunkOps: priorOps.length + journal.length - finishedOps,
   });
 
   let streamError: string | undefined;
   let usage: MemoryHarvestResult["usage"];
-  let nextChunk = Math.min(args.resume?.nextChunk ?? 0, chunks.length);
+  let nextChunk = resumed.startChunk;
   for (let index = nextChunk; index < chunks.length; index++) {
     // Own timeout per chunk: a long epoch must not run out of time on its later chunks. The same
     // signal guards the chunk's memory tool, so a mutation still in flight when it fires is refused.
@@ -472,6 +513,7 @@ export async function runMemoryHarvest(args: {
         index,
         total: chunks.length,
         transcript: chunks[index],
+        landedOps: index === resumed.startChunk ? resumed.landedInStartChunk : undefined,
       }),
       signal,
       label: `${index + 1}/${chunks.length}`,
@@ -484,6 +526,7 @@ export async function runMemoryHarvest(args: {
     }
     usage = sumUsage(usage, outcome.usage);
     nextChunk = index + 1;
+    finishedOps = priorOps.length + journal.length;
     await args.onChunkComplete?.(progressFor(nextChunk));
   }
 

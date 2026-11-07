@@ -1351,7 +1351,8 @@ describe("MemoryConsolidationService", () => {
     }
   });
 
-  it("keeps the budget spent, failed dispatches included, in the harvest record", async () => {
+  it("keeps the budget spent and the failed chunk's landed edits in its record, and the retry uses both", async () => {
+    const chunkTwoPrompts: string[] = [];
     let failedOnce = false;
     const done = () => ({
       stream: simulateReadableStream({
@@ -1386,7 +1387,10 @@ describe("MemoryConsolidationService", () => {
               });
             }
             if (label !== "2") return Promise.resolve(done());
-            if (failedOnce) return Promise.resolve(done());
+            if (failedOnce) {
+              chunkTwoPrompts.push(prompt);
+              return Promise.resolve(done());
+            }
             if (!afterToolResult) {
               // One edit lands and one dispatch fails (both spend budget), then the stream dies.
               return Promise.resolve({
@@ -1431,15 +1435,19 @@ describe("MemoryConsolidationService", () => {
       nextChunk: 1,
       // Chunk one's edit, then chunk two's edit and its failed dispatch.
       budgetUsed: 3,
+      nextChunkOps: 2,
     });
 
     expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
 
+    expect(chunkTwoPrompts[0]).toContain("/memories/workspace/two.md");
+    expect(chunkTwoPrompts[0]).not.toContain("/memories/workspace/one.md");
     status = await fixture.service.getStatus("ws-dream");
     expect(status.latestHarvestRecord).toMatchObject({
       status: "completed",
       nextChunk: 3,
       budgetUsed: 3,
+      nextChunkOps: 0,
     });
   });
 
