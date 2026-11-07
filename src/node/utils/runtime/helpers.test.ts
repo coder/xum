@@ -428,6 +428,7 @@ describe("readPlanFile", () => {
           XUM_LEGACY_PLAN: legacyPath,
           XUM_PLAN: planPath,
         },
+        sandbox: "off",
         timeout: 5,
       },
     });
@@ -496,6 +497,7 @@ describe("movePlanFile", () => {
           XUM_OLD_PLAN: oldPath,
           XUM_NEW_PLAN: newPath,
         },
+        sandbox: "off",
         timeout: 5,
       },
     });

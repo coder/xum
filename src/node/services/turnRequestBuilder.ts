@@ -2811,6 +2811,8 @@ export class TurnRequestBuilder {
         {
           cwd: path.dirname(runtimeTempDir),
           timeout: 10,
+          // Xum code, not agent code: removes Xum's own folder under ~/.xum-tmp.
+          sandbox: "off",
         }
       );
       if (removed.exitCode !== 0)
