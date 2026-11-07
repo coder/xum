@@ -5557,6 +5557,7 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() => Promise.resolve({ idle: stdioConfig("idle-cmd") }));
     servers.serve("idle-cmd", { connect: () => new Promise<void>(() => undefined) });
     servers.startupHangWaitMs = 100;
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(
       servers.expireStartupDeadline(() =>
         manager.getToolsForWorkspace(workspaceRequest("ws-idle-startup"))
