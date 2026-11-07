@@ -73,6 +73,7 @@ import type { MemoryScopeContext, MemoryService } from "@/node/services/memorySe
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { KeyedTurnQueue } from "@/node/utils/concurrency/keyedTurnQueue";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
 type MemoryHarvestRecord = MemoryHarvestRecordPayload;
@@ -298,6 +299,22 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
     delete records[boundaryKey];
   }
 }
+
+/**
+ * Cross-process half of the dream-stream queue. It lives in `<root>/locks`, not inside
+ * `<root>/memory`, because a memory mutation can delete directories there while it is held.
+ */
+export function dreamStreamLockPath(rootDir: string): string {
+  return path.join(rootDir, "locks", "memory-dream-stream.lock");
+}
+
+/** Where a dream stream's turn ended up (see runDreamStreamExclusively). */
+type DreamStreamTurn<T> =
+  | { outcome: "ran"; value: T }
+  /** The signal aborted while the run waited for its turn: `stream` never started. */
+  | { outcome: "cancelled" }
+  /** The cross-process lock could not be taken: `stream` never started. */
+  | { outcome: "lock-failed"; error: string };
 
 /** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
 function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
@@ -934,15 +951,22 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * Run one dream stream once every earlier queued one has settled, so at most
    * one consolidation stream runs at a time across ALL workspaces (harvests are
-   * not queued here). Returns null, without starting `stream`, when `signal`
-   * aborts first: removal must cancel a run that is still waiting its turn.
-   * Waiting happens after maybeRun's synchronous in-flight reservation, so that
-   * per-workspace try-lock keeps its call-order semantics.
+   * not queued here). The in-process queue orders this backend's runs; behind
+   * it, a cross-process lock excludes a second backend on the same root (the
+   * target locks only serialize single memory commands, not the model's
+   * read/decide/write pass). Nothing starts, and `cancelled` comes back, when
+   * `signal` aborts first: removal must cancel a run that is still waiting its
+   * turn. Waiting happens after maybeRun's synchronous in-flight reservation,
+   * so that per-workspace try-lock keeps its call-order semantics.
+   *
+   * `stream` must settle with the provider/tool stream and nothing after it:
+   * everything it awaits holds up every later dream (see consolidate's usage
+   * capture in runLockedEffect).
    */
   private async runDreamStreamExclusively<T>(
     signal: AbortSignal,
     stream: () => Promise<T>
-  ): Promise<T | null> {
+  ): Promise<DreamStreamTurn<T>> {
     const previous = this.dreamStreamTail;
     let release!: () => void;
     const turnDone = new Promise<void>((resolve) => {
@@ -952,8 +976,28 @@ export class MemoryConsolidationService extends EventEmitter {
     // waiter still releases its link, which lets successors pass it.
     this.dreamStreamTail = previous.then(() => turnDone);
     try {
-      if (!(await waitForTurnOrAbort(previous, signal))) return null;
-      return await stream();
+      if (!(await waitForTurnOrAbort(previous, signal))) return { outcome: "cancelled" };
+      let releaseLock: () => Promise<void>;
+      try {
+        releaseLock = await acquireCrossProcessLock({
+          lockPath: dreamStreamLockPath(this.config.rootDir),
+          // A holder's stream is cut at this timeout, so one full timeout outlasts any healthy
+          // holder. A wedged live holder is never taken over (fail closed): this run errors and
+          // the next trigger retries.
+          acquireTimeoutMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          timeoutMessage: "Another Xum process is running a memory consolidation.",
+          signal,
+        });
+      } catch (error) {
+        if (signal.aborted) return { outcome: "cancelled" };
+        return { outcome: "lock-failed", error: getErrorMessage(error) };
+      }
+      try {
+        return { outcome: "ran", value: await stream() };
+      } finally {
+        await releaseLock();
+      }
     } finally {
       release();
     }
@@ -1029,6 +1073,11 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
+      // The stream's usage is recorded after its queue slot is released, not inside it:
+      // recordHeadlessUsage takes the session directory's lock, and a stall there must not hold
+      // every later workspace's dream. An array, not a `let`, because TS cannot narrow
+      // assignments made inside the callback.
+      const recordings: Array<() => Promise<void>> = [];
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1051,32 +1100,43 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: async (usage, providerMetadata) => {
-            const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-              workspaceId,
-              modelString,
-              usage,
-              providerMetadata,
-              {
-                analyticsSource: "memory_consolidation",
-                // Creation-time identity: a catalog refresh mid-run must not
-                // re-attribute this spend (see ModelFactoryLike).
-                metadataModel: modelResult.data.metadataModel,
+          recordUsage: (usage, providerMetadata) => {
+            recordings.push(async () => {
+              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                workspaceId,
+                modelString,
+                usage,
+                providerMetadata,
+                {
+                  analyticsSource: "memory_consolidation",
+                  // Creation-time identity: a catalog refresh mid-run must not
+                  // re-attribute this spend (see ModelFactoryLike).
+                  metadataModel: modelResult.data.metadataModel,
+                }
+              );
+              // The sidecar row only reaches dashboard totals via an explicit
+              // ingest pass; request one (forwarded by ServiceContainer) so sweep
+              // spend doesn't strand until an unrelated stream-end or restart.
+              if (recorded) {
+                self.emit("analyticsIngest", { workspaceId });
               }
-            );
-            // The sidecar row only reaches dashboard totals via an explicit
-            // ingest pass; request one (forwarded by ServiceContainer) so sweep
-            // spend doesn't strand until an unrelated stream-end or restart.
-            if (recorded) {
-              self.emit("analyticsIngest", { workspaceId });
-            }
+            });
+            return Promise.resolve();
           },
         });
-      const result = yield* Effect.promise(async () =>
+      const turn = yield* Effect.promise(async () =>
         self.runDreamStreamExclusively(removalSignal, consolidate)
       );
       // Removal reached this run while it was still queued: no stream started.
-      if (result === null) return Err("workspace is being removed; consolidation refused");
+      if (turn.outcome === "cancelled") {
+        return Err("workspace is being removed; consolidation refused");
+      }
+      // No stream started: a stream without the cross-process lock could overlap another
+      // backend's. Nothing is journaled, so the next trigger retries.
+      if (turn.outcome === "lock-failed") {
+        return Err(`could not take the consolidation lock: ${turn.error}`);
+      }
+      const result = turn.value;
       // A stream failure (provider error or the run timeout) means the pass did
       // NOT cover the memory state: skip the journal record so the debounce and
       // launch sweep retry later instead of reporting a successful consolidation
@@ -1084,6 +1144,18 @@ export class MemoryConsolidationService extends EventEmitter {
       if (result.streamError !== undefined) {
         return Err(`consolidation stream failed: ${result.streamError}`);
       }
+
+      // Best-effort, like the in-stream call it replaced: telemetry never fails the pass.
+      yield* Effect.promise(async () => {
+        for (const recordUsage of recordings) {
+          await recordUsage().catch((error: unknown) => {
+            log.warn("[MemoryConsolidation] could not record dream usage", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
+      });
 
       const record: MemoryConsolidationRecord = {
         lastRunAt: Date.now(),

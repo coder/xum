@@ -492,6 +492,31 @@ describe("consolidation memory tool rails", () => {
       expect(await pathExists(path.join(fixture.globalMemoryDir, "creds.md"))).toBe(false);
     });
 
+    it("rejects a credential that has no keyword beside it", async () => {
+      // A check on the words `token`, `secret` and `password` lets these shapes through: the
+      // guard has to read the credential shapes themselves.
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+
+      const notes = [
+        `The deploy user authenticates as ${githubToken}.\n`,
+        "The notifier posts as xoxb-1234567890-abcdefghij.\n",
+        "The cache lives at redis://:hunter2pw@cache:6379/0.\n",
+      ];
+
+      for (const [index, note] of notes.entries()) {
+        const result = await execute(fixture.tool, {
+          command: "create",
+          path: `/memories/global/note-${index}.md`,
+          file_text: note,
+        });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(JSON.stringify(fixture.journal)).not.toContain("hunter2pw");
+      expect(fixture.getMutationCount()).toBe(0);
+    });
+
     it("accepts text that only talks about tokens and passwords", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
 

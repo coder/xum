@@ -9,7 +9,6 @@ import {
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { assertNever } from "@/common/utils/assertNever";
@@ -18,7 +17,8 @@ import {
   createMutationBudget,
 } from "@/node/services/memoryConsolidation";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
-import { redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { renderToolValue } from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
 const HARVEST_MAX_TRANSCRIPT_CHARS = 40_000;
@@ -33,10 +33,6 @@ const HARVEST_MAX_ROW_TEXT_CHARS = 8_000;
 const HARVEST_MAX_TEXT_PART_CHARS = 128_000;
 const HARVEST_MAX_TOOL_INPUT_CHARS = 1_000;
 const HARVEST_MAX_TOOL_OUTPUT_CHARS = 2_000;
-// Redaction scans this much past a cap so a secret that starts inside the kept prefix is matched
-// whole before the cut, instead of leaving a readable prefix of it in the transcript.
-const HARVEST_REDACTION_LOOKAHEAD_CHARS = 512;
-const MAX_TOOL_VALUE_DEPTH = 30;
 
 /** One piece of a message as the analyzer reads it. Messages that fit one row have one. */
 interface HarvestEvidenceRow {
@@ -114,52 +110,13 @@ export interface MemoryHarvestResult extends HarvestProgress {
   readChunks: number;
 }
 
-const MEDIA_STUB = "[media]";
-// Tool-output attachment shapes: persisted `media`/`display_file` parts and the AI SDK's
-// model-output `image-data`/`file-data` forms. Their bytes never go to the harvest model.
-const MEDIA_PART_TYPES = new Set(["media", "display_file", "image-data", "file-data"]);
-const DATA_URL_PATTERN = /data:[\w.+-]+\/[\w.+-]+(?:;[\w=.+-]+)*;base64,[A-Za-z0-9+/=_-]+/gi;
-
-function sanitizeToolValue(value: unknown, depth: number): unknown {
-  if (depth > MAX_TOOL_VALUE_DEPTH) return "[nested data omitted]";
-  if (Array.isArray(value)) return value.map((item) => sanitizeToolValue(item, depth + 1));
-  if (!isPlainObject(value)) return value;
-  if (typeof value.type === "string" && MEDIA_PART_TYPES.has(value.type)) return MEDIA_STUB;
-  // A history lookup returns other rows' text; forwarding it would copy that text into this
-  // workspace's memory and amplify one lookup into the next epoch's evidence.
-  if (value.toolName === "session_history") return "[session_history result omitted]";
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, sanitizeToolValue(item, depth + 1)])
-  );
-}
-
-function stringifyToolValue(value: unknown): string {
-  if (value === undefined) return "[none]";
-  const sanitized = sanitizeToolValue(value, 0);
-  if (typeof sanitized === "string") return sanitized;
-  try {
-    return JSON.stringify(sanitized) ?? "[unserializable]";
-  } catch {
-    return "[unserializable]";
-  }
-}
-
-function boundToolText(text: string, maxChars: number): string {
-  const withoutMedia = text.replace(DATA_URL_PATTERN, MEDIA_STUB);
-  const redacted = redactSecretLike(
-    withoutMedia.slice(0, maxChars + HARVEST_REDACTION_LOOKAHEAD_CHARS)
-  );
-  if (withoutMedia.length <= maxChars) return redacted;
-  return `${redacted.slice(0, maxChars)} [truncated ${withoutMedia.length - maxChars} more chars for memory harvest]`;
-}
-
 function renderToolResult(part: MuxToolPart): string {
   const label = `TOOL RESULT (${part.toolName}): `;
   switch (part.state) {
     case "output-available":
       return part.toolName === "session_history"
         ? `${label}[session_history result omitted]`
-        : `${label}${boundToolText(stringifyToolValue(part.output), HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
+        : `${label}${renderToolValue(part.output, HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
     case "output-redacted":
       return `${label}[output redacted${part.failed ? "; tool failed" : ""}]`;
     case "input-available":
@@ -175,7 +132,7 @@ function renderToolResult(part: MuxToolPart): string {
  * calls are not rendered; the outer result is what the model saw.
  */
 function renderToolPart(part: MuxToolPart): string {
-  const input = boundToolText(stringifyToolValue(part.input), HARVEST_MAX_TOOL_INPUT_CHARS);
+  const input = renderToolValue(part.input, HARVEST_MAX_TOOL_INPUT_CHARS);
   return `TOOL CALL ${part.toolName}: ${input}\n${renderToolResult(part)}`;
 }
 
@@ -189,6 +146,12 @@ function neutralizeHarvestText(text: string): string {
   return text.replace(/<\/(message)(\s*)>/gi, "&lt;/$1$2>");
 }
 
+/** The text of one message part, and how many characters of a text part lie past its cap. */
+interface RowText {
+  text: string;
+  cutChars: number;
+}
+
 /** A piece of one message part that fits a row: the whole part, or one segment of a long text part. */
 interface HarvestPiece {
   text: string;
@@ -199,19 +162,35 @@ interface HarvestPiece {
   segment?: string;
 }
 
+/**
+ * The text of a text part as rows read it: redacted, and cut at the part's cap. The scan reaches a
+ * lookahead past the cap, so a secret that starts inside the kept text is matched whole, and what
+ * lies past it is never scanned. Text parts are not tool output, but a credential a user pasted or
+ * a model echoed sits in them just the same, and the cap is long enough to carry it to the model.
+ */
+function boundedTextPart(raw: string): RowText {
+  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
+  const prepared = neutralizeHarvestText(redactSecretLike(window));
+  const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
+  return { text, cutChars: raw.length - window.length + prepared.length - text.length };
+}
+
+function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {
+  if (part.type === "text") return boundedTextPart(part.text.trim());
+  return { text: neutralizeHarvestText(partToText(part).trim()), cutChars: 0 };
+}
+
 function piecesOfPart(
   part: MuxMessage["parts"][number],
   position: number,
-  text: string
+  { text, cutChars }: RowText
 ): HarvestPiece[] {
-  if (part.type !== "text" || text.length <= HARVEST_MAX_ROW_TEXT_CHARS) {
+  if (part.type !== "text" || (text.length <= HARVEST_MAX_ROW_TEXT_CHARS && cutChars === 0)) {
     return [{ text, truncated: false, part: position }];
   }
-  const kept = text.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
-  const cutChars = text.length - kept.length;
-  const count = Math.ceil(kept.length / HARVEST_MAX_ROW_TEXT_CHARS);
+  const count = Math.ceil(text.length / HARVEST_MAX_ROW_TEXT_CHARS);
   return Array.from({ length: count }, (_, index): HarvestPiece => {
-    const segment = kept.slice(
+    const segment = text.slice(
       index * HARVEST_MAX_ROW_TEXT_CHARS,
       (index + 1) * HARVEST_MAX_ROW_TEXT_CHARS
     );
@@ -240,11 +219,13 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
     role: message.role,
   };
   const texts = message.parts
-    .map((part) => ({ part, text: neutralizeHarvestText(partToText(part).trim()) }))
-    .filter(({ text }) => text !== "");
+    .map((part) => ({ part, rowText: rowTextOfPart(part) }))
+    .filter(({ rowText }) => rowText.text !== "");
   if (texts.length === 0) return [{ ...base, text: "", truncated: false }];
 
-  const pieces = texts.flatMap(({ part, text }, index) => piecesOfPart(part, index + 1, text));
+  const pieces = texts.flatMap(({ part, rowText }, index) =>
+    piecesOfPart(part, index + 1, rowText)
+  );
   const groups: HarvestPiece[][] = [];
   let groupChars = 0;
   for (const piece of pieces) {
