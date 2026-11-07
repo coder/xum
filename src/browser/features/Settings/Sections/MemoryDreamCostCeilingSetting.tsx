@@ -28,7 +28,9 @@ function parseCeiling(draft: string): ParsedCeiling {
   if (trimmed === "") return { usd: undefined };
   if (THOUSANDS_LOOKALIKE_PATTERN.test(trimmed)) return { error: AMBIGUOUS_CEILING_MESSAGE };
   if (!DECIMAL_PATTERN.test(trimmed)) return { error: INVALID_CEILING_MESSAGE };
-  const usd = Number(trimmed.replace(",", "."));
+  // Whole cents: the refusal prints the ceiling to the cent, so a ceiling of 0.019 would read as
+  // "over the 0.02 USD ceiling" for an estimate that prints as 0.02. The field then shows 0.02.
+  const usd = Math.round(Number(trimmed.replace(",", ".")) * 100) / 100;
   return usd >= MEMORY_DREAM_COST_CEILING_MIN_USD && usd <= MEMORY_DREAM_COST_CEILING_MAX_USD
     ? { usd }
     : { error: INVALID_CEILING_MESSAGE };

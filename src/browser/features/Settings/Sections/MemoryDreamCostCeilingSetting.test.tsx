@@ -207,6 +207,24 @@ describe("MemoryDreamCostCeilingSetting", () => {
     }
   );
 
+  // The refusal prints the ceiling to the cent, and an estimate over a ceiling of 0.019 would
+  // print as 0.02 too, "over the 0.02 USD ceiling". A ceiling in whole cents never reads so.
+  test.each([
+    ["0.019", 0.02],
+    ["0.014", 0.01],
+    ["1.499", 1.5],
+  ])("rounds %p to the cent, %d, and shows the rounded ceiling", async (keys, ceiling) => {
+    const { view, input, saved, type, blur } = await renderSetting();
+
+    type(keys);
+    expect(view.queryByRole("alert")).toBeNull();
+    await blur();
+
+    expect(writes).toEqual([{ memory: { dreamCostCeilingUsd: ceiling } }]);
+    expect(saved()?.dreamCostCeilingUsd).toBe(ceiling);
+    expect(input.value).toBe(String(ceiling));
+  });
+
   test("takes a ceiling up to the largest one, and shows it in plain digits", async () => {
     const { view, input, saved, type, blur } = await renderSetting({
       memory: { dreamCostCeilingUsd: 2 },
