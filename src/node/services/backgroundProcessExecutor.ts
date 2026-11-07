@@ -314,6 +314,9 @@ export async function spawnProcess(
     quotePath,
   });
 
+  // The spawn shell exits as soon as it has started the process, which keeps running and needs
+  // its network allow list until it ends: the handle releases it then.
+  let releaseSandboxNetwork = (): void => undefined;
   try {
     // No timeout - the spawn command backgrounds the process and returns immediately
     const result = await execBuffered(runtime, spawnCommand, {
@@ -322,10 +325,12 @@ export async function spawnProcess(
       // The command starts in FALLBACK_CWD and cd's into the workspace, which the sandbox opens.
       sandboxRoots: backgroundSandboxRoots(options),
       sandbox: options.sandbox,
+      keepSandboxNetwork: (release) => (releaseSandboxNetwork = release),
     });
 
     if (result.exitCode !== 0) {
       log.debug(`BackgroundProcessExecutor.spawnProcess: spawn command failed: ${result.stderr}`);
+      releaseSandboxNetwork();
       await removeOutputDirBestEffort();
       return {
         success: false,
@@ -344,6 +349,8 @@ export async function spawnProcess(
       // command running with no durable trace for archive gating to see. (Remote records
       // cannot feed the local probe; remote crash-orphan gating is tracked in #3944.)
       log.debug(`BackgroundProcessExecutor.spawnProcess: Invalid PID: ${result.stdout}`);
+      // No handle will exist to release the allow list later.
+      releaseSandboxNetwork();
       return {
         success: false,
         error: `Failed to get valid PID from spawn: ${result.stdout}`,
@@ -359,9 +366,17 @@ export async function spawnProcess(
     const probe: SpawnRecordProbe = spawnRecordsAreHostLocal(runtime)
       ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath)
       : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath);
-    const handle = new RuntimeBackgroundHandle(runtime, pid, outputDir, quotePath, probe);
+    const handle = new RuntimeBackgroundHandle(
+      runtime,
+      pid,
+      outputDir,
+      quotePath,
+      probe,
+      releaseSandboxNetwork
+    );
     return { success: true, handle, pid, outputDir };
   } catch (error) {
+    releaseSandboxNetwork();
     const errorMessage = errorMsg(error);
     log.debug(`BackgroundProcessExecutor.spawnProcess: Error: ${errorMessage}`);
     // Post-dispatch ambiguity: a transport-level throw (an SSH/Coder channel or container
@@ -670,7 +685,9 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly pid: number,
     public readonly outputDir: string,
     private readonly quotePath: (p: string) => string,
-    private readonly probe: SpawnRecordProbe
+    private readonly probe: SpawnRecordProbe,
+    /** Ends the process's sandbox network allow list (ExecOptions.keepSandboxNetwork). */
+    private readonly releaseSandboxNetwork: () => void
   ) {
     if (spawnRecordsAreHostLocal(runtime)) {
       this.localProcess = getLocalProcessEvidence(pid);
@@ -694,6 +711,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     if (parsed == null && marker.trim().length > 0) {
       throw new Error(`getExitCode marker is not a number: ${marker.trim().slice(0, 32)}`);
     }
+    if (parsed != null) this.releaseSandboxNetwork();
     return parsed;
   }
 
@@ -739,14 +757,12 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);
     }
+    this.releaseSandboxNetwork();
   }
 
-  /**
-   * Clean up resources.
-   * No resources to clean - process runs independently via nohup.
-   */
+  /** Called once the manager is done with the process, which runs independently via nohup. */
   async dispose(): Promise<void> {
-    // No resources to clean up
+    this.releaseSandboxNetwork();
   }
 
   /**

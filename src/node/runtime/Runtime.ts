@@ -96,6 +96,13 @@ export interface ExecOptions {
    * the workspace of a background command that starts in /tmp and cd's into it.
    */
   sandboxRoots?: string[];
+  /**
+   * Hands the end of the sandbox's network allow list to the caller (local runtimes, when the
+   * sandbox applies). Without it the list ends when the command's shell exits, so a command that
+   * leaves a process running after that (background bash) passes this and calls `release` once
+   * that process ends. `release` may run more than once.
+   */
+  keepSandboxNetwork?: (release: () => void) => void;
 }
 
 export type BackgroundMonitorProbeResult<T> =
