@@ -694,9 +694,9 @@ export class BackupService {
       );
       // The list is rewritten from this machine's installs, so a plugin only the backup lists
       // (a restore installs none) disappears from it. Removing is the user's call, bound to
-      // exactly the removed names like the secret override below. Checked first, so a refusal
-      // for secrets never hides a removal the user has not seen: each approval then survives the
-      // other's round trip.
+      // exactly the removed names like the secret override below. This check runs first: the
+      // Backup section drops a secret override when any other refusal comes back, so asking for
+      // the removal second would make the user approve the secrets twice.
       const removal = exported.pluginRemoval;
       if (removal !== undefined && approvedPluginRemovalDigest !== removal.approval) {
         throw new BackupServiceError(
