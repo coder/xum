@@ -818,9 +818,13 @@ else:
     def test_text_inserted_around_the_fold_never_reads_as_a_board(self):
         # Each regex position that tolerated extra text let a hidden finding pass (verifier
         # mutants on #7975). So a finding goes into every character gap of the fold's three tag
-        # lines, onto a line of its own at every line boundary from the marker to the closing
-        # tag, and onto the marker's line. It goes in as plain text, as an attribute and as an
-        # HTML comment, since tolerance written for any of those shapes could hide it. Every
+        # lines, and onto a line of its own at six boundaries: before the marker, before the
+        # fold, between the details and summary lines, after the summary line, after the help
+        # text and before the closing tag. It also goes in place of the blank line before the
+        # closing tag, at the end of the help text, after the fold and onto the marker's line.
+        # It goes in as plain text, as an attribute and as an HTML comment, since tolerance
+        # written for any of those shapes could hide it. The template carries the three
+        # metadata lines (marker, review state, security) that every real fold has. Every
         # such body must block at once and show the finding: never read completed (0) or
         # running (10). One jq process applies the gate's own classifier to all of them, since
         # a gate run per body took minutes; the real gate checks one body per position kind.
@@ -833,7 +837,7 @@ else:
         end = "\n\n</details>"
         cases, gate_cases = [], []
         for label, exact in ((COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
-            fold = collapsed(FIXTURES["summary"]["body"], label)
+            fold = collapsed(FIXTURES["review_state_summary"]["body"], label)
             opening = fold.index("\n<details>\n<summary><strong>") + 1
             summary = opening + len("<details>\n")
             summary_end = fold.index("</summary>\n", summary) + len("</summary>")
