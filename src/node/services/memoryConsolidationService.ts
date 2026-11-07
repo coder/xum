@@ -60,6 +60,7 @@ import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
+import { assertNever } from "@/common/utils/assertNever";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
@@ -67,7 +68,11 @@ import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
-import { runMemoryHarvest, type HarvestProgress } from "@/node/services/memoryHarvest";
+import {
+  runMemoryHarvest,
+  type ChunkStreamGate,
+  type HarvestProgress,
+} from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -419,7 +424,8 @@ export class MemoryConsolidationService extends EventEmitter {
   private readonly inFlight = new Map<string, Promise<Result<MemoryConsolidationRecord, string>>>();
 
   /**
-   * Tail of the service-wide dream-stream queue (see runDreamStreamExclusively).
+   * Tail of the service-wide memory-stream queue (see runDreamStreamExclusively): dream streams
+   * and each analyzer chunk's stream.
    * `inFlight` is per owner workspace, so two workspaces of one project (or any
    * two, through global memory) could otherwise run the organizer over the same
    * files at once. Never rejects: each link settles when its stream is done or
@@ -428,10 +434,19 @@ export class MemoryConsolidationService extends EventEmitter {
   private dreamStreamTail: Promise<void> = Promise.resolve();
 
   /**
-   * Analyzer-stream queue, keyed by the workspace-memory owner. `harvestInFlight` is per
-   * compaction boundary, so two boundaries of one workspace, or an owner and its sub-agent
-   * (which share the owner's /memories/workspace store), could otherwise edit the same files at
-   * once: the model's numeric `insert` line offsets go stale after the other run's insert.
+   * Analyzer-job queue, keyed by the workspace-memory owner. `harvestInFlight` is per compaction
+   * boundary, so two boundaries of one workspace, or an owner and its sub-agent (which share the
+   * owner's /memories/workspace store), could otherwise run their chunks interleaved: a job
+   * should read what the one ahead of it wrote, and its chunks follow one another.
+   *
+   * This queue alone does not keep the model's read-to-insert sequences apart: the numeric
+   * `insert` line offset it read goes stale after another stream's insert, and a dream, or a
+   * second backend's analyzer, is not behind this queue. That is the dream exclusion's job
+   * (runDreamStreamExclusively), which every chunk's stream takes (runAnalyzerChunkExclusively).
+   *
+   * LOCK ORDER: a job's turn here, then the exclusion, never the reverse. The exclusion is held
+   * for one stream, and nothing that runs inside it waits for a turn here or runs an analyzer
+   * (the in-process tail is not reentrant), so no chain of waits can close into a cycle.
    */
   private readonly analyzerStreams = new KeyedTurnQueue();
 
@@ -976,9 +991,9 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
-   * Run one dream stream once every earlier queued one has settled, so at most
-   * one consolidation stream runs at a time across ALL workspaces (harvests are
-   * not queued here). The in-process queue orders this backend's runs; behind
+   * Run one memory-writing stream once every earlier queued one has settled, so at most
+   * one dream stream or analyzer chunk stream (runAnalyzerChunkExclusively) runs at a time
+   * across ALL workspaces. The in-process queue orders this backend's runs; behind
    * it, a cross-process lock excludes a second backend on the same root (the
    * target locks only serialize single memory commands, not the model's
    * read/decide/write pass). Nothing starts, and `cancelled` comes back, when
@@ -987,8 +1002,9 @@ export class MemoryConsolidationService extends EventEmitter {
    * so that per-workspace try-lock keeps its call-order semantics.
    *
    * `stream` must settle with the provider/tool stream and nothing after it:
-   * everything it awaits holds up every later dream (see consolidate's usage
-   * capture in runLockedEffect).
+   * everything it awaits holds up every later stream (see consolidate's usage
+   * capture in runLockedEffect). It must not wait for an analyzer turn or run an analyzer, or
+   * start another stream behind this queue: the in-process tail is not reentrant.
    */
   private async runDreamStreamExclusively<T>(
     signal: AbortSignal,
@@ -1028,6 +1044,35 @@ export class MemoryConsolidationService extends EventEmitter {
     } finally {
       release();
     }
+  }
+
+  /**
+   * The gate of one analyzer job's chunks (see ChunkStreamGate): each chunk's model stream runs
+   * inside the dream exclusion, so it never interleaves its read-to-insert sequences with a
+   * dream's or another analyzer's, in this process or another. A chunk, not the job, takes the
+   * exclusion: its lock waiters give up after one consolidation timeout, which a job of many
+   * chunks could outlast. `signal` is the job's removal: a chunk still waiting is cancelled.
+   */
+  private runAnalyzerChunkExclusively(signal: AbortSignal): ChunkStreamGate {
+    return async (stream) => {
+      const turn = await this.runDreamStreamExclusively(signal, stream);
+      switch (turn.outcome) {
+        case "ran":
+          return { started: true, value: turn.value };
+        case "cancelled":
+          return {
+            started: false,
+            reason: "workspace removal cancelled it while it waited for its turn",
+          };
+        case "lock-failed":
+          return {
+            started: false,
+            reason: `could not take the consolidation lock: ${turn.error}`,
+          };
+        default:
+          return assertNever(turn);
+      }
+    };
   }
 
   /** The actual run; only ever invoked by maybeRun while holding the lock. */
@@ -1410,8 +1455,9 @@ export class MemoryConsolidationService extends EventEmitter {
           opts.projectPath
         );
 
-      // One analyzer at a time per owner store. The chunk timeouts start inside runMemoryHarvest,
-      // so they bound the run and never the wait behind another one.
+      // One analyzer job at a time per owner store (analyzerStreams), and each chunk's stream
+      // inside the dream exclusion (streamGate). The chunk timeouts start inside runMemoryHarvest,
+      // once the chunk holds it, so they bound the stream and never the wait behind another one.
       const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId);
       // Each clean chunk's usage is recorded after the owner's turn is released, not inside it.
       const usageRecorder = createDeferredUsageRecorder("MemoryHarvest", metadata.workspaceId);
@@ -1436,6 +1482,7 @@ export class MemoryConsolidationService extends EventEmitter {
                 },
                 // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
                 abortSignal: opts.removalSignal,
+                streamGate: self.runAnalyzerChunkExclusively(opts.removalSignal),
                 recordUsage: (usage, providerMetadata) =>
                   usageRecorder.defer(async () => {
                     const recorded = await self.sessionUsageService?.recordHeadlessUsage(

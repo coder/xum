@@ -414,6 +414,21 @@ function budgetSpentNote(firstSkipped: number, total: number): string {
   return `edit budget spent: chunks ${firstSkipped}-${total} of ${total} were not read`;
 }
 
+/** Where a chunk's turn ended up (see ChunkStreamGate). */
+export type ChunkStreamTurn<T> =
+  | { started: true; value: T }
+  /** `stream` never ran; `reason` says why (the wait was cancelled, or the lock failed). */
+  | { started: false; reason: string };
+
+/**
+ * How the caller runs one chunk's model stream: it runs `stream` once nothing else may write the
+ * owner's workspace memory, and never when it cannot get that turn. Each chunk goes through the
+ * gate, not the whole run, so the caller's exclusion is held for one stream and never for the
+ * chunks of a long epoch together. The chunk's timeout starts inside `stream`, so it bounds the
+ * stream and never the wait for the turn.
+ */
+export type ChunkStreamGate = <T>(stream: () => Promise<T>) => Promise<ChunkStreamTurn<T>>;
+
 /** Streams one analyzer chunk to its end. `label` names the chunk in an error ("2/3"). */
 async function analyzeChunk(args: {
   model: LanguageModel;
@@ -485,6 +500,12 @@ export async function runMemoryHarvest(args: {
    * service persists it, so a crash between chunks does not repeat the chunks that landed.
    */
   onChunkComplete?: (progress: HarvestProgress) => Promise<void>;
+  /**
+   * Required, so no caller can stream a chunk without deciding what excludes the other writers of
+   * the store: the model reads a file and then inserts at a numeric line offset, which another
+   * run's insert in between makes stale.
+   */
+  streamGate: ChunkStreamGate;
   /** Workspace removal; each chunk's own timeout is combined with it. */
   abortSignal?: AbortSignal;
   /** Timeout for each chunk's stream. Default: MEMORY_CONSOLIDATION_TIMEOUT_MS. */
@@ -495,6 +516,8 @@ export async function runMemoryHarvest(args: {
    * (with cache-token breakdown) into session-usage.json. providerMetadata
    * is step-accumulated — Anthropic reports billed cache-write tokens only
    * there, so dropping it would price cache writes as ordinary input.
+   * Called while the chunk holds the stream gate, so it must return at once: a caller
+   * with anything slow to do defers it until the run is over.
    */
   recordUsage?: (
     usage: LanguageModelV2Usage,
@@ -535,40 +558,51 @@ export async function runMemoryHarvest(args: {
       finishedOps = priorOps.length + journal.length;
       break;
     }
-    // Own timeout per chunk: a long epoch must not run out of time on its later chunks. The same
-    // signal guards the chunk's memory tool, so a mutation still in flight when it fires is refused.
-    const timeout = AbortSignal.timeout(args.chunkTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS);
-    const signal =
-      args.abortSignal === undefined ? timeout : AbortSignal.any([timeout, args.abortSignal]);
-    const { tool: memoryTool } = createConsolidationMemoryTool({
-      memoryService: args.memoryService,
-      metaService: args.metaService,
-      ctx: args.ctx,
-      dryRun: false,
-      journal,
-      budget,
-      abortSignal: signal,
-      writableScopes: ["workspace"],
-      // The cookbook's analyzers only add and correct; removing and moving files is the organizer's.
-      deniedCommands: ["delete", "rename"],
-      rejectSecretLike: true,
-      description: ANALYZER_TOOL_DESCRIPTION,
+    const label = `${index + 1}/${chunks.length}`;
+    const prompt = buildChunkPrompt({
+      summary: args.summary,
+      index,
+      total: chunks.length,
+      transcript: chunks[index].transcript,
+      landedOps: index === resumed.startChunk ? resumed.landedInStartChunk : undefined,
     });
-    const outcome = await analyzeChunk({
-      model: args.model,
-      memoryTool,
-      prompt: buildChunkPrompt({
-        summary: args.summary,
-        index,
-        total: chunks.length,
-        transcript: chunks[index].transcript,
-        landedOps: index === resumed.startChunk ? resumed.landedInStartChunk : undefined,
-      }),
-      signal,
-      label: `${index + 1}/${chunks.length}`,
-      recordUsage: args.recordUsage,
-      pricingModel: args.pricingModel,
+    const turn = await args.streamGate(async () => {
+      // Own timeout per chunk: a long epoch must not run out of time on its later chunks. Created
+      // here, once the gate let the chunk start, so it never counts the wait for the gate. The
+      // same signal guards the chunk's memory tool, so a mutation still in flight when it fires
+      // is refused.
+      const timeout = AbortSignal.timeout(args.chunkTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS);
+      const signal =
+        args.abortSignal === undefined ? timeout : AbortSignal.any([timeout, args.abortSignal]);
+      const { tool: memoryTool } = createConsolidationMemoryTool({
+        memoryService: args.memoryService,
+        metaService: args.metaService,
+        ctx: args.ctx,
+        dryRun: false,
+        journal,
+        budget,
+        abortSignal: signal,
+        writableScopes: ["workspace"],
+        // The cookbook's analyzers only add and correct; removing and moving files is the organizer's.
+        deniedCommands: ["delete", "rename"],
+        rejectSecretLike: true,
+        description: ANALYZER_TOOL_DESCRIPTION,
+      });
+      return analyzeChunk({
+        model: args.model,
+        memoryTool,
+        prompt,
+        signal,
+        label,
+        recordUsage: args.recordUsage,
+        pricingModel: args.pricingModel,
+      });
     });
+    // Ends the run like a failed stream: no model call was made, so the cursor stays on this
+    // chunk and nothing it would write is repeated.
+    const outcome: ChunkOutcome = turn.started
+      ? turn.value
+      : { streamError: `memory analysis of chunk ${label} did not start: ${turn.reason}` };
     if (outcome.streamError !== undefined) {
       streamError = outcome.streamError;
       break;
