@@ -41,10 +41,13 @@ function renderCards(cards: Array<{ toolCallId: string; isLatest: boolean }>) {
         {cards.map((card) => (
           <SandboxApprovalCard
             key={card.toolCallId}
-            workspaceId={WORKSPACE_ID}
-            toolCallId={card.toolCallId}
+            approval={{
+              workspaceId: WORKSPACE_ID,
+              toolCallId: card.toolCallId,
+              reason: "Push over SSH needs the ssh-agent socket.",
+              timestamp: 1,
+            }}
             script="git push origin HEAD"
-            reason="Push over SSH needs the ssh-agent socket."
             isLatest={card.isLatest}
           />
         ))}

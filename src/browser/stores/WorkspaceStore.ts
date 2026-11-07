@@ -87,6 +87,7 @@ import {
   type ReasoningDeltaEvent,
   type StreamStartEvent,
   type RuntimeStatusEvent,
+  type BashSandboxApprovalEvent,
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
@@ -529,10 +530,10 @@ export interface WorkflowToolLiveRunState {
 }
 
 /** A bash call that waits for the user to let it run once outside the sandbox. */
-export interface BashSandboxApprovalView {
-  reason: string;
-  timestamp: number;
-}
+export type BashSandboxApprovalView = Pick<
+  BashSandboxApprovalEvent,
+  "workspaceId" | "toolCallId" | "reason" | "timestamp"
+>;
 
 interface WorkspaceChatTransientState {
   /** The current attempt delivered its caught-up: live events now flow to the aggregator. */
@@ -789,6 +790,31 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     liveWorkflowRuns: new Map(),
     autoRetryStatus: null,
   };
+}
+
+/** Drops the live state of tool calls the transcript no longer shows. */
+function deleteInactiveToolCalls(liveState: Map<string, unknown>, activeToolCallIds: Set<string>) {
+  for (const toolCallId of Array.from(liveState.keys())) {
+    if (!activeToolCallIds.has(toolCallId)) liveState.delete(toolCallId);
+  }
+}
+
+/** Clears the live tool-call UI that a caught-up makes stale. */
+function clearStaleLiveToolState(
+  transient: WorkspaceChatTransientState,
+  replay: { replacesHistory: boolean; streamGone: boolean }
+): void {
+  // Live tool-call UI is tied to the active stream context; clear it when replay
+  // replaces history, reports no active stream, or reports a different stream ID.
+  if (replay.replacesHistory || replay.streamGone) {
+    transient.liveBashOutput.clear();
+    transient.liveWorkflowRuns.clear();
+    transient.liveTaskIds.clear();
+  }
+  // The server never replays a pending approval, so a full replay of the same stream keeps its
+  // card; a stream that ended or changed while disconnected no longer waits. Approvals sent
+  // during this replay are buffered and apply after this.
+  if (replay.streamGone) transient.sandboxApprovals.clear();
 }
 
 /**
@@ -1449,6 +1475,9 @@ export class WorkspaceStore {
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
       this.applyStreamingDelta(workspaceId, aggregator, data as ToolCallDeltaEvent);
+    },
+    "bash-sandbox-approval": (workspaceId, _aggregator, data) => {
+      if (isBashSandboxApprovalEvent(data)) this.applySandboxApproval(workspaceId, data);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -2788,23 +2817,9 @@ export class WorkspaceStore {
       }
     }
 
-    for (const toolCallId of Array.from(transient.liveBashOutput.keys())) {
-      if (!activeBashToolCallIds.has(toolCallId)) {
-        transient.liveBashOutput.delete(toolCallId);
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.sandboxApprovals.keys())) {
-      if (!activeBashToolCallIds.has(toolCallId)) {
-        transient.sandboxApprovals.delete(toolCallId);
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveWorkflowRuns.keys())) {
-      if (!activeWorkflowToolCallIds.has(toolCallId)) {
-        transient.liveWorkflowRuns.delete(toolCallId);
-      }
-    }
+    deleteInactiveToolCalls(transient.liveBashOutput, activeBashToolCallIds);
+    deleteInactiveToolCalls(transient.sandboxApprovals, activeBashToolCallIds);
+    deleteInactiveToolCalls(transient.liveWorkflowRuns, activeWorkflowToolCallIds);
   }
 
   /**
@@ -2833,6 +2848,18 @@ export class WorkspaceStore {
     // Important: return the stored object reference so useSyncExternalStore sees a stable snapshot.
     // (Returning a fresh object every call can trigger an infinite re-render loop.)
     return state ?? null;
+  }
+
+  private applySandboxApproval(workspaceId: string, data: BashSandboxApprovalEvent): void {
+    const approvals = this.assertChatTransientState(workspaceId).sandboxApprovals;
+    if (data.pending) {
+      const { toolCallId, reason, timestamp } = data;
+      approvals.set(toolCallId, { workspaceId, toolCallId, reason, timestamp });
+    } else if (!approvals.delete(data.toolCallId)) {
+      return;
+    }
+    // Low-frequency, and the user acts on it: bump at once like task-created.
+    this.states.bump(workspaceId);
   }
 
   getBashSandboxApproval(workspaceId: string, toolCallId: string): BashSandboxApprovalView | null {
@@ -5416,7 +5443,6 @@ export class WorkspaceStore {
     return (
       data.type in this.bufferedEventHandlers ||
       data.type === "bash-output" ||
-      data.type === "bash-sandbox-approval" ||
       data.type === "task-created" ||
       data.type === "workflow-run-attached"
     );
@@ -5576,19 +5602,10 @@ export class WorkspaceStore {
         aggregator.setWindowSeed(data.windowSeed ?? null);
       }
 
-      if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
-        // Live tool-call UI is tied to the active stream context; clear it when replay
-        // replaces history, reports no active stream, or reports a different stream ID.
-        transient.liveBashOutput.clear();
-        transient.liveWorkflowRuns.clear();
-        transient.liveTaskIds.clear();
-      }
-      if (!data.cursor?.stream || streamContextMismatched) {
-        // The server never replays a pending approval, so a full replay of the same stream keeps
-        // its card; a stream that ended or changed while disconnected no longer waits. Approvals
-        // sent during this replay are buffered and apply after this.
-        transient.sandboxApprovals.clear();
-      }
+      clearStaleLiveToolState(transient, {
+        replacesHistory: replay === "full",
+        streamGone: !data.cursor?.stream || streamContextMismatched,
+      });
 
       if (sinceContext) {
         // Since replay: the replayed rows are the authoritative suffix for
@@ -5889,21 +5906,6 @@ export class WorkspaceStore {
         ...(nextRun != null ? { run: nextRun } : {}),
       });
 
-      this.states.bump(workspaceId);
-      return;
-    }
-
-    if (isBashSandboxApprovalEvent(data)) {
-      const transient = this.assertChatTransientState(workspaceId);
-      if (data.pending) {
-        transient.sandboxApprovals.set(data.toolCallId, {
-          reason: data.reason,
-          timestamp: data.timestamp,
-        });
-      } else if (!transient.sandboxApprovals.delete(data.toolCallId)) {
-        return;
-      }
-      // Low-frequency, and the user acts on it: bump at once like task-created.
       this.states.bump(workspaceId);
       return;
     }
@@ -6241,7 +6243,7 @@ export function useBashSandboxApproval(
   const latestToolCallId = useSyncExternalStore(subscribe, () =>
     workspaceId ? store.getLatestBashSandboxApprovalToolCallId(workspaceId) : null
   );
-  return approval ? { approval, isLatest: latestToolCallId === toolCallId } : null;
+  return approval ? { approval, isLatest: latestToolCallId === approval.toolCallId } : null;
 }
 
 /**
