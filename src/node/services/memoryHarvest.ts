@@ -295,7 +295,7 @@ export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
  * but never an id. Null when none is (rewound away, or in another epoch): there is no floor.
  */
 export function analyzedFloorRowId(
-  rows: readonly Pick<MuxMessage, "id">[],
+  rows: ReadonlyArray<Pick<MuxMessage, "id">>,
   analyzedRowIds: ReadonlySet<string>
 ): string | null {
   return rows.findLast((row) => analyzedRowIds.has(row.id))?.id ?? null;
