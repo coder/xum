@@ -43,16 +43,21 @@ function agentSandboxOf(value: unknown): unknown {
 function projectAgentSandboxes(document: unknown): Map<string, unknown[]> {
   const projects = (document as { projects?: unknown } | null)?.projects;
   const byProject = new Map<string, unknown[]>();
-  if (!Array.isArray(projects)) return byProject;
-  for (const entry of projects) {
-    if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
-    const key = stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
-    byProject.set(key, [...(byProject.get(key) ?? []), agentSandboxOf(entry[1])]);
+  for (const entry of Array.isArray(projects) ? projects : []) {
+    const key = projectKeyOf(entry);
+    if (key === undefined) continue;
+    byProject.set(key, [...(byProject.get(key) ?? []), agentSandboxOf((entry as unknown[])[1])]);
   }
   for (const [key, values] of byProject) {
     if (values.every((value) => value === undefined)) byProject.set(key, []);
   }
   return byProject;
+}
+
+/** The project path of a stored `[path, config]` entry, normalized like Config does. */
+function projectKeyOf(entry: unknown): string | undefined {
+  if (!Array.isArray(entry) || typeof entry[0] !== "string") return undefined;
+  return stripTrailingSlashes(entry[0] === "" ? "/" : entry[0]);
 }
 
 /** Whether `next` changes agentSandbox by value, globally or in any project (added, edited or removed). */
@@ -64,6 +69,49 @@ export function changesAgentSandbox(current: unknown, next: unknown): boolean {
     if (!isDeepStrictEqual(before.get(key) ?? [], after.get(key) ?? [])) return true;
   }
   return false;
+}
+
+/** Applies `args.operations` to the stored document and writes it, unless a guard refuses. */
+async function rewriteConfigDocument(
+  xumHome: string,
+  args: XumConfigWriteToolArgs,
+  lock: ProjectRegistrationLockHandle | null
+): Promise<XumConfigWriteToolResult> {
+  const registryEntry = CONFIG_FILE_REGISTRY[args.file];
+  const currentDocument = await readConfigDocumentUnvalidated(xumHome, args.file);
+  const mutationResult = applyMutations(currentDocument, args.operations, registryEntry.schema, {
+    rootContainer: registryEntry.rootContainer,
+  });
+
+  if (!mutationResult.success) {
+    return {
+      success: false,
+      error: mutationResult.error,
+      validationIssues: mutationResult.validationIssues?.map((issue) => ({
+        path: issue.path.filter(
+          (segment): segment is string | number => typeof segment !== "symbol"
+        ),
+        message: issue.message,
+      })),
+    };
+  }
+
+  // The sandbox confines the agent, so the agent must not be able to turn it off.
+  if (changesAgentSandbox(currentDocument, mutationResult.document)) {
+    return {
+      success: false,
+      error: "Refusing to change agentSandbox. Only the user can change it in Settings.",
+    };
+  }
+
+  await lock?.assertStillOwned();
+  await writeConfigDocument(xumHome, args.file, mutationResult.document);
+  return {
+    success: true,
+    file: args.file,
+    appliedOps: mutationResult.appliedOps,
+    summary: `Applied ${mutationResult.appliedOps} operation(s) to ${args.file}`,
+  };
 }
 
 export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration) => {
@@ -94,48 +142,8 @@ export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration)
 
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const xumHome = config.xumScope!.xumHome;
-        const registryEntry = CONFIG_FILE_REGISTRY[args.file];
-        const rewrite = async (
-          lock: ProjectRegistrationLockHandle | null
-        ): Promise<XumConfigWriteToolResult> => {
-          const currentDocument = await readConfigDocumentUnvalidated(xumHome, args.file);
-          const mutationResult = applyMutations(
-            currentDocument,
-            args.operations,
-            registryEntry.schema,
-            { rootContainer: registryEntry.rootContainer }
-          );
-
-          if (!mutationResult.success) {
-            return {
-              success: false,
-              error: mutationResult.error,
-              validationIssues: mutationResult.validationIssues?.map((issue) => ({
-                path: issue.path.filter(
-                  (segment): segment is string | number => typeof segment !== "symbol"
-                ),
-                message: issue.message,
-              })),
-            };
-          }
-
-          // The sandbox confines the agent, so the agent must not be able to turn it off.
-          if (changesAgentSandbox(currentDocument, mutationResult.document)) {
-            return {
-              success: false,
-              error: "Refusing to change agentSandbox. Only the user can change it in Settings.",
-            };
-          }
-
-          await lock?.assertStillOwned();
-          await writeConfigDocument(xumHome, args.file, mutationResult.document);
-          return {
-            success: true,
-            file: args.file,
-            appliedOps: mutationResult.appliedOps,
-            summary: `Applied ${mutationResult.appliedOps} operation(s) to ${args.file}`,
-          };
-        };
+        const rewrite = (lock: ProjectRegistrationLockHandle | null) =>
+          rewriteConfigDocument(xumHome, args, lock);
         // config.json carries the project set, and this rewrites the whole document from the
         // bytes it read: like every Config.editConfig save it has to happen under the project
         // registration lock, or a value-only edit here would drop a project a settings-backup
