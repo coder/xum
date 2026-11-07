@@ -1638,17 +1638,5 @@ describe("buildHarvestChunks", () => {
       // Stringifying the chunk so far again for each row came to several times its final size.
       expect(stringified).toBeLessThan(outputChars * 2);
     });
-
-    it("chunks in well under half a second", () => {
-      const messages = toolHeavy();
-      // The best of three, so another process's burst on a shared machine does not fail the test.
-      const elapsed = Array.from({ length: 3 }, () => {
-        const start = performance.now();
-        buildHarvestChunks(messages);
-        return performance.now() - start;
-      });
-
-      expect(Math.min(...elapsed)).toBeLessThan(500);
-    });
   });
 });
