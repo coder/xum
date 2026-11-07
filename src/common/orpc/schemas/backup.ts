@@ -90,6 +90,13 @@ const BackupPluginUrlSchema = z
   .refine((url) => !/^[\\/]{2}/.test(url), {
     message: "A repository URL must not be a network share",
   })
+  // An export never writes a file: source (it is local to the machine that installed it), so
+  // only a tampered list carries one. On Windows, file://host/share and file:////host/share are
+  // UNC shares: the preview's fetch would open SMB, which can send the user's credentials before
+  // any consent.
+  .refine((url) => !/^file:/i.test(url), {
+    message: "A repository URL must not be a file: URL",
+  })
   .refine((url) => !UNSAFE_URL_CHARACTERS.test(url), {
     message: "A repository URL must not contain whitespace or control characters",
   })
