@@ -218,29 +218,59 @@ describe("backup of the managed plugin list", () => {
       expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
     });
 
-    it("leaves a row the restore side would refuse out of the list, not out of the push", async () => {
-      await writeRegistry(muxRoot, [
-        registryRow("alpha"),
-        registryRow("oversized", {
+    it.each([
+      [
+        "more than 512 imported skills",
+        {
+          importedComponents: {
+            skills: Array.from({ length: 513 }, (_, index) => `skill-${index}`),
+            mcpServers: [],
+          },
+        },
+        "importedComponents.skills",
+      ],
+      [
+        "a repository URL over 2048 characters",
+        {
           source: {
             type: "git",
             url: `https://github.com/example/${"x".repeat(3000)}.git`,
             ref: "main",
             refType: "branch",
           },
-        }),
-        registryRow("unpinned", { lockedSha: "abc123" }),
-        registryRow("dash-url", {
-          source: { type: "git", url: "-oProxyCommand=x", ref: "main", refType: "branch" },
-        }),
-      ]);
-      const { payload, managed, request } = await prepare();
+        },
+        "source.url",
+      ],
+      [
+        "whitespace in its URL",
+        {
+          source: {
+            type: "git",
+            url: "https://github.com/example/two words.git",
+            ref: "main",
+            refType: "branch",
+          },
+        },
+        "source.url",
+      ],
+      ["a commit that is not a full id", { lockedSha: "abc123" }, "lockedSha"],
+    ])(
+      "refuses the push for a plugin with %s, naming the plugin and the way out",
+      async (_label, overrides, field) => {
+        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("too-big", overrides)]);
+        const { payload, managed, request } = await prepare();
 
-      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+        const error = (await captureRejection(
+          payload.exportTo({ ...request, contents: DEFAULT_CONTENTS })
+        )) as { code?: string; message: string };
 
-      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
-      expect(sidecar.plugins.map((p) => p.name)).toEqual(["alpha"]);
-    });
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain('"too-big"');
+        expect(error.message).toContain(field);
+        expect(error.message).toContain('Turning off "Agent plugins"');
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      }
+    );
 
     it("leaves out a plugin installed from a path, a file URL or a host on this machine, and logs it", async () => {
       const info = spyOn(log, "info").mockImplementation(() => undefined);

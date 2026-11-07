@@ -152,6 +152,10 @@ async function readInstallSnapshot(
   }
 }
 
+/**
+ * The portable entry of one install, or null for a plugin the backup leaves out on purpose (logged
+ * by name, and listed in the docs). An install the list cannot hold throws instead.
+ */
 function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
   // Another machine cannot use a path or a loopback host on this one, and the list would publish it
   // (the home folder names the user). The plugin is logged by name only, so its absence from the
@@ -182,12 +186,12 @@ function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | n
     importedComponents: install.importedComponents,
   });
   if (!parsed.success) {
-    // A row the restore side would refuse must not make every restore of this backup fail.
-    log.warn("Leaving a plugin out of the settings backup", {
-      plugin: install.name,
-      error: getErrorMessage(parsed.error),
-    });
-    return null;
+    // A row the restore side would refuse. Leaving it out would drop the plugin from the backup
+    // without a word, so the push fails, like it does for a registry this build cannot read whole.
+    throw new BackupServiceError(
+      "IO_ERROR",
+      `The installed plugin "${install.name}" cannot be listed in the backup: ${formatZodIssues(parsed.error.issues.slice(0, 2))}. ${AGENT_PLUGINS_OFF_HINT}`
+    );
   }
   return parsed.data;
 }

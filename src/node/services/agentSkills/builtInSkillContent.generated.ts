@@ -7550,6 +7550,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "One backup lists at most 512 plugins. With more installed, **Back up now** fails, says how many plugins are over the cap, and tells you to uninstall plugins or to turn off **Agent plugins**.",
       "",
+      "If an installed plugin has something a backup cannot hold, such as a repository URL over 2,048 characters or more than 512 imported skills, **Back up now** fails and names the plugin and the reason. Xum does not leave that plugin out of the list. Reinstall the plugin, or turn off **Agent plugins** to back up without the list.",
+      "",
       "Xum reads the registry and the plugin folders for the list while no install, update, or uninstall runs. If one runs, the backup waits for it for up to 10 minutes. After that it fails and names the process that holds the lock.",
       "",
       "With **Agent plugins** off, a backup writes no list and removes the one already in the repository. **Back up now** asks first, and the card says that the whole list is removed. A restore skips the list and says that the backup has one.",
