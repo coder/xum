@@ -310,6 +310,89 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("x".repeat(2_100));
     });
 
+    it("shows the model every tool of a long message, in order, across chunks", async () => {
+      using fixture = createFixture();
+      const callCount = 30;
+      // 30 results of 1.5 KB make one message of about 50 KB: past one chunk and past any
+      // per-message cap. The failure and its fix usually sit in the later calls.
+      fixture.messages = [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: callCount }, (_, index) =>
+            toolPart(
+              "bash",
+              { script: `step ${index}` },
+              { output: `RESULT-${String(index).padStart(2, "0")} ${"x".repeat(1_500)}` }
+            )
+          )
+        ),
+      ];
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toBeUndefined();
+      expect(calls.length).toBeGreaterThan(1);
+      const prompts = calls.map(userPromptText).join("\n");
+      const positions = Array.from({ length: callCount }, (_, index) =>
+        prompts.indexOf(`RESULT-${String(index).padStart(2, "0")} `)
+      );
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+      expect(result.nextChunk).toBe(calls.length);
+    });
+
+    it("splits a long message into rows of one id, each saying which parts it holds", async () => {
+      using fixture = createFixture();
+      fixture.messages = [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: 12 }, (_, index) =>
+            toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+          )
+        ),
+        createMuxMessage("u1", "user", "short follow-up", { historySequence: 1 }),
+      ];
+      const { model, calls } = scriptedModel([]);
+
+      await runHarvest(fixture, model);
+
+      const prompt = calls.map(userPromptText).join("\n");
+      const rowsOfA1 = [...prompt.matchAll(/"id": "a1"[\s\S]*?"parts": "([^"]+)"/g)].map(
+        (match) => match[1]
+      );
+      expect(rowsOfA1.length).toBeGreaterThan(1);
+      expect(rowsOfA1[0]).toMatch(/^1-\d+ of 13$/);
+      expect(rowsOfA1.at(-1)).toMatch(/^\d+-13 of 13$/);
+      // A message that fits one row says nothing about parts.
+      expect(prompt).toMatch(/"id": "u1",\s+"sequence": 1,\s+"role": "user",\s+"text"/);
+    });
+
+    it("caps a single huge text part but keeps the parts after it", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          `HEAD-OF-REPLY ${"z".repeat(30_000)} TAIL-OF-REPLY`,
+          { historySequence: 0 },
+          [toolPart("bash", { script: "echo done" }, { output: "AFTER-THE-LONG-TEXT" })]
+        ),
+      ]);
+
+      expect(prompt).toContain("HEAD-OF-REPLY");
+      expect(prompt).not.toContain("TAIL-OF-REPLY");
+      expect(prompt).toContain("[truncated for memory harvest]");
+      expect(prompt).toContain("AFTER-THE-LONG-TEXT");
+    });
+
     it("caps a huge tool input", async () => {
       using fixture = createFixture();
 
