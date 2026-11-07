@@ -887,7 +887,9 @@ export class MemoryConsolidationService extends EventEmitter {
    * to be deleted, so its failed/stale-pending harvest records can never be
    * retried (recovery needs the compaction epoch's messages) — and once the
    * config entry is gone they could not even be associated with the memory
-   * owner. Mark them terminal now so nothing lingers as "retryable".
+   * owner. Mark them terminal now so nothing lingers as "retryable". The
+   * workspace's dream refusal goes too: it is keyed by the workspace whose
+   * store it describes, and nothing would ever clear it.
    */
   async finalizeHarvestsForRemoval(workspaceId: string): Promise<void> {
     // One read-check-write under the sidecar lock: residual harvest runs
@@ -896,9 +898,9 @@ export class MemoryConsolidationService extends EventEmitter {
     // write must not be overwritten with a failure.
     const finalized = await this.locks.withLock(this.sidecarPath, async () => {
       const file = await this.load();
-      const records = file.harvestsByWorkspace[workspaceId];
-      if (records === undefined) return false;
-      let changed = false;
+      let changed = file.refusalsByWorkspace[workspaceId] !== undefined;
+      delete file.refusalsByWorkspace[workspaceId];
+      const records = file.harvestsByWorkspace[workspaceId] ?? {};
       for (const [boundaryKey, record] of Object.entries(records)) {
         if (isTerminalHarvestRecord(record)) continue;
         records[boundaryKey] = finalizeHarvestRecordForRemoval(record);

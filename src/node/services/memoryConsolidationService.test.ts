@@ -2701,6 +2701,30 @@ describe("MemoryConsolidationService", () => {
         }
       });
 
+      it("drops the refusal of a workspace that is removed, and no other", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-other");
+        await setCeiling(fixture, TIGHT_CEILING_USD);
+        expectOverCeiling(await fixture.service.maybeRun("ws-dream", "compaction"));
+        expectOverCeiling(await fixture.service.maybeRun("ws-other", "compaction"));
+        const refusedWorkspaces = async () => {
+          const sidecar = JSON.parse(
+            await fsPromises.readFile(
+              path.join(fixture.xumHome, "memory-consolidation.json"),
+              "utf-8"
+            )
+          ) as { refusalsByWorkspace: Record<string, unknown> };
+          return Object.keys(sidecar.refusalsByWorkspace).sort();
+        };
+        expect(await refusedWorkspaces()).toEqual(["ws-dream", "ws-other"]);
+
+        // The workspace has no harvest records: its refusal alone must still go.
+        await fixture.service.finalizeHarvestsForRemoval("ws-dream");
+
+        expect(await refusedWorkspaces()).toEqual(["ws-other"]);
+      });
+
       it("drops a malformed refusal instead of failing the sidecar load", async () => {
         using fixture = await createFixture();
         await fsPromises.writeFile(
