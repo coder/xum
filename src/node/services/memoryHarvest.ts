@@ -5,13 +5,12 @@ import { z } from "zod";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import assert from "@/common/utils/assert";
 import { assertNever } from "@/common/utils/assertNever";
-import { redactSecretLike } from "@/node/services/memorySecretRedaction";
-import { DATA_URL_PATTERN, MEDIA_STUB } from "@/node/services/memoryToolText";
+import { REDACTION_LOOKAHEAD_CHARS, redactSecretLike } from "@/node/services/memorySecretRedaction";
+import { renderToolValue } from "@/node/services/memoryToolText";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 
 const HARVEST_MAX_STEPS = 4;
@@ -29,10 +28,6 @@ const HARVEST_MAX_ROW_TEXT_CHARS = 8_000;
 const HARVEST_MAX_TEXT_PART_CHARS = 128_000;
 const HARVEST_MAX_TOOL_INPUT_CHARS = 1_000;
 const HARVEST_MAX_TOOL_OUTPUT_CHARS = 2_000;
-// Redaction scans this much past a cap so a secret that starts inside the kept prefix is matched
-// whole before the cut, instead of leaving a readable prefix of it in the transcript.
-const HARVEST_REDACTION_LOOKAHEAD_CHARS = 512;
-const MAX_TOOL_VALUE_DEPTH = 30;
 
 const MemoryCandidateSchema = z.object({
   category: z.enum(["preference", "project", "environment", "workflow", "other"]),
@@ -72,50 +67,13 @@ export interface MemoryHarvestResult {
   streamError?: string;
 }
 
-// Tool-output attachment shapes: persisted `media`/`display_file` parts and the AI SDK's
-// model-output `image-data`/`file-data` forms. Their bytes never go to the harvest model.
-const MEDIA_PART_TYPES = new Set(["media", "display_file", "image-data", "file-data"]);
-
-function sanitizeToolValue(value: unknown, depth: number): unknown {
-  if (depth > MAX_TOOL_VALUE_DEPTH) return "[nested data omitted]";
-  if (Array.isArray(value)) return value.map((item) => sanitizeToolValue(item, depth + 1));
-  if (!isPlainObject(value)) return value;
-  if (typeof value.type === "string" && MEDIA_PART_TYPES.has(value.type)) return MEDIA_STUB;
-  // A history lookup returns other rows' text; forwarding it would copy that text into this
-  // workspace's memory and amplify one lookup into the next epoch's evidence.
-  if (value.toolName === "session_history") return "[session_history result omitted]";
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, sanitizeToolValue(item, depth + 1)])
-  );
-}
-
-function stringifyToolValue(value: unknown): string {
-  if (value === undefined) return "[none]";
-  const sanitized = sanitizeToolValue(value, 0);
-  if (typeof sanitized === "string") return sanitized;
-  try {
-    return JSON.stringify(sanitized) ?? "[unserializable]";
-  } catch {
-    return "[unserializable]";
-  }
-}
-
-function boundToolText(text: string, maxChars: number): string {
-  const withoutMedia = text.replace(DATA_URL_PATTERN, MEDIA_STUB);
-  const redacted = redactSecretLike(
-    withoutMedia.slice(0, maxChars + HARVEST_REDACTION_LOOKAHEAD_CHARS)
-  );
-  if (withoutMedia.length <= maxChars) return redacted;
-  return `${redacted.slice(0, maxChars)} [truncated ${withoutMedia.length - maxChars} more chars for memory harvest]`;
-}
-
 function renderToolResult(part: MuxToolPart): string {
   const label = `TOOL RESULT (${part.toolName}): `;
   switch (part.state) {
     case "output-available":
       return part.toolName === "session_history"
         ? `${label}[session_history result omitted]`
-        : `${label}${boundToolText(stringifyToolValue(part.output), HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
+        : `${label}${renderToolValue(part.output, HARVEST_MAX_TOOL_OUTPUT_CHARS)}`;
     case "output-redacted":
       return `${label}[output redacted${part.failed ? "; tool failed" : ""}]`;
     case "input-available":
@@ -131,7 +89,7 @@ function renderToolResult(part: MuxToolPart): string {
  * calls are not rendered; the outer result is what the model saw.
  */
 function renderToolPart(part: MuxToolPart): string {
-  const input = boundToolText(stringifyToolValue(part.input), HARVEST_MAX_TOOL_INPUT_CHARS);
+  const input = renderToolValue(part.input, HARVEST_MAX_TOOL_INPUT_CHARS);
   return `TOOL CALL ${part.toolName}: ${input}\n${renderToolResult(part)}`;
 }
 
@@ -168,7 +126,7 @@ interface HarvestPiece {
  * a model echoed sits in them just the same, and the cap is long enough to carry it to the model.
  */
 function boundedTextPart(raw: string): RowText {
-  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + HARVEST_REDACTION_LOOKAHEAD_CHARS);
+  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + REDACTION_LOOKAHEAD_CHARS);
   const prepared = neutralizeHarvestText(redactSecretLike(window));
   const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
   return { text, cutChars: raw.length - window.length + prepared.length - text.length };

@@ -12,6 +12,12 @@
 
 const REDACTED = "[redacted]";
 
+/**
+ * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
+ * text is matched whole before the cut, and not left as a readable prefix of it.
+ */
+export const REDACTION_LOOKAHEAD_CHARS = 512;
+
 // `token` excludes the plural so `max_tokens: 4096` and `input_tokens` stay readable.
 // `AccountKey` is the Azure storage connection string's secret; a key named `bearer` holds the token.
 const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
