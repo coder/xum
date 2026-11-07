@@ -111,15 +111,15 @@ export function PluginRemovalCard(props: {
   return (
     <div className="border-border-light space-y-2 rounded-md border p-3">
       <h4 className="text-foreground text-xs font-medium">Remove plugins from the backup?</h4>
-      <p className="text-muted text-xs">
-        {removal.wholeList
-          ? "The backup has a plugin list, and backing up now writes none (plugin backup is off here, or this machine has no managed plugin). The whole list is removed from the backup."
-          : "Backing up now writes the plugins installed on this machine. These plugins are in the backup but not installed here, so they are removed from it:"}
-      </p>
-      {removal.unreadable && !removal.wholeList ? (
+      {removal.wholeList ? (
         <p className="text-muted text-xs">
-          The list also has entries this version of Xum cannot read, for example from a newer Xum.
-          They are removed too.
+          The backup has a plugin list, and backing up now writes none (plugin backup is off here,
+          or this machine has no managed plugin). The whole list is removed from the backup.
+        </p>
+      ) : removal.names.length > 0 ? (
+        <p className="text-muted text-xs">
+          Backing up now writes the plugins installed on this machine. These plugins are in the
+          backup but not installed here, so they are removed from it:
         </p>
       ) : null}
       {removal.names.length > 0 ? (
@@ -130,6 +130,13 @@ export function PluginRemovalCard(props: {
             </li>
           ))}
         </ul>
+      ) : null}
+      {/* After the list: the names are the readable plugins, not the entries this note means. */}
+      {removal.unreadable && !removal.wholeList ? (
+        <p className="text-muted text-xs">
+          The backup's list also has entries this version of Xum cannot read, for example from a
+          newer Xum. Backing up now removes them too.
+        </p>
       ) : null}
       <Button
         size="sm"

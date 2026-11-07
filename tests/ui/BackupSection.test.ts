@@ -1584,6 +1584,8 @@ describe("BackupSection", () => {
 
         expect(canvas.getByText(/cannot read/)).toBeTruthy();
         expect(canvas.queryAllByRole("listitem")).toHaveLength(0);
+        // No sentence promises a list of names that is not there.
+        expect(canvas.queryByText(/so they are removed from it/)).toBeNull();
 
         push.mockResolvedValueOnce(PUSHED);
         fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));

@@ -814,6 +814,39 @@ describe("backup of the managed plugin list", () => {
         expect(await listedNames()).toEqual(["alpha"]);
       });
 
+      it("asks again when the same names gain an unreadable part or the whole list", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const namesOnly = removalOf(await pushFromSecondMachine([registryRow("beta")]));
+        expect(namesOnly).toMatchObject({ names: ["alpha"], wholeList: false, unreadable: false });
+
+        // The same name, now with the whole list going: the earlier approval does not cover it.
+        const whole = removalOf(
+          await pushFromSecondMachine([registryRow("beta")], {
+            plugins: false,
+            approvedPluginRemovalDigest: namesOnly.approval,
+          })
+        );
+        expect(whole).toMatchObject({ names: ["alpha"], wholeList: true });
+
+        const clone = path.join(tempDir, "tamper");
+        await runGit(["clone", "--quiet", originPath, clone]);
+        const file = path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH);
+        const list = JSON.parse(await fs.readFile(file, "utf-8")) as { plugins: unknown[] };
+        list.plugins.push({ name: "future", source: { type: "archive", url: "https://x/y.tgz" } });
+        await fs.writeFile(file, JSON.stringify(list), "utf-8");
+        await commitAll(clone, "add a row from a newer build");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+
+        // The same name, now with an unreadable part: the names-only approval does not cover it.
+        const withUnreadable = removalOf(
+          await pushFromSecondMachine([registryRow("beta")], {
+            approvedPluginRemovalDigest: namesOnly.approval,
+          })
+        );
+        expect(withUnreadable).toMatchObject({ names: ["alpha"], unreadable: true });
+        expect(await listedNames()).toEqual(["alpha", "future"]);
+      });
+
       it("treats a machine with nothing installed as removing the whole list", async () => {
         await pushFromFirstMachine([registryRow("alpha")]);
 

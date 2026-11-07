@@ -5722,6 +5722,9 @@ describe("sanitizeBackupGitRemote", () => {
       "https://github.com/dev/repo.git?token=abc",
       // A bidi override makes the remote read differently from what git gets.
       "https://github.com/dev/\u202Erepo.git",
+      // C1 controls and invisible format characters (zero-width space) read the same way.
+      "https://github.com/dev/re\u0085po.git",
+      "https://github.com/dev/re\u200Bpo.git",
       // A percent-encoded token would evade the publish-time pattern scan of the manifest.
       `https://example.com/%67hp_${"a".repeat(24)}/repo.git`,
     ]) {
