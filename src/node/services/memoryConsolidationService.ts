@@ -527,6 +527,14 @@ export class MemoryConsolidationService extends EventEmitter {
     Promise<Result<MemoryConsolidationRecord, string>>
   >();
 
+  /**
+   * Archive passes of sub-agents in flight, by the owner whose workspace memory their analysis
+   * writes to. A task-tree archive starts each child's pass in the background before the owner's,
+   * and the owner's final dream must not start while one of them can still write: whatever it
+   * wrote afterward would miss the owner's one chance to promote it (see trackDescendantArchivePass).
+   */
+  private readonly descendantArchivePasses = new Map<string, Set<Promise<void>>>();
+
   constructor(
     private readonly config: Config,
     private readonly memoryService: MemoryService,
@@ -1258,20 +1266,72 @@ export class MemoryConsolidationService extends EventEmitter {
     if (this.removalCancelled.has(workspaceId)) {
       return Err("workspace is being removed; consolidation refused");
     }
-    const runKey = `${workspaceId}:archive-pass`;
-    const active = this.harvestInFlight.get(runKey);
-    if (active !== undefined) {
-      // Queued, not coalesced, like maybeRun's archive: rows added since the active pass read the
-      // epoch (an unarchive and a new archive inside one pass) are for this pass to analyze.
-      await active.catch(() => undefined);
-      return this.maybeRunArchivePass(workspaceId);
-    }
-    const run = this.analyzeOpenEpochThenRunArchive(workspaceId);
-    this.harvestInFlight.set(runKey, run);
+    // Registered in this synchronous frame, before any await, and for the whole call, queueing
+    // behind an earlier pass included: the owner's pass must never find a gap to slip through.
+    const endDescendantPass = this.trackDescendantArchivePass(workspaceId);
     try {
-      return await run;
+      const runKey = `${workspaceId}:archive-pass`;
+      const active = this.harvestInFlight.get(runKey);
+      if (active !== undefined) {
+        // Queued, not coalesced, like maybeRun's archive: rows added since the active pass read
+        // the epoch (an unarchive and a new archive inside one pass) are for this pass to analyze.
+        await active.catch(() => undefined);
+        return await this.maybeRunArchivePass(workspaceId);
+      }
+      const run = this.analyzeOpenEpochThenRunArchive(workspaceId);
+      this.harvestInFlight.set(runKey, run);
+      try {
+        return await run;
+      } finally {
+        this.harvestInFlight.delete(runKey);
+      }
     } finally {
-      this.harvestInFlight.delete(runKey);
+      endDescendantPass();
+    }
+  }
+
+  /**
+   * Marks `workspaceId`'s archive pass as in flight for the owner of its workspace memory, when it
+   * is a sub-agent's: its analysis writes into the owner's store, and the owner's own pass waits
+   * for it (see awaitDescendantArchivePasses). Returns the call that ends the mark. An owner's
+   * pass is not marked: nothing waits on it.
+   */
+  private trackDescendantArchivePass(workspaceId: string): () => void {
+    const ownerId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
+    if (ownerId === workspaceId) return () => undefined;
+    let end!: () => void;
+    const ended = new Promise<void>((resolve) => (end = resolve));
+    const passes = this.descendantArchivePasses.get(ownerId) ?? new Set<Promise<void>>();
+    passes.add(ended);
+    this.descendantArchivePasses.set(ownerId, passes);
+    return () => {
+      passes.delete(ended);
+      if (passes.size === 0 && this.descendantArchivePasses.get(ownerId) === passes) {
+        this.descendantArchivePasses.delete(ownerId);
+      }
+      end();
+    };
+  }
+
+  /**
+   * Resolves once no archive pass of a sub-agent of `ownerId` is in flight, or when `signal`
+   * aborts (the owner's removal: nothing is left to wait for). A pass that starts while this
+   * waits is waited for too. Each pass is bounded by its own chunk timeouts and its workspace's
+   * removal, so this adds no timer of its own.
+   */
+  private async awaitDescendantArchivePasses(ownerId: string, signal: AbortSignal): Promise<void> {
+    for (;;) {
+      const passes = this.descendantArchivePasses.get(ownerId);
+      if (passes === undefined || passes.size === 0) return;
+      log.debug("[MemoryConsolidation] archive pass waiting for sub-agent archive analyses", {
+        workspaceId: ownerId,
+        passes: passes.size,
+      });
+      const waited = await waitForTurnOrAbort(
+        Promise.all(passes).then(() => undefined),
+        signal
+      );
+      if (!waited) return;
     }
   }
 
@@ -1280,20 +1340,26 @@ export class MemoryConsolidationService extends EventEmitter {
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     const removal = this.trackRunController(workspaceId);
     try {
-      const analyzed = await Effect.runPromise(
-        this.analyzeOpenEpochEffect(workspaceId, removal.controller.signal)
-      );
-      if (!analyzed.success) {
-        log.debug("[MemoryConsolidation] open-epoch analysis skipped", {
-          workspaceId,
-          reason: analyzed.error,
-        });
+      try {
+        const analyzed = await Effect.runPromise(
+          this.analyzeOpenEpochEffect(workspaceId, removal.controller.signal)
+        );
+        if (!analyzed.success) {
+          log.debug("[MemoryConsolidation] open-epoch analysis skipped", {
+            workspaceId,
+            reason: analyzed.error,
+          });
+        }
+      } catch (error) {
+        log.warn(
+          "[MemoryConsolidation] open-epoch analysis failed; running the final pass anyway",
+          { workspaceId, error: getErrorMessage(error) }
+        );
       }
-    } catch (error) {
-      log.warn("[MemoryConsolidation] open-epoch analysis failed; running the final pass anyway", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
+      // The sub-agents of a task-tree archive analyze into this workspace's memory in the
+      // background: the dream is the one promotion pass before that memory is deleted, so it starts
+      // after they settle, whether or not this pass's own analysis worked.
+      await this.awaitDescendantArchivePasses(workspaceId, removal.controller.signal);
     } finally {
       removal.dispose();
     }

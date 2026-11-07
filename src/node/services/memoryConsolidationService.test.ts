@@ -33,6 +33,7 @@ import {
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MEMORY_ANALYZER_SYSTEM_PROMPT } from "./memoryHarvest";
+import { log } from "@/node/services/log";
 import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -3001,6 +3002,121 @@ describe("MemoryConsolidationService", () => {
 
         expect(result.success).toBe(false);
         expect(fixture.modelCalls).toHaveLength(0);
+      });
+    });
+
+    describe("a task-tree archive", () => {
+      /**
+       * The deterministic arrival of the owner's pass at its wait for the sub-agents' passes,
+       * which is the one point a test can tell "waiting" from "has not got there yet".
+       */
+      function ownerWaitsForSubAgents(): { arrived: Promise<void>; restore: () => void } {
+        let arrive!: () => void;
+        const arrived = new Promise<void>((resolve) => (arrive = resolve));
+        const debug = spyOn(log, "debug").mockImplementation((message) => {
+          if (String(message).includes("waiting for sub-agent archive analyses")) arrive();
+        });
+        return { arrived, restore: () => debug.mockRestore() };
+      }
+
+      /** Which happens first: the owner's pass starts waiting, or it finishes without waiting. */
+      function whatComesFirst(
+        wait: ReturnType<typeof ownerWaitsForSubAgents>,
+        owner: Promise<unknown>
+      ): Promise<"owner is waiting" | "owner finished"> {
+        return Promise.race([
+          wait.arrived.then(() => "owner is waiting" as const),
+          owner.then(() => "owner finished" as const),
+        ]);
+      }
+
+      it("starts the owner's final dream only after a sub-agent's analysis into the owner's memory settled", async () => {
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        models.readFirstNote.current = () => readNote(fixture, 1);
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const wait = ownerWaitsForSubAgents();
+        try {
+          // The order of a task-tree archive: archive's own trigger starts each sub-agent's pass
+          // in the background, then the owner's follows.
+          fixture.service.triggerInBackground("ws-sub", "archive");
+          await models.firstAnalyzerStarted;
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+
+          // The owner settling first would mean it ran its dream while the child's analysis,
+          // still held, could yet write to its memory.
+          expect(await whatComesFirst(wait, owner)).toBe("owner is waiting");
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+
+          releaseChild();
+          expect((await owner).success).toBe(true);
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+          // The dream saw what the sub-agent's analyzer wrote, so it could promote it.
+          expect(models.runs[1]?.noteAtStart).toContain("analyzer note 1");
+        } finally {
+          releaseChild();
+          wait.restore();
+        }
+      });
+
+      it("stops waiting for the sub-agents when the owner is removed, and runs no dream", async () => {
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const wait = ownerWaitsForSubAgents();
+        try {
+          const child = fixture.service.maybeRunArchivePass("ws-sub");
+          await models.firstAnalyzerStarted;
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+          expect(await whatComesFirst(wait, owner)).toBe("owner is waiting");
+
+          // The child's analysis is still held: removal must not wait for it.
+          await fixture.service.cancelInFlightConsolidation("ws-dream");
+          const result = await owner;
+
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain("being removed");
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+          releaseChild();
+          await child;
+        } finally {
+          releaseChild();
+          wait.restore();
+        }
+      });
+
+      it("does not wait for the archive pass of a workspace outside the owner's task tree", async () => {
+        let releaseOther!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseOther = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-other");
+        await appendRows(fixture, openRowTexts, "ws-other");
+        const wait = ownerWaitsForSubAgents();
+        try {
+          const other = fixture.service.maybeRunArchivePass("ws-other");
+          await models.firstAnalyzerStarted;
+
+          // Settles while the other workspace's analysis is held: no wait on it.
+          const owner = fixture.service.maybeRunArchivePass("ws-dream");
+          expect(await whatComesFirst(wait, owner)).toBe("owner finished");
+          expect((await owner).success).toBe(true);
+          expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+          releaseOther();
+          await other;
+        } finally {
+          releaseOther();
+          wait.restore();
+        }
       });
     });
 
