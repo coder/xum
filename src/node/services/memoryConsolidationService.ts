@@ -67,8 +67,10 @@ import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
+import type { MuxMessage } from "@/common/types/message";
 import {
   analyzedFloorRowId,
+  budgetSpent,
   rowsAfterFloor,
   runMemoryHarvest,
   selectOpenEpoch,
@@ -430,6 +432,31 @@ function analyzedOpenEpochRowIds(
     if (typeof readThrough === "string") ids.add(readThrough);
   }
   return ids;
+}
+
+/**
+ * Mutations the earlier records of the epoch `rows` belong to have spent. The epoch has one budget
+ * (MEMORY_ANALYZER_OP_BUDGET), but a record is one run: every archive after new rows and the
+ * compaction that closes the epoch each make a new record, and each starts from this number, so
+ * the epoch's edits add up to one budget instead of one per record. A record's `budgetUsed`
+ * already includes what it started with, so the most spent record is the total. An open-epoch
+ * record belongs to the epoch when the row its key names is one of `rows`, matched by id like the
+ * floors: a rewound chat can reuse an epoch number but never a row id, so the abandoned
+ * timeline's edits do not spend the new one's budget. Read from the records, so a pruned record
+ * only loses what it spent, which the newer records of the epoch carry.
+ */
+function epochBudgetSpent(
+  records: Record<string, MemoryHarvestRecord> | undefined,
+  rows: ReadonlyArray<Pick<MuxMessage, "id">>
+): number {
+  const rowIds = new Set(rows.map((row) => row.id));
+  let spent = 0;
+  for (const [boundaryKey, record] of Object.entries(records ?? {})) {
+    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
+    if (!rowIds.has(boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length))) continue;
+    spent = Math.max(spent, budgetSpent({ ops: record.ops ?? [], budgetUsed: record.budgetUsed }));
+  }
+  return spent;
 }
 
 /** Terminal marker for a bucket whose transcript is being deleted (see finalizeHarvestsForRemoval). */
@@ -1401,7 +1428,6 @@ export class MemoryConsolidationService extends EventEmitter {
       const attemptState: HarvestAttemptState = {
         analyzedFloorRowId: existing?.analyzedFloorRowId,
       };
-      const analyzedRowIds = analyzedOpenEpochRowIds(sidecar.harvestsByWorkspace[workspaceId]);
 
       if (
         existing?.status === "pending" &&
@@ -1468,7 +1494,7 @@ export class MemoryConsolidationService extends EventEmitter {
             removalSignal,
             progress,
             attemptState,
-            analyzedRowIds,
+            earlierRecords: sidecar.harvestsByWorkspace[workspaceId],
           })
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
@@ -1490,8 +1516,8 @@ export class MemoryConsolidationService extends EventEmitter {
       progress: HarvestProgress;
       /** Shared with the caller for the same reason. */
       attemptState: HarvestAttemptState;
-      /** Rows an earlier open-epoch run analyzed (see analyzedOpenEpochRowIds). */
-      analyzedRowIds: ReadonlySet<string>;
+      /** The workspace's records as they stood before this job: the earlier runs of this epoch. */
+      earlierRecords: Record<string, MemoryHarvestRecord> | undefined;
     }
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -1503,6 +1529,14 @@ export class MemoryConsolidationService extends EventEmitter {
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
+
+      // The epoch has one edit budget, not one per record: a run after an unarchive and a new row,
+      // and the compaction that closes the epoch, start from what the earlier runs spent. A retry
+      // keeps its own spend if that is higher.
+      opts.progress.budgetUsed = Math.max(
+        budgetSpent(opts.progress),
+        epochBudgetSpent(opts.earlierRecords, epoch.data.messages)
+      );
 
       const saveCompleted = (
         progress: HarvestProgress,
@@ -1533,7 +1567,7 @@ export class MemoryConsolidationService extends EventEmitter {
       if (opts.attemptState.analyzedFloorRowId === undefined) {
         opts.attemptState.analyzedFloorRowId = analyzedFloorRowId(
           epoch.data.messages,
-          opts.analyzedRowIds
+          analyzedOpenEpochRowIds(opts.earlierRecords)
         );
       }
       const messages = rowsAfterFloor(epoch.data.messages, opts.attemptState.analyzedFloorRowId);

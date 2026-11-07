@@ -85,6 +85,14 @@ export interface HarvestProgress {
   readThroughRowId?: string | null;
 }
 
+/**
+ * Mutations the epoch's budget has spent: `budgetUsed`, or for a record from before that field the
+ * applied ops, which stand in for it.
+ */
+export function budgetSpent(progress: Pick<HarvestProgress, "ops" | "budgetUsed">): number {
+  return progress.budgetUsed ?? progress.ops.filter((op) => op.applied).length;
+}
+
 /** Where a run starts, read from the progress of an earlier attempt at the same epoch. */
 function resumePoint(
   chunkCount: number,
@@ -100,7 +108,7 @@ function resumePoint(
   const inStartChunk = Math.min(resume?.nextChunkOps ?? 0, ops.length);
   return {
     startChunk: Math.min(resume?.nextChunk ?? 0, chunkCount),
-    budgetUsed: resume?.budgetUsed ?? ops.filter((op) => op.applied).length,
+    budgetUsed: budgetSpent({ ops, budgetUsed: resume?.budgetUsed }),
     landedInStartChunk: ops.slice(ops.length - inStartChunk).filter((op) => op.applied),
     opsBeforeStartChunk: ops.length - inStartChunk,
   };

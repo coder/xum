@@ -260,6 +260,55 @@ function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
   });
 }
 
+/**
+ * An analyzer that tries `editsPerRun` creates of distinct workspace notes in each run's first
+ * step, so a test can count the edits an epoch's runs got in total. The dream makes none.
+ */
+function editsEveryRunModels(editsPerRun: number): {
+  factory: () => MockLanguageModelV3;
+  analyzerRuns: () => number;
+} {
+  let analyzerRuns = 0;
+  const factory = () =>
+    new MockLanguageModelV3({
+      doStream: (options) => {
+        const afterToolResult = options.prompt.some((message) => message.role === "tool");
+        if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT || afterToolResult) {
+          return Promise.resolve({ stream: noChangesStream() });
+        }
+        const run = ++analyzerRuns;
+        return Promise.resolve({
+          stream: simulateReadableStream<LanguageModelV3StreamPart>({
+            chunks: [
+              ...Array.from(
+                { length: editsPerRun },
+                (_, index): LanguageModelV3StreamPart => ({
+                  type: "tool-call",
+                  toolCallId: `edit-${run}-${index}`,
+                  toolName: "memory",
+                  input: JSON.stringify({
+                    command: "create",
+                    path: `/memories/workspace/run-${run}-edit-${index}.md`,
+                    file_text: `fact ${run}.${index}\n`,
+                  }),
+                })
+              ),
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 0, reasoning: 0 },
+                },
+              },
+            ],
+          }),
+        });
+      },
+    });
+  return { factory, analyzerRuns: () => analyzerRuns };
+}
+
 interface ArchivePassRun {
   kind: "analyzer" | "dream";
   prompt: string;
@@ -2808,6 +2857,93 @@ describe("MemoryConsolidationService", () => {
       expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
       expect(fixture.modelCalls).toHaveLength(1);
       expect(await harvestRecords(fixture)).toEqual({});
+    });
+
+    describe("the epoch's one edit budget", () => {
+      const appliedEdits = (records: Record<string, MemoryHarvestRecordPayload>): number =>
+        Object.values(records).reduce(
+          (total, record) => total + (record.ops ?? []).filter((op) => op.applied).length,
+          0
+        );
+
+      it("cannot be spent again by archiving after each new row: the epoch gets MEMORY_ANALYZER_OP_BUDGET edits in all", async () => {
+        const models = editsEveryRunModels(3);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        // Each cycle is an archive, an unarchive and a new row. Each archive tries 3 edits: the
+        // first two get 3 and 3, the third gets the 2 that are left, the fourth none.
+        for (const row of ["open-3", "open-4", "open-5"]) {
+          expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+          await appendRows(fixture, [[row, `Another fact in ${row}.`]]);
+        }
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const records = await harvestRecords(fixture);
+        expect(Object.keys(records).sort()).toEqual([
+          "open:open-2",
+          "open:open-3",
+          "open:open-4",
+          "open:open-5",
+        ]);
+        expect(appliedEdits(records)).toBe(MEMORY_ANALYZER_OP_BUDGET);
+        expect(records["open:open-4"]?.ops?.filter((op) => op.applied)).toHaveLength(2);
+        // The last archive found the budget spent: no analyzer call, and a note saying why.
+        expect(records["open:open-5"]).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(records["open:open-5"]?.note).toContain("edit budget spent");
+        expect(models.analyzerRuns()).toBe(3);
+      });
+
+      it("is spent by the archives before it when the compaction closes the epoch", async () => {
+        const models = editsEveryRunModels(5);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect((await harvestRecords(fixture))["open:open-2"]?.budgetUsed).toBe(5);
+
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+        // The compaction tried 5 more edits and got the 3 the archive left.
+        const records = await harvestRecords(fixture);
+        expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+        expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+        expect(appliedEdits(records)).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      });
+
+      it("starts the next epoch on a fresh budget", async () => {
+        const models = editsEveryRunModels(MEMORY_ANALYZER_OP_BUDGET);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+        // Epoch 1 spent everything on its archive. Epoch 2 is a different epoch.
+        await appendRows(fixture, [["next-1", "Epoch 2 settled on vitest for unit tests."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const next = (await harvestRecords(fixture))["open:next-1"];
+        expect(next?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      });
+
+      it("does not count what a rewound-away timeline of the epoch spent", async () => {
+        const models = editsEveryRunModels(MEMORY_ANALYZER_OP_BUDGET);
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // Rewind to before the row the archive stopped at: the new rows are a new timeline of
+        // the same epoch, which an epoch number alone cannot tell apart.
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-1")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-2b", "Actually scripts use pnpm."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const rerun = (await harvestRecords(fixture))["open:open-2b"];
+        expect(rerun?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+      });
     });
 
     describe("a sub-agent's archive", () => {

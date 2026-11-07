@@ -142,7 +142,9 @@ export const MemoryHarvestRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema).optional(),
   /**
    * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
-   * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
+   * undercounts. A retry resumes the budget from it, and a new record of the same epoch (an
+   * archive after new rows, the compaction that closes it) starts from the most spent record's.
+   * Optional so older binaries parse the record.
    */
   budgetUsed: PersistedCountSchema.optional(),
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
