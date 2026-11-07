@@ -3520,6 +3520,43 @@ describe("MemoryConsolidationService", () => {
         }
       });
 
+      it("counts a sub-agent's archive pass as in flight from the call that triggers it", async () => {
+        // The owner's pass reaches its wait after disk reads, so a registration that slips by an
+        // await or a microtask still lands before that wait in every ordering a pass-against-pass
+        // race can produce. The wait itself, evaluated in the frame right after the trigger, is
+        // the one place a gap shows: a registration made later finds no pass there and returns.
+        let releaseChild!: () => void;
+        const models = archivePassModels({
+          holdFirstAnalyzer: new Promise<void>((resolve) => (releaseChild = resolve)),
+        });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+        const waitForSubAgents = (
+          fixture.service as unknown as {
+            awaitDescendantArchivePasses: (ownerId: string, signal: AbortSignal) => Promise<void>;
+          }
+        ).awaitDescendantArchivePasses.bind(fixture.service);
+        try {
+          fixture.service.triggerInBackground("ws-sub", "archive");
+          const ownerWait = waitForSubAgents("ws-dream", new AbortController().signal);
+
+          // Held in its analyzer, the child's pass cannot end, so the wait is pending unless it
+          // missed the pass.
+          await models.firstAnalyzerStarted;
+          const first = await Promise.race([
+            ownerWait.then(() => "wait ended"),
+            new Promise<string>((resolve) => setImmediate(() => resolve("still waiting"))),
+          ]);
+          expect(first).toBe("still waiting");
+
+          releaseChild();
+          await ownerWait;
+        } finally {
+          releaseChild();
+        }
+      });
+
       it("stops waiting for the sub-agents when the owner is removed, and runs no dream", async () => {
         let releaseChild!: () => void;
         const models = archivePassModels({
