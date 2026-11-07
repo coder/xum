@@ -41,25 +41,21 @@ export async function requestSandboxApproval(
   if (reason == null || !agentSandboxApplies(config)) return "not-asked";
   const workspaceId = config.workspaceId;
   if (config.noInteractiveUser === true || workspaceId === undefined) return "denied";
-  const emit = (pending: boolean) =>
-    emitChatEventBestEffort(
-      config,
-      {
-        type: "bash-sandbox-approval",
-        workspaceId,
-        toolCallId,
-        reason,
-        pending,
-        timestamp: clockOf(config).nowMs(),
-      } satisfies BashSandboxApprovalEvent,
-      "bash"
-    );
-  const answer = sandboxApprovalManager.request(workspaceId, toolCallId, abortSignal);
-  emit(true);
+  const event = (pending: boolean): BashSandboxApprovalEvent => ({
+    type: "bash-sandbox-approval",
+    workspaceId,
+    toolCallId,
+    reason,
+    pending,
+    timestamp: clockOf(config).nowMs(),
+  });
+  const pendingEvent = event(true);
+  const answer = sandboxApprovalManager.request(workspaceId, toolCallId, abortSignal, pendingEvent);
+  emitChatEventBestEffort(config, pendingEvent, "bash");
   try {
     return await answer;
   } finally {
-    emit(false);
+    emitChatEventBestEffort(config, event(false), "bash");
   }
 }
 

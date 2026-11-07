@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import type { BashSandboxApprovalEvent } from "@/common/types/stream";
 
 export type SandboxApprovalAnswer = "approved" | "denied";
 
 interface PendingSandboxApproval {
   resolve: (answer: SandboxApprovalAnswer) => void;
+  /** The pending event the bash call emitted, replayed to a chat that subscribes later. */
+  event?: BashSandboxApprovalEvent;
 }
 
 /**
@@ -19,7 +22,8 @@ export class SandboxApprovalManager {
   request(
     workspaceId: string,
     toolCallId: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    event?: BashSandboxApprovalEvent
   ): Promise<SandboxApprovalAnswer> {
     assert(workspaceId.length > 0, "workspaceId must be non-empty");
     assert(toolCallId.length > 0, "toolCallId must be non-empty");
@@ -35,6 +39,7 @@ export class SandboxApprovalManager {
       const onAbort = () => resolve("denied");
       abortSignal?.addEventListener("abort", onAbort, { once: true });
       pending.set(toolCallId, {
+        event,
         resolve: (answer) => {
           abortSignal?.removeEventListener("abort", onAbort);
           resolve(answer);
@@ -46,6 +51,16 @@ export class SandboxApprovalManager {
         this.pendingByWorkspace.delete(workspaceId);
       }
     });
+  }
+
+  /**
+   * The pending events of a workspace, for a chat subscription that starts while a bash call
+   * waits (reload, another window): without them it shows no card to answer.
+   */
+  pendingEvents(workspaceId: string): BashSandboxApprovalEvent[] {
+    const pending = this.pendingByWorkspace.get(workspaceId);
+    if (!pending) return [];
+    return [...pending.values()].flatMap((entry) => (entry.event ? [entry.event] : []));
   }
 
   /** Answers a pending request; false when none is pending (already answered, or gone). */
