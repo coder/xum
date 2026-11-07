@@ -1,10 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { defaultModel } from "@/common/utils/ai/models";
-import {
-  MEMORY_ANALYZER_MAX_STEPS,
-  MEMORY_CONSOLIDATION_MAX_STEPS,
-} from "@/common/constants/memory";
+import { MEMORY_ANALYZER_MAX_STEPS } from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
@@ -32,18 +29,19 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
     expect(priced([40_000]) ?? 0).toBeGreaterThan(base);
   });
 
-  // A prompt token is billed once by the first step and, from then on, as a cache read by each of
-  // the steps after it. The first bill is a cache write where the model has a write rate (Anthropic
-  // charges 1.25x input for it) and the input rate where it has none. The slope of the estimate in
-  // the prompt size is that sum, whatever the rest of the estimate holds.
+  // A prompt token is billed by every step, at the uncached input rate: the provider's prompt cache
+  // may miss, so the estimate takes no discount for it. The first step may instead write the prompt
+  // to the cache (Anthropic charges 1.25x input for that), so it prices at the higher of the two.
+  // The slope of the estimate in the prompt size is that sum, whatever the rest of the estimate holds.
   it.each(["anthropic:claude-sonnet-5-5", "google:gemini-3-pro-preview"])(
-    "bills each prompt token once at the first-step rate and once per later step as a cache read on %s",
+    "bills each prompt token at the uncached rate on every step, and at the cache-write rate on the first if higher on %s",
     (pricingModel) => {
       const stats = getModelStats(pricingModel);
-      const read = stats?.cache_read_input_token_cost ?? 0;
-      const firstStepRate =
-        stats?.cache_creation_input_token_cost ?? stats?.input_cost_per_token ?? 0;
-      expect(read).toBeGreaterThan(0);
+      const input = stats?.input_cost_per_token ?? 0;
+      const firstStepRate = Math.max(input, stats?.cache_creation_input_token_cost ?? 0);
+      // The cache would discount every resent token on these models, so a bound that took the
+      // discount would price below the slope asserted here.
+      expect(stats?.cache_read_input_token_cost).toBeLessThan(input);
       const [small, large] = [40_000, 80_000];
       const estimate = (chars: number) =>
         estimateAnalyzerUpperBoundUsd({ pricingModel, chunkInputChars: [chars], memoryChars: 0 }) ??
@@ -52,7 +50,7 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
       const perToken =
         (estimate(large) - estimate(small)) / ((large - small) / APPROX_CHARS_PER_TOKEN);
 
-      expect(perToken).toBeCloseTo(firstStepRate + (MEMORY_ANALYZER_MAX_STEPS - 1) * read, 9);
+      expect(perToken).toBeCloseTo(firstStepRate + (MEMORY_ANALYZER_MAX_STEPS - 1) * input, 9);
     }
   );
 
@@ -94,7 +92,7 @@ describe("calibration against a recorded dream", () => {
   const memoryChars =
     Math.round(RECORDED_USAGE.inputTokens / 15) * APPROX_CHARS_PER_TOKEN - SYSTEM_PROMPT_CHARS;
 
-  it("prices the same workload within 3x of its recorded cost, and not under it", () => {
+  it("prices the same workload at no less than its recorded cost", () => {
     const recordedUsd = getTotalCost(createDisplayUsage(RECORDED_USAGE, MODEL)) ?? 0;
     const estimate =
       estimateOrganizerUpperBoundUsd({
@@ -104,27 +102,9 @@ describe("calibration against a recorded dream", () => {
       }) ?? 0;
 
     expect(recordedUsd).toBeGreaterThan(0);
-    // An upper bound: it must not fall under what the run billed.
+    // An upper bound must not fall under what the run billed. It is not held near that bill: the
+    // recorded run was 93% cache hits, and the estimate takes none, so it sits about ten times over.
     expect(estimate).toBeGreaterThanOrEqual(recordedUsd);
-    // Pricing all 32 steps at the full input rate came to about 9x.
-    expect(estimate).toBeLessThanOrEqual(3 * recordedUsd);
-  });
-
-  it("keeps the resent prefix at the full input rate for a priced model with no cache-read rate", () => {
-    // A cached token with no rate would price at zero, leaving only the first step's prompt.
-    const uncached = "openai:chatgpt-4o-latest";
-    const stats = getModelStats(uncached);
-    expect(stats?.cache_read_input_token_cost).toBeUndefined();
-    const promptTokens = Math.round(RECORDED_USAGE.inputTokens / 15);
-    const estimate = estimateOrganizerUpperBoundUsd({
-      pricingModel: uncached,
-      systemPromptChars: SYSTEM_PROMPT_CHARS,
-      memoryChars,
-    });
-
-    expect(estimate).toBeGreaterThan(
-      MEMORY_CONSOLIDATION_MAX_STEPS * promptTokens * (stats?.input_cost_per_token ?? 0)
-    );
   });
 });
 

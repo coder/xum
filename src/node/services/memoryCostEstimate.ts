@@ -2,16 +2,15 @@
  * Upper-bound cost estimates for the dream's two model runs, and the ceiling check that refuses a
  * run before it starts.
  *
- * These are not bills. The estimate assumes the run takes every step its cap allows, that its
- * prompt already holds every visible memory file, and that each step writes a long reply. Real
- * runs stop earlier, read less and write less, so the bill usually falls well under the estimate.
- * The first step prices its prompt at the full input rate. Each later step resends that prefix,
- * and the provider serves it from its prompt cache, so the resent tokens price at the cache-read
- * rate when the model has one (the one run recorded on this host billed 93% of its input that
- * way). Pricing every step at the full rate made a minimal job look many times dearer than it was.
- * A model whose table lists a cache-write rate (Anthropic bills about 1.25x input) prices the first
- * step's prompt at it, since that step may be the one that writes the prefix to the cache, and an
- * estimate at the plain input rate would then fall under the bill.
+ * These are not bills, but they never fall under one: every assumption errs high. The run takes
+ * every step its cap allows, its prompt already holds every visible memory file, and each step
+ * writes a long reply. The estimate also takes nothing it cannot guarantee. A provider's prompt
+ * cache may miss, expire or be off for the route, so every input token of every step, the first
+ * prompt and each resent prefix, prices at the uncached input rate. A model whose table lists a
+ * cache-write rate (Anthropic bills about 1.25x input) prices the first step's prompt at the
+ * higher of the two, since that step may be the one that writes the prefix to the cache. Real
+ * runs stop earlier, read less, write less and hit the cache, so the bill usually falls well
+ * under the estimate (the one run recorded on this host billed 93% of its input as cache reads).
  */
 import {
   MEMORY_ANALYZER_MAX_STEPS,
@@ -41,32 +40,29 @@ function estimateRunUsd(
   steps: number
 ): number | undefined {
   const promptTokens = Math.ceil(promptChars / APPROX_CHARS_PER_TOKEN);
-  const stats = getModelStats(pricingModel);
-  // A model with no cache-read price would price a cached token at zero, so its resent prefix
-  // stays at the full input rate.
-  const cachePriced = stats?.cache_read_input_token_cost !== undefined;
-  const cacheWritePriced = stats?.cache_creation_input_token_cost !== undefined;
+  const cacheWritePriced =
+    getModelStats(pricingModel)?.cache_creation_input_token_cost !== undefined;
   let total = 0;
   for (let step = 1; step <= steps; step++) {
-    const earlierOutputTokens = (step - 1) * ESTIMATED_OUTPUT_TOKENS_PER_STEP;
-    // What the previous step sent: the prefix this step resends. Only the last output is new.
-    const resentTokens =
-      step === 1 ? 0 : promptTokens + earlierOutputTokens - ESTIMATED_OUTPUT_TOKENS_PER_STEP;
-    const usd = getTotalCost(
-      createDisplayUsage(
-        {
-          inputTokens: promptTokens + earlierOutputTokens,
-          cachedInputTokens: cachePriced ? resentTokens : 0,
-          ...(step === 1 && cacheWritePriced
-            ? { inputTokenDetails: { cacheWriteTokens: promptTokens } }
-            : {}),
-          outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
-        },
-        pricingModel
-      )
-    );
-    if (usd === undefined) return undefined;
-    total += usd;
+    // Every token goes out again with each step, uncached: the prompt plus all earlier output.
+    const inputTokens = promptTokens + (step - 1) * ESTIMATED_OUTPUT_TOKENS_PER_STEP;
+    const stepUsd = (cacheWriteTokens: number) =>
+      getTotalCost(
+        createDisplayUsage(
+          {
+            inputTokens,
+            outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
+            inputTokenDetails: { cacheWriteTokens },
+          },
+          pricingModel
+        )
+      );
+    const asInput = stepUsd(0);
+    if (asInput === undefined) return undefined;
+    // The first step may write its prompt to the cache. Pricing it both ways and keeping the
+    // higher needs no assumption about which rate is higher.
+    const asCacheWrite = step === 1 && cacheWritePriced ? stepUsd(promptTokens) : undefined;
+    total += Math.max(asInput, asCacheWrite ?? 0);
   }
   return total;
 }
