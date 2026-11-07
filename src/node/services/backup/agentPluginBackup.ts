@@ -231,8 +231,8 @@ const SCHEME_REMOTE = /^(?:https?|ssh|git):\/\//i;
 const SCP_REMOTE = /^(?:([^@/:]+)@)?([^:/@]{2,}):(?!\/\/)(.*)$/;
 
 /**
- * The port a scheme uses when the URL names none. The URL parser drops these two for http and
- * https only, so ssh and git are listed here for the same reason: `ssh://h:22/x` is `ssh://h/x`.
+ * The port a scheme uses when the URL names none, so `ssh://h:22/x` is `ssh://h/x`. The URL parser
+ * drops the http and https ones itself and keeps the ssh and git ones, so those need this table.
  */
 const DEFAULT_PORTS: Readonly<Record<string, string>> = {
   "https:": "443",
