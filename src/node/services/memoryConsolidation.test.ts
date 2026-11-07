@@ -384,6 +384,43 @@ describe("consolidation memory tool rails", () => {
     });
   });
 
+  describe("denied commands", () => {
+    it("rejects and journals a denied command without spending budget, and still allows the others", async () => {
+      using fixture = await createFixture({ guard: { deniedCommands: ["delete", "rename"] } });
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "keep.md"), "x\n");
+
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: "/memories/global/keep.md",
+      });
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/global/keep.md",
+        new_path: "/memories/global/moved.md",
+      });
+      const edited = await execute(fixture.tool, {
+        command: "str_replace",
+        path: "/memories/global/keep.md",
+        old_str: "x",
+        new_str: "y",
+      });
+
+      expect(deleted.success).toBe(false);
+      expect(renamed.success).toBe(false);
+      expect(edited.success).toBe(true);
+      expect(fixture.journal.map((op) => [op.command, op.applied])).toEqual([
+        ["delete", false],
+        ["rename", false],
+        ["str_replace", true],
+      ]);
+      expect(fixture.journal[0]?.note).toContain("delete");
+      expect(fixture.getMutationCount()).toBe(1);
+      expect(
+        await fsPromises.readFile(path.join(fixture.globalMemoryDir, "keep.md"), "utf-8")
+      ).toBe("y\n");
+    });
+  });
+
   describe("secret check", () => {
     it("rejects create, str_replace and insert text that holds a credential, and journals it without the value", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });

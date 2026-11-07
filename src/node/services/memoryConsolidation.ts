@@ -262,6 +262,11 @@ export function createConsolidationMemoryTool(args: {
    */
   writableScopes?: readonly WritableMemoryScope[];
   /**
+   * Commands this run may not use. Default: none, which the dream pass uses. The harvest analyzer
+   * denies `delete` and `rename`: it adds and corrects, and only the organizer removes.
+   */
+  deniedCommands?: readonly MemoryConsolidationOp["command"][];
+  /**
    * Reject a create/str_replace/insert whose new text, or a create/rename whose new file name,
    * holds a credential shape (see `containsSecretLike`). For runs that read tool output and then
    * write memory.
@@ -302,6 +307,9 @@ export function createConsolidationMemoryTool(args: {
     for (const virtualPath of [target.path, target.newPath]) {
       if (virtualPath == null) continue;
       if (!isWritableScope(parseMemoryPath(virtualPath).scope)) return scopeRejection(virtualPath);
+    }
+    if (args.deniedCommands?.includes(target.command) === true) {
+      return `This run may not use ${target.command}; it can only add to and edit memory.`;
     }
     // The note is journaled into the sidecar record, so it never quotes the rejected text.
     if (args.rejectSecretLike === true) {

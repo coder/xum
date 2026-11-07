@@ -661,6 +661,34 @@ describe("runMemoryHarvest", () => {
       ).toMatchObject({ success: false });
     });
 
+    it("cannot delete or rename a memory file, only add to and edit it", async () => {
+      using fixture = createFixture();
+      const keepPath = "/memories/workspace/keep.md";
+      const seeded = await fixture.memoryService.saveFile(
+        fixture.ctx,
+        keepPath,
+        "keep me\n",
+        null,
+        "agent"
+      );
+      expect(seeded.success).toBe(true);
+      const { model } = scriptedModel(
+        chunkScript([
+          { command: "delete", path: keepPath },
+          { command: "rename", old_path: keepPath, new_path: "/memories/workspace/moved.md" },
+        ])
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.ops.map((op) => [op.command, op.applied])).toEqual([
+        ["delete", false],
+        ["rename", false],
+      ]);
+      const kept = await fixture.memoryService.readFileWithSha(fixture.ctx, keepPath);
+      expect(kept.success && kept.data.content).toBe("keep me\n");
+    });
+
     it("shares one mutation budget across the chunks of an epoch", async () => {
       using fixture = createFixture();
       fixture.messages = manyChunkMessages();

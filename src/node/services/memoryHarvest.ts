@@ -258,7 +258,7 @@ Rules:
 When done, reply with one line: what you changed, or "no changes needed".`;
 
 const ANALYZER_TOOL_DESCRIPTION =
-  "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/.";
+  "Read and edit the persistent memory that future sessions read. You can read workspace, project and global memory. You can write only under /memories/workspace/, and you cannot delete or rename.";
 
 function buildChunkPrompt(args: {
   summary?: MuxMessage;
@@ -452,6 +452,8 @@ export async function runMemoryHarvest(args: {
       budget,
       abortSignal: signal,
       writableScopes: ["workspace"],
+      // The cookbook's analyzers only add and correct; removing and moving files is the organizer's.
+      deniedCommands: ["delete", "rename"],
       rejectSecretLike: true,
       description: ANALYZER_TOOL_DESCRIPTION,
     });
