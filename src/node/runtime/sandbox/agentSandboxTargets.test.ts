@@ -4,7 +4,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ResolvedAgentSandboxSettings } from "@/common/config/schemas/agentSandbox";
-import { agentSandboxPolicyAllows, buildAgentSandboxPolicy } from "./agentSandboxTargets";
+import {
+  AgentSandboxStartError,
+  agentSandboxPolicyAllows,
+  buildAgentSandboxPolicy,
+} from "./agentSandboxTargets";
 
 const SETTINGS: ResolvedAgentSandboxSettings = {
   enabled: true,
@@ -17,6 +21,20 @@ const SETTINGS: ResolvedAgentSandboxSettings = {
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
 }
+
+const savedRoot = process.env.XUM_ROOT;
+// Outside every write root, so a test that moves the home folder into a temp folder does not
+// move Xum's home folder there too, where the policy fails closed. It need not exist.
+const xumRoot = path.join(path.parse(os.tmpdir()).root, `xum-sandbox-test-${process.pid}`);
+
+beforeEach(() => {
+  process.env.XUM_ROOT = xumRoot;
+});
+
+afterEach(() => {
+  if (savedRoot === undefined) delete process.env.XUM_ROOT;
+  else process.env.XUM_ROOT = savedRoot;
+});
 
 describe("buildAgentSandboxPolicy", () => {
   let root: string;
@@ -151,6 +169,23 @@ describe("buildAgentSandboxPolicy", () => {
     }
   });
 
+  // Bash sources it before the script, also for a call that the user let run outside.
+  test("keeps the project tool_env read-only", () => {
+    const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+    for (const dir of [".xum", ".mux"]) {
+      expect(agentSandboxPolicyAllows(policy, path.join(repo, dir, "tool_env"), "write")).toBe(
+        false
+      );
+    }
+  });
+
+  test("fails closed when Xum's home folder is in a folder that commands can write", () => {
+    process.env.XUM_ROOT = path.join(root, "xum-home");
+
+    expect(() => buildAgentSandboxPolicy(SETTINGS, { cwd: repo })).toThrow(AgentSandboxStartError);
+  });
+
   test("hides a home folder outside /Users", async () => {
     const home = path.join(root, "home");
     await fs.mkdir(home);
@@ -180,19 +215,7 @@ describe("buildAgentSandboxPolicy", () => {
 });
 
 describe("buildAgentSandboxPolicy credential files", () => {
-  const savedRoot = process.env.XUM_ROOT;
-  // Outside every write root, so only the nested deny can hide its files. It need not exist.
-  const xumRoot = path.join(path.parse(os.tmpdir()).root, `xum-sandbox-test-${process.pid}`);
-
-  beforeEach(() => {
-    process.env.XUM_ROOT = xumRoot;
-  });
-
-  afterEach(() => {
-    if (savedRoot === undefined) delete process.env.XUM_ROOT;
-    else process.env.XUM_ROOT = savedRoot;
-  });
-
+  // xumRoot is outside every write root, so only the nested deny can hide its files.
   test("stay hidden when extraReadPaths names them", () => {
     const secrets = path.join(xumRoot, "secrets.json");
     const policy = buildAgentSandboxPolicy(

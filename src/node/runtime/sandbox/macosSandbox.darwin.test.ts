@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
@@ -293,25 +293,32 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     // The next command's policy opens their real paths, so a link in their place would open its
     // target. The protected paths under each keep it in place.
-    it("keeps the workspace and scratch folders in place", async () => {
+    it("keeps the workspace, scratch and extra write folders in place", async () => {
       const workspace = path.join(root, "ws");
+      const extra = path.join(workspace, "output");
       const scratch = path.join(root, "scratch");
       const elsewhere = path.join(root, "elsewhere");
-      for (const dir of [workspace, scratch, elsewhere]) await fs.mkdir(dir);
+      for (const dir of [workspace, extra, scratch, elsewhere]) await fs.mkdir(dir);
 
       const result = await runSandboxed(
-        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace, scratchDir: scratch }),
+        buildAgentSandboxPolicy(
+          { ...BASE_SETTINGS, extraWritePaths: [extra] },
+          { cwd: workspace, scratchDir: scratch }
+        ),
         root,
         [
+          `rm -rf ${extra} && ln -s ${elsewhere} ${extra} || echo EXTRA_KEPT`,
           `rm -rf ${scratch} && ln -s ${elsewhere} ${scratch} || echo SCRATCH_KEPT`,
           `rm -rf ${workspace} && ln -s ${elsewhere} ${workspace} || echo WORKSPACE_KEPT`,
         ].join("; ")
       );
 
+      expect(result.stdout).toContain("EXTRA_KEPT");
       expect(result.stdout).toContain("SCRATCH_KEPT");
       expect(result.stdout).toContain("WORKSPACE_KEPT");
-      expect((await fs.lstat(scratch)).isDirectory()).toBe(true);
-      expect((await fs.lstat(workspace)).isDirectory()).toBe(true);
+      for (const dir of [extra, scratch, workspace]) {
+        expect((await fs.lstat(dir)).isDirectory()).toBe(true);
+      }
     });
 
     it("opens the whole checkout of a workspace that works in a sub-project", async () => {
@@ -345,37 +352,44 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
 
     it("keeps a credential file in a write root unwritable, and its folder in place", async () => {
       const workspace = path.join(root, "ws");
-      const xumRoot = path.join(workspace, "xum-home");
-      await fs.mkdir(xumRoot, { recursive: true });
-      await fs.writeFile(path.join(xumRoot, "secrets.json"), '{"key":"SECRET"}');
+      // ~/.cache is a write root, and ~/.cache/huggingface/token a credential file in it.
+      const home = path.join(root, "home");
+      const tokenDir = path.join(home, ".cache", "huggingface");
+      await fs.mkdir(workspace);
+      await fs.mkdir(tokenDir, { recursive: true });
+      await fs.writeFile(path.join(tokenDir, "token"), "SECRET");
       const savedRoot = process.env.XUM_ROOT;
-      process.env.XUM_ROOT = xumRoot;
+      // Outside every write root, unlike <home>/.xum, where the policy fails closed.
+      process.env.XUM_ROOT = path.join("/", `xum-sandbox-test-${process.pid}`);
+      const homedir = spyOn(os, "homedir").mockReturnValue(home);
+      let policy: AgentSandboxPolicy;
       try {
-        const result = await runSandboxed(
-          buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
-          workspace,
-          [
-            `echo stolen > ${xumRoot}/secrets.json || echo WRITE_DENIED`,
-            // A folder renamed out from under the deny, or a hard link, would expose the file at
-            // a path the deny does not name.
-            `mv ${xumRoot} ${workspace}/moved || echo MOVE_DENIED`,
-            `cat ${workspace}/moved/secrets.json`,
-            `ln ${xumRoot}/secrets.json ${workspace}/linked || echo LINK_DENIED`,
-            `cat ${workspace}/linked`,
-          ].join("; ")
-        );
-
-        expect(result.stdout).toContain("WRITE_DENIED");
-        expect(result.stdout).toContain("MOVE_DENIED");
-        expect(result.stdout).toContain("LINK_DENIED");
-        expect(result.stdout).not.toContain("SECRET");
-        expect(await fs.readFile(path.join(xumRoot, "secrets.json"), "utf8")).toBe(
-          '{"key":"SECRET"}'
-        );
+        policy = buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace });
       } finally {
+        homedir.mockRestore();
         if (savedRoot === undefined) delete process.env.XUM_ROOT;
         else process.env.XUM_ROOT = savedRoot;
       }
+
+      const result = await runSandboxed(
+        policy,
+        workspace,
+        [
+          `echo stolen > ${tokenDir}/token || echo WRITE_DENIED`,
+          // A folder renamed out from under the deny, or a hard link, would expose the file at
+          // a path the deny does not name.
+          `mv ${tokenDir} ${workspace}/moved || echo MOVE_DENIED`,
+          `cat ${workspace}/moved/token`,
+          `ln ${tokenDir}/token ${workspace}/linked || echo LINK_DENIED`,
+          `cat ${workspace}/linked`,
+        ].join("; ")
+      );
+
+      expect(result.stdout).toContain("WRITE_DENIED");
+      expect(result.stdout).toContain("MOVE_DENIED");
+      expect(result.stdout).toContain("LINK_DENIED");
+      expect(result.stdout).not.toContain("SECRET");
+      expect(await fs.readFile(path.join(tokenDir, "token"), "utf8")).toBe("SECRET");
     });
 
     it("runs the toolchains that work outside it", async () => {
@@ -650,6 +664,36 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
         await fs.rm(result.outputDir, { recursive: true, force: true });
         await fs.rm(secret, { force: true });
         await fs.rm(victim, { force: true });
+      }
+    });
+
+    it("does not delete through a link a command puts in place of the record folder", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      // In ~, outside every write root.
+      const victim = await homeProbePath();
+      await fs.mkdir(path.join(victim, "bg"), { recursive: true });
+      await fs.writeFile(path.join(victim, "bg", "keep.txt"), "keep");
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtime = new LocalRuntime(workspace);
+      const workspaceId = `sandbox-test-${path.basename(root)}`;
+      const recordRoot = `/tmp/mux-bashes/${workspaceId}`;
+      await fs.mkdir(path.dirname(recordRoot), { recursive: true });
+      await fs.symlink(victim, recordRoot);
+      try {
+        // A spawn that fails after claiming its record folder removes that folder.
+        const result = await spawnProcess(runtime, "true", {
+          cwd: path.join(root, "missing"),
+          workspaceId,
+          processId: "bg",
+          recordDirClaimed: true,
+        });
+
+        expect(result.success).toBe(false);
+        expect(await fs.readFile(path.join(victim, "bg", "keep.txt"), "utf8")).toBe("keep");
+      } finally {
+        await fs.rm(recordRoot, { force: true });
+        await fs.rm(victim, { recursive: true, force: true });
       }
     });
 

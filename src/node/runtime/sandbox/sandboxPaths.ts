@@ -66,6 +66,9 @@ export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFil
   // MCP servers start outside the sandbox.
   ".xum/mcp.jsonc",
   ".mux/mcp.jsonc",
+  // Bash sources it before the script, also for a call the user let run outside the sandbox.
+  ".xum/tool_env",
+  ".mux/tool_env",
   // Plugin hooks and MCP servers.
   ".mcp.json",
   ".xum/plugins",

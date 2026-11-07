@@ -95,8 +95,10 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
 
 /**
  * Xum's own record keeping (spawn records, the kill sequence), not agent code, so it runs
- * outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox. writeMeta
- * does not use it: agent commands can put a symlink in its place (see backgroundRecordFiles.ts).
+ * outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox. Writes and
+ * deletes of a record do not use it (writeMeta, removing a failed spawn's record): agent commands
+ * can put a symlink on the record's path (see backgroundRecordFiles.ts), and the sandbox refuses
+ * a write or delete through it.
  */
 const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
@@ -248,13 +250,13 @@ export async function spawnProcess(
   );
 
   // A failed spawn must not leave a recordless process directory behind: the crash-orphan
-  // probe fails closed on directories without readable metadata or an exit marker.
+  // probe fails closed on directories without readable metadata or an exit marker. In the
+  // sandbox when it applies (see XUM_INTERNAL).
   const removeOutputDirBestEffort = async () => {
     try {
       await execBuffered(runtime, `rm -rf ${quotePath(outputDir)}`, {
         cwd: FALLBACK_CWD,
         timeout: 10,
-        ...XUM_INTERNAL,
       });
     } catch {
       // Best-effort: a leftover directory only over-refuses model-driven archives.
@@ -295,10 +297,10 @@ export async function spawnProcess(
     // process would be trusted as proof that the NEW process exited — both by getExitCode()
     // and by crash-orphan archive gating — so it must be gone before the wrapper's trap owns
     // the file again.
+    // In the sandbox when it applies (see XUM_INTERNAL).
     const rmResult = await execBuffered(runtime, `rm -f ${quotePath(exitCodePath)}`, {
       cwd: FALLBACK_CWD,
       timeout: 10,
-      ...XUM_INTERNAL,
     });
     if (rmResult.exitCode !== 0) {
       await removeOutputDirBestEffort();

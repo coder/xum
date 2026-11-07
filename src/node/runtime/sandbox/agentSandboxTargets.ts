@@ -122,6 +122,14 @@ export function buildAgentSandboxPolicy(
     ...CACHE_WRITE_PATHS.map(expandWriteRoot),
     ...extraWriteRoots,
   ]);
+  // Xum runs code from its home folder with full access (the global mcp.jsonc, tool hooks,
+  // skills), so a policy that can write it does not hold.
+  const xumHome = realpathOfNearest(getXumHome());
+  if (isUnderAny(xumHome, writeRoots)) {
+    throw new AgentSandboxStartError(
+      `Xum's home folder ${xumHome} is inside a folder that commands can write`
+    );
+  }
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
   const gitCommonDirs = dedupe(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
