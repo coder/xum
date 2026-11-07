@@ -870,6 +870,11 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
           BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
+      # The macOS agent sandbox runs commands through /usr/bin/sandbox-exec, which Apple has
+      # deprecated: these tests fail when a macOS release drops it or changes what it enforces.
+      - name: Run macOS agent sandbox tests
+        if: matrix.os == 'macos'
+        run: bun test src/node/runtime/sandbox
       # A failed bug-bash repro writes its trace page, screen (accessibility tree, focus) and
       # failure screenshot under tests/bugbash/.e2e/<phase>/results/<test>/ (e2e 0.20+), next to
       # the report. On the host the app log goes to e2e.config.ts's default, .e2e/logs/app.log.
