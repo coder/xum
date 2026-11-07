@@ -21,6 +21,7 @@ import {
 import { Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  dreamStreamLockPath,
   HARVEST_MAX_ATTEMPTS,
   MemoryConsolidationService,
   resolveDreamAgentBody,
@@ -36,6 +37,7 @@ import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
@@ -1496,6 +1498,89 @@ describe("MemoryConsolidationService", () => {
       } finally {
         releaseUsage();
       }
+    });
+
+    /** Another backend on the same root holding the dream lock: this process sees its token as live. */
+    function holdForeignDreamLock(fixture: Fixture) {
+      return acquireCrossProcessLock({
+        lockPath: dreamStreamLockPath(fixture.xumHome),
+        acquireTimeoutMs: 1_000,
+        staleMs: 60_000,
+        timeoutMessage: "test holder",
+      });
+    }
+
+    it("waits for a dream stream in another process before starting its own", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const releaseForeign = await holdForeignDreamLock(fixture);
+      try {
+        const run = fixture.service.maybeRun("ws-dream", "manual");
+        await waitingForTurn(fixture, 1);
+        expect(held.events).toEqual([]);
+
+        await releaseForeign();
+        await until(() => held.events.includes("start-1"));
+        held.release(1);
+        expect((await run).success).toBe(true);
+      } finally {
+        await releaseForeign();
+      }
+    });
+
+    it("cancels a run that is waiting for another process's dream stream when its workspace is removed", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-other");
+      const releaseForeign = await holdForeignDreamLock(fixture);
+      try {
+        const run = fixture.service.maybeRun("ws-other", "manual");
+        await waitingForTurn(fixture, 1);
+
+        await fixture.service.cancelInFlightConsolidation("ws-other");
+        const cancelled = await run;
+        expect(cancelled.success).toBe(false);
+        if (!cancelled.success) expect(cancelled.error).toContain("being removed");
+        expect(held.events).toEqual([]);
+
+        // The cancelled run released its queue slot and never took the lock.
+        await releaseForeign();
+        const next = fixture.service.maybeRun("ws-dream", "manual");
+        await until(() => held.events.includes("start-2"));
+        held.release(2);
+        expect((await next).success).toBe(true);
+      } finally {
+        await releaseForeign();
+      }
+    });
+
+    it("skips the run, without a stream or a journal row, when the dream lock cannot be taken", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const lockPath = dreamStreamLockPath(fixture.xumHome);
+      const { writeFile } = fsPromises;
+      // The lock's temp file cannot be written: a filesystem error, not contention.
+      const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
+        if (typeof file === "string" && file.startsWith(`${lockPath}.tmp-`)) {
+          throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+        }
+        return writeFile(file, data);
+      });
+      try {
+        const failed = await fixture.service.maybeRun("ws-dream", "manual");
+        expect(failed.success).toBe(false);
+        if (!failed.success) expect(failed.error).toContain("consolidation lock");
+        expect(held.events).toEqual([]);
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      // The failed run released its queue slot, so the next run goes through once the lock works.
+      const retry = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-2"));
+      held.release(2);
+      expect((await retry).success).toBe(true);
     });
 
     it("starts waiting runs in the order they arrived, each after the one before it ended", async () => {
