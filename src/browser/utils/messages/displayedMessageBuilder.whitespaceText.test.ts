@@ -41,9 +41,9 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     const assistant = rows[3];
     if (assistant?.type !== "assistant") throw new Error("expected assistant row");
     expect(assistant.content).toBe("\n\nDone.");
-    expect(
-      rows.filter((row) => "isLastPartOfMessage" in row && row.isLastPartOfMessage)
-    ).toEqual([assistant]);
+    expect(rows.filter((row) => "isLastPartOfMessage" in row && row.isLastPartOfMessage)).toEqual([
+      assistant,
+    ]);
   });
 
   test("streaming reasoning keeps last-part status when whitespace text follows it", () => {
