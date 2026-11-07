@@ -9,6 +9,8 @@ import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSet
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
+import type { AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
+import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -217,6 +219,8 @@ export interface MockORPCClientOptions {
   goalDefaults?: GoalDefaults;
   /** Agent resource limits and their status (Settings → Agents); off when omitted. */
   agentResourceLimits?: AgentResourceLimitsState;
+  /** Agent sandbox setting and support (Settings → Agents); off and supported when omitted. */
+  agentSandbox?: AgentSandboxState;
   /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
   autoModelRouting?: AutoModelRoutingConfig;
   /**
@@ -557,6 +561,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     agentResourceLimits: initialAgentResourceLimits,
+    agentSandbox: initialAgentSandbox,
     autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
     timelineEvents = [],
@@ -741,6 +746,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let agentResourceLimitsState =
     initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
+  let agentSandboxState: AgentSandboxState = initialAgentSandbox ?? {
+    global: {},
+    projects: {},
+    support: { state: "supported" },
+  };
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
   let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
@@ -2161,6 +2171,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ success: true as const, data: undefined });
       },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
+      answerSandboxApproval: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
       truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -2722,6 +2733,23 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           projects
         );
         return Promise.resolve(agentResourceLimitsState);
+      },
+    },
+    agentSandbox: {
+      get: () => Promise.resolve(agentSandboxState),
+      set: (sandbox: AgentSandboxConfig) => {
+        agentSandboxState = { ...agentSandboxState, global: sandbox };
+        return Promise.resolve(agentSandboxState);
+      },
+      setProject: (input: { projectPath: string; sandbox: AgentSandboxConfig }) => {
+        const projects = { ...agentSandboxState.projects };
+        if (Object.keys(input.sandbox).length === 0) {
+          delete projects[input.projectPath];
+        } else {
+          projects[input.projectPath] = input.sandbox;
+        }
+        agentSandboxState = { ...agentSandboxState, projects };
+        return Promise.resolve(agentSandboxState);
       },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by

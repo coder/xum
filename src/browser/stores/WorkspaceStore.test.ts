@@ -8692,7 +8692,10 @@ describe("WorkspaceStore", () => {
 
     // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
     // reconnect shows exactly those; a call answered while disconnected sends nothing.
-    const approvalAfterReconnect = async (workspaceId: string, replayed: WorkspaceChatMessage[]) => {
+    const approvalAfterReconnect = async (
+      workspaceId: string,
+      replayed: WorkspaceChatMessage[]
+    ) => {
       const firstSubscription = createReleaseGate();
       const subscriptions = mockChatReconnectScript((attempt, signal) =>
         attempt === 1
