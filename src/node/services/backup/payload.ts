@@ -307,7 +307,7 @@ async function lstatOrNull(target: string) {
  * parent, `EIO`) propagates: a preflight that read it as "missing" would accept a write the
  * filesystem is about to refuse, after the point where refusing changes nothing.
  */
-async function lstatIfExists(target: string): Promise<Stats | null> {
+export async function lstatIfExists(target: string): Promise<Stats | null> {
   try {
     return await fs.lstat(target);
   } catch (error) {
@@ -2074,9 +2074,19 @@ export class BackupInvalidPayloadError extends Error {
   }
 }
 
-/** An fs failure carries an errno string; a validation failure does not. */
+/**
+ * An errno name (`ENOENT`, `EACCES`) or a Node `ERR_*` code. Our own errors carry a `code` too
+ * (BackupInvalidPayloadError and BackupServiceError: `INVALID_BACKUP`, `IO_ERROR`, ...), so a bare
+ * "has a string code" test would read a repository failure as a disk failure. None of those starts
+ * with `E`; a test keeps it so (payload.test.ts).
+ */
+const ERRNO_CODE = /^E[A-Z0-9_]+$/;
+
+/** An fs failure carries an errno code; a validation failure does not. */
 export function isFilesystemError(error: unknown): boolean {
-  return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string";
+  if (!(error instanceof Error)) return false;
+  const { code } = error as NodeJS.ErrnoException;
+  return typeof code === "string" && ERRNO_CODE.test(code);
 }
 
 /**
@@ -3305,9 +3315,17 @@ export async function writeProjectBundle(
   });
 }
 
+/**
+ * The bytes a sidecar's manifest.json publishes (the project bundle's and the plugin list's).
+ * Exported so the secret scan sees exactly them.
+ */
+export function serializeSidecarManifest(manifest: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+}
+
 /** The bytes `writeProjectBundle` publishes for the manifest; exported so the secret scan sees them too. */
 export function serializeProjectBundleManifest(manifest: BackupProjectBundleManifest): Buffer {
-  return Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+  return serializeSidecarManifest(manifest);
 }
 
 /** Where the bundle manifest lands relative to the managed path. */
@@ -3341,10 +3359,15 @@ export async function assertManagedTreeWithinLimits(destinationDir: string): Pro
  * the full read refuses, and the toggle-off report should say so rather than "none".
  */
 export async function projectBundleExists(sourceDir: string): Promise<boolean> {
+  return await sidecarExists(sourceDir, PROJECT_BUNDLE_DIR);
+}
+
+/** Whether the checked-out backup has anything at a sidecar folder's path, symlink and file included. */
+export async function sidecarExists(sourceDir: string, sidecarDir: string): Promise<boolean> {
   // lstat, never stat: on hosts where git materializes symlinks, a crafted sidecar pointing
-  // at a UNC path would otherwise be followed here — reached even with project backup off —
+  // at a UNC path would otherwise be followed here — reached even with the toggle off —
   // and Windows would start SMB authentication.
-  return (await lstatIfExists(path.join(sourceDir, PROJECT_BUNDLE_DIR))) !== null;
+  return (await lstatIfExists(path.join(sourceDir, sidecarDir))) !== null;
 }
 
 function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {

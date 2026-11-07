@@ -8,7 +8,6 @@ import * as path from "node:path";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import {
-  AgentPluginInstallEntrySchema,
   AgentPluginComponentConsentSchema,
   AgentPluginImportedComponentsSchema,
   type AgentPluginImportedComponents,
@@ -162,7 +161,11 @@ import {
   UNINSTALL_JOURNAL_PREFIX,
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
-import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
+import {
+  PLUGIN_REGISTRY_FILE_NAME,
+  parseRegistryEntriesLenient,
+  readPluginRegistryDocument,
+} from "./registry";
 import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import {
   hashPluginTree,
@@ -2274,35 +2277,8 @@ export class AgentPluginInstallService {
         seenRawNames.add(rawName);
       }
     }
-    const entries: AgentPluginInstallEntry[] = [];
-    const seenNames = new Set<string>();
-    for (const rawEntry of rawEntries) {
-      const parsed = AgentPluginInstallEntrySchema.safeParse(rawEntry);
-      if (!parsed.success) {
-        log.debug("Skipping unrecognized managed plugin registry entry (preserved on disk)", {
-          entry: rawEntry,
-          error: parsed.error.message,
-        });
-        continue;
-      }
-      // Duplicate names are corrupt identity: entry names map 1:1 to
-      // container directories and instance IDs, and raw rewrites match by
-      // name — a mutation would patch EVERY duplicate from the first entry's
-      // source, silently rewriting the others. Mutations (strict) refuse;
-      // views (lenient) keep the first (matching find()-based lookups).
-      if (seenNames.has(parsed.data.name)) {
-        if (mode === "strict") {
-          throw new Error(
-            `The plugin registry (${shortenHome(this.registryFile)}) contains duplicate entries for '${parsed.data.name}'. Repair the file, then retry.`
-          );
-        }
-        log.warn("Ignoring duplicate managed plugin registry entry", { name: parsed.data.name });
-        continue;
-      }
-      seenNames.add(parsed.data.name);
-      entries.push(parsed.data);
-    }
-    return entries;
+    // Strict mode refused every repeated raw name above, so what is left is the lenient parse.
+    return parseRegistryEntriesLenient(rawEntries);
   }
 
   /**

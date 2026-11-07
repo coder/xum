@@ -1,9 +1,9 @@
 import { z } from "zod";
 import {
-  hasUnsafeUrlCharacters,
   hasUrlCredentials,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
+  UNSAFE_URL_CHARACTERS,
 } from "@/common/config/schemas/settingsBackup";
 import {
   AgentPluginGitSourceSchema,
@@ -103,7 +103,7 @@ const BackupPluginUrlSchema = z
   .refine((url) => !/^[\\/]{2}/.test(url), {
     message: "A repository URL must not be a network share",
   })
-  .refine((url) => !hasUnsafeUrlCharacters(url), {
+  .refine((url) => !UNSAFE_URL_CHARACTERS.test(url), {
     message: "A repository URL must not contain whitespace or control characters",
   })
   .refine((url) => !hasUrlCredentials(url), {

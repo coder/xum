@@ -201,12 +201,11 @@ export function hasUrlCredentials(repoUrl: string): boolean {
 /**
  * Whitespace, control characters and bidi controls: none belongs in a remote URL. They are how a
  * command injection into a later shell paste starts, and how a URL shown to the user is made to
- * read differently from the one git gets.
+ * read differently from the one git gets. Not global, so `.test` keeps no state between calls.
  */
-export function hasUnsafeUrlCharacters(url: string): boolean {
-  // eslint-disable-next-line no-control-regex
-  return /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(url);
-}
+// eslint-disable-next-line no-control-regex
+export const UNSAFE_URL_CHARACTERS =
+  /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 
 /** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
 export const MAX_BACKUP_PROJECT_ENTRIES = 256;
@@ -222,7 +221,7 @@ export const MAX_BACKUP_PROJECT_ENTRIES = 256;
 export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
   const url = rawUrl.trim();
   if (url === "" || url.length > 2048) return undefined;
-  if (hasUnsafeUrlCharacters(url)) return undefined;
+  if (UNSAFE_URL_CHARACTERS.test(url)) return undefined;
   // Percent-escapes would let a credential pattern hide from the publish-time secret scan
   // (which sees the manifest text, not its decoded form); real remotes do not need them.
   if (/%[0-9A-Fa-f]{2}/.test(url)) return undefined;

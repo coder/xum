@@ -594,6 +594,27 @@ describe("backup of the managed plugin list", () => {
       }
     );
 
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "fails the preview, not reads a plugin as missing, when the plugins folder cannot be read",
+      async () => {
+        const { payload, request } = await backupOf([registryRow("alpha")]);
+        await useLocalRegistry([]);
+        const plugins = path.join(muxRoot, "plugins");
+        await fs.mkdir(plugins);
+        await fs.chmod(plugins, 0o000);
+        try {
+          const error = await captureRejection(
+            payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+          );
+          expect((error as { code?: string }).code).toBe("EACCES");
+          // Validation reads only the list: it needs nothing from this machine's plugins folder.
+          await payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS });
+        } finally {
+          await fs.chmod(plugins, 0o700);
+        }
+      }
+    );
+
     it("lets a malformed list through when the flag is off", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
       await fs.writeFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "{ not json", "utf-8");

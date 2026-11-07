@@ -28,10 +28,12 @@ import {
   assertProjectMemoryWritesAllowed,
   backupCommandApprovalToken,
   backupSecretApprovalDigest,
+  BackupInvalidPayloadError,
   collectAllowlistedFiles,
   collectMcpCommandApprovals,
   collectProjectBundle,
   createBackupPayload,
+  isFilesystemError,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
   matchedProjectWrites,
@@ -65,6 +67,7 @@ import {
   type BackupContents,
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
+import { BackupOperationErrorSchema } from "@/common/orpc/schemas/backup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 
@@ -5722,6 +5725,23 @@ describe("sanitizeBackupGitRemote", () => {
       `https://example.com/%67hp_${"a".repeat(24)}/repo.git`,
     ]) {
       expect(sanitizeBackupGitRemote(remote)).toBeUndefined();
+    }
+  });
+});
+
+describe("isFilesystemError", () => {
+  it("takes a failed fs call and nothing our own errors can be mistaken for", () => {
+    const missing = Object.assign(new Error("gone"), { code: "ENOENT" });
+    expect(isFilesystemError(missing)).toBe(true);
+    expect(
+      isFilesystemError(Object.assign(new Error("too big"), { code: "ERR_FS_FILE_TOO_LARGE" }))
+    ).toBe(true);
+    expect(isFilesystemError(new Error("no code"))).toBe(false);
+    expect(isFilesystemError({ code: "ENOENT" })).toBe(false);
+    expect(isFilesystemError(new BackupInvalidPayloadError(new Error("bad payload")))).toBe(false);
+    // BackupServiceError carries one of these as its `code`.
+    for (const code of BackupOperationErrorSchema.shape.code.options) {
+      expect(isFilesystemError(Object.assign(new Error(code), { code }))).toBe(false);
     }
   });
 });

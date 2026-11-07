@@ -1,10 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
-import {
-  AgentPluginInstallEntrySchema,
-  type AgentPluginInstallEntry,
-} from "@/common/config/schemas/agentPluginInstalls";
+import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 import type { BackupContents } from "@/common/config/schemas/settingsBackup";
 import {
   BackupPluginEntrySchema,
@@ -16,25 +13,29 @@ import {
   type BackupPluginReport,
   type BackupPluginRow,
   type BackupPluginStatus,
-  EMPTY_BACKUP_PLUGIN_REPORT,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isLocalGitUrl } from "@/node/services/agentPlugins/claudeMarketplace";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
 import type { GeneratedFrom } from "@/node/services/agentPlugins/manifest";
 import {
+  parseRegistryEntriesLenient,
   PLUGIN_REGISTRY_FILE_NAME,
   readPluginRegistryDocument,
 } from "@/node/services/agentPlugins/registry";
 import { log } from "@/node/services/log";
+import { formatZodIssues } from "@/node/utils/markdownFrontmatter";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
   isFilesystemError,
+  lstatIfExists,
   MAX_BACKUP_FILE_BYTES,
   resolveContainedPath,
+  serializeSidecarManifest,
   sha256,
+  sidecarExists,
   type BackupFile,
 } from "./payload";
 
@@ -55,19 +56,13 @@ import {
 export const PLUGIN_BACKUP_DIR = "agent-plugins";
 export const PLUGIN_BACKUP_MANIFEST_PATH = `${PLUGIN_BACKUP_DIR}/${BACKUP_MANIFEST_FILE}`;
 
-/** The managed registry rows this build can read, first row per name (a later duplicate is corrupt). */
+/** The managed registry rows this build can read, by name. */
 async function readManagedInstalls(rootDir: string): Promise<Map<string, AgentPluginInstallEntry>> {
   const { rawEntries } = await readPluginRegistryDocument(
     path.join(rootDir, PLUGIN_REGISTRY_FILE_NAME),
     "lenient"
   );
-  const installs = new Map<string, AgentPluginInstallEntry>();
-  for (const raw of rawEntries) {
-    const parsed = AgentPluginInstallEntrySchema.safeParse(raw);
-    if (parsed.success && !installs.has(parsed.data.name))
-      installs.set(parsed.data.name, parsed.data);
-  }
-  return installs;
+  return new Map(parseRegistryEntriesLenient(rawEntries).map((entry) => [entry.name, entry]));
 }
 
 /**
@@ -126,10 +121,6 @@ export async function collectPluginBackup(rootDir: string): Promise<BackupPlugin
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
 }
 
-export function serializePluginBackupManifest(manifest: BackupPluginManifest): Buffer {
-  return Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
-}
-
 /**
  * The names a push removes from the backup's list, and whether it removes the whole list. Undefined
  * when the backup has no list or every listed plugin stays. A list the backup has but this build
@@ -175,7 +166,7 @@ export async function exportPluginBackup(options: {
     : null;
   const pluginRemoval = pluginRemovalOf(options.prior, manifest);
   if (manifest === null) return { files: [], pluginRemoval };
-  const content = serializePluginBackupManifest(manifest);
+  const content = serializeSidecarManifest(manifest);
   const sidecar = path.join(options.destination, PLUGIN_BACKUP_DIR);
   await fs.mkdir(sidecar, { recursive: true, mode: 0o700 });
   await writeFileAtomic(path.join(sidecar, BACKUP_MANIFEST_FILE), content, { mode: 0o600 });
@@ -184,14 +175,14 @@ export async function exportPluginBackup(options: {
 }
 
 /** Anything at the sidecar path counts, so a malformed one is still reported while the flag is off. */
-async function pluginBackupExists(sourceDir: string): Promise<boolean> {
-  return (await fs.lstat(path.join(sourceDir, PLUGIN_BACKUP_DIR)).catch(() => null)) !== null;
+function pluginBackupExists(sourceDir: string): Promise<boolean> {
+  return sidecarExists(sourceDir, PLUGIN_BACKUP_DIR);
 }
 
 async function readManifestText(sourceDir: string): Promise<string> {
   // The walk refuses a symlink at the sidecar folder or the manifest, which git can store.
   const manifestPath = await resolveContainedPath(sourceDir, PLUGIN_BACKUP_MANIFEST_PATH);
-  const stat = await fs.lstat(manifestPath).catch(() => null);
+  const stat = await lstatIfExists(manifestPath);
   if (stat === null || !stat.isFile() || stat.size > MAX_BACKUP_FILE_BYTES) {
     throw new Error("Backup plugin list is missing, not a file, or too large");
   }
@@ -228,13 +219,6 @@ function rowLabel(row: unknown, index: number): string {
     : `row ${index + 1}`;
 }
 
-function describeIssues(error: z.ZodError): string {
-  return error.issues
-    .slice(0, 2)
-    .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-    .join("; ");
-}
-
 /**
  * Keeps the rows this build can read, first row per name (a later duplicate is corrupt). A row it
  * cannot read, such as a source kind a newer build wrote, is left out and reported: the list is
@@ -247,7 +231,9 @@ function readPluginRows(rows: readonly unknown[]): PluginListRead {
   for (const [index, row] of rows.slice(0, MAX_BACKUP_PLUGIN_ENTRIES).entries()) {
     const parsed = BackupPluginEntrySchema.safeParse(row);
     if (!parsed.success) {
-      problems.push(`Left out ${rowLabel(row, index)}: ${describeIssues(parsed.error)}`);
+      problems.push(
+        `Left out ${rowLabel(row, index)}: ${formatZodIssues(parsed.error.issues.slice(0, 2))}`
+      );
     } else if (names.has(parsed.data.name)) {
       problems.push(`Left out ${rowLabel(row, index)}: the list names that plugin twice`);
     } else {
@@ -304,7 +290,7 @@ async function statusOf(
   local: AgentPluginInstallEntry | undefined
 ): Promise<BackupPluginStatus> {
   if (local !== undefined) return local.lockedSha === plugin.lockedSha ? "installed" : "conflict";
-  const folder = await fs.lstat(path.join(rootDir, "plugins", plugin.name)).catch(() => null);
+  const folder = await lstatIfExists(path.join(rootDir, "plugins", plugin.name));
   return folder === null ? "missing" : "conflict";
 }
 
@@ -324,24 +310,35 @@ async function planPluginRows(
 }
 
 /**
+ * The checked-out list, as far as the flag lets this build read it. With the flag off the list is
+ * only checked for existence, so a malformed one never blocks a settings-only restore, and its
+ * presence is reported (`skipped`). With it on, an unreadable list or row comes back as a warning
+ * (`readPluginBackup`), and a local disk failure still throws. Reads the backup only, so a
+ * restore's validation can call it alone, before the snapshot.
+ */
+export async function readPluginSidecar(
+  sourceDir: string,
+  contents: BackupContents
+): Promise<{ skipped: boolean; list: PluginListRead }> {
+  if (!contents.includePlugins) {
+    return { skipped: await pluginBackupExists(sourceDir), list: { plugins: [], warnings: [] } };
+  }
+  return { skipped: false, list: await readPluginBackup(sourceDir) };
+}
+
+/**
  * What a preview or restore reports of the backup's plugin list. Writes nothing: the rows are an
  * offer the user can take through the install review (see the note at the top of this file).
- * With the flag off the list is only checked for existence, so a malformed one never blocks a
- * settings-only restore, and its presence is reported. With it on, an unreadable list or row comes
- * back as a warning (`readPluginBackup`).
  */
 export async function readPluginRestore(options: {
   rootDir: string;
   sourceDir: string;
   contents: BackupContents;
 }): Promise<BackupPluginReport> {
-  if (!options.contents.includePlugins) {
-    return { ...EMPTY_BACKUP_PLUGIN_REPORT, skipped: await pluginBackupExists(options.sourceDir) };
-  }
-  const list = await readPluginBackup(options.sourceDir);
+  const { skipped, list } = await readPluginSidecar(options.sourceDir, options.contents);
   return {
     rows: await planPluginRows(options.rootDir, list.plugins),
-    skipped: false,
+    skipped,
     warnings: list.warnings,
   };
 }

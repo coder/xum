@@ -53,7 +53,12 @@ import {
   writeShelfBackup,
   type ShelfRestoreEntry,
 } from "./artifactShelfBackup";
-import { exportPluginBackup, readPluginRestore, readPriorPluginList } from "./agentPluginBackup";
+import {
+  exportPluginBackup,
+  readPluginRestore,
+  readPluginSidecar,
+  readPriorPluginList,
+} from "./agentPluginBackup";
 import { BackupRepoCache } from "./gitRepo";
 import {
   MAX_BACKUP_FILE_COUNT,
@@ -773,11 +778,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       await planRestoreWrites(muxRoot, payload);
       // So is a plugin list this machine cannot read from disk. A list it cannot parse is only
       // reported, and reading either writes nothing.
-      await readPluginRestore({
-        rootDir: muxRoot,
-        sourceDir,
-        contents: validateOptions.contents,
-      });
+      await readPluginSidecar(sourceDir, validateOptions.contents);
       // A shelf sidecar the restore would refuse is refused before the snapshot, too.
       const shelf = await omitSymlinkedShelfEntries(
         muxRoot,
