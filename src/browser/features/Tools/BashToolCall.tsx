@@ -53,6 +53,34 @@ const EMPTY_LIVE_OUTPUT: BashLiveOutputView = {
   truncated: false,
 };
 
+/**
+ * A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without `success`
+ * (#6044): that shape is model-visible and replayed, so the card reads the reason from any
+ * non-empty `error` instead of requiring `success: false`. The shared normalizer unwraps the SDK
+ * JSON container (`{ type: "json", value }`); the object check keeps a primitive result (0,
+ * false) from throwing in the `in` check below.
+ */
+function getResultErrorText(result: BashToolResult | undefined): string | null {
+  const normalizedResult: unknown = normalizeToolResultForRendering(result);
+  const errorText: unknown =
+    typeof normalizedResult === "object" && normalizedResult !== null && "error" in normalizedResult
+      ? normalizedResult.error
+      : undefined;
+  return typeof errorText === "string" && errorText.length > 0 ? errorText : null;
+}
+
+function SandboxDenialBadge(props: { summary: string | null }) {
+  return props.summary === null ? null : <SandboxBadge label="Sandbox" className="ml-2" />;
+}
+
+/** Shown collapsed too: it explains the badge and why the command failed. */
+function SandboxDenialFooter(props: { summary: string | null }) {
+  if (props.summary === null) return null;
+  return (
+    <div className="text-warning mt-1 font-sans text-[11px] wrap-anywhere">{props.summary}</div>
+  );
+}
+
 export const BashToolCall: React.FC<BashToolCallProps> = ({
   workspaceId,
   toolCallId,
@@ -105,17 +133,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
 
-  // A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without
-  // `success` (#6044): that shape is model-visible and replayed, so the card reads the reason
-  // from any non-empty `error` instead of requiring `success: false`. The shared normalizer
-  // unwraps the SDK JSON container (`{ type: "json", value }`); the object check keeps a
-  // primitive result (0, false) from throwing in the `in` check below.
-  const normalizedResult: unknown = normalizeToolResultForRendering(result);
-  const errorText: unknown =
-    typeof normalizedResult === "object" && normalizedResult !== null && "error" in normalizedResult
-      ? normalizedResult.error
-      : undefined;
-  const resultError = typeof errorText === "string" && errorText.length > 0 ? errorText : null;
+  const resultError = getResultErrorText(result);
 
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
@@ -162,20 +180,10 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const completedOutput = isBackgroundResult ? undefined : result?.output;
   const completedHasOutput = typeof completedOutput === "string" && completedOutput.length > 0;
   const showCompletedOutputSection = !isBackgroundResult && (completedHasOutput || Boolean(note));
-  const sandboxDenialSummary = describeSandboxDenials(
-    result && "sandboxDenials" in result ? (result.sandboxDenials ?? []) : []
-  );
+  const sandboxDenialSummary = describeSandboxDenials(result);
 
-  if (sandboxApproval && workspaceId && toolCallId) {
-    return (
-      <SandboxApprovalCard
-        workspaceId={workspaceId}
-        toolCallId={toolCallId}
-        script={args.script}
-        reason={sandboxApproval.approval.reason}
-        isLatest={sandboxApproval.isLatest}
-      />
-    );
+  if (sandboxApproval) {
+    return <SandboxApprovalCard {...sandboxApproval} script={args.script} />;
   }
 
   return (
@@ -265,7 +273,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
         {!isBackground && typeof result?.exitCode === "number" && (
           <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
         )}
-        {sandboxDenialSummary !== null && <SandboxBadge label="Sandbox" className="ml-2" />}
+        <SandboxDenialBadge summary={sandboxDenialSummary} />
         <StatusIndicator status={effectiveStatus}>
           {getStatusDisplay(effectiveStatus)}
         </StatusIndicator>
@@ -412,12 +420,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           )}
         </ToolDetails>
       )}
-      {sandboxDenialSummary !== null && (
-        // Shown collapsed too: it explains the badge and why the command failed.
-        <div className="text-warning mt-1 font-sans text-[11px] wrap-anywhere">
-          {sandboxDenialSummary}
-        </div>
-      )}
+      <SandboxDenialFooter summary={sandboxDenialSummary} />
     </ToolContainer>
   );
 };
