@@ -2962,6 +2962,22 @@ export const router = (authToken?: string) => {
         .output(schemas.agentResourceLimits.setEnabled.output)
         .handler(({ context, input }) => context.agentResourceLimits.setEnabled(input.enabled)),
     },
+    agentSandbox: {
+      get: t
+        .input(schemas.agentSandbox.get.input)
+        .output(schemas.agentSandbox.get.output)
+        .handler(({ context }) => context.agentSandbox.get()),
+      set: t
+        .input(schemas.agentSandbox.set.input)
+        .output(schemas.agentSandbox.set.output)
+        .handler(({ context, input }) => context.agentSandbox.set(input)),
+      setProject: t
+        .input(schemas.agentSandbox.setProject.input)
+        .output(schemas.agentSandbox.setProject.output)
+        .handler(({ context, input }) =>
+          context.agentSandbox.setProject(input.projectPath, input.sandbox)
+        ),
+    },
     perfCaptures: {
       list: t
         .input(schemas.perfCaptures.list.input)

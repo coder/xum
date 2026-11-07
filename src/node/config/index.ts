@@ -42,6 +42,7 @@ import {
   normalizeAgentResourceLimits,
   type AgentResourceLimits,
 } from "@/common/config/schemas/agentResourceLimits";
+import { salvageAgentSandbox, type AgentSandboxConfig } from "@/common/config/schemas/agentSandbox";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -926,6 +927,13 @@ function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): 
   else delete project.agentResourceLimits;
 }
 
+/** Store the valid sandbox fields in `value` on the project, or remove its override. */
+function setProjectAgentSandbox(project: ProjectConfig, value: unknown): void {
+  const salvaged = salvageAgentSandbox(value);
+  if (salvaged) project.agentSandbox = salvaged;
+  else delete project.agentSandbox;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -994,6 +1002,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
   setProjectAgentResourceLimits(next, record.agentResourceLimits);
+  setProjectAgentSandbox(next, record.agentSandbox);
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -3092,6 +3101,7 @@ export class Config {
       ),
       agentResourceLimits: normalizeAgentResourceLimits(parsed.agentResourceLimits),
       agentResourceLimitsEnabled: parseOptionalBoolean(parsed.agentResourceLimitsEnabled),
+      agentSandbox: salvageAgentSandbox(parsed.agentSandbox),
       goalDefaults: normalizeGoalDefaults(parsed.goalDefaults),
       evaluationDefaults: normalizeEvaluationDefaults(parsed.evaluationDefaults),
       routePriority,
@@ -3258,6 +3268,7 @@ export class Config {
       // Undefined (no limit set, or the limits are off) leaves the key out of the JSON.
       data.agentResourceLimits = normalizeAgentResourceLimits(config.agentResourceLimits);
       data.agentResourceLimitsEnabled = parseOptionalBoolean(config.agentResourceLimitsEnabled);
+      data.agentSandbox = salvageAgentSandbox(config.agentSandbox);
 
       if (config.goalDefaults) {
         data.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
@@ -3771,6 +3782,28 @@ export class Config {
         );
       }
       setProjectAgentResourceLimits(project, limits);
+      return config;
+    });
+  }
+
+  /** Replaces the global sandbox setting: an omitted field takes its default. */
+  async updateAgentSandbox(sandbox: AgentSandboxConfig): Promise<void> {
+    await this.editConfig((config) => {
+      const salvaged = salvageAgentSandbox(sandbox);
+      if (salvaged) config.agentSandbox = salvaged;
+      else delete config.agentSandbox;
+      return config;
+    });
+  }
+
+  /** Replaces one project's sandbox override: an omitted field follows the global setting. */
+  async updateProjectAgentSandbox(projectPath: string, sandbox: AgentSandboxConfig): Promise<void> {
+    await this.editConfig((config) => {
+      const project = config.projects.get(projectPath);
+      if (!project) {
+        throw new Error(`Project not found: ${projectPath}`);
+      }
+      setProjectAgentSandbox(project, sandbox);
       return config;
     });
   }

@@ -59,6 +59,7 @@ import {
 import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfiler";
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
+import { AgentSandboxService } from "@/node/services/agentSandbox/agentSandboxService";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -284,6 +285,7 @@ export class ServiceContainer {
   public readonly sessionTapes: SessionTapeFolderService;
   // Constructed directly (no DI tag): it needs only the config and holds one config listener.
   public readonly agentResourceLimits: AgentResourceLimitsService;
+  public readonly agentSandbox: AgentSandboxService;
   public readonly coderService: CoderService;
   public readonly serverAuthService: ServerAuthService;
   public readonly desktopSessionManager: DesktopSessionManager;
@@ -331,6 +333,7 @@ export class ServiceContainer {
     this.workflowRuntimeFactory = get(QuickJSRuntimeFactoryTag);
     this.config = get(ConfigTag);
     this.agentResourceLimits = new AgentResourceLimitsService(this.config);
+    this.agentSandbox = new AgentSandboxService(this.config);
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
       recorder: this.perfFlightRecorder,
@@ -475,6 +478,13 @@ export class ServiceContainer {
     {
       name: "agentResourceLimits.start",
       run: () => this.agentResourceLimits.start(),
+      bestEffort: true,
+    },
+    // Before task recovery, so commands of recovered tasks start in the sandbox. Starting srt
+    // cannot block startup: sandboxed commands fail closed until it starts.
+    {
+      name: "agentSandbox.start",
+      run: () => this.agentSandbox.start(),
       bestEffort: true,
     },
     // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
@@ -784,6 +794,7 @@ export class ServiceContainer {
       perfFlightRecorder: this.perfFlightRecorder,
       perfCaptures: this.perfCaptures,
       agentResourceLimits: this.agentResourceLimits,
+      agentSandbox: this.agentSandbox,
       perfReports: this.perfReports,
       sessionTapes: this.sessionTapes,
       sessionUsageService: this.sessionUsageService,
@@ -826,6 +837,7 @@ export class ServiceContainer {
     this.perfFlightRecorder.stop();
     await this.perfCaptures.dispose();
     this.agentResourceLimits.dispose();
+    await this.agentSandbox.dispose();
     this.idleCompactionService.stop();
     await this.browserBridgeServer.stop();
     await this.bashAiProxy.stop();
@@ -992,6 +1004,7 @@ export class ServiceContainer {
     shutdownStep("perfFlightRecorder.stop", () => this.perfFlightRecorder.stop());
     await shutdownStep("perfCaptures.dispose", () => this.perfCaptures.dispose());
     shutdownStep("agentResourceLimits.dispose", () => this.agentResourceLimits.dispose());
+    await shutdownStep("agentSandbox.dispose", () => this.agentSandbox.dispose());
     await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
     await shutdownStep("bashAiProxy.stop", () => this.bashAiProxy.stop());
     shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());

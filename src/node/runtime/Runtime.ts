@@ -78,6 +78,13 @@ export interface ExecOptions {
   abortSignal?: AbortSignal;
   /** Force PTY allocation (SSH only - adds -t flag) */
   forcePTY?: boolean;
+  /**
+   * "off" runs the command outside the macOS agent sandbox (local runtimes only). Only two kinds
+   * of caller may set it: MCP servers, which the user configured and which start outside the
+   * sandbox, and a bash call the user approved to run outside it once. Agent-reachable paths
+   * (bash, background bash, tool hooks, the init hook, web_fetch) never set it otherwise.
+   */
+  sandbox?: "off";
 }
 
 export type BackgroundMonitorProbeResult<T> =
@@ -180,6 +187,8 @@ export interface ExecStream {
   exitCode: Promise<number>;
   /** Promise that resolves with wall clock duration in milliseconds */
   duration: Promise<number>;
+  /** Set when the command runs in the macOS agent sandbox: the key of its denials. */
+  sandboxCommandId?: string;
 }
 
 /**

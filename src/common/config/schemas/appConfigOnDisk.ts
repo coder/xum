@@ -10,6 +10,7 @@ import { CacheTtlSchema } from "./providersConfig";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
 import { AgentResourceLimitsSchema } from "./agentResourceLimits";
+import { AgentSandboxConfigSchema, salvageAgentSandbox } from "./agentSandbox";
 import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
@@ -177,6 +178,13 @@ export const AppConfigOnDiskSchema = z
     agentResourceLimits: AgentResourceLimitsSchema.optional().catch(undefined),
     /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
     agentResourceLimitsEnabled: z.boolean().optional(),
+    /**
+     * macOS sandbox for local agent commands. Absent = off. `.catch` fails closed: a malformed
+     * value keeps its valid fields, and `enabled: true`, instead of turning the sandbox off.
+     */
+    agentSandbox: AgentSandboxConfigSchema.optional().catch((ctx) =>
+      salvageAgentSandbox(ctx.input)
+    ),
     chatTranscriptFullWidth: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */

@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -36,7 +36,13 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
+import {
+  hostChildEnv,
+  mergeChildEnv,
+  sanitizeXumChildEnv,
+  stripSandboxedChildEnv,
+} from "./childProcessEnv";
+import { wrapForAgentSandbox, type AgentSandboxWrap } from "./sandbox/macosSandbox";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 import {
@@ -301,24 +307,48 @@ export abstract class LocalBaseRuntime implements Runtime {
         ? mergedEnv.PATH
         : (mergedEnv.PATH ?? mergedEnv.Path)) ?? defaultPath;
     const effectivePath = basePath;
+    const childEnv: NodeJS.ProcessEnv = {
+      ...mergedEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+      PATH: effectivePath,
+    };
 
-    const childProcess = spawn(spawnCommand, spawnArgs, {
-      cwd,
-      env: {
-        ...mergedEnv,
-        ...NON_INTERACTIVE_ENV_VARS,
-        PATH: effectivePath,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-      // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
-      // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
-      // the entire process group (including all backgrounded children) via process.kill(-pid).
-      // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
-      // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
-      detached: true,
-      // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
-      windowsHide: true,
+    // Null when the sandbox is off, not on macOS, or the caller opts out. Throws (and runs
+    // nothing) when the sandbox applies but cannot start: it never falls back to running
+    // unsandboxed.
+    const sandboxed = await this.wrapForSandbox(cwd, spawnArgs[1], {
+      bashPath,
+      abortSignal: options.abortSignal,
+      optOut: options.sandbox === "off",
+      scratchDir: callerEnv.XUM_SCRATCH_DIR,
+      pathEnv: effectivePath,
     });
+
+    let childProcess: ChildProcessWithoutNullStreams;
+    try {
+      childProcess = spawn(sandboxed?.command ?? spawnCommand, sandboxed?.args ?? spawnArgs, {
+        cwd,
+        // Only the keys srt adds go on top of Xum's own env, so srt cannot bring back a key
+        // that Xum strips.
+        env: sandboxed ? { ...stripSandboxedChildEnv(childEnv), ...sandboxed.env } : childEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+        // CRITICAL: Spawn as detached process group leader to enable cleanup of background processes.
+        // When a bash script spawns background processes (e.g., `sleep 100 &`), we need to kill
+        // the entire process group (including all backgrounded children) via process.kill(-pid).
+        // NOTE: detached:true does NOT cause bash to wait for background jobs when using 'exit' event
+        // instead of 'close' event. The 'exit' event fires when bash exits, ignoring background children.
+        detached: true,
+        // Prevent console window from appearing on Windows (WSL bash spawns steal focus otherwise)
+        windowsHide: true,
+      });
+    } catch (error) {
+      sandboxed?.dispose();
+      throw error;
+    }
+    if (sandboxed) {
+      childProcess.once("exit", sandboxed.dispose);
+      childProcess.once("error", sandboxed.dispose);
+    }
 
     const localProcess = getLocalProcessEvidence(childProcess.pid);
 
@@ -417,7 +447,37 @@ export abstract class LocalBaseRuntime implements Runtime {
       void exitCode.catch(() => undefined).finally(() => clearTimeout(timeoutHandle));
     }
 
-    return { stdout, stderr, stdin, exitCode, duration, localProcess };
+    return {
+      stdout,
+      stderr,
+      stdin,
+      exitCode,
+      duration,
+      localProcess,
+      ...(sandboxed ? { sandboxCommandId: sandboxed.commandId } : {}),
+    };
+  }
+
+  /** The sandboxed spawn of `script` in `cwd`, or null; see wrapForAgentSandbox(). */
+  protected async wrapForSandbox(
+    cwd: string,
+    script: string,
+    options: Parameters<typeof wrapForAgentSandbox>[3]
+  ): Promise<AgentSandboxWrap | null> {
+    try {
+      const sandboxed = await wrapForAgentSandbox(
+        this.agentCgroupProjectPath(),
+        cwd,
+        script,
+        options
+      );
+      throwIfAbortedBeforeExec(options.abortSignal);
+      return sandboxed;
+    } catch (error) {
+      if (error instanceof RuntimeErrorClass) throw error;
+      throwIfAbortedBeforeExec(options.abortSignal);
+      throw new RuntimeErrorClass(getErrorMessage(error), "exec", error);
+    }
   }
 
   readFile(
@@ -647,17 +707,29 @@ export abstract class LocalBaseRuntime implements Runtime {
     }
 
     const loggers = createLineBufferedLoggers(initLogger);
+    const bashPath = getBashPath();
+    const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
+    const hookEnv: NodeJS.ProcessEnv = { ...process.env, ...xumEnv };
+    // The init hook is agent-reachable (a repo file), so it runs in the sandbox like bash does.
+    let sandboxed: AgentSandboxWrap | null;
+    try {
+      sandboxed = await this.wrapForSandbox(workspacePath, script, {
+        bashPath,
+        abortSignal,
+        scratchDir: xumEnv.XUM_SCRATCH_DIR,
+        pathEnv: hookEnv.PATH,
+      });
+    } catch (error) {
+      initLogger.logStderr(`Error running init hook: ${getErrorMessage(error)}`);
+      initLogger.logComplete(abortSignal?.aborted ? EXIT_CODE_ABORTED : -1);
+      return;
+    }
 
     return new Promise<void>((resolve) => {
-      const bashPath = getBashPath();
-      const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
-      const proc = spawn(bashPath, ["-c", script], {
+      const proc = spawn(sandboxed?.command ?? bashPath, sandboxed?.args ?? ["-c", script], {
         cwd: workspacePath,
         stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          ...xumEnv,
-        },
+        env: sandboxed ? { ...stripSandboxedChildEnv(hookEnv), ...sandboxed.env } : hookEnv,
         // Prevent console window from appearing on Windows
         windowsHide: true,
         // Spawn as a detached process group leader so we can reliably cancel the hook.
@@ -696,6 +768,7 @@ export abstract class LocalBaseRuntime implements Runtime {
 
       proc.on("close", (code) => {
         abortSignal?.removeEventListener("abort", onAbort);
+        sandboxed?.dispose();
 
         // Flush any remaining buffered output
         loggers.stdout.flush();
@@ -707,6 +780,7 @@ export abstract class LocalBaseRuntime implements Runtime {
 
       proc.on("error", (err) => {
         abortSignal?.removeEventListener("abort", onAbort);
+        sandboxed?.dispose();
 
         if (aborted || abortSignal?.aborted) {
           initLogger.logComplete(EXIT_CODE_ABORTED);

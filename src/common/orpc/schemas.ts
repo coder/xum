@@ -184,6 +184,7 @@ export {
   memory,
   artifacts,
   agentResourceLimits,
+  agentSandbox,
   mcpApps,
   refinements,
   secrets,

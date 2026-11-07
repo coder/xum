@@ -1,5 +1,9 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { AgentResourceLimitsSchema } from "@/common/config/schemas/agentResourceLimits";
+import {
+  AgentSandboxConfigSchema,
+  salvageAgentSandbox,
+} from "@/common/config/schemas/agentSandbox";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
@@ -456,6 +460,12 @@ export const ProjectConfigSchema = z.object({
     description:
       "CPU and memory that the local agent commands of this project share (Linux cgroup v2), inside the limit that all projects share. Absent = no project limit.",
   }),
+  agentSandbox: AgentSandboxConfigSchema.optional()
+    .catch((ctx) => salvageAgentSandbox(ctx.input))
+    .meta({
+      description:
+        "macOS sandbox for the local agent commands of this project. Each field it sets overrides the global agentSandbox.",
+    }),
 });
 
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;
