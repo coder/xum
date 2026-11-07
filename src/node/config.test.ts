@@ -23,6 +23,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { Workspace } from "@/common/types/project";
 
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
@@ -4423,7 +4424,10 @@ describe("Config", () => {
 
       const metadata = await config.getAllWorkspaceMetadata();
       expect(metadata).toHaveLength(1);
-      expect(metadata[0]?.parentWorkspaceId).toBe("parent");
+      // A legacy row's task tree comes from config alone (CONFIG_TREE_FIELDS): no Xum build wrote
+      // a parent link into a legacy metadata.json, and one read from it would not survive the
+      // read-time migration.
+      expect(metadata[0]?.parentWorkspaceId).toBeUndefined();
       expect(metadata[0]?.bestOf).toBeUndefined();
 
       await flushConfigEdits();
@@ -6557,6 +6561,80 @@ describe("Config", () => {
         .projects.get(projectPath)
         ?.workspaces.find((workspace) => workspace.path === workspacePath);
       expect(persisted?.id).toBe("live-generated-id");
+    });
+
+    describe("task-tree fields of a legacy row", () => {
+      // A migrated row reads as current-format, from the row alone. A task-tree value taken from
+      // the legacy metadata.json would hold for one read only, so every build takes them from the
+      // config row (see CONFIG_TREE_FIELDS): before the migration, after it, and after a restart.
+      const projectPath = "/fake/project";
+      const fileTree = {
+        parentWorkspaceId: "file-parent-id",
+        agentId: "explore",
+        taskStatus: "running",
+        taskPrompt: "Survey the repo",
+        taskIsolation: "none",
+        bestOf: { groupId: "file-group", index: 0, total: 2 },
+        delegatedCreationInterrupted: true,
+      } as const;
+      const pick = (source: object | undefined) =>
+        Object.fromEntries(
+          Object.keys(fileTree).map((key) => [key, (source as Record<string, unknown>)[key]])
+        );
+      const absent = pick({});
+      const workspacePath = () => path.join(config.srcDir, "project", "legacy-task");
+      const register = async (
+        row: Partial<Workspace>,
+        file: { id: string; tree?: object } = { id: "legacy-task-id", tree: fileTree }
+      ) => {
+        fs.mkdirSync(workspacePath(), { recursive: true });
+        fs.mkdirSync(path.join(config.sessionsDir, "legacy-task"), { recursive: true });
+        fs.writeFileSync(
+          path.join(config.sessionsDir, "legacy-task", "metadata.json"),
+          JSON.stringify({ id: file.id, name: "legacy-task", ...file.tree })
+        );
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, { workspaces: [{ path: workspacePath(), ...row }] });
+          return cfg;
+        });
+      };
+      const build = async (from: Config) =>
+        (await from.getAllWorkspaceMetadata({ probeCheckouts: false })).find(
+          (metadata) => metadata.id === "legacy-task-id"
+        );
+      const builds = async () => {
+        const first = pick(await build(config));
+        // The queued migration write lands before this no-op edit.
+        await config.editConfig((cfg) => cfg);
+        return [first, pick(await build(new Config(tempDir)))];
+      };
+
+      it("ignores the legacy file's values in every build", async () => {
+        await register({});
+        expect(await builds()).toEqual([absent, absent]);
+      });
+
+      it("ignores a stale file at a reused path in every build", async () => {
+        // A partially migrated row (an id, no name) whose checkout path an old workspace used.
+        await register({ id: "legacy-task-id" }, { id: "removed-workspace-id", tree: fileTree });
+        expect(await builds()).toEqual([absent, absent]);
+      });
+
+      it("serves the config row's values in every build", async () => {
+        const rowTree = { parentWorkspaceId: "row-parent-id", taskStatus: "reported" } as const;
+        await register(rowTree);
+        const expected = { ...absent, ...rowTree };
+        expect(await builds()).toEqual([expected, expected]);
+      });
+
+      it("reads a row's own shared-checkout isolation in every build", async () => {
+        // The file holds identity only, as every file a Xum build wrote does: an isolation:none
+        // child must not read as owning its parent's checkout (removal would delete it).
+        const rowTree = { parentWorkspaceId: "row-parent-id", taskIsolation: "none" } as const;
+        await register(rowTree, { id: "legacy-task-id" });
+        const expected = { ...absent, ...rowTree };
+        expect(await builds()).toEqual([expected, expected]);
+      });
     });
   });
 
