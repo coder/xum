@@ -128,6 +128,7 @@ describe("replayHistory historyReplayStatus", () => {
       type: "bash-sandbox-approval",
       workspaceId,
       toolCallId: "call-waiting",
+      script: "security find-generic-password",
       reason: "needs the login keychain",
       pending: true,
       timestamp: 1,

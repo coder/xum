@@ -118,6 +118,39 @@ describe("buildAgentSandboxPolicy", () => {
     expect(allowRead).not.toContain(documents);
   });
 
+  // A sandboxed command may write a cache folder or a temp folder, so it can swap one for a link
+  // that the next command's policy must not follow.
+  test("does not open where a cache folder that is a symlink points", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(home);
+    await fs.symlink(home, path.join(home, ".npm"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      expect(buildAgentSandboxPolicy(SETTINGS, { cwd: repo }).writeRoots).not.toContain(home);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  test("does not follow a symlink in a write root to a PATH folder", async () => {
+    const home = path.join(root, "home");
+    const documents = path.join(home, "Documents");
+    await fs.mkdir(path.join(documents, "bin"), { recursive: true });
+    await fs.mkdir(path.join(home, ".cache"));
+    await fs.symlink(documents, path.join(home, ".cache", "tool"));
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const { allowRead } = buildAgentSandboxPolicy(SETTINGS, {
+        cwd: repo,
+        pathEnv: path.join(home, ".cache", "tool", "bin"),
+      });
+
+      expect(allowRead).not.toContain(path.join(documents, "bin"));
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
   test("hides a home folder outside /Users", async () => {
     const home = path.join(root, "home");
     await fs.mkdir(home);

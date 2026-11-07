@@ -54,6 +54,7 @@ import {
   type AgentSandboxPolicy,
   type AgentSandboxPolicyInput,
 } from "./sandbox/agentSandboxTargets";
+import { isPathAtOrUnder } from "./sandbox/sandboxPaths";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 import {
@@ -326,6 +327,25 @@ export abstract class LocalBaseRuntime implements Runtime {
     return undefined;
   }
 
+  /** This runtime's workspace checkout, when it is known. */
+  protected sandboxCheckoutRoot(): string | undefined {
+    return undefined;
+  }
+
+  /**
+   * `roots`, plus the checkout when the command works in it: the cwd of a workspace for a
+   * sub-project is a folder inside the checkout, and git and edits there need the rest of it.
+   */
+  private withCheckoutRoot(cwd: string, roots: readonly string[] | undefined): string[] {
+    const listed = [...(roots ?? [])];
+    const checkout = this.sandboxCheckoutRoot();
+    if (checkout === undefined) return listed;
+    const inCheckout = [cwd, ...listed].some((root) =>
+      isPathAtOrUnder(path.resolve(root), path.resolve(checkout))
+    );
+    return inCheckout ? [...listed, checkout] : listed;
+  }
+
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
@@ -520,7 +540,11 @@ export abstract class LocalBaseRuntime implements Runtime {
     // Devcontainer commands run in the container, which the macOS sandbox does not cover.
     if (this.location !== "local" || process.platform !== "darwin") return null;
     const settings = agentSandboxSettingsFor(this.agentCgroupProjectPath());
-    return settings === null ? null : buildAgentSandboxPolicy(settings, input);
+    if (settings === null) return null;
+    return buildAgentSandboxPolicy(settings, {
+      ...input,
+      workspaceRoots: this.withCheckoutRoot(input.cwd, input.workspaceRoots),
+    });
   }
 
   /** The sandboxed spawn of `script` in `cwd`, or null; see wrapForAgentSandbox(). */
@@ -531,12 +555,10 @@ export abstract class LocalBaseRuntime implements Runtime {
   ): Promise<AgentSandboxWrap | null> {
     if (this.location !== "local") return null;
     try {
-      const sandboxed = await wrapForAgentSandbox(
-        this.agentCgroupProjectPath(),
-        cwd,
-        script,
-        options
-      );
+      const sandboxed = await wrapForAgentSandbox(this.agentCgroupProjectPath(), cwd, script, {
+        ...options,
+        workspaceRoots: this.withCheckoutRoot(cwd, options.workspaceRoots),
+      });
       throwIfAbortedBeforeExec(options.abortSignal);
       return sandboxed;
     } catch (error) {

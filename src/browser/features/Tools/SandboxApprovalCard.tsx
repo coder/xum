@@ -42,7 +42,6 @@ export function SandboxBadge(props: { label: string; className?: string }) {
 
 interface SandboxApprovalCardProps {
   approval: BashSandboxApprovalView;
-  script: string;
   /** The newest card of the workspace: only it answers the keyboard shortcuts. */
   isLatest: boolean;
 }
@@ -171,10 +170,18 @@ export function SandboxApprovalCard(props: SandboxApprovalCardProps) {
     <ToolContainer expanded className="border-warning/40 bg-warning-overlay border">
       <div className="flex min-w-0 items-center gap-2">
         <ToolIcon toolName="bash" />
-        <span className="text-text font-monospace min-w-0 flex-1 truncate">{props.script}</span>
+        <span className="text-text font-monospace min-w-0 flex-1 truncate">
+          {props.approval.script}
+        </span>
         <SandboxBadge label="Needs approval" />
       </div>
       <div className="mt-2 space-y-2 font-sans">
+        <div>
+          <DetailLabel>Command</DetailLabel>
+          <DetailContent className="scroll-fade-y px-2 py-1.5">
+            {props.approval.script}
+          </DetailContent>
+        </div>
         <div>
           <DetailLabel>Reason from the agent</DetailLabel>
           <DetailContent className="px-2 py-1.5 font-sans whitespace-pre-wrap">

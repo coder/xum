@@ -532,7 +532,7 @@ export interface WorkflowToolLiveRunState {
 /** A bash call that waits for the user to let it run once outside the sandbox. */
 export type BashSandboxApprovalView = Pick<
   BashSandboxApprovalEvent,
-  "workspaceId" | "toolCallId" | "reason" | "timestamp"
+  "workspaceId" | "toolCallId" | "script" | "reason" | "timestamp"
 >;
 
 interface WorkspaceChatTransientState {
@@ -2852,8 +2852,8 @@ export class WorkspaceStore {
   private applySandboxApproval(workspaceId: string, data: BashSandboxApprovalEvent): void {
     const approvals = this.assertChatTransientState(workspaceId).sandboxApprovals;
     if (data.pending) {
-      const { toolCallId, reason, timestamp } = data;
-      approvals.set(toolCallId, { workspaceId, toolCallId, reason, timestamp });
+      const { toolCallId, script, reason, timestamp } = data;
+      approvals.set(toolCallId, { workspaceId, toolCallId, script, reason, timestamp });
     } else if (!approvals.delete(data.toolCallId)) {
       return;
     }

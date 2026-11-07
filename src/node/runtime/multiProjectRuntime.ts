@@ -54,7 +54,7 @@ export class MultiProjectRuntime implements Runtime {
   constructor(
     private readonly containerManager: ContainerManager,
     private readonly projectRuntimes: MultiProjectRuntimeEntry[],
-    workspaceName: string
+    private readonly workspaceName: string
   ) {
     assert(projectRuntimes.length > 0, "MultiProjectRuntime requires at least one project runtime");
 
@@ -452,7 +452,7 @@ export class MultiProjectRuntime implements Runtime {
     return this.primaryRuntime.exec(command, {
       ...options,
       cwd: options.cwd || this.containerPath,
-      sandboxRoots: [...(options.sandboxRoots ?? []), ...this.checkoutLinks()],
+      sandboxRoots: [...(options.sandboxRoots ?? []), ...this.checkoutPaths()],
     });
   }
 
@@ -461,17 +461,19 @@ export class MultiProjectRuntime implements Runtime {
     return (
       this.primaryRuntime.agentSandboxPolicy?.({
         ...input,
-        workspaceRoots: [...(input.workspaceRoots ?? []), ...this.checkoutLinks()],
+        workspaceRoots: [...(input.workspaceRoots ?? []), ...this.checkoutPaths()],
       }) ?? null
     );
   }
 
   /**
-   * The container's link to each project's checkout. The sandbox resolves them: Seatbelt checks
-   * real paths, so a write through a link is a write in the checkout.
+   * Each project's checkout, not the container's link to it: a sandboxed command may write the
+   * container, so it can point a link anywhere, and the next command's sandbox would open that.
    */
-  private checkoutLinks(): string[] {
-    return this.projectRuntimes.map((entry) => path.join(this.containerPath, entry.projectName));
+  private checkoutPaths(): string[] {
+    return this.projectRuntimes.map((entry) =>
+      entry.runtime.getWorkspacePath(entry.projectPath, this.workspaceName)
+    );
   }
 
   readFile(

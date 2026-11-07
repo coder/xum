@@ -183,7 +183,8 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const sandboxDenialSummary = describeSandboxDenials(result);
 
   if (sandboxApproval) {
-    return <SandboxApprovalCard {...sandboxApproval} script={args.script} />;
+    // The script the backend runs, which a plugin hook may have rewritten: not args.script.
+    return <SandboxApprovalCard {...sandboxApproval} />;
   }
 
   return (

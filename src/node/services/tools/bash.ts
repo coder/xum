@@ -1159,6 +1159,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       const approval = await requestSandboxApproval(
         config,
         toolCallId,
+        script,
         outside_sandbox_reason,
         abortSignal
       );

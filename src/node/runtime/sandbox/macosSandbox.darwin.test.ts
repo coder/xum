@@ -8,6 +8,7 @@ import * as path from "node:path";
 import type { ResolvedAgentSandboxSettings } from "@/common/config/schemas/agentSandbox";
 import type { BashToolResult } from "@/common/types/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { spawnProcess } from "@/node/services/backgroundProcessExecutor";
 import { createBashTool } from "@/node/services/tools/bash";
@@ -288,6 +289,58 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.stdout).toContain("MOVE_DENIED");
       expect(await exists(path.join(workspace, ".xum"))).toBe(false);
       expect(await exists(path.join(workspace, ".mux"))).toBe(false);
+    });
+
+    // The next command's policy opens their real paths, so a link in their place would open its
+    // target. The protected paths under each keep it in place.
+    it("keeps the workspace and scratch folders in place", async () => {
+      const workspace = path.join(root, "ws");
+      const scratch = path.join(root, "scratch");
+      const elsewhere = path.join(root, "elsewhere");
+      for (const dir of [workspace, scratch, elsewhere]) await fs.mkdir(dir);
+
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace, scratchDir: scratch }),
+        root,
+        [
+          `rm -rf ${scratch} && ln -s ${elsewhere} ${scratch} || echo SCRATCH_KEPT`,
+          `rm -rf ${workspace} && ln -s ${elsewhere} ${workspace} || echo WORKSPACE_KEPT`,
+        ].join("; ")
+      );
+
+      expect(result.stdout).toContain("SCRATCH_KEPT");
+      expect(result.stdout).toContain("WORKSPACE_KEPT");
+      expect((await fs.lstat(scratch)).isDirectory()).toBe(true);
+      expect((await fs.lstat(workspace)).isDirectory()).toBe(true);
+    });
+
+    it("opens the whole checkout of a workspace that works in a sub-project", async () => {
+      // In ~, outside every write root, so only the checkout root can open it.
+      const checkout = await homeProbePath();
+      const subProject = path.join(checkout, "packages", "app");
+      await fs.mkdir(subProject, { recursive: true });
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtimes = {
+        local: new LocalRuntime(checkout),
+        worktree: new WorktreeRuntime(root, {
+          projectPath: path.join(root, "project"),
+          workspaceName: "ws",
+          workspacePath: checkout,
+        }),
+      };
+      try {
+        for (const [name, runtime] of Object.entries(runtimes)) {
+          const result = await execBuffered(runtime, `echo ok > ../../${name}.txt`, {
+            cwd: subProject,
+            timeout: 10,
+          });
+
+          expect(result.exitCode).toBe(0);
+          expect(await fs.readFile(path.join(checkout, `${name}.txt`), "utf8")).toBe("ok\n");
+        }
+      } finally {
+        await fs.rm(checkout, { recursive: true, force: true });
+      }
     });
 
     it("keeps a credential file in a write root unwritable, and its folder in place", async () => {

@@ -491,6 +491,10 @@ export const BashSandboxApprovalEventSchema = z.object({
   type: z.literal("bash-sandbox-approval"),
   workspaceId: z.string(),
   toolCallId: z.string(),
+  script: z.string().meta({
+    description:
+      "The script the call runs: a plugin hook can rewrite the model's arguments before it runs",
+  }),
   reason: z.string(),
   pending: z.boolean(),
   timestamp: z.number().meta({ description: "When the state changed (Date.now())" }),

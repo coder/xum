@@ -16,6 +16,7 @@ import {
   PROTECTED_WRITE_PATHS,
   dedupe,
   expandSandboxPath,
+  expandWriteRoot,
   isPathAtOrUnder,
   realpathOfNearest,
   tempWritePaths,
@@ -118,7 +119,7 @@ export function buildAgentSandboxPolicy(
   const writeRoots = dedupe([
     ...workspaceRoots,
     ...tempWritePaths(),
-    ...CACHE_WRITE_PATHS.map(expandSandboxPath),
+    ...CACHE_WRITE_PATHS.map(expandWriteRoot),
     ...extraWriteRoots,
   ]);
   // A background command starts in a temp folder and gets its checkout in workspaceRoots.
@@ -137,7 +138,7 @@ export function buildAgentSandboxPolicy(
     ...writeRoots,
     ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
-    ...pathFoldersUnderHome(input.pathEnv, home),
+    ...pathFoldersUnderHome(input.pathEnv, home, writeRoots),
     ...outsideNestedDenies(settings.extraReadPaths.map(expandSandboxPath), nestedDenies),
   ]);
   return {
@@ -204,14 +205,41 @@ function linkedWorktreePaths(gitDir: string): string[] {
  * ~/Documents for ~/Documents/bin, so a toolchain that needs files next to it goes in
  * HOME_READ_PATHS or extraReadPaths.
  */
-function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string[] {
+function pathFoldersUnderHome(
+  pathEnv: string | undefined,
+  home: string,
+  writeRoots: readonly string[]
+): string[] {
   if (pathEnv === undefined) return [];
   const tooBroad = new Set([home, path.join(home, ".local"), realpathOfNearest(getXumHome())]);
   return pathEnv.split(path.delimiter).flatMap((entry) => {
     if (!path.isAbsolute(entry)) return [];
-    const folder = realpathOfNearest(entry);
+    const folder = realpathOutside(entry, writeRoots);
     return isPathAtOrUnder(folder, home) && !tooBroad.has(folder) ? [folder] : [];
   });
+}
+
+/**
+ * The real path of `target`, without following a symlink at or under one of `roots`: a sandboxed
+ * command can make or replace such a link, so the rest of the path stays as spelled.
+ */
+function realpathOutside(target: string, roots: readonly string[]): string {
+  const segments = path
+    .resolve(target)
+    .split(path.sep)
+    .filter((segment) => segment.length > 0);
+  let resolved: string = path.sep;
+  for (const [index, segment] of segments.entries()) {
+    const next = path.join(resolved, segment);
+    if (isUnderAny(next, roots)) return path.join(next, ...segments.slice(index + 1));
+    try {
+      // eslint-disable-next-line local/no-sync-fs-methods -- the policy is built synchronously.
+      resolved = fs.realpathSync(next);
+    } catch {
+      return path.join(next, ...segments.slice(index + 1));
+    }
+  }
+  return resolved;
 }
 
 /* eslint-disable local/no-sync-fs-methods -- Runtime.agentSandboxPolicy() is synchronous, so

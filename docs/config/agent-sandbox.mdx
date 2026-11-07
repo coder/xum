@@ -33,6 +33,8 @@ Commands in the sandbox can write only to these folders:
 - Tool caches: `~/.npm`, `~/.bun/install/cache`, `~/.cache`, `~/.cargo/registry`, `~/.cargo/git`, `~/go/pkg/mod`, `~/.gradle/caches`, `~/.m2/repository`, `~/Library/pnpm/store`, `~/.pnpm-store`, `~/Library/Caches/go-build`, `~/Library/Caches/pip`, `~/Library/Caches/Yarn`, `~/Library/Caches/ms-playwright`, `~/Library/Caches/node-gyp`, `~/Library/Caches/bun`, and `~/Library/Developer/Xcode/DerivedData`.
 - For a worktree workspace, the `.git` folder of the main checkout, so that commits work.
 
+A tool cache or `$TMPDIR` that is a symlink stays closed, because a command could replace it with a link to another folder. Add the folder that it links to to `extraWritePaths`.
+
 Some files stay read-only, also inside the workspace and where they link to, because a command could use them to run code later outside the sandbox:
 
 - `.git/hooks`, `.git/config`, `.git/config.worktree`, `.git/modules` (the git folders of submodules), and the `.git` file of a worktree. In the `.git` folder of the main checkout, the same paths, and `config.worktree` and `modules` in the folder of each worktree.
@@ -47,7 +49,7 @@ Commands in the sandbox can read:
 - System files and folders outside `/Users`, `/Volumes` and your home folder.
 - Toolchains and tool settings in your home folder: `~/.gitconfig`, `~/.config/git`, `~/.bunfig.toml`, `~/.bun`, `~/.cargo`, `~/.rustup`, `~/go`, `~/Library/Application Support/go`, `~/.nvm`, `~/.volta`, `~/.pyenv`, `~/.asdf`, `~/.local/share/mise`, `~/.local/share/uv`, and `~/.sdkman`.
 - The global skill and plugin folders.
-- The folders in your `PATH` that are in your home folder. Only the folder itself opens: if a tool in it needs files next to it, add them to `extraReadPaths`.
+- The folders in your `PATH` that are in your home folder. Only the folder itself opens: if a tool in it needs files next to it, add them to `extraReadPaths`. A `PATH` folder that a symlink in a writable folder links to stays closed.
 
 Everything else in `/Users`, `/Volumes` and your home folder (also when it is not in `/Users`) is hidden. Some credential files stay hidden and read-only, also inside folders that are open and when you add them to `extraReadPaths` or `extraWritePaths`:
 

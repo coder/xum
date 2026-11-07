@@ -10,9 +10,14 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import type { AgentSandboxPolicy } from "@/node/runtime/sandbox/agentSandboxTargets";
 import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { createBashTool } from "./bash";
 import { SANDBOX_APPROVAL_DENIED } from "./bashSandbox";
 import { createTestToolConfig } from "./testHelpers";
+import { withHooks } from "./withHooks";
+
+type BashTool = ReturnType<typeof createBashTool>;
 
 const POLICY: AgentSandboxPolicy = {
   writeRoots: [],
@@ -61,7 +66,8 @@ describe("bash outside_sandbox_reason", () => {
 
   function setup(
     policy: AgentSandboxPolicy | null,
-    overrides: Partial<ToolConfiguration> = {}
+    overrides: Partial<ToolConfiguration> = {},
+    wrap: (tool: BashTool, runtime: RecordingRuntime) => BashTool = (tool) => tool
   ): { runtime: RecordingRuntime; run: (abortSignal?: AbortSignal) => Promise<BashToolResult> } {
     const runtime = new RecordingRuntime(cwd, policy);
     const config: ToolConfiguration = {
@@ -72,7 +78,7 @@ describe("bash outside_sandbox_reason", () => {
       },
       ...overrides,
     };
-    const tool = createBashTool(config);
+    const tool = wrap(createBashTool(config), runtime);
     const run = async (abortSignal?: AbortSignal) =>
       (await tool.execute!(
         {
@@ -124,6 +130,59 @@ describe("bash outside_sandbox_reason", () => {
     expect(await run()).toMatchObject({ success: false, error: SANDBOX_APPROVAL_DENIED });
     expect(events).toHaveLength(0);
     expect(runtime.execOptions).toHaveLength(0);
+  });
+
+  // A plugin hook can rewrite the call after the model made it, so the card must show what runs.
+  it("asks about the script that a plugin hook rewrote the call to", async () => {
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "ws-sandbox",
+      pluginName: "rewriter",
+      pluginInstanceId: "rewriter",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          handler: { type: "mcp_tool", server: "rewriter", tool: "rewrite", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
+        callPluginTool: () =>
+          Promise.resolve({
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "allow",
+                    updatedInput: { command: "echo rewritten" },
+                  },
+                }),
+              },
+            ],
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const { run } = setup(POLICY, {}, (tool, runtime) =>
+        withHooks("bash", tool, { runtime, cwd, runtimeTempDir: cwd, workspaceId: "ws-sandbox" })
+      );
+
+      const result = run();
+      await waitFor(() => events.length === 1);
+      expect(events[0]?.script).toBe("echo rewritten");
+      sandboxApprovalManager.answer("ws-sandbox", "call-1", true);
+      expect(await result).toMatchObject({ success: true, output: "rewritten" });
+    } finally {
+      unregister();
+    }
   });
 
   it("ignores the field where no sandbox applies", async () => {

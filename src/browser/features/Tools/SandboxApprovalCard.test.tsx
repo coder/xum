@@ -44,10 +44,10 @@ function renderCards(cards: Array<{ toolCallId: string; isLatest: boolean }>) {
             approval={{
               workspaceId: WORKSPACE_ID,
               toolCallId: card.toolCallId,
+              script: "git push origin HEAD",
               reason: "Push over SSH needs the ssh-agent socket.",
               timestamp: 1,
             }}
-            script="git push origin HEAD"
             isLatest={card.isLatest}
           />
         ))}

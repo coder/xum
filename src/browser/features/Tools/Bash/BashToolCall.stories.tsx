@@ -478,10 +478,10 @@ function SandboxApprovalStory() {
           approval={{
             workspaceId: STORYBOOK_WORKSPACE_ID,
             toolCallId: "sandbox-approval",
+            script: "git push origin HEAD",
             reason: "git push over SSH needs the ssh-agent socket, which the sandbox closes.",
             timestamp: 1,
           }}
-          script="git push origin HEAD"
           isLatest
         />
         <div className="text-muted text-xs" aria-live="polite">

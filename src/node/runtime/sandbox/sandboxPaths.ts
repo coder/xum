@@ -14,7 +14,7 @@ const XUM_HOME_TOKEN = "<xumHome>";
 
 /** Temp folders every sandboxed command may write. */
 export function tempWritePaths(): string[] {
-  return dedupe(["/private/tmp", realpathOfNearest(os.tmpdir())]);
+  return dedupe(["/private/tmp", expandWriteRoot(os.tmpdir())]);
 }
 
 // Other apps keep caches in ~/Library/Caches too, so only tool folders open.
@@ -134,6 +134,16 @@ export const NESTED_DENY_READ_PATHS: readonly string[] = [
 /** `~/x`, `<xumHome>/x` or an absolute path, as the real path Seatbelt matches. */
 export function expandSandboxPath(entry: string): string {
   return realpathOfNearest(expandSandboxPathSpelling(entry));
+}
+
+/**
+ * A write root as Seatbelt matches it, except that a symlink at the root itself is not followed:
+ * a sandboxed command may replace the root (it may write that entry) with a link, and a later
+ * policy that followed it would open wherever the link points.
+ */
+export function expandWriteRoot(entry: string): string {
+  const spelled = expandSandboxPathSpelling(entry);
+  return path.join(realpathOfNearest(path.dirname(spelled)), path.basename(spelled));
 }
 
 /** `~/x`, `<xumHome>/x` or an absolute path, without resolving symlinks. */

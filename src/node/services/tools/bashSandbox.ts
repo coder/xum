@@ -35,6 +35,7 @@ export function sandboxExecOptions(approval: SandboxApproval): Pick<ExecOptions,
 export async function requestSandboxApproval(
   config: ToolConfiguration,
   toolCallId: string,
+  script: string,
   reason: string | null | undefined,
   abortSignal: AbortSignal | undefined
 ): Promise<SandboxApproval> {
@@ -45,6 +46,7 @@ export async function requestSandboxApproval(
     type: "bash-sandbox-approval",
     workspaceId,
     toolCallId,
+    script,
     reason,
     pending,
     timestamp: clockOf(config).nowMs(),
