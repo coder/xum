@@ -156,6 +156,11 @@ export const MemoryHarvestRecordSchema = z.object({
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
   nextChunkOps: z.number().optional(),
   error: z.string().optional(),
+  /**
+   * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
+   * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
+   */
+  note: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**
    * Upper-bound USD estimate of the attempt's chunks still to analyze, made before the attempt

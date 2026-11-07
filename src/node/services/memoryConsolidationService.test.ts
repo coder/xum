@@ -15,6 +15,7 @@ import type {
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
+  MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
   MEMORY_MAX_FILE_BYTES,
@@ -1449,6 +1450,63 @@ describe("MemoryConsolidationService", () => {
       nextChunk: 3,
       budgetUsed: 3,
       nextChunkOps: 0,
+    });
+  });
+
+  it("skips the chunks left once the epoch's edit budget is spent, and notes it in the record", async () => {
+    const chunkLabels: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (!prompt.includes("just-compacted transcript epoch") || afterToolResult) {
+              return Promise.resolve({ stream: noChangesStream() });
+            }
+            chunkLabels.push(/Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "");
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  ...Array.from(
+                    { length: MEMORY_ANALYZER_OP_BUDGET },
+                    (_, index): LanguageModelV3StreamPart => ({
+                      type: "tool-call",
+                      toolCallId: `spend-${index}`,
+                      toolName: "memory",
+                      input: JSON.stringify({
+                        command: "create",
+                        path: `/memories/workspace/spend-${index}.md`,
+                        file_text: `fact ${index}\n`,
+                      }),
+                    })
+                  ),
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                    usage: {
+                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: 1, text: 0, reasoning: 0 },
+                    },
+                  },
+                ],
+              }),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    // Chunk 1 spent all of the epoch's edits, so chunks 2 and 3 made no model call.
+    expect(chunkLabels).toEqual(["1/3"]);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+      status: "completed",
+      nextChunk: 3,
+      budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+      note: expect.stringContaining("chunks 2-3 of 3"),
     });
   });
 

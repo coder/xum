@@ -864,11 +864,10 @@ describe("runMemoryHarvest", () => {
         Array.from({ length: count }, (_, index) =>
           createFile(`/memories/workspace/c${chunk}-${index}.md`, `fact ${chunk}-${index}\n`)
         );
-      // 3 edits over the budget in all, split so no single chunk exceeds it on its own.
+      // 2 edits over the budget in all, split so no single chunk exceeds it on its own.
       const { model } = scriptedModel([
         ...chunkScript(files(1, MEMORY_ANALYZER_OP_BUDGET - 3)),
         ...chunkScript(files(2, 5)),
-        ...chunkScript(files(3, 1)),
       ]);
 
       const result = await runHarvest(fixture, model);
@@ -876,15 +875,76 @@ describe("runMemoryHarvest", () => {
       expect(result.nextChunk).toBe(3);
       expect(result.ops.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
       const rejected = result.ops.filter((op) => !op.applied);
-      expect(rejected).toHaveLength(3);
+      expect(rejected).toHaveLength(2);
       for (const op of rejected) expect(op.note).toContain("budget exhausted");
+    });
+
+    it("skips the model call of every chunk after the budget is spent, and says so", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: number[] = [];
+      const { model, calls } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/spent-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress.nextChunk);
+          return Promise.resolve();
+        },
+      });
+
+      // Chunk 1 ran its two steps; chunks 2 and 3 could write nothing, so they cost nothing.
+      expect(calls).toHaveLength(2);
+      expect(result.streamError).toBeUndefined();
+      // The cursor moves past them: a retry would find the same spent budget.
+      expect(result.nextChunk).toBe(3);
+      expect(result.nextChunkOps).toBe(0);
+      expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      expect(result.note).toContain("chunks 2-3 of 3");
+      expect(reached).toEqual([1]);
+    });
+
+    it("does not call the model at all when a retry resumes with the budget already spent", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model, {
+        resume: { nextChunk: 1, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET },
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.nextChunk).toBe(3);
+      expect(result.note).toContain("chunks 2-3 of 3");
+    });
+
+    it("leaves no note when the last chunk is the one that spends the budget", async () => {
+      using fixture = createFixture();
+      const { model } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/exact-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.nextChunk).toBe(1);
+      expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      expect(result.note).toBeUndefined();
     });
 
     it("counts the edits an earlier attempt applied against the epoch's budget", async () => {
       using fixture = createFixture();
       fixture.messages = manyChunkMessages();
       const spent: MemoryConsolidationOp[] = Array.from(
-        { length: MEMORY_ANALYZER_OP_BUDGET },
+        { length: MEMORY_ANALYZER_OP_BUDGET - 1 },
         (_, index) => ({
           command: "create",
           path: `/memories/workspace/earlier-${index}.md`,
@@ -892,14 +952,22 @@ describe("runMemoryHarvest", () => {
         })
       );
       const { model } = scriptedModel(
-        chunkScript([createFile("/memories/workspace/late.md", "late\n")])
+        chunkScript([
+          createFile("/memories/workspace/last.md", "last\n"),
+          createFile("/memories/workspace/late.md", "late\n"),
+        ])
       );
 
       const result = await runHarvest(fixture, model, { resume: { nextChunk: 2, ops: spent } });
 
-      expect(result.ops).toHaveLength(spent.length + 1);
-      expect(result.ops.at(-1)).toMatchObject({ applied: false });
-      expect(result.ops.at(-1)?.note).toContain("budget exhausted");
+      // One edit was left of the earlier attempt's budget: the first lands, the second is over.
+      expect(result.ops).toHaveLength(spent.length + 2);
+      const fromRetry = result.ops.slice(spent.length);
+      expect(fromRetry.filter((op) => op.applied)).toHaveLength(1);
+      expect(fromRetry.find((op) => !op.applied)?.note).toContain("budget exhausted");
+      expect(
+        await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/last.md")
+      ).toMatchObject({ success: true });
       expect(
         await fixture.memoryService.readFileWithSha(fixture.ctx, "/memories/workspace/late.md")
       ).toMatchObject({ success: false });

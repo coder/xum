@@ -95,6 +95,8 @@ function resumePoint(
 export interface MemoryHarvestResult extends HarvestProgress {
   usage?: { inputTokens: number; outputTokens: number };
   streamError?: string;
+  /** Why the run ended before it read every chunk, when it did: see `budgetSpentNote`. */
+  note?: string;
 }
 
 const MEDIA_STUB = "[media]";
@@ -398,6 +400,14 @@ function sumUsage(
   };
 }
 
+/**
+ * The record's note for chunks the run did not read because the epoch's edit budget was spent: a
+ * chunk can only add or correct memory, so with no edit left its model call would buy nothing.
+ */
+function budgetSpentNote(firstSkipped: number, total: number): string {
+  return `edit budget spent: chunks ${firstSkipped}-${total} of ${total} were not read`;
+}
+
 /** Streams one analyzer chunk to its end. `label` names the chunk in an error ("2/3"). */
 async function analyzeChunk(args: {
   model: LanguageModel;
@@ -531,9 +541,17 @@ export async function runMemoryHarvest(args: {
   });
 
   let streamError: string | undefined;
+  let note: string | undefined;
   let usage: MemoryHarvestResult["usage"];
   let nextChunk = resumed.startChunk;
   for (let index = nextChunk; index < chunks.length; index++) {
+    if (budget.used() >= budget.limit) {
+      // The cursor moves to the end: a retry resumes the same spent budget and would skip them again.
+      note = budgetSpentNote(index + 1, chunks.length);
+      nextChunk = chunks.length;
+      finishedOps = priorOps.length + journal.length;
+      break;
+    }
     // Own timeout per chunk: a long epoch must not run out of time on its later chunks. The same
     // signal guards the chunk's memory tool, so a mutation still in flight when it fires is refused.
     const timeout = AbortSignal.timeout(args.chunkTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS);
@@ -578,5 +596,5 @@ export async function runMemoryHarvest(args: {
     await args.onChunkComplete?.(progressFor(nextChunk));
   }
 
-  return { ...progressFor(nextChunk), usage, streamError };
+  return { ...progressFor(nextChunk), usage, streamError, note };
 }

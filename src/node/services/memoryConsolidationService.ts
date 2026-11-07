@@ -1584,7 +1584,7 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const saveCompleted = (
         progress: HarvestProgress,
-        usage?: MemoryHarvestRecord["usage"]
+        outcome: Pick<MemoryHarvestRecord, "usage" | "note"> = {}
       ): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
           workspaceId,
@@ -1597,7 +1597,8 @@ export class MemoryConsolidationService extends EventEmitter {
             ...harvestRecordIdentity(source),
             ...harvestProgressFields(progress),
             estimatedUsd: opts.attemptState.estimatedUsd,
-            usage,
+            usage: outcome.usage,
+            note: outcome.note,
           },
           ctx.projectPath
         );
@@ -1718,7 +1719,7 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }
 
-      yield* saveCompleted(harvest, harvest.usage);
+      yield* saveCompleted(harvest, harvest);
     });
   }
 
