@@ -1320,19 +1320,19 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture({
       modelFactory: () =>
         new MockLanguageModelV3({
-          doStream: async (options) => {
+          doStream: (options) => {
             if (!failedOnce && userPromptText(options).includes("Transcript chunk 2/3")) {
               failedOnce = true;
-              return {
+              return Promise.resolve({
                 stream: new ReadableStream<LanguageModelV3StreamPart>({
                   pull(controller) {
                     controller.error(new Error("provider exploded"));
                   },
                 }),
-              };
+              });
             }
             // Every other call, a harvest chunk or a sweep, is one clean stream of 1 token each way.
-            return {
+            return Promise.resolve({
               stream: simulateReadableStream({
                 chunks: [
                   { type: "text-start", id: "t1" },
@@ -1348,7 +1348,7 @@ describe("MemoryConsolidationService", () => {
                   },
                 ] satisfies LanguageModelV3StreamPart[],
               }),
-            };
+            });
           },
         }),
     });
