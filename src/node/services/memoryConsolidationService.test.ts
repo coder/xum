@@ -2585,6 +2585,37 @@ describe("MemoryConsolidationService", () => {
       });
     });
 
+    it("prices a retry on the chunks still to analyze, not on the whole epoch again", async () => {
+      let failedOnce = false;
+      using fixture = await createFixture({
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: (options) => {
+              const prompt = userPromptText(options);
+              const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+              if (label.startsWith("2/") && !failedOnce) {
+                failedOnce = true;
+                return Promise.resolve({ stream: failingStream() });
+              }
+              return Promise.resolve({ stream: noChangesStream() });
+            },
+          }),
+      });
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      const failed = (await harvestRecords(fixture))["summary-1"];
+      expect(failed).toMatchObject({ status: "failed", nextChunk: 1 });
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      // Chunk 1 is paid for: the retry's estimate covers chunks 2 and 3 only.
+      const retried = (await harvestRecords(fixture))["summary-1"];
+      expect(retried).toMatchObject({ status: "completed", nextChunk: 3 });
+      expect(retried?.estimatedUsd).toBeGreaterThan(0);
+      expect(retried?.estimatedUsd).toBeLessThan((failed?.estimatedUsd ?? 0) * 0.9);
+    });
+
     it("refuses the organizer over the ceiling without a stream or a record, and runs once it is raised", async () => {
       const models = archivePassModels();
       using fixture = await createFixture({ modelFactory: models.factory });

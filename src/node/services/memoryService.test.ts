@@ -4983,6 +4983,21 @@ describe("MemoryService", () => {
       );
     });
 
+    it("measures what is left when a file vanishes between the listing and the stat", async () => {
+      using fixture = await createFixture();
+      await fixture.service.create(fixture.ctx, "/memories/global/a.md", "12345", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/project/b.md", "1234567", "agent");
+      const list = fixture.service.listIndexEntries.bind(fixture.service);
+      spyOn(fixture.service, "listIndexEntries").mockImplementationOnce(async (ctx) => {
+        const entries = await list(ctx);
+        await fsPromises.rm(path.join(projectMemoryRoot(fixture), "b.md"));
+        return entries;
+      });
+
+      // The estimate that asks must not fail the job for a file another run just removed.
+      expect(await fixture.service.measureVisibleBytes(fixture.ctx)).toBe(5);
+    });
+
     it("read-only operations never create scope roots in a clean checkout", async () => {
       using fixture = await createFixture();
       // Stream startup and the Memory tab enumerate on every memory-enabled

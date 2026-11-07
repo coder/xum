@@ -132,6 +132,17 @@ describe("checkCostCeiling", () => {
     if (!check.allowed) expect(check.reason).toContain("over the 1.00 USD ceiling");
   });
 
+  it("never prints an estimate over the ceiling as equal to it", () => {
+    const check = checkCostCeiling({
+      ceilingUsd: 1,
+      estimatedUsd: 1.001,
+      pricingModel: defaultModel,
+    });
+    expect(check.allowed).toBe(false);
+    // Rounding to nearest would print 1.00 against a 1.00 ceiling, a refusal that reads as a mistake.
+    if (!check.allowed) expect(check.reason).toContain("estimate 1.01 USD");
+  });
+
   it("refuses a model with no known price once a ceiling is set, and names the model", () => {
     const check = checkCostCeiling({
       ceilingUsd: 1,

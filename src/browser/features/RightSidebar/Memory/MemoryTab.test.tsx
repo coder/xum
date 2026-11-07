@@ -490,6 +490,21 @@ describe("MemoryTab", () => {
     expect(globalLine.textContent).not.toContain("est.");
   });
 
+  test("shows an estimate under a cent as under $0.01, not as a rounded zero", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.004 },
+        globalRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.01 },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .*est\. up to under \$0\.01$/);
+    // A cent is not under a cent.
+    await findByText(/^Global: .*est\. up to \$0\.01$/);
+  });
+
   test("shows usage stats for used files and omits them for never-used files", async () => {
     fake = createFakeMemoryApi([
       fileInfo({
