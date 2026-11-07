@@ -936,13 +936,13 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("ghp_a1B2");
     });
 
-    it("keeps the count of cut characters of a part in which redaction shrank the text", async () => {
+    it("keeps the count of cut characters of a part in which redaction shrank the text", () => {
       using fixture = createFixture();
       const text = `${githubToken} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`;
       fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
 
       const rows = buildHarvestChunks(fixture.messages).flatMap(
-        (chunk) => JSON.parse(chunk.transcript) as { text: string }[]
+        (chunk) => JSON.parse(chunk.transcript) as Array<{ text: string }>
       );
 
       // Of the 1,041 characters past the cap, the 30 that redaction took out of the token now fit
