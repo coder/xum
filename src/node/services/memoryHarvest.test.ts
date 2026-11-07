@@ -625,6 +625,20 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain("a1B2a1B2");
     });
 
+    it("redacts a whole quoted secret that holds an escaped quote, in a structured value", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "env" }, { config: { password: 'abc"DEF-SUFFIX' }, ok: true }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("[redacted]");
+      expect(prompt).not.toContain("DEF-SUFFIX");
+      expect(prompt).toContain("ok");
+    });
+
     it("redacts a secret that straddles the cap on a tool's output, not just the part inside it", async () => {
       using fixture = createFixture();
       const githubToken = `ghp_${"a1B2".repeat(9)}`;
