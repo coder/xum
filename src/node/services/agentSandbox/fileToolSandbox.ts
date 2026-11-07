@@ -84,10 +84,7 @@ const MAX_LINK_HOPS = 40;
  * realpathOfNearest it follows a dangling link (a write through one creates its target), and it
  * returns undefined for a link loop.
  */
-export async function realPathFollowingLinks(
-  target: string,
-  hops = 0
-): Promise<string | undefined> {
+async function realPathFollowingLinks(target: string, hops = 0): Promise<string | undefined> {
   if (hops > MAX_LINK_HOPS) return undefined;
   const missing: string[] = [];
   let current = path.resolve(target);

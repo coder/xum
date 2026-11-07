@@ -61,7 +61,7 @@ function projectKeyOf(entry: unknown): string | undefined {
 }
 
 /** Whether `next` changes agentSandbox by value, globally or in any project (added, edited or removed). */
-export function changesAgentSandbox(current: unknown, next: unknown): boolean {
+function changesAgentSandbox(current: unknown, next: unknown): boolean {
   if (!isDeepStrictEqual(agentSandboxOf(current), agentSandboxOf(next))) return true;
   const before = projectAgentSandboxes(current);
   const after = projectAgentSandboxes(next);

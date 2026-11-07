@@ -10,7 +10,7 @@ import {
   type AgentSandboxPolicy,
 } from "./agentSandboxTargets";
 
-export const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
+const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
 /** Whether this backend can sandbox agent commands: macOS with Seatbelt's sandbox-exec. */
 export function isAgentSandboxSupported(): boolean {
@@ -82,7 +82,7 @@ export async function resetAgentSandboxRuntime(): Promise<void> {
 }
 
 /** The srt config that turns `policy` into one command's Seatbelt profile. */
-export function srtConfigForPolicy(policy: AgentSandboxPolicy): Partial<SandboxRuntimeConfig> {
+function srtConfigForPolicy(policy: AgentSandboxPolicy): Partial<SandboxRuntimeConfig> {
   return {
     filesystem: {
       denyRead: policy.denyRead,
@@ -225,7 +225,7 @@ interface SrtMacosSpawnPlan {
 // written as '"'"'. A wrapped string that does not re-quote to itself is not one srt made.
 const BARE_WORD = /^[A-Za-z0-9_./:@+,-][A-Za-z0-9_./:=@+,-]*$/;
 
-export function srtQuote(args: readonly string[]): string {
+function srtQuote(args: readonly string[]): string {
   return args
     .map((arg) => {
       if (arg === "") return "''";
@@ -235,7 +235,7 @@ export function srtQuote(args: readonly string[]): string {
     .join(" ");
 }
 
-export function srtUnquote(quoted: string): string[] {
+function srtUnquote(quoted: string): string[] {
   const args: string[] = [];
   let index = 0;
   while (index < quoted.length) {
@@ -277,7 +277,7 @@ function failSrtWrap(why: string): never {
  * /usr/bin/sandbox-exec -p <profile> <shell> -c <command>"]`. Xum spawns sandbox-exec itself, so
  * it can edit the profile and keep its own child env; any other shape fails closed.
  */
-export function parseSrtMacosArgv(argv: readonly string[], script: string): SrtMacosSpawnPlan {
+function parseSrtMacosArgv(argv: readonly string[], script: string): SrtMacosSpawnPlan {
   if (argv.length !== 3 || argv[1] !== "-c") failSrtWrap("argv shape");
   const words = unquoteSrtWrap(argv[2]);
   if (words[0] !== "env") failSrtWrap("no env prefix");
@@ -320,10 +320,7 @@ function splitEnvAssignments(words: string[]): {
  * once its base config has an allow list, and has no per-command opt-out. Throws when the
  * profile does not have the expected text, so an srt upgrade that changes it fails closed.
  */
-export function postProcessProfile(
-  profile: string,
-  network: AgentSandboxPolicy["network"]
-): string {
+function postProcessProfile(profile: string, network: AgentSandboxPolicy["network"]): string {
   const lines = profile.split("\n");
   for (const rule of SRT_RULES_TO_REMOVE) {
     const at = lines.indexOf(rule);
@@ -368,7 +365,7 @@ function srtEnvOverlay(
 }
 
 /** Short denial lines for one command, for example "write /Users/me/.zshrc". */
-export function agentSandboxDenialsFor(commandId: string): string[] {
+function agentSandboxDenialsFor(commandId: string): string[] {
   let violations: Array<{ line: string }>;
   try {
     violations = SandboxManager.getSandboxViolationStore().getViolationsForCommand(commandId);
@@ -431,7 +428,7 @@ const REPORTED_MACH_SERVICES = new Set(["com.apple.SecurityServer", "com.apple.s
  * "network h". Null for the denials every command logs without failing (sysctl and disk-space
  * queries, global preference reads, configd lookups), which would bury the one that matters.
  */
-export function summarizeViolation(line: string): string | null {
+function summarizeViolation(line: string): string | null {
   const network = /deny(?:\(\d+\))? network-outbound (\S+?)(?::\d+)?(?:\s|$)/.exec(line);
   if (network) return `network ${network[1]}`;
   const file = /deny(?:\(\d+\))? file-(read|write)[\w-]* (.+)$/.exec(line);

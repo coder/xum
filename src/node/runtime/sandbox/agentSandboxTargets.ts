@@ -193,7 +193,7 @@ function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string
  * repository whose `.git` folder is inside the workspace (or no repository). Read from the
  * files git itself reads, so no git process starts for each command.
  */
-export function findGitCommonDir(cwd: string): string | undefined {
+function findGitCommonDir(cwd: string): string | undefined {
   let current = cwd;
   for (;;) {
     const dotGit = path.join(current, ".git");
@@ -217,10 +217,9 @@ function commonDirOfGitFile(dotGitFile: string): string | undefined {
     if (!match) return undefined;
     const gitDir = path.resolve(path.dirname(dotGitFile), match[1]);
     const commonDirFile = path.join(gitDir, "commondir");
-    const commonDir = fs.existsSync(commonDirFile)
+    return fs.existsSync(commonDirFile)
       ? path.resolve(gitDir, fs.readFileSync(commonDirFile, "utf8").trim())
       : gitDir;
-    return commonDir;
   } catch {
     return undefined;
   }
