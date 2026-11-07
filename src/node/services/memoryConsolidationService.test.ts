@@ -564,6 +564,29 @@ async function seedCompactionEpoch(
   };
 }
 
+/** Closes the epoch the way a compaction does, without a row of its own to analyze. */
+async function closeEpochWithoutNewRows(fixture: Fixture): Promise<CompactionCompletionMetadata> {
+  await fixture.historyService.appendToHistory(
+    "ws-dream",
+    createMuxMessage("compact-request", "user", "Please compact", {
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    })
+  );
+  const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+    compactionBoundary: true,
+    compacted: "user",
+    compactionEpoch: 1,
+  });
+  await fixture.historyService.appendToHistory("ws-dream", summary);
+  return {
+    workspaceId: "ws-dream",
+    summaryMessageId: "summary-1",
+    summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+    compactionEpoch: 1,
+    compactionRequestMessageId: "compact-request",
+  };
+}
+
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
     () => true,
@@ -2285,6 +2308,71 @@ describe("MemoryConsolidationService", () => {
       expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
     });
 
+    /**
+     * An archive pass held in its analyzer, and the compaction that `closeEpoch` makes for the
+     * same epoch, started behind it: past its model creation, so only its turn is left to wait
+     * for. The compaction's job reads the earlier records before that wait, and the archive's
+     * rows reach them only as its analyzer finishes chunks. Returns once both ended.
+     */
+    async function compactionBehindHeldArchive(
+      closeEpoch: (fixture: Fixture) => Promise<CompactionCompletionMetadata>
+    ) {
+      const releaseArchive = gate();
+      const secondModel = gate();
+      const models = archivePassModels({ holdFirstAnalyzer: releaseArchive.opened });
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          if (++modelsCreated === 2) secondModel.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const archive = fixture.service.maybeRunArchivePass("ws-dream");
+      await models.firstAnalyzerStarted;
+      const compaction = fixture.service.maybeHarvestThenSweep(await closeEpoch(fixture));
+      await secondModel.opened;
+      await settle();
+      expect(models.runs.filter((run) => run.kind === "analyzer")).toHaveLength(1);
+
+      releaseArchive.open();
+      expect((await archive).success).toBe(true);
+      await compaction;
+      return {
+        analyzerPrompts: models.runs
+          .filter((run) => run.kind === "analyzer")
+          .map((run) => run.prompt),
+        records: await harvestRecords(fixture),
+      };
+    }
+
+    it("starts a compaction that waited behind the archive of its epoch after the rows that archive read", async () => {
+      // seedCompactionEpoch adds one more row, "remember that I prefer concise tests".
+      const { analyzerPrompts, records } = await compactionBehindHeldArchive((fixture) =>
+        seedCompactionEpoch(fixture)
+      );
+
+      expect(analyzerPrompts).toHaveLength(2);
+      const closing = analyzerPrompts[1] ?? "";
+      expect(closing).toContain("remember that I prefer concise tests");
+      expect(closing).not.toContain("We settled on bun");
+      expect(closing).not.toContain("never npm");
+      expect(records["summary-1"]?.status).toBe("completed");
+    });
+
+    it("makes no analyzer call for a compaction that waited behind the archive that read all of its epoch", async () => {
+      const { analyzerPrompts, records } =
+        await compactionBehindHeldArchive(closeEpochWithoutNewRows);
+
+      expect(analyzerPrompts).toHaveLength(1);
+      expect(records["summary-1"]).toMatchObject({
+        status: "completed",
+        nextChunk: 0,
+        analyzedFloorRowId: "open-2",
+      });
+    });
+
     it("keeps a failed run's landed edits in the sidecar before the next run's turn, so that run seeds its budget with them", async () => {
       // The failed record is saved after the turn is released, so what the run spent before its
       // chunk failed reaches the sidecar in that save alone. Holding it here makes the order
@@ -2775,31 +2863,6 @@ describe("MemoryConsolidationService", () => {
     describe("rows an earlier archive analyzed", () => {
       const analyzerRuns = (models: ReturnType<typeof archivePassModels>) =>
         models.runs.filter((run) => run.kind === "analyzer");
-
-      /** Closes the epoch the way a compaction does, without a row of its own to analyze. */
-      async function closeEpochWithoutNewRows(
-        fixture: Fixture
-      ): Promise<CompactionCompletionMetadata> {
-        await fixture.historyService.appendToHistory(
-          "ws-dream",
-          createMuxMessage("compact-request", "user", "Please compact", {
-            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
-          })
-        );
-        const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
-          compactionBoundary: true,
-          compacted: "user",
-          compactionEpoch: 1,
-        });
-        await fixture.historyService.appendToHistory("ws-dream", summary);
-        return {
-          workspaceId: "ws-dream",
-          summaryMessageId: "summary-1",
-          summaryHistorySequence: summary.metadata?.historySequence ?? -1,
-          compactionEpoch: 1,
-          compactionRequestMessageId: "compact-request",
-        };
-      }
 
       it("sends the compaction that closes the epoch only the rows after them", async () => {
         const models = archivePassModels();

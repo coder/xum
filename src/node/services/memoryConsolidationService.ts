@@ -426,6 +426,9 @@ interface HarvestAttemptState {
   analyzedFloorRowId?: string | null;
 }
 
+/** What a run's analyzer turn returns, instead of a harvest, when the records show every row read. */
+const ALL_ROWS_ANALYZED = "all-rows-analyzed";
+
 /** The record fields of a run in flight: its progress and what the attempt learned. */
 function harvestAttemptFields(
   progress: HarvestProgress,
@@ -462,15 +465,18 @@ const OPEN_EPOCH_KEY_PREFIX = "open:";
  * read everything up to its key's row. A failed run counts through the last chunk it read
  * cleanly: those chunks' edits landed, and a later run, an archive after a new row or the
  * compaction that closes the epoch, would otherwise read the rows again with a fresh budget. A
- * failed record without the field read nothing known. Read from the records, so a pruned record
- * only loses its floor, which re-reads rows instead of skipping any.
+ * pending record counts the same way: a run saves its cursor after each chunk, and the run queued
+ * behind it (an archive and the compaction of its epoch can overlap) starts when the turn is
+ * released, before the completed record is saved. A record without the field read nothing known.
+ * Read from the records, so a pruned record only loses its floor, which re-reads rows instead of
+ * skipping any.
  */
 function analyzedOpenEpochRowIds(
   records: Record<string, MemoryHarvestRecord> | undefined
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
-    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX) || record.status === "pending") continue;
+    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
     const readEverythingToKey =
       record.status === "completed" && record.readThroughRowId === undefined;
     const readThrough = readEverythingToKey
@@ -1716,18 +1722,24 @@ export class MemoryConsolidationService extends EventEmitter {
 
       // An archive that read part of this epoch's rows already analyzed them: a second archive
       // after new rows, and the compaction that later closes the epoch, both start after them.
-      // The first attempt fixes the floor in the record and a retry reuses it. Looking again could
-      // find a newer floor: an archive that read the epoch before it closed may complete after
-      // this job began, and the chunk cursor counts chunks of the rows after the old floor.
-      if (opts.attemptState.analyzedFloorRowId === undefined) {
-        opts.attemptState.analyzedFloorRowId = analyzedFloorRowId(
-          epoch.data.messages,
-          analyzedOpenEpochRowIds(opts.earlierRecords)
-        );
-      }
-      const messages = rowsAfterFloor(epoch.data.messages, opts.attemptState.analyzedFloorRowId);
-      if (messages.length === 0 && epoch.data.messages.length > 0) {
-        // Every row was analyzed before: nothing is left to read, so no model call.
+      // The first attempt fixes the floor in the record and a retry reuses it: the chunk cursor
+      // counts chunks of the rows after that floor, and looking again could find a newer one (an
+      // archive that read the epoch before it closed may complete after the first attempt).
+      // A first attempt takes the floor from the records as they stand when its analyzer turn
+      // arrives (below): an archive of the same epoch can still be streaming ahead of it, and
+      // the rows that archive reads meanwhile reach the sidecar only as it finishes chunks. The
+      // read here only spares the model and the wait when nothing is left to read already.
+      const recordedFloor = opts.attemptState.analyzedFloorRowId;
+      const floorFrom = (records: Record<string, MemoryHarvestRecord> | undefined) =>
+        recordedFloor !== undefined
+          ? recordedFloor
+          : analyzedFloorRowId(epoch.data.messages, analyzedOpenEpochRowIds(records));
+      // Every row was analyzed before: nothing is left to read, so no model call.
+      const nothingLeftAfter = (floor: string | null) =>
+        epoch.data.messages.length > 0 && rowsAfterFloor(epoch.data.messages, floor).length === 0;
+      const floorBeforeWait = floorFrom(opts.earlierRecords);
+      if (nothingLeftAfter(floorBeforeWait)) {
+        opts.attemptState.analyzedFloorRowId = floorBeforeWait;
         return yield* saveCompleted(opts.progress);
       }
 
@@ -1786,6 +1798,10 @@ export class MemoryConsolidationService extends EventEmitter {
               // not before the wait: a record of the same epoch that ran ahead (an archive and a
               // compaction of one epoch can overlap) reaches the sidecar only when it completes.
               const { harvestsByWorkspace } = await self.load();
+              // The floor comes from this read too, for the same reason as the budget below.
+              const floor = floorFrom(harvestsByWorkspace[workspaceId]);
+              opts.attemptState.analyzedFloorRowId = floor;
+              if (nothingLeftAfter(floor)) return ALL_ROWS_ANALYZED;
               opts.progress.budgetUsed = Math.max(
                 budgetSpent(opts.progress),
                 epochBudgetSpent(harvestsByWorkspace[workspaceId], epoch.data.messages)
@@ -1796,7 +1812,7 @@ export class MemoryConsolidationService extends EventEmitter {
                 memoryService: self.memoryService,
                 metaService: self.metaService,
                 ctx,
-                messages,
+                messages: rowsAfterFloor(epoch.data.messages, floor),
                 summary: epoch.data.summary,
                 resume: opts.progress,
                 // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
@@ -1853,6 +1869,8 @@ export class MemoryConsolidationService extends EventEmitter {
           new Error("workspace is being removed; harvest cancelled before its turn")
         );
       }
+      // Earlier runs read every row while this one waited for its turn: no chunk, no model call.
+      if (harvest === ALL_ROWS_ANALYZED) return yield* saveCompleted(opts.progress);
       if (harvest.streamError !== undefined) {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }
