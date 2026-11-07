@@ -161,18 +161,35 @@ export async function collectPluginBackup(muxRoot: string): Promise<BackupPlugin
 }
 
 /**
+ * The same plugin in the backup and in this export: the same name from the same repository and
+ * folder. A new commit or ref of that repository is an update of the plugin, which the user can
+ * read in the install review. A name now installed from another source is another plugin: the
+ * list would silently swap what the backup holds for it.
+ */
+function isSamePlugin(listed: BackupPluginEntry, written: BackupPluginEntry): boolean {
+  return (
+    listed.name === written.name &&
+    listed.source.url === written.source.url &&
+    listed.source.subpath === written.source.subpath
+  );
+}
+
+/**
  * The names a push removes from the backup's list, whether it removes the whole list, and whether
- * it replaces parts this build could not read. Undefined when the backup has no list and nothing
- * listed is lost. Every warning of a read marks a part left out, so a read with warnings has
- * unreadable parts, which a push that writes a list drops without naming them.
+ * it replaces parts this build could not read. A name counts as removed when the export does not
+ * write that plugin (`isSamePlugin`), so a plugin replaced by another source is named too. Undefined
+ * when the backup has no list and nothing listed is lost. Every warning of a read marks a part
+ * left out, so a read with warnings has unreadable parts, which a push that writes a list drops
+ * without naming them.
  */
 function pluginRemovalOf(
   prior: PluginListRead | null,
   written: BackupPluginManifest | null
 ): BackupPluginRemoval | undefined {
   if (prior === null) return undefined;
-  const kept = new Set(written?.plugins.map((plugin) => plugin.name));
-  const names = prior.plugins.map((plugin) => plugin.name).filter((name) => !kept.has(name));
+  const names = prior.plugins
+    .filter((listed) => !written?.plugins.some((plugin) => isSamePlugin(listed, plugin)))
+    .map((plugin) => plugin.name);
   const wholeList = written === null;
   const unreadable = prior.warnings.length > 0;
   if (!wholeList && !unreadable && names.length === 0) return undefined;

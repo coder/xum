@@ -793,7 +793,9 @@ describe("backup of the managed plugin list", () => {
         );
       }
 
-      async function listedNames(): Promise<string[]> {
+      async function listedRows(): Promise<
+        Array<{ name: string; lockedSha: string; source: { url: string; subpath?: string } }>
+      > {
         const clone = path.join(tempDir, "inspect");
         await fs.rm(clone, { recursive: true, force: true });
         await runGit(["clone", "--quiet", originPath, clone]);
@@ -801,9 +803,11 @@ describe("backup of the managed plugin list", () => {
           .readFile(path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH), "utf-8")
           .catch(() => null);
         if (text === null) return [];
-        return (JSON.parse(text) as { plugins: Array<{ name: string }> }).plugins.map(
-          (p) => p.name
-        );
+        return (JSON.parse(text) as { plugins: Awaited<ReturnType<typeof listedRows>> }).plugins;
+      }
+
+      async function listedNames(): Promise<string[]> {
+        return (await listedRows()).map((row) => row.name);
       }
 
       /** Another machine's push, as far as this one can tell: the list in the repository changes. */
@@ -834,6 +838,64 @@ describe("backup of the managed plugin list", () => {
 
         expect(removalOf(refused)).toMatchObject({ names: ["alpha"], wholeList: false });
         expect(await listedNames()).toEqual(["alpha", "beta"]);
+      });
+
+      const gitSource = (url: string, subpath?: string) => ({
+        type: "git",
+        url,
+        ref: "main",
+        refType: "branch",
+        ...(subpath === undefined ? {} : { subpath }),
+      });
+
+      it("counts a plugin the machine now installs from another repository as removed", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const otherSource = registryRow("alpha", {
+          source: gitSource("https://github.com/someone-else/alpha.git"),
+        });
+
+        const refused = removalOf(await pushFromSecondMachine([otherSource]));
+
+        expect(refused).toMatchObject({ names: ["alpha"], wholeList: false });
+        expect((await listedRows())[0]?.source.url).toBe("https://github.com/example/alpha.git");
+
+        const pushed = await pushFromSecondMachine([otherSource], {
+          approvedPluginRemovalDigest: refused.approval,
+        });
+        expect(pushed.success).toBe(true);
+        expect((await listedRows())[0]?.source.url).toBe(
+          "https://github.com/someone-else/alpha.git"
+        );
+      });
+
+      it("counts a plugin the machine now installs from another folder of the repository as removed", async () => {
+        await pushFromFirstMachine([
+          registryRow("alpha", {
+            source: gitSource("https://github.com/example/mono.git", "plugins/alpha"),
+          }),
+        ]);
+
+        const refused = await pushFromSecondMachine([
+          registryRow("alpha", {
+            source: gitSource("https://github.com/example/mono.git", "packages/alpha"),
+          }),
+        ]);
+
+        expect(removalOf(refused).names).toEqual(["alpha"]);
+      });
+
+      it("keeps a plugin without approval when only its commit or ref moved", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+
+        const pushed = await pushFromSecondMachine([
+          registryRow("alpha", {
+            lockedSha: shaOf("z"),
+            source: { ...gitSource("https://github.com/example/alpha.git"), ref: "v2.0.0" },
+          }),
+        ]);
+
+        expect(pushed.success).toBe(true);
+        expect((await listedRows())[0]).toMatchObject({ name: "alpha", lockedSha: shaOf("z") });
       });
 
       it("pushes once the approval of that removal comes back with it", async () => {
