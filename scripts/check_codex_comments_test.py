@@ -818,11 +818,19 @@ else:
     def test_text_inserted_around_the_fold_never_reads_as_a_board(self):
         # Each regex position that tolerated extra text let a hidden finding pass (verifier
         # mutants on #7975). So a finding goes into every character gap of the fold's three tag
-        # lines, and onto a line of its own before the marker, before the fold and after it.
-        # Every such body must block at once and show the finding: never read completed (0) or
+        # lines, onto a line of its own at every line boundary from the marker to the closing
+        # tag, and onto the marker's line. It goes in as plain text, as an attribute and as an
+        # HTML comment, since tolerance written for any of those shapes could hide it. Every
+        # such body must block at once and show the finding: never read completed (0) or
         # running (10). One jq process applies the gate's own classifier to all of them, since
         # a gate run per body took minutes; the real gate checks one body per position kind.
         finding = "[P1] Validate the caller before reading credentials"
+        shapes = {
+            "text": finding,
+            "attribute": f' data-note="{finding}"',
+            "comment": f"<!-- {finding} -->",
+        }
+        end = "\n\n</details>"
         cases, gate_cases = [], []
         for label, exact in ((COMPLETED_LABEL, 0), (RUNNING_LABEL, 10)):
             fold = collapsed(FIXTURES["summary"]["body"], label)
@@ -830,28 +838,45 @@ else:
             summary = opening + len("<details>\n")
             summary_end = fold.index("</summary>\n", summary) + len("</summary>")
             closing = len(fold) - len("</details>")
-            self.assertEqual(fold[closing - 2 :], "\n\n</details>")
-            inserted = {
-                f"{label}, {line} gap {gap - start}": fold[:gap] + finding + fold[gap:]
-                for line, start, end in (
+            self.assertTrue(fold.endswith(end))
+            inserted = {}
+            for shape, text in shapes.items():
+                for line, start, stop in (
                     ("details line", opening, summary - 1),
                     ("summary line", summary, summary_end),
                     ("closing line", closing, len(fold)),
+                ):
+                    for gap in range(start, stop + 1):
+                        inserted[f"{label}, {shape}, {line} gap {gap - start}"] = (
+                            fold[:gap] + text + fold[gap:]
+                        )
+                own_line = {
+                    "before the marker": 0,
+                    "before the fold": opening,
+                    "between the details and summary lines": summary,
+                    "after the summary line": summary_end + 1,
+                    "after the help text": closing - 1,
+                    "before the closing tag": closing,
+                }
+                for where, at in own_line.items():
+                    inserted[f"{label}, {shape}, line {where}"] = fold[:at] + text + "\n" + fold[at:]
+                inserted[f"{label}, {shape}, in place of the blank line"] = (
+                    fold[: -len(end)] + "\n" + text + "\n</details>"
                 )
-                for gap in range(start, end + 1)
-            }
-            inserted[f"{label}, line before the marker"] = finding + "\n" + fold
-            inserted[f"{label}, line before the fold"] = fold[:opening] + finding + "\n" + fold[opening:]
-            inserted[f"{label}, line after the fold"] = fold + "\n" + finding
+                inserted[f"{label}, {shape}, end of the help text"] = fold[: -len(end)] + text + end
+                inserted[f"{label}, {shape}, line after the fold"] = fold + "\n" + text
+                inserted[f"{label}, {shape}, marker's line"] = text + " " + fold
             cases.append((f"{label}, exact fold", fold, exact))
             cases += [(case, body, 1) for case, body in inserted.items()]
             gate_cases += [(f"{label}, exact fold", fold, exact)] + [
                 (case, inserted[case], 1)
                 for case in (
-                    f"{label}, details line gap 0",
-                    f"{label}, summary line gap 20",
-                    f"{label}, closing line gap {len('</details>')}",
-                    f"{label}, line before the marker",
+                    f"{label}, text, details line gap 0",
+                    f"{label}, text, summary line gap 20",
+                    f"{label}, text, closing line gap {len('</details>')}",
+                    f"{label}, text, line before the marker",
+                    f"{label}, attribute, details line gap {len('<details')}",
+                    f"{label}, comment, line after the summary line",
                 )
             ]
         verdicts = gate_verdicts([body for _, body, _ in cases], board_head(cases[0][1]))
