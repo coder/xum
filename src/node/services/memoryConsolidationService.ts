@@ -1397,7 +1397,7 @@ export class MemoryConsolidationService extends EventEmitter {
       // that was ahead of this run may have journaled after the pre-queue check passed; and the
       // success record is saved here, before release, so that read sees it. The save is the
       // sidecar's brief in-process lock plus one atomic write. Usage recording is not part of the
-      // turn (see `recordings`).
+      // turn (see `usageRecorder`).
       const runTurn = async (): Promise<Result<MemoryConsolidationRecord, string>> => {
         if (await Effect.runPromise(self.isDebouncedEffect(workspaceId, trigger, options))) {
           return Err(DEBOUNCED_SKIP_REASON);
