@@ -19,7 +19,7 @@ import {
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
   MEMORY_MAX_FILE_BYTES,
 } from "@/common/constants/memory";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   HARVEST_MAX_ATTEMPTS,
@@ -1452,6 +1452,70 @@ describe("MemoryConsolidationService", () => {
     });
   });
 
+  it("keeps the edits of a chunk that wrote and then failed in the failed record", async () => {
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const isHarvest = userPromptText(options).includes("just-compacted transcript epoch");
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            if (isHarvest && !afterToolResult) {
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                }),
+              });
+            }
+            if (isHarvest) {
+              return Promise.resolve({
+                stream: new ReadableStream<LanguageModelV3StreamPart>({
+                  pull(controller) {
+                    controller.error(new Error("provider exploded"));
+                  },
+                }),
+              });
+            }
+            return Promise.resolve({ stream: noChangesStream() });
+          },
+        }),
+    });
+    const metadata = await seedCompactionEpoch(fixture);
+
+    await fixture.service.maybeHarvestThenSweep(metadata);
+
+    // The write landed in memory, so the record that a retry resumes from must say so.
+    expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+      status: "failed",
+      nextChunk: 0,
+      acceptedCandidates: 1,
+      budgetUsed: 1,
+      nextChunkOps: 1,
+      ops: [{ command: "create", path: "/memories/workspace/landed.md", applied: true }],
+    });
+  });
+
+  it("refuses a harvest for a workspace that another backend is removing, before any model call", async () => {
+    const models = archivePassModels();
+    using fixture = await createFixture({ modelFactory: models.factory });
+    const metadata = await seedCompactionEpoch(fixture);
+    await appendRows(fixture, openRowTexts);
+    // History writes refuse once the tombstone exists, so the rows come first.
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-dream");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-dream", removedAt: Date.now() })
+    );
+    const harvested = await fixture.service.maybeHarvestThenSweep(metadata);
+    expect(harvested.success).toBe(false);
+    if (!harvested.success) expect(harvested.error).toContain("being removed");
+    const archived = await fixture.service.maybeRunArchivePass("ws-dream");
+    expect(archived.success).toBe(false);
+
+    expect(models.runs).toEqual([]);
+    expect(await harvestRecords(fixture)).toEqual({});
+  });
+
   it("records an analyzer write outside workspace memory as rejected and never applies it", async () => {
     let harvestStep = 0;
     using fixture = await createFixture({
@@ -1742,6 +1806,97 @@ describe("MemoryConsolidationService", () => {
     } finally {
       timeoutSpy.mockRestore();
     }
+  });
+
+  describe("dream stream queue", () => {
+    /**
+     * Models whose streams each hold until `release(id)`, numbered in the order the runs created
+     * them, and a log of when each stream starts and ends.
+     */
+    function heldStreams() {
+      const events: string[] = [];
+      const gates = new Map<number, () => void>();
+      let created = 0;
+      const factory = () => {
+        const id = ++created;
+        const inner = scriptedModel();
+        return new MockLanguageModelV3({
+          doStream: async (options) => {
+            events.push(`start-${id}`);
+            await new Promise<void>((resolve) => gates.set(id, resolve));
+            events.push(`end-${id}`);
+            return inner.doStream(options);
+          },
+        });
+      };
+      return { events, factory, release: (id: number) => gates.get(id)?.() };
+    }
+
+    async function until(condition: () => boolean): Promise<void> {
+      for (let tick = 0; tick < 400 && !condition(); tick++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(condition()).toBe(true);
+    }
+
+    /** Past model creation, a run is only waiting for its turn in the queue. */
+    async function waitingForTurn(fixture: Fixture, runs: number): Promise<void> {
+      await until(() => fixture.modelCalls.length >= runs);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    it("starts waiting runs in the order they arrived, each after the one before it ended", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-two");
+      await fixture.addWorkspace("ws-three");
+
+      const first = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-1"));
+      const second = fixture.service.maybeRun("ws-two", "manual");
+      await waitingForTurn(fixture, 2);
+      const third = fixture.service.maybeRun("ws-three", "manual");
+      await waitingForTurn(fixture, 3);
+      expect(held.events).toEqual(["start-1"]);
+
+      held.release(1);
+      await until(() => held.events.includes("start-2"));
+      expect(held.events).toEqual(["start-1", "end-1", "start-2"]);
+      held.release(2);
+      await until(() => held.events.includes("start-3"));
+      held.release(3);
+
+      expect((await Promise.all([first, second, third])).every((run) => run.success)).toBe(true);
+      expect(held.events).toEqual(["start-1", "end-1", "start-2", "end-2", "start-3", "end-3"]);
+    });
+
+    it("lets no run pass the running stream when a run between them is cancelled", async () => {
+      const held = heldStreams();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-two");
+      await fixture.addWorkspace("ws-three");
+
+      const first = fixture.service.maybeRun("ws-dream", "manual");
+      await until(() => held.events.includes("start-1"));
+      const middle = fixture.service.maybeRun("ws-two", "manual");
+      await waitingForTurn(fixture, 2);
+      const last = fixture.service.maybeRun("ws-three", "manual");
+      await waitingForTurn(fixture, 3);
+
+      await fixture.service.cancelInFlightConsolidation("ws-two");
+      const cancelled = await middle;
+      expect(cancelled.success).toBe(false);
+      // The cancelled run released its slot, but the stream ahead of it still holds the queue.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(held.events).toEqual(["start-1"]);
+
+      held.release(1);
+      await until(() => held.events.includes("start-3"));
+      held.release(3);
+      expect((await first).success).toBe(true);
+      expect((await last).success).toBe(true);
+      expect(held.events).toEqual(["start-1", "end-1", "start-3", "end-3"]);
+    });
   });
 
   it("workspace removal cancels a dream run that is still waiting for its turn", async () => {
@@ -2095,6 +2250,37 @@ describe("MemoryConsolidationService", () => {
         expect(result.success).toBe(false);
         expect(fixture.modelCalls).toHaveLength(0);
       });
+    });
+
+    it("still runs the final dream when the open epoch cannot be read", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+      const read = spyOn(
+        fixture.historyService,
+        "getHistoryFromLatestBoundary"
+      ).mockResolvedValueOnce(Err("history file unreadable"));
+
+      const result = await fixture.service.maybeRunArchivePass("ws-dream");
+
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+      expect(await harvestRecords(fixture)).toEqual({});
+    });
+
+    it("still runs the final dream when the analysis itself throws", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+      spyOn(fixture.historyService, "getHistoryFromLatestBoundary").mockRejectedValueOnce(
+        new Error("history read exploded")
+      );
+
+      const result = await fixture.service.maybeRunArchivePass("ws-dream");
+
+      expect(result.success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
     });
 
     it("still runs the final dream after a failed analysis, and retries that analysis on the next archive", async () => {

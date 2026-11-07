@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -380,6 +380,68 @@ describe("runMemoryHarvest", () => {
       expect(prompt).not.toContain(githubToken);
       expect(prompt).not.toContain(apiKey);
       expect(prompt).not.toContain("a1B2a1B2");
+    });
+
+    it("redacts a secret that straddles the cap on a tool's output, not just the part inside it", async () => {
+      using fixture = createFixture();
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      // The token starts 10 characters before the 2,000-character cap and ends after it.
+      const output = `${"x".repeat(1_989)} ${githubToken} tail`;
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "env" }, output),
+        ]),
+      ]);
+
+      expect(prompt).toContain("[redacted]");
+      // Cut at the cap before redacting, 10 readable characters of the token would remain.
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("omits a session_history result nested inside another tool's output", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "code_execution",
+            { code: "history()" },
+            {
+              result: {
+                calls: [
+                  {
+                    toolName: "session_history",
+                    output: { items: [{ text: "OTHER-SESSION-ROW" }] },
+                  },
+                  { toolName: "bash", output: "KEPT-NESTED-OUTPUT" },
+                ],
+              },
+            }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).not.toContain("OTHER-SESSION-ROW");
+      expect(prompt).toContain("[session_history result omitted]");
+      expect(prompt).toContain("KEPT-NESTED-OUTPUT");
+    });
+
+    it("keeps nested tool data down to a depth limit and omits what lies beyond it", async () => {
+      using fixture = createFixture();
+      const nest = (depth: number, leaf: string): unknown =>
+        depth === 0 ? leaf : { inner: nest(depth - 1, leaf) };
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "shallow" }, { output: nest(20, "SHALLOW-LEAF") }),
+          toolPart("bash", { script: "deep" }, { output: nest(40, "DEEP-LEAF") }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("SHALLOW-LEAF");
+      expect(prompt).not.toContain("DEEP-LEAF");
+      expect(prompt).toContain("[nested data omitted]");
     });
   });
 
@@ -836,6 +898,35 @@ describe("runMemoryHarvest", () => {
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
   });
 
+  it("sums the usage of the chunks that reported one and none when no chunk did", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    // A telemetry sink that throws on the second chunk leaves that chunk without usage.
+    let reports = 0;
+    const flaky = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+
+    const partial = await runHarvest(fixture, flaky.model, {
+      recordUsage: () => {
+        if (++reports === 2) throw new Error("usage sink failed");
+        return Promise.resolve();
+      },
+    });
+
+    expect(partial.streamError).toBeUndefined();
+    expect(partial.nextChunk).toBe(3);
+    expect(partial.usage).toEqual({ inputTokens: 2, outputTokens: 10 });
+
+    const silent = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+    const none = await runHarvest(fixture, silent.model, {
+      recordUsage: () => {
+        throw new Error("usage sink failed");
+      },
+    });
+
+    expect(none.nextChunk).toBe(3);
+    expect(none.usage).toBeUndefined();
+  });
+
   describe("resume cursor", () => {
     it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
       using fixture = createFixture();
@@ -979,18 +1070,19 @@ describe("runMemoryHarvest", () => {
     it("gives each chunk its own timeout instead of one for the whole epoch", async () => {
       using fixture = createFixture();
       fixture.messages = manyChunkMessages();
-      // 3 chunks of 250 ms: 750 ms in all, over the 500 ms limit that applies to each chunk.
-      const model = new MockLanguageModelV3({
-        doStream: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-          return { stream: simulateReadableStream({ chunks: [finishChunk(1)] }) };
-        },
-      });
+      // Counted at the source: how long a timeout signal takes to fire depends on the runtime,
+      // and a signal that never fires would pass a run that shares one across its chunks.
+      const timeoutSpy = spyOn(AbortSignal, "timeout");
+      try {
+        const { model } = scriptedModel([]);
 
-      const result = await runHarvest(fixture, model, { chunkTimeoutMs: 500 });
+        const result = await runHarvest(fixture, model, { chunkTimeoutMs: 500 });
 
-      expect(result.streamError).toBeUndefined();
-      expect(result.nextChunk).toBe(3);
+        expect(result.nextChunk).toBe(3);
+        expect(timeoutSpy.mock.calls).toEqual([[500], [500], [500]]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
     });
 
     it.each(["its timeout", "workspace removal"])(
