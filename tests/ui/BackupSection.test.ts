@@ -1534,6 +1534,57 @@ describe("BackupSection", () => {
       expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
     });
 
+    test("warns beside Back up now which listed plugins a push would remove from the backup", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [pluginRow("alpha", "missing"), pluginRow("beta", "missing")],
+          pluginsDroppedByPush: ["alpha", "beta"],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      const warning = await canvas.findByText(/Backing up now removes 2 plugins/);
+      expect(warning.textContent).toContain("alpha, beta");
+    });
+
+    test("warns in the singular for one plugin, and keeps the warning after a restore", async () => {
+      const { view } = renderBackupSection({
+        backupRestore: {
+          ...RESTORE_BASE,
+          pluginInstalls: [pluginRow("alpha", "missing")],
+          pluginsDroppedByPush: ["alpha"],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      await confirmRestore(canvas);
+
+      const warning = await canvas.findByText(/Backing up now removes 1 plugin from the backup/);
+      expect(warning.textContent).toContain("is not installed here: alpha");
+    });
+
+    test("shows no push warning when a preview lists nothing to remove", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [pluginRow("beta", "installed")],
+          pluginsDroppedByPush: [],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.queryByText(/Backing up now removes/)).toBeNull();
+    });
+
     test("offers the plugins right after a restore, which installed none of them", async () => {
       const { client, view } = renderBackupSection({
         backupRestore: { ...RESTORE_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },

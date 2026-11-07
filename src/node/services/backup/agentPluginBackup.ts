@@ -278,6 +278,20 @@ async function planPluginInstalls(
 }
 
 /**
+ * The names in the backup's list that a push from this machine would remove: they are listed
+ * there, and this machine's export would not include them. A restore installs nothing, so right
+ * after one the push still rewrites the list from the local installs only.
+ */
+async function namesDroppedByPush(
+  rootDir: string,
+  listed: readonly BackupPluginEntry[]
+): Promise<string[]> {
+  if (listed.length === 0) return [];
+  const exported = new Set((await collectPluginBackup(rootDir))?.plugins.map((p) => p.name));
+  return listed.map((plugin) => plugin.name).filter((name) => !exported.has(name));
+}
+
+/**
  * What a preview or restore reports of the backup's plugin list. Writes nothing: the rows are an
  * offer the user can take through the install review (see the note at the top of this file).
  * With the flag off the list is only checked for existence, so a malformed one never blocks a
@@ -292,12 +306,14 @@ export async function readPluginRestore(options: {
   pluginInstalls: BackupPluginInstall[];
   pluginListSkipped: boolean;
   pluginListWarnings: string[];
+  pluginsDroppedByPush: string[];
 }> {
   if (!options.contents.includePlugins) {
     return {
       pluginInstalls: [],
       pluginListSkipped: await pluginBackupExists(options.sourceDir),
       pluginListWarnings: [],
+      pluginsDroppedByPush: [],
     };
   }
   const list = await readPluginBackup(options.sourceDir);
@@ -305,5 +321,6 @@ export async function readPluginRestore(options: {
     pluginInstalls: await planPluginInstalls(options.rootDir, list.plugins),
     pluginListSkipped: false,
     pluginListWarnings: list.warnings,
+    pluginsDroppedByPush: await namesDroppedByPush(options.rootDir, list.plugins),
   };
 }

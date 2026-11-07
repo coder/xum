@@ -29,6 +29,7 @@ import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import {
   BackupPluginsCard,
   NO_PLUGIN_BACKUP,
+  PluginPushWarning,
   reviewBackedUpPlugins,
   type PluginBackupReport,
 } from "./BackupPluginsCard";
@@ -1113,6 +1114,8 @@ export function BackupSection() {
 
       {actionError ? <div className="text-error text-xs">{actionError}</div> : null}
       {statusMessage ? <div className="text-success-text text-xs">{statusMessage}</div> : null}
+
+      <PluginPushWarning names={pluginBackup.pluginsDroppedByPush} />
 
       <section className="border-border-light flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center">
         <Button

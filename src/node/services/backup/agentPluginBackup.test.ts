@@ -284,6 +284,43 @@ describe("backup of the managed plugin list", () => {
       expect(preview.pluginListSkipped).toBe(false);
     });
 
+    it("names the listed plugins that a push from this machine would remove from the backup", async () => {
+      const { payload, request } = await backupOf([
+        registryRow("missing-one"),
+        registryRow("moved-one"),
+        registryRow("same-one"),
+        registryRow("unmanaged-one"),
+        registryRow("unexportable-one"),
+      ]);
+      await useLocalRegistry([
+        registryRow("moved-one", { lockedSha: shaOf("z") }),
+        registryRow("same-one"),
+        // Installed, but its row would not be exported (the push leaves out a row with no full commit id).
+        registryRow("unexportable-one", { lockedSha: "abc123" }),
+        registryRow("local-only"),
+      ]);
+      await writeFixtureFile(muxRoot, "plugins/unmanaged-one/plugin.json", "{}");
+
+      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+
+      expect(preview.pluginsDroppedByPush).toEqual([
+        "missing-one",
+        "unexportable-one",
+        "unmanaged-one",
+      ]);
+    });
+
+    it("names no plugin to drop when this machine has all of them, or the flag is off", async () => {
+      const { payload, request } = await backupOf([registryRow("alpha")]);
+
+      const withAll = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+      await useLocalRegistry([]);
+      const flagOff = await payload.previewRestore({ ...request, contents: PLUGINS_OFF });
+
+      expect(withAll.pluginsDroppedByPush).toEqual([]);
+      expect(flagOff.pluginsDroppedByPush).toEqual([]);
+    });
+
     it("hands back the pin and the source a reinstall needs", async () => {
       const { payload, request } = await backupOf([
         registryRow("alpha", {
@@ -332,6 +369,8 @@ describe("backup of the managed plugin list", () => {
       expect(restored.pluginInstalls?.map((row) => [row.name, row.status])).toEqual([
         ["alpha", "missing"],
       ]);
+      // Nothing was installed, so a push right after the restore would still remove it.
+      expect(restored.pluginsDroppedByPush).toEqual(["alpha"]);
       expect(await fs.readFile(path.join(muxRoot, "plugins.json"), "utf-8")).toBe(registryBefore);
       expect(await exists(path.join(muxRoot, "plugins"))).toBe(false);
       expect(restored.changedFiles.some((file) => file.includes("plugin"))).toBe(false);
@@ -569,6 +608,7 @@ describe("backup of the managed plugin list", () => {
 
       if (!preview.success) throw new Error(preview.error.message);
       expect(preview.data.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.data.pluginsDroppedByPush).toEqual(["alpha"]);
     });
 
     it("restores the settings when the plugin list is unreadable, and reports the warning", async () => {

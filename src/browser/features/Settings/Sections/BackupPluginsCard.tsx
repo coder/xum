@@ -9,6 +9,7 @@ export interface PluginBackupReport {
   pluginInstalls?: readonly BackupPluginInstall[];
   pluginListSkipped?: boolean;
   pluginListWarnings?: readonly string[];
+  pluginsDroppedByPush?: readonly string[];
 }
 
 export const NO_PLUGIN_BACKUP: PluginBackupReport = {};
@@ -62,6 +63,23 @@ function PluginRow(props: { plugin: BackupPluginInstall }) {
         {plugin.source.ref} · {plugin.lockedSha.slice(0, 12)}
       </span>
     </li>
+  );
+}
+
+/**
+ * Beside "Back up now": a push replaces the backup's plugin list with this machine's installs, and
+ * a restore installs nothing, so right after one the push would remove every plugin not yet
+ * reinstalled here.
+ */
+export function PluginPushWarning(props: { names?: readonly string[] }) {
+  const names = props.names ?? [];
+  if (names.length === 0) return null;
+  const one = names.length === 1;
+  return (
+    <p className="text-warning text-xs">
+      Backing up now removes {names.length} {one ? "plugin" : "plugins"} from the backup that{" "}
+      {one ? "is" : "are"} not installed here: <span className="break-all">{names.join(", ")}</span>
+    </p>
   );
 }
 

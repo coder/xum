@@ -102,6 +102,7 @@ export interface BackupPayloadStore {
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
     pluginListWarnings?: string[];
+    pluginsDroppedByPush?: string[];
     symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
@@ -139,6 +140,7 @@ export interface BackupPayloadStore {
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
     pluginListWarnings?: string[];
+    pluginsDroppedByPush?: string[];
     symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
@@ -589,6 +591,7 @@ export class BackupService {
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
         pluginListWarnings?: string[];
+        pluginsDroppedByPush?: string[];
         symlinkSkipped?: string[];
         pushError: string | null;
       },
@@ -638,6 +641,7 @@ export class BackupService {
         pluginInstalls: restorePreview.pluginInstalls,
         pluginListSkipped: restorePreview.pluginListSkipped,
         pluginListWarnings: restorePreview.pluginListWarnings,
+        pluginsDroppedByPush: restorePreview.pluginsDroppedByPush,
         symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
@@ -732,6 +736,7 @@ export class BackupService {
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
         pluginListWarnings?: string[];
+        pluginsDroppedByPush?: string[];
         symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
@@ -855,6 +860,7 @@ export class BackupService {
               pluginInstalls: restored.pluginInstalls,
               pluginListSkipped: restored.pluginListSkipped,
               pluginListWarnings: restored.pluginListWarnings,
+              pluginsDroppedByPush: restored.pluginsDroppedByPush,
               symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,

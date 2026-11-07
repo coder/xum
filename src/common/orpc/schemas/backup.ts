@@ -189,6 +189,11 @@ export const backup = {
         pluginListSkipped: z.boolean().optional(),
         /** What this build could not read of the plugin list (the list or a row); the rest still shows. */
         pluginListWarnings: z.array(z.string()).optional(),
+        /**
+         * Plugins in the backup's list that this machine does not have installed: a push now would
+         * remove them from the backup, because it rewrites the list from the local installs.
+         */
+        pluginsDroppedByPush: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -238,6 +243,8 @@ export const backup = {
         pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
         pluginListSkipped: z.boolean().optional(),
         pluginListWarnings: z.array(z.string()).optional(),
+        /** As in the preview: a push right after this restore would remove them from the backup. */
+        pluginsDroppedByPush: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
