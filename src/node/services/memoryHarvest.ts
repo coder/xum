@@ -73,6 +73,12 @@ export interface HarvestProgress {
    * Absent in an older record, and 0 when no attempt reached the chunk.
    */
   nextChunkOps?: number;
+  /**
+   * Tokens of every chunk stream that finished cleanly, across attempts. A retry resumes after
+   * those chunks, so without this the completed record would count only the last attempt's.
+   * Absent in an older record, and when no chunk reported usage.
+   */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 /** Where a run starts, read from the progress of an earlier attempt at the same epoch. */
@@ -97,7 +103,6 @@ function resumePoint(
 }
 
 export interface MemoryHarvestResult extends HarvestProgress {
-  usage?: { inputTokens: number; outputTokens: number };
   streamError?: string;
   /** Why the run ended before it read every chunk, when it did: see `budgetSpentNote`. */
   note?: string;
@@ -410,9 +415,9 @@ interface ChunkOutcome {
 }
 
 function sumUsage(
-  total: MemoryHarvestResult["usage"],
+  total: HarvestProgress["usage"],
   chunk: ChunkOutcome["usage"]
-): MemoryHarvestResult["usage"] {
+): HarvestProgress["usage"] {
   if (chunk === undefined) return total;
   return {
     inputTokens: (total?.inputTokens ?? 0) + chunk.inputTokens,
@@ -525,16 +530,18 @@ export async function runMemoryHarvest(args: {
   const budget = createMutationBudget(MEMORY_ANALYZER_OP_BUDGET, resumed.budgetUsed);
   // Ops of the chunks that finished; the ones after them belong to the chunk in flight.
   let finishedOps = resumed.opsBeforeStartChunk;
+  // Starts from the earlier attempts' usage: the chunks they finished are not run again.
+  let usage = args.resume?.usage;
   const progressFor = (nextChunk: number): HarvestProgress => ({
     nextChunk,
     ops: [...priorOps, ...journal],
     budgetUsed: budget.used(),
     nextChunkOps: priorOps.length + journal.length - finishedOps,
+    usage,
   });
 
   let streamError: string | undefined;
   let note: string | undefined;
-  let usage: MemoryHarvestResult["usage"];
   let nextChunk = resumed.startChunk;
   // Chunks that were read: the cursor, except after a budget skip, which moves it past chunks
   // nobody read.
@@ -592,5 +599,5 @@ export async function runMemoryHarvest(args: {
     await args.onChunkComplete?.(progressFor(nextChunk));
   }
 
-  return { ...progressFor(nextChunk), usage, streamError, note, readChunks };
+  return { ...progressFor(nextChunk), streamError, note, readChunks };
 }

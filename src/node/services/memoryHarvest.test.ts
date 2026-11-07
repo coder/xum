@@ -966,6 +966,28 @@ describe("runMemoryHarvest", () => {
     expect(none.usage).toBeUndefined();
   });
 
+  it("adds the usage of the chunks it runs to the usage of the attempt it resumes", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const reached: HarvestProgress[] = [];
+    const { model } = scriptedModel([[finishChunk(5)], [finishChunk(5)]]);
+
+    const result = await runHarvest(fixture, model, {
+      resume: { nextChunk: 1, ops: [], usage: { inputTokens: 7, outputTokens: 11 } },
+      onChunkComplete: (progress) => {
+        reached.push(progress);
+        return Promise.resolve();
+      },
+    });
+
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 21 });
+    // What the service persists after each chunk carries the running total, not the chunk's own.
+    expect(reached.map((progress) => progress.usage)).toEqual([
+      { inputTokens: 8, outputTokens: 16 },
+      { inputTokens: 9, outputTokens: 21 },
+    ]);
+  });
+
   describe("resume cursor", () => {
     it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
       using fixture = createFixture();

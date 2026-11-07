@@ -1315,6 +1315,66 @@ describe("MemoryConsolidationService", () => {
     }
   });
 
+  it("adds the tokens of the chunks a failed attempt finished to the completed record", async () => {
+    let failedOnce = false;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async (options) => {
+            if (!failedOnce && userPromptText(options).includes("Transcript chunk 2/3")) {
+              failedOnce = true;
+              return {
+                stream: new ReadableStream<LanguageModelV3StreamPart>({
+                  pull(controller) {
+                    controller.error(new Error("provider exploded"));
+                  },
+                }),
+              };
+            }
+            // Every other call, a harvest chunk or a sweep, is one clean stream of 1 token each way.
+            return {
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "text-start", id: "t1" },
+                  { type: "text-delta", id: "t1", delta: "no changes needed" },
+                  { type: "text-end", id: "t1" },
+                  {
+                    type: "finish",
+                    finishReason: { unified: "stop", raw: "stop" },
+                    usage: {
+                      inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: 1, text: 1, reasoning: 0 },
+                    },
+                  },
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            };
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+    let status = await fixture.service.getStatus("ws-dream");
+    // Chunk 1 finished and chunk 2 failed: the failed record keeps what chunk 1 cost.
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+    // The retry ran chunks 2 and 3 only; the record counts all three.
+    status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      attemptCount: 2,
+      usage: { inputTokens: 3, outputTokens: 3 },
+    });
+  });
+
   it("keeps the budget spent and the failed chunk's landed edits in its record, and the retry uses both", async () => {
     const chunkTwoPrompts: string[] = [];
     let failedOnce = false;

@@ -153,6 +153,11 @@ export const MemoryHarvestRecordSchema = z.object({
    * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
    */
   note: z.string().optional(),
+  /**
+   * Tokens of every chunk stream that finished cleanly, across attempts. A pending or failed
+   * record carries them so the retry that completes the epoch adds to them. Optional so older
+   * binaries parse the record.
+   */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });

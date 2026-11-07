@@ -330,7 +330,13 @@ function harvestProgressFields(
   progress: HarvestProgress
 ): Pick<
   MemoryHarvestRecord,
-  "nextChunk" | "ops" | "budgetUsed" | "nextChunkOps" | "acceptedCandidates" | "skippedCandidates"
+  | "nextChunk"
+  | "ops"
+  | "budgetUsed"
+  | "nextChunkOps"
+  | "usage"
+  | "acceptedCandidates"
+  | "skippedCandidates"
 > {
   const applied = progress.ops.filter((op) => op.applied).length;
   return {
@@ -338,6 +344,7 @@ function harvestProgressFields(
     ops: progress.ops,
     budgetUsed: progress.budgetUsed,
     nextChunkOps: progress.nextChunkOps,
+    usage: progress.usage,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
   };
@@ -1150,6 +1157,7 @@ export class MemoryConsolidationService extends EventEmitter {
         ops: existing?.ops ?? [],
         budgetUsed: existing?.budgetUsed,
         nextChunkOps: existing?.nextChunkOps,
+        usage: existing?.usage,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
 
@@ -1288,6 +1296,7 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.ops = reached.ops;
         opts.progress.budgetUsed = reached.budgetUsed;
         opts.progress.nextChunkOps = reached.nextChunkOps;
+        opts.progress.usage = reached.usage;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
@@ -1368,7 +1377,6 @@ export class MemoryConsolidationService extends EventEmitter {
           compactionEpoch: metadata.compactionEpoch,
           completionMetadata: metadata,
           ...harvestProgressFields(harvest),
-          usage: harvest.usage,
           note: harvest.note,
         },
         opts.projectPath
