@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
 import { defaultModel } from "@/common/utils/ai/models";
-import { MEMORY_CONSOLIDATION_MAX_STEPS } from "@/common/constants/memory";
+import {
+  MEMORY_ANALYZER_MAX_STEPS,
+  MEMORY_CONSOLIDATION_MAX_STEPS,
+} from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
@@ -28,6 +31,30 @@ describe("estimateAnalyzerUpperBoundUsd", () => {
     expect(priced([8_000], 100_000) ?? 0).toBeGreaterThan(base);
     expect(priced([40_000]) ?? 0).toBeGreaterThan(base);
   });
+
+  // A prompt token is billed once by the first step and, from then on, as a cache read by each of
+  // the steps after it. The first bill is a cache write where the model has a write rate (Anthropic
+  // charges 1.25x input for it) and the input rate where it has none. The slope of the estimate in
+  // the prompt size is that sum, whatever the rest of the estimate holds.
+  it.each(["anthropic:claude-sonnet-5-5", "google:gemini-3-pro-preview"])(
+    "bills each prompt token once at the first-step rate and once per later step as a cache read on %s",
+    (pricingModel) => {
+      const stats = getModelStats(pricingModel);
+      const read = stats?.cache_read_input_token_cost ?? 0;
+      const firstStepRate =
+        stats?.cache_creation_input_token_cost ?? stats?.input_cost_per_token ?? 0;
+      expect(read).toBeGreaterThan(0);
+      const [small, large] = [40_000, 80_000];
+      const estimate = (chars: number) =>
+        estimateAnalyzerUpperBoundUsd({ pricingModel, chunkInputChars: [chars], memoryChars: 0 }) ??
+        0;
+
+      const perToken =
+        (estimate(large) - estimate(small)) / ((large - small) / APPROX_CHARS_PER_TOKEN);
+
+      expect(perToken).toBeCloseTo(firstStepRate + (MEMORY_ANALYZER_MAX_STEPS - 1) * read, 9);
+    }
+  );
 
   it("has no estimate for a model with no known price", () => {
     expect(

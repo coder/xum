@@ -9,6 +9,9 @@
  * and the provider serves it from its prompt cache, so the resent tokens price at the cache-read
  * rate when the model has one (the one run recorded on this host billed 93% of its input that
  * way). Pricing every step at the full rate made a minimal job look many times dearer than it was.
+ * A model whose table lists a cache-write rate (Anthropic bills about 1.25x input) prices the first
+ * step's prompt at it, since that step may be the one that writes the prefix to the cache, and an
+ * estimate at the plain input rate would then fall under the bill.
  */
 import {
   MEMORY_ANALYZER_MAX_STEPS,
@@ -38,9 +41,11 @@ function estimateRunUsd(
   steps: number
 ): number | undefined {
   const promptTokens = Math.ceil(promptChars / APPROX_CHARS_PER_TOKEN);
+  const stats = getModelStats(pricingModel);
   // A model with no cache-read price would price a cached token at zero, so its resent prefix
   // stays at the full input rate.
-  const cachePriced = getModelStats(pricingModel)?.cache_read_input_token_cost !== undefined;
+  const cachePriced = stats?.cache_read_input_token_cost !== undefined;
+  const cacheWritePriced = stats?.cache_creation_input_token_cost !== undefined;
   let total = 0;
   for (let step = 1; step <= steps; step++) {
     const earlierOutputTokens = (step - 1) * ESTIMATED_OUTPUT_TOKENS_PER_STEP;
@@ -52,6 +57,9 @@ function estimateRunUsd(
         {
           inputTokens: promptTokens + earlierOutputTokens,
           cachedInputTokens: cachePriced ? resentTokens : 0,
+          ...(step === 1 && cacheWritePriced
+            ? { inputTokenDetails: { cacheWriteTokens: promptTokens } }
+            : {}),
           outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
         },
         pricingModel
