@@ -59,6 +59,7 @@ import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import {
@@ -4423,6 +4424,12 @@ export class AgentSession {
       // non-empty: the renderer resets its held list with the rest of the replayed chat state.
       if (this.heldInputs.length > 0) {
         listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
+      }
+
+      // A bash call waiting for a sandbox approval: its live event went out before this
+      // subscription, so without a replay the reloaded chat shows no card to answer.
+      for (const event of sandboxApprovalManager.pendingEvents(this.workspaceId)) {
+        listener({ workspaceId: this.workspaceId, message: event });
       }
 
       // Rehydrate auto-retry state on reconnect/reload so RetryBarrier keeps showing "Stop"
