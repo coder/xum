@@ -103,6 +103,12 @@ export interface MemoryHarvestResult extends HarvestProgress {
   /** Why the run ended before it read every chunk, when it did: see `budgetSpentNote`. */
   note?: string;
   /**
+   * How many chunks a model call read, with the earlier attempts'. It is `nextChunk` except after
+   * a budget skip, which moves `nextChunk` past chunks nobody read. A retry that must redo the
+   * run resumes here, so it meets the skip again and keeps the note and the true read-through row.
+   */
+  readChunks: number;
+  /**
    * The newest history row the run, with its earlier attempts, read completely: the last message
    * of the last chunk a model call read (see `HarvestChunk`). Null when none. It is behind the
    * epoch's newest row when the run skipped chunks, so a later run must start after it, not after
@@ -692,5 +698,5 @@ export async function runMemoryHarvest(args: {
   }
 
   const readThroughRowId = readChunks === 0 ? null : chunks[readChunks - 1].readThroughRowId;
-  return { ...progressFor(nextChunk), usage, streamError, note, readThroughRowId };
+  return { ...progressFor(nextChunk), usage, streamError, note, readChunks, readThroughRowId };
 }

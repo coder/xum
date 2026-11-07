@@ -2306,6 +2306,60 @@ describe("MemoryConsolidationService", () => {
         }
       });
 
+      it("keeps the chunks an archive skipped unread when saving its completed record failed", async () => {
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                const analyzing = systemPromptText(options) === MEMORY_ANALYZER_SYSTEM_PROMPT;
+                return Promise.resolve({
+                  stream:
+                    analyzing && !afterToolResult ? spendEveryEditStream() : noChangesStream(),
+                });
+              },
+            }),
+        });
+        // Three chunks of rows bulk-0..4, bulk-5..9 and bulk-10..11. The first spends every edit.
+        await appendBulkRows(fixture);
+        // The harvest's last step, the completed record, is the one write that fails (once).
+        const service = fixture.service as unknown as {
+          saveHarvestRecordEffect: (
+            workspaceId: string,
+            boundaryKey: string,
+            record: MemoryHarvestRecordPayload,
+            projectPath: string
+          ) => Effect.Effect<void>;
+        };
+        const save = service.saveHarvestRecordEffect.bind(service);
+        let failedOnce = false;
+        spyOn(service, "saveHarvestRecordEffect").mockImplementation(
+          (workspaceId, boundaryKey, record, projectPath) => {
+            if (record.status !== "completed" || failedOnce) {
+              return save(workspaceId, boundaryKey, record, projectPath);
+            }
+            failedOnce = true;
+            return Effect.promise(() => Promise.reject(new Error("disk full")));
+          }
+        );
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // The failed record resumes at the first chunk nobody read, not past the skipped ones.
+        expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+          status: "failed",
+          nextChunk: 1,
+        });
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // The retry meets the spent budget again: it says which chunks it skipped, and the rows
+        // after chunk 1 stay unread for the compaction that closes the epoch.
+        expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+          status: "completed",
+          readThroughRowId: "bulk-4",
+        });
+        expect((await harvestRecords(fixture))["open:bulk-11"]?.note).toContain("chunks 2-3 of 3");
+      });
+
       it("takes an archive record from before `readThroughRowId` to have read up to the row its key names", async () => {
         const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });

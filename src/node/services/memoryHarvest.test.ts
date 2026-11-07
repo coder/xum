@@ -911,6 +911,8 @@ describe("runMemoryHarvest", () => {
       expect(result.streamError).toBeUndefined();
       // The cursor moves past them: a retry would find the same spent budget.
       expect(result.nextChunk).toBe(3);
+      // A model read only the first.
+      expect(result.readChunks).toBe(1);
       expect(result.nextChunkOps).toBe(0);
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toContain("chunks 2-3 of 3");
@@ -930,6 +932,7 @@ describe("runMemoryHarvest", () => {
 
       expect(calls).toHaveLength(0);
       expect(result.nextChunk).toBe(3);
+      expect(result.readChunks).toBe(1);
       expect(result.note).toContain("chunks 2-3 of 3");
       // The attempt before it read chunk 1.
       expect(result.readThroughRowId).toBe("m4");
@@ -961,6 +964,7 @@ describe("runMemoryHarvest", () => {
       const result = await runHarvest(fixture, model);
 
       expect(result.nextChunk).toBe(1);
+      expect(result.readChunks).toBe(1);
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toBeUndefined();
       expect(result.readThroughRowId).toBe("m1");

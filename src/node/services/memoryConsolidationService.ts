@@ -1682,8 +1682,8 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* Effect.fail(new HarvestOverCostCeilingError(ceiling.reason));
       }
 
-      const adopt = (reached: HarvestProgress): void => {
-        opts.progress.nextChunk = reached.nextChunk;
+      const adopt = (reached: HarvestProgress, resumeAt = reached.nextChunk): void => {
+        opts.progress.nextChunk = resumeAt;
         opts.progress.ops = reached.ops;
         opts.progress.budgetUsed = reached.budgetUsed;
         opts.progress.nextChunkOps = reached.nextChunkOps;
@@ -1745,8 +1745,10 @@ export class MemoryConsolidationService extends EventEmitter {
           }),
         catch: (error) => error,
       });
-      // Edits of a chunk that failed already landed: the failure record keeps them.
-      adopt(harvest);
+      // Edits of a chunk that failed already landed: the failure record keeps them. A failure from
+      // here on (the completed record's save) resumes at the first chunk nobody read: resuming past
+      // a budget skip would report the skipped chunks' rows as read and lose the note.
+      adopt(harvest, harvest.readChunks);
       if (harvest.streamError !== undefined) {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }
