@@ -5,6 +5,7 @@ import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
@@ -18,6 +19,7 @@ import {
   createConsolidationMemoryTool,
   createMutationBudget,
 } from "@/node/services/memoryConsolidation";
+import { createSpendMeter, type SpendMeter } from "@/node/services/memoryDreamSpend";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import { redactSecretLike } from "@/node/services/memorySecretRedaction";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -83,6 +85,12 @@ export interface HarvestProgress {
    * reading, and in a record written before the field.
    */
   readThroughRowId?: string | null;
+  /**
+   * USD the job's model steps have cost across its attempts, as priced from what each reported
+   * (the failed chunk's finished steps included). A retry continues from it, so the cost ceiling
+   * holds for the epoch's job, not for each attempt. Absent in a record written before the field.
+   */
+  spentUsd?: number;
 }
 
 /** Where a run starts, read from the progress of an earlier attempt at the same epoch. */
@@ -517,13 +525,18 @@ async function analyzeChunk(args: {
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
   pricingModel?: string;
+  /** Prices each step and ends the chunk once the job's spend reaches its ceiling. */
+  meter: SpendMeter;
 }): Promise<ChunkOutcome> {
   const stream = streamText({
     model: args.model,
     system: MEMORY_ANALYZER_SYSTEM_PROMPT,
     prompt: args.prompt,
     tools: { memory: args.memoryTool },
-    stopWhen: stepCountIs(MEMORY_ANALYZER_MAX_STEPS),
+    stopWhen: [stepCountIs(MEMORY_ANALYZER_MAX_STEPS), args.meter.stopIfCeilingReached],
+    onStepEnd: args.meter.recordStep,
+    // Bounds how far the step that crosses the cost ceiling can overshoot it.
+    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     abortSignal: args.signal,
   });
   const streamErrors: string[] = [];
@@ -593,6 +606,11 @@ export async function runMemoryHarvest(args: {
   ) => Promise<void>;
   /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
   pricingModel?: string;
+  /**
+   * The job stops once its measured spend, with `resume.spentUsd` of earlier attempts, reaches
+   * this many USD; none when absent.
+   */
+  ceilingUsd?: number;
 }): Promise<MemoryHarvestResult> {
   const chunks = buildHarvestChunks(args.messages);
   const priorOps = args.resume?.ops ?? [];
@@ -600,6 +618,11 @@ export async function runMemoryHarvest(args: {
   const journal: MemoryConsolidationOp[] = [];
   // One budget for the whole epoch, retries included: what an earlier attempt spent is spent.
   const budget = createMutationBudget(MEMORY_ANALYZER_OP_BUDGET, resumed.budgetUsed);
+  const meter = createSpendMeter({
+    pricingModel: args.pricingModel,
+    ceilingUsd: args.ceilingUsd,
+    spentUsd: args.resume?.spentUsd,
+  });
   // Ops of the chunks that finished; the ones after them belong to the chunk in flight.
   let finishedOps = resumed.opsBeforeStartChunk;
   const readThroughRowIdOf = (readChunks: number): string | null =>
@@ -610,6 +633,7 @@ export async function runMemoryHarvest(args: {
     budgetUsed: budget.used(),
     nextChunkOps: priorOps.length + journal.length - finishedOps,
     readThroughRowId: readThroughRowIdOf(readChunks),
+    spentUsd: meter.spentUsd(),
   });
 
   let streamError: string | undefined;
@@ -623,6 +647,13 @@ export async function runMemoryHarvest(args: {
     if (budget.used() >= budget.limit) {
       // The cursor moves to the end: a retry resumes the same spent budget and would skip them again.
       note = budgetSpentNote(index + 1, chunks.length);
+      nextChunk = chunks.length;
+      finishedOps = priorOps.length + journal.length;
+      break;
+    }
+    // Like the budget skip, a normal end: the chunks left are not read, and a retry would only
+    // meet the same spend. The cursor moves past them for the same reason.
+    if (meter.stopIfCeilingReached()) {
       nextChunk = chunks.length;
       finishedOps = priorOps.length + journal.length;
       break;
@@ -660,6 +691,7 @@ export async function runMemoryHarvest(args: {
       label: `${index + 1}/${chunks.length}`,
       recordUsage: args.recordUsage,
       pricingModel: args.pricingModel,
+      meter,
     });
     if (outcome.streamError !== undefined) {
       streamError = outcome.streamError;
@@ -672,5 +704,11 @@ export async function runMemoryHarvest(args: {
     await args.onChunkComplete?.(progressFor(nextChunk, readChunks));
   }
 
-  return { ...progressFor(nextChunk, readChunks), usage, streamError, note, readChunks };
+  return {
+    ...progressFor(nextChunk, readChunks),
+    usage,
+    streamError,
+    note: note ?? meter.stoppedNote(),
+    readChunks,
+  };
 }

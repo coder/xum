@@ -36,6 +36,7 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
+  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -43,6 +44,7 @@ import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
+import { createSpendMeter } from "@/node/services/memoryDreamSpend";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
@@ -60,6 +62,10 @@ export interface MemoryConsolidationResult {
   budgetExhausted: boolean;
   /** Token cost of the run; undefined when the provider reported none. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** USD the run's steps cost, as priced from what each reported. */
+  spentUsd: number;
+  /** Set when the cost ceiling ended the run before the model finished: see SpendMeter. */
+  note?: string;
   /**
    * Fatal stream error (provider failure or abort/timeout). When set, the
    * pass did NOT complete — callers must not treat the memory state as
@@ -482,6 +488,8 @@ export async function runMemoryConsolidation(args: {
   ) => Promise<void>;
   /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
   pricingModel?: string;
+  /** The run stops once its measured spend reaches this many USD; none when absent. */
+  ceilingUsd?: number;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -504,6 +512,7 @@ export async function runMemoryConsolidation(args: {
         ? " This is the FINAL pass for an archived workspace: preserve only cross-project user preferences or environment facts in /memories/global/... before workspace memory is deleted. Project memory is unavailable for this run; do not promote project-specific lessons to global memory."
         : " This is the FINAL pass for an archived workspace: promote durable workspace lessons before workspace memory is deleted. Move repo-specific lessons to /memories/project/... and only cross-project user preferences or environment facts to /memories/global/....";
 
+  const meter = createSpendMeter({ pricingModel: args.pricingModel, ceilingUsd: args.ceilingUsd });
   const stream = streamText({
     model: args.model,
     system: args.agentBody,
@@ -511,7 +520,10 @@ export async function runMemoryConsolidation(args: {
       "Run a memory-consolidation pass now. Survey the memory directories, then apply the highest-value cleanups within budget." +
       finalPassPrompt,
     tools: { memory: memoryTool },
-    stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
+    stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
+    onStepEnd: meter.recordStep,
+    // Bounds how far the step that crosses the cost ceiling can overshoot it.
+    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     abortSignal: args.abortSignal,
   });
 
@@ -562,6 +574,8 @@ export async function runMemoryConsolidation(args: {
     // rejections must not report a budget the run never spent (MEM-RPT-01).
     budgetExhausted: isBudgetExhausted(),
     usage,
+    spentUsd: meter.spentUsd(),
+    note: meter.stoppedNote(),
     streamError: streamErrors[0],
   };
 }
