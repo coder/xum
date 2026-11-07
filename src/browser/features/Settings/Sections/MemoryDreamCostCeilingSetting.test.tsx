@@ -171,6 +171,12 @@ describe("MemoryDreamCostCeilingSetting", () => {
     [",5", 0.5],
     ["5.", 5],
     ["12", 12],
+    ["99999,99", 99_999.99],
+    // A leading zero or none means three digits after a comma are decimals, not thousands.
+    ["0,500", 0.5],
+    [",500", 0.5],
+    // Four digits are no thousands group either.
+    ["1,5000", 1.5],
   ])("reads %p as %d, a comma standing for the decimal point", async (keys, ceiling) => {
     const { view, saved, type, blur } = await renderSetting();
 
@@ -181,6 +187,25 @@ describe("MemoryDreamCostCeilingSetting", () => {
     expect(writes).toEqual([{ memory: { dreamCostCeilingUsd: ceiling } }]);
     expect(saved()?.dreamCostCeilingUsd).toBe(ceiling);
   });
+
+  // "1,000" is one thousand where a comma groups digits and 1.000 where it marks the decimals.
+  // Reading it either way would save a ceiling a thousand times off, so it is refused.
+  test.each(["1,000", "12,345", "100,500"])(
+    "refuses %p, as a comma and three digits could be a thousands separator",
+    async (keys) => {
+      const { view, input, saved, type, blur } = await renderSetting({
+        memory: { dreamCostCeilingUsd: 2 },
+      });
+
+      type(keys);
+      expect(view.getByRole("alert").textContent).toContain("decimal point");
+      await blur();
+
+      expect(writes).toEqual([]);
+      expect(saved()?.dreamCostCeilingUsd).toBe(2);
+      expect(input.value).toBe("2");
+    }
+  );
 
   test("takes a ceiling up to the largest one, and shows it in plain digits", async () => {
     const { view, input, saved, type, blur } = await renderSetting({

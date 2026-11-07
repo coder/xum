@@ -10,17 +10,28 @@ import {
 // `Number()` alone would also take "0x10", "1e3" and "+5".
 const DECIMAL_PATTERN = /^(?:\d+[.,]?\d*|[.,]\d+)$/;
 
+// A comma and exactly three digits after a non-zero integer part, as in "1,000": one thousand where
+// a comma groups digits, 1.000 where it marks the decimals. A reading either way would save a
+// ceiling a thousand times off, so the draft is refused. "0,500" and ",500" cannot be a group.
+const THOUSANDS_LOOKALIKE_PATTERN = /^\d*[1-9]\d*,\d{3}$/;
+
 const INVALID_CEILING_MESSAGE = `Enter a number of at least $${MEMORY_DREAM_COST_CEILING_MIN_USD} and at most $${MEMORY_DREAM_COST_CEILING_MAX_USD}, or leave empty for no ceiling.`;
 
-/** The ceiling a draft stands for: undefined when empty (no ceiling), null when it is not a valid one. */
-function parseCeiling(draft: string): number | undefined | null {
+const AMBIGUOUS_CEILING_MESSAGE =
+  "A comma and three digits could be a thousands separator. Use a dot or a comma only as the decimal point, and write one thousand as 1000.";
+
+/** What a draft stands for: a ceiling (undefined when empty, meaning none), or why it is no ceiling. */
+type ParsedCeiling = { usd: number | undefined } | { error: string };
+
+function parseCeiling(draft: string): ParsedCeiling {
   const trimmed = draft.trim();
-  if (trimmed === "") return undefined;
-  if (!DECIMAL_PATTERN.test(trimmed)) return null;
-  const value = Number(trimmed.replace(",", "."));
-  return value >= MEMORY_DREAM_COST_CEILING_MIN_USD && value <= MEMORY_DREAM_COST_CEILING_MAX_USD
-    ? value
-    : null;
+  if (trimmed === "") return { usd: undefined };
+  if (THOUSANDS_LOOKALIKE_PATTERN.test(trimmed)) return { error: AMBIGUOUS_CEILING_MESSAGE };
+  if (!DECIMAL_PATTERN.test(trimmed)) return { error: INVALID_CEILING_MESSAGE };
+  const usd = Number(trimmed.replace(",", "."));
+  return usd >= MEMORY_DREAM_COST_CEILING_MIN_USD && usd <= MEMORY_DREAM_COST_CEILING_MAX_USD
+    ? { usd }
+    : { error: INVALID_CEILING_MESSAGE };
 }
 
 /**
@@ -39,9 +50,9 @@ export function MemoryDreamCostCeilingSetting() {
 
   const commit = () => {
     setDraft(null);
-    if (parsed === null || parsed === saved) return;
+    if ("error" in parsed || parsed.usd === saved) return;
     // A merge patch deletes a key set to null: that is how an empty field clears the ceiling.
-    updateUserPreferences({ memory: { dreamCostCeilingUsd: parsed ?? null } });
+    updateUserPreferences({ memory: { dreamCostCeilingUsd: parsed.usd ?? null } });
   };
 
   return (
@@ -55,9 +66,9 @@ export function MemoryDreamCostCeilingSetting() {
           is an upper bound, not a bill: it assumes every step resends the whole prompt and every
           memory file, so the real cost is usually lower. Leave empty for no ceiling.
         </div>
-        {parsed === null && (
+        {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">
-            {INVALID_CEILING_MESSAGE}
+            {parsed.error}
           </div>
         )}
       </div>
