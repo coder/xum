@@ -437,8 +437,6 @@ interface MemoryStore {
    * the result as a best-effort prefix.
    */
   readFilePrefix(relPath: string, maxBytes: number): Promise<string>;
-  /** Size of a file in bytes. */
-  byteLength(relPath: string): Promise<number>;
   /** The same bounded prefix as raw bytes, for callers that must validate the encoding themselves. */
   readFilePrefixBytes(relPath: string, maxBytes: number): Promise<Buffer>;
   /** Atomic write; creates parent directories. */
@@ -751,10 +749,6 @@ class LocalMemoryStore implements MemoryStore {
       if (options?.strict === true && !isMissingPathError(error)) throw error;
       return null;
     }
-  }
-
-  async byteLength(relPath: string): Promise<number> {
-    return (await fsPromises.stat(this.abs(relPath))).size;
   }
 
   async readFilePrefix(relPath: string, maxBytes: number): Promise<string> {
@@ -3694,30 +3688,6 @@ export class MemoryService extends EventEmitter {
     // earlier scope's gate passed only skipped the later ones. Final check
     // over the whole accumulated index.
     return this.withholdAfterTombstone(ctx, entries, (entry) => entry.scope);
-  }
-
-  /**
-   * Bytes a run would read if it read every visible memory file once. A file counts at most the
-   * memory file cap, because the memory tool refuses to read a larger one. Built on the index, so
-   * it lists only what the index lists and withholds what the index withholds. The dream cost
-   * estimate prices the run's prompt growth with it.
-   */
-  async measureVisibleBytes(ctx: MemoryScopeContext): Promise<number> {
-    const entries = await this.listIndexEntries(ctx);
-    const sizes = await Promise.all(
-      entries.map(async (entry) => {
-        try {
-          return Math.min(
-            await this.getStore(ctx, entry.scope).byteLength(entry.relPath),
-            MEMORY_MAX_FILE_BYTES
-          );
-        } catch {
-          // Gone between the listing and the stat: it adds nothing to a later read.
-          return 0;
-        }
-      })
-    );
-    return sizes.reduce((total, size) => total + size, 0);
   }
 
   /**

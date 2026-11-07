@@ -9,10 +9,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
-import {
-  MEMORY_ANALYZER_OP_BUDGET,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
-} from "@/common/constants/memory";
+import { MEMORY_ANALYZER_OP_BUDGET } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
@@ -20,7 +17,6 @@ import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
 import {
   buildHarvestChunks,
-  harvestChunkInputChars,
   runMemoryHarvest,
   selectOpenEpoch,
   type HarvestProgress,
@@ -68,32 +64,6 @@ function userPromptText(options: LanguageModelV3CallOptions): string {
     }
   }
   return parts.join("\n");
-}
-
-function systemPromptText(options: LanguageModelV3CallOptions): string {
-  return options.prompt
-    .flatMap((message) => (message.role === "system" ? [message.content] : []))
-    .join("\n");
-}
-
-/**
- * What a first step sends: the system prompt, the user prompt and the memory tool's definition,
- * which goes out with every step.
- */
-function firstStepChars(options: LanguageModelV3CallOptions): number {
-  const toolDefinitionChars = (options.tools ?? []).reduce(
-    (total, tool) =>
-      tool.type !== "function"
-        ? total
-        : total +
-          JSON.stringify({
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.inputSchema,
-          }).length,
-    0
-  );
-  return systemPromptText(options).length + userPromptText(options).length + toolDefinitionChars;
 }
 
 /** What the tool calls returned to the model, as the next step's prompt carries it. */
@@ -640,27 +610,6 @@ describe("runMemoryHarvest", () => {
     }
   });
 
-  it("measures each chunk's input as exactly what the chunk's first step sends", async () => {
-    using fixture = createFixture();
-    fixture.messages = manyChunkMessages();
-    const { model, calls } = scriptedModel([]);
-    await runHarvest(fixture, model);
-    const sent = calls.map(firstStepChars);
-
-    expect(sent).toHaveLength(3);
-    expect(
-      harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary })
-    ).toEqual(sent);
-    // A resumed run sends only the chunks from its cursor on, and so does the measure.
-    expect(
-      harvestChunkInputChars({
-        messages: fixture.messages,
-        summary: fixture.summary,
-        resume: { nextChunk: 1, ops: [] },
-      })
-    ).toEqual(sent.slice(1));
-  });
-
   it("analyzes an epoch that has no compaction summary", async () => {
     using fixture = createFixture();
     const prompts: string[] = [];
@@ -771,23 +720,6 @@ describe("runMemoryHarvest", () => {
       );
       expect(file.success && file.data.content).toBe(text);
       expect(calls[0]?.tools?.map((entry) => entry.name)).toEqual(["memory"]);
-    });
-
-    // The cost estimate prices each step's output at the cap, so a step the model could write past
-    // it would bill over the estimate.
-    it("caps the output of every step at the cap the cost estimate assumes", async () => {
-      using fixture = createFixture();
-      const { model, calls } = scriptedModel(
-        chunkScript([createFile("/memories/workspace/testing.md", "Run `make test`.\n")])
-      );
-
-      await runHarvest(fixture, model);
-
-      expect(calls).toHaveLength(2);
-      expect(calls.map((call) => call.maxOutputTokens)).toEqual([
-        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
-        MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
-      ]);
     });
 
     it("reads global and project memory but rejects, and journals, a write to either", async () => {
@@ -1112,61 +1044,6 @@ describe("runMemoryHarvest", () => {
 
       expect(result.ops.filter((op) => op.applied)).toHaveLength(3 + MEMORY_ANALYZER_OP_BUDGET - 3);
     });
-
-    describe("the cost estimate of a retry", () => {
-      const appliedOps = (count: number): MemoryConsolidationOp[] =>
-        Array.from({ length: count }, (_, index) => ({
-          command: "create",
-          path: `/memories/workspace/spent-${index}.md`,
-          applied: true,
-        }));
-
-      it("prices a retry whose budget is spent at no model calls, as the run makes none", async () => {
-        using fixture = createFixture();
-        fixture.messages = manyChunkMessages();
-        const resume: HarvestProgress = {
-          nextChunk: 1,
-          ops: [],
-          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
-        };
-        const { model, calls } = scriptedModel([]);
-
-        await runHarvest(fixture, model, { resume });
-
-        expect(calls).toHaveLength(0);
-        expect(
-          harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary, resume })
-        ).toEqual([]);
-      });
-
-      it("prices the chunks left of a retry with one edit of budget remaining", () => {
-        using fixture = createFixture();
-        fixture.messages = manyChunkMessages();
-
-        const left = harvestChunkInputChars({
-          messages: fixture.messages,
-          summary: fixture.summary,
-          resume: { nextChunk: 1, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET - 1 },
-        });
-
-        // Chunks 2 and 3 of 3.
-        expect(left).toHaveLength(2);
-      });
-
-      it("counts the applied ops of an older record that has no budget", () => {
-        using fixture = createFixture();
-        fixture.messages = manyChunkMessages();
-        const estimate = (applied: number) =>
-          harvestChunkInputChars({
-            messages: fixture.messages,
-            summary: fixture.summary,
-            resume: { nextChunk: 1, ops: appliedOps(applied) },
-          });
-
-        expect(estimate(MEMORY_ANALYZER_OP_BUDGET)).toEqual([]);
-        expect(estimate(MEMORY_ANALYZER_OP_BUDGET - 1)).toHaveLength(2);
-      });
-    });
   });
 
   it("reports each clean chunk's usage to cost telemetry and sums it for the record", async () => {
@@ -1339,23 +1216,6 @@ describe("runMemoryHarvest", () => {
       const prompt = userPromptText(third.calls[0]);
       expect(prompt).toContain("/memories/workspace/a.md");
       expect(prompt).toContain("/memories/workspace/b.md");
-    });
-
-    it("sizes the cost estimate by the same note", async () => {
-      using fixture = createFixture();
-      fixture.messages = manyChunkMessages();
-      const resume: HarvestProgress = {
-        nextChunk: 1,
-        ops: [{ command: "create", path: "/memories/workspace/two.md", applied: true }],
-        nextChunkOps: 1,
-      };
-      const { model, calls } = scriptedModel([]);
-      await runHarvest(fixture, model, { resume });
-      const sent = calls.map(firstStepChars);
-
-      expect(
-        harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary, resume })
-      ).toEqual(sent);
     });
   });
 

@@ -91,27 +91,8 @@ export const MemoryConsolidationRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema),
   /** Token cost of the run (absent for records persisted before telemetry). */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
-  /**
-   * Deliberately high USD estimate made before the run (not its bill, and it can still fall under
-   * one for text that tokenizes densely). Optional so older binaries parse the record and for
-   * models with no known price.
-   */
-  estimatedUsd: z.number().optional(),
 });
 export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidationRecordSchema>;
-
-/**
- * The latest dream run the user's cost ceiling stopped before its model call, kept until a later
- * run completes. Without it an automatic refusal is silent: the dream just stops running.
- */
-export const MemoryDreamRefusalSchema = z.object({
-  at: z.number(),
-  /** The check's own reason, with the estimate and the ceiling it compared. */
-  reason: z.string(),
-  /** Optional: a model with no known price has no estimate. */
-  estimatedUsd: z.number().optional(),
-});
-export type MemoryDreamRefusal = z.infer<typeof MemoryDreamRefusalSchema>;
 
 export const CompactionCompletionMetadataSchema = z.object({
   workspaceId: z.string(),
@@ -187,12 +168,6 @@ export const MemoryHarvestRecordSchema = z.object({
    */
   readThroughRowId: z.string().nullish(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
-  /**
-   * Deliberately high USD estimate of the attempt's chunks still to analyze, made before the
-   * attempt (not its bill, and it can still fall under one for text that tokenizes densely).
-   * Optional so older binaries parse the record and for models with no known price.
-   */
-  estimatedUsd: z.number().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });
 export type MemoryHarvestRecordPayload = z.infer<typeof MemoryHarvestRecordSchema>;
@@ -202,8 +177,6 @@ export const MemoryConsolidationStatusSchema = z.object({
   projectRecord: MemoryConsolidationRecordSchema.nullable(),
   globalRecord: MemoryConsolidationRecordSchema.nullable(),
   latestHarvestRecord: MemoryHarvestRecordSchema.nullable(),
-  /** The workspace's memory store's latest ceiling refusal of a dream run, if no run completed since. */
-  latestRefusal: MemoryDreamRefusalSchema.nullish(),
   projectAvailable: z.boolean(),
 });
 export type MemoryConsolidationStatusPayload = z.infer<typeof MemoryConsolidationStatusSchema>;

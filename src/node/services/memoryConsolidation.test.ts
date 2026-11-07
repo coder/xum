@@ -3,20 +3,18 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { Tool } from "ai";
-import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import { MockLanguageModelV3 } from "ai/test";
 
 import {
   MEMORY_CONSOLIDATION_OP_BUDGET,
   MEMORY_MAX_FILE_BYTES,
   MEMORY_MAX_FILES_PER_SCOPE,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { Config } from "@/node/config";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
-  memoryToolDefinitionChars,
   runMemoryConsolidation,
   type MemoryConsolidationOp,
 } from "./memoryConsolidation";
@@ -1057,89 +1055,6 @@ describe("createMutationBudget", () => {
 });
 
 describe("runMemoryConsolidation", () => {
-  // The cost estimate prices each step's output at the cap, so a step the model could write past
-  // it would bill over the estimate.
-  it("caps the output of every step at the cap the cost estimate assumes", async () => {
-    using fixture = await createFixture();
-    const received: Array<number | undefined> = [];
-    const model = new MockLanguageModelV3({
-      doStream: (options) => {
-        received.push(options.maxOutputTokens);
-        return Promise.resolve({
-          stream: simulateReadableStream({
-            chunks: [
-              {
-                type: "finish",
-                finishReason: { unified: "stop", raw: "stop" },
-                usage: {
-                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                  outputTokens: { total: 1, text: 1, reasoning: 0 },
-                },
-              },
-            ],
-          }),
-        });
-      },
-    });
-
-    await runMemoryConsolidation({
-      model,
-      agentBody: "Consolidate the memory directories.",
-      memoryService: fixture.memoryService,
-      metaService: fixture.metaService,
-      ctx: fixture.ctx,
-      dryRun: false,
-    });
-
-    expect(received).toEqual([MEMORY_MAX_OUTPUT_TOKENS_PER_STEP]);
-  });
-
-  // Every step resends the tool definition, and the cost estimate counts it from this measure.
-  it("measures the memory tool definition as the model receives it", async () => {
-    using fixture = await createFixture();
-    const received: string[] = [];
-    const model = new MockLanguageModelV3({
-      doStream: (options) => {
-        for (const tool of options.tools ?? []) {
-          if (tool.type !== "function") continue;
-          received.push(
-            JSON.stringify({
-              name: tool.name,
-              description: tool.description,
-              parameters: tool.inputSchema,
-            })
-          );
-        }
-        return Promise.resolve({
-          stream: simulateReadableStream({
-            chunks: [
-              {
-                type: "finish",
-                finishReason: { unified: "stop", raw: "stop" },
-                usage: {
-                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
-                  outputTokens: { total: 1, text: 1, reasoning: 0 },
-                },
-              },
-            ],
-          }),
-        });
-      },
-    });
-
-    await runMemoryConsolidation({
-      model,
-      agentBody: "Consolidate the memory directories.",
-      memoryService: fixture.memoryService,
-      metaService: fixture.metaService,
-      ctx: fixture.ctx,
-      dryRun: false,
-    });
-
-    expect(received).toHaveLength(1);
-    expect(memoryToolDefinitionChars()).toBe(received[0].length);
-  });
-
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {
     // A real provider stream ends silently when its request is aborted: no error part reaches
     // consumeStream, so the pass used to read as clean and be journaled as a success.

@@ -142,11 +142,7 @@ const DEFAULT_STATUS: MemoryConsolidationStatusPayload = {
 
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
-function renderTab(
-  width: string,
-  status: Partial<MemoryConsolidationStatusPayload> = {},
-  consolidateError?: string
-) {
+function renderTab(width: string, status: Partial<MemoryConsolidationStatusPayload> = {}) {
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -154,7 +150,6 @@ function renderTab(
         memoryFiles: MEMORY_FILES,
         memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
         memoryConsolidationStatus: { ...DEFAULT_STATUS, ...status },
-        memoryConsolidateError: consolidateError,
       })}
     >
       <div className="border-border-light h-[480px] border" style={{ width }}>
@@ -211,51 +206,6 @@ export const Editor: Story = {
     await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
-  },
-};
-
-const CEILING_REASON =
-  "estimate 4.06 USD (deliberately high, not a bill) is over the 1.00 USD ceiling";
-
-// A touch screen cannot open the tooltip that also holds the reason, so the line itself must show
-// all of it: a truncated alert read "Dream stopped 2 minutes ago: estimate 4.06 USD (an up…".
-export const DreamRefusedAtPhoneWidth: Story = {
-  parameters: {
-    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
-    pixel: { exclude: true },
-  },
-  render: () =>
-    renderTab(
-      "375px",
-      {
-        latestRefusal: {
-          at: Date.now() - 2 * 60 * 1000,
-          reason: CEILING_REASON,
-          estimatedUsd: 4.06,
-        },
-        latestHarvestRecord: {
-          ...HARVEST_RECORD,
-          status: "failed",
-          error: CEILING_REASON,
-        },
-      },
-      // The manual run's refusal: the same reason behind the organizer's own prefix.
-      `consolidation not started: ${CEILING_REASON}`
-    ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const alerts = await canvas.findAllByRole("alert");
-    await expect(alerts).toHaveLength(2);
-    // The third line appears once the manual run is refused.
-    await userEvent.click(canvas.getByRole("button", { name: "Consolidate now" }));
-    const runError = await canvas.findByText(/^consolidation not started: /);
-    for (const line of [...alerts, runError]) {
-      await expect(line.textContent).toContain("over the 1.00 USD ceiling");
-      // Clipped text has more content than box: scrollWidth passes clientWidth.
-      await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
-      // Wrapped onto a second line, so it is taller than one 12px text line.
-      await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
-    }
   },
 };
 

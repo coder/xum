@@ -32,7 +32,6 @@ import type { LanguageModel } from "ai";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { Result } from "@/common/types/result";
-import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import {
@@ -44,13 +43,11 @@ import {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   MemoryConsolidationRecordSchema,
-  MemoryDreamRefusalSchema,
   MemoryHarvestRecordSchema,
   type MemoryConsolidationRecordPayload,
   type MemoryConsolidationStatusChangeEventPayload,
   type MemoryConsolidationStatusPayload,
   type MemoryConsolidationTrigger,
-  type MemoryDreamRefusal,
   type MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { defaultModel } from "@/common/utils/ai/models";
@@ -72,22 +69,13 @@ import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFa
 import type { HistoryService } from "@/node/services/historyService";
 import {
   analyzedFloorRowId,
-  harvestChunkInputChars,
   rowsAfterFloor,
   runMemoryHarvest,
   selectOpenEpoch,
   type HarvestEpoch,
   type HarvestProgress,
 } from "@/node/services/memoryHarvest";
-import {
-  memoryToolDefinitionChars,
-  runMemoryConsolidation,
-} from "@/node/services/memoryConsolidation";
-import {
-  checkCostCeiling,
-  estimateAnalyzerUsd,
-  estimateOrganizerUsd,
-} from "@/node/services/memoryCostEstimate";
+import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -104,12 +92,6 @@ interface ConsolidationSidecarFile {
   workspaces: Record<string, MemoryConsolidationRecord>;
   projects: Record<string, MemoryConsolidationRecord>;
   harvestsByWorkspace: Record<string, Record<string, MemoryHarvestRecord>>;
-  /**
-   * The latest ceiling refusal of a dream run per workspace store, until a run completes. A
-   * bucket of its own, so a binary that does not know it drops it on its next write and reads
-   * every other bucket as before.
-   */
-  refusalsByWorkspace: Record<string, MemoryDreamRefusal>;
 }
 
 interface MemoryConsolidationRunOptions {
@@ -141,12 +123,7 @@ interface ModelFactoryLike {
   createModelWithPinnedMetadata(
     modelString: string,
     opts?: { agentInitiated?: boolean; workspaceId?: string }
-  ): Promise<
-    Result<
-      { model: LanguageModel; metadataModel: string; serviceTier?: ServiceTier },
-      { type: string }
-    >
-  >;
+  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, { type: string }>>;
 }
 
 /**
@@ -216,14 +193,6 @@ export async function resolveHeadlessAgentBody(
 
 export function resolveDreamModelString(config: Config, workspaceId: string): string {
   return resolveHeadlessAgentModelString(config, workspaceId, "dream");
-}
-
-/**
- * The user's ceiling on one dream run, in USD; undefined means none. Read at each run, so raising
- * or clearing it takes effect on the next trigger without a restart.
- */
-function resolveDreamCostCeilingUsd(config: Config): number | undefined {
-  return config.loadConfigOrDefault().userPreferences?.memory?.dreamCostCeilingUsd;
 }
 
 export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
@@ -310,16 +279,6 @@ function normalizeHarvestRecord(record: MemoryHarvestRecord): MemoryHarvestRecor
 function parseConsolidationRecordMap(value: unknown): Record<string, MemoryConsolidationRecord> {
   const parsed = ConsolidationRecordMapSchema.safeParse(value);
   return parsed.success ? parsed.data : {};
-}
-
-function parseRefusals(value: unknown): Record<string, MemoryDreamRefusal> {
-  if (!isPlainRecord(value)) return {};
-  const parsed: Record<string, MemoryDreamRefusal> = {};
-  for (const [workspaceId, refusal] of Object.entries(value)) {
-    const candidate = MemoryDreamRefusalSchema.safeParse(refusal);
-    if (candidate.success) parsed[workspaceId] = candidate.data;
-  }
-  return parsed;
 }
 
 function parseHarvestRecords(value: unknown): Record<string, Record<string, MemoryHarvestRecord>> {
@@ -412,28 +371,8 @@ interface HarvestSource {
   readEpoch: () => Promise<Result<HarvestEpoch>>;
 }
 
-/**
- * The cost ceiling refused an analyzer attempt before it made a model call. Such an attempt spent
- * nothing and wrote nothing, so it does not count against HARVEST_MAX_ATTEMPTS: only a run that
- * can fail after spending burns one. The next trigger checks the ceiling again, so raising it
- * lets the job run, and no trigger can loop, since each makes no model call.
- */
-class HarvestOverCostCeilingError extends Error {}
-
-/** Starts the error of an organizer run that the cost ceiling refused before its stream. */
-const ORGANIZER_REFUSAL_PREFIX = "consolidation not started: ";
-
-/**
- * True for the error of a run the cost ceiling refused: it made no model call and wrote nothing,
- * so a caller that budgets its runs (the launch sweep) must not count it as one.
- */
-function isCostCeilingRefusal(error: string): boolean {
-  return error.startsWith(ORGANIZER_REFUSAL_PREFIX);
-}
-
 /** What an attempt learns before it streams; shared so a failure record can carry it. */
 interface HarvestAttemptState {
-  estimatedUsd?: number;
   /** Absent until the job's first attempt reached the epoch; see MemoryHarvestRecord. */
   analyzedFloorRowId?: string | null;
 }
@@ -442,12 +381,10 @@ interface HarvestAttemptState {
 function harvestAttemptFields(
   progress: HarvestProgress,
   state: HarvestAttemptState
-): ReturnType<typeof harvestProgressFields> &
-  Pick<MemoryHarvestRecord, "analyzedFloorRowId" | "estimatedUsd"> {
+): ReturnType<typeof harvestProgressFields> & Pick<MemoryHarvestRecord, "analyzedFloorRowId"> {
   return {
     ...harvestProgressFields(progress),
     analyzedFloorRowId: state.analyzedFloorRowId,
-    estimatedUsd: state.estimatedUsd,
   };
 }
 
@@ -605,7 +542,6 @@ export class MemoryConsolidationService extends EventEmitter {
             workspaces: parseConsolidationRecordMap(json.workspaces),
             projects: parseConsolidationRecordMap(json.projects),
             harvestsByWorkspace: parseHarvestRecords(json.harvestsByWorkspace),
-            refusalsByWorkspace: parseRefusals(json.refusalsByWorkspace),
           };
         },
         catch: () => undefined,
@@ -613,14 +549,7 @@ export class MemoryConsolidationService extends EventEmitter {
         // Missing or corrupt JSON — start fresh (the next save overwrites the file).
         Effect.catch(() => Effect.succeed(undefined))
       );
-      return (
-        parsed ?? {
-          workspaces: {},
-          projects: {},
-          harvestsByWorkspace: {},
-          refusalsByWorkspace: {},
-        }
-      );
+      return parsed ?? { workspaces: {}, projects: {}, harvestsByWorkspace: {} };
     });
   }
 
@@ -661,7 +590,6 @@ export class MemoryConsolidationService extends EventEmitter {
         projectRecord: projectPath === "" ? null : (file.projects[projectPath] ?? null),
         globalRecord,
         latestHarvestRecord: findNewestHarvestRecord(file.harvestsByWorkspace[workspaceId]),
-        latestRefusal: file.refusalsByWorkspace[ownerWorkspaceId] ?? null,
         projectAvailable: projectPath !== "",
       };
     });
@@ -698,35 +626,11 @@ export class MemoryConsolidationService extends EventEmitter {
             if (projectPath !== "") {
               file.projects[projectPath] = record;
             }
-            // A completed run is the proof that the ceiling no longer stops this workspace.
-            delete file.refusalsByWorkspace[workspaceId];
             await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
           })
         );
         // The sidecar write does not touch memory files, so open Memory tabs need
         // this explicit status invalidation even when a run made zero mutations.
-        self.emitStatusChange(workspaceId, projectPath);
-      })
-    );
-  }
-
-  /** Keeps the latest refusal of a workspace's dream run until a run completes (saveRecordEffect). */
-  private saveRefusalEffect(
-    workspaceId: string,
-    projectPath: string,
-    refusal: MemoryDreamRefusal
-  ): Effect.Effect<void> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
-    const self = this;
-    return Effect.uninterruptible(
-      Effect.gen(function* () {
-        yield* Effect.promise(() =>
-          self.locks.withLock(self.sidecarPath, async () => {
-            const file = await self.load();
-            file.refusalsByWorkspace[workspaceId] = refusal;
-            await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
-          })
-        );
         self.emitStatusChange(workspaceId, projectPath);
       })
     );
@@ -912,9 +816,7 @@ export class MemoryConsolidationService extends EventEmitter {
    * to be deleted, so its failed/stale-pending harvest records can never be
    * retried (recovery needs the compaction epoch's messages) — and once the
    * config entry is gone they could not even be associated with the memory
-   * owner. Mark them terminal now so nothing lingers as "retryable". The
-   * workspace's dream refusal goes too: it is keyed by the workspace whose
-   * store it describes, and nothing would ever clear it.
+   * owner. Mark them terminal now so nothing lingers as "retryable".
    */
   async finalizeHarvestsForRemoval(workspaceId: string): Promise<void> {
     // One read-check-write under the sidecar lock: residual harvest runs
@@ -923,9 +825,9 @@ export class MemoryConsolidationService extends EventEmitter {
     // write must not be overwritten with a failure.
     const finalized = await this.locks.withLock(this.sidecarPath, async () => {
       const file = await this.load();
-      let changed = file.refusalsByWorkspace[workspaceId] !== undefined;
-      delete file.refusalsByWorkspace[workspaceId];
-      const records = file.harvestsByWorkspace[workspaceId] ?? {};
+      const records = file.harvestsByWorkspace[workspaceId];
+      if (records === undefined) return false;
+      let changed = false;
       for (const [boundaryKey, record] of Object.entries(records)) {
         if (isTerminalHarvestRecord(record)) continue;
         records[boundaryKey] = finalizeHarvestRecordForRemoval(record);
@@ -1204,31 +1106,6 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
-      // Estimated before the stream, so a run the ceiling refuses costs nothing and leaves no
-      // record: nothing then debounces it, and raising the ceiling lets the next trigger run.
-      const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
-      const estimatedUsd = estimateOrganizerUsd({
-        pricingModel: modelResult.data.metadataModel,
-        serviceTier: modelResult.data.serviceTier,
-        fixedInputChars: agentBody.length + memoryToolDefinitionChars(),
-        memoryChars: memoryBytes,
-      });
-      const ceiling = checkCostCeiling({
-        ceilingUsd: resolveDreamCostCeilingUsd(self.config),
-        estimatedUsd,
-        pricingModel: modelResult.data.metadataModel,
-      });
-      if (!ceiling.allowed) {
-        // Nothing else records a refusal: it writes no run record, so without this the dream just
-        // stops running and a user who set a ceiling cannot tell why.
-        yield* self.saveRefusalEffect(workspaceId, projectPath, {
-          at: Date.now(),
-          reason: ceiling.reason,
-          estimatedUsd,
-        });
-        return Err(`${ORGANIZER_REFUSAL_PREFIX}${ceiling.reason}`);
-      }
-
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1291,7 +1168,6 @@ export class MemoryConsolidationService extends EventEmitter {
         summary: result.summary,
         ops: result.ops,
         usage: result.usage,
-        estimatedUsd,
       };
       yield* self.saveRecordEffect(workspaceId, projectPath, record);
       log.debug("[MemoryConsolidation] run complete", {
@@ -1515,9 +1391,8 @@ export class MemoryConsolidationService extends EventEmitter {
         ops: existing?.ops ?? [],
         budgetUsed: existing?.budgetUsed,
         nextChunkOps: existing?.nextChunkOps,
-        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot
-        // be loaded, or the ceiling refuses it): its failure record would otherwise drop what the
-        // earlier attempt's chunks read.
+        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
+        // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
         readThroughRowId: existing?.readThroughRowId,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
@@ -1573,11 +1448,7 @@ export class MemoryConsolidationService extends EventEmitter {
                 status: "failed",
                 startedAt,
                 completedAt: Date.now(),
-                // A ceiling refusal made no model call: see HarvestOverCostCeilingError.
-                attemptCount:
-                  error instanceof HarvestOverCostCeilingError
-                    ? existingAttemptCount
-                    : existingAttemptCount + 1,
+                attemptCount: existingAttemptCount + 1,
                 ...harvestRecordIdentity(source),
                 ...harvestAttemptFields(progress, attemptState),
                 error: getErrorMessage(error),
@@ -1684,28 +1555,6 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* Effect.fail(
           new Error(`could not create model ${modelString}: ${modelResult.error.type}`)
         );
-      }
-
-      // Estimated before any model call, so a job the ceiling refuses costs nothing. Only the
-      // chunks still to analyze count: a retry resumes after the chunks that landed.
-      const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
-      opts.attemptState.estimatedUsd = estimateAnalyzerUsd({
-        pricingModel: modelResult.data.metadataModel,
-        serviceTier: modelResult.data.serviceTier,
-        chunkInputChars: harvestChunkInputChars({
-          messages,
-          summary: epoch.data.summary,
-          resume: opts.progress,
-        }),
-        memoryChars: memoryBytes,
-      });
-      const ceiling = checkCostCeiling({
-        ceilingUsd: resolveDreamCostCeilingUsd(self.config),
-        estimatedUsd: opts.attemptState.estimatedUsd,
-        pricingModel: modelResult.data.metadataModel,
-      });
-      if (!ceiling.allowed) {
-        return yield* Effect.fail(new HarvestOverCostCeilingError(ceiling.reason));
       }
 
       const adopt = (reached: HarvestProgress, resumeAt = reached.nextChunk): void => {
@@ -2024,6 +1873,7 @@ export class MemoryConsolidationService extends EventEmitter {
           lastRunAt !== 0 && now - lastRunAt < MEMORY_CONSOLIDATION_DEBOUNCE_MS;
         const skipWorkspaceDebounce = workspaceDebounceWouldSkip && projectDebounceAllowsRun;
         if (workspaceDebounceWouldSkip && !skipWorkspaceDebounce) continue;
+        started++;
         // Sequential, not parallel: the sweep is background housekeeping and
         // must not stampede the provider on launch.
         const result: Result<MemoryConsolidationRecord, string> = yield* Effect.tryPromise({
@@ -2034,10 +1884,6 @@ export class MemoryConsolidationService extends EventEmitter {
             Effect.succeed<Result<MemoryConsolidationRecord, string>>(Err(getErrorMessage(error)))
           )
         );
-        // A run the cost ceiling refused spent nothing and leaves no record, so it does not use up
-        // the cap: it would otherwise crowd out a workspace the ceiling lets run, on every launch.
-        const refusedByCeiling = !result.success && isCostCeilingRefusal(result.error);
-        if (!refusedByCeiling) started++;
         if (!result.success) {
           log.debug("[MemoryConsolidation] launch sweep skipped workspace", {
             workspaceId,

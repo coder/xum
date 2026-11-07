@@ -36,12 +36,10 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
-import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
@@ -74,8 +72,6 @@ export interface MemoryConsolidationResult {
 type WritableMemoryScope = Exclude<MemoryScope, "session">;
 
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
-const DEFAULT_TOOL_DESCRIPTION_LEAD =
-  "Manage the persistent memory directory you are consolidating.";
 const PATH_LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 
 interface MutationTarget {
@@ -223,23 +219,6 @@ async function validateMutationForStaging(
   }
 }
 
-function memoryToolDescription(lead = DEFAULT_TOOL_DESCRIPTION_LEAD): string {
-  return `${lead} ${TOOL_DEFINITIONS.memory.description}`;
-}
-
-/**
- * Characters of the memory tool's definition as a model receives it: name, description and JSON
- * schema. Every step of a run resends it, so the cost estimate counts it with the prompt.
- * `descriptionLead` is the `description` option of `createConsolidationMemoryTool`.
- */
-export function memoryToolDefinitionChars(descriptionLead?: string): number {
-  return JSON.stringify({
-    name: "memory",
-    description: memoryToolDescription(descriptionLead),
-    parameters: extractToolJsonSchema({ inputSchema: TOOL_DEFINITIONS.memory.schema }),
-  }).length;
-}
-
 /**
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
@@ -384,7 +363,7 @@ export function createConsolidationMemoryTool(args: {
   };
 
   const memoryTool = tool({
-    description: memoryToolDescription(args.description),
+    description: `${args.description ?? "Manage the persistent memory directory you are consolidating."} ${TOOL_DEFINITIONS.memory.description}`,
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     // toolCallId is threaded into the r2 refinement journal rows so callers
     // (refine, r11) can correlate this run's edits to their journaled ids.
@@ -533,8 +512,6 @@ export async function runMemoryConsolidation(args: {
       finalPassPrompt,
     tools: { memory: memoryTool },
     stopWhen: stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS),
-    // The cost estimate prices each step's output at this cap, so the stream must keep to it.
-    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     abortSignal: args.abortSignal,
   });
 

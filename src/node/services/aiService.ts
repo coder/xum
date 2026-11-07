@@ -88,7 +88,7 @@ import { delegatedToolCallManager } from "./delegatedToolCallManager";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 
-import type { ProvidersConfig, ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import {
   resolveMemoryProjectIdentity,
@@ -748,12 +748,7 @@ export class AIService extends EventEmitter {
   async createModelWithPinnedMetadata(
     modelString: string,
     opts?: { agentInitiated?: boolean; workspaceId?: string }
-  ): Promise<
-    Result<
-      { model: LanguageModel; metadataModel: string; serviceTier?: ServiceTier },
-      SendMessageError
-    >
-  > {
+  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const result = await this.providerModelFactory.createModel(modelString, undefined, {
       ...opts,
@@ -776,16 +771,9 @@ export class AIService extends EventEmitter {
     const metadataSeed = effectiveModelString.startsWith("coder:")
       ? modelString
       : normalizeToCanonical(effectiveModelString);
-    const serviceTier = this.providerModelFactory.resolvePinnedServiceTier(
-      modelString,
-      providersConfig
-    );
     return Ok({
       model: result.data,
       metadataModel: resolveModelForMetadata(metadataSeed, providersConfig),
-      // The tier this model's requests carry, so a caller that prices the run before it starts
-      // prices that tier (the factory pinned it from the same snapshot).
-      ...(serviceTier !== undefined ? { serviceTier } : {}),
     });
   }
 

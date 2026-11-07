@@ -5,7 +5,6 @@ import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
@@ -18,7 +17,6 @@ import { assertNever } from "@/common/utils/assertNever";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
-  memoryToolDefinitionChars,
 } from "@/node/services/memoryConsolidation";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import { redactSecretLike } from "@/node/services/memorySecretRedaction";
@@ -32,7 +30,7 @@ const HARVEST_MAX_TRANSCRIPT_CHARS = 40_000;
 // input and output are bounded part by part below.
 const HARVEST_MAX_ROW_TEXT_CHARS = 8_000;
 // A text part still ends here, with a marker: a pasted log of megabytes is not worth hundreds of
-// model calls, and with no ceiling set nothing else bounds the job.
+// model calls, and nothing else bounds how many chunks one epoch makes.
 const HARVEST_MAX_TEXT_PART_CHARS = 128_000;
 const HARVEST_MAX_TOOL_INPUT_CHARS = 1_000;
 const HARVEST_MAX_TOOL_OUTPUT_CHARS = 2_000;
@@ -526,8 +524,6 @@ async function analyzeChunk(args: {
     prompt: args.prompt,
     tools: { memory: args.memoryTool },
     stopWhen: stepCountIs(MEMORY_ANALYZER_MAX_STEPS),
-    // The cost estimate prices each step's output at this cap, so the stream must keep to it.
-    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     abortSignal: args.signal,
   });
   const streamErrors: string[] = [];
@@ -557,40 +553,6 @@ async function analyzeChunk(args: {
   } catch {
     return {};
   }
-}
-
-/**
- * The characters the first step of each chunk from the resume cursor on sends: the system prompt,
- * the memory tool's definition and that chunk's prompt. It is the input of the cost estimate,
- * which adds what the model reads.
- */
-export function harvestChunkInputChars(args: {
-  messages: HarvestEpoch["messages"];
-  summary?: HarvestEpoch["summary"];
-  /** Progress of an earlier attempt: chunks before its cursor are already analyzed. */
-  resume?: HarvestProgress;
-}): number[] {
-  const chunks = buildHarvestChunks(args.messages);
-  const { startChunk, landedInStartChunk, budgetUsed } = resumePoint(chunks.length, args.resume);
-  // A run whose budget is spent skips every chunk (see runMemoryHarvest): it makes no model call,
-  // so it costs nothing and a lowered ceiling must not refuse it.
-  if (budgetUsed >= MEMORY_ANALYZER_OP_BUDGET) return [];
-  const fixedChars =
-    MEMORY_ANALYZER_SYSTEM_PROMPT.length + memoryToolDefinitionChars(ANALYZER_TOOL_DESCRIPTION);
-  return chunks.flatMap(({ transcript }, index) =>
-    index < startChunk
-      ? []
-      : [
-          fixedChars +
-            buildChunkPrompt({
-              summary: args.summary,
-              index,
-              total: chunks.length,
-              transcript,
-              landedOps: index === startChunk ? landedInStartChunk : undefined,
-            }).length,
-        ]
-  );
 }
 
 /**

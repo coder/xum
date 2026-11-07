@@ -89,21 +89,18 @@ export const MEMORY_ANALYZER_OP_BUDGET = 8;
 export const MEMORY_ANALYZER_MAX_STEPS = 12;
 /**
  * Output cap of one model call (one step) of the analyzer and of the organizer. The dream's cost
- * estimate prices each step's output at this many tokens, and the cap makes that a limit the run
- * cannot exceed, so the estimate never has to guess at output however long a reply the model tries
- * to write. A memory command longer than this is cut off and fails to parse; the model sees the
- * failure and can write it in smaller pieces.
+ * ceiling stops a run only after a step whose measured cost reaches it, so the step in flight
+ * can still go past the ceiling. The cap bounds what that step can write. A memory command longer
+ * than this is cut off and fails to parse; the model sees the failure and can write it in smaller
+ * pieces.
  */
 export const MEMORY_MAX_OUTPUT_TOKENS_PER_STEP = 4_096;
-/**
- * Smallest dream cost ceiling a user can set, in USD. A run's cost estimate is deliberately high
- * and rarely falls below a cent, so a lower ceiling would only refuse every run.
- */
+/** Smallest dream cost ceiling a user can set, in USD: the cent, the unit a stopped run reports in. */
 export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
 /**
- * Largest dream cost ceiling a user can set, in USD. Far above any run's estimate, so it is the
- * same as no ceiling; the cap keeps the saved number short enough that `String()` never prints it
- * in exponent notation (1e+21), which the ceiling field would then read as invalid.
+ * Largest dream cost ceiling a user can set, in USD. Far above what a dream run costs, so it is
+ * the same as no ceiling; the cap keeps the saved number short enough that `String()` never
+ * prints it in exponent notation (1e+21), which the ceiling field would then read as invalid.
  */
 export const MEMORY_DREAM_COST_CEILING_MAX_USD = 100_000;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */

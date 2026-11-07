@@ -27,7 +27,6 @@ import type {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
-import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
 import { MemoryFileEditor } from "./MemoryFileEditor";
 
 const SCOPE_LABELS: Record<MemoryScope, string> = {
@@ -504,16 +503,10 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
-/** The recorded pre-run estimate is deliberately high, so it reads "high est.", never as a bill. */
-function formatEstimate(estimatedUsd: number | undefined): string {
-  if (estimatedUsd === undefined) return "";
-  return ` · high est. ${estimatedUsd < 0.01 ? "under $0.01" : formatCostWithDollar(estimatedUsd)}`;
-}
-
 function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
   if (record === null) return "never";
   const appliedCount = record.ops.filter((op) => op.applied).length;
-  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}${formatEstimate(record.estimatedUsd)}`;
+  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
 }
 
 function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
@@ -526,7 +519,7 @@ function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string 
   // Why a completed run read only part of its epoch (its edit budget ran out), so a line that says
   // "completed" does not read as "everything analyzed".
   const note = record.note === undefined ? "" : ` · ${record.note}`;
-  return `${record.status}: ${counts}${formatEstimate(record.estimatedUsd)}${note}`;
+  return `${record.status}: ${counts}${note}`;
 }
 
 /**
@@ -592,7 +585,6 @@ function ConsolidationFooter(props: {
   const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
-  const refusal = status?.latestRefusal ?? null;
   // One consolidation pass can cover workspace, project, and global memory at
   // once, so those scope records often share the exact same summary. Keep the
   // per-scope status lines below, but avoid repeating identical tooltip text.
@@ -601,7 +593,6 @@ function ConsolidationFooter(props: {
     status?.projectRecord?.summary,
     status?.globalRecord?.summary,
     status?.latestHarvestRecord?.error,
-    refusal?.reason,
   ]).join("\n");
 
   return (
@@ -622,22 +613,15 @@ function ConsolidationFooter(props: {
           <div className="counter-nums truncate">
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
+          {/* Wrap, never truncate: the harvest line carries the note that a run read only part of
+              its epoch, and a touch screen cannot open the tooltip that would show the rest. */}
           <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
-          {/* Wrap, never truncate: a ceiling refusal's reason (the estimate and the ceiling) is the
-              point of the lines below, and a touch screen cannot open the tooltip that also holds
-              it. A manual run's error is the same refusal text, and the harvest line carries the
-              note that a run read only part of its epoch. */}
           {harvestError !== undefined && (
-            <div role="alert" className="text-error break-words">
+            <div role="alert" className="text-error truncate">
               Harvest error: {harvestError}
             </div>
           )}
-          {refusal !== null && (
-            <div role="alert" className="text-error break-words">
-              Dream stopped {formatRelativeTime(refusal.at)}: {refusal.reason}
-            </div>
-          )}
-          {runError !== null && <div className="text-error break-words">{runError}</div>}
+          {runError !== null && <div className="text-error truncate">{runError}</div>}
         </div>
       </TooltipIfPresent>
       <button

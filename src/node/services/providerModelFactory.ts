@@ -2116,21 +2116,33 @@ export class ProviderModelFactory {
         // Fast is one OpenAI preference across direct and forwarding gateways.
         // Resolve it after routing, from the model's config snapshot, so pinned
         // requests cannot change tier midway through creation or on fallback.
-        const {
-          routeOptions: serviceTierRouteOptions,
-          available: serviceTierAvailable,
-          pinnedTier,
-        } = self.resolveServiceTierRoute(modelString, providersConfig, muxProviderOptions?.openai);
-        if (pinnedTier !== undefined) {
+        const serviceTier = ServiceTierSchema.safeParse(
+          muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
+        );
+        const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
+        const serviceTierRouteOptions = {
+          providersConfig: serviceTierProvidersConfig,
+          openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+        };
+        const serviceTierAvailable = openaiServiceTierAvailable(
+          modelString,
+          serviceTierRouteOptions
+        );
+        if (
+          serviceTier.success &&
+          serviceTierAvailable &&
+          // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierRouteOptions)
+        ) {
           serviceTierDefault = {
             namespace: "openai",
             option: "serviceTier",
-            value: pinnedTier,
+            value: serviceTier.data,
           };
           muxProviderOptions ??= {};
           muxProviderOptions.openai = {
             ...muxProviderOptions.openai,
-            serviceTier: pinnedTier,
+            serviceTier: serviceTier.data,
           };
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
@@ -3899,49 +3911,6 @@ export class ProviderModelFactory {
       isGatewayModelAccessible,
       resolveGatewayModelId
     );
-  }
-
-  /**
-   * The one place the OpenAI service tier of a created model is decided: the request's tier, else
-   * the provider preference, kept only where the route carries tiers and (for Ultrafast) the
-   * model accepts it. `routeOptions` and `available` are returned because the caller's live
-   * tier overrides read them too.
-   */
-  private resolveServiceTierRoute(
-    modelString: string,
-    providersConfig: ProvidersConfig,
-    requested: MuxProviderOptions["openai"]
-  ) {
-    const tier = ServiceTierSchema.safeParse(
-      requested?.serviceTier ?? providersConfig.openai?.serviceTier
-    );
-    const routeOptions = {
-      providersConfig: this.providerService.getConfig(providersConfig),
-      openaiWireFormat: requested?.wireFormat,
-    };
-    const available = openaiServiceTierAvailable(modelString, routeOptions);
-    const pinnedTier =
-      tier.success &&
-      available &&
-      // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
-      openaiModelSupportsServiceTier(modelString, tier.data, routeOptions)
-        ? tier.data
-        : undefined;
-    return { routeOptions, available, pinnedTier };
-  }
-
-  /**
-   * The service tier a model created for `modelString` from `providersConfig` pins into every
-   * request, for callers that price a run before it starts (the dream's cost ceiling). Headless
-   * creation passes no request options, so this is the provider preference as the factory keeps
-   * it for the model's route.
-   */
-  resolvePinnedServiceTier(
-    modelString: string,
-    providersConfig: ProvidersConfig
-  ): ServiceTier | undefined {
-    const effective = this.resolveEffectiveModelString(modelString, undefined, providersConfig);
-    return this.resolveServiceTierRoute(effective, providersConfig, undefined).pinnedTier;
   }
 
   /**
