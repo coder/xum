@@ -65,7 +65,7 @@ export interface AgentSandboxPolicy {
   gitCommonDirs: string[];
   /** PROTECTED_WRITE_PATHS in each root, and the protected paths of each git folder. */
   denyWrite: string[];
-  /** DENY_READ_ROOTS and NESTED_DENY_READ_PATHS. */
+  /** DENY_READ_ROOTS, the home folder and NESTED_DENY_READ_PATHS. */
   denyRead: string[];
   /** The write roots, gitCommonDirs, HOME_READ_PATHS, PATH folders under ~ and extraReadPaths. */
   allowRead: string[];
@@ -144,7 +144,8 @@ export function buildAgentSandboxPolicy(
     writeRoots,
     gitCommonDirs,
     denyWrite,
-    denyRead: dedupe([...DENY_READ_ROOTS.map(realpathOfNearest), ...nestedDenies]),
+    // The home folder itself too: an account's home can live outside /Users (a network home).
+    denyRead: dedupe([...DENY_READ_ROOTS.map(realpathOfNearest), home, ...nestedDenies]),
     allowRead,
     network: settings.network,
     allowedHosts: [...settings.allowedHosts],

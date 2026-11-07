@@ -28,6 +28,7 @@ import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { getToolEnvPath } from "@/node/services/hooks";
 import { isLocalBaseRuntime } from "@/node/runtime/Runtime";
+import { mergeSecretsOverXumEnv } from "@/node/runtime/runtimeScratchDir";
 import {
   combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
@@ -1237,7 +1238,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            env: { ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets), ...hooksEnv },
             pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
@@ -1331,7 +1332,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        env: {
+          ...mergeSecretsOverXumEnv(config.xumEnv, config.secrets),
+          ...hooksEnv,
+          ...NON_INTERACTIVE_ENV_VARS,
+        },
         pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -116,6 +116,21 @@ describe("buildAgentSandboxPolicy", () => {
 
     expect(allowRead).toContain(bin);
     expect(allowRead).not.toContain(documents);
+  });
+
+  test("hides a home folder outside /Users", async () => {
+    const home = path.join(root, "home");
+    await fs.mkdir(home);
+    const homedir = spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
+
+      expect(agentSandboxPolicyAllows(policy, path.join(home, ".ssh", "id_rsa"), "read")).toBe(
+        false
+      );
+    } finally {
+      homedir.mockRestore();
+    }
   });
 
   test("keeps the worktree config of a repository in the workspace read-only", () => {

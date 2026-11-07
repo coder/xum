@@ -76,7 +76,9 @@ export function quotePathForShell(p: string): string {
  * runtime everywhere a probe would otherwise trust host paths or host PID checks.
  */
 export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
-  return runtime instanceof LocalBaseRuntime && !(runtime instanceof DevcontainerRuntime);
+  // MultiProjectRuntime runs exec() and tempDir() in its first project's runtime.
+  const execRuntime = runtime.wrappedRuntimes?.[0] ?? runtime;
+  return execRuntime instanceof LocalBaseRuntime && !(execRuntime instanceof DevcontainerRuntime);
 }
 
 /**

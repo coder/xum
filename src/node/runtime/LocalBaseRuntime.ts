@@ -796,7 +796,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     const wrap = await this.wrapInitHookForSandbox(workspacePath, script, initLogger, {
       bashPath,
       abortSignal,
-      scratchDir: xumEnv.XUM_SCRATCH_DIR,
+      // No scratchDir: the init hook gets none from Xum, so an XUM_SCRATCH_DIR here is a secret.
       pathEnv: hookEnv.PATH,
     });
     if (!wrap.ok) return;

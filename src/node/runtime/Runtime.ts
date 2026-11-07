@@ -547,7 +547,7 @@ export interface Runtime {
   /**
    * The runtimes this one delegates to (MultiProjectRuntime: one per project), for code that
    * must look through a wrapper without importing its class. Such a wrapper leaves `location`
-   * and `mode` absent: its answer is its projects' answers.
+   * and `mode` absent: its answer is its projects' answers. The first one runs its exec().
    */
   readonly wrappedRuntimes?: readonly Runtime[];
   /**

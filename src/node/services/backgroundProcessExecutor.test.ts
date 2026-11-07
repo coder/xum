@@ -5,6 +5,8 @@ import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 import type { BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
 import { getSelfIdentity, linuxBirth } from "@/node/utils/concurrency/processLiveness";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
@@ -305,6 +307,39 @@ describe("spawnProcess", () => {
     const probe = await result.handle.readOutputForMonitor?.(0);
     expect(probe?.success).toBe(false);
   }, 15_000);
+
+  // A sandboxed command can write its own records, and the shell probe runs outside the sandbox.
+  it("reads a multi-project workspace's output.log without following a symlink", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-multi-project-"));
+    cleanupDirs.push(hostDir);
+    const secret = path.join(hostDir, "id_rsa");
+    await fs.writeFile(secret, "PRIVATE KEY");
+    const runtime = new MultiProjectRuntime(
+      new ContainerManager(hostDir),
+      [{ projectPath: hostDir, projectName: "a", runtime: new LocalRuntime(hostDir) }],
+      "ws"
+    );
+    const result = await spawnProcess(runtime, "echo hi", {
+      cwd: hostDir,
+      workspaceId: `multi-project-${Date.now()}`,
+      processId: "multi",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    expect(await waitForExit(result.handle)).toBe(0);
+    const outputPath = path.join(result.outputDir, "output.log");
+    await fs.rm(outputPath);
+    await fs.symlink(secret, outputPath);
+
+    const read = await result.handle.readOutput(0).then(
+      (output) => output.content,
+      (error: unknown) => String(error)
+    );
+    expect(read).not.toContain("PRIVATE KEY");
+  });
 
   it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {
     const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-dangling-marker-"));
