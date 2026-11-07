@@ -4760,6 +4760,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Programs with a sandbox of their own, such as Chrome, Electron, Playwright, Codex, and Claude Code, cannot start it inside the agent sandbox. Start them with their no-sandbox flag. Codex and Claude Code also need their login folders in `extraReadPaths`.",
       "- `git push` over SSH fails, because the `ssh-agent` socket and the SSH keys are closed. `gh` with a stored login fails, because the keychain is closed. Approve the one push outside the sandbox.",
       "- A commit or `git submodule update` that changes the git folder of a submodule fails, because that folder is read-only. Approve the command outside the sandbox.",
+      "- File tools check the real path of a file and then open it. A sandboxed command that swaps a symlink between the check and the open can make a file tool read or edit a file that the sandbox hides.",
+      "- The VS Code extension shows no approval card yet. A request to run a command outside the sandbox waits there until you stop the agent.",
       "- Project secrets and the bash AI proxy key are still in the environment of agent commands.",
       "- The sandbox does not cover terminals that you open, MCP servers (they start outside the sandbox), and the Browser tab.",
       "",
