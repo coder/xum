@@ -203,6 +203,20 @@ describe("MarkdownCore", () => {
     );
   });
 
+  // Assistant markdown renders raw HTML, and a "<pre>" written by the model draws its own direct text
+  // through no component that reveals (markdownComponents unwraps pre to its children), so the pass
+  // may not skip a whole pre subtree. A fenced block is unaffected: its pre only wraps a code element,
+  // whose Copy button still gets the fence's raw bytes (the case above).
+  test("reveals a tag payload in raw HTML preformatted text", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`<pre>visible${tags("AB")}</pre>`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.textContent).toContain("visible<U+E0041><U+E0042>"));
+    expect(view.container.textContent).not.toContain(tags("AB"));
+  });
+
   // KaTeX typesets math after the pipeline's reveal pass, and it receives the formula as a code
   // element that pass deliberately leaves raw, so rendered math needs its own reveal
   // (rehypeRevealRenderedMath). The TeX the transcript copies out of a selected formula stays raw:

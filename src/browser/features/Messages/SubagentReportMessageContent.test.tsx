@@ -82,4 +82,29 @@ describe("SubagentReportMessageContent", () => {
     expect(view.getByText("explore<U+E0061><U+E0062>")).toBeTruthy();
     expect(view.container.textContent).not.toContain(tagRun("cd"));
   });
+
+  test("reveals a tag payload in the model label", () => {
+    // parseJsonEnvelope accepts any non-empty `model`, so this one is not necessarily an identifier
+    // the app produced; ModelDisplay reveals what it draws while canonicalization stays raw.
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+    const view = render(
+      <TooltipProvider>
+        <SubagentReportMessageContent
+          report={{
+            taskId: "task-1",
+            agentType: "explore",
+            status: "completed",
+            title: "Explore task",
+            reportMarkdown: "Done.",
+            model: `anthropic:sonnet-${tagRun("xy")}`,
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("Sonnet <U+E0078><U+E0079>", { exact: false })).toBeTruthy();
+    expect(view.container.textContent).not.toContain(tagRun("xy"));
+  });
 });

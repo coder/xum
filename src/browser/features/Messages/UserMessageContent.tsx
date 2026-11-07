@@ -24,6 +24,7 @@ import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
 import { formatArtifactInteractionMarkdown } from "./artifactInteractionMarkdown";
 import { stripReviewBlocksForDisplay } from "@/common/types/review";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 interface UserMessageContentProps {
   content: string;
@@ -236,11 +237,15 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
               );
             }
 
-            const label =
+            // Both a staged attachment's name and a filePart's are bytes the model was given — the
+            // notice built around them embeds the name in the message (stagedAttachments) — so the chip
+            // reveals what is drawn while the download and the href below keep the raw value.
+            const label = revealUnicodeTags(
               part.filename ??
-              (baseMediaType === "application/pdf"
-                ? "PDF attachment"
-                : `Attachment (${baseMediaType})`);
+                (baseMediaType === "application/pdf"
+                  ? "PDF attachment"
+                  : `Attachment (${baseMediaType})`)
+            );
 
             return (
               <a
@@ -289,7 +294,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
             <button
               key={attachment.stagedPath}
               type="button"
-              aria-label={`Download ${attachment.filename}`}
+              aria-label={`Download ${revealUnicodeTags(attachment.filename)}`}
               disabled={!props.onDownloadStagedAttachment}
               className={`${fileAttachmentStyles[props.variant]} ${
                 props.onDownloadStagedAttachment
@@ -299,7 +304,7 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
               onClick={() => props.onDownloadStagedAttachment?.(attachment)}
             >
               <FileText className="h-4 w-4 shrink-0" />
-              <span className="truncate">{attachment.filename}</span>
+              <span className="truncate">{revealUnicodeTags(attachment.filename)}</span>
               <span className="text-[var(--color-text-muted)]">{attachment.sizeLabel}</span>
             </button>
           ))}

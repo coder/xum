@@ -9,6 +9,7 @@ import {
   getModelProvider,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 interface ModelDisplayProps {
@@ -41,7 +42,12 @@ function getRouteDisplayName(
 export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
   const canonicalModel = normalizeToCanonical(props.modelString);
   const originProvider = getModelProvider(canonicalModel);
-  const displayName = formatModelStringForDisplay(canonicalModel);
+  // Both drawn strings are marked here rather than at a call site, because a model string is not
+  // always an identifier this app produced: a sub-agent report's envelope accepts any non-empty
+  // `model`, and its bytes reach the parent model in full, so a payload can be spelled in tag
+  // characters. Nothing functional reads what this component renders — canonicalization, the provider
+  // icon and every lookup above use the raw value.
+  const displayName = revealUnicodeTags(formatModelStringForDisplay(canonicalModel));
   const routeDisplayName = getRouteDisplayName(props.routeProvider, originProvider);
   const showTooltip = props.showTooltip ?? true;
 
@@ -68,7 +74,7 @@ export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
         <span data-model-display-tooltip>{content}</span>
       </TooltipTrigger>
       <TooltipContent align="center" data-model-tooltip-text>
-        {canonicalModel}
+        {revealUnicodeTags(canonicalModel)}
         {routeDisplayName ? (
           <>
             <br />

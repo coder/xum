@@ -3,6 +3,7 @@ import {
   getModelProvider,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import type { MuxMessage } from "@/common/types/message";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
@@ -78,7 +79,7 @@ function routeLabel(metadata: Record<string, unknown>, provider: string): string
   // Own keys only: a damaged row's "constructor" must not resolve to Object.prototype.
   return Object.hasOwn(PROVIDER_DEFINITIONS, route)
     ? PROVIDER_DEFINITIONS[route as ProviderName].displayName
-    : route;
+    : revealUnicodeTags(route);
 }
 
 /** The meta row's model as ModelDisplay draws it (label, icon, route); undefined if damaged. */
@@ -90,7 +91,10 @@ function modelDisplay(metadata: Record<string, unknown>): ViewModel | undefined 
   const canonical = normalizeToCanonical(model);
   const provider = getModelProvider(canonical);
   return {
-    label: formatModelStringForDisplay(canonical),
+    // This is the first paint of the transcript, drawn before the app JS loads, so it must reveal
+    // exactly what ModelDisplay draws once the app takes over: the persisted model string is
+    // metadata this row was written with, not necessarily an identifier the app produced.
+    label: revealUnicodeTags(formatModelStringForDisplay(canonical)),
     provider,
     via: routeLabel(metadata, provider),
   };

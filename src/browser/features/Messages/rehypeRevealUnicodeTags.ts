@@ -3,15 +3,18 @@ import type { Plugin } from "unified";
 import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 /**
- * Where a mark must not be written into drawn text: fenced and inline code are drawn from the very
- * string their Copy button hands to the clipboard (MarkdownComponents.CodeBlock), so a mark placed
- * on that text would be copied as if the user had typed it. That component reveals its own drawn
- * lines instead, keeping the action's bytes raw. `svg` is a renderer's own output — a diagram
- * reveals its labels itself (Mermaid.revealTagsInRenderedDiagram), and math is handled by
+ * Where a mark must not be written into drawn text: a `code` element's text is the very string its
+ * Copy button hands to the clipboard (MarkdownComponents.CodeBlock), so a mark placed on it would be
+ * copied as if the user had typed it; that component reveals its own drawn lines instead, keeping the
+ * action's bytes raw. `pre` is deliberately not in this list: a fenced block's `pre` only ever wraps
+ * such a `code` element, but raw HTML written by the model ("<pre>…</pre>", rendered because assistant
+ * markdown allows it) draws its own direct text through no component at all, and skipping the whole
+ * subtree there would hide a payload the provider received. `svg` is a renderer's own output — a
+ * diagram reveals its labels itself (Mermaid.revealTagsInRenderedDiagram), and math is handled by
  * rehypeRevealRenderedMath below.
  */
 function isOpaqueToReveal(node: Element): boolean {
-  return node.tagName === "code" || node.tagName === "pre" || node.tagName === "svg";
+  return node.tagName === "code" || node.tagName === "svg";
 }
 
 /**
@@ -57,15 +60,22 @@ function isRenderedMath(node: Element): boolean {
  */
 export const rehypeRevealRenderedMath: Plugin<[], Root> = () => {
   return (tree) => {
-    const visit = (node: Root | RootContent, insideMath: boolean): void => {
+    /** What KaTeX emitted: every text node marked, except the MathML node that carries its source. */
+    const revealRendered = (node: Root | RootContent): void => {
       if (node.type === "text") {
-        if (insideMath) node.value = revealUnicodeTags(node.value);
+        node.value = revealUnicodeTags(node.value);
         return;
       }
-      if (node.type === "element" && insideMath && node.tagName === "annotation") return;
-      const next = insideMath || (node.type === "element" && isRenderedMath(node));
-      if ("children" in node) node.children.forEach((child) => visit(child, next));
+      if (node.type === "element" && node.tagName === "annotation") return;
+      if ("children" in node) node.children.forEach(revealRendered);
     };
-    visit(tree, false);
+    const visit = (node: Root | RootContent): void => {
+      if (node.type === "element" && isRenderedMath(node)) {
+        revealRendered(node);
+        return;
+      }
+      if ("children" in node) node.children.forEach(visit);
+    };
+    visit(tree);
   };
 };
