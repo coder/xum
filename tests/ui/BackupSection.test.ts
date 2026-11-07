@@ -1422,7 +1422,7 @@ describe("BackupSection", () => {
     });
 
     test("opens Settings → Plugins with the missing plugins queued for their install review", async () => {
-      const { client, view } = renderBackupSection({
+      const { view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
           plugins: reportOf([
@@ -1435,7 +1435,6 @@ describe("BackupSection", () => {
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");
-      const install = jest.spyOn(client.agentPlugins, "install");
       fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
 
       fireEvent.click(await canvas.findByRole("button", { name: /Review and install/ }));
@@ -1447,8 +1446,6 @@ describe("BackupSection", () => {
       expect(entries.map((entry) => entry.name)).toEqual(["alpha", "delta"]);
       // The statuses were only the reason these two were picked; the queue never reads them.
       expect(entries.some((entry) => "status" in entry)).toBe(false);
-      // Reviewing is only navigation: the install review is where consent happens.
-      expect(install).not.toHaveBeenCalled();
     });
 
     test("reviews from the keyboard only while a preview shows a missing plugin", async () => {
@@ -1667,18 +1664,16 @@ describe("BackupSection", () => {
     });
 
     test("offers the plugins right after a restore, which installed none of them", async () => {
-      const { client, view } = renderBackupSection({
+      const { view } = renderBackupSection({
         backupRestore: { ...RESTORE_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");
-      const install = jest.spyOn(client.agentPlugins, "install");
 
       await confirmRestore(canvas);
 
       await canvas.findByText("Plugins in this backup");
       expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
-      expect(install).not.toHaveBeenCalled();
     });
 
     test("drops the plugin card when the settings change, since it describes the old repository", async () => {

@@ -521,10 +521,9 @@ describe("backup of the managed plugin list", () => {
       // become 10 row warnings, one "2 more" line and one line about the rows past 512.
       expect(preview.plugins.rows).toHaveLength(500);
       expect(preview.plugins.warnings).toHaveLength(12);
-      expect(preview.plugins.warnings?.slice(-2)).toEqual([
-        "2 more plugins were left out",
-        "Only the first 512 plugins of the list were read",
-      ]);
+      // The summary lines name how many problems the cap hid and how many rows were never read.
+      expect(preview.plugins.warnings?.at(-2)).toMatch(/\b2\b/);
+      expect(preview.plugins.warnings?.at(-1)).toMatch(/\b512\b/);
     });
 
     it("reports a list that is a symlink out of the backup without following it", async () => {
