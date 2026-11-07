@@ -2380,7 +2380,7 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
-      it("starts the compaction that closes the epoch after the rows an archive that ran out of edits read, not after its newest row", async () => {
+      it("makes no analyzer call for the compaction that closes an epoch whose every edit an archive spent, though rows are left unread", async () => {
         const analyzerPrompts: Array<{ closing: boolean; prompt: string }> = [];
         using fixture = await createFixture({
           modelFactory: () =>
@@ -2414,16 +2414,15 @@ describe("MemoryConsolidationService", () => {
 
         await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
 
-        const closing = analyzerPrompts
-          .filter((run) => run.closing)
-          .map((run) => run.prompt)
-          .join("\n");
-        // The rows no archive chunk read are read now, and the ones it read are not.
-        for (let index = 0; index < 12; index++) {
-          const row = `preference ${index} x`;
-          if (index < 5) expect(closing).not.toContain(row);
-          else expect(closing).toContain(row);
-        }
+        // The epoch has one budget (see "the epoch's one edit budget"): the compaction that closes
+        // it starts with the archive's spend, so it reads none of the rows the archive left.
+        expect(analyzerPrompts.filter((run) => run.closing)).toEqual([]);
+        const closing = (await harvestRecords(fixture))["summary-1"];
+        expect(closing).toMatchObject({
+          status: "completed",
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        });
+        expect(closing?.note).toContain("edit budget spent");
       });
 
       it("keeps the chunks an archive skipped unread when saving its completed record failed", async () => {
