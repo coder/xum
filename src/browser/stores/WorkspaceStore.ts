@@ -811,10 +811,9 @@ function clearStaleLiveToolState(
     transient.liveWorkflowRuns.clear();
     transient.liveTaskIds.clear();
   }
-  // The server never replays a pending approval, so a full replay of the same stream keeps its
-  // card; a stream that ended or changed while disconnected no longer waits. Approvals sent
-  // during this replay are buffered and apply after this.
-  if (replay.streamGone) transient.sandboxApprovals.clear();
+  // Every replay re-sends the approvals still pending, buffered until after this reset, so a
+  // card answered while disconnected cannot linger.
+  transient.sandboxApprovals.clear();
 }
 
 /**

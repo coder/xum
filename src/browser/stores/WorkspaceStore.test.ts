@@ -8690,12 +8690,9 @@ describe("WorkspaceStore", () => {
       expect(store.getLatestBashSandboxApprovalToolCallId(workspaceId)).toBe("call-new");
     });
 
-    // The server never replays a pending approval, so a reconnect keeps the card only while the
-    // same stream still runs; pending:false of a call that ended while disconnected never came.
-    const approvalAfterReconnect = async (
-      workspaceId: string,
-      secondCaughtUp: WorkspaceChatMessage
-    ) => {
+    // Every replay re-sends the calls still waiting (pending:true) before caught-up, so a
+    // reconnect shows exactly those; a call answered while disconnected sends nothing.
+    const approvalAfterReconnect = async (workspaceId: string, replayed: WorkspaceChatMessage[]) => {
       const firstSubscription = createReleaseGate();
       const subscriptions = mockChatReconnectScript((attempt, signal) =>
         attempt === 1
@@ -8713,7 +8710,9 @@ describe("WorkspaceStore", () => {
             ]
           : [
               createHistoryMessageEvent("history-1", 1),
-              secondCaughtUp,
+              ...replayed,
+              // The same stream still runs, so only the replayed approvals decide the card.
+              fullCaughtUpEvent(1, "history-1", { messageId: "msg-sandbox", lastTimestamp: 1_001 }),
               Promise.resolve(),
               () => waitForAbortSignal(signal),
             ]
@@ -8728,19 +8727,23 @@ describe("WorkspaceStore", () => {
       return store.getBashSandboxApproval(workspaceId, "call-wait");
     };
 
-    it("keeps a waiting call across a full replay of the same stream", async () => {
-      const approval = await approvalAfterReconnect(
-        "sandbox-approval-workspace-2",
-        fullCaughtUpEvent(1, "history-1", { messageId: "msg-sandbox", lastTimestamp: 1_001 })
-      );
-      expect(approval?.reason).toBe("reason for call-wait");
+    it("shows a waiting call that a replay re-sends", async () => {
+      const workspaceId = "sandbox-approval-workspace-2";
+      const approval = await approvalAfterReconnect(workspaceId, [
+        {
+          type: "bash-sandbox-approval",
+          workspaceId,
+          toolCallId: "call-wait",
+          reason: "replayed reason",
+          pending: true,
+          timestamp: 1_001,
+        },
+      ]);
+      expect(approval?.reason).toBe("replayed reason");
     });
 
-    it("drops a waiting call when a reconnect reports no active stream", async () => {
-      const approval = await approvalAfterReconnect(
-        "sandbox-approval-workspace-3",
-        fullCaughtUpEvent()
-      );
+    it("drops a waiting call that a replay no longer re-sends", async () => {
+      const approval = await approvalAfterReconnect("sandbox-approval-workspace-3", []);
       expect(approval).toBeNull();
     });
   });
