@@ -160,9 +160,8 @@ export const MemoryHarvestRecordSchema = z.object({
   analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),
   /**
-   * Why a completed run did not read or finish every chunk: the epoch's edit budget ran out and
-   * the remaining chunks were skipped, or the cost ceiling stopped the job. Optional so older
-   * binaries parse the record.
+   * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
+   * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
    */
   note: z.string().optional(),
   /**
@@ -176,7 +175,8 @@ export const MemoryHarvestRecordSchema = z.object({
   /**
    * USD the epoch's job has cost across its attempts, priced from what each step reported. A retry
    * continues from it, so it feeds the cost ceiling like a count feeds a limit: not negative (see
-   * PersistedCountSchema). Optional so older binaries parse the record.
+   * PersistedCountSchema). A job the ceiling stopped completes with a `note` that says so.
+   * Optional so older binaries parse the record.
    */
   spentUsd: z.number().nonnegative().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
