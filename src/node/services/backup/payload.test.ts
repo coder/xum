@@ -51,6 +51,7 @@ import {
   resolveRestoredContent,
   restoreBackupPayload,
   selectBackupContents,
+  serializeSidecarManifest,
   scanBackupFilesForSecrets,
   writeBackupPayload,
   writeProjectBundle,
@@ -5743,5 +5744,14 @@ describe("isFilesystemError", () => {
     for (const code of BackupOperationErrorSchema.shape.code.options) {
       expect(isFilesystemError(Object.assign(new Error(code), { code }))).toBe(false);
     }
+  });
+});
+
+describe("serializeSidecarManifest", () => {
+  it("keeps the bytes every earlier backup of the project bundle and the plugin list used", () => {
+    // A format change would rewrite each sidecar manifest on the next push from every machine.
+    expect(serializeSidecarManifest({ schemaVersion: 1, plugins: [] }).toString("utf-8")).toBe(
+      '{\n  "schemaVersion": 1,\n  "plugins": []\n}\n'
+    );
   });
 });
