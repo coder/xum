@@ -155,16 +155,8 @@ describe("backup of the managed plugin list", () => {
     });
 
     it("records the install method of a plugin whose plugin.json Xum generated", async () => {
-      await writeRegistry(muxRoot, [
-        registryRow("skills-only"),
-        registryRow("from-market"),
-        registryRow("own-manifest"),
-      ]);
+      await writeRegistry(muxRoot, [registryRow("skills-only"), registryRow("own-manifest")]);
       await writeGeneratedPlugin(muxRoot, "skills-only", { kind: "skills" });
-      await writeGeneratedPlugin(muxRoot, "from-market", {
-        kind: "claude-marketplace",
-        entry: "Market-Entry",
-      });
       await writeFixtureFile(
         muxRoot,
         "plugins/own-manifest/plugin.json",
@@ -179,10 +171,32 @@ describe("backup of the managed plugin list", () => {
       };
       const methods = Object.fromEntries(sidecar.plugins.map((p) => [p.name, p.method]));
       expect(methods).toEqual({
-        "from-market": { kind: "claude-marketplace", entry: "Market-Entry" },
         "own-manifest": undefined,
         "skills-only": { kind: "skills" },
       });
+    });
+
+    it("leaves out a plugin Xum generated from a Claude Code marketplace entry, and logs it", async () => {
+      const info = spyOn(log, "info").mockImplementation(() => undefined);
+      await writeRegistry(muxRoot, [registryRow("skills-only"), registryRow("from-market")]);
+      await writeGeneratedPlugin(muxRoot, "skills-only", { kind: "skills" });
+      // The registry row names the repository the entry resolved to, which can differ from the
+      // marketplace's own repository: the row alone cannot rebuild the entry.
+      await writeGeneratedPlugin(muxRoot, "from-market", {
+        kind: "claude-marketplace",
+        entry: "Market-Entry",
+      });
+      const { payload, managed, request } = await prepare();
+
+      await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<{ name: string }> };
+      expect(sidecar.plugins.map((p) => p.name)).toEqual(["skills-only"]);
+      const logged = info.mock.calls
+        .filter(([message]) => String(message).includes("Claude Code marketplace entry"))
+        .map(([, fields]) => (fields as { plugin: string }).plugin);
+      expect(logged).toEqual(["from-market"]);
+      info.mockRestore();
     });
 
     it("writes no list with the flag off, and drops one pushed before", async () => {

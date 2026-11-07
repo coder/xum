@@ -391,10 +391,10 @@ For each plugin, the backup keeps:
 - The repository URL and the branch or tag the plugin tracks.
 - The commit it is pinned to.
 - Its folder in the repository, for a monorepo plugin.
-- The install method, when Xum generated the plugin's `plugin.json` (a skills repository or a Claude Code marketplace entry).
+- The install method, when Xum generated the plugin's `plugin.json` for a skills repository.
 - The skills and MCP servers you chose to import.
 
-It leaves out your consent, hook trust, install dates, and the auto-update flag. Project plugins and plugins you copied into a plugin folder by hand are not listed. A plugin you installed from a folder on this machine (a local path or a `file://` URL) is not listed either: no other machine can use that path, and the list would publish it.
+It leaves out your consent, hook trust, install dates, and the auto-update flag. Project plugins and plugins you copied into a plugin folder by hand are not listed. A plugin you installed from a folder on this machine (a local path or a `file://` URL) is not listed either: no other machine can use that path, and the list would publish it. A plugin Xum generated from a Claude Code marketplace entry is not listed: Xum keeps only the entry's name, which cannot rebuild an entry that points at another repository. Add that plugin again from the marketplace.
 
 ### Reinstall after a restore
 

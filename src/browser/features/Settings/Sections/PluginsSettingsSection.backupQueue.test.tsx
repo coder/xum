@@ -342,29 +342,18 @@ test("a plugin without a recorded choice starts with everything the preview offe
   });
 });
 
-test("a marketplace entry is previewed by its entry, not by a folder inside the marketplace", async () => {
-  const entry = backedUp("market-plugin", {
-    source: {
-      type: "git",
-      url: "https://github.com/example/market-plugin.git",
-      ref: "main",
-      refType: "branch",
-      subpath: "plugins/market-plugin",
-    },
-    method: { kind: "claude-marketplace", entry: "Market-Plugin" },
-  });
+test("a plugin Xum generated a plugin.json for is previewed with that method", async () => {
+  const entry = backedUp("skills-repo", { method: { kind: "skills" } });
   const { view, previewSpy } = renderWithBackup([entry], {
-    "market-plugin": previewOf("market-plugin", {
-      method: { kind: "claude-marketplace", entry: "Market-Plugin" },
-    }),
+    "skills-repo": previewOf("skills-repo", { method: { kind: "skills" } }),
   });
 
   await waitFor(() =>
     expect(previewSpy).toHaveBeenCalledWith({
-      input: "https://github.com/example/market-plugin.git",
+      input: "https://github.com/example/skills-repo.git",
       ref: PINNED,
       subpath: null,
-      method: { kind: "claude-marketplace", entry: "Market-Plugin" },
+      method: { kind: "skills" },
     })
   );
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));

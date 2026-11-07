@@ -66,14 +66,11 @@ async function readManagedInstalls(muxRoot: string): Promise<Map<string, AgentPl
 }
 
 /**
- * The preview selector that rebuilds a plugin Xum generated a plugin.json for. A plugin with its
- * own manifest has none: the preview takes the first method that fits.
+ * The preview selector that rebuilds a plugin Xum generated a plugin.json for from a skills
+ * repository. A plugin with its own manifest has none: the preview takes the first method that fits.
  */
 function methodOf(generated: GeneratedFrom | undefined): BackupPluginMethod | undefined {
-  if (generated === undefined) return undefined;
-  return generated.kind === "skills"
-    ? { kind: "skills" }
-    : { kind: "claude-marketplace", entry: generated.entry };
+  return generated === undefined ? undefined : { kind: "skills" };
 }
 
 async function entryOf(
@@ -88,9 +85,18 @@ async function entryOf(
     });
     return null;
   }
-  const method = methodOf(
-    await readInstalledGeneratedFrom(path.join(muxRoot, "plugins", install.name))
-  );
+  const generated = await readInstalledGeneratedFrom(path.join(muxRoot, "plugins", install.name));
+  // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
+  // only the entry's name. An entry that points at another repository cannot be rebuilt from this
+  // row, and telling it from an entry in the marketplace's own repository needs a registry field.
+  if (generated?.kind === "claude-marketplace") {
+    log.info(
+      "Leaving a plugin out of the settings backup: Xum generated it from a Claude Code marketplace entry",
+      { plugin: install.name }
+    );
+    return null;
+  }
+  const method = methodOf(generated);
   // Only the fields the schema names: consent, install times and auto-update stay local.
   const parsed = BackupPluginEntrySchema.safeParse({
     name: install.name,

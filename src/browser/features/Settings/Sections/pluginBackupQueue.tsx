@@ -29,14 +29,13 @@ export interface PluginPreviewRequest {
 
 /**
  * The preview that rebuilds a backed-up install. It asks for the pinned commit, not the branch
- * the plugin tracks, so the review shows the code that was backed up. A marketplace entry names
- * its own folder in the marketplace, so a subpath would look for the entry inside that folder.
+ * the plugin tracks, so the review shows the code that was backed up.
  */
 export function backupPreviewRequest(entry: BackupPluginEntry): PluginPreviewRequest {
   return {
     input: entry.source.url,
     ref: entry.lockedSha,
-    subpath: entry.method?.kind === "claude-marketplace" ? null : (entry.source.subpath ?? null),
+    subpath: entry.source.subpath ?? null,
     method: entry.method ?? null,
   };
 }

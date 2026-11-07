@@ -75,17 +75,12 @@ const BackupPluginComponentNamesSchema = z
   .max(MAX_BACKUP_PLUGIN_COMPONENTS);
 
 /**
- * The install methods an export writes: the two for which Xum generates the plugin.json
- * (`generatesManifest` in installMethods.ts). Any other method names a manifest the repository
- * already has, so the preview finds it without a selector.
+ * The install method an export writes: `skills`, for a plugin Xum generated a plugin.json for
+ * from a skills repository (`generatesManifest` in installMethods.ts). Any other method names a
+ * manifest the repository already has, so the preview finds it without a selector. A plugin
+ * generated from a Claude Code marketplace entry is not exported (agentPluginBackup.ts).
  */
-export const BackupPluginMethodSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("skills") }),
-  z.object({
-    kind: z.literal("claude-marketplace"),
-    entry: z.string().min(1).max(MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS),
-  }),
-]);
+export const BackupPluginMethodSchema = z.object({ kind: z.literal("skills") });
 
 /**
  * A repository URL a restore hands to git. The list is repository-controlled, so the URL must not

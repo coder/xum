@@ -28,13 +28,13 @@ describe("BackupPluginEntrySchema", () => {
           refType: "tag",
           subpath: "packages/plugin",
         },
-        method: { kind: "claude-marketplace", entry: "plugin-a" },
+        method: { kind: "skills" },
         importedComponents: { skills: ["review"], mcpServers: [] },
       })
     );
     expect(parsed).toMatchObject({
       source: { ref: "v1.2.0", refType: "tag", subpath: "packages/plugin" },
-      method: { kind: "claude-marketplace", entry: "plugin-a" },
+      method: { kind: "skills" },
       importedComponents: { skills: ["review"], mcpServers: [] },
     });
   });
@@ -145,24 +145,16 @@ describe("BackupPluginEntrySchema", () => {
     ])("refuse %s", (_label, importedComponents) => {
       expect(BackupPluginEntrySchema.safeParse(entry({ importedComponents })).success).toBe(false);
     });
-
-    test("accept a marketplace entry of 256 characters and refuse one of 257", () => {
-      const method = (length: number) => ({
-        kind: "claude-marketplace",
-        entry: "e".repeat(length),
-      });
-      expect(BackupPluginEntrySchema.safeParse(entry({ method: method(256) })).success).toBe(true);
-      expect(BackupPluginEntrySchema.safeParse(entry({ method: method(257) })).success).toBe(false);
-    });
   });
 
   test("takes only the install methods an export writes", () => {
     const parse = (method: unknown) => BackupPluginEntrySchema.safeParse(entry({ method })).success;
     expect(parse({ kind: "skills" })).toBe(true);
-    expect(parse({ kind: "claude-marketplace", entry: "plugin-a" })).toBe(true);
     for (const kind of ["agent-plugin", "claude-plugin", "cursor-plugin"]) {
       expect(parse({ kind })).toBe(false);
     }
+    // A marketplace entry is not exported: the registry keeps no repository of its own for it.
+    expect(parse({ kind: "claude-marketplace", entry: "plugin-a" })).toBe(false);
     expect(parse({ kind: "cursor-marketplace", entry: "plugin-a" })).toBe(false);
   });
 });
