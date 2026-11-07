@@ -7520,7 +7520,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- The install method, when Xum generated the plugin's `plugin.json` (a skills repository or a Claude Code marketplace entry).",
       "- The skills and MCP servers you chose to import.",
       "",
-      "It leaves out your consent, hook trust, install dates, and the auto-update flag. Project plugins and plugins you copied into a plugin folder by hand are not listed.",
+      "It leaves out your consent, hook trust, install dates, and the auto-update flag. Project plugins and plugins you copied into a plugin folder by hand are not listed. A plugin you installed from a folder on this machine (a local path or a `file://` URL) is not listed either: no other machine can use that path, and the list would publish it.",
       "",
       "### Reinstall after a restore",
       "",
