@@ -1412,10 +1412,10 @@ export class MemoryConsolidationService extends EventEmitter {
         removalSignal
       );
 
-      // A sub-agent's inbox lives in the owner's store: wait on and run the
-      // OWNER's consolidation (see maybeRun) so the harvest is actually swept —
-      // still as the acting CHILD, so the child's in-process cancellation,
-      // durable tombstone and removal drain bind the owner-keyed run too.
+      // A sub-agent's analyzer writes into the owner's store: wait on and run the OWNER's
+      // dream (see maybeRun) so what the analyzer wrote is organized — still as the acting
+      // CHILD, so the child's in-process cancellation, durable tombstone and removal drain
+      // bind the owner-keyed run too.
       return yield* Effect.promise(() =>
         self.runCompactionSweepAfterHarvest(
           self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId),
