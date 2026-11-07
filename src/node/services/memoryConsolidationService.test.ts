@@ -17,6 +17,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
+  MEMORY_MAX_FILE_BYTES,
 } from "@/common/constants/memory";
 import { Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
@@ -2708,6 +2709,63 @@ describe("MemoryConsolidationService", () => {
     expect(
       await fixture.service.getRecord(`ws-extra-${MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP}`)
     ).toBeNull();
+  });
+
+  describe("launch sweep under a cost ceiling", () => {
+    it("does not count a workspace the ceiling refused against the cap, so the next one runs", async () => {
+      const calibration = archivePassModels();
+      using fixture = await createFixture({ modelFactory: calibration.factory });
+      const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+      const writeFor = (workspaceId: string) =>
+        fixture.metaService.recordAccess(
+          memoryLogicalKey("workspace", "lesson.md", { projectPath: "", workspaceId }),
+          { write: true }
+        );
+      // A small run's estimate, recorded by a manual run of a workspace the sweep never visits.
+      await fixture.addWorkspace("ws-calibration");
+      const calibrationRun = await fixture.service.maybeRun("ws-calibration", "manual");
+      expect(calibrationRun.success && calibrationRun.data.estimatedUsd).toBeGreaterThan(0);
+      const smallUsd = calibrationRun.success ? (calibrationRun.data.estimatedUsd ?? 0) : 0;
+      // Big workspaces read 400 KB of memory, which prices far over the ceiling; small ones fit.
+      const bigIds = Array.from(
+        { length: MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP },
+        (_, i) => `big-${i}`
+      );
+      const smallIds = ["small-0", "small-1"];
+      const ctxFor = (workspaceId: string) => ({
+        runtime: null,
+        checkoutCwd: "",
+        workspaceId,
+        projectPath: "/projects/demo",
+      });
+      for (const id of [...bigIds, ...smallIds]) {
+        await fixture.addWorkspace(id);
+        await writeFor(id);
+      }
+      for (const id of bigIds) {
+        for (let file = 0; file < 4; file++) {
+          const saved = await fixture.memoryService.saveFile(
+            ctxFor(id),
+            `/memories/workspace/big-${file}.md`,
+            "x".repeat(MEMORY_MAX_FILE_BYTES - 1_000),
+            null,
+            "agent"
+          );
+          expect(saved.success).toBe(true);
+        }
+      }
+      await fixture.config.updateUserPreferences([
+        { memory: { dreamCostCeilingUsd: smallUsd * 1.2 } },
+      ]);
+
+      // The refused ones come first in sweep order, ahead of the ones that fit.
+      await fixture.service.runLaunchSweep(
+        new Map([...bigIds, ...smallIds].map((id): [string, number] => [id, dayAgo]))
+      );
+
+      for (const id of bigIds) expect(await fixture.service.getRecord(id)).toBeNull();
+      for (const id of smallIds) expect(await fixture.service.getRecord(id)).not.toBeNull();
+    });
   });
 
   it("a project-only write qualifies one sibling workspace per sweep", async () => {

@@ -385,6 +385,17 @@ interface HarvestSource {
  */
 class HarvestOverCostCeilingError extends Error {}
 
+/** Starts the error of an organizer run that the cost ceiling refused before its stream. */
+const ORGANIZER_REFUSAL_PREFIX = "consolidation not started: ";
+
+/**
+ * True for the error of a run the cost ceiling refused: it made no model call and wrote nothing,
+ * so a caller that budgets its runs (the launch sweep) must not count it as one.
+ */
+function isCostCeilingRefusal(error: string): boolean {
+  return error.startsWith(ORGANIZER_REFUSAL_PREFIX);
+}
+
 /** What an attempt learns before it streams; shared so a failure record can carry it. */
 interface HarvestAttemptState {
   estimatedUsd?: number;
@@ -1112,7 +1123,7 @@ export class MemoryConsolidationService extends EventEmitter {
         estimatedUsd,
         pricingModel: modelResult.data.metadataModel,
       });
-      if (!ceiling.allowed) return Err(`consolidation not started: ${ceiling.reason}`);
+      if (!ceiling.allowed) return Err(`${ORGANIZER_REFUSAL_PREFIX}${ceiling.reason}`);
 
       const consolidate = () =>
         runMemoryConsolidation({
@@ -1891,7 +1902,6 @@ export class MemoryConsolidationService extends EventEmitter {
           lastRunAt !== 0 && now - lastRunAt < MEMORY_CONSOLIDATION_DEBOUNCE_MS;
         const skipWorkspaceDebounce = workspaceDebounceWouldSkip && projectDebounceAllowsRun;
         if (workspaceDebounceWouldSkip && !skipWorkspaceDebounce) continue;
-        started++;
         // Sequential, not parallel: the sweep is background housekeeping and
         // must not stampede the provider on launch.
         const result: Result<MemoryConsolidationRecord, string> = yield* Effect.tryPromise({
@@ -1902,6 +1912,10 @@ export class MemoryConsolidationService extends EventEmitter {
             Effect.succeed<Result<MemoryConsolidationRecord, string>>(Err(getErrorMessage(error)))
           )
         );
+        // A run the cost ceiling refused spent nothing and leaves no record, so it does not use up
+        // the cap: it would otherwise crowd out a workspace the ceiling lets run, on every launch.
+        const refusedByCeiling = !result.success && isCostCeilingRefusal(result.error);
+        if (!refusedByCeiling) started++;
         if (!result.success) {
           log.debug("[MemoryConsolidation] launch sweep skipped workspace", {
             workspaceId,
