@@ -55,6 +55,25 @@ describe("redactSecretLike", () => {
     const text = "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo";
     expect(redactSecretLike(text)).toBe(text);
   });
+
+  // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
+  // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
+  // JWT segment rescan to the end of the text from every occurrence (seconds per input).
+  it.each([
+    ["token", "token".repeat(20_000)],
+    ["secret-", "secret-".repeat(14_000)],
+    ["authorization", "authorization".repeat(7_700)],
+    ["credential_", "credential_".repeat(9_000)],
+    ["api_key", "api_key".repeat(14_000)],
+    ["a JWT header after a dash", "eyJ-".repeat(25_000)],
+    ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
+  ])("scans %s in linear time", (_label, text) => {
+    redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
+    const started = performance.now();
+    redactSecretLike(text);
+    containsSecretLike(text);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
 });
 
 describe("containsSecretLike", () => {
