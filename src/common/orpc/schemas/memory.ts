@@ -125,10 +125,11 @@ export const CompactionCompletionMetadataSchema = z.object({
 
 /**
  * A persisted count that feeds a limit: whole and not negative. A negative `budgetUsed` would add
- * to the epoch's edit budget instead of spending it (-100 allowed 108 edits), and a negative or
- * fractional chunk cursor starts the run at a chunk that does not exist. A record that fails this
- * is dropped on load, like any invalid record, so the epoch restarts with a fresh budget that is
- * still bounded by the limit. The record's other fields cannot be trusted either.
+ * to the epoch's edit budget instead of spending it (-100 allowed 108 edits), a negative
+ * `attemptCount` would widen `HARVEST_MAX_ATTEMPTS` the same way, and a negative or fractional
+ * chunk cursor starts the run at a chunk that does not exist. A record that fails this is dropped
+ * on load, like any invalid record, so the epoch restarts with a fresh budget that is still
+ * bounded by the limit. The record's other fields cannot be trusted either.
  */
 const PersistedCountSchema = z.number().int().nonnegative();
 
@@ -148,7 +149,7 @@ export const MemoryHarvestRecordSchema = z.object({
    */
   progressAt: z.number().optional(),
   completedAt: z.number().optional(),
-  attemptCount: z.number(),
+  attemptCount: PersistedCountSchema,
   boundaryKey: z.string(),
   compactionEpoch: z.number(),
   acceptedCandidates: z.number(),

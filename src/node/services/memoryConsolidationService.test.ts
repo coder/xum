@@ -2570,7 +2570,46 @@ describe("MemoryConsolidationService", () => {
           expect(record?.note).toContain("edit budget spent");
         });
 
+        it("cannot widen the attempt limit: a negative attemptCount restarts the epoch on the bound every epoch has", async () => {
+          let analyzerCalls = 0;
+          using fixture = await createFixture({
+            modelFactory: () =>
+              new MockLanguageModelV3({
+                doStream: (options) => {
+                  if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
+                    return Promise.resolve({ stream: noChangesStream() });
+                  }
+                  analyzerCalls++;
+                  return Promise.resolve({ stream: failingStream() });
+                },
+              }),
+          });
+          const metadata = await seedCompactionEpoch(fixture);
+          expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            attemptCount: 1,
+          });
+          // An attemptCount of -100 used to stay under HARVEST_MAX_ATTEMPTS for 100 more attempts.
+          await editHarvestRecord(fixture, "summary-1", (record) => {
+            record.attemptCount = -100;
+          });
+          analyzerCalls = 0;
+
+          for (let run = 0; run < HARVEST_MAX_ATTEMPTS + 3; run++) {
+            await fixture.service.maybeHarvestThenSweep(metadata);
+          }
+
+          expect(analyzerCalls).toBe(HARVEST_MAX_ATTEMPTS);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            attemptCount: HARVEST_MAX_ATTEMPTS,
+          });
+        });
+
         it.each([
+          ["attemptCount", -1],
+          ["attemptCount", 1.5],
           ["budgetUsed", -100],
           ["budgetUsed", 1.5],
           ["nextChunk", -1],
