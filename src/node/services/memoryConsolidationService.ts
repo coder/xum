@@ -1680,14 +1680,6 @@ export class MemoryConsolidationService extends EventEmitter {
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
 
-      // The epoch has one edit budget, not one per record: a run after an unarchive and a new row,
-      // and the compaction that closes the epoch, start from what the earlier runs spent. A retry
-      // keeps its own spend if that is higher.
-      opts.progress.budgetUsed = Math.max(
-        budgetSpent(opts.progress),
-        epochBudgetSpent(opts.earlierRecords, epoch.data.messages)
-      );
-
       const saveCompleted = (
         progress: HarvestProgress,
         outcome: Pick<MemoryHarvestRecord, "note" | "readThroughRowId"> = {}
@@ -1770,8 +1762,18 @@ export class MemoryConsolidationService extends EventEmitter {
       const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
       const harvest = yield* Effect.tryPromise({
         try: async () =>
-          self.analyzerStreams.run(ownerId, opts.removalSignal, async () =>
-            runMemoryHarvest({
+          self.analyzerStreams.run(ownerId, opts.removalSignal, async () => {
+            // The epoch has one edit budget, not one per record: a run after an unarchive and a
+            // new row, and the compaction that closes the epoch, start from what the earlier runs
+            // spent. A retry keeps its own spend if that is higher. Read once the turn has come,
+            // not before the wait: a record of the same epoch that ran ahead (an archive and a
+            // compaction of one epoch can overlap) reaches the sidecar only when it completes.
+            const { harvestsByWorkspace } = await self.load();
+            opts.progress.budgetUsed = Math.max(
+              budgetSpent(opts.progress),
+              epochBudgetSpent(harvestsByWorkspace[workspaceId], epoch.data.messages)
+            );
+            return runMemoryHarvest({
               model: modelResult.data.model,
               pricingModel: modelResult.data.metadataModel,
               memoryService: self.memoryService,
@@ -1806,8 +1808,8 @@ export class MemoryConsolidationService extends EventEmitter {
                   self.emit("analyticsIngest", { workspaceId });
                 }
               },
-            })
-          ),
+            });
+          }),
         catch: (error) => error,
       });
       // Removal reached this run while it was still queued: no chunk was read.

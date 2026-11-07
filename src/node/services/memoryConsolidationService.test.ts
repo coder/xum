@@ -266,21 +266,26 @@ function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
 /**
  * An analyzer that tries `editsPerRun` creates of distinct workspace notes in each run's first
  * step, so a test can count the edits an epoch's runs got in total. The dream makes none.
+ * `beforeEdits(run)` holds a run's first step until it settles, to keep a stream open.
  */
-function editsEveryRunModels(editsPerRun: number): {
+function editsEveryRunModels(
+  editsPerRun: number,
+  beforeEdits?: (run: number) => Promise<void>
+): {
   factory: () => MockLanguageModelV3;
   analyzerRuns: () => number;
 } {
   let analyzerRuns = 0;
   const factory = () =>
     new MockLanguageModelV3({
-      doStream: (options) => {
+      doStream: async (options) => {
         const afterToolResult = options.prompt.some((message) => message.role === "tool");
         if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT || afterToolResult) {
-          return Promise.resolve({ stream: noChangesStream() });
+          return { stream: noChangesStream() };
         }
         const run = ++analyzerRuns;
-        return Promise.resolve({
+        await beforeEdits?.(run);
+        return {
           stream: simulateReadableStream<LanguageModelV3StreamPart>({
             chunks: [
               ...Array.from(
@@ -306,7 +311,7 @@ function editsEveryRunModels(editsPerRun: number): {
               },
             ],
           }),
-        });
+        };
       },
     });
   return { factory, analyzerRuns: () => analyzerRuns };
@@ -2182,6 +2187,46 @@ describe("MemoryConsolidationService", () => {
       held.release(2);
       await nextRun;
       expect((await harvestRecords(fixture, "ws-dream"))["summary-2"]?.status).toBe("completed");
+    });
+
+    it("seeds a record's edit budget when its turn arrives, so an archive and a compaction of one epoch overlapping share it", async () => {
+      // The compaction's job reads the earlier records before it waits behind the archive's
+      // analyzer, and what the archive spends meanwhile reaches disk only when its record completes.
+      const created = [gate(), gate()];
+      const streamStarted = [gate(), gate()];
+      const released = [gate(), gate()];
+      const models = editsEveryRunModels(5, async (run) => {
+        streamStarted[run - 1]?.open();
+        await released[run - 1]?.opened;
+      });
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          created[modelsCreated++]?.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+
+      const archive = fixture.service.maybeRunArchivePass("ws-dream");
+      await streamStarted[0]?.opened;
+      const compaction = fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+      await created[1]?.opened;
+      await settle();
+      expect(models.analyzerRuns()).toBe(1);
+
+      released[0]?.open();
+      await streamStarted[1]?.opened;
+      released[1]?.open();
+      expect((await archive).success).toBe(true);
+      // The compaction's own dream is debounced behind the archive's: only its analysis matters.
+      await compaction;
+
+      const records = await harvestRecords(fixture);
+      // The archive's 5 edits all landed. The compaction tried 5 more and got the 3 that are left.
+      expect(records["open:open-2"]?.budgetUsed).toBe(5);
+      expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+      expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
     });
   });
 
