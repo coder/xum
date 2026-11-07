@@ -589,6 +589,7 @@ function ConsolidationFooter(props: {
   const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
+  const refusal = status?.latestRefusal ?? null;
   // One consolidation pass can cover workspace, project, and global memory at
   // once, so those scope records often share the exact same summary. Keep the
   // per-scope status lines below, but avoid repeating identical tooltip text.
@@ -597,6 +598,7 @@ function ConsolidationFooter(props: {
     status?.projectRecord?.summary,
     status?.globalRecord?.summary,
     status?.latestHarvestRecord?.error,
+    refusal?.reason,
   ]).join("\n");
 
   return (
@@ -621,6 +623,11 @@ function ConsolidationFooter(props: {
           {harvestError !== undefined && (
             <div role="alert" className="text-error truncate">
               Harvest error: {harvestError}
+            </div>
+          )}
+          {refusal !== null && (
+            <div role="alert" className="text-error truncate">
+              Dream stopped {formatRelativeTime(refusal.at)}: {refusal.reason}
             </div>
           )}
           {runError !== null && <div className="text-error truncate">{runError}</div>}

@@ -99,6 +99,19 @@ export const MemoryConsolidationRecordSchema = z.object({
 });
 export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidationRecordSchema>;
 
+/**
+ * The latest dream run the user's cost ceiling stopped before its model call, kept until a later
+ * run completes. Without it an automatic refusal is silent: the dream just stops running.
+ */
+export const MemoryDreamRefusalSchema = z.object({
+  at: z.number(),
+  /** The check's own reason, with the estimate and the ceiling it compared. */
+  reason: z.string(),
+  /** Optional: a model with no known price has no estimate. */
+  estimatedUsd: z.number().optional(),
+});
+export type MemoryDreamRefusal = z.infer<typeof MemoryDreamRefusalSchema>;
+
 export const CompactionCompletionMetadataSchema = z.object({
   workspaceId: z.string(),
   summaryMessageId: z.string(),
@@ -158,6 +171,8 @@ export const MemoryConsolidationStatusSchema = z.object({
   projectRecord: MemoryConsolidationRecordSchema.nullable(),
   globalRecord: MemoryConsolidationRecordSchema.nullable(),
   latestHarvestRecord: MemoryHarvestRecordSchema.nullable(),
+  /** The workspace's memory store's latest ceiling refusal of a dream run, if no run completed since. */
+  latestRefusal: MemoryDreamRefusalSchema.nullish(),
   projectAvailable: z.boolean(),
 });
 export type MemoryConsolidationStatusPayload = z.infer<typeof MemoryConsolidationStatusSchema>;

@@ -2298,6 +2298,70 @@ describe("MemoryConsolidationService", () => {
       expect((await harvestRecords(fixture))["open:open-2"]?.status).toBe("completed");
     });
 
+    describe("the latest refusal", () => {
+      it("is kept in the status with its reason and estimate, replaced by the next refusal, and cleared by a run that completes", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await setCeiling(fixture, TIGHT_CEILING_USD);
+        expect((await fixture.service.getStatus("ws-dream")).latestRefusal).toBeNull();
+
+        // An automatic trigger: nothing but the status shows that the dream was stopped.
+        expectOverCeiling(await fixture.service.maybeRun("ws-dream", "compaction"));
+        const first = (await fixture.service.getStatus("ws-dream")).latestRefusal;
+        expect(first?.reason).toContain("over the 0.01 USD ceiling");
+        expect(first?.estimatedUsd).toBeGreaterThan(TIGHT_CEILING_USD);
+
+        // A refusal under another ceiling replaces the first: the status keeps the latest only.
+        await setCeiling(fixture, 0.02);
+        const refused = await fixture.service.maybeRun("ws-dream", "launch");
+        expect(refused.success).toBe(false);
+        expect((await fixture.service.getStatus("ws-dream")).latestRefusal?.reason).toContain(
+          "over the 0.02 USD ceiling"
+        );
+
+        await setCeiling(fixture, LOOSE_CEILING_USD);
+        expect((await fixture.service.maybeRun("ws-dream", "launch")).success).toBe(true);
+        expect((await fixture.service.getStatus("ws-dream")).latestRefusal).toBeNull();
+      });
+
+      it("keeps a refusal across a reload of the sidecar and tells a sub-agent its owner's", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await setCeiling(fixture, TIGHT_CEILING_USD);
+
+        // A child's trigger runs the owner's dream, so the owner's store carries the refusal.
+        expectOverCeiling(await fixture.service.maybeRun("ws-sub", "compaction"));
+
+        const sidecar = JSON.parse(
+          await fsPromises.readFile(
+            path.join(fixture.xumHome, "memory-consolidation.json"),
+            "utf-8"
+          )
+        ) as { refusalsByWorkspace: Record<string, { reason: string }> };
+        expect(Object.keys(sidecar.refusalsByWorkspace)).toEqual(["ws-dream"]);
+        for (const workspaceId of ["ws-dream", "ws-sub"]) {
+          expect((await fixture.service.getStatus(workspaceId)).latestRefusal?.reason).toContain(
+            "over the 0.01 USD ceiling"
+          );
+        }
+      });
+
+      it("drops a malformed refusal instead of failing the sidecar load", async () => {
+        using fixture = await createFixture();
+        await fsPromises.writeFile(
+          path.join(fixture.xumHome, "memory-consolidation.json"),
+          JSON.stringify({
+            workspaces: {},
+            projects: {},
+            refusalsByWorkspace: { "ws-dream": { at: "yesterday", reason: 7 } },
+          })
+        );
+
+        expect((await fixture.service.getStatus("ws-dream")).latestRefusal).toBeNull();
+      });
+    });
+
     it("refuses a model with no known price only while a ceiling is set", async () => {
       const models = archivePassModels();
       using fixture = await createFixture({

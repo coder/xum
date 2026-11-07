@@ -43,11 +43,13 @@ import {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   MemoryConsolidationRecordSchema,
+  MemoryDreamRefusalSchema,
   MemoryHarvestRecordSchema,
   type MemoryConsolidationRecordPayload,
   type MemoryConsolidationStatusChangeEventPayload,
   type MemoryConsolidationStatusPayload,
   type MemoryConsolidationTrigger,
+  type MemoryDreamRefusal,
   type MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { defaultModel } from "@/common/utils/ai/models";
@@ -97,6 +99,12 @@ interface ConsolidationSidecarFile {
   workspaces: Record<string, MemoryConsolidationRecord>;
   projects: Record<string, MemoryConsolidationRecord>;
   harvestsByWorkspace: Record<string, Record<string, MemoryHarvestRecord>>;
+  /**
+   * The latest ceiling refusal of a dream run per workspace store, until a run completes. A
+   * bucket of its own, so a binary that does not know it drops it on its next write and reads
+   * every other bucket as before.
+   */
+  refusalsByWorkspace: Record<string, MemoryDreamRefusal>;
 }
 
 interface MemoryConsolidationRunOptions {
@@ -292,6 +300,16 @@ function normalizeHarvestRecord(record: MemoryHarvestRecord): MemoryHarvestRecor
 function parseConsolidationRecordMap(value: unknown): Record<string, MemoryConsolidationRecord> {
   const parsed = ConsolidationRecordMapSchema.safeParse(value);
   return parsed.success ? parsed.data : {};
+}
+
+function parseRefusals(value: unknown): Record<string, MemoryDreamRefusal> {
+  if (!isPlainRecord(value)) return {};
+  const parsed: Record<string, MemoryDreamRefusal> = {};
+  for (const [workspaceId, refusal] of Object.entries(value)) {
+    const candidate = MemoryDreamRefusalSchema.safeParse(refusal);
+    if (candidate.success) parsed[workspaceId] = candidate.data;
+  }
+  return parsed;
 }
 
 function parseHarvestRecords(value: unknown): Record<string, Record<string, MemoryHarvestRecord>> {
@@ -546,6 +564,7 @@ export class MemoryConsolidationService extends EventEmitter {
             workspaces: parseConsolidationRecordMap(json.workspaces),
             projects: parseConsolidationRecordMap(json.projects),
             harvestsByWorkspace: parseHarvestRecords(json.harvestsByWorkspace),
+            refusalsByWorkspace: parseRefusals(json.refusalsByWorkspace),
           };
         },
         catch: () => undefined,
@@ -553,7 +572,14 @@ export class MemoryConsolidationService extends EventEmitter {
         // Missing or corrupt JSON — start fresh (the next save overwrites the file).
         Effect.catch(() => Effect.succeed(undefined))
       );
-      return parsed ?? { workspaces: {}, projects: {}, harvestsByWorkspace: {} };
+      return (
+        parsed ?? {
+          workspaces: {},
+          projects: {},
+          harvestsByWorkspace: {},
+          refusalsByWorkspace: {},
+        }
+      );
     });
   }
 
@@ -594,6 +620,7 @@ export class MemoryConsolidationService extends EventEmitter {
         projectRecord: projectPath === "" ? null : (file.projects[projectPath] ?? null),
         globalRecord,
         latestHarvestRecord: findNewestHarvestRecord(file.harvestsByWorkspace[workspaceId]),
+        latestRefusal: file.refusalsByWorkspace[ownerWorkspaceId] ?? null,
         projectAvailable: projectPath !== "",
       };
     });
@@ -630,11 +657,35 @@ export class MemoryConsolidationService extends EventEmitter {
             if (projectPath !== "") {
               file.projects[projectPath] = record;
             }
+            // A completed run is the proof that the ceiling no longer stops this workspace.
+            delete file.refusalsByWorkspace[workspaceId];
             await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
           })
         );
         // The sidecar write does not touch memory files, so open Memory tabs need
         // this explicit status invalidation even when a run made zero mutations.
+        self.emitStatusChange(workspaceId, projectPath);
+      })
+    );
+  }
+
+  /** Keeps the latest refusal of a workspace's dream run until a run completes (saveRecordEffect). */
+  private saveRefusalEffect(
+    workspaceId: string,
+    projectPath: string,
+    refusal: MemoryDreamRefusal
+  ): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          self.locks.withLock(self.sidecarPath, async () => {
+            const file = await self.load();
+            file.refusalsByWorkspace[workspaceId] = refusal;
+            await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
+          })
+        );
         self.emitStatusChange(workspaceId, projectPath);
       })
     );
@@ -1123,7 +1174,16 @@ export class MemoryConsolidationService extends EventEmitter {
         estimatedUsd,
         pricingModel: modelResult.data.metadataModel,
       });
-      if (!ceiling.allowed) return Err(`${ORGANIZER_REFUSAL_PREFIX}${ceiling.reason}`);
+      if (!ceiling.allowed) {
+        // Nothing else records a refusal: it writes no run record, so without this the dream just
+        // stops running and a user who set a ceiling cannot tell why.
+        yield* self.saveRefusalEffect(workspaceId, projectPath, {
+          at: Date.now(),
+          reason: ceiling.reason,
+          estimatedUsd,
+        });
+        return Err(`${ORGANIZER_REFUSAL_PREFIX}${ceiling.reason}`);
+      }
 
       const consolidate = () =>
         runMemoryConsolidation({

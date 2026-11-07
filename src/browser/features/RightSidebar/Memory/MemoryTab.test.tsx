@@ -449,6 +449,32 @@ describe("MemoryTab", () => {
     await findByText("Harvest: failed: 0 edits / 0 rejected · est. up to $3.20");
   });
 
+  test("tells the user that the cost ceiling stopped the dream, and shows nothing without a refusal", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestRefusal: {
+          at: Date.now() - 60_000,
+          reason: "estimate 4.06 USD (an upper bound) is over the 1.00 USD ceiling",
+          estimatedUsd: 4.06,
+        },
+      },
+    });
+    const { findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const alert = await findByRole("alert");
+    expect(alert.textContent).toContain("Dream stopped");
+    expect(alert.textContent).toContain("over the 1.00 USD ceiling");
+  });
+
+  test("shows no dream refusal alert when the status has none", async () => {
+    fake = createFakeMemoryApi([]);
+    const { findByText, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: /);
+    expect(queryByRole("alert")).toBeNull();
+  });
+
   test("shows the estimate recorded for a dream run, and nothing for a record without one", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
