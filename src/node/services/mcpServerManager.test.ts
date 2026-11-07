@@ -5551,6 +5551,19 @@ describe("MCPServerManager", () => {
     expect(result.stats.failedServerNames).toEqual(["late"]);
   });
 
+  test("a startup that neither hangs nor ends fails with its cause, not the test timeout", async () => {
+    // connect() never resolves and the connection does not hang on purpose, so the startup waits
+    // for a deadline that fake timers never fire. The harness bounds its wait in real time.
+    configService.listServers = mock(() => Promise.resolve({ idle: stdioConfig("idle-cmd") }));
+    servers.serve("idle-cmd", { connect: () => new Promise<void>(() => undefined) });
+    servers.startupHangWaitMs = 100;
+    await expect(
+      servers.expireStartupDeadline(() =>
+        manager.getToolsForWorkspace(workspaceRequest("ws-idle-startup"))
+      )
+    ).rejects.toThrow("startup never hung (still running after 100 ms)");
+  });
+
   test("a startup timeout waits for its abort cleanup before surfacing", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
     configService.listServers = mock(() =>

@@ -26,6 +26,42 @@ export { MCP_STARTUP_TIMEOUT_MS };
 // bun-types (^1.2.23) lags the pinned runtime (bun@1.4.3), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
+/**
+ * Real time expireStartupDeadline gives a startup to hang before it fails. With fake timers on,
+ * the 5 s test limit did not stop a run that waited without this bound (it stayed stuck for over
+ * 120 s), so the bound is the only stop for a startup that never hangs. It is long because a host
+ * that stalls the process for 20 s must not fail a startup that was only paused.
+ */
+const STARTUP_HANG_WAIT_MS = 30_000;
+
+// lib.es2023 lacks Atomics.waitAsync (ES2024); the pinned runtime (bun@1.4.3) has it.
+type AtomicsWaitAsync = (
+  array: Int32Array,
+  index: number,
+  value: number,
+  timeout: number
+) => { async: false; value: string } | { async: true; value: Promise<string> };
+
+/**
+ * A bound in real time while fake timers are on. Fake timers freeze setTimeout, Date,
+ * performance.now and Bun.sleep, but not Atomics.waitAsync, whose timeout the engine owns.
+ */
+function realTimeBound(ms: number): { expired: Promise<void>; cancel: () => void } {
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  const wait = (Atomics as typeof Atomics & { waitAsync: AtomicsWaitAsync }).waitAsync(
+    cell,
+    0,
+    0,
+    ms
+  );
+  assert(wait.async, "realTimeBound: the cell holds 0, so the wait must be pending");
+  return {
+    expired: wait.value.then(() => undefined),
+    // Wake the waiter so no timer outlives the call.
+    cancel: () => void Atomics.notify(cell, 0),
+  };
+}
+
 type MCPClientHandle = Awaited<ReturnType<typeof mcpSdk.createMCPClient>>;
 type FakePrompt = Awaited<ReturnType<MCPClientHandle["prompts"]>>[number];
 
@@ -91,6 +127,8 @@ export class FakeMcpServers {
   private hungConnects = 0;
   /** Waits for a hung-connection count (expireStartupDeadline), resolved by the hang itself. */
   private readonly hungWaiters = new Set<{ target: number; resolve: () => void }>();
+  /** Real time expireStartupDeadline waits for the hang; a test of the failure shortens it. */
+  startupHangWaitMs = STARTUP_HANG_WAIT_MS;
   private readonly remoteHeaders = new Map<string, Array<Record<string, string> | undefined>>();
   private clientSpy: ReturnType<typeof spyOn<typeof mcpSdk, "createMCPClient">> | null = null;
 
@@ -152,15 +190,30 @@ export class FakeMcpServers {
       const pending = operation();
       // Wait for the hang itself, not for a number of event-loop turns: the startup path does real
       // I/O before it hangs, and a loaded host ran out of turns first. An operation that ends
-      // without hanging fails here instead of waiting forever.
-      const outcome = await Promise.race([
-        this.untilHung(target).then(() => "hung" as const),
-        pending.then(
-          () => "settled" as const,
-          () => "settled" as const
-        ),
-      ]);
-      assert(outcome === "hung", "FakeMcpServers.expireStartupDeadline: startup never hung");
+      // without hanging, or is still running after a bound in real time, fails here with its
+      // cause instead of waiting for the test's own timeout.
+      const bound = realTimeBound(this.startupHangWaitMs);
+      let outcome: "hung" | "settled" | "bound";
+      try {
+        outcome = await Promise.race([
+          this.untilHung(target).then(() => "hung" as const),
+          pending.then(
+            () => "settled" as const,
+            () => "settled" as const
+          ),
+          bound.expired.then(() => "bound" as const),
+        ]);
+      } finally {
+        bound.cancel();
+      }
+      assert(
+        outcome === "hung",
+        `FakeMcpServers.expireStartupDeadline: startup never hung (${
+          outcome === "settled"
+            ? "the operation ended first"
+            : `still running after ${this.startupHangWaitMs} ms`
+        })`
+      );
       // One more turn, so the other startups in flight finish what their microtasks reach (a
       // sibling that fails at once must fail before the deadline fires, not time out with it).
       await new Promise((resolve) => setImmediate(resolve));
