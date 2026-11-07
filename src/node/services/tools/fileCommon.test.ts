@@ -121,6 +121,8 @@ describe("fileCommon", () => {
       }
       await fs.symlink(secretDir, path.join(workspace, "secret-link"));
       await fs.symlink(path.join(secretDir, "new.txt"), path.join(workspace, "dangling-link"));
+      await fs.symlink(path.join(workspace, "loop-b"), path.join(workspace, "loop-a"));
+      await fs.symlink(path.join(workspace, "loop-a"), path.join(workspace, "loop-b"));
       const policy: AgentSandboxPolicy = {
         writeRoots: [workspace],
         denyWrite: [],
@@ -174,6 +176,13 @@ describe("fileCommon", () => {
       {
         name: "writes through a dangling link that points out of the workspace",
         target: () => "dangling-link",
+        access: "write",
+        allowed: false,
+      },
+      // A link loop has no real path, so the check fails closed instead of chasing it forever.
+      {
+        name: "writes through a link loop",
+        target: () => "loop-a",
         access: "write",
         allowed: false,
       },
@@ -235,6 +244,27 @@ describe("fileCommon", () => {
         (await resolvePathWithinCwd(secret, fixture.workspace, fixture.runtime, "write"))
           .resolvedPath
       ).toBe(secret);
+    });
+
+    // SSH and the other remote runtimes have no agent sandbox at all.
+    it("checks nothing on a runtime without an agent sandbox", async () => {
+      const sshRuntime = createRuntime({
+        type: "ssh",
+        host: "user@localhost",
+        srcBaseDir: "/home/user/mux",
+        identityFile: "/tmp/fake-key",
+      });
+
+      expect(
+        (
+          await resolvePathWithinCwd(
+            "/home/user/.ssh/id_rsa",
+            "/home/user/mux/p/b",
+            sshRuntime,
+            "write"
+          )
+        ).resolvedPath
+      ).toBe("/home/user/.ssh/id_rsa");
     });
   });
 
