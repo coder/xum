@@ -146,8 +146,9 @@ describe("MemoryDreamCostCeilingSetting", () => {
 
   // The first three are what a browser's number field reports as "" (no ceiling). The next three
   // parse as numbers in JavaScript (16, 1000, 5), so only the field's own pattern turns them away.
-  // The last two have a second separator.
-  test.each(["-", "1e", "abc", "0x10", "1e3", "+5", "1,2,3", "1.5,5"])(
+  // The last three have a second separator; "1.5,000" must read as no number, not as a thousands
+  // group, since only a whole draft of digits, a comma and three digits can be one.
+  test.each(["-", "1e", "abc", "0x10", "1e3", "+5", "1,2,3", "1.5,5", "1.5,000"])(
     "keeps the saved ceiling when %p is left, and shows why",
     async (keys) => {
       const { view, input, saved, blur } = await renderSetting({
@@ -213,6 +214,8 @@ describe("MemoryDreamCostCeilingSetting", () => {
     ["0.019", 0.02],
     ["0.014", 0.01],
     ["1.499", 1.5],
+    // The range is checked after rounding, so a draft that rounds up to the smallest ceiling saves it.
+    ["0.005", 0.01],
   ])("rounds %p to the cent, %d, and shows the rounded ceiling", async (keys, ceiling) => {
     const { view, input, saved, type, blur } = await renderSetting();
 
