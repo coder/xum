@@ -6,11 +6,11 @@ import {
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import type { BackupContents } from "@/common/config/schemas/settingsBackup";
-import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import {
   BackupPluginEntrySchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
   type BackupPluginEntry,
+  type BackupPluginMethod,
   type BackupPluginManifest,
   type BackupPluginRemoval,
   type BackupPluginReport,
@@ -74,7 +74,7 @@ async function readManagedInstalls(rootDir: string): Promise<Map<string, AgentPl
  * The preview selector that rebuilds a plugin Xum generated a plugin.json for. A plugin with its
  * own manifest has none: the preview takes the first method that fits.
  */
-function methodOf(generated: GeneratedFrom | undefined): AgentPluginInstallMethod | undefined {
+function methodOf(generated: GeneratedFrom | undefined): BackupPluginMethod | undefined {
   if (generated === undefined) return undefined;
   return generated.kind === "skills"
     ? { kind: "skills" }

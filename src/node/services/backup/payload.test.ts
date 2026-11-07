@@ -5716,6 +5716,8 @@ describe("sanitizeBackupGitRemote", () => {
       "../relative/repo",
       "git@github.com:dev/repo.git --upload-pack=evil",
       "https://github.com/dev/repo.git?token=abc",
+      // A bidi override makes the remote read differently from what git gets.
+      "https://github.com/dev/\u202Erepo.git",
       // A percent-encoded token would evade the publish-time pattern scan of the manifest.
       `https://example.com/%67hp_${"a".repeat(24)}/repo.git`,
     ]) {

@@ -478,7 +478,7 @@ describe("backup of the managed plugin list", () => {
       expect(preview.plugins.warnings).toHaveLength(3);
     });
 
-    it("leaves out a row whose url git would read as an option, and a row pinned to a short id", async () => {
+    it("leaves out a row whose url git would read as an option or a network share, and a row pinned to a short id", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
       const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
       const [alpha] = sidecar.plugins;
@@ -488,15 +488,20 @@ describe("backup of the managed plugin list", () => {
         source: { type: "git", url: "--upload-pack=x", ref: "main", refType: "branch" },
       };
       const short = { ...alpha, name: "short-id", lockedSha: "a".repeat(39) };
+      const share = {
+        ...alpha,
+        name: "unc-share",
+        source: { type: "git", url: "//host/share/repo.git", ref: "main", refType: "branch" },
+      };
       await writeSidecar(
         managed,
-        JSON.stringify({ schemaVersion: 1, plugins: [alpha, option, short] })
+        JSON.stringify({ schemaVersion: 1, plugins: [alpha, option, short, share] })
       );
 
       const preview = await previewAndValidate(payload, request);
 
       expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
-      expect(preview.plugins.warnings).toHaveLength(2);
+      expect(preview.plugins.warnings).toHaveLength(3);
     });
 
     it("reads only the first rows of an oversized list and caps the warnings", async () => {

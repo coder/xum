@@ -1,14 +1,14 @@
 import { z } from "zod";
 import {
+  hasUnsafeUrlCharacters,
+  hasUrlCredentials,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
 } from "@/common/config/schemas/settingsBackup";
 import {
   AgentPluginGitSourceSchema,
-  AgentPluginImportedComponentsSchema,
   AgentPluginInstallEntrySchema,
 } from "@/common/config/schemas/agentPluginInstalls";
-import { AgentPluginInstallMethodSchema } from "./agentPlugins";
 import { ResultSchema } from "./result";
 
 /**
@@ -56,41 +56,84 @@ export const BackupProjectImportResultSchema = z.object({
 });
 
 /**
- * A full commit id. The same shape as `isFullCommitSha` (src/node/services/agentPlugins/sourceInput.ts),
- * which common code cannot import. Lowercase only: the install status and the pinned-commit check
- * compare ids as exact strings, and git prints lowercase.
+ * A full commit id in lowercase. `isFullCommitSha` (src/node/services/agentPlugins/sourceInput.ts)
+ * also takes uppercase, but common code cannot import it. The install status and the pinned-commit
+ * check compare ids as exact strings, and git prints lowercase, so a row with an uppercase id is
+ * refused here rather than normalized.
  */
 const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 /** Cap on the plugins one backup list names: it is repository-controlled, and a restore shows every row. */
 export const MAX_BACKUP_PLUGIN_ENTRIES = 512;
 
+/** Caps on what one row names, for the same reason: skills and MCP servers, and each name. */
+export const MAX_BACKUP_PLUGIN_COMPONENTS = 512;
+const MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS = 256;
+
+const BackupPluginComponentNamesSchema = z
+  .array(z.string().min(1).max(MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS))
+  .max(MAX_BACKUP_PLUGIN_COMPONENTS);
+
+/**
+ * The install methods an export writes: the two for which Xum generates the plugin.json
+ * (`generatesManifest` in installMethods.ts). Any other method names a manifest the repository
+ * already has, so the preview finds it without a selector.
+ */
+export const BackupPluginMethodSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("skills") }),
+  z.object({
+    kind: z.literal("claude-marketplace"),
+    entry: z.string().min(1).max(MAX_BACKUP_PLUGIN_COMPONENT_NAME_CHARS),
+  }),
+]);
+
+/**
+ * A repository URL a restore hands to git. The list is repository-controlled, so the URL must not
+ * read as a git option (a leading dash, or whitespace before it, since the preview trims its
+ * input), as a UNC share (`//host/share`, which Windows opens over SMB and so sends the user's
+ * credentials), or carry whitespace, control or bidi characters or a credential. A local path
+ * is not refused here: the export leaves those out (agentPluginBackup.ts), and the user sees the
+ * URL before any preview runs.
+ */
+const BackupPluginUrlSchema = z
+  .string()
+  .min(1)
+  .max(2048)
+  .regex(/^[^\s-]/, { message: "A repository URL must not start with '-' or whitespace" })
+  .refine((url) => !/^[\\/]{2}/.test(url), {
+    message: "A repository URL must not be a network share",
+  })
+  .refine((url) => !hasUnsafeUrlCharacters(url), {
+    message: "A repository URL must not contain whitespace or control characters",
+  })
+  .refine((url) => !hasUrlCredentials(url), {
+    message: "A repository URL must not carry a credential",
+  });
+
 /**
  * One managed Agent Plugin as the backup records it: where it came from and which commit it was
  * pinned to. Only what is needed to offer the install again. Consent, hook trust, approved copies,
  * enabled servers and timestamps are local facts and never travel (the parse drops them): another
- * machine's review is the only thing that can approve a plugin there. Fields are capped like the
- * project bundle's, because the list is repository-controlled.
+ * machine's review is the only thing that can approve a plugin there. Every field has a cap,
+ * because the list is repository-controlled.
  */
 export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
   source: AgentPluginGitSourceSchema.extend({
-    // The list is repository-controlled and the preview hands this URL to git: a leading dash
-    // would be read as a git option, not a repository. The preview trims its input, so leading
-    // whitespace before the dash is refused too.
-    url: z
-      .string()
-      .min(1)
-      .max(2048)
-      .regex(/^[^\s-]/, { message: "A repository URL must not start with '-' or whitespace" }),
+    url: BackupPluginUrlSchema,
     ref: z.string().min(1).max(256),
     subpath: z.string().min(1).max(1024).optional(),
   }),
   /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
   lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),
   /** The install method of a plugin Xum generated a plugin.json for; absent takes the first that fits. */
-  method: AgentPluginInstallMethodSchema.optional(),
-  importedComponents: AgentPluginImportedComponentsSchema.optional(),
+  method: BackupPluginMethodSchema.optional(),
+  importedComponents: z
+    .object({
+      skills: BackupPluginComponentNamesSchema,
+      mcpServers: BackupPluginComponentNamesSchema,
+    })
+    .optional(),
 });
 
 /**
@@ -295,6 +338,7 @@ export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
 export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
+export type BackupPluginMethod = z.infer<typeof BackupPluginMethodSchema>;
 export type BackupPluginStatus = z.infer<typeof BackupPluginStatusSchema>;
 export type BackupPluginRow = z.infer<typeof BackupPluginRowSchema>;
 export type BackupPluginReport = z.infer<typeof BackupPluginReportSchema>;
