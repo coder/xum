@@ -2,6 +2,10 @@ import type { RuntimeConfig, RuntimeMode } from "@/common/types/runtime";
 import type { RuntimeStatusEvent as StreamRuntimeStatusEvent } from "@/common/types/stream";
 import type { Result } from "@/common/types/result";
 import type { HolderEvidence } from "@/node/utils/concurrency/processLiveness";
+import type {
+  AgentSandboxPolicy,
+  AgentSandboxPolicyInput,
+} from "@/node/runtime/sandbox/agentSandboxTargets";
 
 /**
  * Runtime abstraction for executing tools in different environments.
@@ -85,6 +89,11 @@ export interface ExecOptions {
    * (bash, background bash, tool hooks, the init hook, web_fetch) never set it otherwise.
    */
   sandbox?: "off";
+  /**
+   * Workspace folders the sandbox opens like cwd: the checkouts of a multi-project workspace, or
+   * the workspace of a background command that starts in /tmp and cd's into it.
+   */
+  sandboxRoots?: string[];
 }
 
 export type BackgroundMonitorProbeResult<T> =
@@ -187,8 +196,11 @@ export interface ExecStream {
   exitCode: Promise<number>;
   /** Promise that resolves with wall clock duration in milliseconds */
   duration: Promise<number>;
-  /** Set when the command runs in the macOS agent sandbox: the key of its denials. */
-  sandboxCommandId?: string;
+  /**
+   * Set when the command runs in the macOS agent sandbox: what the sandbox blocked, read once the
+   * command exited. `failed` allows a short bounded wait for the system log.
+   */
+  sandboxDenials?: (failed: boolean) => Promise<string[]>;
 }
 
 /**
@@ -509,6 +521,13 @@ export interface Runtime {
    * MultiProjectRuntime and object doubles leave it absent, as instanceof is false for them.
    */
   readonly location?: RuntimeLocation;
+  /**
+   * The macOS agent sandbox policy of a command of this runtime in `input.cwd`, or null when no
+   * sandbox applies (off, not macOS, or not a Local or Worktree runtime). File tools check paths
+   * against it, so they follow the same rules as the shell. Throws AgentSandboxStartError when
+   * the sandbox applies but no safe policy exists for `input.cwd`.
+   */
+  agentSandboxPolicy?(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null;
   /**
    * The runtime type of a workspace config (`ssh`, `docker`, `devcontainer`), for text that names
    * the runtime to a user or a model. SSHRuntime (and CoderSSHRuntime), DockerRuntime and

@@ -21,6 +21,7 @@ import type {
   ToolCallExecutionStartEventSchema,
   ToolCallStartEventSchema,
   BashOutputEventSchema,
+  BashSandboxApprovalEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
   UsageDeltaEventSchema,
@@ -59,6 +60,7 @@ export type StreamAbortEvent = z.infer<typeof StreamAbortEventSchema>;
 export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
 
 export type BashOutputEvent = z.infer<typeof BashOutputEventSchema>;
+export type BashSandboxApprovalEvent = z.infer<typeof BashSandboxApprovalEventSchema>;
 export type TaskCreatedEvent = z.infer<typeof TaskCreatedEventSchema>;
 export type WorkflowRunAttachedEvent = z.infer<typeof WorkflowRunAttachedEventSchema>;
 export type ToolCallStartEvent = z.infer<typeof ToolCallStartEventSchema>;

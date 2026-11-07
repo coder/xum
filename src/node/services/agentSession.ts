@@ -11141,6 +11141,9 @@ export class AgentSession {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
     });
+    forward("bash-sandbox-approval", (payload) => {
+      this.emitChatEvent(payload);
+    });
     forward("task-created", (payload) => {
       this.emitChatEvent(payload);
     });

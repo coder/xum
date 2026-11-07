@@ -483,6 +483,20 @@ export const BashOutputEventSchema = z.object({
 });
 
 /**
+ * UI-only state of a bash call that waits for the user to let it run outside the sandbox. Sent
+ * with `pending: true` when the wait starts and `pending: false` once it ends (answered or
+ * stopped); the approval card shows only while the backend waits.
+ */
+export const BashSandboxApprovalEventSchema = z.object({
+  type: z.literal("bash-sandbox-approval"),
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  reason: z.string(),
+  pending: z.boolean(),
+  timestamp: z.number().meta({ description: "When the state changed (Date.now())" }),
+});
+
+/**
  * UI-only notification that a task tool call has created a child workspace.
  *
  * This is intentionally NOT part of the tool result returned to the model.
@@ -861,6 +875,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
+  BashSandboxApprovalEventSchema,
   LegacyAdvisorOutputEventSchema,
   LegacyAdvisorReasoningOutputEventSchema,
   LegacyAdvisorPhaseEventSchema,

@@ -2187,6 +2187,20 @@ export const workspace = {
       .strict(),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Answers the sandbox approval card of one bash call: approved runs that one call outside the
+   * sandbox. Only the user calls it; sandboxed commands do not get the server token.
+   */
+  answerSandboxApproval: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        toolCallId: z.string(),
+        approved: z.boolean(),
+      })
+      .strict(),
+    output: ResultSchema(z.void(), z.string()),
+  },
   answerDelegatedToolCall: {
     input: z
       .object({

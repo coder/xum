@@ -21,6 +21,7 @@ import type {
   ReadFileOptions,
 } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
+import type { AgentSandboxPolicy, AgentSandboxPolicyInput } from "./sandbox/agentSandboxTargets";
 
 export interface MultiProjectRuntimeEntry {
   projectPath: string;
@@ -451,7 +452,26 @@ export class MultiProjectRuntime implements Runtime {
     return this.primaryRuntime.exec(command, {
       ...options,
       cwd: options.cwd || this.containerPath,
+      sandboxRoots: [...(options.sandboxRoots ?? []), ...this.checkoutLinks()],
     });
+  }
+
+  /** The primary project's policy, with every checkout open like the workspace. */
+  agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
+    return (
+      this.primaryRuntime.agentSandboxPolicy?.({
+        ...input,
+        workspaceRoots: [...(input.workspaceRoots ?? []), ...this.checkoutLinks()],
+      }) ?? null
+    );
+  }
+
+  /**
+   * The container's link to each project's checkout. The sandbox resolves them: Seatbelt checks
+   * real paths, so a write through a link is a write in the checkout.
+   */
+  private checkoutLinks(): string[] {
+    return this.projectRuntimes.map((entry) => path.join(this.containerPath, entry.projectName));
   }
 
   readFile(

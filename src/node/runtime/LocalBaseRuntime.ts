@@ -42,7 +42,17 @@ import {
   sanitizeXumChildEnv,
   stripSandboxedChildEnv,
 } from "./childProcessEnv";
-import { wrapForAgentSandbox, type AgentSandboxWrap } from "./sandbox/macosSandbox";
+import {
+  agentSandboxDenialsAfterExit,
+  wrapForAgentSandbox,
+  type AgentSandboxWrap,
+} from "./sandbox/macosSandbox";
+import {
+  agentSandboxSettingsFor,
+  buildAgentSandboxPolicy,
+  type AgentSandboxPolicy,
+  type AgentSandboxPolicyInput,
+} from "./sandbox/agentSandboxTargets";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 import {
@@ -320,6 +330,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       bashPath,
       abortSignal: options.abortSignal,
       optOut: options.sandbox === "off",
+      workspaceRoots: options.sandboxRoots,
       scratchDir: callerEnv.XUM_SCRATCH_DIR,
       pathEnv: effectivePath,
     });
@@ -454,8 +465,20 @@ export abstract class LocalBaseRuntime implements Runtime {
       exitCode,
       duration,
       localProcess,
-      ...(sandboxed ? { sandboxCommandId: sandboxed.commandId } : {}),
+      ...(sandboxed
+        ? {
+            sandboxDenials: (failed: boolean) =>
+              agentSandboxDenialsAfterExit(sandboxed.commandId, failed),
+          }
+        : {}),
     };
+  }
+
+  agentSandboxPolicy(input: AgentSandboxPolicyInput): AgentSandboxPolicy | null {
+    // Devcontainer commands run in the container, which the macOS sandbox does not cover.
+    if (this.location !== "local" || process.platform !== "darwin") return null;
+    const settings = agentSandboxSettingsFor(this.agentCgroupProjectPath());
+    return settings === null ? null : buildAgentSandboxPolicy(settings, input);
   }
 
   /** The sandboxed spawn of `script` in `cwd`, or null; see wrapForAgentSandbox(). */
@@ -464,6 +487,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     script: string,
     options: Parameters<typeof wrapForAgentSandbox>[3]
   ): Promise<AgentSandboxWrap | null> {
+    if (this.location !== "local") return null;
     try {
       const sandboxed = await wrapForAgentSandbox(
         this.agentCgroupProjectPath(),

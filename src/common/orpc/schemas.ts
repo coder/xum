@@ -150,6 +150,7 @@ export {
   ToolCallExecutionStartEventSchema,
   ToolCallStartEventSchema,
   BashOutputEventSchema,
+  BashSandboxApprovalEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
   RestartBlockerSchema,

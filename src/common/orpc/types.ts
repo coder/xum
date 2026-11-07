@@ -16,6 +16,7 @@ import type {
   ToolCallDeltaEvent,
   ToolCallEndEvent,
   BashOutputEvent,
+  BashSandboxApprovalEvent,
   TaskCreatedEvent,
   WorkflowRunAttachedEvent,
   ReasoningDeltaEvent,
@@ -120,6 +121,12 @@ export function isToolCallDelta(msg: WorkspaceChatMessage): msg is ToolCallDelta
 
 export function isBashOutputEvent(msg: WorkspaceChatMessage): msg is BashOutputEvent {
   return (msg as { type?: string }).type === "bash-output";
+}
+
+export function isBashSandboxApprovalEvent(
+  msg: WorkspaceChatMessage
+): msg is BashSandboxApprovalEvent {
+  return (msg as { type?: string }).type === "bash-sandbox-approval";
 }
 
 export function isTaskCreatedEvent(msg: WorkspaceChatMessage): msg is TaskCreatedEvent {

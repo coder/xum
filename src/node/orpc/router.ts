@@ -100,6 +100,7 @@ import {
   archiveWorkspaceGoal,
   answerDelegatedWorkspaceToolCall,
   answerWorkspaceQuestion,
+  answerWorkspaceSandboxApproval,
   clearWorkspaceGoal,
   createMultiProjectWorkspace,
   createScratchWorkspace,
@@ -2215,6 +2216,10 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.answerAskUserQuestion.input)
         .output(schemas.workspace.answerAskUserQuestion.output)
         .handler(({ context, input }) => answerWorkspaceQuestion(context, input)),
+      answerSandboxApproval: t
+        .input(schemas.workspace.answerSandboxApproval.input)
+        .output(schemas.workspace.answerSandboxApproval.output)
+        .handler(({ input }) => answerWorkspaceSandboxApproval(input)),
       answerDelegatedToolCall: t
         .input(schemas.workspace.answerDelegatedToolCall.input)
         .output(schemas.workspace.answerDelegatedToolCall.output)
