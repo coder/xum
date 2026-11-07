@@ -4003,6 +4003,58 @@ describe("MemoryConsolidationService", () => {
       expect(restarted?.spentUsd).toBeCloseTo(1.5, 3);
     });
 
+    describe("a model with no known price", () => {
+      // The meter counts such a step as $0, so a ceiling would never stop the run. The note puts
+      // that on the record the Memory tab shows, instead of leaving the ceiling looking enforced.
+      const UNPRICED_MODEL = "ollama:no-such-model";
+      const unenforced = "price unknown, ceiling not enforced";
+
+      it("notes on an organizer run that the ceiling was not enforced", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+        await setCeiling(fixture, 0.25);
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+        expect((await fixture.service.getRecord("ws-dream"))?.note).toBe(unenforced);
+      });
+
+      it("notes on an analyzer job that the ceiling was not enforced", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+        await setCeiling(fixture, 0.25);
+
+        expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+        // Every chunk was read: the ceiling stopped nothing.
+        expect(models.steps.filter((step) => step.startsWith("analyzer"))).toHaveLength(6);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          note: unenforced,
+        });
+      });
+
+      it("makes no note when no ceiling is set", async () => {
+        const models = pricedPassModels({ dream: "ends" });
+        using fixture = await createFixture({
+          modelFactory: models.factory,
+          metadataModel: UNPRICED_MODEL,
+        });
+
+        expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+        expect((await fixture.service.getRecord("ws-dream"))?.note).toBeUndefined();
+      });
+    });
+
     it("saves the record of an organizer run the ceiling stopped, so the debounce applies", async () => {
       const models = pricedPassModels({ dream: "never-ends" });
       using fixture = await createFixture({

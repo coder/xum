@@ -23,18 +23,22 @@ interface PricedStep {
 }
 
 /**
- * USD one model step cost, as the app prices usage it records. A model with no known price costs
- * nothing here, as it does in every cost display.
+ * USD one model step cost, as the app prices usage it records; undefined for a model with no known
+ * price. The cost displays show such a step as no cost, but a ceiling must tell it from a step
+ * that cost nothing, because it can never stop a run it cannot price.
  */
-export function stepCostUsd(step: PricedStep, pricingModel: string | undefined): number {
-  if (pricingModel === undefined) return 0;
+export function stepCostUsd(
+  step: PricedStep,
+  pricingModel: string | undefined
+): number | undefined {
+  if (pricingModel === undefined) return undefined;
   // A one-step accumulation is what a recorded run passes with its steps: cache writes moved off
   // the usage, and the context tier of this request.
   const providerMetadata = accumulateStepsProviderMetadata([step], pricingModel);
   const cost = getTotalCost(
     createDisplayUsage(normalizeUsage(step.usage), pricingModel, providerMetadata, pricingModel)
   );
-  return cost !== undefined && Number.isFinite(cost) ? cost : 0;
+  return cost !== undefined && Number.isFinite(cost) ? cost : undefined;
 }
 
 export interface SpendMeter {
@@ -53,8 +57,11 @@ export interface SpendMeter {
   maxOutputTokens: number | undefined;
   /** Measured USD, with what `spentUsd` of the meter's creation already held. */
   spentUsd: () => number;
-  /** The note of a run the ceiling cut short; undefined when it ended on its own. */
-  stoppedNote: () => string | undefined;
+  /**
+   * What the run's record should say about its ceiling: that it cut the run short, or that it
+   * could not (a step had no known price, so the spend stayed at zero). Undefined otherwise.
+   */
+  note: () => string | undefined;
 }
 
 /**
@@ -68,10 +75,13 @@ export function createSpendMeter(args: {
 }): SpendMeter {
   let spent = args.spentUsd ?? 0;
   let stopped = false;
+  let unpriced = false;
   return {
     maxOutputTokens: args.ceilingUsd === undefined ? undefined : MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     recordStep: (step) => {
-      spent += stepCostUsd(step, args.pricingModel);
+      const cost = stepCostUsd(step, args.pricingModel);
+      if (cost === undefined) unpriced = true;
+      else spent += cost;
     },
     stopIfCeilingReached: () => {
       if (args.ceilingUsd === undefined || spent < args.ceilingUsd) return false;
@@ -79,7 +89,10 @@ export function createSpendMeter(args: {
       return true;
     },
     spentUsd: () => spent,
-    stoppedNote: () =>
-      stopped ? `stopped at the cost ceiling after $${spent.toFixed(2)}` : undefined,
+    note: () => {
+      if (stopped) return `stopped at the cost ceiling after $${spent.toFixed(2)}`;
+      if (unpriced && args.ceilingUsd !== undefined) return "price unknown, ceiling not enforced";
+      return undefined;
+    },
   };
 }

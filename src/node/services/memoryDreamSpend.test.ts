@@ -108,9 +108,10 @@ describe("stepCostUsd", () => {
     expect(priority).toBeCloseTo(2 * standard, 9);
   });
 
-  it("counts a model with no known price as free, as every cost display does", () => {
-    expect(stepCostUsd({ usage: usage(250_000, 10_000) }, "ollama:no-such-model")).toBe(0);
-    expect(stepCostUsd({ usage: usage(250_000, 10_000) }, undefined)).toBe(0);
+  it("has no cost for a model with no known price, and a cost of zero for a priced step with no tokens", () => {
+    expect(stepCostUsd({ usage: usage(250_000, 10_000) }, "ollama:no-such-model")).toBeUndefined();
+    expect(stepCostUsd({ usage: usage(250_000, 10_000) }, undefined)).toBeUndefined();
+    expect(stepCostUsd({ usage: usage(0, 0) }, OPENAI_MODEL)).toBe(0);
   });
 });
 
@@ -123,20 +124,41 @@ describe("createSpendMeter", () => {
 
     expect(meter.spentUsd()).toBeCloseTo(50, 9);
     expect(meter.stopIfCeilingReached()).toBe(false);
-    expect(meter.stoppedNote()).toBeUndefined();
+    expect(meter.note()).toBeUndefined();
   });
 
   it("stops once spend reaches the ceiling, not before, and says where", () => {
     const meter = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 1 });
     meter.recordStep(stepOf(250_000));
     expect(meter.stopIfCeilingReached()).toBe(false);
-    expect(meter.stoppedNote()).toBeUndefined();
+    expect(meter.note()).toBeUndefined();
 
     meter.recordStep(stepOf(250_000));
 
     // $0.50 + $0.50: reaching the ceiling exactly stops.
     expect(meter.stopIfCeilingReached()).toBe(true);
-    expect(meter.stoppedNote()).toBe("stopped at the cost ceiling after $1.00");
+    expect(meter.note()).toBe("stopped at the cost ceiling after $1.00");
+  });
+
+  it("says the ceiling is not enforced once a step of a model with no known price ran", () => {
+    const meter = createSpendMeter({ pricingModel: "ollama:no-such-model", ceilingUsd: 1 });
+    expect(meter.note()).toBeUndefined();
+
+    for (let step = 0; step < 100; step++) meter.recordStep(stepOf(250_000));
+
+    // Every step counted as $0: the ceiling can never be reached, and the note says so.
+    expect(meter.stopIfCeilingReached()).toBe(false);
+    expect(meter.note()).toBe("price unknown, ceiling not enforced");
+  });
+
+  it("makes no unknown-price note without a ceiling, or for a known price", () => {
+    const unpriced = createSpendMeter({ pricingModel: "ollama:no-such-model" });
+    unpriced.recordStep(stepOf(250_000));
+    const priced = createSpendMeter({ pricingModel: OPENAI_MODEL, ceilingUsd: 1 });
+    priced.recordStep(stepOf(0));
+
+    expect(unpriced.note()).toBeUndefined();
+    expect(priced.note()).toBeUndefined();
   });
 
   it("carries the spend of earlier attempts", () => {

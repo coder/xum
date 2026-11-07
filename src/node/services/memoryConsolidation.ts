@@ -581,7 +581,7 @@ export async function runMemoryConsolidation(args: {
     budgetExhausted: isBudgetExhausted(),
     usage,
     spentUsd: meter.spentUsd(),
-    note: meter.stoppedNote(),
+    note: meter.note(),
     streamError: streamErrors[0],
   };
 }

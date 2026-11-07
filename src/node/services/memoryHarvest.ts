@@ -701,7 +701,8 @@ export async function runMemoryHarvest(args: {
   return {
     ...progressFor(nextChunk, readChunks),
     streamError,
-    note: note ?? meter.stoppedNote(),
+    // Both can hold: a spent edit budget must not hide that the ceiling was not enforced.
+    note: [note, meter.note()].filter((part) => part !== undefined).join("; ") || undefined,
     readChunks,
   };
 }

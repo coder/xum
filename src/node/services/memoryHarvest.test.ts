@@ -1383,6 +1383,28 @@ describe("runMemoryHarvest", () => {
       ]);
     });
 
+    it("says the ceiling was not enforced for a model with no known price, beside a spent edit budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model } = scriptedModel(
+        chunkScript(
+          Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+            createFile(`/memories/workspace/spent-${index}.md`, `fact ${index}\n`)
+          )
+        )
+      );
+
+      const result = await runHarvest(fixture, model, {
+        pricingModel: "ollama:no-such-model",
+        ceilingUsd: 1,
+      });
+
+      // The spent budget skipped chunks 2 and 3; its note must not hide the unenforced ceiling.
+      expect(result.note).toBe(
+        "edit budget spent: chunks 2-3 of 3 were not read; price unknown, ceiling not enforced"
+      );
+    });
+
     it("leaves a step's output uncapped when no ceiling is set", async () => {
       using fixture = createFixture();
       const { model, calls } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
