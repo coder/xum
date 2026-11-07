@@ -236,7 +236,7 @@ async function disposeWorkflowResources(input: {
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
   agentResourceLimits?: AgentResourceLimitsService;
-  agentSandbox?: AgentSandboxService;
+  agentSandbox: AgentSandboxService;
 }): Promise<void> {
   const services = input.services;
   // Same shape as `xum run`'s list: every step is contained, reported, and
@@ -247,7 +247,7 @@ async function disposeWorkflowResources(input: {
       // reaches a torn-down service. A failed setup stops them too.
       { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
       { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
-      { name: "agentSandbox.dispose", run: () => input.agentSandbox?.dispose() },
+      { name: "agentSandbox.dispose", run: () => input.agentSandbox.dispose() },
       ...(services
         ? [
             // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
@@ -309,16 +309,18 @@ async function createWorkflowContext(options: {
   // the run config to stop its config.json watches.
   const runStores = createConfigStores(tempDir.path);
   const config = runStores.config;
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
+  // Constructed before the try, so the cleanup can always dispose it; a service that never
+  // started has nothing to stop.
+  const agentSandbox = new AgentSandboxService(realConfig);
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
   let agentResourceLimits: AgentResourceLimitsService | undefined;
-  let agentSandbox: AgentSandboxService | undefined;
   try {
-    const realStores = createConfigStores();
-    const realConfig = realStores.config;
     await copyPersistentConfig(realStores, runStores);
 
     const realProvidersStore = realStores.providersConfigStore;
@@ -365,7 +367,6 @@ async function createWorkflowContext(options: {
     // Settings saved in the real config, as the server does.
     agentResourceLimits = new AgentResourceLimitsService(realConfig);
     await agentResourceLimits.start();
-    agentSandbox = new AgentSandboxService(realConfig);
     await agentSandbox.start();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
