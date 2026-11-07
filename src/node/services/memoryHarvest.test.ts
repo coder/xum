@@ -15,7 +15,12 @@ import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { buildHarvestChunks, runMemoryHarvest, type HarvestProgress } from "./memoryHarvest";
+import {
+  buildHarvestChunks,
+  runMemoryHarvest,
+  selectOpenEpoch,
+  type HarvestProgress,
+} from "./memoryHarvest";
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -563,6 +568,8 @@ describe("runMemoryHarvest", () => {
 
     expect(result.streamError).toBeUndefined();
     expect(streamCalls).toBeGreaterThan(1);
+    // Every chunk was read: through the epoch's newest row.
+    expect(result.readThroughRowId).toBe("m11");
   });
 
   it("keeps the compaction summary in the prompt of every chunk", async () => {
@@ -601,6 +608,95 @@ describe("runMemoryHarvest", () => {
       expect(prompt).toContain("[redacted]");
       expect(prompt).not.toContain(githubToken);
     }
+  });
+
+  it("analyzes an epoch that has no compaction summary", async () => {
+    using fixture = createFixture();
+    const prompts: string[] = [];
+    const model = new MockLanguageModelV3({
+      doStream: (options) => {
+        prompts.push(userPromptText(options));
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
+      },
+    });
+
+    const result = await runHarvest(fixture, model, { summary: undefined });
+
+    expect(result.streamError).toBeUndefined();
+    expect(result.nextChunk).toBe(1);
+    expect(prompts.join("\n")).toContain("prefer concise tests");
+    expect(prompts.join("\n")).not.toContain("The user prefers concise tests.");
+  });
+
+  describe("selectOpenEpoch", () => {
+    const summaryRow = (id: string, epoch: number, sequence: number) =>
+      createMuxMessage(id, "assistant", `summary ${epoch}`, {
+        historySequence: sequence,
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: epoch,
+      });
+    const userRow = (
+      id: string,
+      sequence: number,
+      metadata: Partial<MuxMessage["metadata"]> = {}
+    ) => createMuxMessage(id, "user", `row ${id}`, { historySequence: sequence, ...metadata });
+
+    it("keeps the rows after the latest boundary and drops the boundary itself", () => {
+      const open = selectOpenEpoch([
+        summaryRow("summary-2", 2, 5),
+        userRow("after-1", 6),
+        userRow("after-2", 7),
+      ]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["after-1", "after-2"]);
+      // The epoch that the next compaction would close.
+      expect(open.compactionEpoch).toBe(3);
+    });
+
+    it("takes every row of a chat that never compacted", () => {
+      const open = selectOpenEpoch([userRow("a", 0), userRow("b", 1)]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["a", "b"]);
+      expect(open.compactionEpoch).toBe(1);
+    });
+
+    it("starts after a context reset, which has no summary row", () => {
+      const reset = createMuxMessage("reset-1", "assistant", "", {
+        historySequence: 3,
+        contextBoundaryKind: "reset",
+      });
+
+      const open = selectOpenEpoch([userRow("before", 2), reset, userRow("after", 4)]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["after"]);
+    });
+
+    it("drops keep-recent tail copies and model-hidden rows, which the epoch's run never reads", () => {
+      const snapshot: PlanReviewRecord = {
+        v: 1,
+        kind: "snapshot",
+        recordId: "rec_snap",
+        snapshotId: "snap_1",
+        planPath: "/plans/p.md",
+        contentHash: "a".repeat(64),
+        content: "# Plan\n",
+      };
+      const hidden = createMuxMessage("hidden-snap", "user", formatPlanReviewEnvelope(snapshot), {
+        historySequence: 8,
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      });
+
+      const open = selectOpenEpoch([
+        summaryRow("summary-1", 1, 5),
+        userRow("tail-copy", 6, { synthetic: true, rlmPreservedTailCopy: true }),
+        userRow("real", 7),
+        hidden,
+      ]);
+
+      expect(open.messages.map((row) => row.id)).toEqual(["real"]);
+    });
   });
 
   describe("analyzer", () => {
@@ -793,6 +889,8 @@ describe("runMemoryHarvest", () => {
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toContain("chunks 2-3 of 3");
       expect(reached).toEqual([1]);
+      // The cursor is past all three chunks, but only chunk 1's rows were read: m0 to m4.
+      expect(result.readThroughRowId).toBe("m4");
     });
 
     it("does not call the model at all when a retry resumes with the budget already spent", async () => {
@@ -808,6 +906,33 @@ describe("runMemoryHarvest", () => {
       expect(result.nextChunk).toBe(3);
       expect(result.readChunks).toBe(1);
       expect(result.note).toContain("chunks 2-3 of 3");
+      // The attempt before it read chunk 1.
+      expect(result.readThroughRowId).toBe("m4");
+    });
+
+    it("reads through nothing when the budget was spent before any chunk was read", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model, {
+        resume: { nextChunk: 0, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET },
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.readThroughRowId).toBeNull();
+    });
+
+    it("reads through nothing on an epoch with no rows, though its one empty chunk was read", async () => {
+      using fixture = createFixture();
+      fixture.messages = [];
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(calls).toHaveLength(1);
+      expect(result.nextChunk).toBe(1);
+      expect(result.readThroughRowId).toBeNull();
     });
 
     it("leaves no note when the last chunk is the one that spends the budget", async () => {
@@ -826,6 +951,7 @@ describe("runMemoryHarvest", () => {
       expect(result.readChunks).toBe(1);
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toBeUndefined();
+      expect(result.readThroughRowId).toBe("m1");
     });
 
     it("counts the edits an earlier attempt applied against the epoch's budget", async () => {
@@ -990,6 +1116,11 @@ describe("runMemoryHarvest", () => {
       ]);
       // The cursor is reported while the run is still going, before the failing chunk starts.
       expect(reached.map((progress) => progress.nextChunk)).toEqual([1]);
+      // Chunk 1 read cleanly: its last row is read through, in the callback and in the failure.
+      const firstChunkEnd = buildHarvestChunks(fixture.messages)[0].readThroughRowId;
+      expect(firstChunkEnd).not.toBeNull();
+      expect(reached.map((progress) => progress.readThroughRowId)).toEqual([firstChunkEnd]);
+      expect(failed.readThroughRowId).toBe(firstChunkEnd);
 
       const retry = scriptedModel([
         ...chunkScript([createFile("/memories/workspace/two.md", "chunk two fact\n")]),
@@ -1178,6 +1309,54 @@ describe("buildHarvestChunks", () => {
 
     const over = transcriptsOf(messagesHolding(fitting + 1, count));
     expect(over.map((chunk) => (JSON.parse(chunk) as unknown[]).length)).toEqual([count - 1, 1]);
+  });
+
+  describe("the row each chunk reads through", () => {
+    it("is the last message of the chunk", () => {
+      expect(
+        buildHarvestChunks(manyChunkMessages()).map((chunk) => chunk.readThroughRowId)
+      ).toEqual(["m4", "m9", "m11"]);
+    });
+
+    it("leaves out a message that runs on into the next chunk", () => {
+      const longTurn = createMuxMessage(
+        "long",
+        "assistant",
+        "A long turn.",
+        { historySequence: 1 },
+        // 70 results of 1.5 KB: one message of over 100 KB, several chunks.
+        Array.from({ length: 70 }, (_, index) =>
+          toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+        )
+      );
+      const chunks = buildHarvestChunks([
+        createMuxMessage("before", "user", "short", { historySequence: 0 }),
+        longTurn,
+        createMuxMessage("after", "user", "short", { historySequence: 2 }),
+      ]);
+
+      expect(chunks.length).toBeGreaterThan(2);
+      // The long turn ends in the last chunk, with the message after it. Until then the newest
+      // message read in full is the one before it.
+      expect(chunks.slice(0, -1).every((chunk) => chunk.readThroughRowId === "before")).toBe(true);
+      expect(chunks.at(-1)?.readThroughRowId).toBe("after");
+    });
+
+    it("is null while the epoch's first message is still going", () => {
+      const [first] = buildHarvestChunks([
+        createMuxMessage(
+          "only",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: 70 }, (_, index) =>
+            toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+          )
+        ),
+      ]);
+
+      expect(first.readThroughRowId).toBeNull();
+    });
   });
 
   it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
