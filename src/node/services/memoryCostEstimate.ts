@@ -16,6 +16,7 @@ import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_CONSOLIDATION_MAX_STEPS,
 } from "@/common/constants/memory";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
@@ -32,12 +33,14 @@ const ESTIMATED_OUTPUT_TOKENS_PER_STEP = 1_000;
  * Price of a run of `steps` steps over a prompt of `promptChars` characters, or undefined when
  * the model has no known price. Each step is priced as its own request: a model's long-context
  * tier is chosen per request, so pricing the sum of the steps would charge the whole run at the
- * long rate.
+ * long rate. `serviceTier` is the tier the run's requests carry (Fast, Flex, Ultrafast), priced
+ * by the same code that prices a recorded run's reported tier.
  */
 function estimateRunUsd(
   pricingModel: string,
   promptChars: number,
-  steps: number
+  steps: number,
+  serviceTier: ServiceTier | undefined
 ): number | undefined {
   const promptTokens = Math.ceil(promptChars / APPROX_CHARS_PER_TOKEN);
   const cacheWritePriced =
@@ -54,7 +57,8 @@ function estimateRunUsd(
             outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
             inputTokenDetails: { cacheWriteTokens },
           },
-          pricingModel
+          pricingModel,
+          serviceTier === undefined ? undefined : { openai: { serviceTier } }
         )
       );
     const asInput = stepUsd(0);
@@ -75,13 +79,15 @@ export function estimateAnalyzerUpperBoundUsd(args: {
   pricingModel: string;
   chunkInputChars: readonly number[];
   memoryChars: number;
+  serviceTier?: ServiceTier;
 }): number | undefined {
   let total = 0;
   for (const chunkChars of args.chunkInputChars) {
     const chunkUsd = estimateRunUsd(
       args.pricingModel,
       chunkChars + args.memoryChars,
-      MEMORY_ANALYZER_MAX_STEPS
+      MEMORY_ANALYZER_MAX_STEPS,
+      args.serviceTier
     );
     if (chunkUsd === undefined) return undefined;
     total += chunkUsd;
@@ -97,11 +103,13 @@ export function estimateOrganizerUpperBoundUsd(args: {
   pricingModel: string;
   systemPromptChars: number;
   memoryChars: number;
+  serviceTier?: ServiceTier;
 }): number | undefined {
   return estimateRunUsd(
     args.pricingModel,
     args.systemPromptChars + args.memoryChars,
-    MEMORY_CONSOLIDATION_MAX_STEPS
+    MEMORY_CONSOLIDATION_MAX_STEPS,
+    args.serviceTier
   );
 }
 

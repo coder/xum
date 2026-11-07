@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type {
@@ -352,6 +353,8 @@ async function createFixture(options?: {
   withSessionUsage?: boolean;
   /** The pricing identity every created model reports; default: the requested model string. */
   metadataModel?: string;
+  /** The service tier every created model pins into its requests; default: none. */
+  serviceTier?: ServiceTier;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation-service");
   const xumHome = path.join(tempDir.path, "mux-home");
@@ -389,6 +392,7 @@ async function createFixture(options?: {
             options?.modelFactory?.() ??
             (streamFailing ? failingScriptedModel(capturePrompt) : scriptedModel(capturePrompt)),
           metadataModel: options?.metadataModel ?? modelString,
+          ...(options?.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
         });
       },
     },
@@ -2940,6 +2944,60 @@ describe("MemoryConsolidationService", () => {
         );
 
         expect((await fixture.service.getStatus("ws-dream")).latestRefusal).toBeNull();
+      });
+    });
+
+    describe("service tier of the created model", () => {
+      // gpt-6.1-sol bills the priority tier at twice its Standard rates.
+      const PRICED_MODEL = "openai:gpt-6.1-sol";
+      const PRIORITY_FACTOR = 2;
+
+      /** What each pass records when the tight ceiling refuses it. */
+      async function refusedEstimates(
+        serviceTier?: ServiceTier
+      ): Promise<{ analyzerUsd: number; organizerUsd: number }> {
+        using fixture = await createFixture({ metadataModel: PRICED_MODEL, serviceTier });
+        await setCeiling(fixture, TIGHT_CEILING_USD);
+        expectOverCeiling(
+          await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture))
+        );
+        const analyzerUsd = (await harvestRecords(fixture))["summary-1"]?.estimatedUsd;
+        expectOverCeiling(await fixture.service.maybeRun("ws-dream", "manual"));
+        const organizerUsd = (await fixture.service.getStatus("ws-dream")).latestRefusal
+          ?.estimatedUsd;
+        expect(analyzerUsd).toBeGreaterThan(0);
+        expect(organizerUsd).toBeGreaterThan(0);
+        return { analyzerUsd: analyzerUsd ?? 0, organizerUsd: organizerUsd ?? 0 };
+      }
+
+      it("prices the analyzer job and the organizer run at the tier the model carries", async () => {
+        const standard = await refusedEstimates();
+        const priority = await refusedEstimates("priority");
+
+        expect(priority.analyzerUsd).toBeCloseTo(PRIORITY_FACTOR * standard.analyzerUsd, 9);
+        expect(priority.organizerUsd).toBeCloseTo(PRIORITY_FACTOR * standard.organizerUsd, 9);
+      });
+
+      it("refuses a priority-tier run under a ceiling its Standard run fits", async () => {
+        const ceilingUsd = (await refusedEstimates()).organizerUsd * 1.5;
+
+        for (const [serviceTier, allowed] of [
+          [undefined, true],
+          ["priority", false],
+        ] as const) {
+          const models = archivePassModels();
+          using fixture = await createFixture({
+            modelFactory: models.factory,
+            metadataModel: PRICED_MODEL,
+            serviceTier,
+          });
+          await setCeiling(fixture, ceilingUsd);
+
+          const result = await fixture.service.maybeRun("ws-dream", "manual");
+
+          expect(result.success).toBe(allowed);
+          expect(models.runs.map((run) => run.kind)).toEqual(allowed ? ["dream"] : []);
+        }
       });
     });
 

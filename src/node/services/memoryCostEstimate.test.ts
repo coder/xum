@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { defaultModel } from "@/common/utils/ai/models";
 import { MEMORY_ANALYZER_MAX_STEPS } from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -75,6 +76,49 @@ describe("estimateOrganizerUpperBoundUsd", () => {
       }) ?? 0;
     expect(estimate(0)).toBeGreaterThan(0);
     expect(estimate(100_000)).toBeGreaterThan(estimate(0));
+  });
+});
+
+describe("service tier", () => {
+  // gpt-6.1-sol's published tiers, as multiples of its Standard rates: Fast (priority) 2x, Flex
+  // 0.5x, Ultrafast 6x. A reported "default" or "auto" bills at Standard.
+  const MODEL = "openai:gpt-6.1-sol";
+  const analyzer = (serviceTier?: ServiceTier) =>
+    estimateAnalyzerUpperBoundUsd({
+      pricingModel: MODEL,
+      chunkInputChars: [8_000, 20_000],
+      memoryChars: 30_000,
+      serviceTier,
+    }) ?? 0;
+  const organizer = (serviceTier?: ServiceTier) =>
+    estimateOrganizerUpperBoundUsd({
+      pricingModel: MODEL,
+      systemPromptChars: 12_000,
+      memoryChars: 30_000,
+      serviceTier,
+    }) ?? 0;
+
+  it.each<[ServiceTier, number]>([
+    ["priority", 2],
+    ["flex", 0.5],
+    ["ultrafast", 6],
+    ["default", 1],
+    ["auto", 1],
+  ])("prices a run on the %s tier at %dx its Standard estimate", (serviceTier, factor) => {
+    expect(analyzer()).toBeGreaterThan(0);
+    expect(analyzer(serviceTier)).toBeCloseTo(factor * analyzer(), 9);
+    expect(organizer(serviceTier)).toBeCloseTo(factor * organizer(), 9);
+  });
+
+  it("applies the tier to the long-context rates too (a prompt over the 272k threshold)", () => {
+    const longPrompt = (serviceTier?: ServiceTier) =>
+      estimateOrganizerUpperBoundUsd({
+        pricingModel: MODEL,
+        systemPromptChars: 12_000,
+        memoryChars: 400_000 * APPROX_CHARS_PER_TOKEN,
+        serviceTier,
+      }) ?? 0;
+    expect(longPrompt("priority")).toBeCloseTo(2 * longPrompt(), 6);
   });
 });
 

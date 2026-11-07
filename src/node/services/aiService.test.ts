@@ -1374,6 +1374,36 @@ describe("AIService.createModelWithPinnedMetadata", () => {
   });
 });
 
+describe("AIService.createModelWithPinnedMetadata service tier", () => {
+  // The dream prices its run before it starts, so the tier the created model carries must come
+  // back with it.
+  it.each([
+    ["openai:gpt-6.1-sol", { serviceTier: "priority" }, "priority"],
+    ["openai:gpt-6.1-sol", {}, undefined],
+    ["openai:gpt-6.1-sol", { serviceTier: "ultrafast" }, "ultrafast"],
+    // Ultrafast is model-gated: the factory drops it for other models, so the model carries none.
+    ["openai:gpt-6-luna", { serviceTier: "ultrafast" }, undefined],
+    // The OpenAI tier does not reach another provider's requests.
+    ["anthropic:claude-sonnet-5-5", { serviceTier: "priority" }, undefined],
+  ] as const)(
+    "reports the tier a model for %s with %o config carries",
+    async (modelString, openaiConfig, expectedTier) => {
+      using xumHome = new DisposableTempDir("pinned-metadata-service-tier");
+      await writeProvidersConfig(xumHome.path, {
+        openai: { apiKey: "sk-test-key", ...openaiConfig },
+        anthropic: { apiKey: "sk-ant-test-key" },
+      });
+
+      const result = await createBasicAIService(xumHome.path).service.createModelWithPinnedMetadata(
+        modelString
+      );
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.serviceTier).toBe(expectedTier);
+    }
+  );
+});
+
 describe("AIService.streamMessage compaction boundary slicing", () => {
   interface StreamMessageHarness {
     config: Config;

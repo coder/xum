@@ -32,6 +32,7 @@ import type { LanguageModel } from "ai";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { Result } from "@/common/types/result";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import {
@@ -137,7 +138,12 @@ interface ModelFactoryLike {
   createModelWithPinnedMetadata(
     modelString: string,
     opts?: { agentInitiated?: boolean; workspaceId?: string }
-  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, { type: string }>>;
+  ): Promise<
+    Result<
+      { model: LanguageModel; metadataModel: string; serviceTier?: ServiceTier },
+      { type: string }
+    >
+  >;
 }
 
 /**
@@ -1189,6 +1195,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
       const estimatedUsd = estimateOrganizerUpperBoundUsd({
         pricingModel: modelResult.data.metadataModel,
+        serviceTier: modelResult.data.serviceTier,
         systemPromptChars: agentBody.length,
         memoryChars: memoryBytes,
       });
@@ -1666,6 +1673,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
       opts.attemptState.estimatedUsd = estimateAnalyzerUpperBoundUsd({
         pricingModel: modelResult.data.metadataModel,
+        serviceTier: modelResult.data.serviceTier,
         chunkInputChars: harvestChunkInputChars({
           messages,
           summary: epoch.data.summary,

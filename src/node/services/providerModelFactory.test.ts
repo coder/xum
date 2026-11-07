@@ -1909,6 +1909,9 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
         try {
           const result = await factory.createModel("openai:team-astra");
           if (!result.success) throw new Error(result.error.type);
+          expect(
+            factory.resolvePinnedServiceTier("openai:team-astra", store.loadProvidersConfig() ?? {})
+          ).toBe("priority");
           store.saveProvidersConfig({ openai: { ...provider, serviceTier: "auto", store: true } });
           for (const [providerOptions, tier, storeValue] of [
             [undefined, "priority", false],
@@ -1978,6 +1981,10 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
           );
           expect(calls.length).toBe(1);
           expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+          // A caller that prices a run before it starts must see the tier the wire carries.
+          expect(
+            factory.resolvePinnedServiceTier(`openai:${model}`, store.loadProvidersConfig() ?? {})
+          ).toBe(tier);
         } finally {
           fetchSpy.mockRestore();
         }
