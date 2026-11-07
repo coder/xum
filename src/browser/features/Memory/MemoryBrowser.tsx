@@ -523,7 +523,10 @@ function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string 
     record.ops === undefined
       ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
       : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
-  return `${record.status}: ${counts}${formatEstimate(record.estimatedUsd)}`;
+  // Why a completed run read only part of its epoch (its edit budget ran out), so a line that says
+  // "completed" does not read as "everything analyzed".
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${record.status}: ${counts}${formatEstimate(record.estimatedUsd)}${note}`;
 }
 
 /**
@@ -619,10 +622,11 @@ function ConsolidationFooter(props: {
           <div className="counter-nums truncate">
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
-          <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
           {/* Wrap, never truncate: a ceiling refusal's reason (the estimate and the ceiling) is the
-              point of these three lines, and a touch screen cannot open the tooltip that also holds
-              it. A manual run's error is the same refusal text. */}
+              point of the lines below, and a touch screen cannot open the tooltip that also holds
+              it. A manual run's error is the same refusal text, and the harvest line carries the
+              note that a run read only part of its epoch. */}
           {harvestError !== undefined && (
             <div role="alert" className="text-error break-words">
               Harvest error: {harvestError}

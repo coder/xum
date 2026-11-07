@@ -373,6 +373,32 @@ describe("MemoryTab", () => {
     await findByText("Harvest: completed: 3 edits / 1 rejected");
   });
 
+  test("says on the harvest line when a completed run read only part of its epoch", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(
+      "Harvest: completed: 8 edits / 0 rejected · edit budget spent: chunks 2-3 of 3 were not read"
+    );
+  });
+
   test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {
