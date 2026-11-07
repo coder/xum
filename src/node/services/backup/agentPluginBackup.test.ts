@@ -13,7 +13,6 @@ import {
   collectPluginBackup,
   PLUGIN_BACKUP_DIR,
   PLUGIN_BACKUP_MANIFEST_PATH,
-  repositoryIdentity,
 } from "./agentPluginBackup";
 import { captureRejection, commitAll, runGit, writeFixtureFile } from "./testHelpers";
 
@@ -69,104 +68,6 @@ async function writeGeneratedPlugin(root: string, name: string, generatedFrom: u
     JSON.stringify({ name, extensions: { mux: { generatedFrom } } })
   );
 }
-
-describe("repositoryIdentity", () => {
-  /** Spellings of one repository that must stay one identity: only these differences are ignored. */
-  const sameRepository = {
-    "host case, .git, a trailing slash and the default port of https": [
-      "https://github.com/o/r.git",
-      "https://github.com/o/r",
-      "https://github.com/o/r/",
-      "https://github.com/o/r.git/",
-      "https://GitHub.COM/o/r.git",
-      "HTTPS://github.com/o/r.git",
-      "https://github.com:443/o/r",
-      "  https://github.com/o/r.git ",
-    ],
-    "the default port of http": ["http://h:80/x", "http://h/x"],
-    "the default port of git": ["git://h:9418/x.git", "git://H/x/"],
-    "the default port of ssh": ["ssh://git@h:22/x", "ssh://git@h/x"],
-    "ssh with the same user and an absolute path": [
-      "ssh://git@github.com/o/r.git",
-      "ssh://git@GitHub.com:22/o/r/",
-      "git@github.com:/o/r.git",
-      "git@GITHUB.com:/o/r",
-    ],
-    "scp with the same user and a relative path": [
-      "git@github.com:o/r.git",
-      "git@GITHUB.com:o/r",
-      "git@github.com:o/r.git/",
-    ],
-  };
-
-  it.each(Object.entries(sameRepository))("keeps %s as one identity", (_label, spellings) => {
-    expect(new Set(spellings.map(repositoryIdentity)).size).toBe(1);
-  });
-
-  /** Pairs that name two repositories, or two ways in: a false merge replaces a backed-up plugin. */
-  const differentRepository: Array<[label: string, a: string, b: string]> = [
-    ["another owner", "https://github.com/o/r.git", "https://github.com/other/r.git"],
-    ["another repository", "https://github.com/o/r.git", "https://github.com/o/other.git"],
-    ["a longer repository name", "https://github.com/o/r.git", "https://github.com/o/r2.git"],
-    ["a deeper path", "https://github.com/o/r.git", "https://github.com/o/r/sub.git"],
-    ["a path of another case", "https://github.com/o/r.git", "https://github.com/o/R.git"],
-    ["another host", "https://github.com/o/r.git", "https://gitlab.com/o/r.git"],
-    [
-      "a host that only starts with it",
-      "https://github.com/o/r.git",
-      "https://github.com.example.com/o/r.git",
-    ],
-    ["http and https", "http://github.com/o/r", "https://github.com/o/r"],
-    ["https and ssh", "https://github.com/o/r.git", "ssh://git@github.com/o/r.git"],
-    ["https and scp", "https://github.com/o/r.git", "git@github.com:o/r.git"],
-    ["another host over scp", "git@gitlab.com:o/r.git", "git@github.com:o/r.git"],
-    ["another ssh user", "ssh://alice@h/x", "ssh://bob@h/x"],
-    ["another scp user", "alice@h.example:x", "bob@h.example:x"],
-    ["a user and none", "ssh://git@h/x", "ssh://h/x"],
-    ["another port", "ssh://git@h:2222/x", "ssh://git@h:2223/x"],
-    ["a port and the default", "ssh://git@h:2222/x", "ssh://git@h/x"],
-    ["a port of https and the default", "https://h:8443/x", "https://h/x"],
-    ["a relative scp path and an absolute ssh path", "git@h.example:x", "ssh://git@h.example/x"],
-    ["a relative and an absolute scp path", "h.example:x", "h.example:/x"],
-    ["a query", "https://h/x", "https://h/x?ref=1"],
-    ["a fragment", "https://h/x", "https://h/x#frag"],
-  ];
-
-  it.each(differentRepository)("tells %s apart", (_label, a, b) => {
-    expect(repositoryIdentity(a)).not.toBe(repositoryIdentity(b));
-  });
-
-  it.each([
-    ["a query", "https://evil.com?@github.com/o/r"],
-    ["a fragment", "https://evil.com#@github.com/o/r"],
-    ["a backslash", "https://evil.com\\@github.com/o/r"],
-  ])("keeps the host in front of an @ after %s", (_label, hostile) => {
-    // A browser, curl and the WHATWG parser all end the host before the `@` here.
-    for (const github of [
-      "https://github.com/o/r",
-      "git@github.com:o/r",
-      "ssh://git@github.com/o/r",
-    ]) {
-      expect(repositoryIdentity(hostile)).not.toBe(repositoryIdentity(github));
-    }
-  });
-
-  it("keeps a path, or a spelling it does not know, as its own identity", () => {
-    const spellings = [
-      "/home/someone/plugins/alpha",
-      "/home/someone/plugins/beta",
-      "C:\\plugins\\alpha",
-      "file:///home/someone/alpha",
-      "file:///home/someone/beta",
-      "https://",
-    ];
-
-    expect(new Set(spellings.map(repositoryIdentity)).size).toBe(spellings.length);
-    expect(repositoryIdentity(" /home/someone/plugins/alpha ")).toBe(
-      repositoryIdentity("/home/someone/plugins/alpha")
-    );
-  });
-});
 
 describe("backup of the managed plugin list", () => {
   let tempDir: string;
@@ -650,7 +551,7 @@ describe("backup of the managed plugin list", () => {
       expect(preview.plugins.skipped).toBe(false);
     });
 
-    it("reads a plugin of the same name and commit from another repository or folder as in use", async () => {
+    it("reads a plugin of the same name and commit from another repository, spelling or folder as in use", async () => {
       const source = (url: string, subpath?: string) => ({
         type: "git",
         url,
@@ -660,7 +561,8 @@ describe("backup of the managed plugin list", () => {
       });
       const mono = "https://github.com/example/mono.git";
       const { payload, request } = await backupOf([
-        registryRow("same-other-spelling", { source: source(mono, "plugins/a") }),
+        registryRow("same-other-slashes", { source: source(mono, "plugins/a") }),
+        registryRow("other-spelling", { source: source(mono, "plugins/a") }),
         registryRow("same-over-ssh", { source: source(mono, "plugins/a") }),
         registryRow("other-folder", { source: source(mono, "plugins/a") }),
         registryRow("no-folder", { source: source(mono, "plugins/a") }),
@@ -669,10 +571,12 @@ describe("backup of the managed plugin list", () => {
         registryRow("same-gone", { source: source(mono, "plugins/a") }),
       ]);
       await useLocalRegistry([
-        registryRow("same-other-spelling", {
-          source: source("https://GitHub.com:443/example/mono/", "/plugins/a/"),
+        // The same URL as written, so only the slashes of the folder differ.
+        registryRow("same-other-slashes", { source: source(mono, "/plugins/a/") }),
+        // The same repository in another spelling is another source: the user approves it once.
+        registryRow("other-spelling", {
+          source: source("https://GitHub.com:443/example/mono/", "plugins/a"),
         }),
-        // The same repository over ssh is another way in: the user approves it once.
         registryRow("same-over-ssh", {
           source: source("git@github.com:example/mono", "plugins/a"),
         }),
@@ -687,7 +591,8 @@ describe("backup of the managed plugin list", () => {
         registryRow("same-gone", { source: source(mono, "plugins/a") }),
       ]);
       for (const name of [
-        "same-other-spelling",
+        "same-other-slashes",
+        "other-spelling",
         "same-over-ssh",
         "other-folder",
         "no-folder",
@@ -702,7 +607,8 @@ describe("backup of the managed plugin list", () => {
         (preview.plugins.rows ?? []).map((row) => [row.name, row.status])
       );
       expect(statuses).toEqual({
-        "same-other-spelling": "installed",
+        "same-other-slashes": "installed",
+        "other-spelling": "conflict",
         "same-over-ssh": "conflict",
         "other-folder": "conflict",
         "no-folder": "conflict",
@@ -1214,28 +1120,33 @@ describe("backup of the managed plugin list", () => {
         expect((await listedRows())[0]).toMatchObject({ name: "alpha", lockedSha: shaOf("z") });
       });
 
-      it("keeps a plugin without approval when the same repository is spelled another way", async () => {
+      it("keeps a plugin without approval when only the slashes of its folder differ", async () => {
+        const mono = "https://github.com/example/mono.git";
         await pushFromFirstMachine([
-          registryRow("alpha"),
-          registryRow("beta", {
-            source: gitSource("https://github.com/example/mono.git", "plugins/beta"),
-          }),
+          registryRow("beta", { source: gitSource(mono, "plugins/beta") }),
         ]);
 
-        // Another host case, no `.git`, the default port, a trailing slash and another slash style
-        // for the folder: none of them names another repository.
         const pushed = await pushFromSecondMachine([
-          registryRow("alpha", { source: gitSource("https://GitHub.com/example/alpha") }),
-          registryRow("beta", {
-            source: gitSource("https://github.com:443/example/mono/", "/plugins/beta/"),
-          }),
+          registryRow("beta", { source: gitSource(mono, "/plugins/beta/") }),
         ]);
 
         expect(pushed.success).toBe(true);
-        expect((await listedRows()).map((row) => row.source.url)).toEqual([
-          "https://GitHub.com/example/alpha",
-          "https://github.com:443/example/mono/",
+        expect((await listedRows()).map((row) => row.source.subpath)).toEqual(["/plugins/beta/"]);
+      });
+
+      it.each([
+        ["a host in another case", "https://GitHub.com/example/alpha.git"],
+        ["no .git", "https://github.com/example/alpha"],
+        ["the default port", "https://github.com:443/example/alpha.git"],
+        ["a trailing slash", "https://github.com/example/alpha.git/"],
+      ])("asks for approval when the same repository is spelled with %s", async (_label, url) => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+
+        const refused = await pushFromSecondMachine([
+          registryRow("alpha", { source: gitSource(url) }),
         ]);
+
+        expect(removalOf(refused).names).toEqual(["alpha"]);
       });
 
       it("asks for approval once when the same repository comes back over SSH instead of HTTPS", async () => {

@@ -225,91 +225,23 @@ export async function collectPluginBackup(
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
 }
 
-/** The remotes read as URLs: a clone URL with one of these schemes. Any other spelling is text. */
-const SCHEME_REMOTE = /^(?:https?|ssh|git):\/\//i;
-// `[user@]host:path`, not `scheme://...`, and not a drive path (`C:\...`: a host has two characters or more).
-const SCP_REMOTE = /^(?:([^@/:]+)@)?([^:/@]{2,}):(?!\/\/)(.*)$/;
-
-/**
- * The port a scheme uses when the URL names none, so `ssh://h:22/x` is `ssh://h/x`. The URL parser
- * drops the http and https ones itself and keeps the ssh and git ones, so those need this table.
- */
-const DEFAULT_PORTS: Readonly<Record<string, string>> = {
-  "https:": "443",
-  "http:": "80",
-  "ssh:": "22",
-  "git:": "9418",
-};
-
-/** What a repository's path is called, without how it ends: `/o/r.git/`, `/o/r/` and `/o/r`. */
-function repositoryPath(repoPath: string): string {
-  return repoPath.replace(/\/+$/, "").replace(/\.git$/, "");
-}
-
-/**
- * The parts of a `scheme://` clone URL that pick a server, an account and a repository, read the
- * way a browser reads them (WHATWG), so `?` and `#` (and `\` for http and https) end the host
- * before an `@` can name another one: `https://evil.com?@github.com/o/r` is on `evil.com`. Null
- * when it does not parse.
- */
-function schemeRemoteParts(text: string): string[] | null {
-  let url: URL;
-  try {
-    url = new URL(text);
-  } catch {
-    return null;
-  }
-  const port = url.port === DEFAULT_PORTS[url.protocol] ? "" : url.port;
-  // The query and fragment stay: a repository this code cannot tell apart is a false merge.
-  const target = repositoryPath(url.pathname) + url.search + url.hash;
-  return [url.protocol, url.username, url.hostname.toLowerCase(), port, target];
-}
-
-/**
- * The parts of an scp-style `[user@]host:path` clone URL, as an ssh remote. The path stays as
- * written: `host:x` is relative to the account's home and `ssh://host/x` is absolute, so they are
- * two repositories (`host:/x` is the absolute one).
- */
-function scpRemoteParts(text: string): string[] | null {
-  const match = SCP_REMOTE.exec(text);
-  if (match === null) return null;
-  const [, user = "", host = "", repoPath = ""] = match;
-  return ["ssh:", user, host.toLowerCase(), "", repositoryPath(repoPath)];
-}
-
-/**
- * The repository a clone URL names, without how it is spelled. A false merge silently replaces a
- * backed-up plugin, which costs more than an extra approval prompt, so only three differences are
- * ignored: the host's case, a trailing `.git` and a trailing slash, and a port that is the
- * scheme's default. The scheme, the user, a port that is not the default, the path (and its case:
- * a host may tell `Repo` from `repo`) and any query or fragment tell repositories apart. So one
- * repository over ssh and over https is two identities: asking the user to approve once costs
- * little. `owner/repo` shorthand is stored as https or as scp, depending on whether this session
- * has an SSH agent (gitUrls.ts), so the same repository can read differently from one machine to
- * the next. A path or any other spelling is its own identity, as written.
- */
-export function repositoryIdentity(url: string): string {
-  const trimmed = url.trim();
-  const parts = SCHEME_REMOTE.test(trimmed) ? schemeRemoteParts(trimmed) : scpRemoteParts(trimmed);
-  // A remote's JSON starts with a scheme and a colon, which SCP_REMOTE reads as a remote too, so
-  // no spelling that is only text can equal one.
-  return parts === null ? trimmed : JSON.stringify(parts);
-}
-
 /** A monorepo folder with no leading or trailing slash, so `/a/b/` and `a/b` are one folder. */
 function folderIdentity(subpath: string | undefined): string {
   return (subpath ?? "").replace(/^\/+|\/+$/g, "");
 }
 
-/** The same repository and folder, wherever the commit or ref of either one points. */
+/**
+ * The same repository URL as written, and the same folder, wherever the commit or ref of either
+ * one points. Another spelling of one repository (`.git`, ssh against https, a host's case) is
+ * another source here: a rule that merged spellings could also merge two repositories, and that
+ * would count a different repository's plugin as kept with no approval. A spelling difference
+ * asks for approval on a push and reads "Name in use" on a restore, which is the safe direction.
+ */
 function isSameSource(
   a: Pick<BackupPluginEntry["source"], "url" | "subpath">,
   b: Pick<BackupPluginEntry["source"], "url" | "subpath">
 ): boolean {
-  return (
-    repositoryIdentity(a.url) === repositoryIdentity(b.url) &&
-    folderIdentity(a.subpath) === folderIdentity(b.subpath)
-  );
+  return a.url === b.url && folderIdentity(a.subpath) === folderIdentity(b.subpath);
 }
 
 /**
