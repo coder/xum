@@ -1665,10 +1665,9 @@ type ConfigTreeField = {
 }[keyof Workspace & keyof WorkspaceMetadata];
 
 /**
- * Fields a legacy row takes from its config row alone, as a current-format row does: the task tree
- * (the parent link, the agent, the task state, how the task holds its checkout), the archive and
- * pin marks, the sub-project and the tags. The row's legacy metadata.json supplies identity only.
- * The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
+ * Task-tree fields: the parent link, the agent, the task state and how the task holds its
+ * checkout. A legacy row takes them from its config row alone, as a current-format row does, and
+ * its legacy metadata.json supplies none of them. The last build that wrote such files (v0.3.0-rc.2) wrote only the id, name, project and
  * createdAt, #303 stopped every write in v0.3.0, and parentWorkspaceId came later (#1219), in
  * config.json only. Read from the file, a value would hold only until the read-time migration (a
  * migrated row reads the row alone): a stray file could attach a legacy row to a parent, or detach
@@ -1694,11 +1693,6 @@ const CONFIG_TREE_FIELDS = [
   "taskSticky",
   "taskExecutionId",
   "taskExecutionStatus",
-  "archivedAt",
-  "unarchivedAt",
-  "pinnedAt",
-  "subProjectPath",
-  "tags",
 ] as const satisfies readonly ConfigTreeField[];
 
 /** Sets each CONFIG_TREE_FIELDS value of `metadata` to the config row's, absent included. */
@@ -5098,7 +5092,13 @@ export class Config {
             metadata.bestOf = normalizeWorkspaceBestOf(workspace.bestOf);
             metadata.delegatedCreationInterrupted =
               delegatedCreationInterruptedField(workspace).delegatedCreationInterrupted;
+            // Preserve archived timestamps from config
+            metadata.archivedAt ??= workspace.archivedAt;
+            metadata.unarchivedAt ??= workspace.unarchivedAt;
+            // Preserve sub-project assignment from config.
+            metadata.subProjectPath ??= workspace.subProjectPath;
             metadata.forkFamilyBaseName ??= workspace.forkFamilyBaseName;
+            metadata.tags ??= workspace.tags;
 
             // Persisted config identity fields win over metadata.json values. The queued
             // migration below uses ??= (it must never clobber concurrent edits), so any

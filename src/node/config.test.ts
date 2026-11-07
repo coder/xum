@@ -6574,8 +6574,6 @@ describe("Config", () => {
         taskStatus: "running",
         taskPrompt: "Survey the repo",
         taskIsolation: "none",
-        archivedAt: "2026-01-03T00:00:00.000Z",
-        tags: { team: "file" },
         bestOf: { groupId: "file-group", index: 0, total: 2 },
         delegatedCreationInterrupted: true,
       } as const;
