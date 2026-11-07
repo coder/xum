@@ -2,45 +2,70 @@
  * Upper-bound cost estimates for the dream's two model runs, and the ceiling check that refuses a
  * run before it starts.
  *
- * These are not bills. Each step of a run resends the prompt plus everything its earlier steps
- * read, and the run may take up to its step cap, so the estimate prices every step at the full
- * prompt plus every visible memory file. Real runs stop earlier and read less, and prompt
- * caching lowers the input price, so the bill usually falls well under the estimate.
+ * These are not bills. The estimate assumes the run takes every step its cap allows, that its
+ * prompt already holds every visible memory file, and that each step writes a long reply. Real
+ * runs stop earlier, read less and write less, so the bill usually falls well under the estimate.
+ * The first step prices its prompt at the full input rate. Each later step resends that prefix,
+ * and the provider serves it from its prompt cache, so the resent tokens price at the cache-read
+ * rate when the model has one (the one run recorded on this host billed 93% of its input that
+ * way). Pricing every step at the full rate made a minimal job look many times dearer than it was.
  */
 import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_CONSOLIDATION_MAX_STEPS,
 } from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 
 /**
  * Output of one step: a memory command carries the text it writes, and output costs several
- * times what input does, so ignoring it would let the estimate fall under the bill.
+ * times what input does, so ignoring it would let the estimate fall under the bill. The next
+ * step reads it back as input.
  */
 const ESTIMATED_OUTPUT_TOKENS_PER_STEP = 1_000;
 
 /**
- * Price of one step that sends `inputChars` characters, or undefined when the model has no known
- * price. One step is priced alone: a model's long-context tier is chosen per request, so pricing
- * the sum of the steps would charge the whole run at the long rate.
+ * Price of a run of `steps` steps over a prompt of `promptChars` characters, or undefined when
+ * the model has no known price. Each step is priced as its own request: a model's long-context
+ * tier is chosen per request, so pricing the sum of the steps would charge the whole run at the
+ * long rate.
  */
-function estimateStepUsd(pricingModel: string, inputChars: number): number | undefined {
-  const usage = createDisplayUsage(
-    {
-      inputTokens: Math.ceil(inputChars / APPROX_CHARS_PER_TOKEN),
-      outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
-    },
-    pricingModel
-  );
-  return getTotalCost(usage);
+function estimateRunUsd(
+  pricingModel: string,
+  promptChars: number,
+  steps: number
+): number | undefined {
+  const promptTokens = Math.ceil(promptChars / APPROX_CHARS_PER_TOKEN);
+  // A model with no cache-read price would price a cached token at zero, so its resent prefix
+  // stays at the full input rate.
+  const cachePriced = getModelStats(pricingModel)?.cache_read_input_token_cost !== undefined;
+  let total = 0;
+  for (let step = 1; step <= steps; step++) {
+    const earlierOutputTokens = (step - 1) * ESTIMATED_OUTPUT_TOKENS_PER_STEP;
+    // What the previous step sent: the prefix this step resends. Only the last output is new.
+    const resentTokens =
+      step === 1 ? 0 : promptTokens + earlierOutputTokens - ESTIMATED_OUTPUT_TOKENS_PER_STEP;
+    const usd = getTotalCost(
+      createDisplayUsage(
+        {
+          inputTokens: promptTokens + earlierOutputTokens,
+          cachedInputTokens: cachePriced ? resentTokens : 0,
+          outputTokens: ESTIMATED_OUTPUT_TOKENS_PER_STEP,
+        },
+        pricingModel
+      )
+    );
+    if (usd === undefined) return undefined;
+    total += usd;
+  }
+  return total;
 }
 
 /**
  * Estimate of an analyzer job: each chunk (the characters its first step sends, system prompt
- * included) runs up to the analyzer's step cap, each step resending the chunk and `memoryChars`
- * of memory read.
+ * included) runs up to the analyzer's step cap over the chunk and `memoryChars` of memory read.
  */
 export function estimateAnalyzerUpperBoundUsd(args: {
   pricingModel: string;
@@ -49,24 +74,31 @@ export function estimateAnalyzerUpperBoundUsd(args: {
 }): number | undefined {
   let total = 0;
   for (const chunkChars of args.chunkInputChars) {
-    const stepUsd = estimateStepUsd(args.pricingModel, chunkChars + args.memoryChars);
-    if (stepUsd === undefined) return undefined;
-    total += stepUsd * MEMORY_ANALYZER_MAX_STEPS;
+    const chunkUsd = estimateRunUsd(
+      args.pricingModel,
+      chunkChars + args.memoryChars,
+      MEMORY_ANALYZER_MAX_STEPS
+    );
+    if (chunkUsd === undefined) return undefined;
+    total += chunkUsd;
   }
   return total;
 }
 
 /**
- * Estimate of an organizer run: up to the organizer's step cap, each step resending its system
- * prompt and `memoryChars` of memory read.
+ * Estimate of an organizer run: up to the organizer's step cap over its system prompt and
+ * `memoryChars` of memory read.
  */
 export function estimateOrganizerUpperBoundUsd(args: {
   pricingModel: string;
   systemPromptChars: number;
   memoryChars: number;
 }): number | undefined {
-  const stepUsd = estimateStepUsd(args.pricingModel, args.systemPromptChars + args.memoryChars);
-  return stepUsd === undefined ? undefined : stepUsd * MEMORY_CONSOLIDATION_MAX_STEPS;
+  return estimateRunUsd(
+    args.pricingModel,
+    args.systemPromptChars + args.memoryChars,
+    MEMORY_CONSOLIDATION_MAX_STEPS
+  );
 }
 
 export type CostCeilingCheck = { allowed: true } | { allowed: false; reason: string };
