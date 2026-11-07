@@ -170,6 +170,43 @@ describe("checkCostCeiling", () => {
     if (!check.allowed) expect(check.reason).toContain("estimate 1.01 USD");
   });
 
+  // 1.1, 0.07 and 0.14 times 100 come out a hair over a whole number, so rounding them up print a cent too many.
+  it.each([
+    [1.1, "1.10"],
+    [0.07, "0.07"],
+    [0.14, "0.14"],
+  ])("prints a %d ceiling as the user set it", (ceilingUsd, printed) => {
+    const refused = checkCostCeiling({ ceilingUsd, estimatedUsd: 50, pricingModel: defaultModel });
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) expect(refused.reason).toContain(`over the ${printed} USD ceiling`);
+
+    const unpriced = checkCostCeiling({
+      ceilingUsd,
+      estimatedUsd: undefined,
+      pricingModel: UNPRICED_MODEL,
+    });
+    expect(unpriced.allowed).toBe(false);
+    if (!unpriced.allowed) expect(unpriced.reason).toContain(`the ${printed} USD ceiling`);
+  });
+
+  it.each([
+    [1.1, "1.10"],
+    [0.07, "0.07"],
+    [0.14, "0.14"],
+    [1.1000001, "1.11"],
+  ])(
+    "prints an estimate of %d as %s: up, but not past an exact cent",
+    (estimatedUsd, printed) => {
+      const check = checkCostCeiling({
+        ceilingUsd: 0.01,
+        estimatedUsd,
+        pricingModel: defaultModel,
+      });
+      expect(check.allowed).toBe(false);
+      if (!check.allowed) expect(check.reason).toContain(`estimate ${printed} USD`);
+    }
+  );
+
   it("refuses a model with no known price once a ceiling is set, and names the model", () => {
     const check = checkCostCeiling({
       ceilingUsd: 1,

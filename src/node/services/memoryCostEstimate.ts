@@ -111,9 +111,20 @@ export function estimateOrganizerUpperBoundUsd(args: {
 
 export type CostCeilingCheck = { allowed: true } | { allowed: false; reason: string };
 
-/** Rounded up, so an estimate over the ceiling never prints as equal to it. */
-function formatUsd(usd: number): string {
-  return (Math.ceil(usd * 100) / 100).toFixed(2);
+/**
+ * The ceiling as the user set it. Rounding it up like an estimate would print 1.1 as 1.11, because
+ * 1.1 * 100 is 110.00000000000001.
+ */
+function formatCeilingUsd(usd: number): string {
+  return usd.toFixed(2);
+}
+
+/**
+ * Rounded up, so an estimate over the ceiling never prints as equal to it. The epsilon absorbs
+ * binary noise (1.1 * 100 is 110.00000000000001), which would otherwise round an exact cent up.
+ */
+function formatEstimateUsd(usd: number): string {
+  return (Math.ceil(usd * 100 - 1e-9) / 100).toFixed(2);
 }
 
 /**
@@ -127,7 +138,7 @@ export function checkCostCeiling(args: {
   pricingModel: string;
 }): CostCeilingCheck {
   if (args.ceilingUsd === undefined) return { allowed: true };
-  const ceiling = `${formatUsd(args.ceilingUsd)} USD ceiling`;
+  const ceiling = `${formatCeilingUsd(args.ceilingUsd)} USD ceiling`;
   if (args.estimatedUsd === undefined) {
     return {
       allowed: false,
@@ -137,6 +148,6 @@ export function checkCostCeiling(args: {
   if (args.estimatedUsd <= args.ceilingUsd) return { allowed: true };
   return {
     allowed: false,
-    reason: `estimate ${formatUsd(args.estimatedUsd)} USD (an upper bound) is over the ${ceiling}`,
+    reason: `estimate ${formatEstimateUsd(args.estimatedUsd)} USD (an upper bound) is over the ${ceiling}`,
   };
 }
