@@ -381,3 +381,41 @@ Tool hooks see only the tools that `plugin.json` lists in `extensions.mux.hooks.
 - `resultOmitted: true`: the tool result is over 256 KiB (262,144 characters) as JSON, or Xum cannot serialize it as JSON. `tool.execute.after` gets no `result`.
 
 A hook that crashes, times out, or returns a malformed output never breaks the turn. Xum logs it and continues. Xum ignores an `args` rewrite that is not an object. Xum drops `request.assemble` context over 64 KiB (65,536 characters). Xum adds an annotation only to an object result.
+
+## Back up and restore your plugins
+
+**Settings → Backup** can back up the plugins you installed from **Settings → Plugins**. **Agent plugins** is on by default. The backup records where each plugin came from, never the plugin itself, and a restore never installs a plugin. A restore only lists them, and you reinstall each one through the normal install review.
+
+For each plugin, the backup keeps:
+
+- The repository URL and the branch or tag the plugin tracks.
+- The commit it is pinned to.
+- Its folder in the repository, for a monorepo plugin.
+- The install method, when Xum generated the plugin's `plugin.json` (a skills repository or a Claude Code marketplace entry).
+- The skills and MCP servers you chose to import.
+
+It leaves out your consent, hook trust, install dates, and the auto-update flag. Project plugins and plugins you copied into a plugin folder by hand are not listed.
+
+### Reinstall after a restore
+
+**Preview changes** and **Restore** both show a **Plugins in this backup** card that compares each listed plugin with this machine:
+
+| Status        | Meaning                                                                                                  |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| Not installed | This machine has no plugin of that name.                                                                 |
+| Installed     | A plugin of that name at the same commit.                                                                |
+| Name in use   | The name is taken by another commit, or by a folder Xum does not manage. Xum does not offer this plugin. |
+
+Select **Review and install** to open **Settings → Plugins** with every **Not installed** plugin queued. Xum previews each one at its pinned commit, not at the tip of its branch, so you review the code that was backed up. Read the preview, then select **Install**, or select **Skip** to leave that plugin out. When the backup recorded which skills and MCP servers you imported, the review starts with those, as far as the repository still offers them. If a preview fails, for example because the repository moved, fix the source in the form and preview again, or skip the plugin.
+
+The installed plugin sits at the pinned commit and keeps tracking the branch or tag the backup recorded, so **update available** can show.
+
+### Back up before you reinstall
+
+A backup writes the list from the plugins installed on this machine. A plugin that the backup lists and you have not reinstalled yet would drop out of the backup. After **Preview changes** or **Restore**, **Settings → Backup** warns beside **Back up now** and names each plugin that a backup would remove.
+
+### When the list cannot be read
+
+If Xum cannot read part of the list, for example a plugin that a newer Xum recorded, it leaves that part out and shows a warning on the card. The rest of the restore still runs.
+
+With **Agent plugins** off, a backup writes no list, and the next backup removes the one already in the repository. A restore skips the list and says that the backup has one.
