@@ -120,7 +120,8 @@ export function PluginRemovalCard(props: {
       ) : removal.names.length > 0 ? (
         <p className="text-muted text-xs">
           Backing up now writes the plugins installed on this machine. These plugins are in the
-          backup but not installed here, so they are removed from it:
+          backup, and this machine would not back them up from the same source, so they are removed
+          from it:
         </p>
       ) : null}
       {removal.names.length > 0 ? (
