@@ -10,3 +10,6 @@ export const MERMAID_MAX_ATTRIBUTE_NESTING = 8;
 export const MERMAID_PAGE_FRAME_SELECTOR = ".mermaid-container:not(.mermaid-modal)";
 
 export const MERMAID_PAGE_DIAGRAM_SELECTOR = `${MERMAID_PAGE_FRAME_SELECTOR} > svg`;
+
+/** What a diagram that failed to render shows, in place of its frame. */
+export const MERMAID_ERROR_PREFIX = "Mermaid Error:";

@@ -11,6 +11,7 @@ import {
   TABLET_TOUCH_TARGET_PX,
 } from "../src/constants/layout";
 import {
+  MERMAID_ERROR_PREFIX,
   MERMAID_PAGE_DIAGRAM_SELECTOR,
   MERMAID_PAGE_FRAME_SELECTOR,
 } from "../src/constants/mermaid";
@@ -748,22 +749,28 @@ interface Pixels {
 }
 
 async function waitForRenderedDiagrams(page: StoryPage) {
-  const args: [string, string, number] = [
+  const args: [string, string, string, number] = [
     MERMAID_PAGE_FRAME_SELECTOR,
     MERMAID_PAGE_DIAGRAM_SELECTOR,
+    MERMAID_ERROR_PREFIX,
     DIAGRAM_RENDER_TIMEOUT_MS,
   ];
-  const rendered = await page.evaluate(async ([frames, diagrams, timeout]) => {
+  const rendered = await page.evaluate(async ([frames, diagrams, errorPrefix, timeout]) => {
+    // A diagram that fails replaces its whole frame, so the counts below cannot see it.
+    const hasFailed = () =>
+      Array.from(document.querySelectorAll("pre")).some((pre) =>
+        pre.textContent?.startsWith(errorPrefix)
+      );
     const isRendered = () => {
       const drawn = document.querySelectorAll(diagrams).length;
       return drawn > 0 && drawn === document.querySelectorAll(frames).length;
     };
     // Not Date.now(): the preview freezes it (.storybook/preview.tsx).
     const deadline = performance.now() + timeout;
-    while (!isRendered() && performance.now() < deadline) {
+    while (!isRendered() && !hasFailed() && performance.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    return isRendered();
+    return isRendered() && !hasFailed();
   }, args);
   assert(rendered, NO_DIAGRAM_MESSAGE);
 }
