@@ -26,6 +26,7 @@ import {
   SRT_RULES_TO_REMOVE,
   wrapWithPolicy,
 } from "./macosSandbox";
+import { isPathAtOrUnder } from "./sandboxPaths";
 
 // These tests spawn the real /usr/bin/sandbox-exec. Each policy covers temp folders only, so the
 // result does not depend on the developer's home. A macOS that drops sandbox-exec fails them.
@@ -197,9 +198,19 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       git(repo, ...GIT_IDENTITY.split(" "), "commit", "-q", "--allow-empty", "-m", "init");
       git(repo, "worktree", "add", "-q", worktree);
       const commonDir = path.join(repo, ".git");
+      const policy = buildAgentSandboxPolicy(BASE_SETTINGS, {
+        cwd: worktree,
+        pathEnv: process.env.PATH,
+      });
+      expect(policy.gitCommonDir).toBe(commonDir);
 
       const result = await runSandboxed(
-        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: worktree, pathEnv: process.env.PATH }),
+        // The temp folder is a write root and holds the main repository too. Close it, so only
+        // gitCommonDir lets the commit write the main .git.
+        {
+          ...policy,
+          writeRoots: policy.writeRoots.filter((dir) => !isPathAtOrUnder(commonDir, dir)),
+        },
         worktree,
         [
           `echo change > file.txt && git add file.txt && git ${GIT_IDENTITY} commit -q -m change && echo COMMITTED`,
