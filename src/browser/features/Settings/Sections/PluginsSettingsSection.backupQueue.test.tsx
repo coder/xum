@@ -591,3 +591,28 @@ test("a backup reinstall replaces the plain Add plugin panel that is already ope
   await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
   expect(previewSpy).toHaveBeenCalledTimes(1);
 });
+
+test("a second backup reinstall starts again from its own first plugin", async () => {
+  const { api } = previewingClient({ alpha: previewOf("alpha"), beta: previewOf("beta") });
+  publishPluginsSectionIntent({
+    type: "install-from-backup",
+    entries: [backedUp("alpha"), backedUp("beta")],
+  });
+  const view = render(
+    <APIProvider client={api}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  await clickButton(view, /^Skip$/);
+  await waitFor(() => expect(header(view)).toContain("From backup: 2 of 2"));
+
+  act(() => {
+    publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+  });
+
+  await waitFor(() => expect(header(view)).toContain("From backup: 1 of 1"));
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+});
