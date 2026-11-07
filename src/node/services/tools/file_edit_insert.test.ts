@@ -422,4 +422,48 @@ describe("file_edit_insert plan mode enforcement", () => {
       .catch(() => false);
     expect(wrongFileExists).toBe(false);
   });
+
+  it("follows the agent sandbox: blocks writes outside it, keeps the plan file writable", async () => {
+    const root = await fs.realpath(testDir);
+    const workspace = path.join(root, "ws");
+    const plans = path.join(root, "plans");
+    await fs.mkdir(workspace);
+    await fs.mkdir(plans);
+    const runtime = createRuntime({ type: "local", srcBaseDir: workspace });
+    // A stand-in policy over temp folders, never the developer's real home.
+    runtime.agentSandboxPolicy = () => ({
+      writeRoots: [workspace],
+      denyWrite: [],
+      denyRead: [root],
+      allowRead: [workspace],
+      network: "allowlist",
+      allowedHosts: [],
+      allowLocalBinding: true,
+    });
+    const planFilePath = path.join(plans, "plan.md");
+    const tool = createFileEditInsertTool({
+      sessionLocks: nodeSessionLocks,
+      ...getTestDeps(),
+      cwd: workspace,
+      runtime,
+      runtimeTempDir: workspace,
+      planFilePath,
+    });
+
+    const outside = path.join(root, "outside.txt");
+    const blocked = (await tool.execute!(
+      { path: outside, content: "x" },
+      mockToolCallOptions
+    )) as FileEditInsertToolResult;
+    const plan = (await tool.execute!(
+      { path: planFilePath, content: "# Plan" },
+      mockToolCallOptions
+    )) as FileEditInsertToolResult;
+
+    expect(blocked.success).toBe(false);
+    expect(blocked.success ? "" : blocked.error).toContain("The agent sandbox blocks writes");
+    expect(await fs.stat(outside).catch(() => null)).toBeNull();
+    expect(plan.success).toBe(true);
+    expect(await fs.readFile(planFilePath, "utf-8")).toBe("# Plan");
+  });
 });

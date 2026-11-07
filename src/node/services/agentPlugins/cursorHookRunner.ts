@@ -30,7 +30,7 @@ import type {
   TurnStopContinueReason,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
-import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
+import { resolveFileToolPath } from "@/node/services/tools/fileCommon";
 import { isAgentToolsDisabled, isTerminalsDisabled } from "@/node/utils/agentToolsDisabled";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import type { PluginHookDefinition } from "./codexHooks";
@@ -201,7 +201,7 @@ function fileEditOf(ctx: ToolExecuteContext): { filePath: string; edits: unknown
     ctx.toolName === "file_edit_insert"
       ? { old_string: "", new_string: args.content }
       : { old_string: args.old_string, new_string: args.new_string };
-  const { resolvedPath } = resolvePathWithinCwd(args.path, ctx.host.cwd, ctx.host.runtime);
+  const { resolvedPath } = resolveFileToolPath(args.path, ctx.host.cwd, ctx.host.runtime);
   return { filePath: resolvedPath, edits: [edit] };
 }
 

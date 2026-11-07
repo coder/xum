@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { describe, it, expect } from "bun:test";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { FileStat, Runtime } from "@/node/runtime/Runtime";
@@ -5,9 +7,12 @@ import {
   validatePlanModeAccess,
   validateFileSize,
   validateNoRedundantPrefix,
+  resolveFileToolPath,
   resolvePathWithinCwd,
   MAX_FILE_SIZE,
 } from "./fileCommon";
+import { TestTempDir } from "./testHelpers";
+import type { AgentSandboxPolicy } from "@/node/runtime/sandbox/agentSandboxTargets";
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -73,13 +78,13 @@ describe("fileCommon", () => {
     });
   });
 
-  describe("resolvePathWithinCwd", () => {
+  describe("resolveFileToolPath", () => {
     const cwd = "/workspace/project";
     const runtime = createRuntime({ type: "local", srcBaseDir: cwd });
 
     it("keeps resolving configured plan files outside cwd", () => {
       const planFilePath = "/home/user/.mux/plans/plan.md";
-      const result = resolvePathWithinCwd(planFilePath, cwd, runtime);
+      const result = resolveFileToolPath(planFilePath, cwd, runtime);
 
       expect(result.correctedPath).toBe(planFilePath);
       expect(result.resolvedPath).toBe(planFilePath);
@@ -87,17 +92,147 @@ describe("fileCommon", () => {
 
     it("keeps resolving unrelated absolute paths outside cwd", () => {
       const otherPath = "/home/user/.mux/plans/other.md";
-      const result = resolvePathWithinCwd(otherPath, cwd, runtime);
+      const result = resolveFileToolPath(otherPath, cwd, runtime);
 
       expect(result.correctedPath).toBe(otherPath);
       expect(result.resolvedPath).toBe(otherPath);
     });
 
     it("resolves relative paths that traverse outside cwd", () => {
-      const result = resolvePathWithinCwd("../plans/ancestor.md", cwd, runtime);
+      const result = resolveFileToolPath("../plans/ancestor.md", cwd, runtime);
 
       expect(result.correctedPath).toBe("../plans/ancestor.md");
       expect(result.resolvedPath).toBe("/workspace/plans/ancestor.md");
+    });
+  });
+
+  describe("resolvePathWithinCwd under the agent sandbox", () => {
+    // A stand-in home under a temp folder, so the policy never names the developer's real home.
+    async function sandboxFixture(temp: TestTempDir) {
+      const root = await fs.realpath(temp.path);
+      const home = path.join(root, "home");
+      const workspace = path.join(home, "ws");
+      const tools = path.join(home, "tools");
+      const secretDir = path.join(home, "secret");
+      const plans = path.join(home, "plans");
+      const outputs = path.join(home, "outputs");
+      for (const dir of [workspace, tools, secretDir, plans, outputs]) {
+        await fs.mkdir(dir, { recursive: true });
+      }
+      await fs.symlink(secretDir, path.join(workspace, "secret-link"));
+      await fs.symlink(path.join(secretDir, "new.txt"), path.join(workspace, "dangling-link"));
+      const policy: AgentSandboxPolicy = {
+        writeRoots: [workspace],
+        denyWrite: [],
+        denyRead: [home],
+        allowRead: [workspace, tools],
+        network: "allowlist",
+        allowedHosts: [],
+        allowLocalBinding: true,
+      };
+      const runtime = createRuntime({ type: "local", srcBaseDir: workspace });
+      runtime.agentSandboxPolicy = () => policy;
+      const sandbox = {
+        exemptPaths: [path.join(plans, "plan.md")],
+        readExemptPaths: [path.join(plans, "ancestor.md"), outputs],
+      };
+      return { home, workspace, runtime, sandbox };
+    }
+
+    const cases: Array<{
+      name: string;
+      target: (home: string) => string;
+      access: "read" | "write";
+      allowed: boolean;
+    }> = [
+      { name: "reads in the workspace", target: () => "src/a.ts", access: "read", allowed: true },
+      { name: "writes in the workspace", target: () => "src/a.ts", access: "write", allowed: true },
+      {
+        name: "reads a closed folder",
+        target: (home) => path.join(home, "secret", "key"),
+        access: "read",
+        allowed: false,
+      },
+      {
+        name: "reads a read-only folder",
+        target: (home) => path.join(home, "tools", "bin"),
+        access: "read",
+        allowed: true,
+      },
+      {
+        name: "writes a read-only folder",
+        target: (home) => path.join(home, "tools", "bin"),
+        access: "write",
+        allowed: false,
+      },
+      {
+        name: "reads through a link that points out of the workspace",
+        target: () => "secret-link/key",
+        access: "read",
+        allowed: false,
+      },
+      {
+        name: "writes through a dangling link that points out of the workspace",
+        target: () => "dangling-link",
+        access: "write",
+        allowed: false,
+      },
+      {
+        name: "writes the plan file",
+        target: (home) => path.join(home, "plans", "plan.md"),
+        access: "write",
+        allowed: true,
+      },
+      {
+        name: "reads an ancestor plan file",
+        target: (home) => path.join(home, "plans", "ancestor.md"),
+        access: "read",
+        allowed: true,
+      },
+      {
+        name: "writes an ancestor plan file",
+        target: (home) => path.join(home, "plans", "ancestor.md"),
+        access: "write",
+        allowed: false,
+      },
+      {
+        name: "reads bash overflow output",
+        target: (home) => path.join(home, "outputs", "bash-1.txt"),
+        access: "read",
+        allowed: true,
+      },
+    ];
+
+    for (const testCase of cases) {
+      it(`${testCase.allowed ? "allows" : "blocks"}: ${testCase.name}`, async () => {
+        using temp = new TestTempDir("file-sandbox");
+        const fixture = await sandboxFixture(temp);
+        const resolve = () =>
+          resolvePathWithinCwd(
+            testCase.target(fixture.home),
+            fixture.workspace,
+            fixture.runtime,
+            testCase.access,
+            fixture.sandbox
+          );
+        if (testCase.allowed) {
+          expect(await resolve()).toBeDefined();
+        } else {
+          await expect(resolve()).rejects.toThrow(/The agent sandbox blocks/);
+        }
+      });
+    }
+
+    it("checks nothing when no sandbox applies", async () => {
+      using temp = new TestTempDir("file-sandbox");
+      const fixture = await sandboxFixture(temp);
+      fixture.runtime.agentSandboxPolicy = () => null;
+      const secret = path.join(fixture.home, "secret", "key");
+
+      expect(
+        (await resolvePathWithinCwd(secret, fixture.workspace, fixture.runtime, "write"))
+          .resolvedPath
+      ).toBe(secret);
     });
   });
 

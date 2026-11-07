@@ -1,3 +1,4 @@
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
@@ -3203,6 +3204,7 @@ export class TurnRequestBuilder {
       cwd: toolsForModelConfig.cwd,
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
+      sandbox: fileToolSandboxContext(toolsForModelConfig),
     });
     const ptcEnabled = !isSideChat && experiments.programmaticToolCalling;
     const mcpWarningSection = mcpStats
