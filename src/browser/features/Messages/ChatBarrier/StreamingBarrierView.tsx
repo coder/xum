@@ -227,7 +227,9 @@ function CancelControl(props: StreamingBarrierViewProps) {
       <button
         type="button"
         onClick={props.onCancel}
-        className="group/stop inline-flex cursor-pointer items-center"
+        // justify-center matters on a phone: the 44px floor makes the button wider than the drawn
+        // circle, and without it the circle sits flush left and the line's right edge reads ragged.
+        className="group/stop inline-flex cursor-pointer items-center justify-center"
         aria-label="Stop streaming"
       >
         <span
