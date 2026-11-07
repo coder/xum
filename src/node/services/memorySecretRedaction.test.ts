@@ -11,6 +11,14 @@ describe("redactSecretLike", () => {
     openai: `sk-${"k3J9".repeat(6)}`,
     bearer: "tok_live_abcdefghijklmnop",
     jwt: `eyJ${"h".repeat(12)}.eyJ${"p".repeat(12)}.${"s".repeat(12)}`,
+    stripeLive: `sk_live_${"4eC3".repeat(6)}`,
+    stripeTest: `sk_test_${"9aZ1".repeat(6)}`,
+    stripeRestricted: `rk_live_${"7qW2".repeat(6)}`,
+    gitlab: `glpat-${"x9Y8".repeat(5)}`,
+    google: `AIza${"Sy7_".repeat(8)}abc`,
+    npm: `npm_${"Ab3d".repeat(9)}`,
+    slackHook: `T${"0".repeat(8)}/B${"1".repeat(8)}/${"Xz9k".repeat(6)}`,
+    urlPassword: "s3cr3t-pw",
   };
 
   it.each([
@@ -45,6 +53,38 @@ describe("redactSecretLike", () => {
       '{"password": "unterminated-secret-va',
       "unterminated-secret-va",
     ],
+    [
+      "URL userinfo",
+      `clone https://deploy:${FAKE.urlPassword}@git.example.com/org/repo.git`,
+      FAKE.urlPassword,
+    ],
+    [
+      "URL userinfo with an empty user",
+      `redis://:${FAKE.urlPassword}@cache:6379/0`,
+      FAKE.urlPassword,
+    ],
+    ["a live Stripe key", `STRIPE=${FAKE.stripeLive}`, FAKE.stripeLive],
+    ["a test Stripe key", `using ${FAKE.stripeTest}`, FAKE.stripeTest],
+    ["a restricted Stripe key", `using ${FAKE.stripeRestricted}`, FAKE.stripeRestricted],
+    ["a GitLab token", `glab auth ${FAKE.gitlab}`, FAKE.gitlab],
+    ["a Google API key", `maps ${FAKE.google}`, FAKE.google],
+    ["an npm token", `//registry.npmjs.org/:_authToken ${FAKE.npm}`, FAKE.npm],
+    [
+      "a Slack webhook URL",
+      `curl https://hooks.slack.com/services/${FAKE.slackHook}`,
+      FAKE.slackHook,
+    ],
+    [
+      "a bracketed environment assignment",
+      'os.environ["API_KEY"] = "abc123xyz-value"',
+      "abc123xyz-value",
+    ],
+    ["a bracketed single-quoted assignment", "env['DB_PASSWORD']= 'hunter2x'", "hunter2x"],
+    [
+      "a bracketed assignment in JSON-escaped text",
+      String.raw`{"c":"cfg[\"token\"] = \"zz9plural\""}`,
+      "zz9plural",
+    ],
   ])("redacts %s", (_label, text, secret) => {
     const redacted = redactSecretLike(text);
     expect(redacted).not.toContain(secret);
@@ -54,6 +94,23 @@ describe("redactSecretLike", () => {
   it("leaves ordinary text and token counts readable", () => {
     const text = "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo";
     expect(redactSecretLike(text)).toBe(text);
+  });
+
+  it("leaves URLs without a password, SSH remotes, npm variable names and index lookups readable", () => {
+    const text = [
+      "https://user@example.com/path and http://localhost:8080/api@v2",
+      "git@github.com:org/repo.git",
+      "npm_config_cache and npm_package_version",
+      "seen[token] = true; tokens[id] = 1",
+      "pk_live_publishable and sk_live_ is a prefix",
+    ].join("\n");
+    expect(redactSecretLike(text)).toBe(text);
+  });
+
+  it("keeps the userinfo's host readable", () => {
+    expect(redactSecretLike("https://deploy:pw@git.example.com/org/repo")).toBe(
+      "https://[redacted]@git.example.com/org/repo"
+    );
   });
 
   // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
@@ -66,6 +123,8 @@ describe("redactSecretLike", () => {
     ["credential_", "credential_".repeat(9_000)],
     ["api_key", "api_key".repeat(14_000)],
     ["a JWT header after a dash", "eyJ-".repeat(25_000)],
+    ["a bare bracket assignment", 'password"]'.repeat(10_000)],
+    ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
     ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing

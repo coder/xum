@@ -44,7 +44,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import { containsSecretLike } from "@/node/services/memorySecretRedaction";
+import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecretRedaction";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
@@ -262,8 +262,9 @@ export function createConsolidationMemoryTool(args: {
    */
   writableScopes?: readonly WritableMemoryScope[];
   /**
-   * Reject a create/str_replace/insert whose new text holds a credential shape (see
-   * `containsSecretLike`). For runs that read tool output and then write memory.
+   * Reject a create/str_replace/insert whose new text, or a create/rename whose new file name,
+   * holds a credential shape (see `containsSecretLike`). For runs that read tool output and then
+   * write memory.
    */
   rejectSecretLike?: boolean;
   /**
@@ -303,9 +304,17 @@ export function createConsolidationMemoryTool(args: {
       if (!isWritableScope(parseMemoryPath(virtualPath).scope)) return scopeRejection(virtualPath);
     }
     // The note is journaled into the sidecar record, so it never quotes the rejected text.
-    const text = args.rejectSecretLike === true ? newTextOf(input) : null;
-    if (text !== null && containsSecretLike(text)) {
-      return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
+    if (args.rejectSecretLike === true) {
+      const text = newTextOf(input);
+      if (text !== null && containsSecretLike(text)) {
+        return `${target.path} was not changed: the new text contains a credential-like value (a key, token, password or private key). Memory must never hold secrets; say what the credential is for and where it lives, and leave the value out.`;
+      }
+      // A file name is text too: `sk-ant-....md` stores the key in the directory listing. A delete
+      // names an existing file and adds nothing, so it stays open; a rename adds only its new name.
+      const addedName = target.command === "rename" ? target.newPath : target.path;
+      if (target.command !== "delete" && addedName != null && containsSecretLike(addedName)) {
+        return "The path contains a credential-like value, so it was not used. Name the file for what it holds, not for a key, token or password.";
+      }
     }
     // Pin protection: pinned files are editable but never deleted/renamed.
     // Deletes/renames may target a directory (MemoryService removes
@@ -368,7 +377,17 @@ export function createConsolidationMemoryTool(args: {
         return { success: false, error: getErrorMessage(error) };
       }
       if (rejection !== null) {
-        journal.push({ ...target, applied: false, note: rejection });
+        // The journal is persisted, and a rejected path (or the note that quotes it) may itself be
+        // the credential the guard just refused.
+        const persisted = (text: string): string =>
+          args.rejectSecretLike === true ? redactSecretLike(text) : text;
+        journal.push({
+          ...target,
+          path: persisted(target.path),
+          ...(target.newPath !== undefined && { newPath: persisted(target.newPath) }),
+          applied: false,
+          note: persisted(rejection),
+        });
         return { success: false, error: rejection };
       }
 

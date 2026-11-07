@@ -437,6 +437,53 @@ describe("consolidation memory tool rails", () => {
       expect(result.success).toBe(true);
     });
 
+    it("rejects a file name that holds a credential, journals it redacted, and never creates it", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const keyName = `sk-ant-api03-${"Ab3d".repeat(8)}`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "old.md"), "x\n");
+
+      const created = await execute(fixture.tool, {
+        command: "create",
+        path: `/memories/global/${keyName}.md`,
+        file_text: "what the key is for\n",
+      });
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/global/old.md",
+        new_path: `/memories/global/${keyName}.md`,
+      });
+
+      for (const result of [created, renamed]) {
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("credential");
+      }
+      expect(fixture.journal.map((op) => op.applied)).toEqual([false, false]);
+      expect(JSON.stringify(fixture.journal)).not.toContain(keyName);
+      expect(fixture.getMutationCount()).toBe(0);
+      expect(await pathExists(path.join(fixture.globalMemoryDir, `${keyName}.md`))).toBe(false);
+      expect(await pathExists(path.join(fixture.globalMemoryDir, "old.md"))).toBe(true);
+    });
+
+    it("lets a rename or delete clear away a file that already has a credential in its name", async () => {
+      using fixture = await createFixture({ guard: { rejectSecretLike: true } });
+      const keyName = `sk-ant-api03-${"Ab3d".repeat(8)}.md`;
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, keyName), "x\n");
+      await fsPromises.writeFile(path.join(fixture.globalMemoryDir, `other-${keyName}`), "y\n");
+
+      const renamed = await execute(fixture.tool, {
+        command: "rename",
+        old_path: `/memories/global/${keyName}`,
+        new_path: "/memories/global/clean.md",
+      });
+      const deleted = await execute(fixture.tool, {
+        command: "delete",
+        path: `/memories/global/other-${keyName}`,
+      });
+
+      expect(renamed.success).toBe(true);
+      expect(deleted.success).toBe(true);
+    });
+
     it("leaves deletes and renames alone", async () => {
       using fixture = await createFixture({ guard: { rejectSecretLike: true } });
       await fsPromises.writeFile(path.join(fixture.globalMemoryDir, "old.md"), "x\n");

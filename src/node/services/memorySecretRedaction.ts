@@ -24,19 +24,25 @@ const GAP_MAX = 48;
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
   /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|$)/g,
-  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16})/g,
+  // Provider key prefixes: OpenAI/Anthropic, GitHub, Slack, AWS, Stripe, GitLab, Google, npm.
+  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,})/g,
+  // A Slack incoming-webhook URL is a bearer secret in its path.
+  /\bhooks\.slack\.com\/services\/[A-Za-z0-9/_-]{8,}/g,
+  // `scheme://user:password@host`: only the userinfo goes, so the host stays readable. The user
+  // may be empty (`redis://:password@host`).
+  /(?<=:\/\/)[^\s:/@]{0,64}:[^\s/@]{1,256}(?=@)/g,
   new RegExp(String.raw`\bBearer\s{1,${GAP_MAX}}[A-Za-z0-9._~+/=-]{8,}`, "gi"),
   // Anchored to the start of a character run: `\b` also matches after `-`, so `eyJ-eyJ-eyJ-...`
   // would start a scan to the end of the run at every `eyJ`.
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
 ];
 
-// `key=value`, `key: value`, `"key": "value"` and the same inside a JSON-escaped string
-// (`\"key\": \"value\"`). The value is a quoted run (to its closing quote, or to the end of an
-// unterminated one) or one unquoted word, optionally behind an auth scheme. Already-redacted
-// values are skipped so the passes compose, and so are comparisons (`token === x`).
+// `key=value`, `key: value`, `"key": "value"`, `os.environ["KEY"] = "value"` and the same inside a
+// JSON-escaped string (`\"key\": \"value\"`). The value is a quoted run (to its closing quote, or
+// to the end of an unterminated one) or one unquoted word, optionally behind an auth scheme.
+// Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
-  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}\\?["']?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
+  String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\?["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
     String.raw`(?![=]|\[redacted\])(?:(\\?["'])[\s\S]*?(?:\2|$)|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
   "gi"
 );
