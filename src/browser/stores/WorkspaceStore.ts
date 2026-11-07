@@ -1428,6 +1428,10 @@ export class WorkspaceStore {
     "tool-call-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
+      // The aggregator counts the tool's input tokens here. Without this bump a reader that
+      // cached the stats before this event shows the old count until the next delta, so the
+      // "~N tokens" readout depended on whether React rendered between the two events.
+      this.streamingStatsStore.bump(workspaceId);
     },
     "tool-call-execution-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
