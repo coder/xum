@@ -134,8 +134,8 @@ export function PluginRemovalCard(props: {
       {/* After the list: the names are the readable plugins, not the entries this note means. */}
       {removal.unreadable && !removal.wholeList ? (
         <p className="text-muted text-xs">
-          The backup's list also has entries this version of Xum cannot read, for example from a
-          newer Xum. Backing up now removes them too.
+          The list in the backup also has entries this version of Xum cannot read, for example from
+          a newer Xum. Backing up now removes them too.
         </p>
       ) : null}
       <Button
