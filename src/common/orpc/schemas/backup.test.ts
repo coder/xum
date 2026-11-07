@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BackupPluginManifestSchema } from "./backup";
+import { BackupPluginEntrySchema } from "./backup";
 
 const SHA = "a".repeat(40);
 
@@ -17,28 +17,22 @@ function entry(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function manifest(...plugins: unknown[]) {
-  return { schemaVersion: 1, plugins };
-}
-
-describe("BackupPluginManifestSchema", () => {
+describe("BackupPluginEntrySchema", () => {
   test("keeps the source, pin, method and imports of an entry", () => {
-    const parsed = BackupPluginManifestSchema.parse(
-      manifest(
-        entry({
-          source: {
-            type: "git",
-            url: "https://github.com/example/mono.git",
-            ref: "v1.2.0",
-            refType: "tag",
-            subpath: "packages/plugin",
-          },
-          method: { kind: "claude-marketplace", entry: "plugin-a" },
-          importedComponents: { skills: ["review"], mcpServers: [] },
-        })
-      )
+    const parsed = BackupPluginEntrySchema.parse(
+      entry({
+        source: {
+          type: "git",
+          url: "https://github.com/example/mono.git",
+          ref: "v1.2.0",
+          refType: "tag",
+          subpath: "packages/plugin",
+        },
+        method: { kind: "claude-marketplace", entry: "plugin-a" },
+        importedComponents: { skills: ["review"], mcpServers: [] },
+      })
     );
-    expect(parsed.plugins[0]).toMatchObject({
+    expect(parsed).toMatchObject({
       source: { ref: "v1.2.0", refType: "tag", subpath: "packages/plugin" },
       method: { kind: "claude-marketplace", entry: "plugin-a" },
       importedComponents: { skills: ["review"], mcpServers: [] },
@@ -46,16 +40,14 @@ describe("BackupPluginManifestSchema", () => {
   });
 
   test("drops local trust state a hand-edited list carries", () => {
-    const parsed = BackupPluginManifestSchema.parse(
-      manifest(
-        entry({
-          installedAt: "2026-01-01T00:00:00.000Z",
-          autoUpdate: true,
-          componentConsent: { skills: { review: "abc" }, mcpServers: {} },
-        })
-      )
+    const parsed = BackupPluginEntrySchema.parse(
+      entry({
+        installedAt: "2026-01-01T00:00:00.000Z",
+        autoUpdate: true,
+        componentConsent: { skills: { review: "abc" }, mcpServers: {} },
+      })
     );
-    expect(Object.keys(parsed.plugins[0] ?? {}).sort()).toEqual(["lockedSha", "name", "source"]);
+    expect(Object.keys(parsed).sort()).toEqual(["lockedSha", "name", "source"]);
   });
 
   test.each([
@@ -94,13 +86,6 @@ describe("BackupPluginManifestSchema", () => {
       }),
     ],
   ])("refuses %s", (_label, row) => {
-    expect(BackupPluginManifestSchema.safeParse(manifest(row)).success).toBe(false);
-  });
-
-  test("refuses a list that names a plugin twice and an unknown version", () => {
-    expect(BackupPluginManifestSchema.safeParse(manifest(entry(), entry())).success).toBe(false);
-    expect(BackupPluginManifestSchema.safeParse({ schemaVersion: 2, plugins: [] }).success).toBe(
-      false
-    );
+    expect(BackupPluginEntrySchema.safeParse(row).success).toBe(false);
   });
 });

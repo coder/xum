@@ -93,19 +93,15 @@ export const BackupPluginEntrySchema = z.object({
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
 });
 
-/** The `agent-plugins/manifest.json` sidecar of a backup. */
-export const BackupPluginManifestSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    plugins: z.array(BackupPluginEntrySchema).max(MAX_BACKUP_PLUGIN_ENTRIES),
-  })
-  .refine(
-    (manifest) =>
-      new Set(manifest.plugins.map((plugin) => plugin.name)).size === manifest.plugins.length,
-    {
-      message: "The plugin list names a plugin twice",
-    }
-  );
+/**
+ * The `agent-plugins/manifest.json` sidecar of a backup. The reader (agentPluginBackup.ts) checks
+ * the envelope and then each row on its own, so one row this build cannot read never hides the
+ * others; there is no schema for the whole file.
+ */
+export interface BackupPluginManifest {
+  schemaVersion: 1;
+  plugins: BackupPluginEntry[];
+}
 
 /**
  * How a listed plugin compares with this machine's managed installs: `missing` (nothing by that
@@ -299,7 +295,6 @@ export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
 export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
-export type BackupPluginManifest = z.infer<typeof BackupPluginManifestSchema>;
 export type BackupPluginStatus = z.infer<typeof BackupPluginStatusSchema>;
 export type BackupPluginRow = z.infer<typeof BackupPluginRowSchema>;
 export type BackupPluginReport = z.infer<typeof BackupPluginReportSchema>;
