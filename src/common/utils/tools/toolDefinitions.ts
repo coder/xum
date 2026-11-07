@@ -661,12 +661,14 @@ export const TaskAwaitToolArgsSchema = z
     // Bash output has no report pages: each read returns the next unread output by itself, so
     // an offset there would only mislead the model into thinking it skipped or re-read output.
     // The messages never quote a submitted ID or offset: rejection text reaches the shared log.
+    // The log sink splits rejection clauses on "; " and shortens a label at its first ".", so
+    // these messages use neither "; " nor a colon after a word, otherwise the log copy loses text.
     if (offset > 0 && [...ids].some((id) => id.startsWith("bash:"))) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "offset_chars pages agent reports, not bash output. Bash output pages by itself: call " +
-          "task_await with only a bash task ID from this call, timeout_secs: 0 and no " +
+          "offset_chars pages agent reports, not bash output. Bash output pages by itself, so call " +
+          "task_await with only a bash task ID from this call, timeout_secs 0 and no " +
           "offset_chars to read the next unread output.",
         path: ["offset_chars"],
       });
@@ -676,8 +678,8 @@ export const TaskAwaitToolArgsSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          `offset_chars pages one report, so it needs exactly one task ID; this call has ${ids.size}. ` +
-          "Call task_await once per report with its one task ID, timeout_secs: 0 and the same " +
+          `offset_chars pages one report, so it needs exactly one task ID and this call has ${ids.size}. ` +
+          "Call task_await once per report with its one task ID, timeout_secs 0 and the same " +
           "offset_chars, and await other tasks without offset_chars.",
         path: ["offset_chars"],
       });
