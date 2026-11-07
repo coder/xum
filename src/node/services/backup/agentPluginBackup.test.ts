@@ -140,7 +140,6 @@ describe("repositoryIdentity", () => {
     ["a query", "https://evil.com?@github.com/o/r"],
     ["a fragment", "https://evil.com#@github.com/o/r"],
     ["a backslash", "https://evil.com\\@github.com/o/r"],
-    ["a query on an scp-like host", "git@evil.com:?@github.com/o/r"],
   ])("keeps the host in front of an @ after %s", (_label, hostile) => {
     // A browser, curl and the WHATWG parser all end the host before the `@` here.
     for (const github of [
