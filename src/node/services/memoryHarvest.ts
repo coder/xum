@@ -146,6 +146,12 @@ function neutralizeHarvestText(text: string): string {
   return text.replace(/<\/(message)(\s*)>/gi, "&lt;/$1$2>");
 }
 
+/** The text of one message part, and how many characters of a text part lie past its cap. */
+interface RowText {
+  text: string;
+  cutChars: number;
+}
+
 /** A piece of one message part that fits a row: the whole part, or one segment of a long text part. */
 interface HarvestPiece {
   text: string;
@@ -156,19 +162,35 @@ interface HarvestPiece {
   segment?: string;
 }
 
+/**
+ * The text of a text part as rows read it: redacted, and cut at the part's cap. The scan reaches a
+ * lookahead past the cap, so a secret that starts inside the kept text is matched whole, and what
+ * lies past it is never scanned. Text parts are not tool output, but a credential a user pasted or
+ * a model echoed sits in them just the same, and the cap is long enough to carry it to the model.
+ */
+function boundedTextPart(raw: string): RowText {
+  const window = raw.slice(0, HARVEST_MAX_TEXT_PART_CHARS + HARVEST_REDACTION_LOOKAHEAD_CHARS);
+  const prepared = neutralizeHarvestText(redactSecretLike(window));
+  const text = prepared.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
+  return { text, cutChars: raw.length - window.length + prepared.length - text.length };
+}
+
+function rowTextOfPart(part: MuxMessage["parts"][number]): RowText {
+  if (part.type === "text") return boundedTextPart(part.text.trim());
+  return { text: neutralizeHarvestText(partToText(part).trim()), cutChars: 0 };
+}
+
 function piecesOfPart(
   part: MuxMessage["parts"][number],
   position: number,
-  text: string
+  { text, cutChars }: RowText
 ): HarvestPiece[] {
-  if (part.type !== "text" || text.length <= HARVEST_MAX_ROW_TEXT_CHARS) {
+  if (part.type !== "text" || (text.length <= HARVEST_MAX_ROW_TEXT_CHARS && cutChars === 0)) {
     return [{ text, truncated: false, part: position }];
   }
-  const kept = text.slice(0, HARVEST_MAX_TEXT_PART_CHARS);
-  const cutChars = text.length - kept.length;
-  const count = Math.ceil(kept.length / HARVEST_MAX_ROW_TEXT_CHARS);
+  const count = Math.ceil(text.length / HARVEST_MAX_ROW_TEXT_CHARS);
   return Array.from({ length: count }, (_, index): HarvestPiece => {
-    const segment = kept.slice(
+    const segment = text.slice(
       index * HARVEST_MAX_ROW_TEXT_CHARS,
       (index + 1) * HARVEST_MAX_ROW_TEXT_CHARS
     );
@@ -197,11 +219,13 @@ function formatMessageForHarvest(message: MuxMessage): HarvestEvidenceRow[] {
     role: message.role,
   };
   const texts = message.parts
-    .map((part) => ({ part, text: neutralizeHarvestText(partToText(part).trim()) }))
-    .filter(({ text }) => text !== "");
+    .map((part) => ({ part, rowText: rowTextOfPart(part) }))
+    .filter(({ rowText }) => rowText.text !== "");
   if (texts.length === 0) return [{ ...base, text: "", truncated: false }];
 
-  const pieces = texts.flatMap(({ part, text }, index) => piecesOfPart(part, index + 1, text));
+  const pieces = texts.flatMap(({ part, rowText }, index) =>
+    piecesOfPart(part, index + 1, rowText)
+  );
   const groups: HarvestPiece[][] = [];
   let groupChars = 0;
   for (const piece of pieces) {
@@ -294,7 +318,12 @@ export function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
 }
 
 function looksSecretLike(text: string): boolean {
-  return /(api[_-]?key|secret|token|password|sk-[A-Za-z0-9_-]{12,})/i.test(text);
+  // Redaction also knows the credential shapes that carry no keyword (`ghp_...`, `xoxb-...`, a
+  // URL's password), which the word check cannot see.
+  return (
+    /(api[_-]?key|secret|token|password|sk-[A-Za-z0-9_-]{12,})/i.test(text) ||
+    redactSecretLike(text) !== text
+  );
 }
 
 function normalizeCandidateKey(candidate: MemoryCandidate): string {

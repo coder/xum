@@ -814,6 +814,118 @@ describe("runMemoryHarvest", () => {
     }
   });
 
+  describe("a credential in a text part", () => {
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    const slackToken = "xoxb-1234567890-abcdefghij";
+    // Past the 8,000-character row limit a text part is cut into segments, one row each.
+    const ROW_TEXT_LIMIT = 8_000;
+    const TEXT_PART_LIMIT = 128_000;
+
+    async function promptOfText(text: string, role: "user" | "assistant"): Promise<string> {
+      using fixture = createFixture();
+      return harvestPrompt(fixture, [createMuxMessage("t1", role, text, { historySequence: 0 })]);
+    }
+
+    it.each(["user", "assistant"] as const)(
+      "is redacted from a short %s message, whatever the text around it",
+      async (role) => {
+        const prompt = await promptOfText(
+          `Use ${githubToken} for the deploy and ${slackToken}.`,
+          role
+        );
+
+        expect(prompt).toContain("for the deploy");
+        expect(prompt).toContain("[redacted]");
+        expect(prompt).not.toContain(githubToken);
+        expect(prompt).not.toContain(slackToken);
+      }
+    );
+
+    it("is redacted past the first row of a long part", async () => {
+      const prompt = await promptOfText(
+        `${"x".repeat(ROW_TEXT_LIMIT + 2_000)} ${githubToken} END-OF-TEXT`,
+        "assistant"
+      );
+
+      expect(prompt).toContain("END-OF-TEXT");
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("is redacted whole when it straddles two segments of one part", async () => {
+      // The token starts 10 characters before the first segment ends.
+      const prompt = await promptOfText(
+        `${"x".repeat(ROW_TEXT_LIMIT - 11)} ${githubToken} tail`,
+        "user"
+      );
+
+      expect(prompt).toContain("tail");
+      // Redacting each segment alone would leave the 10 readable characters of the token's start.
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("is redacted whole when it straddles the part's cap", async () => {
+      const prompt = await promptOfText(
+        `${"x".repeat(TEXT_PART_LIMIT - 11)} ${githubToken} tail`,
+        "user"
+      );
+
+      expect(prompt).toContain("[truncated");
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("keeps the count of cut characters of a part in which redaction shrank the text", async () => {
+      using fixture = createFixture();
+      const text = `${githubToken} ${"y".repeat(TEXT_PART_LIMIT + 1_000)}`;
+      fixture.messages = [createMuxMessage("t1", "user", text, { historySequence: 0 })];
+
+      const rows = buildHarvestChunks(fixture.messages).flatMap(
+        (chunk) => JSON.parse(chunk.transcript) as { text: string }[]
+      );
+
+      // Of the 1,041 characters past the cap, the 30 that redaction took out of the token now fit
+      // under it.
+      expect(rows.at(-1)?.text).toEndWith("[truncated 1011 more chars for memory harvest]");
+      expect(rows.map((row) => row.text).join("")).not.toContain(githubToken);
+    });
+  });
+
+  it("skips a candidate that carries a credential without a keyword, in its text or rationale", async () => {
+    using fixture = createFixture();
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    const candidate = (memoryText: string, rationale: string) => ({
+      category: "environment",
+      memoryText,
+      evidenceMessageIds: ["m1"],
+      confidence: 0.95,
+      rationale,
+    });
+
+    const result = await runHarvest(
+      fixture,
+      modelFromChunks([
+        harvestToolCall([
+          candidate(`The deploy user authenticates as ${githubToken}.`, "Stated by the user."),
+          candidate("The notifier posts as xoxb-1234567890-abcdefghij.", "Seen in the setup."),
+          candidate("The cache lives at redis://:hunter2pw@cache:6379/0.", "Seen in the setup."),
+          candidate("Deploys run on the staging cluster.", `The user pasted ${githubToken}.`),
+          candidate("The user prefers concise tests.", "Stated as a durable preference."),
+        ]),
+        toolFinishChunk(),
+      ])
+    );
+
+    expect(result.acceptedCandidates).toBe(1);
+    expect(result.skippedCandidates).toBe(4);
+    const file = await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH);
+    expect(file.success).toBe(true);
+    if (file.success) {
+      expect(file.data.content).toContain("concise tests");
+      expect(file.data.content).not.toContain("ghp_");
+      expect(file.data.content).not.toContain("xoxb-");
+      expect(file.data.content).not.toContain("hunter2pw");
+    }
+  });
+
   it("keys inbox cleanup by compaction boundary id instead of epoch", async () => {
     using fixture = createFixture();
     const oldBoundaryInbox = "/memories/workspace/harvest/old-summary.md";
