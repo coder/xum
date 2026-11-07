@@ -149,14 +149,24 @@ async function entryOf(
   return parsed.data;
 }
 
-/** Every managed install as a portable entry, sorted by name; null when there is none. */
+/**
+ * Every managed install as a portable entry, sorted by name; null when there is none. A list over
+ * the cap fails the push, like a registry this build cannot read whole: keeping the first
+ * plugins would leave the rest out of the backup without a word. The code is IO_ERROR for the
+ * same reason (`readInstallsToList`).
+ */
 export async function collectPluginBackup(muxRoot: string): Promise<BackupPluginManifest | null> {
   const installs = await readInstallsToList(muxRoot);
   const entries = await Promise.all(installs.map((install) => entryOf(muxRoot, install)));
   const plugins = entries
     .filter((entry) => entry !== null)
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .slice(0, MAX_BACKUP_PLUGIN_ENTRIES);
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (plugins.length > MAX_BACKUP_PLUGIN_ENTRIES) {
+    throw new BackupServiceError(
+      "IO_ERROR",
+      `${plugins.length} plugins are installed here that a backup can list, and one backup lists at most ${MAX_BACKUP_PLUGIN_ENTRIES}. Backing up would leave ${plugins.length - MAX_BACKUP_PLUGIN_ENTRIES} of them out. ${AGENT_PLUGINS_OFF_HINT}`
+    );
+  }
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
 }
 

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { resolveBackupContents } from "@/common/config/schemas/settingsBackup";
-import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { MAX_BACKUP_PLUGIN_ENTRIES, type SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupService } from "./backupService";
 import {
@@ -409,6 +409,48 @@ describe("backup of the managed plugin list", () => {
         await payload.exportTo({ ...request, contents: PLUGINS_OFF });
 
         expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
+    });
+
+    describe("a registry with more plugins than one backup lists", () => {
+      /** Rows only: the export reads the registry, never a plugin folder, so nothing is installed. */
+      const manyRows = (count: number) =>
+        Array.from({ length: count }, (_, index) =>
+          registryRow(`plugin-${String(index).padStart(4, "0")}`)
+        );
+
+      it("refuses the push instead of keeping the first plugins, and says why and what to do", async () => {
+        await writeRegistry(muxRoot, manyRows(MAX_BACKUP_PLUGIN_ENTRIES + 3));
+        const { payload, managed, request } = await prepare();
+
+        const error = (await captureRejection(
+          payload.exportTo({ ...request, contents: DEFAULT_CONTENTS })
+        )) as { code?: string; message: string };
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain(String(MAX_BACKUP_PLUGIN_ENTRIES + 3));
+        expect(error.message).toContain(String(MAX_BACKUP_PLUGIN_ENTRIES));
+        expect(error.message).toContain('Turning off "Agent plugins"');
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
+
+      it("still backs up without the list once the flag is off", async () => {
+        await writeRegistry(muxRoot, manyRows(MAX_BACKUP_PLUGIN_ENTRIES + 1));
+        const { payload, managed, request } = await prepare();
+
+        await payload.exportTo({ ...request, contents: PLUGINS_OFF });
+
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
+
+      it("lists every plugin of a registry at the cap", async () => {
+        await writeRegistry(muxRoot, manyRows(MAX_BACKUP_PLUGIN_ENTRIES));
+        const { payload, managed, request } = await prepare();
+
+        await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
+
+        const sidecar = (await readSidecar(managed)) as { plugins: unknown[] };
+        expect(sidecar.plugins).toHaveLength(MAX_BACKUP_PLUGIN_ENTRIES);
       });
     });
 
