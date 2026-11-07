@@ -60,5 +60,8 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     if (reasoning?.type !== "reasoning") throw new Error("expected reasoning row");
     expect(reasoning.isStreaming).toBe(true);
     expect(reasoning.isLastPartOfMessage).toBe(true);
+    // Reasoning-only status keeps the row out of operational bundles, as it
+    // would be without the whitespace part.
+    expect(reasoning.isOnlyMessageContent).toBe(true);
   });
 });
