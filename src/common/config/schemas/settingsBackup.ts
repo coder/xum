@@ -203,9 +203,7 @@ export function hasUrlCredentials(repoUrl: string): boolean {
  * command injection into a later shell paste starts, and how a URL shown to the user is made to
  * read differently from the one git gets. Not global, so `.test` keeps no state between calls.
  */
-// eslint-disable-next-line no-control-regex
-export const UNSAFE_URL_CHARACTERS =
-  /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+export const UNSAFE_URL_CHARACTERS = /[\s\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
 export const MAX_BACKUP_PROJECT_ENTRIES = 256;
