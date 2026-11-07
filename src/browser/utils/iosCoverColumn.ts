@@ -558,16 +558,14 @@ class CoverColumnViewport {
   // on every keystroke, since it treats the column as hidden. Re-laying the page out each time
   // made the composer flicker between widths on every letter (Mike, on the folded Duo). That scroll
   // comes from the page, so scrollTo undoes it for good. A pan from a gesture comes from iOS, which
-  // holds it against scrollTo: when the page pans again before two frames pass, or is still panned
-  // then, heal it.
+  // holds it against scrollTo: when the page is still panned two frames after the first undo, heal
+  // it. A scroll inside that window is only undone again, since key repeat can reveal the caret
+  // twice in it; the window is not extended, so a pan iOS keeps forcing back still heals on time.
   onScroll(): void {
     if (this.size == null || this.healing || !isPagePannedSideways()) return;
-    if (this.undoingScroll) {
-      this.healPan();
-      return;
-    }
-    this.undoingScroll = true;
     window.scrollTo(0, window.scrollY);
+    if (this.undoingScroll) return;
+    this.undoingScroll = true;
     afterTwoFrames(() => {
       this.undoingScroll = false;
       if (isPagePannedSideways()) this.healPan();

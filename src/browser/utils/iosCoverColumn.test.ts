@@ -262,12 +262,28 @@ describe("installIosCoverColumn", () => {
       expect(meta.content).toStartWith("width=466, height=678,");
     });
 
-    test("is healed at once when iOS pans the page again right after scrollTo", () => {
+    test("is scrolled back without a relayout when key repeat reveals the caret every frame", async () => {
+      window.scrollTo = ((x: number) => {
+        Object.defineProperty(window, "scrollX", { configurable: true, value: x });
+      }) as typeof window.scrollTo;
+
+      for (let keystroke = 0; keystroke < 6; keystroke++) {
+        panPage();
+        await frames(1);
+      }
+      await frames(3);
+
+      await Promise.resolve();
+      expect(layoutLog).toEqual([]);
+    });
+
+    test("is healed on time when iOS keeps panning the page back inside the undo window", async () => {
       window.scrollTo = (() => undefined) as typeof window.scrollTo;
 
       panPage();
-      expect(meta.content).toStartWith("width=466, height=678,");
+      await frames(1);
       panPage();
+      await frames(1);
       expect(meta.content).toBe(DEVICE_WIDTH_META);
     });
   });
