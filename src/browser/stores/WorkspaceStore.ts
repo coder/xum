@@ -67,6 +67,7 @@ import {
   isInitOutput,
   isInitStart,
   isBashOutputEvent,
+  isBashSandboxApprovalEvent,
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
   isMuxMessage,
@@ -527,6 +528,12 @@ export interface WorkflowToolLiveRunState {
   run?: WorkflowRunRecord;
 }
 
+/** A bash call that waits for the user to let it run once outside the sandbox. */
+export interface BashSandboxApprovalView {
+  reason: string;
+  timestamp: number;
+}
+
 interface WorkspaceChatTransientState {
   /** The current attempt delivered its caught-up: live events now flow to the aggregator. */
   caughtUp: boolean;
@@ -553,6 +560,8 @@ interface WorkspaceChatTransientState {
   queuedMessage: QueuedMessage | null;
   heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
+  /** Bash calls that wait for the user to let them run outside the sandbox, by toolCallId. */
+  sandboxApprovals: Map<string, BashSandboxApprovalView>;
   liveTaskIds: Map<string, string[]>;
   liveWorkflowRuns: Map<string, WorkflowToolLiveRunState>;
   autoRetryStatus: AutoRetryStatus | null;
@@ -775,6 +784,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     queuedMessage: null,
     heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
+    sandboxApprovals: new Map(),
     liveTaskIds: new Map(),
     liveWorkflowRuns: new Map(),
     autoRetryStatus: null,
@@ -2748,7 +2758,11 @@ export class WorkspaceStore {
   ): void {
     const transient = this.chatTransientState.get(workspaceId);
     if (!transient) return;
-    if (transient.liveBashOutput.size === 0 && transient.liveWorkflowRuns.size === 0) {
+    if (
+      transient.liveBashOutput.size === 0 &&
+      transient.sandboxApprovals.size === 0 &&
+      transient.liveWorkflowRuns.size === 0
+    ) {
       return;
     }
 
@@ -2777,6 +2791,12 @@ export class WorkspaceStore {
     for (const toolCallId of Array.from(transient.liveBashOutput.keys())) {
       if (!activeBashToolCallIds.has(toolCallId)) {
         transient.liveBashOutput.delete(toolCallId);
+      }
+    }
+
+    for (const toolCallId of Array.from(transient.sandboxApprovals.keys())) {
+      if (!activeBashToolCallIds.has(toolCallId)) {
+        transient.sandboxApprovals.delete(toolCallId);
       }
     }
 
@@ -2813,6 +2833,22 @@ export class WorkspaceStore {
     // Important: return the stored object reference so useSyncExternalStore sees a stable snapshot.
     // (Returning a fresh object every call can trigger an infinite re-render loop.)
     return state ?? null;
+  }
+
+  getBashSandboxApproval(workspaceId: string, toolCallId: string): BashSandboxApprovalView | null {
+    return this.chatTransientState.get(workspaceId)?.sandboxApprovals.get(toolCallId) ?? null;
+  }
+
+  /** The toolCallId of the newest approval the workspace waits for; the shortcuts answer it. */
+  getLatestBashSandboxApprovalToolCallId(workspaceId: string): string | null {
+    const approvals = this.chatTransientState.get(workspaceId)?.sandboxApprovals;
+    let latest: { toolCallId: string; timestamp: number } | null = null;
+    for (const [toolCallId, approval] of approvals ?? []) {
+      if (latest === null || approval.timestamp >= latest.timestamp) {
+        latest = { toolCallId, timestamp: approval.timestamp };
+      }
+    }
+    return latest?.toolCallId ?? null;
   }
 
   getTaskToolLiveTaskIds(workspaceId: string, toolCallId: string): string[] | null {
@@ -5380,6 +5416,7 @@ export class WorkspaceStore {
     return (
       data.type in this.bufferedEventHandlers ||
       data.type === "bash-output" ||
+      data.type === "bash-sandbox-approval" ||
       data.type === "task-created" ||
       data.type === "workflow-run-attached"
     );
@@ -5545,6 +5582,12 @@ export class WorkspaceStore {
         transient.liveBashOutput.clear();
         transient.liveWorkflowRuns.clear();
         transient.liveTaskIds.clear();
+      }
+      if (!data.cursor?.stream || streamContextMismatched) {
+        // The server never replays a pending approval, so a full replay of the same stream keeps
+        // its card; a stream that ended or changed while disconnected no longer waits. Approvals
+        // sent during this replay are buffered and apply after this.
+        transient.sandboxApprovals.clear();
       }
 
       if (sinceContext) {
@@ -5846,6 +5889,21 @@ export class WorkspaceStore {
         ...(nextRun != null ? { run: nextRun } : {}),
       });
 
+      this.states.bump(workspaceId);
+      return;
+    }
+
+    if (isBashSandboxApprovalEvent(data)) {
+      const transient = this.assertChatTransientState(workspaceId);
+      if (data.pending) {
+        transient.sandboxApprovals.set(data.toolCallId, {
+          reason: data.reason,
+          timestamp: data.timestamp,
+        });
+      } else if (!transient.sandboxApprovals.delete(data.toolCallId)) {
+        return;
+      }
+      // Low-frequency, and the user acts on it: bump at once like task-created.
       this.states.bump(workspaceId);
       return;
     }
@@ -6164,6 +6222,26 @@ export function useBashToolLiveOutput(
       return store.getBashToolLiveOutput(workspaceId, toolCallId);
     }
   );
+}
+
+/**
+ * The sandbox approval a bash call waits for (null when none), and whether it is the newest one
+ * of its workspace, which the keyboard shortcuts answer.
+ */
+export function useBashSandboxApproval(
+  workspaceId: string | undefined,
+  toolCallId: string | undefined
+): { approval: BashSandboxApprovalView; isLatest: boolean } | null {
+  const store = getStoreInstance();
+  const subscribe = (listener: () => void) =>
+    workspaceId ? store.subscribeKey(workspaceId, listener) : () => undefined;
+  const approval = useSyncExternalStore(subscribe, () =>
+    workspaceId && toolCallId ? store.getBashSandboxApproval(workspaceId, toolCallId) : null
+  );
+  const latestToolCallId = useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getLatestBashSandboxApprovalToolCallId(workspaceId) : null
+  );
+  return approval ? { approval, isLatest: latestToolCallId === toolCallId } : null;
 }
 
 /**
