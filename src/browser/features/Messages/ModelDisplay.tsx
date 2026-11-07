@@ -32,7 +32,9 @@ function getRouteDisplayName(
     return PROVIDER_DEFINITIONS[routeProvider as ProviderName].displayName;
   }
 
-  return routeProvider;
+  // An unknown route is drawn as-is, so it is the one branch that can carry raw bytes: a persisted
+  // routeProvider is metadata the row was written with, and the "via …" text is all the user gets.
+  return revealUnicodeTags(routeProvider);
 }
 
 /**

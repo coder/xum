@@ -35,9 +35,12 @@ void mock.module("@/browser/contexts/API", () => ({
 const tags = (ascii: string) =>
   [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
 
-function assistantMessage(content: string): DisplayedMessage & { type: "assistant" } {
+function assistantMessage(
+  content: string,
+  metadata?: Record<string, unknown>
+): DisplayedMessage & { type: "assistant" } {
   const rows = buildDisplayedMessagesForMessage({
-    message: createMuxMessage("a1", "assistant", "", undefined, [{ type: "text", text: content }]),
+    message: createMuxMessage("a1", "assistant", "", metadata, [{ type: "text", text: content }]),
     hasActiveStream: false,
     isContextBoundaryMessage: () => false,
   });
@@ -81,5 +84,26 @@ describe("AssistantMessage invisible-tag handling", () => {
 
     expect(copies).toEqual([original]);
     expect(copies[0]).not.toContain("<U+");
+  });
+
+  // A persisted routeProvider is metadata the row was written with, and an unknown one is drawn as
+  // text, so the "via …" label can carry the payload; the same value reveals in the static first view.
+  test("reveals a tag payload in the routed-provider label", () => {
+    const view = render(
+      <AssistantMessage
+        message={assistantMessage("done", {
+          model: "anthropic:claude-sonnet-4-5",
+          routeProvider: `gateway${tags("XY")}`,
+        })}
+        workspaceId="ws-1"
+      />
+    );
+
+    // "via " and the name are separate text nodes inside one span, so match on the element's text.
+    const via = [...view.container.querySelectorAll("span")].find((span) =>
+      (span.textContent ?? "").startsWith("via ")
+    );
+    expect(via?.textContent).toBe("via gateway<U+E0058><U+E0059>");
+    expect(view.container.textContent).not.toContain(tags("XY"));
   });
 });

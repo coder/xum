@@ -163,6 +163,34 @@ describe("readWorkspaceViewTail", () => {
     expect(rows[0]?.model?.via).toBe("gateway<U+E0058><U+E0059>");
   });
 
+  // The live row builder drops a text part that can paint nothing, so the pre-hydration view must drop
+  // it too: otherwise the first paint shows a blank block that disappears when the app takes over.
+  test("a row that paints nothing carries no text, and a tag payload still does", async () => {
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const stream = { agentId: "exec", finishReason: "stop", timestamp: 1, model: STOP.model };
+    const part = (text: string) => [{ type: "text", text, timestamp: 7 }] as never;
+    await append([
+      msg("nl", "assistant", "", stream, part("\n")),
+      msg("zwsp", "assistant", "", stream, part("\u200b")),
+      msg("bel", "assistant", "", stream, part("\u0007")),
+      msg("braille", "assistant", "", stream, part("\u2800\u2800")),
+      msg("tags", "assistant", "", stream, part(tagRun("AB"))),
+      msg("real", "assistant", "", stream, part("done")),
+    ]);
+
+    const { rows } = (await read())!;
+
+    expect(rows.map((row) => [row.id, row.text])).toEqual([
+      ["nl", null],
+      ["zwsp", null],
+      ["bel", null],
+      ["braille", null],
+      ["tags", tagRun("AB")],
+      ["real", "done"],
+    ]);
+  });
+
   test("rows the live transcript draws differently carry no text", async () => {
     const tool = { type: "dynamic-tool", toolName: "bash", toolCallId: "t", input: {} };
     await append([

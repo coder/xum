@@ -4,6 +4,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
+import { isPaintableText } from "@/common/utils/messages/paintableText";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import type { MuxMessage } from "@/common/types/message";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
@@ -69,7 +70,10 @@ function drawableText(message: MuxMessage, metadata: Record<string, unknown>): s
   const texts = message.parts.map((part) => (part.type === "text" ? part.text : null));
   if (texts.length === 0 || texts.includes(null)) return null;
   const text = texts.join("");
-  return text.trim().length > 0 ? text : null;
+  // The same predicate the live row builder uses: a persisted part of only a newline, a
+  // default-ignorable, a control character or a blank braille cell earns no row there, so drawing one
+  // here would paint a gap pre-hydration that vanishes the moment the app takes the transcript over.
+  return isPaintableText(text) ? text : null;
 }
 
 /** The "via …" label ModelDisplay adds when the reply was routed through another provider. */
