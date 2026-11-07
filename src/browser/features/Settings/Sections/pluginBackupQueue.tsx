@@ -41,16 +41,20 @@ export function backupPreviewRequest(item: BackupPluginInstall): PluginPreviewRe
 
 /**
  * The source an install records. A commit-pinned preview resolves to a bare commit, which would
- * stop the plugin from tracking its branch or tag. The backup's ref goes back in, so the plugin
- * sits at the pinned commit and still offers updates from where it came from. Another repository
- * (the user edited the form) keeps what its own preview resolved.
+ * stop the plugin from tracking its branch or tag. When the preview did resolve the commit the
+ * backup pinned, the backup's ref goes back in, so the plugin sits at the pinned commit and still
+ * offers updates from where it came from. That holds when the user fixed the URL (ssh to https)
+ * for the same commit. A preview of anything else (the user edited the ref to another branch or
+ * commit) keeps what it resolved, because the backup's ref would describe a different checkout.
  */
 export function installSource(
-  previewed: AgentPluginGitSource,
+  preview: AgentPluginInstallPreview,
   item: BackupPluginInstall | null
 ): AgentPluginGitSource {
-  if (item === null || previewed.url !== item.source.url) return previewed;
-  return { ...previewed, ref: item.source.ref, refType: item.source.refType };
+  const pinned =
+    item !== null && preview.source.refType === "commit" && preview.lockedSha === item.lockedSha;
+  if (!pinned) return preview.source;
+  return { ...preview.source, ref: item.source.ref, refType: item.source.refType };
 }
 
 /**

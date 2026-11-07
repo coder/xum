@@ -852,7 +852,7 @@ const AddPluginPanel: React.FC<{
     setError(null);
     try {
       const result = await api.agentPlugins.install({
-        source: installSource(preview.source, queue.item),
+        source: installSource(preview, queue.item),
         method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,

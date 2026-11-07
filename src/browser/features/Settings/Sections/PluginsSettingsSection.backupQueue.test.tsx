@@ -78,17 +78,23 @@ function previewOf(
   };
 }
 
+/** A repository's preview, or one that depends on the ref the user asked for. */
+type PreviewOf = AgentPluginInstallPreview | ((ref: string | null) => AgentPluginInstallPreview);
+
 /** The section with a backup reinstall waiting for it, as the Backup section leaves it. */
-function renderWithBackup(
-  plugins: BackupPluginInstall[],
-  previews: Record<string, AgentPluginInstallPreview>
-) {
+function renderWithBackup(plugins: BackupPluginInstall[], previews: Record<string, PreviewOf>) {
   const api = createMockORPCClient({ agentPlugins: { items: [] } });
   const previewSpy = spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
     const found = Object.entries(previews).find(([name]) => input.input.includes(`/${name}.git`));
     return Promise.resolve(
       found
-        ? { success: true as const, data: { kind: "plugin" as const, preview: found[1] } }
+        ? {
+            success: true as const,
+            data: {
+              kind: "plugin" as const,
+              preview: typeof found[1] === "function" ? found[1](input.ref) : found[1],
+            },
+          }
         : { success: false as const, error: `Could not fetch ${input.input}` }
     );
   });
@@ -142,6 +148,72 @@ test("previews the pinned commit of the first backed-up plugin and installs it t
     expectedConsentDigest: "digest-alpha",
   });
 });
+
+test("keeps tracking the backup's branch when the user fixed the URL and the preview resolved the pinned commit", async () => {
+  const { view, installSpy } = renderWithBackup(
+    [
+      backedUp("alpha", {
+        source: {
+          type: "git",
+          url: "git@github.com:example/alpha.git",
+          ref: "main",
+          refType: "branch",
+        },
+      }),
+    ],
+    { alpha: previewOf("alpha") }
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+
+  await clickButton(view, /^Install$/);
+
+  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+  expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
+    source: { url: "https://github.com/example/alpha.git", ref: "main", refType: "branch" },
+    expectedSha: PINNED,
+  });
+});
+
+test.each([
+  ["another commit than the pinned one", { lockedSha: LATEST }],
+  ["a branch whose tip is the pinned commit", { lockedSha: PINNED }],
+])(
+  "records what the user previewed, not the backup's branch, after editing the ref to %s",
+  async (_label, resolved) => {
+    // The pinned commit until the user asks for "develop", then that branch as resolved here.
+    const developBranch = (ref: string | null) =>
+      ref !== "develop"
+        ? previewOf("alpha")
+        : previewOf("alpha", {
+            source: {
+              type: "git",
+              url: "https://github.com/example/alpha.git",
+              ref: "develop",
+              refType: "branch",
+            },
+            ...resolved,
+          });
+    const { view, installSpy } = renderWithBackup([backedUp("alpha")], { alpha: developBranch });
+    await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+    await clickButton(view, /^Back$/);
+    const refField = await view.findByLabelText(/Branch, tag, or commit SHA/);
+    // Replaces the pinned commit the form was filled with.
+    await userEvent.type(refField, "develop", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: PINNED.length,
+    });
+    await clickButton(view, /^Preview$/);
+    await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+
+    await clickButton(view, /^Install$/);
+
+    await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+    expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
+      source: { ref: "develop", refType: "branch" },
+      expectedSha: resolved.lockedSha,
+    });
+  }
+);
 
 test("moves to the next plugin after an install, and closes after the last with the list refreshed", async () => {
   const { view, previewSpy, listSpy } = renderWithBackup([backedUp("alpha"), backedUp("beta")], {
