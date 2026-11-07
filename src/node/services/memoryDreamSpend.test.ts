@@ -105,7 +105,8 @@ describe("stepCostUsd", () => {
       OPENAI_MODEL
     );
 
-    expect(priority).toBeCloseTo(2 * standard, 9);
+    // NaN if the standard step had no price: the comparison then fails, as it should.
+    expect(priority).toBeCloseTo(2 * (standard ?? Number.NaN), 9);
   });
 
   it("has no cost for a model with no known price, and a cost of zero for a priced step with no tokens", () => {
