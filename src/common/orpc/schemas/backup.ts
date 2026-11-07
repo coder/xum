@@ -76,12 +76,13 @@ export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
   source: AgentPluginGitSourceSchema.extend({
     // The list is repository-controlled and the preview hands this URL to git: a leading dash
-    // would be read as a git option, not a repository.
+    // would be read as a git option, not a repository. The preview trims its input, so leading
+    // whitespace before the dash is refused too.
     url: z
       .string()
       .min(1)
       .max(2048)
-      .regex(/^[^-]/, { message: "A repository URL must not start with '-'" }),
+      .regex(/^[^\s-]/, { message: "A repository URL must not start with '-' or whitespace" }),
     ref: z.string().min(1).max(256),
     subpath: z.string().min(1).max(1024).optional(),
   }),

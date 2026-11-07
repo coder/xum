@@ -522,9 +522,14 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      // 522 rows: the first 512 are read, so 12 broken rows and 500 valid ones.
+      // 522 rows: the first 512 are read, so 12 broken rows and 500 valid ones. The 12 problems
+      // become 10 row warnings, one "2 more" line and one line about the rows past 512.
       expect(preview.pluginInstalls).toHaveLength(500);
-      expect(preview.pluginListWarnings?.length).toBeLessThan(15);
+      expect(preview.pluginListWarnings).toHaveLength(12);
+      expect(preview.pluginListWarnings?.slice(-2)).toEqual([
+        "2 more plugins were left out",
+        "Only the first 512 plugins of the list were read",
+      ]);
     });
 
     it("reports a list that is a symlink out of the backup without following it", async () => {
@@ -535,6 +540,24 @@ describe("backup of the managed plugin list", () => {
       const manifest = path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH);
       await fs.rm(manifest);
       await fs.symlink(outside, manifest);
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginInstalls).toEqual([]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
+    });
+
+    it("reports a sidecar folder that is a symlink without reading through it", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const outside = path.join(tempDir, "outside-sidecar");
+      await fs.mkdir(outside, { recursive: true });
+      await fs.copyFile(
+        path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH),
+        path.join(outside, path.basename(PLUGIN_BACKUP_MANIFEST_PATH))
+      );
+      const sidecarDir = path.dirname(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH));
+      await fs.rm(sidecarDir, { recursive: true });
+      await fs.symlink(outside, sidecarDir, "dir");
 
       const preview = await previewAndValidate(payload, request);
 
@@ -621,6 +644,7 @@ describe("backup of the managed plugin list", () => {
         ["alpha", "missing"],
         ["beta", "missing"],
       ]);
+      expect(restored.data.pluginsDroppedByPush).toEqual(["alpha", "beta"]);
       expect(await exists(path.join(second, "plugins.json"))).toBe(false);
       expect(await exists(path.join(second, "plugins"))).toBe(false);
     });

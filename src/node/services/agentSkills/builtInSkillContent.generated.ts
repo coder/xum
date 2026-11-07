@@ -7538,7 +7538,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "### Back up before you reinstall",
       "",
-      "A backup writes the list from the plugins installed on this machine. A plugin that the backup lists and you have not reinstalled yet would drop out of the backup. After **Preview changes** or **Restore**, **Settings → Backup** warns beside **Back up now** and names each plugin that a backup would remove.",
+      "A backup writes the list from the plugins installed on this machine. A plugin that the backup lists and you have not reinstalled yet would drop out of the backup. After **Preview changes** or **Restore**, **Settings → Backup** warns beside **Back up now** and names each plugin that a backup would remove. The warning names only the plugins it could read from the list: a part of the list that Xum left out (see below) is also removed by the next backup.",
       "",
       "### When the list cannot be read",
       "",
