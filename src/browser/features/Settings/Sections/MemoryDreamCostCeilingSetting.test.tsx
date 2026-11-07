@@ -144,8 +144,11 @@ describe("MemoryDreamCostCeilingSetting", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
-  test.each(["-", "1e", "1,5", "abc"])(
-    "keeps the saved ceiling when a half-typed %p is left, and shows why",
+  // The first three are what a browser's number field reports as "" (no ceiling). The next three
+  // parse as numbers in JavaScript (16, 1000, 5), so only the field's own pattern turns them away.
+  // The last two have a second separator.
+  test.each(["-", "1e", "abc", "0x10", "1e3", "+5", "1,2,3", "1.5,5"])(
+    "keeps the saved ceiling when %p is left, and shows why",
     async (keys) => {
       const { view, input, saved, blur } = await renderSetting({
         memory: { dreamCostCeilingUsd: 2 },
@@ -155,12 +158,57 @@ describe("MemoryDreamCostCeilingSetting", () => {
       expect(view.getByRole("alert").textContent).toContain("at least $0.01");
       await blur();
 
-      // A browser's number field reports "" for these, which would read as "no ceiling".
       expect(writes).toEqual([]);
       expect(saved()?.dreamCostCeilingUsd).toBe(2);
       expect(input.value).toBe("2");
     }
   );
+
+  test.each([
+    ["0,5", 0.5],
+    ["1,5", 1.5],
+    [".5", 0.5],
+    [",5", 0.5],
+    ["5.", 5],
+    ["12", 12],
+  ])("reads %p as %d, a comma standing for the decimal point", async (keys, ceiling) => {
+    const { view, saved, type, blur } = await renderSetting();
+
+    type(keys);
+    expect(view.queryByRole("alert")).toBeNull();
+    await blur();
+
+    expect(writes).toEqual([{ memory: { dreamCostCeilingUsd: ceiling } }]);
+    expect(saved()?.dreamCostCeilingUsd).toBe(ceiling);
+  });
+
+  test("takes a ceiling up to the largest one, and shows it in plain digits", async () => {
+    const { view, input, saved, type, blur } = await renderSetting({
+      memory: { dreamCostCeilingUsd: 2 },
+    });
+
+    type("100000");
+    expect(view.queryByRole("alert")).toBeNull();
+    await blur();
+
+    expect(saved()?.dreamCostCeilingUsd).toBe(100_000);
+    // `String(1e21)` is "1e+21", which the field would read as invalid at rest.
+    expect(input.value).toBe("100000");
+  });
+
+  test("refuses a ceiling over the largest one, with the limit in the message", async () => {
+    const { view, input, saved, type, blur } = await renderSetting({
+      memory: { dreamCostCeilingUsd: 2 },
+    });
+
+    type("100000.01");
+    expect(view.getByRole("alert").textContent).toContain("at most $100000");
+    await blur();
+
+    expect(writes).toEqual([]);
+    expect(saved()?.dreamCostCeilingUsd).toBe(2);
+    expect(input.value).toBe("2");
+  });
 
   test("does not save a ceiling that is already saved", async () => {
     const { type, blur } = await renderSetting({ memory: { dreamCostCeilingUsd: 2 } });

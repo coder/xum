@@ -92,6 +92,12 @@ export const MEMORY_ANALYZER_MAX_STEPS = 12;
  * that rarely falls below a cent, so a lower ceiling would only refuse every run.
  */
 export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
+/**
+ * Largest dream cost ceiling a user can set, in USD. Far above any run's estimate, so it is the
+ * same as no ceiling; the cap keeps the saved number short enough that `String()` never prints it
+ * in exponent notation (1e+21), which the ceiling field would then read as invalid.
+ */
+export const MEMORY_DREAM_COST_CEILING_MAX_USD = 100_000;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */

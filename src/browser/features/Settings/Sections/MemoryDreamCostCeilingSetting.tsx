@@ -1,18 +1,26 @@
 import { useState } from "react";
 import { Input } from "@/browser/components/Input/Input";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
-import { MEMORY_DREAM_COST_CEILING_MIN_USD } from "@/common/constants/memory";
+import {
+  MEMORY_DREAM_COST_CEILING_MAX_USD,
+  MEMORY_DREAM_COST_CEILING_MIN_USD,
+} from "@/common/constants/memory";
 
-// Digits with an optional decimal point. `Number()` alone would also take "0x10" and "1e3".
-const DECIMAL_PATTERN = /^(?:\d+\.?\d*|\.\d+)$/;
+// Digits with an optional decimal separator, a point or a comma (many keyboards type "0,5").
+// `Number()` alone would also take "0x10", "1e3" and "+5".
+const DECIMAL_PATTERN = /^(?:\d+[.,]?\d*|[.,]\d+)$/;
+
+const INVALID_CEILING_MESSAGE = `Enter a number of at least $${MEMORY_DREAM_COST_CEILING_MIN_USD} and at most $${MEMORY_DREAM_COST_CEILING_MAX_USD}, or leave empty for no ceiling.`;
 
 /** The ceiling a draft stands for: undefined when empty (no ceiling), null when it is not a valid one. */
 function parseCeiling(draft: string): number | undefined | null {
   const trimmed = draft.trim();
   if (trimmed === "") return undefined;
   if (!DECIMAL_PATTERN.test(trimmed)) return null;
-  const value = Number(trimmed);
-  return Number.isFinite(value) && value >= MEMORY_DREAM_COST_CEILING_MIN_USD ? value : null;
+  const value = Number(trimmed.replace(",", "."));
+  return value >= MEMORY_DREAM_COST_CEILING_MIN_USD && value <= MEMORY_DREAM_COST_CEILING_MAX_USD
+    ? value
+    : null;
 }
 
 /**
@@ -49,8 +57,7 @@ export function MemoryDreamCostCeilingSetting() {
         </div>
         {parsed === null && (
           <div role="alert" className="text-error mt-1 text-xs">
-            Enter a number of at least ${MEMORY_DREAM_COST_CEILING_MIN_USD}, or leave empty for no
-            ceiling.
+            {INVALID_CEILING_MESSAGE}
           </div>
         )}
       </div>
