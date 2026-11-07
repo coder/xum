@@ -72,9 +72,25 @@ describe("describeCutOffBashScript", () => {
       "x=$(cat <<EO\\\nF\nit's here\nEOF\n)\necho done\n",
     ],
     // Bash removes the quoting of a delimiter word and expands nothing in it, so an
-    // escaped word means `AB` and the scanner models both forms.
+    // escaped word means `AB`, and a substitution stays in the word instead of ending it.
     ["escaped heredoc delimiter word", "cat <<A\\B\nit's here\nAB\necho done\n"],
     ["variable heredoc delimiter word", "D=EOF\ncat <<$D\nit's\n$D\necho done\n"],
+    [
+      "command substitution heredoc delimiter word",
+      "cat <<$(echo EOF)\n$\nit's\n$(echo EOF)\necho done\n",
+    ],
+    [
+      "arithmetic expansion heredoc delimiter word",
+      "cat <<$((1+1))\n$\nit's\n$((1+1))\necho done\n",
+    ],
+    [
+      "nested parentheses in a heredoc delimiter word",
+      "cat <<$(echo (x))\n$\nit's\n$(echo (x))\necho done\n",
+    ],
+    ["parameter expansion heredoc delimiter word", "X=EOF\ncat <<${X}\n$\nit's\n${X}\necho done\n"],
+    // A substitution that is still open at the newline gives up, so a script bash itself
+    // refuses to parse is reported complete: a deliberate miss.
+    ["unbalanced substitution heredoc delimiter word", "cat <<$(echo EOF\none\nEOF\n"],
     // Bash ends the body at a backtick delimiter as written; the scanner gives up on it.
     ["backtick heredoc delimiter", "cat <<`echo EOF`\nit's\n`echo EOF`\n"],
     ["backtick heredoc delimiter after <<-", "cat <<-`echo EOF`\n\tit's\n\t`echo EOF`\n"],
@@ -162,6 +178,16 @@ describe("describeCutOffBashScript", () => {
       "single quote after a heredoc with a variable word",
       "unterminated single quote",
       "D=EOF\ncat <<$D\nbody\n$D\necho 'cut\n",
+    ],
+    [
+      "single quote after a heredoc with a command substitution word",
+      "unterminated single quote",
+      "cat <<$(echo EOF)\nbody\n$(echo EOF)\necho 'cut\n",
+    ],
+    [
+      "single quote after a heredoc with an arithmetic word",
+      "unterminated single quote",
+      "cat <<$((1+1))\nbody\n$((1+1))\necho 'cut\n",
     ],
     [
       "double quote after a double-quoted delimiter",

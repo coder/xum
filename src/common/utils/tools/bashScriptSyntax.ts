@@ -25,6 +25,11 @@ type Frame = "code" | "paren" | "array" | "command" | "arith" | "double" | "para
 // syntax the scanner does not model.
 type Verdict = CutOffShellConstruct | "complete";
 
+// A heredoc delimiter word: the text as written, the same text with its top-level quoting
+// removed, and the index where the word ended. "giveUp" means the word could not be read
+// whole, so no heredoc is modelled.
+type DelimiterWord = { raw: string; delimiter: string; end: number } | "giveUp";
+
 interface PendingHeredoc {
   delimiter: string;
   stripTabs: boolean;
@@ -62,20 +67,13 @@ const QUOTED_FRAMES = new Set<Frame>(["double", "quotedParam"]);
 // Bash splits words only on these blanks, not on CR, NBSP or other Unicode spaces.
 const WORD_BOUNDARY = /[ \t\n;&|()<>]/;
 // A quoted run, an escaped character or a plain character of a heredoc delimiter.
-const DELIMITER_PART = /'[^'\n]*'|"[^"\n]*"|\\.|[^\s;&|<>()'"\\`]/.source;
-// `<<[-]WORD` starts a heredoc whose body begins on the next line. A here-string
-// (`<<<`) never matches a word, because the word cannot start with `<`.
-const HEREDOC_OPERATOR = new RegExp(`<<(?:(-?)[ \\t]*((?:${DELIMITER_PART})+))?`, "y");
-// An unquoted backtick in the delimiter word: bash ends the body at the word as
-// written, and the word runs on through blanks inside the backticks.
-const BACKTICK_DELIMITER = new RegExp(`<<-?[ \\t]*(?:${DELIMITER_PART})*\``, "y");
-// A backslash that ends the delimiter word joins the next line into it, so bash reads
-// `EO\` plus a line holding `F` as the word `EOF`. The scanner reads words per line, so
-// it holds only `EO`, and a body line equal to `EO` would end the body early and resume
-// code scanning inside a heredoc body, where a body quote reads as an open quote. That
-// rejects a script bash accepts, so a continued word gives up instead.
-const CONTINUED_DELIMITER = /\\\r?\n/y;
-const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
+// `<<` or `<<-` with the blanks bash skips before the delimiter word. The word itself
+// is read by readDelimiterWord, because a word can hold parentheses and quotes, which
+// no plain character class can express.
+const HEREDOC_OPERATOR = new RegExp("<<(?:(-?)[ \\t]*)?", "y");
+// Where bash ends a word. CR is not a bash word break, but a word holding one is not
+// read here either, because the scanner's line rules would not agree with it.
+const WORD_BREAK = /[ \t\r\n;&|<>]/;
 const UNMODELLED_DELIMITER_QUOTING = /\$['"]|'[^']*\\|"[^"]*\\/;
 const CASE_WORD = /case[ \t\n]/y;
 
@@ -328,41 +326,116 @@ class ShellScanner {
   }
 
   private readRedirect(): Verdict | undefined {
-    BACKTICK_DELIMITER.lastIndex = this.index;
-    if (BACKTICK_DELIMITER.test(this.text)) {
-      return "complete";
-    }
     HEREDOC_OPERATOR.lastIndex = this.index;
-    const match = HEREDOC_OPERATOR.exec(this.text);
-    if (match === null) {
+    const operator = HEREDOC_OPERATOR.exec(this.text);
+    if (operator === null) {
       this.index += 1;
       return undefined;
     }
-    if (match[2] !== undefined) {
-      CONTINUED_DELIMITER.lastIndex = HEREDOC_OPERATOR.lastIndex;
-      if (CONTINUED_DELIMITER.test(this.text)) {
-        return "complete";
-      }
-    }
-    if (match[2] !== undefined && UNMODELLED_DELIMITER_QUOTING.test(match[2])) {
-      // Bash decodes $'', $"" and escapes in quoted delimiters; the scanner does not.
+    const wordStart = HEREDOC_OPERATOR.lastIndex;
+    const word = this.readDelimiterWord(wordStart);
+    if (word === "giveUp") {
       return "complete";
     }
-    if (match[2] !== undefined) {
-      // Bash removes the quoting of the delimiter word and expands nothing in it: `<<$D`
-      // ends the body at a line holding the text `$D`, and `<<A\B` ends it at `AB`. So
-      // quote removal alone, which HEREDOC_DELIMITER_QUOTING does, gives the terminator.
-      this.heredocs.push({
-        delimiter: match[2].replace(
-          HEREDOC_DELIMITER_QUOTING,
-          (quoted: string, single?: string, double?: string) => single ?? double ?? quoted.slice(1)
-        ),
-        stripTabs: match[1] === "-",
-        depth: this.stack.length,
-      });
+    if (word.end === wordStart) {
+      // Nothing a word can start on: a here-string (`<<<`) or a bare `<<`, so no body.
+      this.index = wordStart;
+      return undefined;
     }
-    this.index = HEREDOC_OPERATOR.lastIndex;
+    if (UNMODELLED_DELIMITER_QUOTING.test(word.raw)) {
+      // Bash decodes $'', $"" and escapes inside quoted delimiters; the scanner does not.
+      return "complete";
+    }
+    this.heredocs.push({
+      delimiter: word.delimiter,
+      stripTabs: operator[1] === "-",
+      depth: this.stack.length,
+    });
+    this.index = word.end;
     return undefined;
+  }
+
+  /**
+   * Read the heredoc delimiter word that starts at `start`.
+   *
+   * Bash ends the word at an unquoted blank or at `;`, `&`, `|`, `<` or `>`, removes the
+   * word's quoting and expands nothing in it. Measured on bash 3.2.57: `<<$D` ends the
+   * body at a line holding the text `$D`, `<<A\B` at `AB`, and `<<$(echo EOF)`,
+   * `<<$((1+1))` and `<<$(echo (x))` at their own text. So `raw` is the text bash matches
+   * a body line against once the quoting at the top level of the word is removed, which
+   * `delimiter` holds. Parentheses stay inside the word, because a command substitution
+   * is part of the word rather than a word break.
+   *
+   * "giveUp" is returned for a word the scanner cannot read whole: a backtick, whose word
+   * runs on through the blanks inside it; a backslash that continues the word on the next
+   * line, so bash reads `EO\` plus a line holding `F` as `EOF` while this reader holds
+   * `EO`; a backslash with nothing after it; or parentheses left open, which bash itself
+   * refuses to parse. A word read only in part gives a terminator that is a guess, and a
+   * guessed terminator ends the body early and resumes code scanning inside the body,
+   * where a body quote reads as an open quote and a script bash accepts gets rejected.
+   */
+  private readDelimiterWord(start: number): DelimiterWord {
+    let index = start;
+    let raw = "";
+    let delimiter = "";
+    let depth = 0;
+    while (index < this.text.length) {
+      const char = this.text[index];
+      if (char === "(") {
+        depth += 1;
+      } else if (char === ")") {
+        if (depth === 0) {
+          break;
+        }
+        depth -= 1;
+      } else if (char === "`") {
+        return "giveUp";
+      } else if (char === "\\") {
+        const next = this.text[index + 1];
+        if (
+          next === undefined ||
+          next === "\n" ||
+          (next === "\r" && this.text[index + 2] === "\n")
+        ) {
+          return "giveUp";
+        }
+        raw += char + next;
+        delimiter += depth === 0 ? next : char + next;
+        index += 2;
+        continue;
+      } else if (char === "'" || char === '"') {
+        const close = this.text.indexOf(char, index + 1);
+        const lineEnd = this.text.indexOf("\n", index);
+        if (close === -1 || (lineEnd !== -1 && close > lineEnd)) {
+          // The quote does not close on this line, so leave it to the scanner: an open
+          // quote is a cut, and no heredoc starts, so this is not a terminator guess.
+          break;
+        }
+        const content = this.text.slice(index + 1, close);
+        raw += char + content + char;
+        delimiter += depth === 0 ? content : char + content + char;
+        index = close + 1;
+        continue;
+      } else if (WORD_BREAK.test(char)) {
+        if (depth === 0) {
+          break;
+        }
+        if (char === "\n") {
+          // An open substitution that carries on past the line: bash reads the word
+          // across the newline and this scanner works one line at a time, so give up.
+          return "giveUp";
+        }
+        // A blank or an operator inside a substitution stays inside the word, so fall
+        // through and keep it.
+      }
+      raw += char;
+      delimiter += char;
+      index += 1;
+    }
+    if (depth !== 0) {
+      return "giveUp";
+    }
+    return { raw, delimiter, end: index };
   }
 
   private skipHeredocBodies(): Verdict | undefined {
