@@ -1368,59 +1368,6 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(2);
   });
 
-  it("runs dream streams one at a time across workspaces", async () => {
-    // Two workspaces share global memory (and often a project), so their organizer
-    // streams must not overlap. The first stream stays open until a second one starts,
-    // or for 150 ms: an unserialized second stream starts inside that window and shows
-    // up in the log before the first one ends.
-    const events: string[] = [];
-    let streamCount = 0;
-    let markOtherStarted!: () => void;
-    const otherStarted = new Promise<void>((resolve) => {
-      markOtherStarted = resolve;
-    });
-    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
-    let timeoutCount = 0;
-    const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
-      events.push(`timeout-${++timeoutCount}`);
-      return realTimeout(ms);
-    });
-    try {
-      using fixture = await createFixture({
-        modelFactory: () => {
-          const inner = scriptedModel();
-          return new MockLanguageModelV3({
-            doStream: async (options) => {
-              const n = ++streamCount;
-              events.push(`start-${n}`);
-              if (n === 1) {
-                await Promise.race([
-                  otherStarted,
-                  new Promise((resolve) => setTimeout(resolve, 150)),
-                ]);
-              } else {
-                markOtherStarted();
-              }
-              events.push(`end-${n}`);
-              return inner.doStream(options);
-            },
-          });
-        },
-      });
-      await fixture.addWorkspace("ws-other");
-
-      const runs = await Promise.all([
-        fixture.service.maybeRun("ws-dream", "manual"),
-        fixture.service.maybeRun("ws-other", "manual"),
-      ]);
-      expect(runs.every((run) => run.success)).toBe(true);
-      // The 5 min timeout covers a stream, not the wait for its turn.
-      expect(events).toEqual(["timeout-1", "start-1", "end-1", "timeout-2", "start-2", "end-2"]);
-    } finally {
-      timeoutSpy.mockRestore();
-    }
-  });
-
   describe("dream stream queue", () => {
     /**
      * Models whose streams each hold until `release(id)`, numbered in the order the runs created
@@ -1452,11 +1399,54 @@ describe("MemoryConsolidationService", () => {
       expect(condition()).toBe(true);
     }
 
-    /** Past model creation, a run is only waiting for its turn in the queue. */
+    /**
+     * Model creation is the last step of a run's setup that waits on the disk. What follows it up
+     * to the stream is promise work only, so a few loop turns drain it: a run still without a
+     * stream after them is waiting for its turn in the queue, not for the host.
+     */
     async function waitingForTurn(fixture: Fixture, runs: number): Promise<void> {
       await until(() => fixture.modelCalls.length >= runs);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      for (let turn = 0; turn < 10; turn++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
     }
+
+    it("starts a run's timeout when its turn arrives, not while it waits behind another stream", async () => {
+      // Streams hold until released, so a second stream that starts anyway (no queue) shows up
+      // in the log before the first one ends, however slow the host is.
+      const held = heldStreams();
+      const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+      let timeoutCount = 0;
+      const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+        held.events.push(`timeout-${++timeoutCount}`);
+        return realTimeout(ms);
+      });
+      try {
+        using fixture = await createFixture({ modelFactory: held.factory });
+        await fixture.addWorkspace("ws-other");
+
+        const first = fixture.service.maybeRun("ws-dream", "manual");
+        await until(() => held.events.includes("start-1"));
+        const second = fixture.service.maybeRun("ws-other", "manual");
+        await waitingForTurn(fixture, 2);
+        expect(held.events).toEqual(["timeout-1", "start-1"]);
+
+        held.release(1);
+        await until(() => held.events.includes("start-2"));
+        held.release(2);
+        expect((await Promise.all([first, second])).every((run) => run.success)).toBe(true);
+        expect(held.events).toEqual([
+          "timeout-1",
+          "start-1",
+          "end-1",
+          "timeout-2",
+          "start-2",
+          "end-2",
+        ]);
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    });
 
     it("starts waiting runs in the order they arrived, each after the one before it ended", async () => {
       const held = heldStreams();
