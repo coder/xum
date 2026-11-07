@@ -557,7 +557,10 @@ export function harvestChunkInputChars(args: {
   resume?: HarvestProgress;
 }): number[] {
   const chunks = buildHarvestChunks(args.messages);
-  const { startChunk, landedInStartChunk } = resumePoint(chunks.length, args.resume);
+  const { startChunk, landedInStartChunk, budgetUsed } = resumePoint(chunks.length, args.resume);
+  // A run whose budget is spent skips every chunk (see runMemoryHarvest): it makes no model call,
+  // so it costs nothing and a lowered ceiling must not refuse it.
+  if (budgetUsed >= MEMORY_ANALYZER_OP_BUDGET) return [];
   return chunks.flatMap(({ transcript }, index) =>
     index < startChunk
       ? []

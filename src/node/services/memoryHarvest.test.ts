@@ -1056,6 +1056,61 @@ describe("runMemoryHarvest", () => {
 
       expect(result.ops.filter((op) => op.applied)).toHaveLength(3 + MEMORY_ANALYZER_OP_BUDGET - 3);
     });
+
+    describe("the cost estimate of a retry", () => {
+      const appliedOps = (count: number): MemoryConsolidationOp[] =>
+        Array.from({ length: count }, (_, index) => ({
+          command: "create",
+          path: `/memories/workspace/spent-${index}.md`,
+          applied: true,
+        }));
+
+      it("prices a retry whose budget is spent at no model calls, as the run makes none", async () => {
+        using fixture = createFixture();
+        fixture.messages = manyChunkMessages();
+        const resume: HarvestProgress = {
+          nextChunk: 1,
+          ops: [],
+          budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+        };
+        const { model, calls } = scriptedModel([]);
+
+        await runHarvest(fixture, model, { resume });
+
+        expect(calls).toHaveLength(0);
+        expect(
+          harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary, resume })
+        ).toEqual([]);
+      });
+
+      it("prices the chunks left of a retry with one edit of budget remaining", () => {
+        using fixture = createFixture();
+        fixture.messages = manyChunkMessages();
+
+        const left = harvestChunkInputChars({
+          messages: fixture.messages,
+          summary: fixture.summary,
+          resume: { nextChunk: 1, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET - 1 },
+        });
+
+        // Chunks 2 and 3 of 3.
+        expect(left).toHaveLength(2);
+      });
+
+      it("counts the applied ops of an older record that has no budget", () => {
+        using fixture = createFixture();
+        fixture.messages = manyChunkMessages();
+        const estimate = (applied: number) =>
+          harvestChunkInputChars({
+            messages: fixture.messages,
+            summary: fixture.summary,
+            resume: { nextChunk: 1, ops: appliedOps(applied) },
+          });
+
+        expect(estimate(MEMORY_ANALYZER_OP_BUDGET)).toEqual([]);
+        expect(estimate(MEMORY_ANALYZER_OP_BUDGET - 1)).toHaveLength(2);
+      });
+    });
   });
 
   it("reports each clean chunk's usage to cost telemetry and sums it for the record", async () => {

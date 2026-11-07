@@ -2710,6 +2710,71 @@ describe("MemoryConsolidationService", () => {
       expect(retried?.estimatedUsd).toBeLessThan((failed?.estimatedUsd ?? 0) * 0.9);
     });
 
+    it("never refuses a retry whose budget is spent: it skips every chunk, so it costs nothing", async () => {
+      let failedOnce = false;
+      using fixture = await createFixture({
+        modelFactory: () =>
+          new MockLanguageModelV3({
+            doStream: (options) => {
+              const afterToolResult = options.prompt.some((message) => message.role === "tool");
+              if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT) {
+                return Promise.resolve({ stream: noChangesStream() });
+              }
+              // Chunk 1 spends every edit, then its stream dies: the failed record keeps the spent
+              // budget, and a retry starts at chunk 1 again.
+              if (afterToolResult) {
+                failedOnce = true;
+                return Promise.resolve({ stream: failingStream() });
+              }
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: [
+                    ...Array.from(
+                      { length: MEMORY_ANALYZER_OP_BUDGET },
+                      (_, index): LanguageModelV3StreamPart => ({
+                        type: "tool-call",
+                        toolCallId: `spend-${index}`,
+                        toolName: "memory",
+                        input: JSON.stringify({
+                          command: "create",
+                          path: `/memories/workspace/spend-${index}.md`,
+                          file_text: `fact ${index}\n`,
+                        }),
+                      })
+                    ),
+                    {
+                      type: "finish",
+                      finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                      usage: {
+                        inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                        outputTokens: { total: 1, text: 0, reasoning: 0 },
+                      },
+                    },
+                  ],
+                }),
+              });
+            },
+          }),
+      });
+      await appendBulkRows(fixture);
+      const metadata = await seedCompactionEpoch(fixture);
+      expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+      expect(failedOnce).toBe(true);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "failed",
+        nextChunk: 0,
+        budgetUsed: MEMORY_ANALYZER_OP_BUDGET,
+      });
+
+      // The ceiling the user lowers meanwhile is under the estimate of all three chunks.
+      await setCeiling(fixture, TIGHT_CEILING_USD);
+      expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      const retried = (await harvestRecords(fixture))["summary-1"];
+      expect(retried).toMatchObject({ status: "completed", estimatedUsd: 0 });
+      expect(retried?.note).toContain("chunks 1-3 of 3");
+    });
+
     it("refuses the organizer over the ceiling without a stream or a record, and runs once it is raised", async () => {
       const models = archivePassModels();
       using fixture = await createFixture({ modelFactory: models.factory });
