@@ -61,7 +61,7 @@
     "args": [
       {
         "lockPath": "<root:fork>/sessions/ws-record-fork/branch-summary.lock",
-        "timeoutMs": 21000,
+        "timeoutMs": 45000,
         "label": "branch summary pending marker"
       }
     ]
