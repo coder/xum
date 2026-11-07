@@ -671,7 +671,16 @@ function createProcedureProxy(
         const clientMethod = getClientMethod();
         // trpc-cli sends {} for void inputs, but the server expects undefined
         const input = isVoidInput && isEmptyObject(opts.input) ? undefined : opts.input;
-        return clientMethod(input);
+        const result = await clientMethod(input);
+        // If a procedure returns a failure result, ensure the CLI exits non-zero (#7856)
+        if (
+          result !== null &&
+          typeof result === "object" &&
+          (result as { success?: unknown }).success === false
+        ) {
+          process.exitCode = 1;
+        }
+        return result;
       },
     },
   };
