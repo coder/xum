@@ -1141,6 +1141,43 @@ describe("runMemoryHarvest", () => {
         expect(result.nextChunk).toBe(1);
       }
     );
+
+    it.each(["its timeout", "workspace removal"])(
+      "is not held past %s by a memory read that never returns",
+      async (cause) => {
+        using fixture = createFixture();
+        const removal = new AbortController();
+        const chunkTimeout = new AbortController();
+        // Bun 1.3.14 never fires AbortSignal.timeout once streamText has added and removed a
+        // listener, so the test fires the chunk's timeout itself.
+        const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation(
+          () => chunkTimeout.signal
+        );
+        let markReadStarted!: () => void;
+        const readStarted = new Promise<void>((resolve) => {
+          markReadStarted = resolve;
+        });
+        spyOn(fixture.memoryService, "view").mockImplementation(() => {
+          markReadStarted();
+          return new Promise(() => undefined);
+        });
+        try {
+          const { model } = scriptedModel([
+            [memoryToolCall({ command: "view", path: "/memories/" }), toolFinishChunk()],
+          ]);
+
+          const running = runHarvest(fixture, model, { abortSignal: removal.signal });
+          await readStarted;
+          (cause === "its timeout" ? chunkTimeout : removal).abort();
+          const result = await running;
+
+          expect(result.streamError).toContain("cut short");
+          expect(result.nextChunk).toBe(0);
+        } finally {
+          timeoutSpy.mockRestore();
+        }
+      }
+    );
   });
 });
 

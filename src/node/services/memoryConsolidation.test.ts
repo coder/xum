@@ -232,6 +232,37 @@ describe("consolidation memory tool rails", () => {
     expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("original");
   });
 
+  it("a read stalled in filesystem I/O returns once the pass is cancelled", async () => {
+    // Only mutations re-check the signal inside MemoryService, and the provider loop waits for
+    // the tool result: a read that never settles would hold the run past its timeout.
+    using fixture = await createFixture();
+    const controller = new AbortController();
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      abortSignal: controller.signal,
+    });
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    spyOn(fixture.memoryService, "view").mockImplementation(() => {
+      markReadStarted();
+      return new Promise(() => undefined);
+    });
+
+    const pending = execute(tool, { command: "view", path: "/memories/" });
+    await readStarted;
+    controller.abort();
+
+    const result = await pending;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cancelled");
+  });
+
   it("applies in-scope mutations and journals them", async () => {
     using fixture = await createFixture();
     const result = await execute(fixture.tool, {
