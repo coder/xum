@@ -368,6 +368,23 @@ function buildConnectToPin(url: URL, address: string): string {
   return `${url.hostname}:${port}:${routedAddress}:${port}`;
 }
 
+/**
+ * Whether curl runs in the macOS agent sandbox with a restricted network. There getaddrinfo has
+ * no mDNSResponder socket, so the host is neither resolved nor pinned: curl goes through the
+ * proxy the sandbox sets (HTTP_PROXY and the like), which resolves it, enforces the allow list
+ * and refuses private addresses. A direct connection is closed by the sandbox, and the route
+ * check refuses its response. The "open" network has no proxy, so it keeps the pin.
+ */
+function routesThroughSandboxProxy(config: ToolConfiguration): boolean {
+  try {
+    const policy = config.runtime.agentSandboxPolicy?.({ cwd: config.cwd });
+    return policy != null && policy.network !== "open";
+  } catch {
+    // No safe policy for this cwd: the curl command fails closed before it runs.
+    return true;
+  }
+}
+
 async function assertWebFetchTargetAllowed(
   config: ToolConfiguration,
   rawUrl: string,
@@ -392,6 +409,10 @@ async function assertWebFetchTargetAllowed(
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }
+    return { url: parsedUrl, addresses: [hostname], pinned: false };
+  }
+
+  if (routesThroughSandboxProxy(config)) {
     return { url: parsedUrl, addresses: [hostname], pinned: false };
   }
 
