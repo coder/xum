@@ -70,8 +70,9 @@ import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
 import {
+  analyzedFloorRowId,
   harvestChunkInputChars,
-  rowsAfterAnalyzedFloor,
+  rowsAfterFloor,
   runMemoryHarvest,
   selectOpenEpoch,
   type HarvestEpoch,
@@ -417,6 +418,21 @@ function isCostCeilingRefusal(error: string): boolean {
 /** What an attempt learns before it streams; shared so a failure record can carry it. */
 interface HarvestAttemptState {
   estimatedUsd?: number;
+  /** Absent until the job's first attempt reached the epoch; see MemoryHarvestRecord. */
+  analyzedFloorRowId?: string | null;
+}
+
+/** The record fields of a run in flight: its progress and what the attempt learned. */
+function harvestAttemptFields(
+  progress: HarvestProgress,
+  state: HarvestAttemptState
+): ReturnType<typeof harvestProgressFields> &
+  Pick<MemoryHarvestRecord, "analyzedFloorRowId" | "estimatedUsd"> {
+  return {
+    ...harvestProgressFields(progress),
+    analyzedFloorRowId: state.analyzedFloorRowId,
+    estimatedUsd: state.estimatedUsd,
+  };
 }
 
 function harvestRecordIdentity(
@@ -1473,7 +1489,11 @@ export class MemoryConsolidationService extends EventEmitter {
         nextChunkOps: existing?.nextChunkOps,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
-      const attemptState: HarvestAttemptState = {};
+      // A retry keeps the floor of the first attempt: the chunk cursor above counts chunks of the
+      // rows after it.
+      const attemptState: HarvestAttemptState = {
+        analyzedFloorRowId: existing?.analyzedFloorRowId,
+      };
       const analyzedRowIds = analyzedOpenEpochRowIds(sidecar.harvestsByWorkspace[workspaceId]);
 
       if (
@@ -1504,7 +1524,7 @@ export class MemoryConsolidationService extends EventEmitter {
             startedAt,
             attemptCount: existingAttemptCount + 1,
             ...harvestRecordIdentity(source),
-            ...harvestProgressFields(progress),
+            ...harvestAttemptFields(progress, attemptState),
           },
           projectPath
         );
@@ -1527,8 +1547,7 @@ export class MemoryConsolidationService extends EventEmitter {
                     ? existingAttemptCount
                     : existingAttemptCount + 1,
                 ...harvestRecordIdentity(source),
-                ...harvestProgressFields(progress),
-                estimatedUsd: attemptState.estimatedUsd,
+                ...harvestAttemptFields(progress, attemptState),
                 error: getErrorMessage(error),
               },
               projectPath
@@ -1595,8 +1614,7 @@ export class MemoryConsolidationService extends EventEmitter {
             completedAt: Date.now(),
             attemptCount: opts.existingAttemptCount + 1,
             ...harvestRecordIdentity(source),
-            ...harvestProgressFields(progress),
-            estimatedUsd: opts.attemptState.estimatedUsd,
+            ...harvestAttemptFields(progress, opts.attemptState),
             usage: outcome.usage,
             note: outcome.note,
           },
@@ -1605,9 +1623,16 @@ export class MemoryConsolidationService extends EventEmitter {
 
       // An archive that read part of this epoch's rows already analyzed them: a second archive
       // after new rows, and the compaction that later closes the epoch, both start after them.
-      // The floor comes from records that completed before this job, so a retry of the job finds
-      // the floor it started with: no open-epoch run can complete inside an epoch once it closed.
-      const messages = rowsAfterAnalyzedFloor(epoch.data.messages, opts.analyzedRowIds);
+      // The first attempt fixes the floor in the record and a retry reuses it. Looking again could
+      // find a newer floor: an archive that read the epoch before it closed may complete after
+      // this job began, and the chunk cursor counts chunks of the rows after the old floor.
+      if (opts.attemptState.analyzedFloorRowId === undefined) {
+        opts.attemptState.analyzedFloorRowId = analyzedFloorRowId(
+          epoch.data.messages,
+          opts.analyzedRowIds
+        );
+      }
+      const messages = rowsAfterFloor(epoch.data.messages, opts.attemptState.analyzedFloorRowId);
       if (messages.length === 0 && epoch.data.messages.length > 0) {
         // Every row was analyzed before: nothing is left to read, so no model call.
         return yield* saveCompleted(opts.progress);
@@ -1667,8 +1692,7 @@ export class MemoryConsolidationService extends EventEmitter {
             progressAt: Date.now(),
             attemptCount: opts.existingAttemptCount + 1,
             ...harvestRecordIdentity(source),
-            ...harvestProgressFields(progress),
-            estimatedUsd: opts.attemptState.estimatedUsd,
+            ...harvestAttemptFields(progress, opts.attemptState),
           },
           ctx.projectPath
         );

@@ -290,16 +290,26 @@ export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
 }
 
 /**
- * The rows after the newest one whose id is in `analyzedRowIds`, which an earlier run already
- * analyzed along with every row before it. Rows match by id, never by history sequence: a rewound
- * chat can reuse a sequence but never an id. With no such row among `rows` (rewound away, or in
- * another epoch) there is no floor and every row stays.
+ * The newest row of `rows` whose id is in `analyzedRowIds`: an earlier run analyzed it and every
+ * row before it. Rows match by id, never by history sequence: a rewound chat can reuse a sequence
+ * but never an id. Null when none is (rewound away, or in another epoch): there is no floor.
  */
-export function rowsAfterAnalyzedFloor<T extends Pick<MuxMessage, "id">>(
-  rows: readonly T[],
+export function analyzedFloorRowId(
+  rows: readonly Pick<MuxMessage, "id">[],
   analyzedRowIds: ReadonlySet<string>
+): string | null {
+  return rows.findLast((row) => analyzedRowIds.has(row.id))?.id ?? null;
+}
+
+/**
+ * The rows after the floor row. A floor that is not among `rows` any more (the chat was rewound
+ * past it) leaves every row.
+ */
+export function rowsAfterFloor<T extends Pick<MuxMessage, "id">>(
+  rows: readonly T[],
+  floorRowId: string | null
 ): T[] {
-  const floorIndex = rows.findLastIndex((row) => analyzedRowIds.has(row.id));
+  const floorIndex = floorRowId === null ? -1 : rows.findIndex((row) => row.id === floorRowId);
   return rows.slice(floorIndex + 1);
 }
 

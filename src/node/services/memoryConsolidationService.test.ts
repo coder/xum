@@ -2158,6 +2158,85 @@ describe("MemoryConsolidationService", () => {
         expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
       });
 
+      it("starts after the newest archive's floor, not the oldest, when several archives ran", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-4", "Releases are cut from the main branch."]]);
+        const metadata = await seedCompactionEpoch(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(3);
+        const closing = analyzerRuns(models)[2]?.prompt ?? "";
+        expect(closing).toContain("Releases are cut from the main branch.");
+        expect(closing).toContain("remember that I prefer concise tests");
+        // The second archive read up to open-3: the first archive's floor is behind it.
+        expect(closing).not.toContain("CI pins node 22");
+        expect(closing).not.toContain("We settled on bun");
+      });
+
+      it("keeps a retry of the closing compaction on the rows its first attempt read, even if an archive completes meanwhile", async () => {
+        const chunkLabels: string[] = [];
+        let failedOnce = false;
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const prompt = userPromptText(options);
+                const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+                if (!prompt.includes("just-compacted transcript epoch")) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                chunkLabels.push(label);
+                if (label.startsWith("2/") && !failedOnce) {
+                  failedOnce = true;
+                  return Promise.resolve({ stream: failingStream() });
+                }
+                return Promise.resolve({ stream: noChangesStream() });
+              },
+            }),
+        });
+        await appendBulkRows(fixture);
+        const metadata = await seedCompactionEpoch(fixture);
+        expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "failed",
+          nextChunk: 1,
+          // No archive had read this epoch: the record says "no floor", not "not looked at".
+          analyzedFloorRowId: null,
+        });
+
+        // An archive pass that read the epoch before it closed finishes after the first attempt:
+        // its row is inside the closed epoch, so it must not move the rows under the saved cursor.
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+          harvestsByWorkspace: Record<string, Record<string, unknown>>;
+        };
+        sidecar.harvestsByWorkspace["ws-dream"]["open:bulk-9"] = {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "open:bulk-9",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+        };
+        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+
+        expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+        expect(chunkLabels).toEqual(["1/3", "2/3", "2/3", "3/3"]);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 3,
+        });
+      });
+
       it("makes no analyzer call for a compaction that closes an epoch an archive fully analyzed", async () => {
         const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });
