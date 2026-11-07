@@ -45,8 +45,6 @@ export function salvageAgentSandbox(value: unknown): AgentSandboxConfig | undefi
     const parsed = AgentSandboxConfigSchema.shape[field].safeParse(record[field]);
     if (parsed.success) salvaged[field] = parsed.data;
   }
-  // A malformed `enabled` that still reads as true keeps the sandbox on.
-  if (salvaged.enabled === undefined && record.enabled === true) salvaged.enabled = true;
   const result = AgentSandboxConfigSchema.parse(salvaged);
   return Object.keys(result).length > 0 ? result : undefined;
 }

@@ -77,6 +77,12 @@ export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
  * NOTE: Local runtimes validate that cwd exists before spawning, so this must be a real directory.
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
+/** The workspace and its scratch folder, which the sandbox opens like a cwd. */
+function backgroundSandboxRoots(options: SpawnOptions): string[] {
+  const scratchDir = options.env?.XUM_SCRATCH_DIR;
+  return scratchDir ? [options.cwd, scratchDir] : [options.cwd];
+}
+
 /**
  * Xum's own record keeping (spawn records, output reads, the kill sequence), not agent code, so
  * it runs outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox.
@@ -314,11 +320,8 @@ export async function spawnProcess(
       cwd: FALLBACK_CWD,
       pathEnv: { ...options.pathEnv, [BACKGROUND_CWD_ENV]: options.cwd },
       // The command starts in FALLBACK_CWD and cd's into the workspace, which the sandbox opens.
-      sandboxRoots: [
-        options.cwd,
-        ...(options.env?.XUM_SCRATCH_DIR ? [options.env.XUM_SCRATCH_DIR] : []),
-      ],
-      ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+      sandboxRoots: backgroundSandboxRoots(options),
+      sandbox: options.sandbox,
     });
 
     if (result.exitCode !== 0) {
