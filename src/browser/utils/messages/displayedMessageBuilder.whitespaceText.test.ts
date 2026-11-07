@@ -64,4 +64,12 @@ describe("buildDisplayedMessagesForMessage whitespace-only text parts", () => {
     // would be without the whitespace part.
     expect(reasoning.isOnlyMessageContent).toBe(true);
   });
+
+  test("a corrupted text part without text renders no row instead of crashing", () => {
+    // A lone part skips mergeAdjacentParts, so the builder sees the raw row.
+    const corruptedPart: unknown = { type: "text" };
+    const rows = build([corruptedPart as MuxMessage["parts"][number]], false);
+
+    expect(rows).toEqual([]);
+  });
 });
