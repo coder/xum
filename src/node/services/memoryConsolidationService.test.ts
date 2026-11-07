@@ -2147,23 +2147,19 @@ describe("MemoryConsolidationService", () => {
       expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]?.status).toBe("completed");
     });
 
-    it("does not make a workspace wait for the analyzer of an unrelated one", async () => {
+    it("runs the chunks of two unrelated workspaces one after the other, like every memory-writing stream", async () => {
+      // The dream's exclusion is service-wide: its lock file is one for the root, so a chunk of
+      // another owner cannot hold it beside this one. Each owner still has its own job queue.
       const held = heldAnalyzers();
       using fixture = await createFixture({ modelFactory: held.factory });
       await fixture.addWorkspace("ws-other");
       const first = await seedCompactionEpoch(fixture);
       const other = await seedCompactionEpoch(fixture, "ws-other");
 
-      const firstRun = fixture.service.maybeHarvestThenSweep(first);
-      await held.streamStarted(1);
-      const otherRun = fixture.service.maybeHarvestThenSweep(other);
-      // The first stream is still held: the other workspace's analyzer starts anyway.
-      await held.streamStarted(2);
-      expect(held.events).toEqual(["start-1", "start-2"]);
+      await runSecondBehindFirst(fixture, held, first, other);
 
-      held.release(1);
-      held.release(2);
-      await Promise.all([firstRun, otherRun]);
+      expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      expect((await harvestRecords(fixture, "ws-other"))["summary-1"]?.status).toBe("completed");
     });
 
     it("starts the owner's next analyzer while the previous one's usage is still being recorded", async () => {
@@ -2281,7 +2277,21 @@ describe("MemoryConsolidationService", () => {
         await held.streamStarted(1);
         const dreamRun = fixture.service.maybeRun("ws-dream", "manual");
         await held.modelCreated(2);
-        await settle();
+        // A dream with no exclusion to wait for still has disk work (its lock) before its stream,
+        // which no count of loop turns bounds. The stream starting is the event waited for; the
+        // bound only ends the wait of a dream that is held back, as it should be.
+        let giveUp: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const startedEarly = await Promise.race([
+            held.dreamStarted.then(() => true),
+            new Promise<boolean>((resolve) => {
+              giveUp = setTimeout(() => resolve(false), 250);
+            }),
+          ]);
+          expect(startedEarly).toBe(false);
+        } finally {
+          clearTimeout(giveUp);
+        }
         expect(held.events).toEqual(["start-1"]);
 
         held.release(1);
