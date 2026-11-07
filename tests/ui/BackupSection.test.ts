@@ -1624,6 +1624,8 @@ describe("BackupSection", () => {
         });
         fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
         const override = await canvas.findByRole("checkbox", { name: "Override secret scan" });
+        // The secret refusal says nothing about the removal, so its card stays.
+        expect(canvas.getByText("Remove plugins from the backup?")).toBeTruthy();
         fireEvent.click(override);
         await waitFor(() => expect(override.getAttribute("data-state")).toBe("checked"));
 
