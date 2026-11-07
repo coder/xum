@@ -599,6 +599,23 @@ describe("runMemoryHarvest", () => {
     });
   });
 
+  it("reports each clean chunk's usage to cost telemetry and sums it for the record", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const recorded: number[] = [];
+    const { model } = scriptedModel([[finishChunk(5)], [finishChunk(5)], [finishChunk(5)]]);
+
+    const result = await runHarvest(fixture, model, {
+      recordUsage: (usage) => {
+        recorded.push(usage.outputTokens ?? 0);
+        return Promise.resolve();
+      },
+    });
+
+    expect(recorded).toEqual([5, 5, 5]);
+    expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 15 });
+  });
+
   describe("resume cursor", () => {
     it("restarts a failed epoch at the chunk that failed, with the same chunk text", async () => {
       using fixture = createFixture();

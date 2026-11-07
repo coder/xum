@@ -1,4 +1,4 @@
-import { stepCountIs, streamText, type LanguageModel } from "ai";
+import { stepCountIs, streamText, type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import {
@@ -235,6 +235,73 @@ function buildChunkPrompt(args: {
   );
 }
 
+interface ChunkOutcome {
+  streamError?: string;
+  /** Tokens of the chunk's whole stream; absent after a failure or when the provider sent none. */
+  usage?: { inputTokens: number; outputTokens: number };
+}
+
+function sumUsage(
+  total: MemoryHarvestResult["usage"],
+  chunk: ChunkOutcome["usage"]
+): MemoryHarvestResult["usage"] {
+  if (chunk === undefined) return total;
+  return {
+    inputTokens: (total?.inputTokens ?? 0) + chunk.inputTokens,
+    outputTokens: (total?.outputTokens ?? 0) + chunk.outputTokens,
+  };
+}
+
+/** Streams one analyzer chunk to its end. `label` names the chunk in an error ("2/3"). */
+async function analyzeChunk(args: {
+  model: LanguageModel;
+  memoryTool: Tool;
+  prompt: string;
+  signal: AbortSignal;
+  label: string;
+  recordUsage?: (
+    usage: LanguageModelV2Usage,
+    providerMetadata?: Record<string, unknown>
+  ) => Promise<void>;
+  pricingModel?: string;
+}): Promise<ChunkOutcome> {
+  const stream = streamText({
+    model: args.model,
+    system: MEMORY_ANALYZER_SYSTEM_PROMPT,
+    prompt: args.prompt,
+    tools: { memory: args.memoryTool },
+    stopWhen: stepCountIs(MEMORY_ANALYZER_MAX_STEPS),
+    abortSignal: args.signal,
+  });
+  const streamErrors: string[] = [];
+  await stream.consumeStream({ onError: (error) => streamErrors.push(getErrorMessage(error)) });
+  if (streamErrors.length > 0) return { streamError: streamErrors[0] };
+  // An abort ends the stream without an error part, so it would read as a clean chunk and move
+  // the cursor past a chunk that was never analyzed.
+  if (args.signal.aborted) {
+    return {
+      streamError: `memory analysis of chunk ${args.label} was cut short by its timeout or by workspace removal`,
+    };
+  }
+
+  try {
+    // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
+    const totalUsage = await stream.usage;
+    await args.recordUsage?.(
+      totalUsage,
+      accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
+    );
+    return {
+      usage: {
+        inputTokens: totalUsage.inputTokens ?? 0,
+        outputTokens: totalUsage.outputTokens ?? 0,
+      },
+    };
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Runs the analyzer over one compaction epoch: one `streamText` per transcript chunk, each with
  * the guarded memory tool restricted to workspace memory. Reads pass through, so the model can
@@ -293,15 +360,14 @@ export async function runMemoryHarvest(args: {
     ops: [...priorOps, ...journal],
   });
 
-  const streamErrors: string[] = [];
+  let streamError: string | undefined;
   let usage: MemoryHarvestResult["usage"];
   let nextChunk = Math.min(args.resume?.nextChunk ?? 0, chunks.length);
   for (let index = nextChunk; index < chunks.length; index++) {
     // Own timeout per chunk: a long epoch must not run out of time on its later chunks. The same
     // signal guards the chunk's memory tool, so a mutation still in flight when it fires is refused.
-    const timeoutMs = args.chunkTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS;
-    const timeout = AbortSignal.timeout(timeoutMs);
-    const chunkSignal =
+    const timeout = AbortSignal.timeout(args.chunkTimeoutMs ?? MEMORY_CONSOLIDATION_TIMEOUT_MS);
+    const signal =
       args.abortSignal === undefined ? timeout : AbortSignal.any([timeout, args.abortSignal]);
     const { tool: memoryTool } = createConsolidationMemoryTool({
       memoryService: args.memoryService,
@@ -310,57 +376,33 @@ export async function runMemoryHarvest(args: {
       dryRun: false,
       journal,
       budget,
-      abortSignal: chunkSignal,
+      abortSignal: signal,
       writableScopes: ["workspace"],
       rejectSecretLike: true,
       description: ANALYZER_TOOL_DESCRIPTION,
     });
-    const stream = streamText({
+    const outcome = await analyzeChunk({
       model: args.model,
-      system: MEMORY_ANALYZER_SYSTEM_PROMPT,
+      memoryTool,
       prompt: buildChunkPrompt({
         summary: args.summary,
         index,
         total: chunks.length,
         transcript: chunks[index],
       }),
-      tools: { memory: memoryTool },
-      stopWhen: stepCountIs(MEMORY_ANALYZER_MAX_STEPS),
-      abortSignal: chunkSignal,
+      signal,
+      label: `${index + 1}/${chunks.length}`,
+      recordUsage: args.recordUsage,
+      pricingModel: args.pricingModel,
     });
-
-    await stream.consumeStream({
-      onError: (error) => streamErrors.push(getErrorMessage(error)),
-    });
-    // An abort ends the stream without an error part, so it would read as a clean chunk and move
-    // the cursor past a chunk that was never analyzed.
-    if (streamErrors.length === 0 && chunkSignal.aborted) {
-      streamErrors.push(
-        args.abortSignal?.aborted === true
-          ? "memory analysis was cancelled"
-          : `chunk ${index + 1}/${chunks.length} timed out after ${timeoutMs} ms`
-      );
+    if (outcome.streamError !== undefined) {
+      streamError = outcome.streamError;
+      break;
     }
-    if (streamErrors.length > 0) break;
-
-    try {
-      // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
-      const totalUsage = await stream.usage;
-      usage = {
-        inputTokens: (usage?.inputTokens ?? 0) + (totalUsage.inputTokens ?? 0),
-        outputTokens: (usage?.outputTokens ?? 0) + (totalUsage.outputTokens ?? 0),
-      };
-      await args.recordUsage?.(
-        totalUsage,
-        accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
-      );
-    } catch {
-      usage = undefined;
-    }
-
+    usage = sumUsage(usage, outcome.usage);
     nextChunk = index + 1;
     await args.onChunkComplete?.(progressAt(nextChunk));
   }
 
-  return { ...progressAt(nextChunk), usage, streamError: streamErrors[0] };
+  return { ...progressAt(nextChunk), usage, streamError };
 }
