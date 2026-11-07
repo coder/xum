@@ -67,7 +67,14 @@ import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
-import { runMemoryHarvest, type HarvestProgress } from "@/node/services/memoryHarvest";
+import {
+  analyzedFloorRowId,
+  rowsAfterFloor,
+  runMemoryHarvest,
+  selectOpenEpoch,
+  type HarvestEpoch,
+  type HarvestProgress,
+} from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
@@ -350,6 +357,81 @@ function harvestProgressFields(
   };
 }
 
+/**
+ * What one analyzer run reads, and the identity of its record. A closed epoch is keyed by its
+ * summary message and keeps the compaction metadata, which recovery needs to read the epoch again.
+ * The open epoch (the rows after the latest boundary, analyzed when the workspace is archived)
+ * has neither: nothing recovers it, the next archive retries a failed record.
+ */
+interface HarvestSource {
+  workspaceId: string;
+  boundaryKey: string;
+  compactionEpoch: number;
+  completionMetadata?: CompactionCompletionMetadata;
+  readEpoch: () => Promise<Result<HarvestEpoch>>;
+}
+
+/** What an attempt learns before it streams; shared so a failure record can carry it. */
+interface HarvestAttemptState {
+  /** Absent until the job's first attempt reached the epoch; see MemoryHarvestRecord. */
+  analyzedFloorRowId?: string | null;
+}
+
+/** The record fields of a run in flight: its progress and what the attempt learned. */
+function harvestAttemptFields(
+  progress: HarvestProgress,
+  state: HarvestAttemptState
+): ReturnType<typeof harvestProgressFields> & Pick<MemoryHarvestRecord, "analyzedFloorRowId"> {
+  return {
+    ...harvestProgressFields(progress),
+    analyzedFloorRowId: state.analyzedFloorRowId,
+  };
+}
+
+function harvestRecordIdentity(
+  source: HarvestSource
+): Pick<MemoryHarvestRecord, "boundaryKey" | "compactionEpoch" | "completionMetadata"> {
+  return {
+    boundaryKey: source.boundaryKey,
+    compactionEpoch: source.compactionEpoch,
+    completionMetadata: source.completionMetadata,
+  };
+}
+
+/**
+ * Harvest-record key of the open epoch: its newest row's id. A compaction key is a message id too
+ * and no message id starts with this prefix. The key changes when a row arrives, so an archive
+ * that finds the same newest row has nothing new to analyze. A row id, unlike a history sequence,
+ * is never reused: a rewound chat can grow back to the same sequence.
+ */
+const OPEN_EPOCH_KEY_PREFIX = "open:";
+
+/**
+ * The ids of the rows that open-epoch runs read up to: every row up to each was analyzed. That is
+ * the record's `readThroughRowId`, not always the newest row its key names: a run that skipped
+ * chunks for its budget never read the rows after it. A completed record from before the field
+ * read everything up to its key's row. A failed run counts through the last chunk it read
+ * cleanly: those chunks' edits landed, and a later run, an archive after a new row or the
+ * compaction that closes the epoch, would otherwise read the rows again with a fresh budget. A
+ * failed record without the field read nothing known. Read from the records, so a pruned record
+ * only loses its floor, which re-reads rows instead of skipping any.
+ */
+function analyzedOpenEpochRowIds(
+  records: Record<string, MemoryHarvestRecord> | undefined
+): Set<string> {
+  const ids = new Set<string>();
+  for (const [boundaryKey, record] of Object.entries(records ?? {})) {
+    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX) || record.status === "pending") continue;
+    const readEverythingToKey =
+      record.status === "completed" && record.readThroughRowId === undefined;
+    const readThrough = readEverythingToKey
+      ? boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length)
+      : record.readThroughRowId;
+    if (typeof readThrough === "string") ids.add(readThrough);
+  }
+  return ids;
+}
+
 /** Terminal marker for a bucket whose transcript is being deleted (see finalizeHarvestsForRemoval). */
 function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHarvestRecord {
   return {
@@ -409,7 +491,10 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   private readonly removalCancelled = new Set<string>();
 
-  /** Coalesces duplicate completion signals for one physical compaction boundary. */
+  /**
+   * Coalesces duplicate completion signals for one physical compaction boundary. Also holds a
+   * workspace's active archive pass, which a later archive queues behind.
+   */
   private readonly harvestInFlight = new Map<
     string,
     Promise<Result<MemoryConsolidationRecord, string>>
@@ -608,6 +693,7 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const retryable = records
         .filter((record) => {
+          // Nothing to read the epoch again from: the open epoch's record has no metadata.
           if (record.completionMetadata === undefined) return false;
           if (record.attemptCount >= HARVEST_MAX_ATTEMPTS) return false;
           return record.status === "failed" || isStalePendingHarvestRecord(record);
@@ -1127,6 +1213,103 @@ export class MemoryConsolidationService extends EventEmitter {
     }
   }
 
+  /**
+   * Archive's final pass: analyze the epoch the workspace is still in (no compaction closed it, so
+   * nothing has read it), then run the dream, so the dream can promote what the analyzer wrote.
+   * Best effort: an analysis that fails or is refused never stops the dream, the one chance to
+   * promote before workspace memory is deleted. Undebounced, like every archive run.
+   *
+   * A sub-agent's archive analyzes its own open epoch too, into the owner's workspace memory (its
+   * analyzer context redirects there, as a compaction's does), but the dream is the owner's: the
+   * child's archive is refused after the analysis, as maybeRun does, and the owner's archive pass
+   * promotes what the child wrote.
+   */
+  async maybeRunArchivePass(
+    workspaceId: string
+  ): Promise<Result<MemoryConsolidationRecord, string>> {
+    if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
+    if (this.removalCancelled.has(workspaceId)) {
+      return Err("workspace is being removed; consolidation refused");
+    }
+    const runKey = `${workspaceId}:archive-pass`;
+    const active = this.harvestInFlight.get(runKey);
+    if (active !== undefined) {
+      // Queued, not coalesced, like maybeRun's archive: rows added since the active pass read the
+      // epoch (an unarchive and a new archive inside one pass) are for this pass to analyze.
+      await active.catch(() => undefined);
+      return this.maybeRunArchivePass(workspaceId);
+    }
+    const run = this.analyzeOpenEpochThenRunArchive(workspaceId);
+    this.harvestInFlight.set(runKey, run);
+    try {
+      return await run;
+    } finally {
+      this.harvestInFlight.delete(runKey);
+    }
+  }
+
+  private async analyzeOpenEpochThenRunArchive(
+    workspaceId: string
+  ): Promise<Result<MemoryConsolidationRecord, string>> {
+    const removal = this.trackRunController(workspaceId);
+    try {
+      const analyzed = await Effect.runPromise(
+        this.analyzeOpenEpochEffect(workspaceId, removal.controller.signal)
+      );
+      if (!analyzed.success) {
+        log.debug("[MemoryConsolidation] open-epoch analysis skipped", {
+          workspaceId,
+          reason: analyzed.error,
+        });
+      }
+    } catch (error) {
+      log.warn("[MemoryConsolidation] open-epoch analysis failed; running the final pass anyway", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    } finally {
+      removal.dispose();
+    }
+    return this.maybeRun(workspaceId, "archive");
+  }
+
+  /**
+   * Analyzer run over the rows after the latest context boundary. The record key is the newest
+   * row (see OPEN_EPOCH_KEY_PREFIX): the same rows are never analyzed twice, new rows get a new
+   * run that reads only them (see analyzedOpenEpochRowIds), and an epoch with nothing to read makes
+   * no model call and no record.
+   */
+  private analyzeOpenEpochEffect(
+    workspaceId: string,
+    removalSignal: AbortSignal
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const scope = yield* self.harvestScopeEffect(workspaceId);
+      if (!scope.success) return Err(scope.error);
+      const history = yield* Effect.promise(() =>
+        self.historyService.getHistoryFromLatestBoundary(workspaceId)
+      );
+      if (!history.success) return Err(`could not read workspace history: ${history.error}`);
+      const openEpoch = selectOpenEpoch(history.data);
+      const newest = openEpoch.messages.at(-1);
+      if (newest === undefined) return Ok(undefined);
+
+      yield* self.runHarvestJobEffect(
+        {
+          workspaceId,
+          boundaryKey: `${OPEN_EPOCH_KEY_PREFIX}${newest.id}`,
+          compactionEpoch: openEpoch.compactionEpoch,
+          readEpoch: () => Promise.resolve(Ok({ messages: openEpoch.messages })),
+        },
+        scope.data,
+        removalSignal
+      );
+      return Ok(undefined);
+    });
+  }
+
   private harvestThenSweepLockedEffect(
     metadata: CompactionCompletionMetadata,
     removalSignal: AbortSignal
@@ -1134,109 +1317,20 @@ export class MemoryConsolidationService extends EventEmitter {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
-      // Durable cross-process teardown gate (r61); see isRemovalTombstonedEffect.
-      if (yield* self.isRemovalTombstonedEffect(metadata.workspaceId)) {
-        return Err("workspace is being removed; harvest refused");
-      }
-      const workspace = self.config.findWorkspace(metadata.workspaceId);
-      if (!workspace) return Err(`workspace not found: ${metadata.workspaceId}`);
-      const projectPath = resolveConsolidationProjectPath(workspace);
-      const ctx: MemoryScopeContext = {
-        runtime: null,
-        checkoutCwd: "",
-        workspaceId: metadata.workspaceId,
-        projectPath,
-      };
-      const boundaryKey = metadata.summaryMessageId;
-      const sidecar = yield* self.loadEffect();
-      const existing = sidecar.harvestsByWorkspace[metadata.workspaceId]?.[boundaryKey];
-      const existingAttemptCount = existing?.attemptCount ?? 0;
-      // A retry resumes where the failed attempt stopped: its chunks already wrote to memory.
-      const progress: HarvestProgress = {
-        nextChunk: existing?.nextChunk ?? 0,
-        ops: existing?.ops ?? [],
-        budgetUsed: existing?.budgetUsed,
-        nextChunkOps: existing?.nextChunkOps,
-        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
-        // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
-        readThroughRowId: existing?.readThroughRowId,
-      };
-      const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
-
-      if (
-        existing?.status === "pending" &&
-        stalePending &&
-        existingAttemptCount >= HARVEST_MAX_ATTEMPTS
-      ) {
-        yield* self.saveHarvestRecordEffect(
-          metadata.workspaceId,
-          boundaryKey,
-          {
-            ...existing,
-            status: "failed",
-            completedAt: Date.now(),
-            error: existing.error ?? "stale pending harvest exceeded retry attempts",
-          },
-          projectPath
-        );
-      }
-
-      if (existing?.status !== "completed" && existingAttemptCount < HARVEST_MAX_ATTEMPTS) {
-        const startedAt = Date.now();
-        yield* self.saveHarvestRecordEffect(
-          metadata.workspaceId,
-          boundaryKey,
-          {
-            status: "pending",
-            startedAt,
-            attemptCount: existingAttemptCount + 1,
-            boundaryKey,
-            compactionEpoch: metadata.compactionEpoch,
-            completionMetadata: metadata,
-            ...harvestProgressFields(progress),
-          },
-          projectPath
-        );
-
-        // The pre-Effect body was one whole try/catch: any failure — a typed
-        // throw below, a rejected await, or a defect such as the
-        // completed-record save rejecting — journals a failed record and
-        // still falls through to the sweep, so the fold handles the error
-        // channel AND defects identically.
-        const journalHarvestFailure = (error: unknown): Effect.Effect<void> =>
-          Effect.gen(function* () {
-            yield* self.saveHarvestRecordEffect(
-              metadata.workspaceId,
-              boundaryKey,
-              {
-                status: "failed",
-                startedAt,
-                completedAt: Date.now(),
-                attemptCount: existingAttemptCount + 1,
-                boundaryKey,
-                compactionEpoch: metadata.compactionEpoch,
-                completionMetadata: metadata,
-                ...harvestProgressFields(progress),
-                error: getErrorMessage(error),
-              },
-              projectPath
-            );
-            log.warn("[MemoryConsolidation] harvest failed; running sweep anyway", {
-              workspaceId: metadata.workspaceId,
-              boundaryKey,
-              error: getErrorMessage(error),
-            });
-          });
-
-        yield* self
-          .runHarvestAttemptEffect(metadata, ctx, boundaryKey, startedAt, {
-            existingAttemptCount,
-            projectPath,
-            removalSignal,
-            progress,
-          })
-          .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
-      }
+      const scope = yield* self.harvestScopeEffect(metadata.workspaceId);
+      if (!scope.success) return Err(scope.error);
+      yield* self.runHarvestJobEffect(
+        {
+          workspaceId: metadata.workspaceId,
+          boundaryKey: metadata.summaryMessageId,
+          compactionEpoch: metadata.compactionEpoch,
+          completionMetadata: metadata,
+          readEpoch: () =>
+            self.historyService.getMessagesForCompactionEpoch(metadata.workspaceId, metadata),
+        },
+        scope.data,
+        removalSignal
+      );
 
       // A sub-agent's analyzer writes into the owner's store: wait on and run the OWNER's
       // dream (see maybeRun) so what the analyzer wrote is organized — still as the acting
@@ -1251,39 +1345,209 @@ export class MemoryConsolidationService extends EventEmitter {
     });
   }
 
+  /** The durable teardown gate and the memory scope that every analyzer run starts with. */
+  private harvestScopeEffect(
+    workspaceId: string
+  ): Effect.Effect<Result<MemoryScopeContext, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // Durable cross-process teardown gate (r61); see isRemovalTombstonedEffect.
+      if (yield* self.isRemovalTombstonedEffect(workspaceId)) {
+        return Err("workspace is being removed; harvest refused");
+      }
+      const workspace = self.config.findWorkspace(workspaceId);
+      if (!workspace) return Err(`workspace not found: ${workspaceId}`);
+      return Ok<MemoryScopeContext>({
+        runtime: null,
+        checkoutCwd: "",
+        workspaceId,
+        projectPath: resolveConsolidationProjectPath(workspace),
+      });
+    });
+  }
+
+  /**
+   * One analyzer run of `source`, with its record: skip a completed one or one out of attempts,
+   * otherwise run it (resuming at the chunk an earlier attempt reached) and journal the outcome.
+   * Never fails: the pre-Effect body was one whole try/catch, so any failure is journaled.
+   */
+  private runHarvestJobEffect(
+    source: HarvestSource,
+    ctx: MemoryScopeContext,
+    removalSignal: AbortSignal
+  ): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const { workspaceId, boundaryKey } = source;
+      const projectPath = ctx.projectPath;
+      const sidecar = yield* self.loadEffect();
+      const existing = sidecar.harvestsByWorkspace[workspaceId]?.[boundaryKey];
+      const existingAttemptCount = existing?.attemptCount ?? 0;
+      // A retry resumes where the failed attempt stopped: its chunks already wrote to memory.
+      const progress: HarvestProgress = {
+        nextChunk: existing?.nextChunk ?? 0,
+        ops: existing?.ops ?? [],
+        budgetUsed: existing?.budgetUsed,
+        nextChunkOps: existing?.nextChunkOps,
+        // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
+        // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
+        readThroughRowId: existing?.readThroughRowId,
+      };
+      const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
+      // A retry keeps the floor of the first attempt: the chunk cursor above counts chunks of the
+      // rows after it.
+      const attemptState: HarvestAttemptState = {
+        analyzedFloorRowId: existing?.analyzedFloorRowId,
+      };
+      const analyzedRowIds = analyzedOpenEpochRowIds(sidecar.harvestsByWorkspace[workspaceId]);
+
+      if (
+        existing?.status === "pending" &&
+        stalePending &&
+        existingAttemptCount >= HARVEST_MAX_ATTEMPTS
+      ) {
+        yield* self.saveHarvestRecordEffect(
+          workspaceId,
+          boundaryKey,
+          {
+            ...existing,
+            status: "failed",
+            completedAt: Date.now(),
+            error: existing.error ?? "stale pending harvest exceeded retry attempts",
+          },
+          projectPath
+        );
+      }
+
+      if (existing?.status !== "completed" && existingAttemptCount < HARVEST_MAX_ATTEMPTS) {
+        const startedAt = Date.now();
+        yield* self.saveHarvestRecordEffect(
+          workspaceId,
+          boundaryKey,
+          {
+            status: "pending",
+            startedAt,
+            attemptCount: existingAttemptCount + 1,
+            ...harvestRecordIdentity(source),
+            ...harvestAttemptFields(progress, attemptState),
+          },
+          projectPath
+        );
+
+        // Any failure — a typed throw below, a rejected await, or a defect such
+        // as the completed-record save rejecting — journals a failed record, so
+        // the fold handles the error channel AND defects identically.
+        const journalHarvestFailure = (error: unknown): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            yield* self.saveHarvestRecordEffect(
+              workspaceId,
+              boundaryKey,
+              {
+                status: "failed",
+                startedAt,
+                completedAt: Date.now(),
+                attemptCount: existingAttemptCount + 1,
+                ...harvestRecordIdentity(source),
+                ...harvestAttemptFields(progress, attemptState),
+                error: getErrorMessage(error),
+              },
+              projectPath
+            );
+            log.warn("[MemoryConsolidation] harvest failed", {
+              workspaceId,
+              boundaryKey,
+              error: getErrorMessage(error),
+            });
+          });
+
+        yield* self
+          .runHarvestAttemptEffect(source, ctx, startedAt, {
+            existingAttemptCount,
+            removalSignal,
+            progress,
+            attemptState,
+            analyzedRowIds,
+          })
+          .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
+      }
+    });
+  }
+
   /**
    * The old try-block of harvestThenSweepLocked; fails with the thrown cause. Runs the analyzer
    * over the epoch and persists a resume cursor after each clean chunk.
    */
   private runHarvestAttemptEffect(
-    metadata: CompactionCompletionMetadata,
+    source: HarvestSource,
     ctx: MemoryScopeContext,
-    boundaryKey: string,
     startedAt: number,
     opts: {
       existingAttemptCount: number;
-      projectPath: string;
       removalSignal: AbortSignal;
       /** Shared with the caller: its failure record reads what this attempt reached. */
       progress: HarvestProgress;
+      /** Shared with the caller for the same reason. */
+      attemptState: HarvestAttemptState;
+      /** Rows an earlier open-epoch run analyzed (see analyzedOpenEpochRowIds). */
+      analyzedRowIds: ReadonlySet<string>;
     }
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      const { workspaceId, boundaryKey } = source;
       const epoch = yield* Effect.tryPromise({
-        try: async () =>
-          self.historyService.getMessagesForCompactionEpoch(metadata.workspaceId, metadata),
+        try: async () => source.readEpoch(),
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
 
-      const modelString = resolveDreamModelString(self.config, metadata.workspaceId);
+      const saveCompleted = (
+        progress: HarvestProgress,
+        outcome: Pick<MemoryHarvestRecord, "usage" | "note" | "readThroughRowId"> = {}
+      ): Effect.Effect<void> =>
+        self.saveHarvestRecordEffect(
+          workspaceId,
+          boundaryKey,
+          {
+            status: "completed",
+            startedAt,
+            completedAt: Date.now(),
+            attemptCount: opts.existingAttemptCount + 1,
+            ...harvestRecordIdentity(source),
+            ...harvestAttemptFields(progress, opts.attemptState),
+            usage: outcome.usage,
+            note: outcome.note,
+            readThroughRowId: outcome.readThroughRowId,
+          },
+          ctx.projectPath
+        );
+
+      // An archive that read part of this epoch's rows already analyzed them: a second archive
+      // after new rows, and the compaction that later closes the epoch, both start after them.
+      // The first attempt fixes the floor in the record and a retry reuses it. Looking again could
+      // find a newer floor: an archive that read the epoch before it closed may complete after
+      // this job began, and the chunk cursor counts chunks of the rows after the old floor.
+      if (opts.attemptState.analyzedFloorRowId === undefined) {
+        opts.attemptState.analyzedFloorRowId = analyzedFloorRowId(
+          epoch.data.messages,
+          opts.analyzedRowIds
+        );
+      }
+      const messages = rowsAfterFloor(epoch.data.messages, opts.attemptState.analyzedFloorRowId);
+      if (messages.length === 0 && epoch.data.messages.length > 0) {
+        // Every row was analyzed before: nothing is left to read, so no model call.
+        return yield* saveCompleted(opts.progress);
+      }
+
+      const modelString = resolveDreamModelString(self.config, workspaceId);
       const modelResult = yield* Effect.tryPromise({
         try: async () =>
           self.modelFactory.createModelWithPinnedMetadata(modelString, {
             agentInitiated: true,
-            workspaceId: metadata.workspaceId,
+            workspaceId,
           }),
         catch: (error) => error,
       });
@@ -1302,7 +1566,7 @@ export class MemoryConsolidationService extends EventEmitter {
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
-          metadata.workspaceId,
+          workspaceId,
           boundaryKey,
           {
             status: "pending",
@@ -1311,12 +1575,10 @@ export class MemoryConsolidationService extends EventEmitter {
             // isStalePendingHarvestRecord).
             progressAt: Date.now(),
             attemptCount: opts.existingAttemptCount + 1,
-            boundaryKey,
-            compactionEpoch: metadata.compactionEpoch,
-            completionMetadata: metadata,
-            ...harvestProgressFields(progress),
+            ...harvestRecordIdentity(source),
+            ...harvestAttemptFields(progress, opts.attemptState),
           },
-          opts.projectPath
+          ctx.projectPath
         );
 
       const harvest = yield* Effect.tryPromise({
@@ -1327,7 +1589,7 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             metaService: self.metaService,
             ctx,
-            messages: epoch.data.messages,
+            messages,
             summary: epoch.data.summary,
             resume: opts.progress,
             // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
@@ -1340,7 +1602,7 @@ export class MemoryConsolidationService extends EventEmitter {
             abortSignal: opts.removalSignal,
             recordUsage: async (usage, providerMetadata) => {
               const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-                metadata.workspaceId,
+                workspaceId,
                 modelString,
                 usage,
                 providerMetadata,
@@ -1353,7 +1615,7 @@ export class MemoryConsolidationService extends EventEmitter {
               // Same as consolidation above: request an ingest pass so harvest
               // spend reaches dashboard totals promptly.
               if (recorded) {
-                self.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
+                self.emit("analyticsIngest", { workspaceId });
               }
             },
           }),
@@ -1367,23 +1629,7 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }
 
-      yield* self.saveHarvestRecordEffect(
-        metadata.workspaceId,
-        boundaryKey,
-        {
-          status: "completed",
-          startedAt,
-          completedAt: Date.now(),
-          attemptCount: opts.existingAttemptCount + 1,
-          boundaryKey,
-          compactionEpoch: metadata.compactionEpoch,
-          completionMetadata: metadata,
-          ...harvestProgressFields(harvest),
-          usage: harvest.usage,
-          note: harvest.note,
-        },
-        opts.projectPath
-      );
+      yield* saveCompleted(harvest, harvest);
     });
   }
 
@@ -1437,7 +1683,10 @@ export class MemoryConsolidationService extends EventEmitter {
     if (!this.enabled()) return;
     Effect.runFork(
       Effect.tryPromise({
-        try: async () => this.maybeRun(workspaceId, trigger),
+        try: async () =>
+          trigger === "archive"
+            ? this.maybeRunArchivePass(workspaceId)
+            : this.maybeRun(workspaceId, trigger),
         catch: (error) => error,
       }).pipe(
         Effect.flatMap((result) =>

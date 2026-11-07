@@ -147,6 +147,13 @@ export const MemoryHarvestRecordSchema = z.object({
   budgetUsed: PersistedCountSchema.optional(),
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
   nextChunkOps: PersistedCountSchema.optional(),
+  /**
+   * The row of this epoch an earlier open-epoch run had analyzed up to when the first attempt
+   * began (null: none), so the run reads the rows after it. A retry reuses it instead of
+   * looking again: an open-epoch run that completes later must not move the rows under the saved
+   * chunk cursor. Absent before an attempt reached the epoch, and in older records.
+   */
+  analyzedFloorRowId: z.string().nullish(),
   error: z.string().optional(),
   /**
    * Why a completed run did not read every chunk: the epoch's edit budget ran out, so the model
@@ -155,8 +162,9 @@ export const MemoryHarvestRecordSchema = z.object({
   note: z.string().optional(),
   /**
    * The newest row of the epoch the run read completely (null: none). It is behind the newest row
-   * when the run skipped chunks for its budget. A failed run records the last chunk it read
-   * cleanly, whose edits landed. Absent in older records.
+   * when the run skipped chunks for its budget: the floor of a later run is this row, not the
+   * newest one. A failed run records the last chunk it read cleanly, whose edits landed. Absent in
+   * older records, which read up to the row their key names (a failed one read nothing known).
    */
   readThroughRowId: z.string().nullish(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
