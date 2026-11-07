@@ -396,25 +396,6 @@ test("the backup's choices return when the user picks the first method again", a
   });
 });
 
-test("a plugin backed up with a method keeps its choices only for that method", async () => {
-  const { view, installSpy } = renderWithBackup(
-    [backedUp("alpha", { method: SKILLS, importedComponents: BACKED_UP_CHOICE })],
-    { alpha: (_ref, method) => withTwoMethods(method) }
-  );
-  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
-  expect(view.getByRole("radio", { name: /Skills/ }).getAttribute("aria-checked")).toBe("true");
-  await pickInstallAs(view, /Agent Plugin/);
-
-  await clickButton(view, /^Install$/);
-
-  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
-  expect(installSpy.mock.calls[0]?.[0]).toMatchObject({
-    method: AGENT_PLUGIN,
-    source: { ref: PINNED, refType: "commit" },
-    importedComponents: { skills: ["keep", "other"], mcpServers: [] },
-  });
-});
-
 test("a plugin without a recorded choice starts with everything the preview offers selected", async () => {
   const { view, installSpy } = renderWithBackup([backedUp("alpha")], {
     alpha: previewOf("alpha", { skills: [{ name: "one" }, { name: "two" }] }),
@@ -428,23 +409,6 @@ test("a plugin without a recorded choice starts with everything the preview offe
     skills: ["one", "two"],
     mcpServers: [],
   });
-});
-
-test("a plugin Xum generated a plugin.json for is previewed with that method", async () => {
-  const entry = backedUp("skills-repo", { method: { kind: "skills" } });
-  const { view, previewSpy } = renderWithBackup([entry], {
-    "skills-repo": previewOf("skills-repo", { method: { kind: "skills" } }),
-  });
-
-  await waitFor(() =>
-    expect(previewSpy).toHaveBeenCalledWith({
-      input: "https://github.com/example/skills-repo.git",
-      ref: PINNED,
-      subpath: null,
-      method: { kind: "skills" },
-    })
-  );
-  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
 });
 
 test("a monorepo plugin keeps its folder in the preview", async () => {

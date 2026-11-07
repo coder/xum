@@ -30,14 +30,15 @@ export interface PluginPreviewRequest {
 
 /**
  * The preview that rebuilds a backed-up install. It asks for the pinned commit, not the branch
- * the plugin tracks, so the review shows the code that was backed up.
+ * the plugin tracks, so the review shows the code that was backed up. It names no install method:
+ * the preview takes the first one that fits, and the Install as picker offers the others.
  */
 export function backupPreviewRequest(entry: BackupPluginEntry): PluginPreviewRequest {
   return {
     input: entry.source.url,
     ref: entry.lockedSha,
     subpath: entry.source.subpath ?? null,
-    method: entry.method ?? null,
+    method: null,
   };
 }
 
@@ -91,7 +92,7 @@ export function usePreviewOnMount(
 
 /**
  * Which previews of a backed-up plugin the backup still describes: those with the install method
- * the first preview resolved (the backup's own method, or the first that fits). Another method of
+ * the first preview resolved (the first that fits, since the backup names none). Another method of
  * the Install as picker offers other components and tracks its source another way, so its preview
  * starts from its own defaults. Switching back to the first method brings the backup's choices
  * back. Gives the backup's plugin for a preview that keeps the method, and undefined for another.

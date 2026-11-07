@@ -75,14 +75,6 @@ const BackupPluginComponentNamesSchema = z
   .max(MAX_BACKUP_PLUGIN_COMPONENTS);
 
 /**
- * The install method an export writes: `skills`, for a plugin Xum generated a plugin.json for
- * from a skills repository (`generatesManifest` in installMethods.ts). Any other method names a
- * manifest the repository already has, so the preview finds it without a selector. A plugin
- * generated from a Claude Code marketplace entry is not exported (agentPluginBackup.ts).
- */
-export const BackupPluginMethodSchema = z.object({ kind: z.literal("skills") });
-
-/**
  * A repository URL a restore hands to git. The list is repository-controlled, so the URL must not
  * read as a git option (a leading dash, or whitespace before it, since the preview trims its
  * input), as a UNC share (`//host/share`, which Windows opens over SMB and so sends the user's
@@ -109,8 +101,10 @@ const BackupPluginUrlSchema = z
  * One managed Agent Plugin as the backup records it: where it came from and which commit it was
  * pinned to. Only what is needed to offer the install again. Consent, hook trust, approved copies,
  * enabled servers and timestamps are local facts and never travel (the parse drops them): another
- * machine's review is the only thing that can approve a plugin there. Every field has a cap,
- * because the list is repository-controlled.
+ * machine's review is the only thing that can approve a plugin there. The install method does not
+ * travel either, so the repository cannot choose how a restore installs a plugin: a list that
+ * names one still reads, and the parse drops it. Every field has a cap, because the list is
+ * repository-controlled.
  */
 export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
@@ -121,8 +115,6 @@ export const BackupPluginEntrySchema = z.object({
   }),
   /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
   lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),
-  /** The install method of a plugin Xum generated a plugin.json for; absent takes the first that fits. */
-  method: BackupPluginMethodSchema.optional(),
   importedComponents: z
     .object({
       skills: BackupPluginComponentNamesSchema,
@@ -343,7 +335,6 @@ export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
 export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
-export type BackupPluginMethod = z.infer<typeof BackupPluginMethodSchema>;
 export type BackupPluginStatus = z.infer<typeof BackupPluginStatusSchema>;
 export type BackupPluginRow = z.infer<typeof BackupPluginRowSchema>;
 export type BackupPluginReport = z.infer<typeof BackupPluginReportSchema>;

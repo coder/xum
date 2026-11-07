@@ -159,7 +159,7 @@ describe("backup of the managed plugin list", () => {
       }
     });
 
-    it("records the install method of a plugin whose plugin.json Xum generated", async () => {
+    it("writes no install method, whatever marker a plugin's plugin.json carries", async () => {
       await writeRegistry(muxRoot, [registryRow("skills-only"), registryRow("own-manifest")]);
       await writeGeneratedPlugin(muxRoot, "skills-only", { kind: "skills" });
       await writeFixtureFile(
@@ -171,14 +171,9 @@ describe("backup of the managed plugin list", () => {
 
       await payload.exportTo({ ...request, contents: DEFAULT_CONTENTS });
 
-      const sidecar = (await readSidecar(managed)) as {
-        plugins: Array<{ name: string; method?: unknown }>;
-      };
-      const methods = Object.fromEntries(sidecar.plugins.map((p) => [p.name, p.method]));
-      expect(methods).toEqual({
-        "own-manifest": undefined,
-        "skills-only": { kind: "skills" },
-      });
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      expect(sidecar.plugins.map((p) => p.name)).toEqual(["own-manifest", "skills-only"]);
+      expect(sidecar.plugins.filter((p) => "method" in p)).toEqual([]);
     });
 
     it("leaves out a plugin Xum generated from a Claude Code marketplace entry, and logs it", async () => {
@@ -439,17 +434,19 @@ describe("backup of the managed plugin list", () => {
         await settle();
         expect(done).toBe(false);
         // The mutation lands while the read waits: beta is uninstalled, alpha moves to a new
-        // commit, gamma is installed from a skills repository.
+        // commit, gamma is installed from a Claude Code marketplace entry (which the list omits).
         await writeRegistry(muxRoot, [
           registryRow("alpha", { lockedSha: shaOf("z") }),
           registryRow("gamma"),
         ]);
-        await writeGeneratedPlugin(muxRoot, "gamma", { kind: "skills" });
+        await writeGeneratedPlugin(muxRoot, "gamma", {
+          kind: "claude-marketplace",
+          entry: "Gamma",
+        });
         await finishMutation();
 
         const manifest = await collecting;
-        expect(listedNames(manifest)).toEqual([`alpha@${shaOf("z")}`, `gamma@${shaOf("gamma")}`]);
-        expect(manifest?.plugins[1]?.method).toEqual({ kind: "skills" });
+        expect(listedNames(manifest)).toEqual([`alpha@${shaOf("z")}`]);
       });
 
       it("fails the push with an IO_ERROR when the mutation outlasts the wait", async () => {

@@ -18,7 +18,7 @@ function entry(overrides: Record<string, unknown> = {}) {
 }
 
 describe("BackupPluginEntrySchema", () => {
-  test("keeps the source, pin, method and imports of an entry", () => {
+  test("keeps the source, pin and imports of an entry", () => {
     const parsed = BackupPluginEntrySchema.parse(
       entry({
         source: {
@@ -28,13 +28,11 @@ describe("BackupPluginEntrySchema", () => {
           refType: "tag",
           subpath: "packages/plugin",
         },
-        method: { kind: "skills" },
         importedComponents: { skills: ["review"], mcpServers: [] },
       })
     );
     expect(parsed).toMatchObject({
       source: { ref: "v1.2.0", refType: "tag", subpath: "packages/plugin" },
-      method: { kind: "skills" },
       importedComponents: { skills: ["review"], mcpServers: [] },
     });
   });
@@ -147,14 +145,9 @@ describe("BackupPluginEntrySchema", () => {
     });
   });
 
-  test("takes only the install methods an export writes", () => {
-    const parse = (method: unknown) => BackupPluginEntrySchema.safeParse(entry({ method })).success;
-    expect(parse({ kind: "skills" })).toBe(true);
-    for (const kind of ["agent-plugin", "claude-plugin", "cursor-plugin"]) {
-      expect(parse({ kind })).toBe(false);
-    }
-    // A marketplace entry is not exported: the registry keeps no repository of its own for it.
-    expect(parse({ kind: "claude-marketplace", entry: "plugin-a" })).toBe(false);
-    expect(parse({ kind: "cursor-marketplace", entry: "plugin-a" })).toBe(false);
+  test("drops an install method that a list written by an earlier build carries", () => {
+    // A repository-authored list must not choose how a restore installs a plugin.
+    const parsed = BackupPluginEntrySchema.parse(entry({ method: { kind: "skills" } }));
+    expect(Object.keys(parsed).sort()).toEqual(["lockedSha", "name", "source"]);
   });
 });

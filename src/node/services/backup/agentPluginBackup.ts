@@ -7,7 +7,6 @@ import {
   BackupPluginEntrySchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
   type BackupPluginEntry,
-  type BackupPluginMethod,
   type BackupPluginManifest,
   type BackupPluginRemoval,
   type BackupPluginReport,
@@ -153,14 +152,6 @@ async function readInstallSnapshot(
   }
 }
 
-/**
- * The preview selector that rebuilds a plugin Xum generated a plugin.json for from a skills
- * repository. A plugin with its own manifest has none: the preview takes the first method that fits.
- */
-function methodOf(generated: GeneratedFrom | undefined): BackupPluginMethod | undefined {
-  return generated === undefined ? undefined : { kind: "skills" };
-}
-
 function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
   // Another machine cannot use a path or a loopback host on this one, and the list would publish it
   // (the home folder names the user). The plugin is logged by name only, so its absence from the
@@ -174,6 +165,8 @@ function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | n
   // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
   // only the entry's name. An entry that points at another repository cannot be rebuilt from this
   // row, and telling it from an entry in the marketplace's own repository needs a registry field.
+  // The marker is read for this exclusion alone. A plugin's repository can author its own marker,
+  // so it can only remove a plugin from the backup, never choose how a restore installs it.
   if (generated?.kind === "claude-marketplace") {
     log.info(
       "Leaving a plugin out of the settings backup: Xum generated it from a Claude Code marketplace entry",
@@ -181,13 +174,11 @@ function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | n
     );
     return null;
   }
-  const method = methodOf(generated);
   // Only the fields the schema names: consent, install times and auto-update stay local.
   const parsed = BackupPluginEntrySchema.safeParse({
     name: install.name,
     source: install.source,
     lockedSha: install.lockedSha,
-    method,
     importedComponents: install.importedComponents,
   });
   if (!parsed.success) {
