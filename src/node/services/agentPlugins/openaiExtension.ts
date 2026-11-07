@@ -12,6 +12,7 @@
  * discovery's realpath containment (ensurePluginPathContained, which also refuses .git) first.
  */
 import { getOwn } from "@/common/utils/getOwn";
+import { RGI_SUBDIVISION_FLAG_PATTERN } from "@/common/utils/agentPluginReviewText";
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   isPlainObject,
@@ -157,14 +158,11 @@ const SHAPING_MARK = `(?=[${ZWNJ_SCRIPTS}])\\p{Mn}`;
  * joining controls), as in the half-form क्‍ष, and only before a letter of the same script.
  * Anywhere else it changes nothing on screen, so it could make two names look alike.
  */
-/** Tag characters of a string: U+E0000 plus each ASCII code point. */
-const tags = (ascii: string): string =>
-  [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
-/** The three RGI subdivision flags: black flag, region tags, cancel tag. */
-const RGI_SUBDIVISION_FLAGS = new RegExp(
-  `\u{1f3f4}(?:${["gbeng", "gbsct", "gbwls"].map(tags).join("|")})\u{e007f}`,
-  "gu"
-);
+/**
+ * The three RGI subdivision flags: black flag, region tags, cancel tag. Same pattern source the
+ * transcript uses to decide which tag sequences are a real emoji, so the two layers cannot drift.
+ */
+const RGI_SUBDIVISION_FLAGS = new RegExp(RGI_SUBDIVISION_FLAG_PATTERN, "gu");
 const VIRAMA_SCRIPTS: ReadonlyArray<[script: string, virama: string]> = [
   ["Devanagari", "\\u094d"],
   ["Bengali", "\\u09cd"],

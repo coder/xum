@@ -73,6 +73,21 @@ const classes = (node: StaticNode): string[] =>
         ...node.slice(2).flatMap((c) => classes(c as StaticNode)),
       ];
 
+/** Tag characters (U+E0020-U+E007F) carry ASCII one-to-one, so a run of them spells hidden text. */
+const tags = (ascii: string) =>
+  [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+const FENCE = "```";
+
+/** Everything the static view draws as text, so a reveal can be checked without a DOM. */
+const staticText = (node: StaticNode): string =>
+  typeof node === "string"
+    ? node
+    : node
+        .slice(2)
+        .map((c) => staticText(c as StaticNode))
+        .join("");
+
 describe("renderRowTree", () => {
   let cleanupDom: () => void;
   beforeEach(() => (cleanupDom = installDom()));
@@ -111,6 +126,31 @@ describe("renderRowTree", () => {
     // Assistant rows parse allowed raw HTML, so the payload becomes an img: not in the allow-list.
     expect(renderRowTree(PAYLOAD, false)).toBeNull();
   });
+
+  // The first paint is the row's only chance to show a tag payload to a reader who never scrolls:
+  // it is drawn here, on the server, from the same components the live row uses. Tag characters
+  // (U+E0020-U+E007F) carry ASCII one-to-one, so an un-revealed payload reads as nothing at all.
+  // Callers hand this function raw bytes (the reveal lives inside the markdown pipeline), so the
+  // first paint reveals by construction and cannot drift from the live view.
+  for (const [name, raw, mark, payload] of [
+    ["paragraph text", `shipping now${tags("XY")}`, "shipping now<U+E0058><U+E0059>", tags("XY")],
+    ["inline code", `prefer \`added${tags("XY")}\` here`, "added<U+E0058><U+E0059>", tags("XY")],
+    [
+      "a code fence",
+      `${FENCE}ts\nconst x = ${tags("A")};\n${FENCE}`,
+      "const x = <U+E0041>;",
+      tags("A"),
+    ],
+  ] as const) {
+    test(`the first paint reveals a tag payload in ${name}`, () => {
+      const tree = renderRowTree(raw, false);
+      if (!tree) throw new Error("Expected a static view for this row");
+      const drawn = staticText(tree);
+      expect(drawn).toContain(mark);
+      // And never both: the mark replaces the bytes it decoded from.
+      expect(drawn).not.toContain(payload);
+    });
+  }
 });
 
 describe("validateStaticTree", () => {

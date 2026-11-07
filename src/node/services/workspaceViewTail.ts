@@ -3,6 +3,8 @@ import {
   getModelProvider,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
+import { isPaintableText } from "@/common/utils/messages/paintableText";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import type { MuxMessage } from "@/common/types/message";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
@@ -68,7 +70,17 @@ function drawableText(message: MuxMessage, metadata: Record<string, unknown>): s
   const texts = message.parts.map((part) => (part.type === "text" ? part.text : null));
   if (texts.length === 0 || texts.includes(null)) return null;
   const text = texts.join("");
-  return text.trim().length > 0 ? text : null;
+  if (message.role === "user") {
+    // A user row is drawn by the live builder whatever its text holds (buildUserDisplayedMessages
+    // always returns one: the bubble also carries a command prefix, attachments and reviews), so this
+    // keeps the pre-existing emptiness gate. Applying the assistant predicate here would drop a row
+    // pre-hydration that the live transcript then inserts — the mismatch this check exists to avoid.
+    return text.trim().length > 0 ? text : null;
+  }
+  // Assistant rows share the live row builder's predicate (paintableText): a persisted part of only a
+  // newline, a default-ignorable, a control character or a blank braille cell earns no row there, so
+  // drawing one here would paint a gap pre-hydration that vanishes when the app takes over.
+  return isPaintableText(text) ? text : null;
 }
 
 /** The "via …" label ModelDisplay adds when the reply was routed through another provider. */
@@ -78,7 +90,7 @@ function routeLabel(metadata: Record<string, unknown>, provider: string): string
   // Own keys only: a damaged row's "constructor" must not resolve to Object.prototype.
   return Object.hasOwn(PROVIDER_DEFINITIONS, route)
     ? PROVIDER_DEFINITIONS[route as ProviderName].displayName
-    : route;
+    : revealUnicodeTags(route);
 }
 
 /** The meta row's model as ModelDisplay draws it (label, icon, route); undefined if damaged. */
@@ -90,7 +102,10 @@ function modelDisplay(metadata: Record<string, unknown>): ViewModel | undefined 
   const canonical = normalizeToCanonical(model);
   const provider = getModelProvider(canonical);
   return {
-    label: formatModelStringForDisplay(canonical),
+    // This is the first paint of the transcript, drawn before the app JS loads, so it must reveal
+    // exactly what ModelDisplay draws once the app takes over: the persisted model string is
+    // metadata this row was written with, not necessarily an identifier the app produced.
+    label: revealUnicodeTags(formatModelStringForDisplay(canonical)),
     provider,
     via: routeLabel(metadata, provider),
   };

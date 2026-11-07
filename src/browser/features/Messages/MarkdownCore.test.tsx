@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 
-import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { MarkdownCore, markdownMayContainMath } from "./MarkdownCore";
@@ -10,6 +10,10 @@ import { publishKatexPlugins } from "./mathRendering";
 // An earlier block holds a lone `*`. Repairing the whole text (Streamdown's own repair) would
 // append a stray `*` after the last block; repairing only the last block does not.
 const STREAMED = "Price is 5 * 3.\n\nAll **done";
+
+/** Tag characters (U+E0020-U+E007F) carry ASCII one-to-one, so a run of them spells hidden text. */
+const tags = (ascii: string) =>
+  [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
 
 function renderCore(renderSynchronously: boolean) {
   return render(
@@ -121,6 +125,130 @@ describe("MarkdownCore", () => {
     act(() => publishKatexPlugins(katexRehypePlugins));
     await waitFor(() => expect(view.container.querySelector(".katex")).not.toBeNull());
     expect(view.getByText("Intro paragraph.")).toBe(intro);
+  });
+
+  // Tag characters (U+E0020-U+E007F) are default-ignorables that carry ASCII one-to-one, so a run of
+  // them spells text the model received and no renderer shows. The reveal lives inside this pipeline
+  // (rehypeRevealUnicodeTags) rather than in callers: callers hand raw bytes to the tree because
+  // Copy, an editor draft and a provider request all read the same string, and the mark is
+  // irreversible. Rendering the whole reply also covers what a caller cannot know: the static first
+  // paint and hover cards go through here, and markdown owns links, lists and code fences.
+  test("reveals a tag payload in paragraph text, leaving no tag bytes", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`shipping now${tags("XY")}`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() =>
+      expect(view.container.textContent).toContain("shipping now<U+E0058><U+E0059>")
+    );
+    // The mark replaces the bytes: a revealed string must not also carry what it decoded from,
+    // otherwise a copy of the row would contain both.
+    expect(view.container.textContent).not.toContain(tags("XY"));
+  });
+
+  // Markdown structure is parsed from the raw bytes, so a payload cannot smuggle markup through the
+  // reveal: the tag run sits inside the link text and the link survives as a link.
+  test("reveals inside link text without letting a payload become markup", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`[ship${tags("AB")}](https://x.test)`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.querySelector("a")).not.toBeNull());
+    expect(view.container.querySelector("a")?.textContent).toBe("ship<U+E0041><U+E0042>");
+    expect(
+      view.container.querySelector("a")?.getAttribute("href")?.startsWith("https://x.test")
+    ).toBe(true);
+  });
+
+  // A code fence's drawn text is not the string its Copy button hands out (MarkdownComponents
+  // .CodeBlock keeps that raw), so the pipeline skipping code elements must not hide the payload.
+  test("shows the marks in a fenced block's drawn text and copies its raw bytes", async () => {
+    const code = `const x = ${tags("A")};`;
+    const copyText = spyOn(navigator.clipboard, "writeText").mockResolvedValue(undefined);
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={"```ts\n" + code + "\n```"} renderSynchronously />
+      </ThemeProvider>
+    );
+    const drawn = view.container.querySelector(".code-line");
+    if (!drawn) throw new Error("No code line rendered");
+    // Both draw paths must reveal: Shiki's HTML is inserted as markup (the escaped-mark branch) and
+    // the plain fallback renders React children, and the test environment can land on either.
+    expect(drawn.textContent).toBe("const x = <U+E0041>;");
+    expect(drawn.textContent).not.toContain(tags("A"));
+
+    await act(async () => {
+      fireEvent.click(
+        view.container.querySelector<HTMLButtonElement>('button[aria-label="Copy to clipboard"]')!
+      );
+      await Promise.resolve();
+    });
+    // The clipboard gets the fence's bytes, newlines included, never the mark.
+    expect(copyText).toHaveBeenCalledTimes(1);
+    expect(copyText.mock.calls[0][0]).toContain(`const x = ${tags("A")};`);
+    expect(copyText.mock.calls[0][0]).not.toContain("<U+");
+    copyText.mockRestore();
+  });
+
+  test("reveals an inline code span", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`prefer \`add${tags("AB")}\` here`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector("code")?.textContent).toBe("add<U+E0041><U+E0042>")
+    );
+  });
+
+  // Assistant markdown renders raw HTML, and a "<pre>" written by the model draws its own direct text
+  // through no component that reveals (markdownComponents unwraps pre to its children), so the pass
+  // may not skip a whole pre subtree. A fenced block is unaffected: its pre only wraps a code element,
+  // whose Copy button still gets the fence's raw bytes (the case above).
+  test("reveals a tag payload in raw HTML preformatted text", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`<pre>visible${tags("AB")}</pre>`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.textContent).toContain("visible<U+E0041><U+E0042>"));
+    expect(view.container.textContent).not.toContain(tags("AB"));
+  });
+
+  // An attribute is the other place the same bytes can hide: alt text is announced by a screen reader
+  // and, for a broken image, painted as the fallback label, and it never passes through a text node.
+  test("reveals a tag payload in an image's alt text", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore
+          content={`![${tags("AB")}](https://x.test/missing.png)`}
+          renderSynchronously
+        />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.querySelector("img")).not.toBeNull());
+    expect(view.container.querySelector("img")?.getAttribute("alt")).toBe("<U+E0041><U+E0042>");
+    // The markdown the provider sent is untouched, and nothing copies an alt value out of a selection
+    // (transcriptContextMenu excludes img), so no action can carry the mark.
+    expect(view.container.textContent).not.toContain(tags("AB"));
+  });
+
+  // KaTeX typesets math after the pipeline's reveal pass, and it receives the formula as a code
+  // element that pass deliberately leaves raw, so rendered math needs its own reveal
+  // (rehypeRevealRenderedMath). The TeX the transcript copies out of a selected formula stays raw:
+  // pasting marks back would not round-trip.
+  test("reveals a tag payload in rendered math and keeps the copied TeX raw", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`$$a${tags("AB")}b$$`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.querySelector(".katex-html")).not.toBeNull());
+    expect(view.container.querySelector(".katex-html")?.textContent).toBe("a<U+E0041><U+E0042>b");
+    // The annotation is the source: MarkdownCore keeps it byte-identical for copy-as-Markdown.
+    expect(view.container.querySelector("annotation")?.textContent).toBe(`a${tags("AB")}b`);
   });
 
   // remark-math leaves these as text (single-dollar math is off), so they must not load KaTeX.

@@ -1386,6 +1386,12 @@ export type DisplayedMessage =
       type: "user";
       id: string; // Display ID for UI/React keys
       historyId: string; // Original XumMessage ID for history operations
+      /**
+       * The row's text with the stored bytes: Copy, Edit, a re-send and every other consumer of this
+       * field round-trip exactly what the user sent. Invisible Unicode tag characters are revealed
+       * for reading at the render leaves (see `revealUnicodeTags`), never here, because that mark
+       * cannot be reversed and would otherwise be copied and persisted as if the user typed it.
+       */
       content: string;
       /**
        * Command prefix to highlight in the UI (e.g. "/compact -m sonnet" or "/react-effects").
@@ -1479,6 +1485,7 @@ export type DisplayedMessage =
       type: "assistant";
       id: string; // Display ID for UI/React keys
       historyId: string; // Original XumMessage ID for history operations
+      /** The row's text with the stored bytes; see the `user` variant's `content`. */
       content: string;
       historySequence: number; // Global ordering across all messages
       isStreaming: boolean;

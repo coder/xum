@@ -22,6 +22,7 @@ import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
 import { ArtifactInteractionPill } from "./ArtifactInteractionPill";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { createDownloadRetryCache } from "@/browser/utils/downloadFile";
@@ -88,6 +89,9 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   const isSynthetic = message.isSynthetic === true;
   const isGoalContinuation = message.isGoalContinuation === true;
   const isBudgetLimitWrapup = message.isBudgetLimitWrapup === true;
+  // The stored bytes, which every decision below and the Copy payload read. Tag characters are
+  // revealed by the render sinks this row hands text to: the mark is not reversible, so a revealed
+  // row copied or edited back into the composer would corrupt the user's message.
   const content = message.content;
   const visibleContent = stripStagedAttachmentNotice(content);
   // Only backend-authored synthetic messages may opt into protocol-aware presentation. A user who
@@ -166,6 +170,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     "UserMessage expects clipboardWriteText to be a callable function."
   );
 
+  // Detection stays on the stored bytes: the envelope tags cannot hold tag characters, and the
+  // output it slices is only a render target.
   const isLocalCommandOutput =
     content.startsWith("<local-command-stdout>") && content.endsWith("</local-command-stdout>");
 
@@ -308,7 +314,9 @@ export const UserMessage: React.FC<UserMessageProps> = ({
 
   let renderedContent: React.ReactNode;
   if (isLocalCommandOutput) {
-    renderedContent = <TerminalOutput output={extractedOutput} isError={false} />;
+    renderedContent = (
+      <TerminalOutput output={revealUnicodeTags(extractedOutput)} isError={false} />
+    );
   } else if (isGoalContinuation || isBudgetLimitWrapup) {
     renderedContent = (
       <GoalSyntheticMessageContent

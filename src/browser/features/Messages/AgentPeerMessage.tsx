@@ -4,6 +4,7 @@ import { ChevronRight, MessageSquare } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
@@ -47,7 +48,9 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
           agent message
         </span>
         <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
-        <span className="truncate">Message from {fromTitle ?? fromWorkspaceId ?? "agent"}</span>
+        <span className="truncate">
+          Message from {revealUnicodeTags(fromTitle ?? fromWorkspaceId ?? "agent")}
+        </span>
         <ChevronRight
           aria-hidden="true"
           className={cn("size-3 shrink-0", expanded && "rotate-90")}
@@ -65,7 +68,7 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
           // Defensive fallback: metadata says peer message but the envelope failed to parse
           // (e.g. truncated history row) — show the raw model-facing text instead of hiding it.
           <pre className="text-muted bg-muted/5 border-border mt-1.5 max-h-[40vh] w-full overflow-y-auto rounded-md border p-2 text-xs leading-relaxed whitespace-pre-wrap">
-            {props.message.content}
+            {revealUnicodeTags(props.message.content)}
           </pre>
         ))}
     </div>

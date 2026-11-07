@@ -3,6 +3,7 @@ import type { HeldInput } from "@/common/orpc/types";
 import type { DisplayedMessage, DisplayedUserMessage, QueuedMessage } from "@/common/types/message";
 import type { RuntimeStatusEvent } from "@/common/types/stream";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 
 /** The longest preview kept per line; the bar truncates visually well before this. */
 const PREVIEW_MAX_CHARS = 160;
@@ -16,12 +17,23 @@ function oneLine(text: string): string {
   return line.length > PREVIEW_MAX_CHARS ? `${line.slice(0, PREVIEW_MAX_CHARS - 1)}…` : line;
 }
 
+/**
+ * A row's text as a preview line: invisible tag characters become readable marks, since a preview is
+ * the second place a user checks what a message really says. Parse structure out of the row's own
+ * `content` before calling this; the mark is not reversible.
+ */
+function previewLine(text: string): string {
+  return oneLine(revealUnicodeTags(text));
+}
+
 /** A short plain-text name for what a tool call works on (bash display_name, file path, task title). */
 export function toolCallDetail(args: unknown): string | undefined {
   if (args == null || typeof args !== "object") return undefined;
   for (const key of TOOL_DETAIL_KEYS) {
     const value: unknown = Reflect.get(args, key);
-    if (typeof value === "string" && value.trim() !== "") return oneLine(value);
+    // Display-only, like every other preview here: these values are model-authored and travel back to
+    // the provider inside the call's arguments, so a tag payload in one must not paint nothing.
+    if (typeof value === "string" && value.trim() !== "") return previewLine(value);
   }
   return undefined;
 }
@@ -185,7 +197,8 @@ export interface LastMessageReceipt {
 }
 
 function previewOrPlaceholder(text: string): string {
-  return oneLine(text) || "(no text)";
+  // User-typed text: the transcript row for it reveals tags, so the receipt must not hide them.
+  return previewLine(text) || "(no text)";
 }
 
 /** The queued message (newer than every row: it is not in history yet), else the newest human row. */
@@ -258,7 +271,7 @@ const ROW_BUILDERS: RowBuilders = {
     kind: "user",
     // Machine-authored user rows (wakes, continuations) are Xum's, not the user's.
     label: isHumanUserMessage(message) ? "You" : "Xum",
-    preview: oneLine(message.content),
+    preview: previewLine(message.content),
   }),
   assistant: (message) => {
     // Another agent's message: name its sender and show its text, as the transcript's card does,
@@ -269,11 +282,18 @@ const ROW_BUILDERS: RowBuilders = {
       return {
         id: message.id,
         kind: "assistant",
-        label: `From ${peer.fromTitle ?? peer.fromWorkspaceId}`,
-        preview: oneLine(envelope?.message ?? message.content),
+        // A peer's workspace title is another agent's text, not ours: reveal it as the row's preview
+        // does, so the peek cannot show a sender whose name hides a payload.
+        label: `From ${previewLine(peer.fromTitle ?? peer.fromWorkspaceId)}`,
+        preview: previewLine(envelope?.message ?? message.content),
       };
     }
-    return { id: message.id, kind: "assistant", label: "Agent", preview: oneLine(message.content) };
+    return {
+      id: message.id,
+      kind: "assistant",
+      label: "Agent",
+      preview: previewLine(message.content),
+    };
   },
   tool: (message) => ({
     id: message.id,
@@ -285,7 +305,10 @@ const ROW_BUILDERS: RowBuilders = {
     id: message.id,
     kind: "reasoning",
     label: "Thinking",
-    preview: oneLine(message.content),
+    // Reasoning is replayed to the provider from its persisted part, and the transcript row reveals
+    // tags, so a preview that swallowed them would hide provider-visible text from the same peek
+    // where the user checks what a message really says.
+    preview: previewLine(message.content),
   }),
   "stream-error": (message) => ({
     id: message.id,

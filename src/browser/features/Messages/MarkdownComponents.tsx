@@ -16,6 +16,7 @@ import { normalizeLocalhostProxyUrl } from "@/common/utils/localhostProxyUrl";
 import { InlineSkillPreviewContext } from "./InlineSkillPreviewContext";
 import { decodeInlineSkillHref, INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
 import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { revealUnicodeTags, revealUnicodeTagsAsHtml } from "@/common/utils/agentPluginReviewText";
 
 // Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
 // when a message contains one.
@@ -329,6 +330,9 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
 
   const messageListContext = useOptionalMessageListContext();
   const openTerminal = messageListContext?.openTerminal;
+  // `code` is what this block's actions hand out: the Copy button's text and a runnable command.
+  // MarkdownCore reveals the markdown tree but skips code elements, because that is the very string
+  // this button copies - so the marks appear in the drawn lines below and never in the clipboard.
   const runnableCommand = isRunnableShellLanguage(language)
     ? normalizeSuggestedShellCommand(code)
     : "";
@@ -342,7 +346,12 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     shikiLanguage,
     theme
   );
-  const lines = highlightedLines ?? plainLines;
+  // Drawn lines only, revealed per branch: highlighted lines go in as HTML, so their marks need
+  // escaped brackets or the parser would eat them as an unknown tag; plain lines are React children.
+  // `code` itself stays raw, since it is what the Copy button and Run action hand out.
+  const lines = highlightedLines
+    ? highlightedLines.map(revealUnicodeTagsAsHtml)
+    : plainLines.map(revealUnicodeTags);
   const isSingleLine = lines.length === 1;
 
   return (
@@ -510,7 +519,7 @@ export const markdownComponents = {
       return (
         <pre>
           <code className={className} {...props}>
-            {children}
+            {revealUnicodeTags(childString)}
           </code>
         </pre>
       );
@@ -519,7 +528,7 @@ export const markdownComponents = {
     // Inline code (filter out node prop to avoid [object Object])
     return (
       <code className={className} {...props}>
-        {children}
+        {revealUnicodeTags(childString)}
       </code>
     );
   },

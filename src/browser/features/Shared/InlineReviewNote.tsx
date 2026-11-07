@@ -12,6 +12,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/To
 import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { cn } from "@/common/lib/utils";
 import type { Review } from "@/common/types/review";
 
@@ -181,7 +182,9 @@ export const InlineReviewNote: React.FC<InlineReviewNoteProps> = ({
           {/* File path or just line range */}
           {showFilePath ? (
             <span className="text-primary min-w-0 flex-1 truncate font-mono text-[10px]">
-              {review.data.filePath}:L{formatLineRangeCompact(review.data.lineRange)}
+              {revealUnicodeTags(
+                `${review.data.filePath}:L${formatLineRangeCompact(review.data.lineRange)}`
+              )}
             </span>
           ) : (
             <span className="text-muted font-mono">
@@ -338,7 +341,7 @@ export const InlineReviewNote: React.FC<InlineReviewNoteProps> = ({
               </div>
             ) : review.data.userNote ? (
               <div className="text-secondary text-[11px] leading-[1.4] whitespace-pre-wrap">
-                {review.data.userNote}
+                {revealUnicodeTags(review.data.userNote)}
               </div>
             ) : null}
           </div>
