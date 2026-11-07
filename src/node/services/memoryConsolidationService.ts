@@ -80,7 +80,9 @@ import {
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { KeyedTurnQueue } from "@/node/utils/concurrency/keyedTurnQueue";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
 type MemoryHarvestRecord = MemoryHarvestRecordPayload;
@@ -307,6 +309,22 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
   }
 }
 
+/**
+ * Cross-process half of the dream-stream queue. It lives in `<root>/locks`, not inside
+ * `<root>/memory`, because a memory mutation can delete directories there while it is held.
+ */
+export function dreamStreamLockPath(rootDir: string): string {
+  return path.join(rootDir, "locks", "memory-dream-stream.lock");
+}
+
+/** Where a dream stream's turn ended up (see runDreamStreamExclusively). */
+type DreamStreamTurn<T> =
+  | { outcome: "ran"; value: T }
+  /** The signal aborted while the run waited for its turn: `stream` never started. */
+  | { outcome: "cancelled" }
+  /** The cross-process lock could not be taken: `stream` never started. */
+  | { outcome: "lock-failed"; error: string };
+
 /** Resolves true once `turn` settles, or false if `signal` aborts first (a pre-aborted signal never waits). */
 function waitForTurnOrAbort(turn: Promise<void>, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -344,6 +362,7 @@ function harvestProgressFields(
   | "budgetUsed"
   | "nextChunkOps"
   | "readThroughRowId"
+  | "usage"
   | "acceptedCandidates"
   | "skippedCandidates"
 > {
@@ -354,6 +373,7 @@ function harvestProgressFields(
     budgetUsed: progress.budgetUsed,
     nextChunkOps: progress.nextChunkOps,
     readThroughRowId: progress.readThroughRowId,
+    usage: progress.usage,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
   };
@@ -490,6 +510,14 @@ export class MemoryConsolidationService extends EventEmitter {
    * its wait was cancelled.
    */
   private dreamStreamTail: Promise<void> = Promise.resolve();
+
+  /**
+   * Analyzer-stream queue, keyed by the workspace-memory owner. `harvestInFlight` is per
+   * compaction boundary, so two boundaries of one workspace, or an owner and its sub-agent
+   * (which share the owner's /memories/workspace store), could otherwise edit the same files at
+   * once: the model's numeric `insert` line offsets go stale after the other run's insert.
+   */
+  private readonly analyzerStreams = new KeyedTurnQueue();
 
   /**
    * Per-run removal controllers (r60): workspace removal must abort and
@@ -1046,15 +1074,22 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * Run one dream stream once every earlier queued one has settled, so at most
    * one consolidation stream runs at a time across ALL workspaces (harvests are
-   * not queued here). Returns null, without starting `stream`, when `signal`
-   * aborts first: removal must cancel a run that is still waiting its turn.
-   * Waiting happens after maybeRun's synchronous in-flight reservation, so that
-   * per-workspace try-lock keeps its call-order semantics.
+   * not queued here). The in-process queue orders this backend's runs; behind
+   * it, a cross-process lock excludes a second backend on the same root (the
+   * target locks only serialize single memory commands, not the model's
+   * read/decide/write pass). Nothing starts, and `cancelled` comes back, when
+   * `signal` aborts first: removal must cancel a run that is still waiting its
+   * turn. Waiting happens after maybeRun's synchronous in-flight reservation,
+   * so that per-workspace try-lock keeps its call-order semantics.
+   *
+   * `stream` must settle with the provider/tool stream and nothing after it:
+   * everything it awaits holds up every later dream (see consolidate's usage
+   * capture in runLockedEffect).
    */
   private async runDreamStreamExclusively<T>(
     signal: AbortSignal,
     stream: () => Promise<T>
-  ): Promise<T | null> {
+  ): Promise<DreamStreamTurn<T>> {
     const previous = this.dreamStreamTail;
     let release!: () => void;
     const turnDone = new Promise<void>((resolve) => {
@@ -1064,8 +1099,28 @@ export class MemoryConsolidationService extends EventEmitter {
     // waiter still releases its link, which lets successors pass it.
     this.dreamStreamTail = previous.then(() => turnDone);
     try {
-      if (!(await waitForTurnOrAbort(previous, signal))) return null;
-      return await stream();
+      if (!(await waitForTurnOrAbort(previous, signal))) return { outcome: "cancelled" };
+      let releaseLock: () => Promise<void>;
+      try {
+        releaseLock = await acquireCrossProcessLock({
+          lockPath: dreamStreamLockPath(this.config.rootDir),
+          // A holder's stream is cut at this timeout, so one full timeout outlasts any healthy
+          // holder. A wedged live holder is never taken over (fail closed): this run errors and
+          // the next trigger retries.
+          acquireTimeoutMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          staleMs: MEMORY_CONSOLIDATION_TIMEOUT_MS,
+          timeoutMessage: "Another Xum process is running a memory consolidation.",
+          signal,
+        });
+      } catch (error) {
+        if (signal.aborted) return { outcome: "cancelled" };
+        return { outcome: "lock-failed", error: getErrorMessage(error) };
+      }
+      try {
+        return { outcome: "ran", value: await stream() };
+      } finally {
+        await releaseLock();
+      }
     } finally {
       release();
     }
@@ -1141,6 +1196,11 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
+      // The stream's usage is recorded after its queue slot is released, not inside it:
+      // recordHeadlessUsage takes the session directory's lock, and a stall there must not hold
+      // every later workspace's dream. An array, not a `let`, because TS cannot narrow
+      // assignments made inside the callback.
+      const recordings: Array<() => Promise<void>> = [];
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1163,32 +1223,43 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: async (usage, providerMetadata) => {
-            const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-              workspaceId,
-              modelString,
-              usage,
-              providerMetadata,
-              {
-                analyticsSource: "memory_consolidation",
-                // Creation-time identity: a catalog refresh mid-run must not
-                // re-attribute this spend (see ModelFactoryLike).
-                metadataModel: modelResult.data.metadataModel,
+          recordUsage: (usage, providerMetadata) => {
+            recordings.push(async () => {
+              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                workspaceId,
+                modelString,
+                usage,
+                providerMetadata,
+                {
+                  analyticsSource: "memory_consolidation",
+                  // Creation-time identity: a catalog refresh mid-run must not
+                  // re-attribute this spend (see ModelFactoryLike).
+                  metadataModel: modelResult.data.metadataModel,
+                }
+              );
+              // The sidecar row only reaches dashboard totals via an explicit
+              // ingest pass; request one (forwarded by ServiceContainer) so sweep
+              // spend doesn't strand until an unrelated stream-end or restart.
+              if (recorded) {
+                self.emit("analyticsIngest", { workspaceId });
               }
-            );
-            // The sidecar row only reaches dashboard totals via an explicit
-            // ingest pass; request one (forwarded by ServiceContainer) so sweep
-            // spend doesn't strand until an unrelated stream-end or restart.
-            if (recorded) {
-              self.emit("analyticsIngest", { workspaceId });
-            }
+            });
+            return Promise.resolve();
           },
         });
-      const result = yield* Effect.promise(async () =>
+      const turn = yield* Effect.promise(async () =>
         self.runDreamStreamExclusively(removalSignal, consolidate)
       );
       // Removal reached this run while it was still queued: no stream started.
-      if (result === null) return Err("workspace is being removed; consolidation refused");
+      if (turn.outcome === "cancelled") {
+        return Err("workspace is being removed; consolidation refused");
+      }
+      // No stream started: a stream without the cross-process lock could overlap another
+      // backend's. Nothing is journaled, so the next trigger retries.
+      if (turn.outcome === "lock-failed") {
+        return Err(`could not take the consolidation lock: ${turn.error}`);
+      }
+      const result = turn.value;
       // A stream failure (provider error or the run timeout) means the pass did
       // NOT cover the memory state: skip the journal record so the debounce and
       // launch sweep retry later instead of reporting a successful consolidation
@@ -1196,6 +1267,18 @@ export class MemoryConsolidationService extends EventEmitter {
       if (result.streamError !== undefined) {
         return Err(`consolidation stream failed: ${result.streamError}`);
       }
+
+      // Best-effort, like the in-stream call it replaced: telemetry never fails the pass.
+      yield* Effect.promise(async () => {
+        for (const recordUsage of recordings) {
+          await recordUsage().catch((error: unknown) => {
+            log.warn("[MemoryConsolidation] could not record dream usage", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
+      });
 
       const record: MemoryConsolidationRecord = {
         lastRunAt: Date.now(),
@@ -1487,6 +1570,7 @@ export class MemoryConsolidationService extends EventEmitter {
         // Kept across an attempt that fails before it reads a chunk (the epoch or the model cannot be
         // loaded): its failure record would otherwise drop what the earlier attempt's chunks read.
         readThroughRowId: existing?.readThroughRowId,
+        usage: existing?.usage,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
       // A retry keeps the floor of the first attempt: the chunk cursor above counts chunks of the
@@ -1606,7 +1690,7 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const saveCompleted = (
         progress: HarvestProgress,
-        outcome: Pick<MemoryHarvestRecord, "usage" | "note" | "readThroughRowId"> = {}
+        outcome: Pick<MemoryHarvestRecord, "note" | "readThroughRowId"> = {}
       ): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
           workspaceId,
@@ -1618,7 +1702,6 @@ export class MemoryConsolidationService extends EventEmitter {
             attemptCount: opts.existingAttemptCount + 1,
             ...harvestRecordIdentity(source),
             ...harvestAttemptFields(progress, opts.attemptState),
-            usage: outcome.usage,
             note: outcome.note,
             readThroughRowId: outcome.readThroughRowId,
           },
@@ -1663,6 +1746,7 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.budgetUsed = reached.budgetUsed;
         opts.progress.nextChunkOps = reached.nextChunkOps;
         opts.progress.readThroughRowId = reached.readThroughRowId;
+        opts.progress.usage = reached.usage;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
@@ -1681,46 +1765,57 @@ export class MemoryConsolidationService extends EventEmitter {
           ctx.projectPath
         );
 
+      // One analyzer at a time per owner store. The chunk timeouts start inside runMemoryHarvest,
+      // so they bound the run and never the wait behind another one.
+      const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
       const harvest = yield* Effect.tryPromise({
         try: async () =>
-          runMemoryHarvest({
-            model: modelResult.data.model,
-            pricingModel: modelResult.data.metadataModel,
-            memoryService: self.memoryService,
-            metaService: self.metaService,
-            ctx,
-            messages,
-            summary: epoch.data.summary,
-            resume: opts.progress,
-            // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
-            // must not make the retry write the earlier chunks' memory again.
-            onChunkComplete: async (reached) => {
-              adopt(reached);
-              await Effect.runPromise(savePending(reached));
-            },
-            // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
-            abortSignal: opts.removalSignal,
-            recordUsage: async (usage, providerMetadata) => {
-              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-                workspaceId,
-                modelString,
-                usage,
-                providerMetadata,
-                {
-                  analyticsSource: "memory_harvest",
-                  // Creation-time identity (see ModelFactoryLike).
-                  metadataModel: modelResult.data.metadataModel,
+          self.analyzerStreams.run(ownerId, opts.removalSignal, async () =>
+            runMemoryHarvest({
+              model: modelResult.data.model,
+              pricingModel: modelResult.data.metadataModel,
+              memoryService: self.memoryService,
+              metaService: self.metaService,
+              ctx,
+              messages,
+              summary: epoch.data.summary,
+              resume: opts.progress,
+              // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
+              // must not make the retry write the earlier chunks' memory again.
+              onChunkComplete: async (reached) => {
+                adopt(reached);
+                await Effect.runPromise(savePending(reached));
+              },
+              // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
+              abortSignal: opts.removalSignal,
+              recordUsage: async (usage, providerMetadata) => {
+                const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                  workspaceId,
+                  modelString,
+                  usage,
+                  providerMetadata,
+                  {
+                    analyticsSource: "memory_harvest",
+                    // Creation-time identity (see ModelFactoryLike).
+                    metadataModel: modelResult.data.metadataModel,
+                  }
+                );
+                // Same as consolidation above: request an ingest pass so harvest
+                // spend reaches dashboard totals promptly.
+                if (recorded) {
+                  self.emit("analyticsIngest", { workspaceId });
                 }
-              );
-              // Same as consolidation above: request an ingest pass so harvest
-              // spend reaches dashboard totals promptly.
-              if (recorded) {
-                self.emit("analyticsIngest", { workspaceId });
-              }
-            },
-          }),
+              },
+            })
+          ),
         catch: (error) => error,
       });
+      // Removal reached this run while it was still queued: no chunk was read.
+      if (harvest === null) {
+        return yield* Effect.fail(
+          new Error("workspace is being removed; harvest cancelled before its turn")
+        );
+      }
       // Edits of a chunk that failed already landed: the failure record keeps them. A failure from
       // here on (the completed record's save) resumes at the first chunk nobody read: resuming past
       // a budget skip would report the skipped chunks' rows as read and lose the note.

@@ -169,6 +169,11 @@ export const MemoryHarvestRecordSchema = z.object({
    * older records, which read up to the row their key names (a failed one read nothing known).
    */
   readThroughRowId: z.string().nullish(),
+  /**
+   * Tokens of every chunk stream that finished cleanly, across attempts. A pending or failed
+   * record carries them so the retry that completes the epoch adds to them. Optional so older
+   * binaries parse the record.
+   */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });

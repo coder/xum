@@ -13,6 +13,12 @@
 
 const REDACTED = "[redacted]";
 
+/**
+ * Callers cut text at a cap. They scan this much past it, so a secret that starts inside the kept
+ * text is matched whole before the cut, and not left as a readable prefix of it.
+ */
+export const REDACTION_LOOKAHEAD_CHARS = 512;
+
 // `token` excludes the plural so `max_tokens: 4096` and `input_tokens` stay readable.
 // `AccountKey` is the Azure storage connection string's secret; a key named `bearer` holds the token.
 const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
@@ -39,13 +45,22 @@ const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
 ];
 
+// A quoted value reads through backslash escapes, so an escaped quote inside the string does not
+// end it: `{"password":"abc\"DEF"}` (what `JSON.stringify` makes of `abc"DEF`) must lose `DEF` too.
+// Every position can take a character, except a closing delimiter and the end of the text, which
+// end the value. So a match never fails and backtracks into the body, and the scan stays linear.
+const QUOTED_VALUE = String.raw`(["'])(?:\\[\s\S]|(?!\2)[^\\]|\\$)*(?:\2|$)`;
+// Inside a JSON-escaped string the delimiter is `\"` and an inner escaped quote is `\\\"`. A run of
+// backslashes before a quote ends the value only when it is one more than a multiple of four.
+const ESCAPED_QUOTED_VALUE = String.raw`\\(["'])(?:[^\\]|\\{4}|\\{3}\3|\\{1,3}(?!\3)[^\\]|\\(?!\3))*(?:\\\3|$)`;
+
 // `key=value`, `key: value`, `"key": "value"`, `os.environ["KEY"] = "value"` and the same inside a
 // JSON-escaped string (`\"key\": \"value\"`). The value is a quoted run (to its closing quote, or
 // to the end of an unterminated one) or one unquoted word, optionally behind an auth scheme.
 // Already-redacted values are skipped so the passes compose, and so are comparisons (`token === x`).
 const SECRET_KEY_VALUE_PATTERN = new RegExp(
   String.raw`(${SECRET_NAME}[\w-]{0,${NAME_SUFFIX_MAX}}(?:\\?["']\]?)?\s{0,${GAP_MAX}}[:=]\s{0,${GAP_MAX}})` +
-    String.raw`(?![=]|\[redacted\])(?:(\\?["'])[\s\S]*?(?:\2|$)|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
+    String.raw`(?![=]|\[redacted\])(?:${QUOTED_VALUE}|${ESCAPED_QUOTED_VALUE}|(?:(?:Basic|Bearer|Token|Digest)\s{1,${GAP_MAX}})?[^\s"'\\,;&}\])]+)`,
   "gi"
 );
 

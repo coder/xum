@@ -1,0 +1,298 @@
+import { describe, expect, it, spyOn } from "bun:test";
+
+import { isPlainObject } from "@/common/utils/isPlainObject";
+import { redactSecretLike } from "./memorySecretRedaction";
+import { renderToolValue, serializeToolValue, takeWithoutMedia } from "./memoryToolText";
+
+// How the renderer worked before it was size-budgeted: clone and stringify the whole value, replace
+// every data URL, and only then cut. The budgeted one must print the same for what fits.
+function renderBeforeBudget(value: unknown, maxChars: number): string {
+  const sanitize = (item: unknown, depth: number): unknown => {
+    if (depth > 30) return "[nested data omitted]";
+    if (Array.isArray(item)) return item.map((child) => sanitize(child, depth + 1));
+    if (!isPlainObject(item)) return item;
+    if (
+      typeof item.type === "string" &&
+      ["media", "display_file", "image-data", "file-data"].includes(item.type)
+    ) {
+      return "[media]";
+    }
+    if (item.toolName === "session_history") return "[session_history result omitted]";
+    return Object.fromEntries(
+      Object.entries(item).map(([key, child]) => [key, sanitize(child, depth + 1)])
+    );
+  };
+  const stringify = (): string => {
+    if (value === undefined) return "[none]";
+    const sanitized = sanitize(value, 0);
+    if (typeof sanitized === "string") return sanitized;
+    try {
+      return JSON.stringify(sanitized) ?? "[unserializable]";
+    } catch {
+      return "[unserializable]";
+    }
+  };
+  const withoutMedia = stringify().replace(
+    /data:[\w.+-]+\/[\w.+-]+(?:;[\w=.+-]+)*;base64,[A-Za-z0-9+/=_-]+/gi,
+    "[media]"
+  );
+  const redacted = redactSecretLike(withoutMedia.slice(0, maxChars + 512));
+  if (withoutMedia.length <= maxChars) return redacted;
+  return `${redacted.slice(0, maxChars)} [truncated ${withoutMedia.length - maxChars} more chars for memory harvest]`;
+}
+
+const TRUNCATED = " [truncated ";
+
+describe("renderToolValue", () => {
+  const githubToken = `ghp_${"a1B2".repeat(9)}`;
+  const dataUrl = "data:image/png;base64,QUJDREVGR0hJSktM";
+  const nest = (depth: number, leaf: string): unknown =>
+    depth === 0 ? leaf : { inner: nest(depth - 1, leaf) };
+  const withHole = new Array<number>(3);
+  withHole[0] = 1;
+  withHole[2] = 3;
+
+  const values: Array<[string, unknown]> = [
+    ["a string", 'plain output\nwith a newline, "quotes" and a \\ backslash'],
+    ["an empty string", ""],
+    ["no value", undefined],
+    ["a number", 42],
+    ["negative zero", -0],
+    ["a large float", 1.5e21],
+    ["NaN", Number.NaN],
+    ["null", null],
+    ["a boolean", false],
+    ["an empty array", []],
+    ["an empty object", {}],
+    ["every JSON type", { a: 1, b: "two", c: [3, { d: null }], e: true, f: [] }],
+    ["a string of unicode", "héllo \u2028 日本語 \u{1F600}"],
+    ["a key that needs escaping", { 'a"b\\c\n': 1 }],
+    ["an own __proto__ key", JSON.parse('{"__proto__":{"a":1},"b":[1,{"c":null}]}')],
+    [
+      "properties and items that JSON leaves out",
+      { a: undefined, b: () => 1, c: [undefined, () => 2] },
+    ],
+    ["an array with a hole", withHole],
+    ["a Date", { when: new Date(0) }],
+    ["a bigint", { n: 10n }],
+    ["a media part", { type: "media", data: "QUJD".repeat(100), mediaType: "image/png" }],
+    [
+      "media parts inside a result",
+      {
+        content: [
+          { type: "text", text: "hi" },
+          { type: "display_file", data: "x" },
+        ],
+      },
+    ],
+    ["a session_history result", { toolName: "session_history", output: { items: ["x"] } }],
+    [
+      "a session_history result inside another",
+      {
+        calls: [
+          { toolName: "session_history", output: "x" },
+          { toolName: "bash", output: "ok" },
+        ],
+      },
+    ],
+    ["data URLs in strings", { image: `before ${dataUrl} after`, again: [dataUrl] }],
+    ["a data URL as the whole value", dataUrl],
+    ["a secret", { env: `GITHUB_TOKEN=${githubToken}`, ok: true }],
+    ["a secret that crosses the cap", `${"x".repeat(1_989)} ${githubToken} tail`],
+    ["data nested to the limit", nest(29, "LEAF")],
+    ["data nested past the limit", nest(40, "DEEP")],
+    ["a long array", Array.from({ length: 3_000 }, (_, index) => index)],
+    ["a long string", "x".repeat(5_000)],
+    [
+      "a wide object",
+      Object.fromEntries(
+        Array.from({ length: 500 }, (_, index) => [`key${index}`, `value ${index}`])
+      ),
+    ],
+    ["a string a few characters over the cap", "y".repeat(2_100)],
+  ];
+  const caps = [10, 120, 2_000];
+
+  it.each(values.flatMap(([label, value]) => caps.map((cap) => [label, value, cap] as const)))(
+    "prints %s as before, at a cap of %d",
+    (_label, value, cap) => {
+      const expected = renderBeforeBudget(value, cap);
+      const actual = renderToolValue(value, cap);
+      const marker = expected.lastIndexOf(TRUNCATED);
+      if (marker === -1) {
+        expect(actual).toBe(expected);
+        return;
+      }
+      // What was kept is the same. The count of what was cut is exact while the serialization
+      // fits the redaction lookahead past the cap, and a lower bound past it: the walk stopped.
+      const cutChars = Number(/\[truncated (\d+) more/.exec(expected.slice(marker))?.[1]);
+      expect(actual).toBe(
+        cutChars <= 512
+          ? expected
+          : `${expected.slice(0, marker)}${TRUNCATED}512+ more chars for memory harvest]`
+      );
+    }
+  );
+
+  it("says how much was cut when the whole value fit, and at least how much when it did not", () => {
+    expect(renderToolValue("x".repeat(2_100), 2_000)).toBe(
+      `${"x".repeat(2_000)} [truncated 100 more chars for memory harvest]`
+    );
+    expect(renderToolValue("x".repeat(60_000), 2_000)).toBe(
+      `${"x".repeat(2_000)} [truncated 512+ more chars for memory harvest]`
+    );
+  });
+
+  it("does not spend the cap on attachment bytes", () => {
+    const shot = `data:image/png;base64,${"QUJD".repeat(250_000)}`;
+
+    expect(renderToolValue({ shot, log: "build ok" }, 2_000)).toBe(
+      '{"shot":"[media]","log":"build ok"}'
+    );
+  });
+
+  it("redacts a secret that starts inside the cap and ends past it", () => {
+    const rendered = renderToolValue(`${"x".repeat(1_989)} ${githubToken} tail`, 2_000);
+
+    expect(rendered).toContain("[redacted]");
+    expect(rendered).not.toContain("ghp_");
+  });
+});
+
+/** An array of `length` items that exist only when read, so a walk's reads are countable. */
+function lazyArray(length: number, itemAt: (index: number) => unknown): unknown[] {
+  return new Proxy([] as unknown[], {
+    get(target, key, receiver): unknown {
+      if (key === "length") return length;
+      if (typeof key === "string" && /^\d+$/.test(key)) return itemAt(Number(key));
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+}
+
+/** The length of every string a regex scanned while `run` ran. */
+function regexInputLengths(run: () => void): number[] {
+  const spy = spyOn(RegExp.prototype, "exec");
+  try {
+    run();
+    return spy.mock.calls.map(([input]) => input.length);
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+// A tool result can be megabytes of text or millions of entries; only a short prefix is sent. These
+// count the work done instead of timing it: a value is read only as far as the budget reaches.
+describe("a value far past the budget", () => {
+  const BUDGET = 2_512; // a 2,000-character cap and the redaction lookahead
+
+  it("reads only as many items of a huge array as the budget holds", () => {
+    let reads = 0;
+    const huge = lazyArray(1_000_000, (index) => {
+      reads++;
+      return index;
+    });
+
+    const { text, complete } = serializeToolValue(huge, BUDGET);
+
+    expect(complete).toBe(false);
+    expect(text).toHaveLength(BUDGET);
+    expect(text.startsWith("[0,1,2,3,")).toBe(true);
+    expect(reads).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("reads only as many values of a wide object as the budget holds", () => {
+    let reads = 0;
+    const wide: Record<string, unknown> = {};
+    for (let index = 0; index < 20_000; index++) {
+      Object.defineProperty(wide, `key${index}`, {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return `value ${index}`;
+        },
+      });
+    }
+
+    const { text, complete } = serializeToolValue({ rows: wide }, BUDGET);
+
+    expect(complete).toBe(false);
+    expect(text.startsWith('{"rows":{"key0":"value 0","key1"')).toBe(true);
+    expect(reads).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("stops at the budget inside deeply nested wide values", () => {
+    let reads = 0;
+    const rows = lazyArray(1_000_000, (index) => {
+      reads++;
+      return { id: index, tags: ["a", "b"], nested: { ok: true } };
+    });
+
+    const { complete } = serializeToolValue({ calls: [{ rows }] }, BUDGET);
+
+    expect(complete).toBe(false);
+    expect(reads).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("scans no more of a huge string than the budget reaches", () => {
+    let rendered = "";
+    const scanned = regexInputLengths(() => {
+      rendered = renderToolValue({ output: `HEAD ${"x".repeat(20_000_000)} TAIL` }, 2_000);
+    });
+
+    expect(rendered).toContain("HEAD");
+    expect(rendered).not.toContain("TAIL");
+    // The spy sees every regex scan: the media search and the redaction patterns.
+    expect(scanned.length).toBeGreaterThan(0);
+    expect(Math.max(...scanned)).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("reads a data URL to its end, and the text after it", () => {
+    const text = `data:image/png;base64,${"QUJD".repeat(1_000_000)} tail text`;
+
+    expect(renderToolValue(text, 2_000)).toBe("[media] tail text");
+  });
+});
+
+describe("takeWithoutMedia", () => {
+  it("takes the text when it fits, and says nothing followed", () => {
+    expect(takeWithoutMedia("a data:x b", 100)).toEqual({ text: "a data:x b", cut: false });
+    expect(takeWithoutMedia("", 100)).toEqual({ text: "", cut: false });
+  });
+
+  it("counts the stub, not the payload, against the limit", () => {
+    const text = `data:image/png;base64,${"A".repeat(100_000)} tail text here`;
+
+    expect(takeWithoutMedia(text, 12)).toEqual({ text: "[media] tail", cut: true });
+    expect(takeWithoutMedia(text, 1_000)).toEqual({ text: "[media] tail text here", cut: false });
+  });
+
+  it("searches only the text the limit can reach for a URL", () => {
+    const scanned = regexInputLengths(() => {
+      takeWithoutMedia(`${"x".repeat(1_000_000)}data:image/png;base64,QUJD`, 100);
+    });
+
+    expect(scanned.length).toBeGreaterThan(0);
+    expect(Math.max(...scanned)).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("takeWithoutMedia on hostile text", () => {
+  // Tool output is text a repository or a web page controls, so a hostile 100 KB result must not
+  // stall the process. Each shape is one the header or the wrapped-line loop could rescan.
+  it.each([
+    ["a bare scheme", "data:".repeat(20_000)],
+    ["a media-type header without a payload", "data:image/png;".repeat(7_000)],
+    ["a header of parameters", `data:a/a${";a".repeat(50_000)}`],
+    ["a header word", `data:${"a".repeat(100_000)}`],
+    ["a wrapped payload", `data:image/png;base64,${`${"QUJD".repeat(5)}\n`.repeat(10_000)}`],
+    ["a payload of one-character lines", `data:image/png;base64,${"A\n".repeat(50_000)}`],
+    ["many short payloads", `data:image/png;base64,${"A".repeat(20)}\n`.repeat(3_000)],
+    ["escaped line breaks", `data:image/png;base64,${`${"A".repeat(20)}\\n`.repeat(8_000)}`],
+  ])("scans %s in linear time", (_label, text) => {
+    takeWithoutMedia(text, Number.POSITIVE_INFINITY); // keep a cold regex compile out of the timing
+    const started = performance.now();
+    takeWithoutMedia(text, Number.POSITIVE_INFINITY);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+});

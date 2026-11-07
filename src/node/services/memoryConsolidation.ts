@@ -48,6 +48,7 @@ import { containsSecretLike, redactSecretLike } from "@/node/services/memorySecr
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
 import { executeMemoryCommand, type MemoryCommandInput } from "@/node/services/tools/memory";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 // Re-exported for journal consumers; defined next to the oRPC schema so the
 // wire shape and the node shape can never drift (z.infer single source).
@@ -71,6 +72,7 @@ export interface MemoryConsolidationResult {
 /** Scopes a consolidation run can be allowed to modify; the session scope is never one of them. */
 type WritableMemoryScope = Exclude<MemoryScope, "session">;
 
+const CANCELLED_PASS_ERROR = "Consolidation pass was cancelled";
 const DEFAULT_WRITABLE_SCOPES: readonly WritableMemoryScope[] = ["workspace", "global", "project"];
 const PATH_LIST_FORMAT = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
 
@@ -372,12 +374,18 @@ export function createConsolidationMemoryTool(args: {
       // pre-commit recheck (below) is what stops executions that were
       // already in flight when the caller was torn down.
       if (args.abortSignal?.aborted === true) {
-        return { success: false, error: "Consolidation pass was cancelled" };
+        return { success: false, error: CANCELLED_PASS_ERROR };
       }
       const target = classifyMutation(input);
       if (target === null) {
-        // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
+        // Reads (and malformed inputs, which fail validation inside) pass through. A read that
+        // stalls in filesystem I/O has nothing to re-check the signal, and the provider loop
+        // waits for the tool result: race it, so the run's timeout and removal still end the run.
+        const read = await raceWithAbortAndTimeout(
+          executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId),
+          { signal: args.abortSignal }
+        );
+        return read.kind === "ok" ? read.value : { success: false, error: CANCELLED_PASS_ERROR };
       }
 
       let rejection: string | null;
