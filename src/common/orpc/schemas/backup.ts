@@ -187,6 +187,8 @@ export const backup = {
         pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
         /** The backup carries a plugin list but `includePlugins` is off, so it is skipped. */
         pluginListSkipped: z.boolean().optional(),
+        /** What this build could not read of the plugin list (the list or a row); the rest still shows. */
+        pluginListWarnings: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -235,6 +237,7 @@ export const backup = {
         /** The backup's plugin list against this machine's installs, for the reinstall offer. */
         pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
         pluginListSkipped: z.boolean().optional(),
+        pluginListWarnings: z.array(z.string()).optional(),
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**

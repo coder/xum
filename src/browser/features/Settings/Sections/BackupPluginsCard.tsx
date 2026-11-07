@@ -8,6 +8,7 @@ import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 export interface PluginBackupReport {
   pluginInstalls?: readonly BackupPluginInstall[];
   pluginListSkipped?: boolean;
+  pluginListWarnings?: readonly string[];
 }
 
 export const NO_PLUGIN_BACKUP: PluginBackupReport = {};
@@ -64,6 +65,23 @@ function PluginRow(props: { plugin: BackupPluginInstall }) {
   );
 }
 
+/** What this build could not read of the list. The rows it could read still show. */
+function PluginListWarnings(props: { warnings: readonly string[] }) {
+  if (props.warnings.length === 0) return null;
+  return (
+    <div className="text-warning text-xs">
+      <p>Part of the plugin list could not be read and was left out:</p>
+      <ul className="mt-1 list-disc space-y-0.5 pl-4">
+        {props.warnings.map((warning) => (
+          <li key={warning} className="break-words">
+            {warning}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /**
  * The backup's plugin list after a preview or restore, with the one way forward: review each
  * missing plugin through the normal install preview. Also says so when a list was skipped.
@@ -74,6 +92,7 @@ export function BackupPluginsCard(props: {
   onReview: () => void;
 }) {
   const plugins = props.report.pluginInstalls ?? [];
+  const warnings = props.report.pluginListWarnings ?? [];
   const missing = missingPlugins(props.report);
   if (props.report.pluginListSkipped === true) {
     return (
@@ -83,7 +102,7 @@ export function BackupPluginsCard(props: {
       </div>
     );
   }
-  if (plugins.length === 0) return null;
+  if (plugins.length === 0 && warnings.length === 0) return null;
   return (
     <div className="border-border-light space-y-3 rounded-md border p-3">
       <div>
@@ -93,6 +112,7 @@ export function BackupPluginsCard(props: {
           preview at the commit the backup pinned, and nothing installs until you confirm it.
         </p>
       </div>
+      <PluginListWarnings warnings={warnings} />
       <ul className="space-y-2">
         {plugins.map((plugin) => (
           <PluginRow key={plugin.name} plugin={plugin} />

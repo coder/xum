@@ -101,6 +101,7 @@ export interface BackupPayloadStore {
     /** The backup's plugin list against this machine's installs; a restore installs none. */
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
+    pluginListWarnings?: string[];
     symlinkSkipped?: string[];
   }>;
   validateRestore(options: {
@@ -137,6 +138,7 @@ export interface BackupPayloadStore {
     shelfSkipped?: string[];
     pluginInstalls?: BackupPluginInstall[];
     pluginListSkipped?: boolean;
+    pluginListWarnings?: string[];
     symlinkSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
@@ -586,6 +588,7 @@ export class BackupService {
         shelfSkipped: string[];
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
+        pluginListWarnings?: string[];
         symlinkSkipped?: string[];
         pushError: string | null;
       },
@@ -634,6 +637,7 @@ export class BackupService {
         ],
         pluginInstalls: restorePreview.pluginInstalls,
         pluginListSkipped: restorePreview.pluginListSkipped,
+        pluginListWarnings: restorePreview.pluginListWarnings,
         symlinkSkipped: restorePreview.symlinkSkipped,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
@@ -727,6 +731,7 @@ export class BackupService {
         shelfSkipped: string[];
         pluginInstalls?: BackupPluginInstall[];
         pluginListSkipped?: boolean;
+        pluginListWarnings?: string[];
         symlinkSkipped?: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
@@ -849,6 +854,7 @@ export class BackupService {
               shelfSkipped: restored.shelfSkipped ?? [],
               pluginInstalls: restored.pluginInstalls,
               pluginListSkipped: restored.pluginListSkipped,
+              pluginListWarnings: restored.pluginListWarnings,
               symlinkSkipped: restored.symlinkSkipped,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,

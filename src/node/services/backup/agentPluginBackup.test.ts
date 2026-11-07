@@ -365,52 +365,153 @@ describe("backup of the managed plugin list", () => {
       expect(preview.pluginListSkipped).toBe(false);
     });
 
-    it("refuses a malformed list as an invalid backup", async () => {
+    async function writeSidecar(managed: string, content: string) {
+      await fs.writeFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), content, "utf-8");
+    }
+
+    /** What a preview and a restore validation make of the list as it is checked out now. */
+    async function previewAndValidate(
+      payload: Awaited<ReturnType<typeof prepare>>["payload"],
+      request: Awaited<ReturnType<typeof prepare>>["request"]
+    ) {
+      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+      await payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS });
+      return preview;
+    }
+
+    it("reports a list that is not JSON and still previews and validates the restore", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
-      await fs.writeFile(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH), "{ not json", "utf-8");
+      await writeSidecar(managed, "{ not json");
 
-      const preview = await captureRejection(
-        payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS })
-      );
-      const validation = await captureRejection(
-        payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS })
-      );
+      const preview = await previewAndValidate(payload, request);
 
-      expect((preview as { code?: string }).code).toBe("INVALID_BACKUP");
-      expect((validation as { code?: string }).code).toBe("INVALID_BACKUP");
+      expect(preview.pluginInstalls).toEqual([]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.pluginListSkipped).toBe(false);
     });
 
-    it("refuses a list whose entries break the schema", async () => {
+    it.each([
+      ["a list that is not an object", "[]"],
+      ["a list of another version", JSON.stringify({ schemaVersion: 2, plugins: [] })],
+      ["a list without a plugins array", JSON.stringify({ schemaVersion: 1 })],
+    ])("skips the whole list for %s, and reports it", async (_label, content) => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      await writeSidecar(managed, content);
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginInstalls).toEqual([]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
+    });
+
+    it("leaves out a row this build cannot read and keeps the others", async () => {
+      const { payload, managed, request } = await backupOf([
+        registryRow("alpha"),
+        registryRow("beta"),
+      ]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha, beta] = sidecar.plugins;
+      const future = {
+        ...alpha,
+        name: "future",
+        source: { type: "archive", url: "https://example.com/future.tgz" },
+      };
+      await writeSidecar(
+        managed,
+        JSON.stringify({ schemaVersion: 1, plugins: [alpha, future, beta] })
+      );
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha", "beta"]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.pluginListWarnings?.[0]).toContain("future");
+    });
+
+    it("leaves out a row with no name, a row whose entry breaks the schema, and a repeated name", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
       const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
-      sidecar.plugins[0] = { ...sidecar.plugins[0], lockedSha: "main" };
-      await fs.writeFile(
-        path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH),
-        JSON.stringify(sidecar),
-        "utf-8"
-      );
+      const [alpha] = sidecar.plugins;
+      const rows = [
+        alpha,
+        { source: alpha?.source },
+        { ...alpha, name: "pinned-to-a-branch", lockedSha: "main" },
+        alpha,
+      ];
+      await writeSidecar(managed, JSON.stringify({ schemaVersion: 1, plugins: rows }));
 
-      const error = await captureRejection(
-        payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS })
-      );
+      const preview = await previewAndValidate(payload, request);
 
-      expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.pluginListWarnings).toHaveLength(3);
     });
 
-    it("refuses a list that is a symlink out of the backup", async () => {
+    it("reads only the first rows of an oversized list and caps the warnings", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const broken = Array.from({ length: 12 }, (_, i) => ({ name: `broken-${i}` }));
+      const valid = Array.from({ length: 510 }, (_, i) => ({ ...alpha, name: `plugin-${i}` }));
+      await writeSidecar(
+        managed,
+        JSON.stringify({ schemaVersion: 1, plugins: [...broken, ...valid] })
+      );
+
+      const preview = await previewAndValidate(payload, request);
+
+      // 522 rows: the first 512 are read, so 12 broken rows and 500 valid ones.
+      expect(preview.pluginInstalls).toHaveLength(500);
+      expect(preview.pluginListWarnings?.length).toBeLessThan(15);
+    });
+
+    it("reports a list that is a symlink out of the backup without following it", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
       const outside = path.join(tempDir, "outside.json");
-      await fs.writeFile(outside, '{"schemaVersion":1,"plugins":[]}', "utf-8");
+      const sidecar = (await readSidecar(managed)) as { plugins: unknown[] };
+      await fs.writeFile(outside, JSON.stringify(sidecar), "utf-8");
       const manifest = path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH);
       await fs.rm(manifest);
       await fs.symlink(outside, manifest);
 
-      const error = await captureRejection(
-        payload.validateRestore({ ...request, contents: DEFAULT_CONTENTS })
-      );
+      const preview = await previewAndValidate(payload, request);
 
-      expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+      expect(preview.pluginInstalls).toEqual([]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
     });
+
+    it("reports a sidecar folder with no list file", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      await fs.rm(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH));
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginInstalls).toEqual([]);
+      expect(preview.pluginListWarnings).toHaveLength(1);
+    });
+
+    it("reports no warnings for a list it can read whole", async () => {
+      const { payload, request } = await backupOf([registryRow("alpha")]);
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginListWarnings).toEqual([]);
+    });
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "still throws when the list file cannot be read from disk",
+      async () => {
+        const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+        const manifest = path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH);
+        await fs.chmod(manifest, 0o000);
+
+        const error = await captureRejection(
+          payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+        );
+        await fs.chmod(manifest, 0o600);
+
+        expect((error as { code?: string }).code).toBe("EACCES");
+      }
+    );
 
     it("lets a malformed list through when the flag is off", async () => {
       const { payload, managed, request } = await backupOf([registryRow("alpha")]);
@@ -470,7 +571,7 @@ describe("backup of the managed plugin list", () => {
       expect(preview.data.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
     });
 
-    it("refuses a malformed list before the safety snapshot, with nothing written", async () => {
+    it("restores the settings when the plugin list is unreadable, and reports the warning", async () => {
       await pushFromFirstMachine([registryRow("alpha")]);
       const clone = path.join(tempDir, "tamper");
       await runGit(["clone", "--quiet", originPath, clone]);
@@ -479,12 +580,18 @@ describe("backup of the managed plugin list", () => {
       await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
       const second = await secondMachine();
 
+      const preview = await serviceFor(second).preview(settings);
       const restored = await serviceFor(second).restore(settings);
 
-      if (restored.success) throw new Error("Expected the malformed list to block the restore");
-      expect(restored.error.code).toBe("INVALID_BACKUP");
-      expect(restored.error.snapshotPath ?? null).toBeNull();
-      expect((await fs.readdir(second)).sort()).toEqual(["backup-cache"]);
+      if (!preview.success) throw new Error(preview.error.message);
+      expect(preview.data.pluginListWarnings).toHaveLength(1);
+      if (!restored.success) throw new Error(restored.error.message);
+      expect(await fs.readFile(path.join(second, "AGENTS.md"), "utf-8")).toBe(
+        "from the first machine\n"
+      );
+      expect(restored.data.pluginInstalls).toEqual([]);
+      expect(restored.data.pluginListWarnings).toHaveLength(1);
+      expect(await exists(path.join(second, "plugins.json"))).toBe(false);
     });
   });
 });

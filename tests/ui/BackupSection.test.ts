@@ -1500,6 +1500,40 @@ describe("BackupSection", () => {
       expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
     });
 
+    test("shows what it could not read of the plugin list, even with no row to show", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [],
+          pluginListWarnings: ["The plugin list was not read: it is not valid JSON."],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/it is not valid JSON/);
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("shows a left-out row next to the rows it could read", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          pluginInstalls: [pluginRow("alpha", "missing")],
+          pluginListWarnings: ['Left out row 2 ("future"): source.type: Invalid input'],
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/Left out row 2 \("future"\)/);
+      expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+    });
+
     test("offers the plugins right after a restore, which installed none of them", async () => {
       const { client, view } = renderBackupSection({
         backupRestore: { ...RESTORE_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },

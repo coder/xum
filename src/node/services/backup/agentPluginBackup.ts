@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { z } from "zod";
 import {
   AgentPluginInstallEntrySchema,
   type AgentPluginInstallEntry,
@@ -8,7 +9,6 @@ import type { BackupContents } from "@/common/config/schemas/settingsBackup";
 import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import {
   BackupPluginEntrySchema,
-  BackupPluginManifestSchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
   type BackupPluginEntry,
   type BackupPluginInstall,
@@ -26,7 +26,6 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   assertManagedTreeWithinLimits,
   BACKUP_MANIFEST_FILE,
-  BackupInvalidPayloadError,
   isFilesystemError,
   MAX_BACKUP_FILE_BYTES,
   resolveContainedPath,
@@ -153,29 +152,103 @@ async function readManifestText(sourceDir: string): Promise<string> {
   return await fs.readFile(manifestPath, "utf-8");
 }
 
-function parseManifest(text: string): BackupPluginManifest {
-  const parsed = BackupPluginManifestSchema.safeParse(JSON.parse(text));
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    throw new Error(
-      `Backup plugin list is invalid at '${issue?.path.join(".") ?? ""}': ${issue?.message ?? ""}`
-    );
-  }
-  return parsed.data;
+/** The version and the rows of the list file. Each row is read on its own (`readPluginRows`). */
+const PluginListEnvelopeSchema = z.object({
+  schemaVersion: z.literal(1),
+  plugins: z.array(z.unknown()),
+});
+
+/** The name of a row, for its warning, when it has a string one. */
+const PluginRowNameSchema = z.object({ name: z.string() });
+
+/** A corrupt list of hundreds of rows must not become hundreds of warning lines. */
+const MAX_PLUGIN_LIST_WARNINGS = 10;
+
+/** What this build could read of the checked-out list, and what it had to leave out. */
+interface PluginListRead {
+  plugins: BackupPluginEntry[];
+  warnings: string[];
+}
+
+function skippedList(reason: string): PluginListRead {
+  return { plugins: [], warnings: [`The plugin list was not read: ${reason}.`] };
+}
+
+/** Row numbers keep every warning distinct, even for rows that share a name or have none. */
+function rowLabel(row: unknown, index: number): string {
+  const named = PluginRowNameSchema.safeParse(row);
+  return named.success
+    ? `row ${index + 1} ("${named.data.name.slice(0, 64)}")`
+    : `row ${index + 1}`;
+}
+
+function describeIssues(error: z.ZodError): string {
+  return error.issues
+    .slice(0, 2)
+    .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+    .join("; ");
 }
 
 /**
- * The checked-out list, validated whole: null when the backup has none, INVALID_BACKUP when it is
- * malformed. A local disk failure keeps its own error, so it is not blamed on the repository.
+ * Keeps the rows this build can read, first row per name (a later duplicate is corrupt). A row it
+ * cannot read, such as a source kind a newer build wrote, is left out and reported: the list is
+ * advice, so one bad row must not hide the others or block the restore.
  */
-export async function readPluginBackup(sourceDir: string): Promise<BackupPluginManifest | null> {
-  if (!(await pluginBackupExists(sourceDir))) return null;
+function readPluginRows(rows: readonly unknown[]): PluginListRead {
+  const plugins: BackupPluginEntry[] = [];
+  const problems: string[] = [];
+  const names = new Set<string>();
+  for (const [index, row] of rows.slice(0, MAX_BACKUP_PLUGIN_ENTRIES).entries()) {
+    const parsed = BackupPluginEntrySchema.safeParse(row);
+    if (!parsed.success) {
+      problems.push(`Left out ${rowLabel(row, index)}: ${describeIssues(parsed.error)}`);
+    } else if (names.has(parsed.data.name)) {
+      problems.push(`Left out ${rowLabel(row, index)}: the list names that plugin twice`);
+    } else {
+      names.add(parsed.data.name);
+      plugins.push(parsed.data);
+    }
+  }
+  const warnings = problems.slice(0, MAX_PLUGIN_LIST_WARNINGS);
+  if (problems.length > warnings.length) {
+    warnings.push(`${problems.length - warnings.length} more plugins were left out`);
+  }
+  if (rows.length > MAX_BACKUP_PLUGIN_ENTRIES) {
+    warnings.push(`Only the first ${MAX_BACKUP_PLUGIN_ENTRIES} plugins of the list were read`);
+  }
+  return { plugins, warnings };
+}
+
+function parsePluginList(text: string): PluginListRead {
+  let json: unknown;
   try {
-    return parseManifest(await readManifestText(sourceDir));
+    json = JSON.parse(text);
+  } catch {
+    return skippedList("it is not valid JSON");
+  }
+  const envelope = PluginListEnvelopeSchema.safeParse(json);
+  if (!envelope.success) {
+    return skippedList("only a version 1 list with a plugins array can be read here");
+  }
+  return readPluginRows(envelope.data.plugins);
+}
+
+/**
+ * The checked-out list as far as this build can read it. The list is advice, so a list it cannot
+ * read (bad JSON, another version, a symlink, a missing or oversized file) or a row it cannot read
+ * becomes a warning and never refuses the restore. A local disk failure still throws, so it is not
+ * blamed on the repository. A symlink is reported without being followed.
+ */
+async function readPluginBackup(sourceDir: string): Promise<PluginListRead> {
+  if (!(await pluginBackupExists(sourceDir))) return { plugins: [], warnings: [] };
+  let text: string;
+  try {
+    text = await readManifestText(sourceDir);
   } catch (error) {
     if (isFilesystemError(error)) throw error;
-    throw new BackupInvalidPayloadError(error);
+    return skippedList(getErrorMessage(error));
   }
+  return parsePluginList(text);
 }
 
 /** `installed`: that name at that commit. Another commit, or a folder the installer does not manage: `conflict`. */
@@ -191,11 +264,13 @@ async function statusOf(
 
 async function planPluginInstalls(
   rootDir: string,
-  manifest: BackupPluginManifest
+  listed: readonly BackupPluginEntry[]
 ): Promise<BackupPluginInstall[]> {
+  // No rows, nothing to compare: a backup without a list never reads this machine's registry.
+  if (listed.length === 0) return [];
   const local = await readManagedInstalls(rootDir);
   return await Promise.all(
-    manifest.plugins.map(async (plugin) => ({
+    listed.map(async (plugin) => ({
       ...plugin,
       status: await statusOf(rootDir, plugin, local.get(plugin.name)),
     }))
@@ -206,19 +281,29 @@ async function planPluginInstalls(
  * What a preview or restore reports of the backup's plugin list. Writes nothing: the rows are an
  * offer the user can take through the install review (see the note at the top of this file).
  * With the flag off the list is only checked for existence, so a malformed one never blocks a
- * settings-only restore, and its presence is reported.
+ * settings-only restore, and its presence is reported. With it on, an unreadable list or row comes
+ * back as a warning (`readPluginBackup`).
  */
 export async function readPluginRestore(options: {
   rootDir: string;
   sourceDir: string;
   contents: BackupContents;
-}): Promise<{ pluginInstalls: BackupPluginInstall[]; pluginListSkipped: boolean }> {
+}): Promise<{
+  pluginInstalls: BackupPluginInstall[];
+  pluginListSkipped: boolean;
+  pluginListWarnings: string[];
+}> {
   if (!options.contents.includePlugins) {
-    return { pluginInstalls: [], pluginListSkipped: await pluginBackupExists(options.sourceDir) };
+    return {
+      pluginInstalls: [],
+      pluginListSkipped: await pluginBackupExists(options.sourceDir),
+      pluginListWarnings: [],
+    };
   }
-  const manifest = await readPluginBackup(options.sourceDir);
+  const list = await readPluginBackup(options.sourceDir);
   return {
-    pluginInstalls: manifest === null ? [] : await planPluginInstalls(options.rootDir, manifest),
+    pluginInstalls: await planPluginInstalls(options.rootDir, list.plugins),
     pluginListSkipped: false,
+    pluginListWarnings: list.warnings,
   };
 }
