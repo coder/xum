@@ -67,17 +67,13 @@ export const ReasoningMessage: React.FC<ReasoningMessageProps> = ({
     summaryLineRaw.length > MAX_SUMMARY_CHARS
       ? `${summaryLineRaw.slice(0, MAX_SUMMARY_CHARS)}…`
       : summaryLineRaw;
-  const parsedLeadingBoldSummary = parseLeadingBoldSummary(summaryLine);
-  // Structure above parses the stored bytes; the marks below are for reading only. Reasoning
-  // replays to the provider from this part's own text and providerMetadata, so a payload encoded
-  // in tag characters is model-visible while the row would otherwise draw nothing.
+  // The trace below replays to the provider from this part's own text and providerMetadata, so a
+  // payload encoded in tag characters is model-visible while the header would draw nothing. Only these
+  // two display values carry marks, and the bold split runs on the revealed line: a mark is `<U+XXXX>`
+  // and holds no `*`, so it cannot move an existing marker, and the only new emphasis a payload can
+  // spell is its own - in the header, where nothing is stored or copied from.
   const displayedSummaryLine = revealUnicodeTags(summaryLine);
-  const displayedBoldSummary = parsedLeadingBoldSummary
-    ? {
-        boldText: revealUnicodeTags(parsedLeadingBoldSummary.boldText),
-        trailingText: revealUnicodeTags(parsedLeadingBoldSummary.trailingText),
-      }
-    : null;
+  const displayedBoldSummary = parseLeadingBoldSummary(displayedSummaryLine);
   const hasAdditionalLines = hasContent && /[\r\n]/.test(trimmedContent);
   // OpenAI models often emit terse, single-line traces; surface them inline instead of hiding behind the label.
   const isSingleLineTrace = !isStreaming && hasContent && !hasAdditionalLines;

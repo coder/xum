@@ -8,6 +8,7 @@ import {
   findStartHereSource,
   isTurnActive,
   recentTranscriptRows,
+  toolCallDetail,
   type StatusActivityFlags,
 } from "./agentInterfaceStatusBar";
 
@@ -394,6 +395,20 @@ describe("recentTranscriptRows", () => {
     const rows = recentTranscriptRows([reasoningRow(`ponder${tagRun("ab")}`)], 1);
 
     expect(rows[0]?.preview).toBe("ponder<U+E0061><U+E0062>");
+  });
+
+  test("reveals unicode tags in a tool call's detail, a model-written argument", () => {
+    // display_name and title are arguments the model chose and which travel back to the provider in
+    // the stored call, so the running-tool line and the row preview must not draw them as nothing.
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const call = tool("bash", "executing", {
+      display_name: `Serve${tagRun("XY")}`,
+      path: "/tmp/a",
+    });
+
+    expect(recentTranscriptRows([call], 1)[0]?.preview).toBe("Serve<U+E0058><U+E0059>");
+    expect(toolCallDetail({ title: `Fix ${tagRun("AB")} up` })).toBe("Fix <U+E0041><U+E0042> up");
   });
 });
 

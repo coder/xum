@@ -31,7 +31,9 @@ export function toolCallDetail(args: unknown): string | undefined {
   if (args == null || typeof args !== "object") return undefined;
   for (const key of TOOL_DETAIL_KEYS) {
     const value: unknown = Reflect.get(args, key);
-    if (typeof value === "string" && value.trim() !== "") return oneLine(value);
+    // Display-only, like every other preview here: these values are model-authored and travel back to
+    // the provider inside the call's arguments, so a tag payload in one must not paint nothing.
+    if (typeof value === "string" && value.trim() !== "") return previewLine(value);
   }
   return undefined;
 }
