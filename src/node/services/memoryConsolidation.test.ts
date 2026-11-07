@@ -1221,6 +1221,18 @@ describe("runMemoryConsolidation", () => {
 
       expect(scripted.calls).toEqual([MEMORY_MAX_OUTPUT_TOKENS_PER_STEP]);
     });
+
+    it("leaves a step's output uncapped when no ceiling is set", async () => {
+      using fixture = await createFixture();
+      const scripted = listingModel();
+
+      await run(fixture, scripted);
+
+      // Every step the run may take, none of them capped: the cap exists only to bound the step
+      // that crosses a ceiling, and a user who set none keeps the model's own limit.
+      expect(scripted.calls).toHaveLength(MEMORY_CONSOLIDATION_MAX_STEPS);
+      expect(scripted.calls.every((cap) => cap === undefined)).toBe(true);
+    });
   });
 
   it("reports a pass cut short by its timeout as a stream error, not a clean run", async () => {

@@ -5,7 +5,6 @@ import {
   MEMORY_ANALYZER_MAX_STEPS,
   MEMORY_ANALYZER_OP_BUDGET,
   MEMORY_CONSOLIDATION_TIMEOUT_MS,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
 } from "@/common/constants/memory";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
@@ -529,8 +528,7 @@ async function analyzeChunk(args: {
     tools: { memory: args.memoryTool },
     stopWhen: [stepCountIs(MEMORY_ANALYZER_MAX_STEPS), args.meter.stopIfCeilingReached],
     onStepEnd: args.meter.recordStep,
-    // Bounds how far the step that crosses the cost ceiling can overshoot it.
-    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+    maxOutputTokens: args.meter.maxOutputTokens,
     abortSignal: args.signal,
   });
   const streamErrors: string[] = [];

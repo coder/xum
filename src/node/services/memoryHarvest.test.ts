@@ -1374,12 +1374,24 @@ describe("runMemoryHarvest", () => {
       using fixture = createFixture();
       const { model, calls } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
 
-      await runHarvest(fixture, model, priced);
+      // A ceiling the two $0.50 steps stay under: the cap is set, and the run still takes both.
+      await runHarvest(fixture, model, { ...priced, ceilingUsd: 100 });
 
       expect(calls.map((call) => call.maxOutputTokens)).toEqual([
         MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
         MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
       ]);
+    });
+
+    it("leaves a step's output uncapped when no ceiling is set", async () => {
+      using fixture = createFixture();
+      const { model, calls } = scriptedModel(pricedChunkScript("/memories/workspace/one.md"));
+
+      // The cap exists only to bound the step that crosses a ceiling: a user who set none keeps
+      // the model's own limit.
+      await runHarvest(fixture, model, priced);
+
+      expect(calls.map((call) => call.maxOutputTokens)).toEqual([undefined, undefined]);
     });
   });
 

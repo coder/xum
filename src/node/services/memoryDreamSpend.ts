@@ -8,6 +8,7 @@
  * speed and xAI's exact cost from that metadata). A run stops once its measured spend reaches
  * the ceiling, so the step in flight can go past it by up to one step's cost.
  */
+import { MEMORY_MAX_OUTPUT_TOKENS_PER_STEP } from "@/common/constants/memory";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import {
@@ -44,6 +45,12 @@ export interface SpendMeter {
    * take, so a true answer is a run the ceiling cut short, and the meter remembers that.
    */
   stopIfCeilingReached: () => boolean;
+  /**
+   * Wire as `maxOutputTokens` of every stream of the run. Bounds how far the step that crosses
+   * the ceiling can overshoot it, so it exists only with a ceiling: a run with none keeps the
+   * model's own limit.
+   */
+  maxOutputTokens: number | undefined;
   /** Measured USD, with what `spentUsd` of the meter's creation already held. */
   spentUsd: () => number;
   /** The note of a run the ceiling cut short; undefined when it ended on its own. */
@@ -62,6 +69,7 @@ export function createSpendMeter(args: {
   let spent = args.spentUsd ?? 0;
   let stopped = false;
   return {
+    maxOutputTokens: args.ceilingUsd === undefined ? undefined : MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
     recordStep: (step) => {
       spent += stepCostUsd(step, args.pricingModel);
     },

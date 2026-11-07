@@ -36,7 +36,6 @@ import assert from "@/common/utils/assert";
 import {
   MEMORY_CONSOLIDATION_MAX_STEPS,
   MEMORY_CONSOLIDATION_OP_BUDGET,
-  MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
   type MemoryScope,
 } from "@/common/constants/memory";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -530,8 +529,7 @@ export async function runMemoryConsolidation(args: {
     tools: { memory: memoryTool },
     stopWhen: [stepCountIs(MEMORY_CONSOLIDATION_MAX_STEPS), meter.stopIfCeilingReached],
     onStepEnd: meter.recordStep,
-    // Bounds how far the step that crosses the cost ceiling can overshoot it.
-    maxOutputTokens: MEMORY_MAX_OUTPUT_TOKENS_PER_STEP,
+    maxOutputTokens: meter.maxOutputTokens,
     abortSignal: args.abortSignal,
   });
 
