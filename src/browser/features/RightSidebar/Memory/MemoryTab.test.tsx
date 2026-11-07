@@ -429,6 +429,47 @@ describe("MemoryTab", () => {
     expect(harvestLine.classList.contains("truncate")).toBe(false);
   });
 
+  test("shows what each run cost and the note of a run the cost ceiling stopped", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: {
+          ...DEFAULT_CONSOLIDATION_RECORD,
+          spentUsd: 1.004,
+          note: "stopped at the cost ceiling after $1.00",
+        },
+        // A record written before the cost was measured has none to show.
+        globalRecord: DEFAULT_CONSOLIDATION_RECORD,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 2,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 1,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          spentUsd: 1.5,
+          note: "stopped at the cost ceiling after $1.50",
+        },
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const workspaceLine = await findByText(
+      /^Workspace: .*1 change · \$1\.00 · stopped at the cost ceiling after \$1\.00$/
+    );
+    await findByText(
+      "Harvest: completed: 1 edit / 0 rejected · $1.50 · stopped at the cost ceiling after $1.50"
+    );
+    expect((await findByText(/^Global: /)).textContent).not.toContain("$");
+    // A touch screen cannot open the tooltip, so the note must wrap instead of truncating.
+    expect(workspaceLine.classList.contains("break-words")).toBe(true);
+    expect(workspaceLine.classList.contains("truncate")).toBe(false);
+  });
+
   test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
     fake = createFakeMemoryApi([], {
       consolidationStatus: {

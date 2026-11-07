@@ -28,8 +28,8 @@ function parseCeiling(draft: string): ParsedCeiling {
   if (trimmed === "") return { usd: undefined };
   if (THOUSANDS_LOOKALIKE_PATTERN.test(trimmed)) return { error: AMBIGUOUS_CEILING_MESSAGE };
   if (!DECIMAL_PATTERN.test(trimmed)) return { error: INVALID_CEILING_MESSAGE };
-  // Whole cents: the refusal prints the ceiling to the cent, so a ceiling of 0.019 would read as
-  // "over the 0.02 USD ceiling" for an estimate that prints as 0.02. The field then shows 0.02.
+  // Whole cents: a stopped run prints its spend to the cent, so a ceiling of 0.014 would read as
+  // a stop at $0.01, under the ceiling it reached. The field then shows 0.01.
   const usd = Math.round(Number(trimmed.replace(",", ".")) * 100) / 100;
   return usd >= MEMORY_DREAM_COST_CEILING_MIN_USD && usd <= MEMORY_DREAM_COST_CEILING_MAX_USD
     ? { usd }
@@ -64,11 +64,10 @@ export function MemoryDreamCostCeilingSetting() {
           Dream cost ceiling
         </label>
         <div className="text-muted mt-0.5 text-xs">
-          A dream run whose estimated cost is over this many US dollars does not start. The estimate
-          is deliberately high, not a bill: it assumes every step resends the whole prompt, every
-          memory file and the tool definition at the uncached rate, and writes as much as it may, so
-          the real cost is usually lower. It can still fall under the bill for text that splits into
-          more tokens than usual, such as code or non-Latin scripts. Leave empty for no ceiling.
+          A dream run stops once its measured spend reaches this many US dollars. Each model step is
+          priced from the usage it reports, as the app prices recorded usage, and the step in flight
+          when the ceiling is reached can go past it. A model with no known price counts as free.
+          Leave empty for no ceiling.
         </div>
         {"error" in parsed && (
           <div role="alert" className="text-error mt-1 text-xs">

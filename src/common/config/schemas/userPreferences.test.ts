@@ -140,7 +140,7 @@ describe("UserPreferencesSchema", () => {
     expect(normalizeUserPreferences({ memory: { dreamCostCeilingUsd: 100_000 } })).toEqual({
       memory: { dreamCostCeilingUsd: 100_000 },
     });
-    // A hand-edited value below the smallest ceiling (or not a number) must not refuse every
+    // A hand-edited value below the smallest ceiling (or not a number) must not stop every
     // run, and must not take other preferences down with it.
     // Nor may one past the largest ceiling: `String()` would show a huge one in exponent notation.
     for (const stored of [0, -1, 0.001, 100_000.01, 1e21, "5", null]) {

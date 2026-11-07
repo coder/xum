@@ -208,8 +208,8 @@ describe("MemoryDreamCostCeilingSetting", () => {
     }
   );
 
-  // The refusal prints the ceiling to the cent, and an estimate over a ceiling of 0.019 would
-  // print as 0.02 too, "over the 0.02 USD ceiling". A ceiling in whole cents never reads so.
+  // A stopped run prints its spend to the cent, so a ceiling of 0.014 would read as a stop at
+  // $0.01, under the ceiling it reached. A ceiling in whole cents never reads so.
   test.each([
     ["0.019", 0.02],
     ["0.014", 0.01],
