@@ -265,7 +265,7 @@ export function createConsolidationMemoryTool(args: {
    * Commands this run may not use. Default: none, which the dream pass uses. The harvest analyzer
    * denies `delete` and `rename`: it adds and corrects, and only the organizer removes.
    */
-  deniedCommands?: readonly MemoryConsolidationOp["command"][];
+  deniedCommands?: ReadonlyArray<MemoryConsolidationOp["command"]>;
   /**
    * Reject a create/str_replace/insert whose new text, or a create/rename whose new file name,
    * holds a credential shape (see `containsSecretLike`). For runs that read tool output and then
