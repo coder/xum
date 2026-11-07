@@ -49,6 +49,12 @@ interface HarvestEvidenceMessage {
 export interface HarvestProgress {
   nextChunk: number;
   ops: MemoryConsolidationOp[];
+  /**
+   * Mutations the epoch's budget has spent. It counts every accepted command, so a dispatch that
+   * failed spent one too, and `ops` alone undercounts it. Absent in a record written before the
+   * field: the applied ops stand in for it.
+   */
+  budgetUsed?: number;
 }
 
 export interface MemoryHarvestResult extends HarvestProgress {
@@ -424,14 +430,15 @@ export async function runMemoryHarvest(args: {
   const chunks = buildHarvestChunks(args.messages);
   const priorOps = args.resume?.ops ?? [];
   const journal: MemoryConsolidationOp[] = [];
-  // One budget for the whole epoch, retries included: what an earlier attempt applied is spent.
+  // One budget for the whole epoch, retries included: what an earlier attempt spent is spent.
   const budget = createMutationBudget(
     MEMORY_ANALYZER_OP_BUDGET,
-    priorOps.filter((op) => op.applied).length
+    args.resume?.budgetUsed ?? priorOps.filter((op) => op.applied).length
   );
   const progressFor = (nextChunk: number): HarvestProgress => ({
     nextChunk,
     ops: [...priorOps, ...journal],
+    budgetUsed: budget.used(),
   });
 
   let streamError: string | undefined;

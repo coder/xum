@@ -1351,6 +1351,98 @@ describe("MemoryConsolidationService", () => {
     }
   });
 
+  it("keeps the budget spent, failed dispatches included, in the harvest record", async () => {
+    let failedOnce = false;
+    const done = () => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start", id: "t1" },
+          { type: "text-delta", id: "t1", delta: "no changes needed" },
+          { type: "text-end", id: "t1" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 1, text: 1, reasoning: 0 },
+            },
+          },
+        ] satisfies LanguageModelV3StreamPart[],
+      }),
+    });
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            const prompt = userPromptText(options);
+            if (!prompt.includes("just-compacted transcript epoch")) return Promise.resolve(done());
+            const afterToolResult = options.prompt.some((message) => message.role === "tool");
+            const label = /Transcript chunk (\d+)\//.exec(prompt)?.[1];
+            if (label === "1" && !afterToolResult) {
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: harvestWriteChunks("/memories/workspace/one.md"),
+                }),
+              });
+            }
+            if (label !== "2") return Promise.resolve(done());
+            if (failedOnce) return Promise.resolve(done());
+            if (!afterToolResult) {
+              // One edit lands and one dispatch fails (both spend budget), then the stream dies.
+              return Promise.resolve({
+                stream: simulateReadableStream({
+                  chunks: [
+                    ...harvestWriteChunks("/memories/workspace/two.md").slice(0, 1),
+                    {
+                      type: "tool-call",
+                      toolCallId: "missing-edit",
+                      toolName: "memory",
+                      input: JSON.stringify({
+                        command: "str_replace",
+                        path: "/memories/workspace/missing.md",
+                        old_str: "a",
+                        new_str: "b",
+                      }),
+                    },
+                    ...harvestWriteChunks("/memories/workspace/two.md").slice(1),
+                  ] satisfies LanguageModelV3StreamPart[],
+                }),
+              });
+            }
+            failedOnce = true;
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                pull(controller) {
+                  controller.error(new Error("provider exploded"));
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await appendBulkRows(fixture);
+    const metadata = await seedCompactionEpoch(fixture);
+
+    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+
+    let status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "failed",
+      nextChunk: 1,
+      // Chunk one's edit, then chunk two's edit and its failed dispatch.
+      budgetUsed: 3,
+    });
+
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+    status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord).toMatchObject({
+      status: "completed",
+      nextChunk: 3,
+      budgetUsed: 3,
+    });
+  });
+
   it("records an analyzer write outside workspace memory as rejected and never applies it", async () => {
     let harvestStep = 0;
     using fixture = await createFixture({

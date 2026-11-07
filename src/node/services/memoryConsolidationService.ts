@@ -348,11 +348,15 @@ function isTerminalHarvestRecord(record: MemoryHarvestRecord): boolean {
  */
 function harvestProgressFields(
   progress: HarvestProgress
-): Pick<MemoryHarvestRecord, "nextChunk" | "ops" | "acceptedCandidates" | "skippedCandidates"> {
+): Pick<
+  MemoryHarvestRecord,
+  "nextChunk" | "ops" | "budgetUsed" | "acceptedCandidates" | "skippedCandidates"
+> {
   const applied = progress.ops.filter((op) => op.applied).length;
   return {
     nextChunk: progress.nextChunk,
     ops: progress.ops,
+    budgetUsed: progress.budgetUsed,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
   };
@@ -1394,6 +1398,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const progress: HarvestProgress = {
         nextChunk: existing?.nextChunk ?? 0,
         ops: existing?.ops ?? [],
+        budgetUsed: existing?.budgetUsed,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
       const attemptState: HarvestAttemptState = {};
@@ -1574,6 +1579,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const adopt = (reached: HarvestProgress): void => {
         opts.progress.nextChunk = reached.nextChunk;
         opts.progress.ops = reached.ops;
+        opts.progress.budgetUsed = reached.budgetUsed;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(

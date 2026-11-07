@@ -135,6 +135,11 @@ export const MemoryHarvestRecordSchema = z.object({
   nextChunk: z.number().optional(),
   /** Every memory command the analyzer ran for this epoch, across attempts. */
   ops: z.array(MemoryConsolidationOpSchema).optional(),
+  /**
+   * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
+   * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
+   */
+  budgetUsed: z.number().optional(),
   error: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**

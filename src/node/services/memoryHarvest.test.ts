@@ -738,6 +738,64 @@ describe("runMemoryHarvest", () => {
     });
   });
 
+  describe("retry budget", () => {
+    const failingEdit = (index: number) => ({
+      command: "str_replace",
+      path: `/memories/workspace/missing-${index}.md`,
+      old_str: "a",
+      new_str: "b",
+    });
+
+    it("spends budget on a command that failed to apply and resumes the spent amount", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const reached: HarvestProgress[] = [];
+      const first = scriptedModel([
+        ...chunkScript([failingEdit(0), failingEdit(1), failingEdit(2)]),
+        new Error("provider exploded"),
+      ]);
+
+      const failed = await runHarvest(fixture, first.model, {
+        onChunkComplete: (progress) => {
+          reached.push(progress);
+          return Promise.resolve();
+        },
+      });
+
+      // Three dispatches failed: nothing applied, but the budget is three spent.
+      expect(failed.ops.filter((op) => op.applied)).toHaveLength(0);
+      expect(reached.map((progress) => progress.budgetUsed)).toEqual([3]);
+      expect(failed.budgetUsed).toBe(3);
+
+      const creates = Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+        createFile(`/memories/workspace/retry-${index}.md`, `fact ${index}\n`)
+      );
+      const retry = scriptedModel(chunkScript(creates));
+      const resumed = await runHarvest(fixture, retry.model, { resume: failed });
+
+      expect(resumed.ops.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET - 3);
+      expect(resumed.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+    });
+
+    it("falls back to the applied ops when an older record has no budget", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const applied: MemoryConsolidationOp[] = Array.from({ length: 3 }, (_, index) => ({
+        command: "create",
+        path: `/memories/workspace/older-${index}.md`,
+        applied: true,
+      }));
+      const creates = Array.from({ length: MEMORY_ANALYZER_OP_BUDGET }, (_, index) =>
+        createFile(`/memories/workspace/later-${index}.md`, `fact ${index}\n`)
+      );
+      const { model } = scriptedModel(chunkScript(creates));
+
+      const result = await runHarvest(fixture, model, { resume: { nextChunk: 2, ops: applied } });
+
+      expect(result.ops.filter((op) => op.applied)).toHaveLength(3 + MEMORY_ANALYZER_OP_BUDGET - 3);
+    });
+  });
+
   it("reports each clean chunk's usage to cost telemetry and sums it for the record", async () => {
     using fixture = createFixture();
     fixture.messages = manyChunkMessages();
