@@ -44,6 +44,24 @@ describe("redactSecretLike", () => {
       "MIIEowIBAAKCAQEA",
     ],
     [
+      "a PGP private key block",
+      "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nlQdGBF4hBkcBEADdzx3k\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----",
+      "lQdGBF4hBkcBEADdzx3k",
+    ],
+    [
+      "an unterminated PGP private key block",
+      "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF4hBkcBEADdzx3k",
+      "lQdGBF4hBkcBEADdzx3k",
+    ],
+    [
+      "an Azure storage connection string",
+      "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=Eby8vdM02xNOcqFlqUwJ+PEx/3x==;EndpointSuffix=core.windows.net",
+      "Eby8vdM02xNOcqFlqUwJ+PEx/3x==",
+    ],
+    ["an account key in a JSON pair", '{"accountKey": "Eby8vdM02xNOc"}', "Eby8vdM02xNOc"],
+    ["a bearer assignment", "curl -d bearer=abc123def456 https://example.com", "abc123def456"],
+    ["a bearer JSON pair", '{"bearer": "abc123def456"}', "abc123def456"],
+    [
       "an unterminated PEM private key",
       "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg",
       "MIIEvQIBADANBg",
@@ -92,7 +110,8 @@ describe("redactSecretLike", () => {
   });
 
   it("leaves ordinary text and token counts readable", () => {
-    const text = "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo";
+    const text =
+      "max_tokens: 4096, input_tokens=120, ran 3 tests in the task-runner, name: demo, bearer scheme, account name";
     expect(redactSecretLike(text)).toBe(text);
   });
 
@@ -126,6 +145,9 @@ describe("redactSecretLike", () => {
     ["a bare bracket assignment", 'password"]'.repeat(10_000)],
     ["URL schemes with a short userinfo", "://a:".repeat(25_000)],
     ["a keyword followed by whitespace", `token${" ".repeat(100_000)}x`],
+    ["account_key", "account_key".repeat(9_000)],
+    ["bearer", "bearer".repeat(16_000)],
+    ["a PGP key header", "-----BEGIN PGP PRIVATE KEY BLOCK-----".repeat(3_000)],
   ])("scans %s in linear time", (_label, text) => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     const started = performance.now();

@@ -14,7 +14,8 @@
 const REDACTED = "[redacted]";
 
 // `token` excludes the plural so `max_tokens: 4096` and `input_tokens` stay readable.
-const SECRET_NAME = String.raw`(?:api[_-]?key|secret|token(?!s\b)|passw(?:or)?d|authorization|credential)`;
+// `AccountKey` is the Azure storage connection string's secret; a key named `bearer` holds the token.
+const SECRET_NAME = String.raw`(?:api[_-]?key|account[_-]?key|secret|token(?!s\b)|bearer|passw(?:or)?d|authorization|credential)`;
 // Longest run after the name (`secret_access_key`, `token_endpoint_auth_method`) and widest gap
 // of spaces around the separator that still count. Past these a pair is not recognized.
 const NAME_SUFFIX_MAX = 48;
@@ -23,7 +24,8 @@ const GAP_MAX = 48;
 // Credential shapes that are secret on their own, wherever they appear.
 const STANDALONE_SECRET_PATTERNS: RegExp[] = [
   // An unterminated block (a tool that cut its own output) redacts through to the end of the text.
-  /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY-----|$)/g,
+  // A PGP armor header ends `PRIVATE KEY BLOCK-----`.
+  /-----BEGIN [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z ]{0,40}PRIVATE KEY(?: BLOCK)?-----|$)/g,
   // Provider key prefixes: OpenAI/Anthropic, GitHub, Slack, AWS, Stripe, GitLab, Google, npm.
   /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{8,}|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|glpat-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,})/g,
   // A Slack incoming-webhook URL is a bearer secret in its path.
