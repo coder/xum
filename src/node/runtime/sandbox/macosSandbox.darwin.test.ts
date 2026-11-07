@@ -8,6 +8,7 @@ import * as path from "node:path";
 import type { ResolvedAgentSandboxSettings } from "@/common/config/schemas/agentSandbox";
 import type { BashToolResult } from "@/common/types/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { spawnProcess } from "@/node/services/backgroundProcessExecutor";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
@@ -108,6 +109,16 @@ async function exists(target: string): Promise<boolean> {
     () => true,
     () => false
   );
+}
+
+/** The background process's exit code, or null when it is still running after 10 seconds. */
+async function waitForExitCode(handle: BackgroundHandle): Promise<number | null> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const exitCode = await handle.getExitCode();
+    if (exitCode !== null) return exitCode;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
 }
 
 const GIT_IDENTITY = "-c user.name=sandbox -c user.email=sandbox@example.com";
@@ -317,6 +328,46 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           await new Promise<void>((resolve) => socketServer.close(() => resolve()));
         }
       });
+
+      it("keeps the host allow list of background bash after its spawn shell exits", async () => {
+        const workspace = path.join(root, "ws");
+        await fs.mkdir(workspace);
+        setAgentSandboxTargets({
+          fallback: {
+            ...BASE_SETTINGS,
+            network: "allowlist",
+            allowedHosts: ["xum-allowed.invalid"],
+          },
+          byProject: new Map(),
+        });
+
+        // The command waits for `go`, which the test writes only after spawnProcess returns, so it
+        // reaches the proxy after its spawn shell has exited. The proxy answers a listed name it
+        // cannot resolve with a 502 and refuses an unlisted one with a 403, so this needs no
+        // internet.
+        const result = await spawnProcess(
+          new LocalRuntime(workspace),
+          [
+            "while [ ! -e go ]; do sleep 0.05; done",
+            "curl -sS -m 5 -o /dev/null -w 'LISTED=%{http_code}\\n' http://xum-allowed.invalid/",
+            "curl -sS -m 5 -o /dev/null -w 'UNLISTED=%{http_code}\\n' http://xum-unlisted.invalid/",
+          ].join("; "),
+          { cwd: workspace, workspaceId: `sandbox-test-${path.basename(root)}`, processId: "bg" }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        try {
+          await fs.writeFile(path.join(workspace, "go"), "");
+          expect(await waitForExitCode(result.handle)).toBe(0);
+          const output = await fs.readFile(path.join(result.outputDir, "output.log"), "utf8");
+          expect(output).toContain("LISTED=502");
+          expect(output).toContain("UNLISTED=403");
+        } finally {
+          await result.handle.terminate();
+          await result.handle.dispose();
+          await fs.rm(result.outputDir, { recursive: true, force: true });
+        }
+      });
     });
 
     it("lets commands read the global tool hooks but not the secrets next to them", async () => {
@@ -385,12 +436,7 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       expect(result.success).toBe(true);
       if (!result.success) return;
       try {
-        let exitCode: number | null = null;
-        for (let attempt = 0; attempt < 100 && exitCode === null; attempt++) {
-          exitCode = await result.handle.getExitCode();
-          if (exitCode === null) await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-        expect(exitCode).toBe(0);
+        expect(await waitForExitCode(result.handle)).toBe(0);
         expect(await fs.readFile(path.join(workspace, "bg.txt"), "utf8")).toBe("bg\n");
         expect(await exists(escaped)).toBe(false);
         expect(await fs.readFile(path.join(result.outputDir, "output.log"), "utf8")).toContain(

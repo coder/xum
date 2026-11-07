@@ -238,11 +238,17 @@ function execPathOf(callerEnv: NodeJS.ProcessEnv, mergedEnv: NodeJS.ProcessEnv):
 
 /**
  * Spawns `bash -c script` through `start`, or sandbox-exec when `sandboxed` is set, and frees the
- * sandbox registration when the process ends or fails to start.
+ * sandbox registration when the process fails to start, and when it ends unless `keepNetwork`
+ * takes that over (ExecOptions.keepSandboxNetwork).
  */
 function spawnWithSandbox<T extends ChildProcess>(
   sandboxed: AgentSandboxWrap | null,
-  input: { bashPath: string; script: string; env: NodeJS.ProcessEnv },
+  input: {
+    bashPath: string;
+    script: string;
+    env: NodeJS.ProcessEnv;
+    keepNetwork?: (release: () => void) => void;
+  },
   start: (command: string, args: string[], env: NodeJS.ProcessEnv) => T
 ): T {
   if (sandboxed === null) return start(input.bashPath, ["-c", input.script], input.env);
@@ -258,8 +264,9 @@ function spawnWithSandbox<T extends ChildProcess>(
     sandboxed.dispose();
     throw error;
   }
-  proc.once("exit", sandboxed.dispose);
   proc.once("error", sandboxed.dispose);
+  if (input.keepNetwork === undefined) proc.once("exit", sandboxed.dispose);
+  else input.keepNetwork(sandboxed.dispose);
   return proc;
 }
 
@@ -384,7 +391,7 @@ export abstract class LocalBaseRuntime implements Runtime {
 
     const childProcess = spawnWithSandbox(
       sandboxed,
-      { bashPath, script, env: childEnv },
+      { bashPath, script, env: childEnv, keepNetwork: options.keepSandboxNetwork },
       (spawnCommand, spawnArgs, env): ChildProcessWithoutNullStreams =>
         spawn(spawnCommand, spawnArgs, {
           cwd,
