@@ -1,10 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxToolPart } from "@/common/types/message";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -14,7 +14,7 @@ import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { runMemoryHarvest } from "./memoryHarvest";
+import { buildHarvestChunks, runMemoryHarvest } from "./memoryHarvest";
 
 const INBOX_PATH = "/memories/workspace/harvest/summary-1.md";
 
@@ -159,6 +159,46 @@ async function runHarvest(
     messages: fixture.messages,
     summary: fixture.summary,
   });
+}
+
+/** 12 rows of 7,000 characters: three transcript chunks (5 + 5 + 2 rows). */
+function manyChunkMessages(): MuxMessage[] {
+  return Array.from({ length: 12 }, (_, index) =>
+    createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
+      historySequence: index,
+    })
+  );
+}
+
+function toolPart(toolName: string, input: unknown, output: unknown): MuxToolPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId: `call-${toolName}`,
+    toolName,
+    state: "output-available",
+    input,
+    output,
+  };
+}
+
+/** A model that ends every call at once and records what each call was sent. */
+function recordingModel(): { model: MockLanguageModelV3; calls: LanguageModelV3CallOptions[] } {
+  const calls: LanguageModelV3CallOptions[] = [];
+  const model = new MockLanguageModelV3({
+    doStream: (options) => {
+      calls.push(options);
+      return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
+    },
+  });
+  return { model, calls };
+}
+
+/** Runs one harvest over `messages` and returns the prompts the harvest model received. */
+async function harvestPrompt(fixture: Fixture, messages: MuxMessage[]): Promise<string> {
+  fixture.messages = messages;
+  const { model, calls } = recordingModel();
+  await runHarvest(fixture, model);
+  return calls.map(userPromptText).join("\n");
 }
 
 describe("runMemoryHarvest", () => {
@@ -357,6 +397,343 @@ describe("runMemoryHarvest", () => {
     }
   });
 
+  describe("tool results", () => {
+    it("shows the harvest model each tool's input and output", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "Running the build.", { historySequence: 0 }, [
+          toolPart(
+            "bash",
+            { script: "make build" },
+            { success: true, output: "build passed in 12s" }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).toContain("TOOL CALL bash: ");
+      expect(prompt).toContain("make build");
+      expect(prompt).toContain("TOOL RESULT (bash): ");
+      expect(prompt).toContain("build passed in 12s");
+    });
+
+    it("says when a tool never returned or its result was redacted", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-read",
+            toolName: "file_read",
+            state: "input-available",
+            input: { path: "a.ts" },
+          },
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-bash",
+            toolName: "bash",
+            state: "output-redacted",
+            failed: true,
+            input: { script: "false" },
+          },
+        ]),
+      ]);
+
+      expect(prompt).toContain("TOOL RESULT (file_read): [no result");
+      expect(prompt).toContain("TOOL RESULT (bash): [output redacted; tool failed]");
+    });
+
+    it("caps a huge tool output without dropping a later tool in the same message", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "Two commands.", { historySequence: 0 }, [
+          toolPart(
+            "bash",
+            { script: "cat big.log" },
+            { output: `HEAD-OF-LOG ${"x".repeat(60_000)} TAIL-OF-LOG` }
+          ),
+          toolPart("bash", { script: "echo done" }, { output: "SECOND-TOOL-OUTPUT" }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("HEAD-OF-LOG");
+      expect(prompt).not.toContain("TAIL-OF-LOG");
+      expect(prompt).toContain("more chars for memory harvest");
+      expect(prompt).toContain("SECOND-TOOL-OUTPUT");
+      // The whole 60k-char output would show up as a run this long if the cap did not apply.
+      expect(prompt).not.toContain("x".repeat(2_100));
+    });
+
+    it("shows the model every tool of a long message, in order, across chunks", async () => {
+      using fixture = createFixture();
+      const callCount = 30;
+      // 30 results of 1.5 KB make one message of about 50 KB: past one chunk and past any
+      // per-message cap. The failure and its fix usually sit in the later calls.
+      fixture.messages = [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: callCount }, (_, index) =>
+            toolPart(
+              "bash",
+              { script: `step ${index}` },
+              { output: `RESULT-${String(index).padStart(2, "0")} ${"x".repeat(1_500)}` }
+            )
+          )
+        ),
+      ];
+      const { model, calls } = recordingModel();
+
+      const result = await runHarvest(fixture, model);
+
+      expect(result.streamError).toBeUndefined();
+      expect(calls.length).toBeGreaterThan(1);
+      const prompts = calls.map(userPromptText).join("\n");
+      const positions = Array.from({ length: callCount }, (_, index) =>
+        prompts.indexOf(`RESULT-${String(index).padStart(2, "0")} `)
+      );
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    });
+
+    it("splits a long message into rows of one id, each saying which parts it holds", async () => {
+      using fixture = createFixture();
+      fixture.messages = [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: 12 }, (_, index) =>
+            toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+          )
+        ),
+        createMuxMessage("u1", "user", "short follow-up", { historySequence: 1 }),
+      ];
+      const { model, calls } = recordingModel();
+
+      await runHarvest(fixture, model);
+
+      const prompt = calls.map(userPromptText).join("\n");
+      const rowsOfA1 = [...prompt.matchAll(/"id": "a1"[\s\S]*?"parts": "([^"]+)"/g)].map(
+        (match) => match[1]
+      );
+      expect(rowsOfA1.length).toBeGreaterThan(1);
+      expect(rowsOfA1[0]).toMatch(/^1-\d+ of 13$/);
+      expect(rowsOfA1.at(-1)).toMatch(/^\d+-13 of 13$/);
+      // A message that fits one row says nothing about parts.
+      expect(prompt).toMatch(/"id": "u1",\s+"sequence": 1,\s+"role": "user",\s+"text"/);
+    });
+
+    it("shows the tail of a long text part, and the parts after it", async () => {
+      using fixture = createFixture();
+      fixture.messages = [
+        createMuxMessage(
+          "a1",
+          "assistant",
+          `HEAD-OF-REPLY ${"z".repeat(30_000)} TAIL-OF-REPLY`,
+          { historySequence: 0 },
+          [toolPart("bash", { script: "echo done" }, { output: "AFTER-THE-LONG-TEXT" })]
+        ),
+      ];
+      const { model, calls } = recordingModel();
+
+      await runHarvest(fixture, model);
+
+      const prompts = calls.map(userPromptText).join("\n");
+      const positions = ["HEAD-OF-REPLY", "TAIL-OF-REPLY", "AFTER-THE-LONG-TEXT"].map((marker) =>
+        prompts.indexOf(marker)
+      );
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+      expect(prompts).not.toContain("more chars for memory harvest");
+    });
+
+    it("caps a huge tool input", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("file_write", { path: "a.ts", content: `${"y".repeat(5_000)}INPUT-TAIL` }, "ok"),
+        ]),
+      ]);
+
+      expect(prompt).toContain("a.ts");
+      expect(prompt).not.toContain("INPUT-TAIL");
+      expect(prompt).not.toContain("y".repeat(1_100));
+    });
+
+    it("never forwards attachments, data URLs or session_history results", async () => {
+      using fixture = createFixture();
+      const base64 = "QUJD".repeat(500);
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "attach_file",
+            { path: "shot.png" },
+            {
+              type: "content",
+              value: [
+                { type: "text", text: "captured the page" },
+                { type: "media", data: base64, mediaType: "image/png" },
+              ],
+            }
+          ),
+          toolPart(
+            "bash",
+            { script: "cat icon.b64" },
+            { output: `data:image/png;base64,${base64}` }
+          ),
+          toolPart("session_history", { query: "q" }, { items: [{ text: "OTHER-SESSION-ROW" }] }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("captured the page");
+      expect(prompt).toContain("[media]");
+      expect(prompt).not.toContain(base64.slice(0, 40));
+      expect(prompt).not.toContain("OTHER-SESSION-ROW");
+      expect(prompt).toContain("TOOL RESULT (session_history): [session_history result omitted]");
+    });
+
+    it("never sends a secret-shaped value from a tool to the harvest model", async () => {
+      using fixture = createFixture();
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      const apiKey = `sk-proj-${"Z9y8".repeat(6)}`;
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "bash",
+            { script: `curl -H "Authorization: Bearer ${githubToken}" https://api.example.com` },
+            {
+              success: true,
+              output: `GITHUB_TOKEN=${githubToken}\nOPENAI_API_KEY=${apiKey}\nlogin ok`,
+            }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).toContain("login ok");
+      expect(prompt).toContain("[redacted]");
+      expect(prompt).not.toContain(githubToken);
+      expect(prompt).not.toContain(apiKey);
+      expect(prompt).not.toContain("a1B2a1B2");
+    });
+
+    it("redacts a secret that straddles the cap on a tool's output, not just the part inside it", async () => {
+      using fixture = createFixture();
+      const githubToken = `ghp_${"a1B2".repeat(9)}`;
+      // The token starts 10 characters before the 2,000-character cap and ends after it.
+      const output = `${"x".repeat(1_989)} ${githubToken} tail`;
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "env" }, output),
+        ]),
+      ]);
+
+      expect(prompt).toContain("[redacted]");
+      // Cut at the cap before redacting, 10 readable characters of the token would remain.
+      expect(prompt).not.toContain("ghp_a1B2");
+    });
+
+    it("omits a session_history result nested inside another tool's output", async () => {
+      using fixture = createFixture();
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart(
+            "code_execution",
+            { code: "history()" },
+            {
+              result: {
+                calls: [
+                  {
+                    toolName: "session_history",
+                    output: { items: [{ text: "OTHER-SESSION-ROW" }] },
+                  },
+                  { toolName: "bash", output: "KEPT-NESTED-OUTPUT" },
+                ],
+              },
+            }
+          ),
+        ]),
+      ]);
+
+      expect(prompt).not.toContain("OTHER-SESSION-ROW");
+      expect(prompt).toContain("[session_history result omitted]");
+      expect(prompt).toContain("KEPT-NESTED-OUTPUT");
+    });
+
+    it("keeps nested tool data down to a depth limit and omits what lies beyond it", async () => {
+      using fixture = createFixture();
+      const nest = (depth: number, leaf: string): unknown =>
+        depth === 0 ? leaf : { inner: nest(depth - 1, leaf) };
+
+      const prompt = await harvestPrompt(fixture, [
+        createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+          toolPart("bash", { script: "shallow" }, { output: nest(20, "SHALLOW-LEAF") }),
+          toolPart("bash", { script: "deep" }, { output: nest(40, "DEEP-LEAF") }),
+        ]),
+      ]);
+
+      expect(prompt).toContain("SHALLOW-LEAF");
+      expect(prompt).not.toContain("DEEP-LEAF");
+      expect(prompt).toContain("[nested data omitted]");
+    });
+  });
+
+  it("accepts a candidate that cites a message spanning chunks, from any chunk that holds a row of it", async () => {
+    using fixture = createFixture();
+    fixture.messages = [
+      createMuxMessage("early", "user", "short opening", { historySequence: 0 }),
+      createMuxMessage(
+        "long",
+        "assistant",
+        "A long turn.",
+        { historySequence: 1 },
+        // 30 results of 1.5 KB: the message runs from the first chunk into the second.
+        Array.from({ length: 30 }, (_, index) =>
+          toolPart("bash", { script: `step ${index}` }, { output: "x".repeat(1_500) })
+        )
+      ),
+    ];
+    const total = buildHarvestChunks(fixture.messages).length;
+    expect(total).toBe(2);
+    // Submits from the last chunk only, which holds a later piece of `long` and nothing of `early`.
+    const model = new MockLanguageModelV3({
+      doStream: (options) => {
+        const isFirstStep = !options.prompt.some((message) => message.role === "tool");
+        const inLastChunk = userPromptText(options).includes(`Transcript chunk ${total}/${total}`);
+        const candidate = (evidenceId: string) => ({
+          category: "workflow",
+          memoryText: `Remember the lesson cited from ${evidenceId}.`,
+          evidenceMessageIds: [evidenceId],
+          confidence: 0.95,
+          rationale: "Cited by id.",
+        });
+        return Promise.resolve({
+          stream: simulateReadableStream({
+            chunks:
+              isFirstStep && inLastChunk
+                ? [harvestToolCall([candidate("long"), candidate("early")]), toolFinishChunk()]
+                : [finishChunk(1)],
+          }),
+        });
+      },
+    });
+
+    const result = await runHarvest(fixture, model);
+
+    expect(result.acceptedCandidates).toBe(1);
+    expect(result.skippedCandidates).toBe(1);
+  });
+
   it("serializes transcript evidence as JSON instead of breakable pseudo-XML", async () => {
     using fixture = createFixture();
     fixture.messages = [
@@ -383,11 +760,7 @@ describe("runMemoryHarvest", () => {
 
   it("chunks oversized epochs before calling the model", async () => {
     using fixture = createFixture();
-    fixture.messages = Array.from({ length: 12 }, (_, index) =>
-      createMuxMessage(`m${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`, {
-        historySequence: index,
-      })
-    );
+    fixture.messages = manyChunkMessages();
     let streamCalls = 0;
 
     const result = await runHarvest(
@@ -402,6 +775,29 @@ describe("runMemoryHarvest", () => {
 
     expect(result.streamError).toBeUndefined();
     expect(streamCalls).toBeGreaterThan(1);
+  });
+
+  it("redacts a credential in the compaction summary from every chunk's prompt", async () => {
+    using fixture = createFixture();
+    const githubToken = `ghp_${"a1B2".repeat(9)}`;
+    fixture.summary = createMuxMessage(
+      "summary-1",
+      "assistant",
+      `SUMMARY-FACT: deploys use bun. The user pasted GITHUB_TOKEN=${githubToken} into the chat.`,
+      { historySequence: 2, compactionBoundary: true }
+    );
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = recordingModel();
+
+    await runHarvest(fixture, model);
+
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const prompt = userPromptText(call);
+      expect(prompt).toContain("SUMMARY-FACT: deploys use bun");
+      expect(prompt).toContain("[redacted]");
+      expect(prompt).not.toContain(githubToken);
+    }
   });
 
   it("keys inbox cleanup by compaction boundary id instead of epoch", async () => {
@@ -478,6 +874,245 @@ describe("runMemoryHarvest", () => {
     expect(result.acceptedCandidates).toBe(0);
     expect(await fixture.memoryService.readFileWithSha(fixture.ctx, INBOX_PATH)).toMatchObject({
       success: false,
+    });
+  });
+});
+
+describe("buildHarvestChunks", () => {
+  const CHUNK_LIMIT = 40_000;
+
+  const transcriptsOf = (messages: MuxMessage[]): string[] =>
+    buildHarvestChunks(messages).map((chunk) => chunk.transcript);
+
+  /** `count` one-part user messages whose texts hold `totalChars` characters between them. */
+  function messagesHolding(totalChars: number, count: number): MuxMessage[] {
+    return Array.from({ length: count }, (_, index) =>
+      createMuxMessage(
+        `m${index}`,
+        "user",
+        "x".repeat(Math.floor(totalChars / count) + (index < totalChars % count ? 1 : 0)),
+        { historySequence: index }
+      )
+    );
+  }
+
+  /** The text size that makes a chunk of `count` rows exactly `chunkChars` long, whatever a row's frame is. */
+  function textCharsFillingChunk(count: number, chunkChars: number): number {
+    const oneCharEach = transcriptsOf(messagesHolding(count, count));
+    expect(oneCharEach).toHaveLength(1);
+    return chunkChars - oneCharEach[0].length + count;
+  }
+
+  it("fits a chunk that is exactly the limit and splits one that is a character over", () => {
+    const count = 7;
+    const fitting = textCharsFillingChunk(count, CHUNK_LIMIT);
+
+    const exact = transcriptsOf(messagesHolding(fitting, count));
+    expect(exact.map((chunk) => chunk.length)).toEqual([CHUNK_LIMIT]);
+
+    const over = transcriptsOf(messagesHolding(fitting + 1, count));
+    expect(over.map((chunk) => (JSON.parse(chunk) as unknown[]).length)).toEqual([count - 1, 1]);
+  });
+
+  it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
+    // A fixed spread of sizes: long and short texts, some with tool parts.
+    const messages = Array.from({ length: 240 }, (_, index) =>
+      createMuxMessage(
+        `m${index}`,
+        "assistant",
+        `turn ${index} ${"t".repeat((index * 7_919) % 6_000)}`,
+        { historySequence: index },
+        index % 3 === 0
+          ? Array.from({ length: (index % 6) + 1 }, (_, tool) =>
+              toolPart(
+                "bash",
+                { script: `step ${tool}` },
+                { output: "o".repeat((index * 131) % 2_500) }
+              )
+            )
+          : []
+      )
+    );
+
+    const chunks = transcriptsOf(messages);
+
+    const rowsOf = chunks.map((chunk) => JSON.parse(chunk) as Array<{ id: string }>);
+    expect(chunks.length).toBeGreaterThan(10);
+    chunks.forEach((chunk, index) => {
+      expect(chunk).toBe(JSON.stringify(rowsOf[index], null, 2));
+      expect(chunk.length <= CHUNK_LIMIT || rowsOf[index].length === 1).toBe(true);
+      const nextFirst = rowsOf[index + 1]?.[0];
+      if (nextFirst !== undefined) {
+        expect(JSON.stringify([...rowsOf[index], nextFirst], null, 2).length).toBeGreaterThan(
+          CHUNK_LIMIT
+        );
+      }
+    });
+    const ids = rowsOf.flat().map((row) => row.id);
+    expect([...new Set(ids)]).toEqual(messages.map((message) => message.id));
+  });
+
+  describe("evidence rows", () => {
+    const ROW_TEXT_LIMIT = 8_000;
+    const TEXT_PART_LIMIT = 128_000;
+
+    interface Row {
+      id: string;
+      sequence: number | null;
+      role: string;
+      parts?: string;
+      segment?: string;
+      text: string;
+      truncated: boolean;
+    }
+
+    const textPart = (text: string): MuxMessage["parts"][number] => ({ type: "text", text });
+
+    function rowsOf(...messages: MuxMessage[]): Row[] {
+      return transcriptsOf(messages).flatMap((chunk) => JSON.parse(chunk) as Row[]);
+    }
+
+    /** One assistant message whose parts are texts of the given lengths, in order. */
+    function messageOfTexts(...lengths: number[]): MuxMessage {
+      return createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+        ...lengths.map((length, index) => textPart(`${index}`.repeat(length))),
+      ]);
+    }
+
+    describe("a text part too long for one row", () => {
+      it("is split into segments of one row each that read back as the whole text, then the parts after it", () => {
+        const text = `HEAD ${"z".repeat(30_000)} TAIL`;
+        const rows = rowsOf(
+          createMuxMessage("a1", "assistant", text, { historySequence: 0 }, [
+            toolPart("bash", { script: "echo done" }, { output: "AFTER" }),
+          ])
+        );
+
+        const segments = rows.filter((row) => row.segment !== undefined);
+        expect(segments.map((row) => row.segment)).toEqual([
+          "1 of 4",
+          "2 of 4",
+          "3 of 4",
+          "4 of 4",
+        ]);
+        expect(segments.every((row) => row.parts === "1-1 of 2")).toBe(true);
+        expect(segments.map((row) => row.text).join("")).toBe(text);
+        expect(segments.every((row) => row.text.length <= ROW_TEXT_LIMIT)).toBe(true);
+        expect(rows.at(-1)).toMatchObject({ parts: "2-2 of 2", truncated: false });
+        expect(rows.at(-1)?.segment).toBeUndefined();
+        expect(rows.at(-1)?.text).toContain("AFTER");
+        expect(rows.every((row) => !row.truncated)).toBe(true);
+      });
+
+      it("starts at one character more than a row holds", () => {
+        const fits = rowsOf(messageOfTexts(ROW_TEXT_LIMIT));
+        expect(fits).toHaveLength(1);
+        expect(fits[0].segment).toBeUndefined();
+
+        const splits = rowsOf(messageOfTexts(ROW_TEXT_LIMIT + 1));
+        expect(splits.map((row) => [row.segment, row.text.length])).toEqual([
+          ["1 of 2", ROW_TEXT_LIMIT],
+          ["2 of 2", 1],
+        ]);
+      });
+
+      it("ends at the cap, with the cut part named in the last row", () => {
+        const atCap = rowsOf(messageOfTexts(TEXT_PART_LIMIT));
+        expect(atCap).toHaveLength(TEXT_PART_LIMIT / ROW_TEXT_LIMIT);
+        expect(atCap.some((row) => row.truncated)).toBe(false);
+
+        const over = rowsOf(messageOfTexts(TEXT_PART_LIMIT + 1_500));
+        expect(over).toHaveLength(TEXT_PART_LIMIT / ROW_TEXT_LIMIT);
+        expect(over.slice(0, -1).some((row) => row.truncated)).toBe(false);
+        expect(over.at(-1)?.truncated).toBe(true);
+        expect(over.at(-1)?.text).toEndWith("[truncated 1500 more chars for memory harvest]");
+      });
+
+      it("keep the message's id on every segment", () => {
+        const rows = rowsOf(messageOfTexts(ROW_TEXT_LIMIT * 2 + 5));
+        expect(new Set(rows.map((row) => row.id))).toEqual(new Set(["a1"]));
+      });
+    });
+
+    describe("parts packed into a row", () => {
+      it("fill it to exactly the row's limit, the joining newline counted", () => {
+        // 3999 + newline + 4000 is 8000.
+        expect(rowsOf(messageOfTexts(3_999, 4_000))).toHaveLength(1);
+        // 4000 + newline + 4000 is one over.
+        expect(rowsOf(messageOfTexts(4_000, 4_000))).toHaveLength(2);
+        // Three newlines join four parts of 2000: the fourth would make the row 8003.
+        expect(rowsOf(messageOfTexts(2_000, 2_000, 2_000, 2_000)).map((row) => row.parts)).toEqual([
+          "1-3 of 4",
+          "4-4 of 4",
+        ]);
+      });
+
+      it("leave out a part with no text, and number only the parts that have some", () => {
+        const [row] = rowsOf(
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            textPart("FIRST"),
+            textPart("   \n "),
+            textPart("SECOND"),
+          ])
+        );
+
+        expect(row.text).toBe("FIRST\nSECOND");
+        // One row: it says nothing about parts.
+        expect(row.parts).toBeUndefined();
+
+        const rows = rowsOf(
+          createMuxMessage("a1", "assistant", "", { historySequence: 0 }, [
+            textPart("a".repeat(5_000)),
+            textPart(""),
+            textPart("b".repeat(5_000)),
+          ])
+        );
+        expect(rows.map((r) => r.parts)).toEqual(["1-1 of 2", "2-2 of 2"]);
+      });
+
+      it("give a message with no text at all one empty row", () => {
+        expect(rowsOf(createMuxMessage("u1", "user", "  \n", { historySequence: 0 }))).toEqual([
+          { id: "u1", sequence: 0, role: "user", text: "", truncated: false },
+        ]);
+      });
+    });
+  });
+
+  describe("on an epoch of thousands of tool-heavy messages", () => {
+    const toolHeavy = () =>
+      Array.from({ length: 2_000 }, (_, index) =>
+        createMuxMessage(
+          `a${index}`,
+          "assistant",
+          `turn ${index}`,
+          { historySequence: index },
+          Array.from({ length: 40 }, (_, tool) =>
+            toolPart("bash", { script: `step ${tool}` }, { output: "ok" })
+          )
+        )
+      );
+
+    it("stringifies each row once, not the whole chunk again for every row", () => {
+      const messages = toolHeavy();
+      const stringify = JSON.stringify;
+      let stringified = 0;
+      const spy = spyOn(JSON, "stringify").mockImplementation(((
+        ...args: Parameters<typeof stringify>
+      ) => {
+        const out = stringify(...args);
+        stringified += out?.length ?? 0;
+        return out;
+      }) as typeof JSON.stringify);
+      let chunks: string[];
+      try {
+        chunks = transcriptsOf(messages);
+      } finally {
+        spy.mockRestore();
+      }
+
+      const outputChars = chunks.reduce((total, chunk) => total + chunk.length, 0);
+      // Stringifying the chunk so far again for each row came to several times its final size.
+      expect(stringified).toBeLessThan(outputChars * 2);
     });
   });
 });
