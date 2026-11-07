@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
@@ -18,7 +18,7 @@ import {
   MEMORY_CONSOLIDATION_DEBOUNCE_MS,
   MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP,
 } from "@/common/constants/memory";
-import { Ok } from "@/common/types/result";
+import { Ok, type Result } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
   HARVEST_MAX_ATTEMPTS,
@@ -324,36 +324,49 @@ async function createFixture(options?: {
   };
 }
 
+/** Seeds one closed compaction epoch; epoch N > 1 sits after epoch N - 1's boundary. */
 async function seedCompactionEpoch(
   fixture: Fixture,
-  workspaceId = "ws-dream"
+  workspaceId = "ws-dream",
+  epoch = 1,
+  previousBoundaryHistorySequence?: number
 ): Promise<CompactionCompletionMetadata> {
+  // Epoch 1 keeps the original ids that other tests cite.
+  const suffix = epoch === 1 ? "" : `-${epoch}`;
   await fixture.historyService.appendToHistory(
     workspaceId,
-    createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
+    createMuxMessage(`pref-${epoch}`, "user", "Please remember that I prefer concise tests.")
   );
   await fixture.historyService.appendToHistory(
     workspaceId,
-    createMuxMessage("compact-request", "user", "Please compact", {
+    createMuxMessage(`compact-request${suffix}`, "user", "Please compact", {
       muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
     })
   );
-  const summary = createMuxMessage("summary-1", "assistant", "The user prefers concise tests.", {
-    compactionBoundary: true,
-    compacted: "user",
-    compactionEpoch: 1,
-  });
+  const summary = createMuxMessage(
+    `summary-${epoch}`,
+    "assistant",
+    "The user prefers concise tests.",
+    { compactionBoundary: true, compacted: "user", compactionEpoch: epoch }
+  );
   await fixture.historyService.appendToHistory(workspaceId, summary);
 
   const summaryHistorySequence = summary.metadata?.historySequence;
   expect(typeof summaryHistorySequence).toBe("number");
   return {
     workspaceId,
-    summaryMessageId: "summary-1",
+    summaryMessageId: `summary-${epoch}`,
     summaryHistorySequence: summaryHistorySequence ?? -1,
-    compactionEpoch: 1,
-    compactionRequestMessageId: "compact-request",
+    compactionEpoch: epoch,
+    compactionRequestMessageId: `compact-request${suffix}`,
+    ...(previousBoundaryHistorySequence !== undefined ? { previousBoundaryHistorySequence } : {}),
   };
+}
+
+/** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
+function expectDebounced(result: Result<unknown, string>): void {
+  expect(result.success).toBe(false);
+  if (!result.success) expect(result.error).toContain("debounced");
 }
 
 describe("MemoryConsolidationService", () => {
@@ -924,9 +937,11 @@ describe("MemoryConsolidationService", () => {
 
     releaseFirstSweep();
     expect((await activeSweep).success).toBe(true);
-    expect((await harvestThenSweep).success).toBe(true);
-    expect(sweepStreamCount).toBe(2);
-    expect(fixture.modelCalls).toHaveLength(3);
+    // The sweep waited for the active one (an "already in flight" refusal would say so), and
+    // the active run's journal record then put it inside the 6 h window.
+    expectDebounced(await harvestThenSweep);
+    expect(sweepStreamCount).toBe(1);
+    expect(fixture.modelCalls).toHaveLength(2);
   });
 
   it("runs an archive final pass after harvest if the workspace is archived mid-harvest", async () => {
@@ -1069,10 +1084,11 @@ describe("MemoryConsolidationService", () => {
     const metadata = await seedCompactionEpoch(fixture);
 
     expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
-    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+    // The second compaction signal falls inside the 6 h window: no re-harvest, and no sweep.
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
 
     expect(harvestStreamCount).toBe(1);
-    expect(fixture.modelCalls).toHaveLength(3);
+    expect(fixture.modelCalls).toHaveLength(2);
   });
 
   it("retries a failed harvest record without marking the boundary completed", async () => {
@@ -1154,7 +1170,8 @@ describe("MemoryConsolidationService", () => {
     expect(status.latestHarvestRecord?.status).toBe("failed");
     expect(status.latestHarvestRecord?.attemptCount).toBe(1);
 
-    expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+    // The retry harvests even though the sweep after it is inside the 6 h window.
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
     status = await fixture.service.getStatus("ws-dream");
     expect(status.latestHarvestRecord?.status).toBe("completed");
     expect(status.latestHarvestRecord?.attemptCount).toBe(2);
@@ -1192,7 +1209,8 @@ describe("MemoryConsolidationService", () => {
     const status = await fixture.service.getStatus("ws-dream");
     expect(status.latestHarvestRecord?.status).toBe("completed");
     expect(status.latestHarvestRecord?.attemptCount).toBe(2);
-    expect(fixture.modelCalls).toHaveLength(3);
+    // The manual sweep, then the recovered harvest; the sweep after that harvest is debounced.
+    expect(fixture.modelCalls).toHaveLength(2);
   });
 
   it("normalizes stale max-attempt pending harvest records to failed", async () => {
@@ -1243,6 +1261,43 @@ describe("MemoryConsolidationService", () => {
     const manual = await fixture.service.maybeRun("ws-dream", "manual");
     expect(manual.success).toBe(true);
     expect(fixture.modelCalls).toHaveLength(3);
+  });
+
+  it("a second compaction inside the debounce window harvests but starts no dream stream, while archive still does", async () => {
+    // Each dream pass reads every memory file, so a compaction must not buy one more
+    // inside the 6 h window; the harvest still files its candidates for the next pass.
+    let dreamStreams = 0;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        scriptedModel((prompt) => {
+          if (!prompt.includes("just-compacted transcript epoch")) dreamStreams++;
+        }),
+    });
+    const first = await seedCompactionEpoch(fixture);
+    expect((await fixture.service.maybeHarvestThenSweep(first)).success).toBe(true);
+    expect(dreamStreams).toBe(1);
+
+    const second = await seedCompactionEpoch(fixture, "ws-dream", 2, first.summaryHistorySequence);
+    expectDebounced(await fixture.service.maybeHarvestThenSweep(second));
+    expect(dreamStreams).toBe(1);
+    const status = await fixture.service.getStatus("ws-dream");
+    expect(status.latestHarvestRecord?.boundaryKey).toBe("summary-2");
+    expect(status.latestHarvestRecord?.status).toBe("completed");
+
+    // Archived mid-flight, the same compaction signal becomes the one-shot final pass.
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get("/projects/demo")
+        ?.workspaces.find((entry) => entry.id === "ws-dream");
+      if (workspace === undefined) throw new Error("missing test workspace");
+      workspace.archivedAt = new Date().toISOString();
+      return cfg;
+    });
+    const third = await seedCompactionEpoch(fixture, "ws-dream", 3, second.summaryHistorySequence);
+    const archive = await fixture.service.maybeHarvestThenSweep(third);
+    expect(archive.success).toBe(true);
+    if (archive.success) expect(archive.data.trigger).toBe("archive");
+    expect(dreamStreams).toBe(2);
   });
 
   it("routes project-specific archive final-pass promotions to project memory when available", async () => {
@@ -1311,6 +1366,104 @@ describe("MemoryConsolidationService", () => {
     expect(archiveResult.success).toBe(true);
     if (archiveResult.success) expect(archiveResult.data.trigger).toBe("archive");
     expect(fixture.modelCalls).toHaveLength(2);
+  });
+
+  it("runs dream streams one at a time across workspaces", async () => {
+    // Two workspaces share global memory (and often a project), so their organizer
+    // streams must not overlap. The first stream stays open until a second one starts,
+    // or for 150 ms: an unserialized second stream starts inside that window and shows
+    // up in the log before the first one ends.
+    const events: string[] = [];
+    let streamCount = 0;
+    let markOtherStarted!: () => void;
+    const otherStarted = new Promise<void>((resolve) => {
+      markOtherStarted = resolve;
+    });
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    let timeoutCount = 0;
+    const timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      events.push(`timeout-${++timeoutCount}`);
+      return realTimeout(ms);
+    });
+    try {
+      using fixture = await createFixture({
+        modelFactory: () => {
+          const inner = scriptedModel();
+          return new MockLanguageModelV3({
+            doStream: async (options) => {
+              const n = ++streamCount;
+              events.push(`start-${n}`);
+              if (n === 1) {
+                await Promise.race([
+                  otherStarted,
+                  new Promise((resolve) => setTimeout(resolve, 150)),
+                ]);
+              } else {
+                markOtherStarted();
+              }
+              events.push(`end-${n}`);
+              return inner.doStream(options);
+            },
+          });
+        },
+      });
+      await fixture.addWorkspace("ws-other");
+
+      const runs = await Promise.all([
+        fixture.service.maybeRun("ws-dream", "manual"),
+        fixture.service.maybeRun("ws-other", "manual"),
+      ]);
+      expect(runs.every((run) => run.success)).toBe(true);
+      // The 5 min timeout covers a stream, not the wait for its turn.
+      expect(events).toEqual(["timeout-1", "start-1", "end-1", "timeout-2", "start-2", "end-2"]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("workspace removal cancels a dream run that is still waiting for its turn", async () => {
+    let releaseHolder!: () => void;
+    const holderReleased = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    let markHolderStarted!: () => void;
+    const holderStarted = new Promise<void>((resolve) => {
+      markHolderStarted = resolve;
+    });
+    let streamCount = 0;
+    using fixture = await createFixture({
+      modelFactory: () => {
+        const inner = scriptedModel();
+        return new MockLanguageModelV3({
+          doStream: async (options) => {
+            streamCount++;
+            markHolderStarted();
+            await holderReleased;
+            return inner.doStream(options);
+          },
+        });
+      },
+    });
+    await fixture.addWorkspace("ws-other");
+
+    const holder = fixture.service.maybeRun("ws-dream", "manual");
+    await holderStarted;
+    const queued = fixture.service.maybeRun("ws-other", "manual");
+    // Past its model creation, the queued run is only waiting for the holder's stream.
+    while (fixture.modelCalls.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await fixture.service.cancelInFlightConsolidation("ws-other");
+    const cancelled = await queued;
+    expect(cancelled.success).toBe(false);
+    if (!cancelled.success) expect(cancelled.error).toContain("being removed");
+
+    releaseHolder();
+    expect((await holder).success).toBe(true);
+    // The cancelled run never started a stream, and its queue slot did not wedge the next one.
+    expect(streamCount).toBe(1);
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect(streamCount).toBe(2);
   });
 
   it("does not journal or debounce a run whose stream failed", async () => {
