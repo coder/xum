@@ -18,6 +18,7 @@ import { DEFAULT_ALLOWED_HOSTS } from "@/common/constants/agentSandbox";
 import type { AgentSandboxState } from "@/common/orpc/schemas/agentSandbox";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getProjectDisplayName, getTopLevelProjectEntries } from "@/common/utils/subProjects";
+import { followConfigValue } from "./followConfigValue";
 
 function allowedHostsOf(config: AgentSandboxConfig): readonly string[] {
   return config.allowedHosts ?? DEFAULT_ALLOWED_HOSTS;
@@ -69,24 +70,6 @@ function withProjectMode(
   return mode === "global" ? rest : { ...rest, enabled: mode === "on" };
 }
 
-/** Load the setting, and again after every config change, until `signal` aborts. */
-async function followAgentSandbox(
-  api: APIClient,
-  signal: AbortSignal,
-  onLoaded: (state: AgentSandboxState) => void
-): Promise<void> {
-  const load = async () => {
-    const state = await api.agentSandbox.get();
-    if (!signal.aborted) onLoaded(state);
-  };
-  // Load only once the subscription is live, so a change made during the load loads again.
-  const changes = await api.config.onConfigChanged(undefined, { signal });
-  await load();
-  for await (const _ of changes) {
-    await load();
-  }
-}
-
 /** The saved setting, following changes made elsewhere. Saves replace the whole value. */
 function useAgentSandbox() {
   const api = useLiveAPI();
@@ -97,7 +80,12 @@ function useAgentSandbox() {
     // API doubles in tests of other settings can omit this namespace.
     if (api?.agentSandbox == null) return;
     const controller = new AbortController();
-    followAgentSandbox(api, controller.signal, setState).catch((loadError: unknown) => {
+    followConfigValue(
+      api,
+      controller.signal,
+      (client) => client.agentSandbox.get(),
+      setState
+    ).catch((loadError: unknown) => {
       if (isStreamFailure(loadError, controller.signal)) {
         setError(`Failed to load the agent sandbox setting: ${getErrorMessage(loadError)}`);
       }
