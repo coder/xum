@@ -79,7 +79,9 @@ function previewOf(
 }
 
 /** A repository's preview, or one that depends on the ref the user asked for. */
-type PreviewOf = AgentPluginInstallPreview | ((ref: string | null) => AgentPluginInstallPreview);
+type PreviewOf =
+  | AgentPluginInstallPreview
+  | ((ref: string | null | undefined) => AgentPluginInstallPreview);
 
 /** The section with a backup reinstall waiting for it, as the Backup section leaves it. */
 function renderWithBackup(plugins: BackupPluginInstall[], previews: Record<string, PreviewOf>) {
@@ -181,7 +183,7 @@ test.each([
   "records what the user previewed, not the backup's branch, after editing the ref to %s",
   async (_label, resolved) => {
     // The pinned commit until the user asks for "develop", then that branch as resolved here.
-    const developBranch = (ref: string | null) =>
+    const developBranch = (ref: string | null | undefined) =>
       ref !== "develop"
         ? previewOf("alpha")
         : previewOf("alpha", {
