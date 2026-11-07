@@ -3,6 +3,7 @@ import type { Pluggable, Plugin } from "unified";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import { MATH_CLASS_NAMES, publishKatexPlugins } from "./mathRendering";
+import { rehypeRevealRenderedMath } from "./rehypeRevealUnicodeTags";
 
 const MATH_CLASSES = new Set<string>(MATH_CLASS_NAMES);
 
@@ -35,6 +36,10 @@ const rehypeMarkMathAncestors: Plugin<[], Root> = () => (tree) => {
 export const katexRehypePlugins: Pluggable[] = [
   rehypeMarkMathAncestors,
   [rehypeKatex, { errorColor: "var(--color-muted-foreground)" }],
+  // After KaTeX: markdown's own reveal pass skips code elements, and math reaches KaTeX as a
+  // math-inline/math-display/language-math code node, so a tag payload inside $$…$$ would otherwise
+  // be typeset as invisible glyphs. See rehypeRevealRenderedMath.
+  rehypeRevealRenderedMath,
 ];
 
 // Loaded through React.lazy in MarkdownCore: evaluating the chunk switches every math row to KaTeX.

@@ -9,12 +9,19 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
   const isSuperseded = props.failure.errorType === "workspace_turn_superseded";
   const isIncomplete = props.failure.errorType === "workspace_turn_incomplete";
   const StatusIcon = isSuperseded ? ArrowRightLeft : CircleAlert;
-  const metadata = [
+  // Every value below is drawn from the envelope's own bytes, which stay provider-visible in full, so
+  // each reveals at the point of drawing: an imported or damaged envelope can hold a tag payload in an
+  // id or an error type, and "Technical details" is where a user looks to check one. The envelope
+  // itself is never rewritten — the row's Copy and any re-send read `message.content`, not this.
+  const metadata: Array<[string, string | undefined]> = [];
+  for (const [label, value] of [
     ["Task ID", props.failure.taskId],
     ["Error type", props.failure.errorType],
     ["Execution ID", props.failure.executionId],
     ["Execution version", props.failure.executionVersion],
-  ];
+  ] as const) {
+    metadata.push([label, value ? revealUnicodeTags(value) : undefined]);
+  }
 
   return (
     <div className="flex min-w-0 items-start gap-2.5">

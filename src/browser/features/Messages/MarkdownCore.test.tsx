@@ -203,6 +203,22 @@ describe("MarkdownCore", () => {
     );
   });
 
+  // KaTeX typesets math after the pipeline's reveal pass, and it receives the formula as a code
+  // element that pass deliberately leaves raw, so rendered math needs its own reveal
+  // (rehypeRevealRenderedMath). The TeX the transcript copies out of a selected formula stays raw:
+  // pasting marks back would not round-trip.
+  test("reveals a tag payload in rendered math and keeps the copied TeX raw", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownCore content={`$$a${tags("AB")}b$$`} renderSynchronously />
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.container.querySelector(".katex-html")).not.toBeNull());
+    expect(view.container.querySelector(".katex-html")?.textContent).toBe("a<U+E0041><U+E0042>b");
+    // The annotation is the source: MarkdownCore keeps it byte-identical for copy-as-Markdown.
+    expect(view.container.querySelector("annotation")?.textContent).toBe(`a${tags("AB")}b`);
+  });
+
   // remark-math leaves these as text (single-dollar math is off), so they must not load KaTeX.
   test.each([
     "A plain reply with **bold**, `code`, and a [link](https://example.com).",

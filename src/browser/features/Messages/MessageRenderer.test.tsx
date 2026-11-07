@@ -562,6 +562,32 @@ This sub-agent task failed terminally and will not produce a report. Do not re-a
     expect(view.getByText("New input superseded this turn.")).toBeDefined();
   });
 
+  test("reveals a tag payload in a failure row's technical metadata", () => {
+    // The whole envelope is provider-visible text, and parseSubagentFailureEnvelope accepts these
+    // fields as-is, so a payload spelled in tag characters must not survive into "Technical details"
+    // as nothing at all — that panel is where a user goes to check an id.
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const message = failureMessage(`failed${tagRun("ab")}`, "An error occurred.");
+    message.content = message.content.replace(
+      "<task_id>task-failed</task_id>",
+      `<task_id>task-${tagRun("XY")}</task_id>`
+    );
+
+    const view = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByText("Technical details"));
+
+    expect(view.getByText("task-<U+E0058><U+E0059>")).toBeDefined();
+    expect(view.getByText("failed<U+E0061><U+E0062>")).toBeDefined();
+    // And never both: the mark replaces the bytes it decoded from.
+    expect(view.container.textContent).not.toContain(tagRun("XY"));
+    expect(view.container.textContent).not.toContain(tagRun("ab"));
+  });
+
   test("shows unknown failure reasons as escaped text without requiring execution metadata", () => {
     const error = '<img src=x onerror="alert(1)">\nWorker exited unexpectedly.';
     const message = failureMessage("unknown_future_error", error);
