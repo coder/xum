@@ -279,7 +279,7 @@ function ProjectOverride(props: {
   );
 }
 
-function Header(props: { state: AgentSandboxState | null }) {
+function Header(props: { state: AgentSandboxState | null; enabled: boolean }) {
   const support = props.state?.support;
   return (
     <div className="mb-4 min-w-0">
@@ -291,7 +291,12 @@ function Header(props: { state: AgentSandboxState | null }) {
         macOS only. Applies to Local and Worktree workspaces.
       </div>
       {support?.state === "unsupported" && (
-        <div className="text-warning mt-1 text-xs">{support.reason}</div>
+        <div className="text-warning mt-1 text-xs">
+          {support.reason}
+          {/* The switch stays live here so it can be turned off (controlsState), which would
+              otherwise read as a sandbox that is working. */}
+          {props.enabled && " The switch is on, but commands here run without the sandbox."}
+        </div>
       )}
     </div>
   );
@@ -345,7 +350,7 @@ export function AgentSandboxSettings() {
 
   return (
     <div>
-      <Header state={state} />
+      <Header state={state} enabled={enabled} />
       <div className="space-y-4">
         <EnabledSwitch
           enabled={enabled}
