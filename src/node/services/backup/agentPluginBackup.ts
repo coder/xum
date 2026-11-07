@@ -219,7 +219,7 @@ export async function collectPluginBackup(
   if (plugins.length > MAX_BACKUP_PLUGIN_ENTRIES) {
     throw new BackupServiceError(
       "IO_ERROR",
-      `${plugins.length} plugins are installed here that a backup can list, and one backup lists at most ${MAX_BACKUP_PLUGIN_ENTRIES}. Backing up would leave ${plugins.length - MAX_BACKUP_PLUGIN_ENTRIES} of them out. ${AGENT_PLUGINS_OFF_HINT}`
+      `${plugins.length} plugins are installed here that a backup can list, and one backup lists at most ${MAX_BACKUP_PLUGIN_ENTRIES}. Backing up would leave ${plugins.length - MAX_BACKUP_PLUGIN_ENTRIES} of them out. Uninstalling that many plugins brings the count under the cap. ${AGENT_PLUGINS_OFF_HINT}`
     );
   }
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
