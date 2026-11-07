@@ -89,6 +89,8 @@ export class FakeMcpServers {
   private readonly processes: FakeProcess[] = [];
   private nextNonce = 0;
   private hungConnects = 0;
+  /** Waits for a hung-connection count (expireStartupDeadline), resolved by the hang itself. */
+  private readonly hungWaiters = new Set<{ target: number; resolve: () => void }>();
   private readonly remoteHeaders = new Map<string, Array<Record<string, string> | undefined>>();
   private clientSpy: ReturnType<typeof spyOn<typeof mcpSdk, "createMCPClient">> | null = null;
 
@@ -148,11 +150,20 @@ export class FakeMcpServers {
     setSystemTime(new Date(startedAt));
     try {
       const pending = operation();
-      // setImmediate is not faked, so real I/O in the startup path keeps flowing.
-      for (let turn = 0; this.hungConnects < target; turn++) {
-        assert(turn < 10_000, "FakeMcpServers.expireStartupDeadline: startup never hung");
-        await new Promise((resolve) => setImmediate(resolve));
-      }
+      // Wait for the hang itself, not for a number of event-loop turns: the startup path does real
+      // I/O before it hangs, and a loaded host ran out of turns first. An operation that ends
+      // without hanging fails here instead of waiting forever.
+      const outcome = await Promise.race([
+        this.untilHung(target).then(() => "hung" as const),
+        pending.then(
+          () => "settled" as const,
+          () => "settled" as const
+        ),
+      ]);
+      assert(outcome === "hung", "FakeMcpServers.expireStartupDeadline: startup never hung");
+      // One more turn, so the other startups in flight finish what their microtasks reach (a
+      // sibling that fails at once must fail before the deadline fires, not time out with it).
+      await new Promise((resolve) => setImmediate(resolve));
       fakeTimers.advanceTimersByTime(MCP_STARTUP_TIMEOUT_MS);
       return await pending;
     } finally {
@@ -160,6 +171,12 @@ export class FakeMcpServers {
       fakeTimers.useRealTimers();
       setSystemTime(new Date(now));
     }
+  }
+
+  /** Resolves once `target` connections have hung since the last reset. */
+  private untilHung(target: number): Promise<void> {
+    if (this.hungConnects >= target) return Promise.resolve();
+    return new Promise((resolve) => this.hungWaiters.add({ target, resolve }));
   }
 
   /** Restore createMCPClient and forget every server; call from afterEach. */
@@ -174,6 +191,7 @@ export class FakeMcpServers {
     this.processesByNonce.clear();
     this.processes.length = 0;
     this.hungConnects = 0;
+    this.hungWaiters.clear();
     this.exec.mockClear();
   }
 
@@ -274,6 +292,11 @@ export class FakeMcpServers {
     await behavior.connect?.();
     if (behavior.hang === true) {
       this.hungConnects += 1;
+      for (const waiter of this.hungWaiters) {
+        if (this.hungConnects < waiter.target) continue;
+        this.hungWaiters.delete(waiter);
+        waiter.resolve();
+      }
       await new Promise<never>(() => undefined);
     }
     const modern = behavior.era === "modern";

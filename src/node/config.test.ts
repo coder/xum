@@ -634,12 +634,15 @@ describe("Config", () => {
     });
 
     it("a config that cannot be serialized rejects the edit (#4444)", async () => {
-      const cyclic: Record<string, unknown> = {};
-      cyclic.self = cyclic;
+      // A BigInt is what JSON.stringify refuses at once. This test once used a cyclic object,
+      // and Bun's indented JSON.stringify of a cycle (the save writes with an indent) spent 3 s of
+      // CPU before it threw, which timed the test out on a loaded host. The edit still has to
+      // reject, whatever makes the config unserializable.
+      const unserializable = { value: 1n };
       const saveError = await config
         .editConfig((value) => ({
           ...value,
-          settingsBackup: cyclic as unknown as NonNullable<typeof value.settingsBackup>,
+          settingsBackup: unserializable as unknown as NonNullable<typeof value.settingsBackup>,
         }))
         .catch((error: unknown) => error);
 

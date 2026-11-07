@@ -5535,6 +5535,22 @@ describe("MCPServerManager", () => {
   /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
   const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
 
+  test("the startup deadline fires once a connection hangs, however long real I/O delays the hang", async () => {
+    // The harness waits for the hang itself. It once gave the hang a fixed number of event-loop
+    // turns, which a loaded host used up before the startup's real I/O (here a child process that
+    // runs 400 ms: fake timers fake every sleep, so only I/O takes real time) reached the hang:
+    // "startup never hung".
+    configService.listServers = mock(() => Promise.resolve({ late: stdioConfig("late-cmd") }));
+    servers.serve("late-cmd", {
+      connect: async () => void (await Bun.spawn(["sleep", "0.4"]).exited),
+      hang: true,
+    });
+    const result = await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest("ws-late-hang"))
+    );
+    expect(result.stats.failedServerNames).toEqual(["late"]);
+  });
+
   test("a startup timeout waits for its abort cleanup before surfacing", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
     configService.listServers = mock(() =>
