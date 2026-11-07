@@ -11,6 +11,7 @@ import {
   WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
 import { AskUserQuestionToolArgsSchema as LightAskUserQuestionToolArgsSchema } from "./askUserQuestionSchemas";
+import { formatToolInputIssues } from "./formatToolInputIssues";
 
 describe("TOOL_DEFINITIONS", () => {
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
@@ -408,6 +409,20 @@ describe("TOOL_DEFINITIONS", () => {
     for (const timeout_secs of [0, -1]) {
       expect(TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", timeout_secs }).success).toBe(
         false
+      );
+    }
+  });
+
+  it("rejects a bash script that arrived cut off mid-quote", () => {
+    // The message itself is owned by bashScriptSyntax.test.ts; this pins that the
+    // check runs on the script argument, including its `command` alias.
+    const input = { command: 'cd "$XUM_SCR', timeout_secs: 60, display_name: "Test" };
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse(input);
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(formatToolInputIssues(parsed.error.issues, input)).toMatch(
+        /^script: arrived cut off: /
       );
     }
   });
