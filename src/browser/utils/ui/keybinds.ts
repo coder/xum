@@ -64,6 +64,11 @@ export function matchesNewSidebarTabKeybind(event: React.KeyboardEvent | Keyboar
   return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.NEW_SIDEBAR_TAB);
 }
 
+/** OPEN_PLAN_TAB is a Ctrl/Cmd+Alt+Shift chord, so it ignores AltGr input like NEW_SIDEBAR_TAB. */
+export function matchesOpenPlanTabKeybind(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.OPEN_PLAN_TAB);
+}
+
 export function matchesKeybind(
   event: React.KeyboardEvent | KeyboardEvent,
   keybind: Keybind
@@ -626,6 +631,9 @@ export const KEYBINDS = {
   /** Agent interface view: open Start Here from the agent's last reply, from the status page's bar */
   STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
+  /** Open (or focus) the Plan tab in the right sidebar */
+  OPEN_PLAN_TAB: { key: "l", code: "KeyL", ctrl: true, alt: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */
@@ -839,6 +847,13 @@ export const KEYBINDS = {
 
   /** Copy the active file's full contents to the clipboard in immersive review */
   REVIEW_COPY_FILE: { key: "y" },
+
+  // Plan tab shortcuts: only handled while focus is inside the Plan tab, like the Artifacts
+  // panel's single-key shortcuts.
+  /** Open the plan file in the external editor (Plan tab) */
+  PLAN_TAB_EDIT: { key: "e" },
+  /** Copy the plan to the clipboard (Plan tab) */
+  PLAN_TAB_COPY: { key: "y" },
 
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
