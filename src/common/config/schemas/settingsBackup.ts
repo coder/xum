@@ -199,11 +199,12 @@ export function hasUrlCredentials(repoUrl: string): boolean {
 }
 
 /**
- * Whitespace, control characters and bidi controls: none belongs in a remote URL. They are how a
+ * Whitespace, control characters (C0 and C1) and invisible format characters (bidi controls,
+ * zero-width spaces and joiners): none belongs in a remote URL. They are how a
  * command injection into a later shell paste starts, and how a URL shown to the user is made to
  * read differently from the one git gets. Not global, so `.test` keeps no state between calls.
  */
-export const UNSAFE_URL_CHARACTERS = /[\s\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+export const UNSAFE_URL_CHARACTERS = /[\s\p{Cc}\p{Cf}]/u;
 
 /** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
 export const MAX_BACKUP_PROJECT_ENTRIES = 256;

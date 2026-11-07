@@ -116,6 +116,12 @@ export function PluginRemovalCard(props: {
           ? "The backup has a plugin list, and backing up now writes none (plugin backup is off here, or this machine has no managed plugin). The whole list is removed from the backup."
           : "Backing up now writes the plugins installed on this machine. These plugins are in the backup but not installed here, so they are removed from it:"}
       </p>
+      {removal.unreadable && !removal.wholeList ? (
+        <p className="text-muted text-xs">
+          The list also has entries this version of Xum cannot read, for example from a newer Xum.
+          They are removed too.
+        </p>
+      ) : null}
       {removal.names.length > 0 ? (
         <ul className="text-foreground list-disc space-y-0.5 pl-4 text-xs">
           {removal.names.map((name) => (

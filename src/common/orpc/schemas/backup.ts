@@ -176,12 +176,15 @@ export const EMPTY_BACKUP_PLUGIN_REPORT: BackupPluginReport = {
 
 /**
  * What a push removes from the backup's plugin list: the listed plugins this machine's export
- * leaves out, and `wholeList` when the backup has a list and the push writes none. The push
- * refuses until it carries the `approval` of exactly this removal (a changed list asks again).
+ * leaves out, `wholeList` when the backup has a list and the push writes none, and `unreadable`
+ * when the list has parts this build could not read (a newer Xum's rows), which a push that
+ * writes a list replaces without being able to name them. The push refuses until it carries the
+ * `approval` of exactly this removal: a different removal asks again.
  */
 export const BackupPluginRemovalSchema = z.object({
   names: z.array(z.string()),
   wholeList: z.boolean(),
+  unreadable: z.boolean(),
   approval: z.string(),
 });
 

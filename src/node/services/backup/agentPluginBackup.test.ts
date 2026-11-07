@@ -594,6 +594,22 @@ describe("backup of the managed plugin list", () => {
     );
 
     it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "still throws when the sidecar folder cannot be searched",
+      async () => {
+        const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+        const sidecarDir = path.dirname(path.join(managed, PLUGIN_BACKUP_MANIFEST_PATH));
+        await fs.chmod(sidecarDir, 0o000);
+
+        const error = await captureRejection(
+          payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS })
+        );
+        await fs.chmod(sidecarDir, 0o700);
+
+        expect((error as { code?: string }).code).toBe("EACCES");
+      }
+    );
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
       "fails the preview, not reads a plugin as missing, when the plugins folder cannot be read",
       async () => {
         const { payload, request } = await backupOf([registryRow("alpha")]);
@@ -774,6 +790,28 @@ describe("backup of the managed plugin list", () => {
         const refused = removalOf(await pushFromSecondMachine([], { plugins: false }));
 
         expect(refused).toMatchObject({ names: [], wholeList: true });
+      });
+
+      it("refuses a push that would drop list entries this build cannot read, and drops them once approved", async () => {
+        await pushFromFirstMachine([registryRow("alpha")]);
+        const clone = path.join(tempDir, "tamper");
+        await runGit(["clone", "--quiet", originPath, clone]);
+        const file = path.join(clone, "xum", PLUGIN_BACKUP_MANIFEST_PATH);
+        const list = JSON.parse(await fs.readFile(file, "utf-8")) as { plugins: unknown[] };
+        // A row a newer Xum could write: a source kind this build does not know.
+        list.plugins.push({ name: "future", source: { type: "archive", url: "https://x/y.tgz" } });
+        await fs.writeFile(file, JSON.stringify(list), "utf-8");
+        await commitAll(clone, "add a row from a newer build");
+        await runGit(["-C", clone, "push", "--quiet", "origin", "HEAD:refs/heads/main"]);
+
+        const refused = removalOf(await pushFromSecondMachine([registryRow("alpha")]));
+        expect(refused).toMatchObject({ names: [], wholeList: false, unreadable: true });
+
+        const pushed = await pushFromSecondMachine([registryRow("alpha")], {
+          approvedPluginRemovalDigest: refused.approval,
+        });
+        expect(pushed.success).toBe(true);
+        expect(await listedNames()).toEqual(["alpha"]);
       });
 
       it("treats a machine with nothing installed as removing the whole list", async () => {

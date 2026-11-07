@@ -98,6 +98,13 @@ describe("BackupPluginEntrySchema", () => {
     ["a url with a control character", "https://github.com/example/rep\u0007o.git"],
     ["a url with a right-to-left override", "https://github.com/example/\u202Egit.repo"],
     ["a url with a zero-width bidi mark", "https://github.com/exam\u200Fple/repo.git"],
+    ["a url with a C1 control character", "https://github.com/example/re\u0085po.git"],
+    ["a url with an Arabic letter mark", "https://github.com/exam\u061Cple/repo.git"],
+    ["a url with a left-to-right mark", "https://github.com/exam\u200Eple/repo.git"],
+    ["a url with a left-to-right embedding", "https://github.com/\u202Aexample/repo.git"],
+    ["a url with a bidi isolate", "https://github.com/\u2066example\u2069/repo.git"],
+    ["a url with a zero-width space", "https://github.com/exam\u200Bple/repo.git"],
+    ["a url with a word joiner", "https://github.com/exam\u2060ple/repo.git"],
     ["a url with a credential", "https://user:pass-word@example.com/example/repo.git"],
   ])("refuses %s", (_label, url) => {
     const row = entry({ source: { type: "git", url, ref: "main", refType: "branch" } });

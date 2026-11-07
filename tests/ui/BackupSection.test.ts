@@ -1544,12 +1544,17 @@ describe("BackupSection", () => {
     });
 
     describe("removal approval", () => {
-      const REFUSED = (names: string[], approval: string, wholeList = false) => ({
+      const REFUSED = (
+        names: string[],
+        approval: string,
+        wholeList = false,
+        unreadable = false
+      ) => ({
         success: false as const,
         error: {
           code: "PLUGIN_REMOVAL_APPROVAL_REQUIRED" as const,
           message: "This backup would remove plugins from the backup's plugin list",
-          pluginRemoval: { names, wholeList, approval },
+          pluginRemoval: { names, wholeList, unreadable, approval },
         },
       });
       const PUSHED = {
@@ -1557,17 +1562,36 @@ describe("BackupSection", () => {
         data: { commit: "abc1234", changed: true, credential: "ssh" as const, redactions: [] },
       };
 
-      async function openCard(names: string[], approval: string, wholeList = false) {
+      async function openCard(
+        names: string[],
+        approval: string,
+        wholeList = false,
+        unreadable = false
+      ) {
         const { client, view } = renderBackupSection();
         const canvas = within(view.container);
         await canvas.findByText("Settings backup");
         const push = jest
           .spyOn(client.backup, "push")
-          .mockResolvedValueOnce(REFUSED(names, approval, wholeList));
+          .mockResolvedValueOnce(REFUSED(names, approval, wholeList, unreadable));
         fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
         await canvas.findByText("Remove plugins from the backup?");
         return { push, canvas };
       }
+
+      test("says that entries it cannot read are removed too, and confirms with their digest", async () => {
+        const { push, canvas } = await openCard([], "digest-u", false, true);
+
+        expect(canvas.getByText(/cannot read/)).toBeTruthy();
+        expect(canvas.queryAllByRole("listitem")).toHaveLength(0);
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        await canvas.findByText(/Backed up settings at abc1234/);
+        expect(push).toHaveBeenLastCalledWith(
+          expect.objectContaining({ approvedPluginRemovalDigest: "digest-u" })
+        );
+      });
 
       test("sends no approval until the user confirms the removal the backup named", async () => {
         const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");

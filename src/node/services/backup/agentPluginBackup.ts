@@ -122,9 +122,10 @@ export async function collectPluginBackup(muxRoot: string): Promise<BackupPlugin
 }
 
 /**
- * The names a push removes from the backup's list, and whether it removes the whole list. Undefined
- * when the backup has no list or every listed plugin stays. A list the backup has but this build
- * cannot read names nothing, so only a push that writes no list (`written` null) reports it.
+ * The names a push removes from the backup's list, whether it removes the whole list, and whether
+ * it replaces parts this build could not read. Undefined when the backup has no list and nothing
+ * listed is lost. Every warning of a read marks a part left out, so a read with warnings has
+ * unreadable parts, which a push that writes a list drops without naming them.
  */
 function pluginRemovalOf(
   prior: PluginListRead | null,
@@ -134,11 +135,12 @@ function pluginRemovalOf(
   const kept = new Set(written?.plugins.map((plugin) => plugin.name));
   const names = prior.plugins.map((plugin) => plugin.name).filter((name) => !kept.has(name));
   const wholeList = written === null;
-  if (!wholeList && names.length === 0) return undefined;
+  const unreadable = prior.warnings.length > 0;
+  if (!wholeList && !unreadable && names.length === 0) return undefined;
   names.sort();
   // JSON, not a delimiter: a name is repository-controlled text.
-  const approval = sha256(Buffer.from(JSON.stringify({ names, wholeList }), "utf-8"));
-  return { names, wholeList, approval };
+  const approval = sha256(Buffer.from(JSON.stringify({ names, wholeList, unreadable }), "utf-8"));
+  return { names, wholeList, unreadable, approval };
 }
 
 /**
