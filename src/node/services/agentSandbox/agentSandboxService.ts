@@ -102,11 +102,11 @@ function projectAgentSandboxSettings(
 
 function agentSandboxSupport(): AgentSandboxSupport {
   if (isAgentSandboxSupported()) return { state: "supported" };
+  // wrapForAgentSandbox throws on a Mac that cannot sandbox and skips the sandbox elsewhere.
+  const onMac = process.platform === "darwin";
   return {
     state: "unsupported",
-    reason:
-      process.platform === "darwin"
-        ? "/usr/bin/sandbox-exec is missing on this Mac."
-        : "Available on macOS only.",
+    reason: onMac ? "/usr/bin/sandbox-exec is missing on this Mac." : "Available on macOS only.",
+    failsClosed: onMac,
   };
 }

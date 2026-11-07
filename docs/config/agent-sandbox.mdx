@@ -11,7 +11,10 @@ The sandbox works only on macOS. It covers Local and Worktree workspaces. SSH, C
 
 In **Settings → Agents → Agent sandbox**, turn on **Run agent commands in a sandbox**. Commands that start after that run in the sandbox.
 
-On another operating system, or on a Mac without `/usr/bin/sandbox-exec`, the section shows why the sandbox is not available and you cannot turn it on. If the setting is already on there (for example in a `config.json` copied from a Mac), commands still run without the sandbox, and you can only turn the switch off.
+On another operating system, or on a Mac without `/usr/bin/sandbox-exec`, the section shows why the sandbox is not available and you cannot turn it on. If the setting is already on there (for example in a `config.json` copied from a Mac), the section says so, and you can only turn it off: with the switch, or with **Global** or **Off** for a project that is **On**. Until then:
+
+- On another operating system, commands run without the sandbox.
+- On a Mac without `sandbox-exec`, the commands that the sandbox covers fail. Xum never runs them without the sandbox that you turned on.
 
 To use another setting for one project, select the project in **Project** and click:
 

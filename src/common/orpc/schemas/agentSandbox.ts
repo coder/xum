@@ -7,7 +7,15 @@ import { AgentSandboxConfigSchema } from "@/common/config/schemas/agentSandbox";
  */
 export const AgentSandboxSupportSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("supported") }),
-  z.object({ state: z.literal("unsupported"), reason: z.string() }),
+  z.object({
+    state: z.literal("unsupported"),
+    reason: z.string(),
+    /**
+     * True on a Mac without sandbox-exec: a setting that is on makes commands fail rather
+     * than run without the sandbox. Elsewhere the sandbox does not apply and they run.
+     */
+    failsClosed: z.boolean(),
+  }),
 ]);
 export type AgentSandboxSupport = z.infer<typeof AgentSandboxSupportSchema>;
 

@@ -159,7 +159,11 @@ describe("AgentSandboxSettings", () => {
   });
 
   test("off macOS only a sandbox that is on can still be changed: turned off", async () => {
-    const unsupported = { state: "unsupported", reason: "Available on macOS only." } as const;
+    const unsupported = {
+      state: "unsupported",
+      reason: "Available on macOS only.",
+      failsClosed: false,
+    } as const;
     const off = renderSettings({ global: {}, projects: {}, support: unsupported });
     await off.findByText("Available on macOS only.");
     expect(off.toggle().disabled).toBe(true);
@@ -173,5 +177,28 @@ describe("AgentSandboxSettings", () => {
     await waitFor(() => expect(on.toggle().disabled).toBe(false));
     fireEvent.click(on.toggle());
     await waitFor(() => expect(on.set.mock.calls).toEqual([[{ enabled: false }]]));
+  });
+
+  test("on a Mac that cannot sandbox, a project that is On can be turned off and says so", async () => {
+    const view = renderSettings({
+      global: {},
+      projects: { [PHAROS]: { enabled: true, network: "loopback" } },
+      support: { state: "unsupported", reason: "No sandbox-exec.", failsClosed: true },
+    });
+    await view.findByText(/No sandbox-exec\. .+ fail until you turn it off\./);
+    expect(view.toggle().disabled).toBe(true);
+
+    const off = view.getByRole("button", { name: "Off" }) as HTMLButtonElement;
+    await waitFor(() => expect(off.disabled).toBe(false));
+    fireEvent.click(off);
+    await waitFor(() =>
+      expect(view.setProject.mock.calls).toEqual([
+        [{ projectPath: PHAROS, sandbox: { network: "loopback", enabled: false } }],
+      ])
+    );
+    // Once it is off, the project cannot be turned back on here.
+    await waitFor(() =>
+      expect((view.getByRole("button", { name: "On" }) as HTMLButtonElement).disabled).toBe(true)
+    );
   });
 });

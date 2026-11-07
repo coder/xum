@@ -229,6 +229,8 @@ function NetworkModes(props: {
 function ProjectOverride(props: {
   projects: AgentSandboxState["projects"];
   disabled: boolean;
+  /** Where the sandbox cannot run, a project can only leave On, like the switch. */
+  onlyTurnOff: boolean;
   onSave: (projectPath: string, sandbox: AgentSandboxConfig) => void;
 }) {
   const { userProjects } = useProjectContext();
@@ -242,6 +244,7 @@ function ProjectOverride(props: {
   const project = projects.find((candidate) => candidate.path === picked) ?? projects[0];
   if (project === undefined) return null;
   const sandbox = props.projects[project.path];
+  const mode = projectModeOf(sandbox);
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -265,8 +268,8 @@ function ProjectOverride(props: {
           <div role="group" aria-label={`Agent sandbox for ${project.name}`}>
             <ToggleGroup
               options={PROJECT_MODE_OPTIONS}
-              value={projectModeOf(sandbox)}
-              disabled={props.disabled}
+              value={mode}
+              disabled={props.disabled || (props.onlyTurnOff && mode !== "on")}
               onChange={(mode) => props.onSave(project.path, withProjectMode(sandbox, mode))}
             />
           </div>
@@ -279,7 +282,7 @@ function ProjectOverride(props: {
   );
 }
 
-function Header(props: { state: AgentSandboxState | null; enabled: boolean }) {
+function Header(props: { state: AgentSandboxState | null; on: boolean }) {
   const support = props.state?.support;
   return (
     <div className="mb-4 min-w-0">
@@ -293,9 +296,12 @@ function Header(props: { state: AgentSandboxState | null; enabled: boolean }) {
       {support?.state === "unsupported" && (
         <div className="text-warning mt-1 text-xs">
           {support.reason}
-          {/* The switch stays live here so it can be turned off (controlsState), which would
-              otherwise read as a sandbox that is working. */}
-          {props.enabled && " The switch is on, but commands here run without the sandbox."}
+          {/* A sandbox that is on stays changeable here so it can be turned off (controlsState),
+              which would otherwise read as a sandbox that is working. */}
+          {props.on &&
+            (support.failsClosed
+              ? " The sandbox is on, so the agent commands it covers fail until you turn it off."
+              : " The sandbox is on, but commands here run without it.")}
         </div>
       )}
     </div>
@@ -325,6 +331,12 @@ function EnabledSwitch(props: {
   );
 }
 
+/** On globally or for any project, so commands somewhere could need the sandbox. */
+function isOnAnywhere(state: AgentSandboxState | null): boolean {
+  if (state?.global.enabled === true) return true;
+  return Object.values(state?.projects ?? {}).some((sandbox) => sandbox.enabled === true);
+}
+
 /** Which controls can change the setting now. */
 function controlsState(state: AgentSandboxState | null, offline: boolean) {
   const global = state?.global ?? {};
@@ -334,6 +346,9 @@ function controlsState(state: AgentSandboxState | null, offline: boolean) {
   return {
     global,
     enabled,
+    on: isOnAnywhere(state),
+    unavailable,
+    unsupported,
     disabled: unavailable || unsupported,
     // A switch that is on stays usable, so a sandbox turned on elsewhere can be turned off.
     switchDisabled: unavailable || (unsupported && !enabled),
@@ -346,11 +361,14 @@ function controlsState(state: AgentSandboxState | null, offline: boolean) {
  */
 export function AgentSandboxSettings() {
   const { state, error, offline, save, saveProject } = useAgentSandbox();
-  const { global, enabled, disabled, switchDisabled } = controlsState(state, offline);
+  const { global, enabled, on, unavailable, unsupported, disabled, switchDisabled } = controlsState(
+    state,
+    offline
+  );
 
   return (
     <div>
-      <Header state={state} enabled={enabled} />
+      <Header state={state} on={on} />
       <div className="space-y-4">
         <EnabledSwitch
           enabled={enabled}
@@ -365,7 +383,8 @@ export function AgentSandboxSettings() {
         />
         <ProjectOverride
           projects={state?.projects ?? {}}
-          disabled={disabled}
+          disabled={unavailable}
+          onlyTurnOff={unsupported}
           onSave={saveProject}
         />
         {error ? <div className="text-danger-light text-xs">{error}</div> : null}
