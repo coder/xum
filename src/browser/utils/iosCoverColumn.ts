@@ -21,8 +21,8 @@ import { IOS_STATUS_BAND_HEIGHT_PX } from "@/constants/layout";
  *   finger itself, and keeps a flick gliding.
  * - The page can pan sideways by the column's width (a swipe, a double tap, a tap on the status bar)
  *   and iOS then holds that offset: `scrollTo(0, 0)` is undone within milliseconds. The pan guard
- *   cancels sideways drags that nothing would scroll, and whatever still pans is undone by laying the
- *   page out once at device width.
+ *   cancels sideways drags that nothing would scroll, and whatever still pans is scrolled back or,
+ *   when iOS holds it, undone by laying the page out once at device width.
  * - iOS takes the touches on its clock and status glyphs itself. globals.css keeps that band
  *   (`--ios-cover-column`) clear of controls.
  */
@@ -513,6 +513,10 @@ function isPagePannedSideways(): boolean {
   return window.scrollX !== 0 && !zoomed;
 }
 
+function afterTwoFrames(callback: () => void): void {
+  window.requestAnimationFrame(() => window.requestAnimationFrame(callback));
+}
+
 /** The viewport size that lays the page out across the column, kept in step with the display. */
 class CoverColumnViewport {
   /** The column's width while the page is laid out across it, else 0. */
@@ -523,6 +527,7 @@ class CoverColumnViewport {
   private size: ViewportSize | null = null;
   private geometryKey = "";
   private healing = false;
+  private undoingScroll = false;
 
   constructor(meta: HTMLMetaElement) {
     this.meta = meta;
@@ -549,19 +554,37 @@ class CoverColumnViewport {
     if (readGeometryKey() !== this.geometryKey) this.sync();
   }
 
-  // iOS holds a sideways pan against scrollTo; laying the page out at device width clamps the pan
-  // back to 0. iOS applies that only from the next frame it draws, so the size returns two frames
-  // later (about 50ms on the simulator): in the same task the layout never reaches iOS.
-  healPan(): void {
+  // Typing past the column's left edge makes WebKit scroll the page sideways to reveal the caret,
+  // on every keystroke, since it treats the column as hidden. Re-laying the page out each time
+  // made the composer flicker between widths on every letter (Mike, on the folded Duo). That scroll
+  // comes from the page, so scrollTo undoes it for good. A pan from a gesture comes from iOS, which
+  // holds it against scrollTo: when the page pans again before two frames pass, or is still panned
+  // then, heal it.
+  onScroll(): void {
     if (this.size == null || this.healing || !isPagePannedSideways()) return;
+    if (this.undoingScroll) {
+      this.healPan();
+      return;
+    }
+    this.undoingScroll = true;
+    window.scrollTo(0, window.scrollY);
+    afterTwoFrames(() => {
+      this.undoingScroll = false;
+      if (isPagePannedSideways()) this.healPan();
+    });
+  }
+
+  // Laying the page out at device width clamps a pan iOS holds back to 0. iOS applies that only
+  // from the next frame it draws, so the size returns two frames later (about 50ms on the
+  // simulator): in the same task the layout never reaches iOS.
+  private healPan(): void {
+    if (this.size == null || this.healing) return;
     this.healing = true;
     setViewportSize(this.meta, null);
-    window.requestAnimationFrame(() =>
-      window.requestAnimationFrame(() => {
-        this.healing = false;
-        setViewportSize(this.meta, this.size);
-      })
-    );
+    afterTwoFrames(() => {
+      this.healing = false;
+      setViewportSize(this.meta, this.size);
+    });
   }
 
   dispose(): void {
@@ -582,7 +605,7 @@ export function installIosCoverColumn(): () => void {
   const removers = [
     new ColumnTouchBridge(() => viewport.column).install(),
     listen("resize", () => viewport.onResize()),
-    listen("scroll", () => viewport.healPan()),
+    listen("scroll", () => viewport.onScroll()),
   ];
   return () => {
     for (const remove of removers) remove();
