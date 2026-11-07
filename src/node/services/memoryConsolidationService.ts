@@ -986,6 +986,11 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
+      // The stream's usage is recorded after its queue slot is released, not inside it:
+      // recordHeadlessUsage takes the session directory's lock, and a stall there must not hold
+      // every later workspace's dream. An array, not a `let`, because TS cannot narrow
+      // assignments made inside the callback.
+      const recordings: Array<() => Promise<void>> = [];
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1008,25 +1013,28 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: async (usage, providerMetadata) => {
-            const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-              workspaceId,
-              modelString,
-              usage,
-              providerMetadata,
-              {
-                analyticsSource: "memory_consolidation",
-                // Creation-time identity: a catalog refresh mid-run must not
-                // re-attribute this spend (see ModelFactoryLike).
-                metadataModel: modelResult.data.metadataModel,
+          recordUsage: (usage, providerMetadata) => {
+            recordings.push(async () => {
+              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                workspaceId,
+                modelString,
+                usage,
+                providerMetadata,
+                {
+                  analyticsSource: "memory_consolidation",
+                  // Creation-time identity: a catalog refresh mid-run must not
+                  // re-attribute this spend (see ModelFactoryLike).
+                  metadataModel: modelResult.data.metadataModel,
+                }
+              );
+              // The sidecar row only reaches dashboard totals via an explicit
+              // ingest pass; request one (forwarded by ServiceContainer) so sweep
+              // spend doesn't strand until an unrelated stream-end or restart.
+              if (recorded) {
+                self.emit("analyticsIngest", { workspaceId });
               }
-            );
-            // The sidecar row only reaches dashboard totals via an explicit
-            // ingest pass; request one (forwarded by ServiceContainer) so sweep
-            // spend doesn't strand until an unrelated stream-end or restart.
-            if (recorded) {
-              self.emit("analyticsIngest", { workspaceId });
-            }
+            });
+            return Promise.resolve();
           },
         });
       const result = yield* Effect.promise(async () =>
@@ -1041,6 +1049,18 @@ export class MemoryConsolidationService extends EventEmitter {
       if (result.streamError !== undefined) {
         return Err(`consolidation stream failed: ${result.streamError}`);
       }
+
+      // Best-effort, like the in-stream call it replaced: telemetry never fails the pass.
+      yield* Effect.promise(async () => {
+        for (const recordUsage of recordings) {
+          await recordUsage().catch((error: unknown) => {
+            log.warn("[MemoryConsolidation] could not record dream usage", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        }
+      });
 
       const record: MemoryConsolidationRecord = {
         lastRunAt: Date.now(),

@@ -206,6 +206,8 @@ interface Fixture extends Disposable {
   historyService: HistoryService;
   memoryService: MemoryService;
   metaService: MemoryMetaService;
+  /** Present with `withSessionUsage`: the service that records the dream's headless usage. */
+  sessionUsage?: SessionUsageService;
   modelCalls: number[];
   modelPrompts: string[];
   setEnabled: (enabled: boolean) => void;
@@ -244,6 +246,9 @@ async function createFixture(options?: {
 
   let enabled = true;
   let streamFailing = false;
+  const sessionUsage = options?.withSessionUsage
+    ? new SessionUsageService(config, historyService)
+    : undefined;
   const modelCalls: number[] = [];
   const modelPrompts: string[] = [];
   const capturePrompt = (prompt: string) => modelPrompts.push(prompt);
@@ -268,7 +273,7 @@ async function createFixture(options?: {
       isExperimentEnabled: (id) =>
         enabled && (id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_CONSOLIDATION),
     },
-    options?.withSessionUsage ? new SessionUsageService(config, historyService) : undefined
+    sessionUsage
   );
 
   return {
@@ -278,6 +283,7 @@ async function createFixture(options?: {
     historyService,
     memoryService,
     metaService,
+    sessionUsage,
     modelCalls,
     modelPrompts,
     setEnabled: (value) => {
@@ -1445,6 +1451,50 @@ describe("MemoryConsolidationService", () => {
         ]);
       } finally {
         timeoutSpy.mockRestore();
+      }
+    });
+
+    it("frees the queue once a stream ends, while its usage is still being recorded", async () => {
+      // Recording usage takes the session directory's lock: a stall there must not hold every
+      // other workspace's dream, and the usage must still be recorded afterwards.
+      let streamsStarted = 0;
+      using fixture = await createFixture({
+        withSessionUsage: true,
+        modelFactory: () => {
+          const inner = scriptedModel();
+          return new MockLanguageModelV3({
+            doStream: (options) => {
+              streamsStarted++;
+              return inner.doStream(options);
+            },
+          });
+        },
+      });
+      await fixture.addWorkspace("ws-other");
+      let releaseUsage!: () => void;
+      const usageStalled = new Promise<void>((resolve) => {
+        releaseUsage = resolve;
+      });
+      const recorded: string[] = [];
+      spyOn(fixture.sessionUsage!, "recordHeadlessUsage").mockImplementation(
+        async (workspaceId) => {
+          recorded.push(workspaceId);
+          await usageStalled;
+          return undefined;
+        }
+      );
+
+      try {
+        const first = fixture.service.maybeRun("ws-dream", "manual");
+        await until(() => recorded.length === 1);
+        const second = fixture.service.maybeRun("ws-other", "manual");
+        await until(() => streamsStarted === 2);
+
+        releaseUsage();
+        expect((await Promise.all([first, second])).every((run) => run.success)).toBe(true);
+        expect(recorded.sort()).toEqual(["ws-dream", "ws-other"]);
+      } finally {
+        releaseUsage();
       }
     });
 
