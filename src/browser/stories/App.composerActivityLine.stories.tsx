@@ -14,6 +14,7 @@ import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
+import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createOnChatAdapter } from "./helpers/chatSetup";
@@ -355,18 +356,18 @@ export const WorstCaseDesktop: AppStory = {
   },
 };
 
-// The bashes chip folds into "+N" while a turn runs. Its list, opened from the "+N" entry, closes
-// on a row's Escape or the bashes chord and hands focus to the "+N" chip: the hidden bashes chip
-// cannot take it.
-async function assertBashesFromOverflow(line: HTMLElement) {
+// The chips the line has no room for fold into a "+N" chip. Its list opens as a popover above the
+// line here, and a row in it opens that chip's panel and focuses it; the panel's Escape or the
+// chip's chord closes it and hands focus back to the "+N" chip (a folded chip cannot take focus).
+// Reviews is the chip a live turn folds at this width, so the test drives that one.
+async function assertFoldedChipOpensFromList(line: HTMLElement) {
   const more = within(line).getByRole("button", { name: /^\d+ more$/ });
-  for (const close of ["{Escape}", "{Control>}{Alt>}j{/Alt}{/Control}"]) {
+  for (const close of ["{Escape}", "{Control>}{Alt>}r{/Alt}{/Control}"]) {
     await userEvent.click(more);
     const list = await within(line).findByRole("group", { name: "More activity" });
-    await userEvent.click(within(list).getByRole("button", { name: /Bashes/ }));
-    await waitFor(() =>
-      expect(document.activeElement?.closest("[data-process-row]")).not.toBeNull()
-    );
+    await userEvent.click(within(list).getByRole("button", { name: /Reviews/ }));
+    const panel = await findChatActivityPanel();
+    await waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
     await userEvent.keyboard(close);
     await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
     await expect(more).toHaveFocus();
@@ -374,8 +375,7 @@ async function assertBashesFromOverflow(line: HTMLElement) {
 }
 
 // A desktop window: matchMedia sees its width, so the panels open as popovers above the line,
-// while the fixed-width frame narrows the line until chips fold into "+N". 375px, not 390px: the
-// bashes chip still fits a 390px frame.
+// while the fixed-width frame narrows the line until chips fold into "+N".
 export const NarrowPaneDesktop: AppStory = {
   render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-narrow")} />,
   decorators: [phoneFrame(375)],
@@ -385,7 +385,7 @@ export const NarrowPaneDesktop: AppStory = {
   },
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement);
-    await assertBashesFromOverflow(line);
+    await assertFoldedChipOpensFromList(line);
   },
 };
 
@@ -426,17 +426,24 @@ async function assertSheetTabs(line: HTMLElement) {
 
 // The chip that opened the sheet can move into the "+N" chip while the sheet is open: a turn
 // that starts takes room for Stop. Closing the sheet returns focus to the "+N" chip then, not to
-// the page: the hidden chip cannot take it.
+// the page: the hidden chip cannot take it. Which chip a turn pushes out follows the chips' widths,
+// so the test reads it from the two layouts instead of naming one: the chip the live line folds,
+// that fits once the turn ends. Only a chip with a panel (`aria-expanded`) opens the sheet.
 async function assertSheetFocusWhenChipHides(line: HTMLElement, workspaceId: string) {
-  const bashes = line.querySelector<HTMLElement>(
-    '[data-component="BackgroundProcessesBanner"] [data-activity-chip]'
+  const foldedWhileLive = [...line.querySelectorAll<HTMLElement>("[data-activity-chip]")].filter(
+    (chip) => chip.hasAttribute("aria-expanded") && getComputedStyle(chip).visibility === "hidden"
   );
-  if (bashes === null) throw new Error("No background bashes chip");
-  const shown = () => getComputedStyle(bashes).visibility !== "hidden";
-  // Between turns the line has room for the bashes chip.
+  const shown = (chip: HTMLElement) => getComputedStyle(chip).visibility !== "hidden";
+  // Between turns the line has room for a chip that a live turn has none for.
   await endTurn(line, workspaceId);
-  await waitFor(() => expect(shown()).toBe(true));
-  await userEvent.click(bashes);
+  const chip = await waitFor(() => {
+    const fits = foldedWhileLive.find((candidate) => shown(candidate));
+    if (fits === undefined) {
+      throw new Error("No chip the live line folds into +N fits the line once the turn ends");
+    }
+    return fits;
+  });
+  await userEvent.click(chip);
   await screen.findByRole("dialog", { name: "Activity" });
 
   emitChat({
@@ -447,7 +454,7 @@ async function assertSheetFocusWhenChipHides(line: HTMLElement, workspaceId: str
     historySequence: 4,
     startTime: STABLE_TIMESTAMP,
   });
-  await waitFor(() => expect(shown()).toBe(false));
+  await waitFor(() => expect(shown(chip)).toBe(false));
   await userEvent.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Activity" })).toBeNull());
   await waitFor(() =>
@@ -577,5 +584,89 @@ export const SubAgentsOnlyPhone: AppStory = {
     const line = await findLine(canvasElement, 1);
     await assertOneLine(line);
     await assertChipsLeftWithoutDividers(line);
+  },
+};
+
+/** The tallest icon drawn inside a control's drawing, or null when it draws no icon. */
+function drawingIcon(drawing: Element): number | null {
+  const icons = [...drawing.querySelectorAll<SVGElement>("svg")].filter(
+    (svg) => getComputedStyle(svg).display !== "none"
+  );
+  if (icons.length === 0) return null;
+  return Math.max(...icons.map((svg) => svg.getBoundingClientRect().height));
+}
+
+// The phone line draws each of its controls smaller than the touch box around it, so it reads as a
+// secondary row above the composer instead of a band of boxes as large as the composer's own
+// controls. Neither Pixel nor the Storybook test-runner emulates `pointer: coarse`, so the 44px
+// floor globals.css gives a phone's buttons is stood in for here, as in App.phoneViewports'
+// IPhone17ProMaxTouchTargetRows. What this holds is the split itself: the hit area keeps the whole
+// floor (a tap in a chip's empty corner still opens its panel), and the drawing stays inside it.
+export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
+  decorators: [phoneFrame(390)],
+  render: () => (
+    <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-phone-hit-area")} />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const line = await findLine(canvasElement);
+
+    const touchFloor = document.createElement("style");
+    touchFloor.textContent = `[data-component="ChatActivityLine"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; }`;
+    document.head.append(touchFloor);
+    try {
+      await waitFor(() => {
+        const controls = [
+          ...shownChips(line),
+          within(line).getByRole("button", { name: "Stop streaming" }),
+        ];
+        if (controls.length < 2) {
+          throw new Error(
+            `The phone line shows ${controls.length} controls, expected chips and Stop`
+          );
+        }
+        for (const control of controls) {
+          const name = control.getAttribute("aria-label") ?? "control";
+          const hit = control.getBoundingClientRect();
+          const drawingEl = control.firstElementChild;
+          if (drawingEl === null) {
+            throw new Error(`${name} draws on the button instead of inside it`);
+          }
+          const drawing = drawingEl.getBoundingClientRect();
+          // The touch floor globals.css would set, and the row's growth with it: a control capped
+          // below the floor reports its own height here. Half a pixel of play, because the runner's
+          // browser lands layout on fractional pixels.
+          if (hit.height < MOBILE_TOUCH_TARGET_PX - 0.5) {
+            throw new Error(
+              `${name} hits ${Math.round(hit.height)}px, under the ${MOBILE_TOUCH_TARGET_PX}px touch floor`
+            );
+          }
+          if (drawing.height >= hit.height) {
+            throw new Error(
+              `${name} draws ${Math.round(drawing.height)}px inside a ${Math.round(hit.height)}px hit area`
+            );
+          }
+          if (drawing.height >= MOBILE_TOUCH_TARGET_PX) {
+            throw new Error(
+              `${name} draws at the ${MOBILE_TOUCH_TARGET_PX}px touch floor, so the line reads as loud as the composer`
+            );
+          }
+          // The drawing is the control's box around its icon, not the icon itself: a control that
+          // draws on the button has the icon as its first child, and the button is the touch floor.
+          const icon = drawingIcon(drawingEl);
+          if (icon !== null && drawing.height <= icon) {
+            throw new Error(
+              `${name} draws on the button: its first child is the ${Math.round(icon)}px icon`
+            );
+          }
+        }
+      });
+      await assertOneLine(line);
+    } finally {
+      touchFloor.remove();
+    }
   },
 };
