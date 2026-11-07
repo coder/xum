@@ -8,8 +8,8 @@
  * nesting it gives up and calls the script complete: a missed cut costs one
  * shell error, a false rejection blocks real work. It gives up on, for example,
  * a quote inside a double-quoted `${...}`, `case` inside `$(...)`, a heredoc
- * delimiter with `$'`, `$"` or a backslash inside its quotes, and one with an
- * unquoted backtick.
+ * delimiter with `$'`, `$"` or a backslash inside its quotes, one with an unquoted
+ * backtick, and one whose word a backslash-newline continues.
  */
 type CutOffShellConstruct =
   | "single-quote"
@@ -69,6 +69,12 @@ const HEREDOC_OPERATOR = new RegExp(`<<(?:(-?)[ \\t]*((?:${DELIMITER_PART})+))?`
 // An unquoted backtick in the delimiter word: bash ends the body at the word as
 // written, and the word runs on through blanks inside the backticks.
 const BACKTICK_DELIMITER = new RegExp(`<<-?[ \\t]*(?:${DELIMITER_PART})*\``, "y");
+// A backslash that ends the delimiter word joins the next line into it, so bash reads
+// `EO\` plus a line holding `F` as the word `EOF`. The scanner reads words per line, so
+// it holds only `EO`, and a body line equal to `EO` would end the body early and resume
+// code scanning inside a heredoc body, where a body quote reads as an open quote. That
+// rejects a script bash accepts, so a continued word gives up instead.
+const CONTINUED_DELIMITER = /\\\r?\n/y;
 const HEREDOC_DELIMITER_QUOTING = /'([^']*)'|"([^"]*)"|\\./g;
 const UNMODELLED_DELIMITER_QUOTING = /\$['"]|'[^']*\\|"[^"]*\\/;
 const CASE_WORD = /case[ \t\n]/y;
@@ -332,11 +338,20 @@ class ShellScanner {
       this.index += 1;
       return undefined;
     }
+    if (match[2] !== undefined) {
+      CONTINUED_DELIMITER.lastIndex = HEREDOC_OPERATOR.lastIndex;
+      if (CONTINUED_DELIMITER.test(this.text)) {
+        return "complete";
+      }
+    }
     if (match[2] !== undefined && UNMODELLED_DELIMITER_QUOTING.test(match[2])) {
       // Bash decodes $'', $"" and escapes in quoted delimiters; the scanner does not.
       return "complete";
     }
     if (match[2] !== undefined) {
+      // Bash removes the quoting of the delimiter word and expands nothing in it: `<<$D`
+      // ends the body at a line holding the text `$D`, and `<<A\B` ends it at `AB`. So
+      // quote removal alone, which HEREDOC_DELIMITER_QUOTING does, gives the terminator.
       this.heredocs.push({
         delimiter: match[2].replace(
           HEREDOC_DELIMITER_QUOTING,

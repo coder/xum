@@ -53,6 +53,28 @@ describe("describeCutOffBashScript", () => {
     ["backslash in a single-quoted delimiter", "cat <<'E\\'OF'\n$(cut\nE\\'OF\n"],
     ["double-quoted delimiter look-alike line", 'cat <<"E\\"OF"\nE\\\necho "unclosed\n'],
     ["single-quoted delimiter look-alike line", "cat <<'E\\'OF'\nE\\\necho 'unclosed\n"],
+    // A trailing backslash joins the next line into the word, so bash's delimiter is the
+    // joined word (`EOF`) while the scanner reads only the part before the newline.
+    [
+      "heredoc delimiter continued on the next line",
+      "cat <<EO\\\nF\nEO\nit's here\nEOF\necho done\n",
+    ],
+    [
+      "continued heredoc delimiter with no look-alike body line",
+      "cat <<EO\\\nF\nit's here\nEOF\necho done\n",
+    ],
+    [
+      "continued heredoc delimiter after <<- with tabbed lines",
+      "cat <<-EO\\\nF\n\tit's here\n\tEOF\necho done\n",
+    ],
+    [
+      "continued heredoc delimiter inside a command substitution",
+      "x=$(cat <<EO\\\nF\nit's here\nEOF\n)\necho done\n",
+    ],
+    // Bash removes the quoting of a delimiter word and expands nothing in it, so an
+    // escaped word means `AB` and the scanner models both forms.
+    ["escaped heredoc delimiter word", "cat <<A\\B\nit's here\nAB\necho done\n"],
+    ["variable heredoc delimiter word", "D=EOF\ncat <<$D\nit's\n$D\necho done\n"],
     // Bash ends the body at a backtick delimiter as written; the scanner gives up on it.
     ["backtick heredoc delimiter", "cat <<`echo EOF`\nit's\n`echo EOF`\n"],
     ["backtick heredoc delimiter after <<-", "cat <<-`echo EOF`\n\tit's\n\t`echo EOF`\n"],
@@ -134,6 +156,13 @@ describe("describeCutOffBashScript", () => {
     ],
     ["double quote ending in a backslash", "unterminated double quote", `echo "a \\`],
     ["double quote after a heredoc", "unterminated double quote", `cat <<A\nA\necho "x`],
+    // Bash does not expand the delimiter word, so the body ends at the literal `$D` line
+    // and the quote after it is a real cut. bash -n exits 2 on this script.
+    [
+      "single quote after a heredoc with a variable word",
+      "unterminated single quote",
+      "D=EOF\ncat <<$D\nbody\n$D\necho 'cut\n",
+    ],
     [
       "double quote after a double-quoted delimiter",
       "unterminated double quote",
