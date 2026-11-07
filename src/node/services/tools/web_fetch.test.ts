@@ -267,6 +267,48 @@ describe("web_fetch tool", () => {
     expect(isCurlCommand(execSpy.mock.calls[1]?.[1] ?? "")).toBe(true);
   });
 
+  it.each([
+    { network: "allowlist" as const, resolvesAndPins: false },
+    { network: "loopback" as const, resolvesAndPins: false },
+    { network: "open" as const, resolvesAndPins: true },
+  ])(
+    "in the agent sandbox with the $network network, resolves and pins: $resolvesAndPins",
+    async ({ network, resolvesAndPins }) => {
+      using tempDir = new TestTempDir("test-web-fetch");
+      const config = createTestToolConfig(tempDir.path);
+      config.runtime.agentSandboxPolicy = () => ({
+        writeRoots: [],
+        denyWrite: [],
+        denyRead: [],
+        allowRead: [],
+        network,
+        allowedHosts: [],
+        allowLocalBinding: true,
+      });
+      const tool = createWebFetchTool(config);
+      const execSpy = mockRuntimeExec((_runtime, command) =>
+        Promise.resolve(
+          isRuntimeResolveCommand(command)
+            ? createExecResult({ stdout: "93.184.216.34\n" })
+            : createExecResult({
+                stdout: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nproxied",
+              })
+        )
+      );
+
+      const result = (await tool.execute!(
+        { url: "https://public.example/article" },
+        toolCallOptions
+      )) as WebFetchToolResult;
+
+      expect(result.success).toBe(true);
+      const commands = execSpy.mock.calls.map(([, command]) => command);
+      expect(commands.some(isRuntimeResolveCommand)).toBe(resolvesAndPins);
+      const curl = commands.find(isCurlCommand) ?? "";
+      expect(curl.includes("--connect-to")).toBe(resolvesAndPins);
+    }
+  );
+
   it("revalidates redirect hostnames through the runtime before following them", async () => {
     using testEnv = createTestWebFetchTool();
 
