@@ -54,13 +54,17 @@ export function resolveAgentSandboxSettings(
   global: AgentSandboxConfig | undefined,
   project: AgentSandboxConfig | undefined
 ): ResolvedAgentSandboxSettings {
-  const pick = <K extends keyof AgentSandboxConfig>(key: K): AgentSandboxConfig[K] =>
-    project?.[key] ?? global?.[key];
+  const pick = <K extends keyof AgentSandboxConfig>(
+    key: K,
+    fallback: NonNullable<AgentSandboxConfig[K]>
+  ): NonNullable<AgentSandboxConfig[K]> =>
+    // mutation-equivalent: the only falsy set value is `enabled: false`, whose fallback is false
+    project?.[key] ?? global?.[key] ?? fallback;
   return {
-    enabled: pick("enabled") === true,
-    network: pick("network") ?? "allowlist",
-    allowedHosts: [...(pick("allowedHosts") ?? DEFAULT_ALLOWED_HOSTS)],
-    extraWritePaths: [...(pick("extraWritePaths") ?? [])],
-    extraReadPaths: [...(pick("extraReadPaths") ?? [])],
+    enabled: pick("enabled", false),
+    network: pick("network", "allowlist"),
+    allowedHosts: [...pick("allowedHosts", [...DEFAULT_ALLOWED_HOSTS])],
+    extraWritePaths: [...pick("extraWritePaths", [])],
+    extraReadPaths: [...pick("extraReadPaths", [])],
   };
 }
