@@ -210,8 +210,8 @@ export function BackupPluginsCard(props: {
       </ul>
       {plugins.some((plugin) => plugin.status === "conflict") ? (
         <p className="text-muted text-xs">
-          A plugin marked “Name in use” is not offered: this machine already has a different
-          version, or a folder Xum does not manage, under that name.
+          A plugin marked “Name in use” is not offered: this machine already has another commit,
+          another repository or folder, or a folder Xum does not manage, under that name.
         </p>
       ) : null}
       {missing.length > 0 ? (
