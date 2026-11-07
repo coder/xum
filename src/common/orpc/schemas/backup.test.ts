@@ -61,8 +61,20 @@ describe("BackupPluginManifestSchema", () => {
   test.each([
     ["a short commit id", entry({ lockedSha: "abc1234" })],
     ["an uppercase commit id", entry({ lockedSha: "A".repeat(40) })],
+    ["a 64-character commit id", entry({ lockedSha: "a".repeat(64) })],
     ["a name with a path separator", entry({ name: "../evil" })],
     ["a reserved device name", entry({ name: "con" })],
+    [
+      "a url git would read as an option",
+      entry({
+        source: {
+          type: "git",
+          url: "--upload-pack=touch /tmp/pwned",
+          ref: "main",
+          refType: "branch",
+        },
+      }),
+    ],
     ["a non-git source", entry({ source: { type: "path", url: "/tmp/x" } })],
     [
       "an oversized url",

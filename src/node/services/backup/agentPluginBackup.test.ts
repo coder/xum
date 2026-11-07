@@ -215,6 +215,9 @@ describe("backup of the managed plugin list", () => {
           },
         }),
         registryRow("unpinned", { lockedSha: "abc123" }),
+        registryRow("dash-url", {
+          source: { type: "git", url: "-oProxyCommand=x", ref: "main", refType: "branch" },
+        }),
       ]);
       const { payload, managed, request } = await prepare();
 
@@ -483,6 +486,27 @@ describe("backup of the managed plugin list", () => {
 
       expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
       expect(preview.pluginListWarnings).toHaveLength(3);
+    });
+
+    it("leaves out a row whose url git would read as an option, and a row pinned to a short id", async () => {
+      const { payload, managed, request } = await backupOf([registryRow("alpha")]);
+      const sidecar = (await readSidecar(managed)) as { plugins: Array<Record<string, unknown>> };
+      const [alpha] = sidecar.plugins;
+      const option = {
+        ...alpha,
+        name: "option-url",
+        source: { type: "git", url: "--upload-pack=x", ref: "main", refType: "branch" },
+      };
+      const short = { ...alpha, name: "short-id", lockedSha: "a".repeat(39) };
+      await writeSidecar(
+        managed,
+        JSON.stringify({ schemaVersion: 1, plugins: [alpha, option, short] })
+      );
+
+      const preview = await previewAndValidate(payload, request);
+
+      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.pluginListWarnings).toHaveLength(2);
     });
 
     it("reads only the first rows of an oversized list and caps the warnings", async () => {

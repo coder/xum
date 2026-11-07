@@ -55,6 +55,13 @@ export const BackupProjectImportResultSchema = z.object({
   registered: z.boolean(),
 });
 
+/**
+ * A full commit id. The same shape as `isFullCommitSha` (src/node/services/agentPlugins/sourceInput.ts),
+ * which common code cannot import. Lowercase only: the install status and the pinned-commit check
+ * compare ids as exact strings, and git prints lowercase.
+ */
+const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
 /** Cap on the plugins one backup list names: it is repository-controlled, and a restore shows every row. */
 export const MAX_BACKUP_PLUGIN_ENTRIES = 512;
 
@@ -68,12 +75,18 @@ export const MAX_BACKUP_PLUGIN_ENTRIES = 512;
 export const BackupPluginEntrySchema = z.object({
   name: AgentPluginInstallEntrySchema.shape.name,
   source: AgentPluginGitSourceSchema.extend({
-    url: z.string().min(1).max(2048),
+    // The list is repository-controlled and the preview hands this URL to git: a leading dash
+    // would be read as a git option, not a repository.
+    url: z
+      .string()
+      .min(1)
+      .max(2048)
+      .regex(/^[^-]/, { message: "A repository URL must not start with '-'" }),
     ref: z.string().min(1).max(256),
     subpath: z.string().min(1).max(1024).optional(),
   }),
   /** Full commit id: a restore previews this exact commit, whatever `source.ref` tracks now. */
-  lockedSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  lockedSha: z.string().regex(FULL_COMMIT_SHA_PATTERN, { message: "Not a full commit id" }),
   /** The install method of a plugin Xum generated a plugin.json for; absent takes the first that fits. */
   method: AgentPluginInstallMethodSchema.optional(),
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
