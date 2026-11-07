@@ -194,18 +194,15 @@ describe("checkCostCeiling", () => {
     [0.07, "0.07"],
     [0.14, "0.14"],
     [1.1000001, "1.11"],
-  ])(
-    "prints an estimate of %d as %s: up, but not past an exact cent",
-    (estimatedUsd, printed) => {
-      const check = checkCostCeiling({
-        ceilingUsd: 0.01,
-        estimatedUsd,
-        pricingModel: defaultModel,
-      });
-      expect(check.allowed).toBe(false);
-      if (!check.allowed) expect(check.reason).toContain(`estimate ${printed} USD`);
-    }
-  );
+  ])("prints an estimate of %d as %s: up, but not past an exact cent", (estimatedUsd, printed) => {
+    const check = checkCostCeiling({
+      ceilingUsd: 0.01,
+      estimatedUsd,
+      pricingModel: defaultModel,
+    });
+    expect(check.allowed).toBe(false);
+    if (!check.allowed) expect(check.reason).toContain(`estimate ${printed} USD`);
+  });
 
   it("refuses a model with no known price once a ceiling is set, and names the model", () => {
     const check = checkCostCeiling({
