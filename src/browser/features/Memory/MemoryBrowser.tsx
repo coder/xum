@@ -22,6 +22,7 @@ import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -508,6 +509,19 @@ function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | nu
   return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
 }
 
+function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
+  if (record === null) return "never";
+  // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
+  const counts =
+    record.ops === undefined
+      ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+      : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  // Why a completed run read only part of its epoch (its edit budget ran out), so a line that says
+  // "completed" does not read as "everything analyzed".
+  const note = record.note === undefined ? "" : ` · ${record.note}`;
+  return `${record.status}: ${counts}${note}`;
+}
+
 /**
  * Dream consolidation surface (memory-consolidation experiment, PRD #3534):
  * "last consolidated" line + manual run button. Self-contained — fetches its
@@ -568,9 +582,7 @@ function ConsolidationFooter(props: {
     status?.projectAvailable === false
       ? "unavailable"
       : formatConsolidationRecord(status?.projectRecord ?? null);
-  const harvestLabel = status?.latestHarvestRecord
-    ? `${status.latestHarvestRecord.status}: ${status.latestHarvestRecord.acceptedCandidates} accepted / ${status.latestHarvestRecord.skippedCandidates} skipped`
-    : "never";
+  const harvestLabel = formatHarvestRecord(status?.latestHarvestRecord ?? null);
   const harvestError =
     status?.latestHarvestRecord?.status === "failed" ? status.latestHarvestRecord.error : undefined;
   // One consolidation pass can cover workspace, project, and global memory at
@@ -601,7 +613,9 @@ function ConsolidationFooter(props: {
           <div className="counter-nums truncate">
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
-          <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          {/* Wrap, never truncate: the harvest line carries the note that a run read only part of
+              its epoch, and a touch screen cannot open the tooltip that would show the rest. */}
+          <div className="counter-nums break-words">Harvest: {harvestLabel}</div>
           {harvestError !== undefined && (
             <div role="alert" className="text-error truncate">
               Harvest error: {harvestError}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { redactSecretLike } from "./memorySecretRedaction";
+import { containsSecretLike, redactSecretLike } from "./memorySecretRedaction";
 
 describe("redactSecretLike", () => {
   const FAKE = {
@@ -132,8 +132,7 @@ describe("redactSecretLike", () => {
     );
   });
 
-  // Tool output is text a repository or a web page controls, so a hostile 100 KB result must not
-  // stall the process.
+  // The guard scans text a model supplied, so a hostile 100 KB write must not stall the process.
   // Each shape repeats a keyword with nothing after it, which made the open-ended name suffix and
   // JWT segment rescan to the end of the text from every occurrence (seconds per input).
   it.each([
@@ -153,6 +152,16 @@ describe("redactSecretLike", () => {
     redactSecretLike("warm up token: abc"); // keep a cold regex compile out of the timing
     const started = performance.now();
     redactSecretLike(text);
+    containsSecretLike(text);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("containsSecretLike", () => {
+  it("flags a credential shape and passes ordinary prose about tokens", () => {
+    expect(containsSecretLike("DB_PASSWORD=hunter2 npm start")).toBe(true);
+    expect(containsSecretLike(`key sk-${"k3J9".repeat(6)}`)).toBe(true);
+    expect(containsSecretLike("The token budget resets each turn; max_tokens: 4096.")).toBe(false);
+    expect(containsSecretLike("Auth uses a password manager and a bearer scheme.")).toBe(false);
   });
 });

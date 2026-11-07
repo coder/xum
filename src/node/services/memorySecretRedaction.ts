@@ -1,13 +1,14 @@
 /**
- * Credential-shape detection for text that reaches a model whose output is written to memory.
- * The harvest transcript renderer redacts tool output and the compaction summary with it before
- * the model reads them. A heuristic, not a vault: it catches common shapes, not every secret.
+ * Credential-shape detection for text that reaches, or is about to be written to, memory.
+ * Shared by the harvest transcript renderer (redacts before a model reads tool output) and the
+ * guarded memory tool (rejects a write that carries a credential), so both agree on what a
+ * secret looks like. A heuristic, not a vault: it catches common shapes, not every secret.
  *
- * Tool output is text a repository, a web page or a command controls, so no pattern may backtrack
- * quadratically. A quantifier that a failed match rescans (a name suffix, a gap, a JWT segment, a
- * PEM label) is bounded or anchored to the start of a character run. Token bodies after a fixed
- * prefix are left open: once their minimum is met the match succeeds, so nothing rescans them, and
- * a bound would leave the tail of a long credential readable.
+ * The guard runs this on model-supplied text, so no pattern may backtrack quadratically. A
+ * quantifier that a failed match rescans (a name suffix, a gap, a JWT segment, a PEM label) is
+ * bounded or anchored to the start of a character run. Token bodies after a fixed prefix are left
+ * open: once their minimum is met the match succeeds, so nothing rescans them, and a bound would
+ * leave the tail of a long credential readable.
  */
 
 const REDACTED = "[redacted]";
@@ -56,4 +57,9 @@ export function redactSecretLike(text: string): string {
     SECRET_KEY_VALUE_PATTERN,
     (_match, prefix: string) => `${prefix}${REDACTED}`
   );
+}
+
+/** True when `text` holds a credential shape: redacting it would change it. */
+export function containsSecretLike(text: string): boolean {
+  return redactSecretLike(text) !== text;
 }
