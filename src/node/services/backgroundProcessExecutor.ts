@@ -761,8 +761,9 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   }
 
   /** Called once the manager is done with the process, which runs independently via nohup. */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     this.releaseSandboxNetwork();
+    return Promise.resolve();
   }
 
   /**
