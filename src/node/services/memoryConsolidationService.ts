@@ -454,18 +454,23 @@ function harvestRecordIdentity(
 const OPEN_EPOCH_KEY_PREFIX = "open:";
 
 /**
- * The ids of the rows that completed open-epoch runs ended on: every row up to each was analyzed.
- * Read from the records, so a pruned record only loses its floor, which re-reads rows instead of
- * skipping any.
+ * The ids of the rows that completed open-epoch runs read up to: every row up to each was
+ * analyzed. That is the record's `readThroughRowId`, not always the newest row its key names: a run
+ * that skipped chunks for its budget never read the rows after it. A record from before the field
+ * read everything up to its key's row. Read from the records, so a pruned record only loses its
+ * floor, which re-reads rows instead of skipping any.
  */
 function analyzedOpenEpochRowIds(
   records: Record<string, MemoryHarvestRecord> | undefined
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
-    if (record.status === "completed" && boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) {
-      ids.add(boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length));
-    }
+    if (record.status !== "completed" || !boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
+    const readThrough =
+      record.readThroughRowId === undefined
+        ? boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length)
+        : record.readThroughRowId;
+    if (readThrough !== null) ids.add(readThrough);
   }
   return ids;
 }
@@ -1605,7 +1610,7 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const saveCompleted = (
         progress: HarvestProgress,
-        outcome: Pick<MemoryHarvestRecord, "usage" | "note"> = {}
+        outcome: Pick<MemoryHarvestRecord, "usage" | "note" | "readThroughRowId"> = {}
       ): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(
           workspaceId,
@@ -1619,6 +1624,7 @@ export class MemoryConsolidationService extends EventEmitter {
             ...harvestAttemptFields(progress, opts.attemptState),
             usage: outcome.usage,
             note: outcome.note,
+            readThroughRowId: outcome.readThroughRowId,
           },
           ctx.projectPath
         );

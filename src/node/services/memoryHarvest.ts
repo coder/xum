@@ -102,6 +102,13 @@ export interface MemoryHarvestResult extends HarvestProgress {
   streamError?: string;
   /** Why the run ended before it read every chunk, when it did: see `budgetSpentNote`. */
   note?: string;
+  /**
+   * The newest history row the run, with its earlier attempts, read completely: the last message
+   * of the last chunk a model call read (see `HarvestChunk`). Null when none. It is behind the
+   * epoch's newest row when the run skipped chunks, so a later run must start after it, not after
+   * the newest row. Absent when the run did not get as far as reading.
+   */
+  readThroughRowId?: string | null;
 }
 
 const MEDIA_STUB = "[media]";
@@ -273,13 +280,26 @@ const ROW_SEPARATOR = ",\n";
 const ROW_INDENT = "  ";
 const CHUNK_FRAME_CHARS = CHUNK_OPEN.length + CHUNK_CLOSE.length;
 
+/** One model call's worth of the epoch's transcript. */
+interface HarvestChunk {
+  transcript: string;
+  /**
+   * The id of the newest message (a history row, as `analyzedFloorRowId` uses the word) that ends
+   * in this chunk or an earlier one: once the chunk is read, so is that message and every one
+   * before it. Null while the first message is still going. A message that runs on into the next
+   * chunk is not counted, because the rest of it is not read yet.
+   */
+  readThroughRowId: string | null;
+}
+
 /**
  * Splits the epoch into transcript chunks. Pure over `messages`, so a retry of the same epoch
  * rebuilds the same chunks and the resume cursor (`HarvestProgress.nextChunk`) points at the same one.
  * A chunk holds whole rows; a message with many parts spans several rows and so several chunks.
  */
-export function buildHarvestChunks(messages: MuxMessage[]): string[] {
-  const chunks: string[] = [];
+export function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
+  const chunks: HarvestChunk[] = [];
+  let completedRowId: string | null = null;
   // Each row as it sits in the chunk's `JSON.stringify(rows, null, 2)`, and their total length with
   // the separators. Counting as rows arrive keeps the build linear: stringifying the whole chunk
   // again for every new row took seconds on an epoch of thousands of tool-heavy messages.
@@ -288,7 +308,10 @@ export function buildHarvestChunks(messages: MuxMessage[]): string[] {
 
   function flush(): void {
     if (currentRows.length === 0) return;
-    chunks.push(`${CHUNK_OPEN}${currentRows.join(ROW_SEPARATOR)}${CHUNK_CLOSE}`);
+    chunks.push({
+      transcript: `${CHUNK_OPEN}${currentRows.join(ROW_SEPARATOR)}${CHUNK_CLOSE}`,
+      readThroughRowId: completedRowId,
+    });
     currentRows = [];
     currentRowChars = 0;
   }
@@ -312,10 +335,11 @@ export function buildHarvestChunks(messages: MuxMessage[]): string[] {
       currentRowChars = grownChars;
       currentRows.push(rowJson);
     }
+    completedRowId = message.id;
   }
 
   flush();
-  if (chunks.length === 0) return ["[]"];
+  if (chunks.length === 0) return [{ transcript: "[]", readThroughRowId: null }];
   return chunks;
 }
 
@@ -534,7 +558,7 @@ export function harvestChunkInputChars(args: {
 }): number[] {
   const chunks = buildHarvestChunks(args.messages);
   const { startChunk, landedInStartChunk } = resumePoint(chunks.length, args.resume);
-  return chunks.flatMap((transcript, index) =>
+  return chunks.flatMap(({ transcript }, index) =>
     index < startChunk
       ? []
       : [
@@ -608,6 +632,9 @@ export async function runMemoryHarvest(args: {
   let note: string | undefined;
   let usage: MemoryHarvestResult["usage"];
   let nextChunk = resumed.startChunk;
+  // Chunks that were read: the cursor, except after a budget skip, which moves it past chunks
+  // nobody read.
+  let readChunks = nextChunk;
   for (let index = nextChunk; index < chunks.length; index++) {
     if (budget.used() >= budget.limit) {
       // The cursor moves to the end: a retry resumes the same spent budget and would skip them again.
@@ -642,7 +669,7 @@ export async function runMemoryHarvest(args: {
         summary: args.summary,
         index,
         total: chunks.length,
-        transcript: chunks[index],
+        transcript: chunks[index].transcript,
         landedOps: index === resumed.startChunk ? resumed.landedInStartChunk : undefined,
       }),
       signal,
@@ -656,9 +683,11 @@ export async function runMemoryHarvest(args: {
     }
     usage = sumUsage(usage, outcome.usage);
     nextChunk = index + 1;
+    readChunks = nextChunk;
     finishedOps = priorOps.length + journal.length;
     await args.onChunkComplete?.(progressFor(nextChunk));
   }
 
-  return { ...progressFor(nextChunk), usage, streamError, note };
+  const readThroughRowId = readChunks === 0 ? null : chunks[readChunks - 1].readThroughRowId;
+  return { ...progressFor(nextChunk), usage, streamError, note, readThroughRowId };
 }

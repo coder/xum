@@ -575,6 +575,8 @@ describe("runMemoryHarvest", () => {
 
     expect(result.streamError).toBeUndefined();
     expect(streamCalls).toBeGreaterThan(1);
+    // Every chunk was read: through the epoch's newest row.
+    expect(result.readThroughRowId).toBe("m11");
   });
 
   it("keeps the compaction summary in the prompt of every chunk", async () => {
@@ -913,6 +915,8 @@ describe("runMemoryHarvest", () => {
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toContain("chunks 2-3 of 3");
       expect(reached).toEqual([1]);
+      // The cursor is past all three chunks, but only chunk 1's rows were read: m0 to m4.
+      expect(result.readThroughRowId).toBe("m4");
     });
 
     it("does not call the model at all when a retry resumes with the budget already spent", async () => {
@@ -927,6 +931,21 @@ describe("runMemoryHarvest", () => {
       expect(calls).toHaveLength(0);
       expect(result.nextChunk).toBe(3);
       expect(result.note).toContain("chunks 2-3 of 3");
+      // The attempt before it read chunk 1.
+      expect(result.readThroughRowId).toBe("m4");
+    });
+
+    it("reads through nothing when the budget was spent before any chunk was read", async () => {
+      using fixture = createFixture();
+      fixture.messages = manyChunkMessages();
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model, {
+        resume: { nextChunk: 0, ops: [], budgetUsed: MEMORY_ANALYZER_OP_BUDGET },
+      });
+
+      expect(calls).toHaveLength(0);
+      expect(result.readThroughRowId).toBeNull();
     });
 
     it("leaves no note when the last chunk is the one that spends the budget", async () => {
@@ -944,6 +963,7 @@ describe("runMemoryHarvest", () => {
       expect(result.nextChunk).toBe(1);
       expect(result.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
       expect(result.note).toBeUndefined();
+      expect(result.readThroughRowId).toBe("m1");
     });
 
     it("counts the edits an earlier attempt applied against the epoch's budget", async () => {
@@ -1282,6 +1302,9 @@ describe("runMemoryHarvest", () => {
 describe("buildHarvestChunks", () => {
   const CHUNK_LIMIT = 40_000;
 
+  const transcriptsOf = (messages: MuxMessage[]): string[] =>
+    buildHarvestChunks(messages).map((chunk) => chunk.transcript);
+
   /** `count` one-part user messages whose texts hold `totalChars` characters between them. */
   function messagesHolding(totalChars: number, count: number): MuxMessage[] {
     return Array.from({ length: count }, (_, index) =>
@@ -1296,7 +1319,7 @@ describe("buildHarvestChunks", () => {
 
   /** The text size that makes a chunk of `count` rows exactly `chunkChars` long, whatever a row's frame is. */
   function textCharsFillingChunk(count: number, chunkChars: number): number {
-    const oneCharEach = buildHarvestChunks(messagesHolding(count, count));
+    const oneCharEach = transcriptsOf(messagesHolding(count, count));
     expect(oneCharEach).toHaveLength(1);
     return chunkChars - oneCharEach[0].length + count;
   }
@@ -1305,11 +1328,59 @@ describe("buildHarvestChunks", () => {
     const count = 7;
     const fitting = textCharsFillingChunk(count, CHUNK_LIMIT);
 
-    const exact = buildHarvestChunks(messagesHolding(fitting, count));
+    const exact = transcriptsOf(messagesHolding(fitting, count));
     expect(exact.map((chunk) => chunk.length)).toEqual([CHUNK_LIMIT]);
 
-    const over = buildHarvestChunks(messagesHolding(fitting + 1, count));
+    const over = transcriptsOf(messagesHolding(fitting + 1, count));
     expect(over.map((chunk) => (JSON.parse(chunk) as unknown[]).length)).toEqual([count - 1, 1]);
+  });
+
+  describe("the row each chunk reads through", () => {
+    it("is the last message of the chunk", () => {
+      expect(
+        buildHarvestChunks(manyChunkMessages()).map((chunk) => chunk.readThroughRowId)
+      ).toEqual(["m4", "m9", "m11"]);
+    });
+
+    it("leaves out a message that runs on into the next chunk", () => {
+      const longTurn = createMuxMessage(
+        "long",
+        "assistant",
+        "A long turn.",
+        { historySequence: 1 },
+        // 70 results of 1.5 KB: one message of over 100 KB, several chunks.
+        Array.from({ length: 70 }, (_, index) =>
+          toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+        )
+      );
+      const chunks = buildHarvestChunks([
+        createMuxMessage("before", "user", "short", { historySequence: 0 }),
+        longTurn,
+        createMuxMessage("after", "user", "short", { historySequence: 2 }),
+      ]);
+
+      expect(chunks.length).toBeGreaterThan(2);
+      // The long turn ends in the last chunk, with the message after it. Until then the newest
+      // message read in full is the one before it.
+      expect(chunks.slice(0, -1).every((chunk) => chunk.readThroughRowId === "before")).toBe(true);
+      expect(chunks.at(-1)?.readThroughRowId).toBe("after");
+    });
+
+    it("is null while the epoch's first message is still going", () => {
+      const [first] = buildHarvestChunks([
+        createMuxMessage(
+          "only",
+          "assistant",
+          "A long turn.",
+          { historySequence: 0 },
+          Array.from({ length: 70 }, (_, index) =>
+            toolPart("bash", { script: `step ${index}` }, { output: "y".repeat(1_500) })
+          )
+        ),
+      ]);
+
+      expect(first.readThroughRowId).toBeNull();
+    });
   });
 
   it("closes each chunk as the pretty JSON of its rows, filled until the next row would pass the limit", () => {
@@ -1332,7 +1403,7 @@ describe("buildHarvestChunks", () => {
       )
     );
 
-    const chunks = buildHarvestChunks(messages);
+    const chunks = transcriptsOf(messages);
 
     const rowsOf = chunks.map((chunk) => JSON.parse(chunk) as Array<{ id: string }>);
     expect(chunks.length).toBeGreaterThan(10);
@@ -1369,7 +1440,7 @@ describe("buildHarvestChunks", () => {
     });
 
     function rowsOf(...messages: MuxMessage[]): Row[] {
-      return buildHarvestChunks(messages).flatMap((chunk) => JSON.parse(chunk) as Row[]);
+      return transcriptsOf(messages).flatMap((chunk) => JSON.parse(chunk) as Row[]);
     }
 
     /** One assistant message whose parts are texts of the given lengths, in order. */
@@ -1505,7 +1576,7 @@ describe("buildHarvestChunks", () => {
       }) as typeof JSON.stringify);
       let chunks: string[];
       try {
-        chunks = buildHarvestChunks(messages);
+        chunks = transcriptsOf(messages);
       } finally {
         spy.mockRestore();
       }

@@ -2255,6 +2255,99 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      it("starts the compaction that closes the epoch after the rows an archive that ran out of edits read, not after its newest row", async () => {
+        const analyzerPrompts: Array<{ closing: boolean; prompt: string }> = [];
+        using fixture = await createFixture({
+          modelFactory: () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const prompt = userPromptText(options);
+                const closing = prompt.includes("just-compacted transcript epoch");
+                analyzerPrompts.push({ closing, prompt });
+                if (closing) return Promise.resolve({ stream: noChangesStream() });
+                // The archive's first chunk spends every edit of the epoch's budget.
+                return Promise.resolve({
+                  stream: simulateReadableStream({
+                    chunks: [
+                      ...Array.from(
+                        { length: MEMORY_ANALYZER_OP_BUDGET },
+                        (_, index): LanguageModelV3StreamPart => ({
+                          type: "tool-call",
+                          toolCallId: `spend-${index}`,
+                          toolName: "memory",
+                          input: JSON.stringify({
+                            command: "create",
+                            path: `/memories/workspace/spend-${index}.md`,
+                            file_text: `fact ${index}\n`,
+                          }),
+                        })
+                      ),
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                        usage: {
+                          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                          outputTokens: { total: 1, text: 0, reasoning: 0 },
+                        },
+                      },
+                    ],
+                  }),
+                });
+              },
+            }),
+        });
+        // Three chunks of rows bulk-0..4, bulk-5..9 and bulk-10..11.
+        await appendBulkRows(fixture);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect(analyzerPrompts.map((run) => run.closing)).toEqual([false]);
+        const archive = (await harvestRecords(fixture))["open:bulk-11"];
+        expect(archive?.note).toContain("chunks 2-3 of 3");
+        expect(archive?.readThroughRowId).toBe("bulk-4");
+
+        await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+        const closing = analyzerPrompts
+          .filter((run) => run.closing)
+          .map((run) => run.prompt)
+          .join("\n");
+        // The rows no archive chunk read are read now, and the ones it read are not.
+        for (let index = 0; index < 12; index++) {
+          const row = `preference ${index} x`;
+          if (index < 5) expect(closing).not.toContain(row);
+          else expect(closing).toContain(row);
+        }
+      });
+
+      it("takes an archive record from before `readThroughRowId` to have read up to the row its key names", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+          harvestsByWorkspace: Record<string, Record<string, Record<string, unknown>>>;
+        };
+        const record = sidecar.harvestsByWorkspace["ws-dream"]["open:open-2"];
+        expect(record.readThroughRowId).toBe("open-2");
+        delete record.readThroughRowId;
+        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+
+        expect(analyzerRuns(models)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+        });
+      });
+
       it("analyzes every row again once the chat was rewound past the row an archive stopped at", async () => {
         const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });

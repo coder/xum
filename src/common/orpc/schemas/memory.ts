@@ -168,6 +168,12 @@ export const MemoryHarvestRecordSchema = z.object({
    * calls of the remaining chunks were skipped. Optional so older binaries parse the record.
    */
   note: z.string().optional(),
+  /**
+   * The newest row of the epoch the run read completely (null: none). It is behind the newest row
+   * when the run skipped chunks for its budget: the floor of a later run is this row, not the
+   * newest one. Absent in older records, which read up to the row their key names.
+   */
+  readThroughRowId: z.string().nullish(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   /**
    * Upper-bound USD estimate of the attempt's chunks still to analyze, made before the attempt
