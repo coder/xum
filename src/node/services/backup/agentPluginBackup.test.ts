@@ -386,6 +386,23 @@ describe("backup of the managed plugin list", () => {
         expect(error.message).toContain('Turning off "Agent plugins"');
       });
 
+      it("refuses the push when two entries name the same plugin, and counts the second as unreadable", async () => {
+        // Both rows pass the schema, so only their name tells them apart from a healthy list.
+        await writeRegistry(muxRoot, [
+          registryRow("alpha"),
+          registryRow("beta"),
+          registryRow("alpha", { lockedSha: shaOf("z") }),
+        ]);
+
+        const { error, managed } = await exportFailure();
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain(registryFile());
+        expect(error.message).toContain("1 of 3 entries");
+        expect(error.message).toContain('Turning off "Agent plugins"');
+        expect(await exists(path.join(managed, PLUGIN_BACKUP_DIR))).toBe(false);
+      });
+
       it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
         "refuses the push for a plugins.json it cannot read from disk",
         async () => {

@@ -1,10 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
-import {
-  AgentPluginInstallEntrySchema,
-  type AgentPluginInstallEntry,
-} from "@/common/config/schemas/agentPluginInstalls";
+import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 import type { BackupContents } from "@/common/config/schemas/settingsBackup";
 import {
   BackupPluginEntrySchema,
@@ -73,9 +70,10 @@ const AGENT_PLUGINS_OFF_HINT = 'Turning off "Agent plugins" backs up without the
 
 /**
  * The registry rows a push lists. A restore only compares names, so it reads what it can. A push
- * writes the list, so a registry it cannot read whole would drop plugins from the backup without
- * a word: the push fails instead, and names the file. A missing file is no plugins. The code is
- * IO_ERROR, not INVALID_BACKUP: the file is on this machine, not in the backup repository.
+ * writes the list, so a registry it cannot read whole (a row it cannot parse, or a name listed
+ * twice) would drop plugins from the backup without a word: the push fails instead, and names the
+ * file. A missing file is no plugins. The code is IO_ERROR, not INVALID_BACKUP: the file is on
+ * this machine, not in the backup repository.
  */
 async function readInstallsToList(muxRoot: string): Promise<AgentPluginInstallEntry[]> {
   const registryFile = path.join(muxRoot, PLUGIN_REGISTRY_FILE_NAME);
@@ -85,16 +83,18 @@ async function readInstallsToList(muxRoot: string): Promise<AgentPluginInstallEn
   } catch (error) {
     throw new BackupServiceError("IO_ERROR", `${getErrorMessage(error)} ${AGENT_PLUGINS_OFF_HINT}`);
   }
-  const unreadable = rawEntries.filter(
-    (row) => !AgentPluginInstallEntrySchema.safeParse(row).success
-  ).length;
+  // The rows the lenient read drops: a row that fails the schema, and a second row of a name (the
+  // first wins there). A repeated name is corrupt identity, so the list could not say which row the
+  // user means.
+  const installs = parseRegistryEntriesLenient(rawEntries);
+  const unreadable = rawEntries.length - installs.length;
   if (unreadable > 0) {
     throw new BackupServiceError(
       "IO_ERROR",
       `The plugin registry (${registryFile}) has ${unreadable} of ${rawEntries.length} entries this version of Xum cannot read, for example plugins a newer Xum installed. Backing up would leave them out of the list. ${AGENT_PLUGINS_OFF_HINT}`
     );
   }
-  return parseRegistryEntriesLenient(rawEntries);
+  return installs;
 }
 
 /**
