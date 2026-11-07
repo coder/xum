@@ -1769,7 +1769,7 @@ describe("MemoryConsolidationService", () => {
       expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream", "dream"]);
     });
 
-    it("analyzes the rows added after an unarchive on the next archive", async () => {
+    it("analyzes only the rows added after an unarchive on the next archive", async () => {
       const models = archivePassModels();
       using fixture = await createFixture({ modelFactory: models.factory });
       await seedCompactionEpoch(fixture);
@@ -1786,10 +1786,120 @@ describe("MemoryConsolidationService", () => {
         "dream",
       ]);
       expect(models.runs[2]?.prompt).toContain("CI pins node 22");
+      // The rows the first archive's analysis already read are not sent again.
+      expect(models.runs[2]?.prompt).not.toContain("We settled on bun");
+      expect(models.runs[2]?.prompt).not.toContain("never npm");
       expect(Object.keys(await harvestRecords(fixture)).sort()).toEqual([
         "open:open-2",
         "open:open-3",
       ]);
+    });
+
+    describe("rows an earlier archive analyzed", () => {
+      const analyzerRuns = (models: ReturnType<typeof archivePassModels>) =>
+        models.runs.filter((run) => run.kind === "analyzer");
+
+      /** Closes the epoch the way a compaction does, without a row of its own to analyze. */
+      async function closeEpochWithoutNewRows(
+        fixture: Fixture
+      ): Promise<CompactionCompletionMetadata> {
+        await fixture.historyService.appendToHistory(
+          "ws-dream",
+          createMuxMessage("compact-request", "user", "Please compact", {
+            muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+          })
+        );
+        const summary = createMuxMessage("summary-1", "assistant", "Scripts use bun.", {
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+        });
+        await fixture.historyService.appendToHistory("ws-dream", summary);
+        return {
+          workspaceId: "ws-dream",
+          summaryMessageId: "summary-1",
+          summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+          compactionEpoch: 1,
+          compactionRequestMessageId: "compact-request",
+        };
+      }
+
+      it("sends the compaction that closes the epoch only the rows after them", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        // seedCompactionEpoch adds one more row, "remember that I prefer concise tests".
+        const metadata = await seedCompactionEpoch(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(2);
+        const closing = analyzerRuns(models)[1]?.prompt ?? "";
+        expect(closing).toContain("CI pins node 22");
+        expect(closing).toContain("remember that I prefer concise tests");
+        expect(closing).not.toContain("We settled on bun");
+        expect(closing).not.toContain("never npm");
+        expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+      });
+
+      it("makes no analyzer call for a compaction that closes an epoch an archive fully analyzed", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        const metadata = await closeEpochWithoutNewRows(fixture);
+
+        await fixture.service.maybeHarvestThenSweep(metadata);
+
+        expect(analyzerRuns(models)).toHaveLength(1);
+        expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+          status: "completed",
+          nextChunk: 0,
+          acceptedCandidates: 0,
+        });
+      });
+
+      it("analyzes every row again once the chat was rewound past the row an archive stopped at", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // Rewind to before the row the archive stopped at, then grow past its old position. A
+        // history sequence is reused after a rewind; a row id never is.
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-2")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-2b", "Actually scripts use pnpm."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        const rerun = analyzerRuns(models)[1]?.prompt ?? "";
+        expect(rerun).toContain("Actually scripts use pnpm.");
+        expect(rerun).toContain("We settled on bun");
+      });
+
+      it("keeps the floor of an older archive when a newer one was rewound away", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        await appendRows(fixture, [["open-3", "CI pins node 22 for the release job."]]);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        expect(
+          (await fixture.historyService.truncateAfterMessage("ws-dream", "open-3")).success
+        ).toBe(true);
+        await appendRows(fixture, [["open-3b", "CI pins node 24 instead."]]);
+
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+        // open-2 is still in the chat, so what an archive read up to it stays read.
+        const rerun = analyzerRuns(models)[2]?.prompt ?? "";
+        expect(rerun).toContain("CI pins node 24 instead.");
+        expect(rerun).not.toContain("We settled on bun");
+        expect(rerun).not.toContain("CI pins node 22");
+      });
     });
 
     type EmptyOpenEpoch =

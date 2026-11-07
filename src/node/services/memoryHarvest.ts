@@ -208,6 +208,20 @@ export function selectOpenEpoch(rows: MuxMessage[]): OpenEpoch {
   };
 }
 
+/**
+ * The rows after the newest one whose id is in `analyzedRowIds`, which an earlier run already
+ * analyzed along with every row before it. Rows match by id, never by history sequence: a rewound
+ * chat can reuse a sequence but never an id. With no such row among `rows` (rewound away, or in
+ * another epoch) there is no floor and every row stays.
+ */
+export function rowsAfterAnalyzedFloor<T extends Pick<MuxMessage, "id">>(
+  rows: readonly T[],
+  analyzedRowIds: ReadonlySet<string>
+): T[] {
+  const floorIndex = rows.findLastIndex((row) => analyzedRowIds.has(row.id));
+  return rows.slice(floorIndex + 1);
+}
+
 /** What one analyzer run reads. */
 export interface HarvestEpoch {
   messages: MuxMessage[];

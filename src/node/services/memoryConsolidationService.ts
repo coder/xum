@@ -69,6 +69,7 @@ import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFa
 import type { HistoryService } from "@/node/services/historyService";
 import {
   harvestChunkInputChars,
+  rowsAfterAnalyzedFloor,
   runMemoryHarvest,
   selectOpenEpoch,
   type HarvestEpoch,
@@ -401,6 +402,23 @@ function harvestRecordIdentity(
  * is never reused: a rewound chat can grow back to the same sequence.
  */
 const OPEN_EPOCH_KEY_PREFIX = "open:";
+
+/**
+ * The ids of the rows that completed open-epoch runs ended on: every row up to each was analyzed.
+ * Read from the records, so a pruned record only loses its floor, which re-reads rows instead of
+ * skipping any.
+ */
+function analyzedOpenEpochRowIds(
+  records: Record<string, MemoryHarvestRecord> | undefined
+): Set<string> {
+  const ids = new Set<string>();
+  for (const [boundaryKey, record] of Object.entries(records ?? {})) {
+    if (record.status === "completed" && boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) {
+      ids.add(boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length));
+    }
+  }
+  return ids;
+}
 
 /** Terminal marker for a bucket whose transcript is being deleted (see finalizeHarvestsForRemoval). */
 function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHarvestRecord {
@@ -1263,7 +1281,8 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * Analyzer run over the rows after the latest context boundary. The record key is the newest
    * row (see OPEN_EPOCH_KEY_PREFIX): the same rows are never analyzed twice, new rows get a new
-   * run, and an epoch with nothing to read makes no model call and no record.
+   * run that reads only them (see analyzedOpenEpochRowIds), and an epoch with nothing to read makes
+   * no model call and no record.
    */
   private analyzeOpenEpochEffect(
     workspaceId: string,
@@ -1378,6 +1397,7 @@ export class MemoryConsolidationService extends EventEmitter {
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
       const attemptState: HarvestAttemptState = {};
+      const analyzedRowIds = analyzedOpenEpochRowIds(sidecar.harvestsByWorkspace[workspaceId]);
 
       if (
         existing?.status === "pending" &&
@@ -1449,6 +1469,7 @@ export class MemoryConsolidationService extends EventEmitter {
             removalSignal,
             progress,
             attemptState,
+            analyzedRowIds,
           })
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
@@ -1470,6 +1491,8 @@ export class MemoryConsolidationService extends EventEmitter {
       progress: HarvestProgress;
       /** Shared with the caller for the same reason. */
       attemptState: HarvestAttemptState;
+      /** Rows an earlier open-epoch run analyzed (see analyzedOpenEpochRowIds). */
+      analyzedRowIds: ReadonlySet<string>;
     }
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -1481,6 +1504,36 @@ export class MemoryConsolidationService extends EventEmitter {
         catch: (error) => error,
       });
       if (!epoch.success) return yield* Effect.fail(new Error(epoch.error));
+
+      const saveCompleted = (
+        progress: HarvestProgress,
+        usage?: MemoryHarvestRecord["usage"]
+      ): Effect.Effect<void> =>
+        self.saveHarvestRecordEffect(
+          workspaceId,
+          boundaryKey,
+          {
+            status: "completed",
+            startedAt,
+            completedAt: Date.now(),
+            attemptCount: opts.existingAttemptCount + 1,
+            ...harvestRecordIdentity(source),
+            ...harvestProgressFields(progress),
+            estimatedUsd: opts.attemptState.estimatedUsd,
+            usage,
+          },
+          ctx.projectPath
+        );
+
+      // An archive that read part of this epoch's rows already analyzed them: a second archive
+      // after new rows, and the compaction that later closes the epoch, both start after them.
+      // The floor comes from records that completed before this job, so a retry of the job finds
+      // the floor it started with: no open-epoch run can complete inside an epoch once it closed.
+      const messages = rowsAfterAnalyzedFloor(epoch.data.messages, opts.analyzedRowIds);
+      if (messages.length === 0 && epoch.data.messages.length > 0) {
+        // Every row was analyzed before: nothing is left to read, so no model call.
+        return yield* saveCompleted(opts.progress);
+      }
 
       const modelString = resolveDreamModelString(self.config, workspaceId);
       const modelResult = yield* Effect.tryPromise({
@@ -1503,7 +1556,7 @@ export class MemoryConsolidationService extends EventEmitter {
       opts.attemptState.estimatedUsd = estimateAnalyzerUpperBoundUsd({
         pricingModel: modelResult.data.metadataModel,
         chunkInputChars: harvestChunkInputChars({
-          messages: epoch.data.messages,
+          messages,
           summary: epoch.data.summary,
           fromChunk: opts.progress.nextChunk,
         }),
@@ -1548,7 +1601,7 @@ export class MemoryConsolidationService extends EventEmitter {
             memoryService: self.memoryService,
             metaService: self.metaService,
             ctx,
-            messages: epoch.data.messages,
+            messages,
             summary: epoch.data.summary,
             resume: opts.progress,
             // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
@@ -1586,21 +1639,7 @@ export class MemoryConsolidationService extends EventEmitter {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }
 
-      yield* self.saveHarvestRecordEffect(
-        workspaceId,
-        boundaryKey,
-        {
-          status: "completed",
-          startedAt,
-          completedAt: Date.now(),
-          attemptCount: opts.existingAttemptCount + 1,
-          ...harvestRecordIdentity(source),
-          ...harvestProgressFields(harvest),
-          estimatedUsd: opts.attemptState.estimatedUsd,
-          usage: harvest.usage,
-        },
-        ctx.projectPath
-      );
+      yield* saveCompleted(harvest, harvest.usage);
     });
   }
 
