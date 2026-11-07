@@ -160,7 +160,8 @@ export async function collectPluginBackup(muxRoot: string): Promise<BackupPlugin
   return plugins.length === 0 ? null : { schemaVersion: 1, plugins };
 }
 
-const SCHEME_REMOTE = /^(?:https?|ssh|git):\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/@]+)(?::\d*)?(?:\/(.*))?$/i;
+const SCHEME_REMOTE =
+  /^(?:https?|ssh|git):\/\/(?:[^@/]*@)?(\[[^\]]+\]|[^:/@]+)(?::\d*)?(?:\/(.*))?$/i;
 // `host:path`, not `scheme://...`, and not a drive path (`C:\...`: a host has two characters or more).
 const SCP_REMOTE = /^(?:[^@/:]+@)?([^:/@]{2,}):(?!\/\/)(.*)$/;
 
@@ -379,16 +380,23 @@ async function hasPluginFolder(muxRoot: string, name: string): Promise<boolean> 
 }
 
 /**
- * `installed`: that name at that commit, with its folder. `folderMissing`: the registry lists it
- * but the folder is gone, so it is not installed and a reinstall would collide with the row.
- * Another commit, or a folder the installer does not manage: `conflict`.
+ * `installed`: that name at that commit from that repository and folder (`isSameSource`), with its
+ * folder. `folderMissing`: the registry lists that plugin but the folder is gone, so it is not
+ * installed and a reinstall would collide with the row. Another commit, another source under that
+ * name, or a folder the installer does not manage: `conflict`. The restore only names a plugin by
+ * its source, so a same-named plugin from elsewhere is not the one the backup pinned.
  */
 async function statusOf(
   muxRoot: string,
   plugin: BackupPluginEntry,
   local: AgentPluginInstallEntry | undefined
 ): Promise<BackupPluginStatus> {
-  if (local !== undefined && local.lockedSha !== plugin.lockedSha) return "conflict";
+  if (
+    local !== undefined &&
+    (local.lockedSha !== plugin.lockedSha || !isSameSource(local.source, plugin.source))
+  ) {
+    return "conflict";
+  }
   const folder = await hasPluginFolder(muxRoot, plugin.name);
   if (local === undefined) return folder ? "conflict" : "missing";
   return folder ? "installed" : "folderMissing";

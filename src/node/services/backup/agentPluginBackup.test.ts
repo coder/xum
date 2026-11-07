@@ -477,6 +477,57 @@ describe("backup of the managed plugin list", () => {
       expect(preview.plugins.skipped).toBe(false);
     });
 
+    it("reads a plugin of the same name and commit from another repository or folder as in use", async () => {
+      const source = (url: string, subpath?: string) => ({
+        type: "git",
+        url,
+        ref: "main",
+        refType: "branch",
+        ...(subpath === undefined ? {} : { subpath }),
+      });
+      const mono = "https://github.com/example/mono.git";
+      const { payload, request } = await backupOf([
+        registryRow("same-other-spelling", { source: source(mono, "plugins/a") }),
+        registryRow("other-folder", { source: source(mono, "plugins/a") }),
+        registryRow("no-folder", { source: source(mono, "plugins/a") }),
+        registryRow("other-repo", { source: source(mono, "plugins/a") }),
+        registryRow("other-repo-gone", { source: source(mono, "plugins/a") }),
+        registryRow("same-gone", { source: source(mono, "plugins/a") }),
+      ]);
+      await useLocalRegistry([
+        registryRow("same-other-spelling", {
+          source: source("git@GitHub.com:example/mono", "/plugins/a/"),
+        }),
+        registryRow("other-folder", { source: source(mono, "plugins/b") }),
+        registryRow("no-folder", { source: source(mono) }),
+        registryRow("other-repo", {
+          source: source("https://github.com/someone/mono.git", "plugins/a"),
+        }),
+        registryRow("other-repo-gone", {
+          source: source("https://github.com/someone/mono.git", "plugins/a"),
+        }),
+        registryRow("same-gone", { source: source(mono, "plugins/a") }),
+      ]);
+      for (const name of ["same-other-spelling", "other-folder", "no-folder", "other-repo"]) {
+        await writeFixtureFile(muxRoot, `plugins/${name}/plugin.json`, "{}");
+      }
+
+      const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
+
+      const statuses = Object.fromEntries(
+        (preview.plugins.rows ?? []).map((row) => [row.name, row.status])
+      );
+      expect(statuses).toEqual({
+        "same-other-spelling": "installed",
+        "other-folder": "conflict",
+        "no-folder": "conflict",
+        "other-repo": "conflict",
+        // Another source cannot be a plugin whose folder is gone: a reinstall would still collide.
+        "other-repo-gone": "conflict",
+        "same-gone": "folderMissing",
+      });
+    });
+
     it("hands back the pin and the source a reinstall needs", async () => {
       const { payload, request } = await backupOf([
         registryRow("alpha", {

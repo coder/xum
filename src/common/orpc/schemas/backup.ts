@@ -143,10 +143,10 @@ export interface BackupPluginManifest {
 
 /**
  * How a listed plugin compares with this machine's managed installs: `missing` (nothing by that
- * name), `installed` (that name at the same commit, with its folder), `folderMissing` (the
- * registry lists that name at the same commit but its folder is gone: not offered, since an
- * install would collide with the row), `conflict` (that name is taken by another commit or by a
- * folder the installer does not manage).
+ * name), `installed` (that name at the same commit, repository and folder, with its folder),
+ * `folderMissing` (the registry lists that plugin but its folder is gone: not offered, since an
+ * install would collide with the row), `conflict` (that name is taken by another commit, another
+ * repository or folder, or by a folder the installer does not manage).
  */
 export const BackupPluginStatusSchema = z.enum([
   "missing",
