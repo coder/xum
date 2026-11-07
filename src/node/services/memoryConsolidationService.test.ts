@@ -2048,6 +2048,183 @@ describe("MemoryConsolidationService", () => {
     }
   });
 
+  describe("analyzer queue", () => {
+    interface Gate {
+      opened: Promise<void>;
+      open: () => void;
+    }
+    function gate(): Gate {
+      let open!: () => void;
+      const opened = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      return { opened, open };
+    }
+
+    /**
+     * Models whose analyzer streams each hold until `release(id)`, numbered in the order they
+     * start, with a log of when each starts and ends. The sweep's dream stream is not held.
+     * `modelCreated(n)` and `streamStarted(n)` resolve on the events themselves, so a test waits
+     * on what happened, not on how long it took.
+     */
+    function heldAnalyzers() {
+      const events: string[] = [];
+      const gates = {
+        created: new Map<number, Gate>(),
+        started: new Map<number, Gate>(),
+        released: new Map<number, Gate>(),
+      };
+      const gateFor = (kind: keyof typeof gates, id: number): Gate => {
+        let found = gates[kind].get(id);
+        if (found === undefined) {
+          found = gate();
+          gates[kind].set(id, found);
+        }
+        return found;
+      };
+      let modelsCreated = 0;
+      let analyzerStreams = 0;
+      const factory = () => {
+        gateFor("created", ++modelsCreated).open();
+        const inner = scriptedModel();
+        return new MockLanguageModelV3({
+          doStream: async (options) => {
+            if (!userPromptText(options).includes("just-compacted transcript epoch")) {
+              return inner.doStream(options);
+            }
+            const id = ++analyzerStreams;
+            events.push(`start-${id}`);
+            gateFor("started", id).open();
+            await gateFor("released", id).opened;
+            events.push(`end-${id}`);
+            return inner.doStream(options);
+          },
+        });
+      };
+      return {
+        events,
+        factory,
+        modelCreated: (id: number) => gateFor("created", id).opened,
+        streamStarted: (id: number) => gateFor("started", id).opened,
+        release: (id: number) => gateFor("released", id).open(),
+      };
+    }
+
+    /** Lets every reaction already queued on a promise run. Nothing here waits for elapsed time. */
+    async function settle(): Promise<void> {
+      for (let turn = 0; turn < 5; turn++) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+
+    /**
+     * Starts `first`'s analyzer and holds its stream, then starts `second`'s: past its model
+     * creation, the second run has only its turn left to wait for. Returns once both settled.
+     */
+    async function runSecondBehindFirst(
+      fixture: Fixture,
+      held: ReturnType<typeof heldAnalyzers>,
+      first: CompactionCompletionMetadata,
+      second: CompactionCompletionMetadata
+    ): Promise<void> {
+      const firstRun = fixture.service.maybeHarvestThenSweep(first);
+      await held.streamStarted(1);
+      const secondRun = fixture.service.maybeHarvestThenSweep(second);
+      await held.modelCreated(2);
+      await settle();
+      expect(held.events).toEqual(["start-1"]);
+
+      held.release(1);
+      await held.streamStarted(2);
+      expect(held.events).toEqual(["start-1", "end-1", "start-2"]);
+      held.release(2);
+      await Promise.all([firstRun, secondRun]);
+      expect(held.events).toEqual(["start-1", "end-1", "start-2", "end-2"]);
+    }
+
+    it("runs the analyzers of two compaction boundaries of one workspace one after the other", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      const first = await seedCompactionEpoch(fixture);
+      const second = await seedCompactionEpoch(
+        fixture,
+        "ws-dream",
+        2,
+        first.summaryHistorySequence
+      );
+
+      await runSecondBehindFirst(fixture, held, first, second);
+
+      const records = await harvestRecords(fixture);
+      expect(records["summary-1"]?.status).toBe("completed");
+      expect(records["summary-2"]?.status).toBe("completed");
+    });
+
+    it("runs a sub-agent's analyzer after its owner's, since both write the owner's workspace memory", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+      const owner = await seedCompactionEpoch(fixture);
+      const child = await seedCompactionEpoch(fixture, "ws-sub");
+
+      await runSecondBehindFirst(fixture, held, owner, child);
+
+      expect((await harvestRecords(fixture, "ws-dream"))["summary-1"]?.status).toBe("completed");
+      expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]?.status).toBe("completed");
+    });
+
+    it("does not make a workspace wait for the analyzer of an unrelated one", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-other");
+      const first = await seedCompactionEpoch(fixture);
+      const other = await seedCompactionEpoch(fixture, "ws-other");
+
+      const firstRun = fixture.service.maybeHarvestThenSweep(first);
+      await held.streamStarted(1);
+      const otherRun = fixture.service.maybeHarvestThenSweep(other);
+      // The first stream is still held: the other workspace's analyzer starts anyway.
+      await held.streamStarted(2);
+      expect(held.events).toEqual(["start-1", "start-2"]);
+
+      held.release(1);
+      held.release(2);
+      await Promise.all([firstRun, otherRun]);
+    });
+
+    it("lets removal cancel an analyzer that is still waiting its turn, without wedging the queue", async () => {
+      const held = heldAnalyzers();
+      using fixture = await createFixture({ modelFactory: held.factory });
+      await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+      const owner = await seedCompactionEpoch(fixture);
+      const child = await seedCompactionEpoch(fixture, "ws-sub");
+
+      const ownerRun = fixture.service.maybeHarvestThenSweep(owner);
+      await held.streamStarted(1);
+      const childRun = fixture.service.maybeHarvestThenSweep(child);
+      await held.modelCreated(2);
+      await settle();
+
+      await fixture.service.cancelInFlightConsolidation("ws-sub");
+      await childRun;
+      // The cancelled run never read a chunk; the owner's stream is untouched.
+      expect(held.events).toEqual(["start-1"]);
+      expect((await harvestRecords(fixture, "ws-sub"))["summary-1"]).toMatchObject({
+        status: "failed",
+        error: expect.stringContaining("before its turn") as string,
+      });
+
+      held.release(1);
+      await ownerRun;
+      const next = await seedCompactionEpoch(fixture, "ws-dream", 2, owner.summaryHistorySequence);
+      const nextRun = fixture.service.maybeHarvestThenSweep(next);
+      await held.streamStarted(2);
+      held.release(2);
+      await nextRun;
+      expect((await harvestRecords(fixture, "ws-dream"))["summary-2"]?.status).toBe("completed");
+    });
+  });
+
   describe("dream stream queue", () => {
     /**
      * Models whose streams each hold until `release(id)`, numbered in the order the runs created

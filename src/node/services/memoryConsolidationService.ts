@@ -71,6 +71,7 @@ import { runMemoryHarvest, type HarvestProgress } from "@/node/services/memoryHa
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import { KeyedTurnQueue } from "@/node/utils/concurrency/keyedTurnQueue";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 export type MemoryConsolidationRecord = MemoryConsolidationRecordPayload;
 
@@ -381,6 +382,14 @@ export class MemoryConsolidationService extends EventEmitter {
    * its wait was cancelled.
    */
   private dreamStreamTail: Promise<void> = Promise.resolve();
+
+  /**
+   * Analyzer-stream queue, keyed by the workspace-memory owner. `harvestInFlight` is per
+   * compaction boundary, so two boundaries of one workspace, or an owner and its sub-agent
+   * (which share the owner's /memories/workspace store), could otherwise edit the same files at
+   * once: the model's numeric `insert` line offsets go stale after the other run's insert.
+   */
+  private readonly analyzerStreams = new KeyedTurnQueue();
 
   /**
    * Per-run removal controllers (r60): workspace removal must abort and
@@ -1317,46 +1326,57 @@ export class MemoryConsolidationService extends EventEmitter {
           opts.projectPath
         );
 
+      // One analyzer at a time per owner store. The chunk timeouts start inside runMemoryHarvest,
+      // so they bound the run and never the wait behind another one.
+      const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId);
       const harvest = yield* Effect.tryPromise({
         try: async () =>
-          runMemoryHarvest({
-            model: modelResult.data.model,
-            pricingModel: modelResult.data.metadataModel,
-            memoryService: self.memoryService,
-            metaService: self.metaService,
-            ctx,
-            messages: epoch.data.messages,
-            summary: epoch.data.summary,
-            resume: opts.progress,
-            // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
-            // must not make the retry write the earlier chunks' memory again.
-            onChunkComplete: async (reached) => {
-              adopt(reached);
-              await Effect.runPromise(savePending(reached));
-            },
-            // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
-            abortSignal: opts.removalSignal,
-            recordUsage: async (usage, providerMetadata) => {
-              const recorded = await self.sessionUsageService?.recordHeadlessUsage(
-                metadata.workspaceId,
-                modelString,
-                usage,
-                providerMetadata,
-                {
-                  analyticsSource: "memory_harvest",
-                  // Creation-time identity (see ModelFactoryLike).
-                  metadataModel: modelResult.data.metadataModel,
+          self.analyzerStreams.run(ownerId, opts.removalSignal, async () =>
+            runMemoryHarvest({
+              model: modelResult.data.model,
+              pricingModel: modelResult.data.metadataModel,
+              memoryService: self.memoryService,
+              metaService: self.metaService,
+              ctx,
+              messages: epoch.data.messages,
+              summary: epoch.data.summary,
+              resume: opts.progress,
+              // The cursor reaches disk after each clean chunk: a crash or a later chunk's failure
+              // must not make the retry write the earlier chunks' memory again.
+              onChunkComplete: async (reached) => {
+                adopt(reached);
+                await Effect.runPromise(savePending(reached));
+              },
+              // Removal (r60); each chunk adds its own timeout (see runMemoryHarvest).
+              abortSignal: opts.removalSignal,
+              recordUsage: async (usage, providerMetadata) => {
+                const recorded = await self.sessionUsageService?.recordHeadlessUsage(
+                  metadata.workspaceId,
+                  modelString,
+                  usage,
+                  providerMetadata,
+                  {
+                    analyticsSource: "memory_harvest",
+                    // Creation-time identity (see ModelFactoryLike).
+                    metadataModel: modelResult.data.metadataModel,
+                  }
+                );
+                // Same as consolidation above: request an ingest pass so harvest
+                // spend reaches dashboard totals promptly.
+                if (recorded) {
+                  self.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
                 }
-              );
-              // Same as consolidation above: request an ingest pass so harvest
-              // spend reaches dashboard totals promptly.
-              if (recorded) {
-                self.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
-              }
-            },
-          }),
+              },
+            })
+          ),
         catch: (error) => error,
       });
+      // Removal reached this run while it was still queued: no chunk was read.
+      if (harvest === null) {
+        return yield* Effect.fail(
+          new Error("workspace is being removed; harvest cancelled before its turn")
+        );
+      }
       // Edits of a chunk that failed already landed: the failure record keeps them. A failure from
       // here on (the completed record's save) resumes at the first chunk nobody read: resuming past
       // a budget skip would lose the note.
