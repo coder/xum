@@ -75,6 +75,15 @@ export interface HarvestProgress {
    * Absent in an older record, and 0 when no attempt reached the chunk.
    */
   nextChunkOps?: number;
+  /**
+   * The newest history row the run, with its earlier attempts, read completely: the last message
+   * of the last chunk a model call read (see `HarvestChunk`). Null when none. It is behind the
+   * epoch's newest row when the run skipped chunks, so a later run must start after it, not after
+   * the newest row. A chunk that read cleanly counts even when a later chunk failed: its edits
+   * landed, so a later run must not read those rows again. Absent when no run got as far as
+   * reading, and in a record written before the field.
+   */
+  readThroughRowId?: string | null;
 }
 
 /** Where a run starts, read from the progress of an earlier attempt at the same epoch. */
@@ -109,13 +118,6 @@ export interface MemoryHarvestResult extends HarvestProgress {
    * run resumes here, so it meets the skip again and keeps the note and the true read-through row.
    */
   readChunks: number;
-  /**
-   * The newest history row the run, with its earlier attempts, read completely: the last message
-   * of the last chunk a model call read (see `HarvestChunk`). Null when none. It is behind the
-   * epoch's newest row when the run skipped chunks, so a later run must start after it, not after
-   * the newest row. Absent when the run did not get as far as reading.
-   */
-  readThroughRowId?: string | null;
 }
 
 const MEDIA_STUB = "[media]";
@@ -634,11 +636,14 @@ export async function runMemoryHarvest(args: {
   const budget = createMutationBudget(MEMORY_ANALYZER_OP_BUDGET, resumed.budgetUsed);
   // Ops of the chunks that finished; the ones after them belong to the chunk in flight.
   let finishedOps = resumed.opsBeforeStartChunk;
-  const progressFor = (nextChunk: number): HarvestProgress => ({
+  const readThroughRowIdOf = (readChunks: number): string | null =>
+    readChunks === 0 ? null : chunks[readChunks - 1].readThroughRowId;
+  const progressFor = (nextChunk: number, readChunks: number): HarvestProgress => ({
     nextChunk,
     ops: [...priorOps, ...journal],
     budgetUsed: budget.used(),
     nextChunkOps: priorOps.length + journal.length - finishedOps,
+    readThroughRowId: readThroughRowIdOf(readChunks),
   });
 
   let streamError: string | undefined;
@@ -698,9 +703,8 @@ export async function runMemoryHarvest(args: {
     nextChunk = index + 1;
     readChunks = nextChunk;
     finishedOps = priorOps.length + journal.length;
-    await args.onChunkComplete?.(progressFor(nextChunk));
+    await args.onChunkComplete?.(progressFor(nextChunk, readChunks));
   }
 
-  const readThroughRowId = readChunks === 0 ? null : chunks[readChunks - 1].readThroughRowId;
-  return { ...progressFor(nextChunk), usage, streamError, note, readChunks, readThroughRowId };
+  return { ...progressFor(nextChunk, readChunks), usage, streamError, note, readChunks };
 }

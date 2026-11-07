@@ -171,7 +171,8 @@ export const MemoryHarvestRecordSchema = z.object({
   /**
    * The newest row of the epoch the run read completely (null: none). It is behind the newest row
    * when the run skipped chunks for its budget: the floor of a later run is this row, not the
-   * newest one. Absent in older records, which read up to the row their key names.
+   * newest one. A failed run records the last chunk it read cleanly, whose edits landed. Absent in
+   * older records, which read up to the row their key names (a failed one read nothing known).
    */
   readThroughRowId: z.string().nullish(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),

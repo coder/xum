@@ -2379,6 +2379,116 @@ describe("MemoryConsolidationService", () => {
         expect((await harvestRecords(fixture))["open:bulk-11"]?.note).toContain("chunks 2-3 of 3");
       });
 
+      describe("an archive that failed after reading some chunks", () => {
+        /**
+         * Chunks bulk-0..4, bulk-5..9 and bulk-10..11. The first chunk's edit lands; the stream of
+         * the archive's second chunk fails once, so the record reads through bulk-4.
+         */
+        function archiveFailingAtItsSecondChunk() {
+          const prompts: Array<{ closing: boolean; prompt: string }> = [];
+          let failed = false;
+          const factory = () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const prompt = userPromptText(options);
+                const closing = prompt.includes("just-compacted transcript epoch");
+                prompts.push({ closing, prompt });
+                const label = /Transcript chunk (\d+\/\d+)/.exec(prompt)?.[1] ?? "";
+                if (label.startsWith("2/") && !failed && !closing) {
+                  failed = true;
+                  return Promise.resolve({ stream: failingStream() });
+                }
+                return Promise.resolve({
+                  stream: label.startsWith("1/")
+                    ? simulateReadableStream({
+                        chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                      })
+                    : noChangesStream(),
+                });
+              },
+            });
+          return { prompts, factory };
+        }
+
+        async function failFirstArchive(fixture: Fixture): Promise<void> {
+          await appendBulkRows(fixture);
+          await fixture.service.maybeRunArchivePass("ws-dream");
+          expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+            status: "failed",
+            nextChunk: 1,
+            // The chunk that read cleanly is read through, though a later one failed.
+            readThroughRowId: "bulk-4",
+          });
+        }
+
+        function expectRowsFromFive(prompt: string): void {
+          for (let index = 0; index < 12; index++) {
+            const row = `preference ${index} x`;
+            if (index < 5) expect(prompt).not.toContain(row);
+            else expect(prompt).toContain(row);
+          }
+        }
+
+        it("starts the next archive, after another row arrived, behind the chunks it read", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+          await appendRows(fixture, [["open-new", "CI pins node 22 for the release job."]]);
+          const before = scripted.prompts.length;
+
+          await fixture.service.maybeRunArchivePass("ws-dream");
+
+          const rerun = scripted.prompts
+            .slice(before)
+            .map((run) => run.prompt)
+            .join("\n");
+          expect(rerun).toContain("CI pins node 22");
+          expectRowsFromFive(rerun);
+          expect((await harvestRecords(fixture))["open:open-new"]?.status).toBe("completed");
+        });
+
+        it("starts the compaction that closes the epoch behind the chunks it read", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+          const before = scripted.prompts.length;
+
+          await fixture.service.maybeHarvestThenSweep(await seedCompactionEpoch(fixture));
+
+          const closing = scripted.prompts
+            .slice(before)
+            .filter((run) => run.closing)
+            .map((run) => run.prompt)
+            .join("\n");
+          expect(closing).toContain("remember that I prefer concise tests");
+          expectRowsFromFive(closing);
+          expect((await harvestRecords(fixture))["summary-1"]?.status).toBe("completed");
+        });
+
+        it("keeps what its chunks read when its retry is refused by the cost ceiling", async () => {
+          const scripted = archiveFailingAtItsSecondChunk();
+          using fixture = await createFixture({ modelFactory: scripted.factory });
+          await failFirstArchive(fixture);
+          await fixture.config.updateUserPreferences([{ memory: { dreamCostCeilingUsd: 0.01 } }]);
+
+          await fixture.service.maybeRunArchivePass("ws-dream");
+
+          // The refusal rewrote the failed record: it must still name the rows already read.
+          expect((await harvestRecords(fixture))["open:bulk-11"]).toMatchObject({
+            status: "failed",
+            nextChunk: 1,
+            readThroughRowId: "bulk-4",
+          });
+        });
+      });
+
       it("takes an archive record from before `readThroughRowId` to have read up to the row its key names", async () => {
         const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });

@@ -375,7 +375,13 @@ function harvestProgressFields(
   progress: HarvestProgress
 ): Pick<
   MemoryHarvestRecord,
-  "nextChunk" | "ops" | "budgetUsed" | "nextChunkOps" | "acceptedCandidates" | "skippedCandidates"
+  | "nextChunk"
+  | "ops"
+  | "budgetUsed"
+  | "nextChunkOps"
+  | "readThroughRowId"
+  | "acceptedCandidates"
+  | "skippedCandidates"
 > {
   const applied = progress.ops.filter((op) => op.applied).length;
   return {
@@ -383,6 +389,7 @@ function harvestProgressFields(
     ops: progress.ops,
     budgetUsed: progress.budgetUsed,
     nextChunkOps: progress.nextChunkOps,
+    readThroughRowId: progress.readThroughRowId,
     acceptedCandidates: applied,
     skippedCandidates: progress.ops.length - applied,
   };
@@ -460,23 +467,27 @@ function harvestRecordIdentity(
 const OPEN_EPOCH_KEY_PREFIX = "open:";
 
 /**
- * The ids of the rows that completed open-epoch runs read up to: every row up to each was
- * analyzed. That is the record's `readThroughRowId`, not always the newest row its key names: a run
- * that skipped chunks for its budget never read the rows after it. A record from before the field
- * read everything up to its key's row. Read from the records, so a pruned record only loses its
- * floor, which re-reads rows instead of skipping any.
+ * The ids of the rows that open-epoch runs read up to: every row up to each was analyzed. That is
+ * the record's `readThroughRowId`, not always the newest row its key names: a run that skipped
+ * chunks for its budget never read the rows after it. A completed record from before the field
+ * read everything up to its key's row. A failed run counts through the last chunk it read
+ * cleanly: those chunks' edits landed, and a later run, an archive after a new row or the
+ * compaction that closes the epoch, would otherwise read the rows again with a fresh budget. A
+ * failed record without the field read nothing known. Read from the records, so a pruned record
+ * only loses its floor, which re-reads rows instead of skipping any.
  */
 function analyzedOpenEpochRowIds(
   records: Record<string, MemoryHarvestRecord> | undefined
 ): Set<string> {
   const ids = new Set<string>();
   for (const [boundaryKey, record] of Object.entries(records ?? {})) {
-    if (record.status !== "completed" || !boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX)) continue;
-    const readThrough =
-      record.readThroughRowId === undefined
-        ? boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length)
-        : record.readThroughRowId;
-    if (readThrough !== null) ids.add(readThrough);
+    if (!boundaryKey.startsWith(OPEN_EPOCH_KEY_PREFIX) || record.status === "pending") continue;
+    const readEverythingToKey =
+      record.status === "completed" && record.readThroughRowId === undefined;
+    const readThrough = readEverythingToKey
+      ? boundaryKey.slice(OPEN_EPOCH_KEY_PREFIX.length)
+      : record.readThroughRowId;
+    if (typeof readThrough === "string") ids.add(readThrough);
   }
   return ids;
 }
@@ -1501,6 +1512,9 @@ export class MemoryConsolidationService extends EventEmitter {
         ops: existing?.ops ?? [],
         budgetUsed: existing?.budgetUsed,
         nextChunkOps: existing?.nextChunkOps,
+        // Kept across an attempt that fails before it reads a chunk (a ceiling refusal): its
+        // failure record would otherwise drop what the earlier attempt's chunks read.
+        readThroughRowId: existing?.readThroughRowId,
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
       // A retry keeps the floor of the first attempt: the chunk cursor above counts chunks of the
@@ -1695,6 +1709,7 @@ export class MemoryConsolidationService extends EventEmitter {
         opts.progress.ops = reached.ops;
         opts.progress.budgetUsed = reached.budgetUsed;
         opts.progress.nextChunkOps = reached.nextChunkOps;
+        opts.progress.readThroughRowId = reached.readThroughRowId;
       };
       const savePending = (progress: HarvestProgress): Effect.Effect<void> =>
         self.saveHarvestRecordEffect(

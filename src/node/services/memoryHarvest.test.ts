@@ -1219,6 +1219,11 @@ describe("runMemoryHarvest", () => {
       ]);
       // The cursor is reported while the run is still going, before the failing chunk starts.
       expect(reached.map((progress) => progress.nextChunk)).toEqual([1]);
+      // Chunk 1 read cleanly: its last row is read through, in the callback and in the failure.
+      const firstChunkEnd = buildHarvestChunks(fixture.messages)[0].readThroughRowId;
+      expect(firstChunkEnd).not.toBeNull();
+      expect(reached.map((progress) => progress.readThroughRowId)).toEqual([firstChunkEnd]);
+      expect(failed.readThroughRowId).toBe(firstChunkEnd);
 
       const retry = scriptedModel([
         ...chunkScript([createFile("/memories/workspace/two.md", "chunk two fact\n")]),
