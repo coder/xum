@@ -87,7 +87,7 @@ function srtConfigForPolicy(policy: AgentSandboxPolicy): Partial<SandboxRuntimeC
     filesystem: {
       denyRead: policy.denyRead,
       allowRead: policy.allowRead,
-      allowWrite: [...policy.writeRoots, ...(policy.gitCommonDir ? [policy.gitCommonDir] : [])],
+      allowWrite: [...policy.writeRoots, ...policy.gitCommonDirs],
       denyWrite: policy.denyWrite,
     },
     network: {

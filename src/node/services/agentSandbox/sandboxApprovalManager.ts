@@ -17,6 +17,16 @@ interface PendingSandboxApproval {
  */
 export class SandboxApprovalManager {
   private pendingByWorkspace = new Map<string, Map<string, PendingSandboxApproval>>();
+  private noUserToAnswer = false;
+
+  /**
+   * For a process that no user can answer, such as the `xum run` and `xum workflow` CLIs: their
+   * agents (sub-agents and workflow agents too) get no tool policy that says so, and a request
+   * there would wait forever.
+   */
+  denyAllRequests(): void {
+    this.noUserToAnswer = true;
+  }
 
   /** Waits for the user's answer to `toolCallId`. An abort (Stop) denies it. */
   request(
@@ -27,14 +37,9 @@ export class SandboxApprovalManager {
   ): Promise<SandboxApprovalAnswer> {
     assert(workspaceId.length > 0, "workspaceId must be non-empty");
     assert(toolCallId.length > 0, "toolCallId must be non-empty");
-    if (abortSignal?.aborted) return Promise.resolve("denied");
-    let workspaceMap = this.pendingByWorkspace.get(workspaceId);
-    if (!workspaceMap) {
-      workspaceMap = new Map();
-      this.pendingByWorkspace.set(workspaceId, workspaceMap);
-    }
-    assert(!workspaceMap.has(toolCallId), `sandbox approval already pending for ${toolCallId}`);
-    const pending = workspaceMap;
+    if (this.noUserToAnswer || abortSignal?.aborted) return Promise.resolve("denied");
+    const pending = this.pendingMapFor(workspaceId);
+    assert(!pending.has(toolCallId), `sandbox approval already pending for ${toolCallId}`);
     return new Promise<SandboxApprovalAnswer>((resolve) => {
       const onAbort = () => resolve("denied");
       abortSignal?.addEventListener("abort", onAbort, { once: true });
@@ -51,6 +56,15 @@ export class SandboxApprovalManager {
         this.pendingByWorkspace.delete(workspaceId);
       }
     });
+  }
+
+  private pendingMapFor(workspaceId: string): Map<string, PendingSandboxApproval> {
+    let workspaceMap = this.pendingByWorkspace.get(workspaceId);
+    if (!workspaceMap) {
+      workspaceMap = new Map();
+      this.pendingByWorkspace.set(workspaceId, workspaceMap);
+    }
+    return workspaceMap;
   }
 
   /**

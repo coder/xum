@@ -11,7 +11,8 @@ import {
   DENY_READ_ROOTS,
   HOME_READ_PATHS,
   NESTED_DENY_READ_PATHS,
-  PROTECTED_GIT_COMMON_DIR_PATHS,
+  PROTECTED_GIT_DIR_PATHS,
+  PROTECTED_LINKED_WORKTREE_PATHS,
   PROTECTED_WRITE_PATHS,
   dedupe,
   expandSandboxPath,
@@ -60,13 +61,13 @@ export function anyAgentSandboxEnabled(): boolean {
 export interface AgentSandboxPolicy {
   /** The workspace, its scratch folder, temp folders, caches and extraWritePaths. */
   writeRoots: string[];
-  /** The main .git of a worktree: writable except hooks and config. */
-  gitCommonDir?: string;
-  /** PROTECTED_WRITE_PATHS in each root. */
+  /** The main .git of each worktree among the workspace roots: writable except hooks and config. */
+  gitCommonDirs: string[];
+  /** PROTECTED_WRITE_PATHS in each root, and the protected paths of each git folder. */
   denyWrite: string[];
   /** DENY_READ_ROOTS and NESTED_DENY_READ_PATHS. */
   denyRead: string[];
-  /** The write roots, gitCommonDir, HOME_READ_PATHS, PATH folders under ~ and extraReadPaths. */
+  /** The write roots, gitCommonDirs, HOME_READ_PATHS, PATH folders under ~ and extraReadPaths. */
   allowRead: string[];
   network: AgentSandboxNetwork;
   /** Used only for "allowlist". */
@@ -105,7 +106,11 @@ export function buildAgentSandboxPolicy(
 ): AgentSandboxPolicy {
   const home = realpathOfNearest(os.homedir());
   const cwd = workspaceRootOrThrow(realpathOfNearest(input.cwd), home);
-  const extraWriteRoots = settings.extraWritePaths.map(expandSandboxPath);
+  const nestedDenies = NESTED_DENY_READ_PATHS.map(expandSandboxPath);
+  const extraWriteRoots = outsideNestedDenies(
+    settings.extraWritePaths.map(expandSandboxPath),
+    nestedDenies
+  );
   const extraWorkspaceRoots = (input.workspaceRoots ?? []).map((root) =>
     workspaceRootOrThrow(realpathOfNearest(root), home)
   );
@@ -116,29 +121,26 @@ export function buildAgentSandboxPolicy(
     ...CACHE_WRITE_PATHS.map(expandSandboxPath),
     ...extraWriteRoots,
   ]);
-  // Zero or one folder: the main git folder of a worktree.
-  const gitCommonDirs = realpathIfSet(findGitCommonDir(cwd));
+  // A background command starts in a temp folder and gets its checkout in workspaceRoots.
+  const gitCommonDirs = dedupe(
+    [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
+  );
   const denyWrite = dedupe([
     ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
-    ...gitCommonDirs.flatMap((dir) =>
-      PROTECTED_GIT_COMMON_DIR_PATHS.map((name) => path.join(dir, name))
-    ),
+    ...gitCommonDirs.flatMap(protectedGitDirPaths),
   ]);
   const allowRead = dedupe([
     ...writeRoots,
     ...gitCommonDirs,
     ...HOME_READ_PATHS.map(expandSandboxPath),
     ...pathFoldersUnderHome(input.pathEnv, home),
-    ...settings.extraReadPaths.map(expandSandboxPath),
+    ...outsideNestedDenies(settings.extraReadPaths.map(expandSandboxPath), nestedDenies),
   ]);
   return {
     writeRoots,
-    ...(gitCommonDirs.length > 0 ? { gitCommonDir: gitCommonDirs[0] } : {}),
+    gitCommonDirs,
     denyWrite,
-    denyRead: dedupe([
-      ...DENY_READ_ROOTS.map(realpathOfNearest),
-      ...NESTED_DENY_READ_PATHS.map(expandSandboxPath),
-    ]),
+    denyRead: dedupe([...DENY_READ_ROOTS.map(realpathOfNearest), ...nestedDenies]),
     allowRead,
     network: settings.network,
     allowedHosts: [...settings.allowedHosts],
@@ -160,12 +162,35 @@ function workspaceRootOrThrow(root: string, home: string): string {
   return root;
 }
 
+/**
+ * Seatbelt applies a deny after the allows only when it lies strictly inside an allowed path, so
+ * an extra path at or inside a nested deny would open that credential file: drop it.
+ */
+function outsideNestedDenies(paths: readonly string[], nestedDenies: readonly string[]): string[] {
+  return paths.filter((target) => !isUnderAny(target, nestedDenies));
+}
+
 function protectedPathsUnder(root: string): string[] {
-  return PROTECTED_WRITE_PATHS.flatMap((entry) => {
+  const listed = PROTECTED_WRITE_PATHS.flatMap((entry) => {
     if (typeof entry === "string") return [path.join(root, entry)];
     const target = path.join(root, entry.path);
     return isFile(target) ? [target] : [];
   });
+  return [...listed, ...linkedWorktreePaths(path.join(root, ".git"))];
+}
+
+function protectedGitDirPaths(gitDir: string): string[] {
+  return [
+    ...PROTECTED_GIT_DIR_PATHS.map((name) => path.join(gitDir, name)),
+    ...linkedWorktreePaths(gitDir),
+  ];
+}
+
+/** PROTECTED_LINKED_WORKTREE_PATHS of each linked worktree that the git folder `gitDir` has. */
+function linkedWorktreePaths(gitDir: string): string[] {
+  return childDirs(path.join(gitDir, "worktrees")).flatMap((dir) =>
+    PROTECTED_LINKED_WORKTREE_PATHS.map((name) => path.join(dir, name))
+  );
 }
 
 /**
@@ -189,12 +214,12 @@ function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string
 /* eslint-disable local/no-sync-fs-methods -- Runtime.agentSandboxPolicy() is synchronous, so
    the file tools can check a path before each access; these are a few small reads per command. */
 /**
- * The main git folder of a worktree whose `.git` file points elsewhere, or undefined for a
- * repository whose `.git` folder is inside the workspace (or no repository). Read from the
+ * The main git folder of a linked worktree whose `.git` file points elsewhere, or undefined for
+ * a repository whose `.git` folder is inside the workspace (or no repository). Read from the
  * files git itself reads, so no git process starts for each command.
  */
-function findGitCommonDir(cwd: string): string | undefined {
-  let current = cwd;
+function findGitCommonDir(root: string): string | undefined {
+  let current = root;
   for (;;) {
     const dotGit = path.join(current, ".git");
     let stat: fs.Stats | undefined;
@@ -204,24 +229,45 @@ function findGitCommonDir(cwd: string): string | undefined {
       stat = undefined;
     }
     if (stat?.isDirectory()) return undefined;
-    if (stat?.isFile()) return commonDirOfGitFile(dotGit);
+    if (stat?.isFile()) return commonDirOfWorktree(dotGit);
     const parent = path.dirname(current);
     if (parent === current) return undefined;
     current = parent;
   }
 }
 
-function commonDirOfGitFile(dotGitFile: string): string | undefined {
+/**
+ * `<common>` (a real path) for a `.git` file that points at `<common>/worktrees/<name>`, when
+ * that folder points back at the `.git` file and `<common>` holds a HEAD. A sandboxed command can
+ * rewrite the `commondir` file in an open git folder and write `.git` files in a temp folder, so
+ * neither may choose the folder this opens. A submodule's `.git` file points elsewhere (no
+ * back pointer), so a submodule checkout gets no git folder: git there cannot write.
+ */
+function commonDirOfWorktree(dotGitFile: string): string | undefined {
   try {
     const match = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGitFile, "utf8"));
     if (!match) return undefined;
-    const gitDir = path.resolve(path.dirname(dotGitFile), match[1]);
-    const commonDirFile = path.join(gitDir, "commondir");
-    return fs.existsSync(commonDirFile)
-      ? path.resolve(gitDir, fs.readFileSync(commonDirFile, "utf8").trim())
-      : gitDir;
+    const gitDir = fs.realpathSync(path.resolve(path.dirname(dotGitFile), match[1]));
+    const commonDir = path.dirname(path.dirname(gitDir));
+    if (path.basename(path.dirname(gitDir)) !== "worktrees") return undefined;
+    if (!isFile(path.join(commonDir, "HEAD"))) return undefined;
+    const backPointer = fs.readFileSync(path.join(gitDir, "gitdir"), "utf8").trim();
+    const pointsBack =
+      fs.realpathSync(path.resolve(gitDir, backPointer)) === fs.realpathSync(dotGitFile);
+    return pointsBack ? commonDir : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function childDirs(folder: string): string[] {
+  try {
+    return fs
+      .readdirSync(folder, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(folder, entry.name));
+  } catch {
+    return [];
   }
 }
 
@@ -249,10 +295,7 @@ export function agentSandboxPolicyAllows(
 }
 
 function writeAllowed(policy: AgentSandboxPolicy, target: string): boolean {
-  const roots =
-    policy.gitCommonDir === undefined
-      ? policy.writeRoots
-      : [...policy.writeRoots, policy.gitCommonDir];
+  const roots = [...policy.writeRoots, ...policy.gitCommonDirs];
   return (
     isUnderAny(target, roots) &&
     !isUnderAny(target, policy.denyWrite) &&

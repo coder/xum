@@ -42,6 +42,14 @@ describe("SandboxApprovalManager", () => {
     expect(await manager.request("ws", "late", controller.signal)).toBe("denied");
   });
 
+  it("denies at once in a process that no user can answer", async () => {
+    const manager = new SandboxApprovalManager();
+    manager.denyAllRequests();
+
+    expect(await manager.request("ws", "call")).toBe("denied");
+    expect(manager.pendingEvents("ws")).toEqual([]);
+  });
+
   it("answers only the request of the same workspace", async () => {
     const manager = new SandboxApprovalManager();
     const pending = manager.request("ws-a", "call");

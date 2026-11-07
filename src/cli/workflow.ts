@@ -27,6 +27,7 @@ import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { AgentSandboxService } from "@/node/services/agentSandbox/agentSandboxService";
+import { sandboxApprovalManager } from "@/node/services/agentSandbox/sandboxApprovalManager";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
@@ -368,6 +369,7 @@ async function createWorkflowContext(options: {
     agentResourceLimits = new AgentResourceLimitsService(realConfig);
     await agentResourceLimits.start();
     await agentSandbox.start();
+    sandboxApprovalManager.denyAllRequests();
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.

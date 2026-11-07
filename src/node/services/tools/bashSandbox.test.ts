@@ -16,6 +16,7 @@ import { createTestToolConfig } from "./testHelpers";
 
 const POLICY: AgentSandboxPolicy = {
   writeRoots: [],
+  gitCommonDirs: [],
   denyWrite: [],
   denyRead: [],
   allowRead: [],

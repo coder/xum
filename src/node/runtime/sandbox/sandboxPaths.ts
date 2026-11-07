@@ -41,14 +41,27 @@ export const CACHE_WRITE_PATHS: readonly string[] = [
 ];
 
 /**
+ * Read-only in every git folder the sandbox opens: Xum runs git with the user's full access
+ * (gitNoHooksEnv.ts), and git runs hooks and reads config from these, also the config.worktree
+ * of a repository with extensions.worktreeConfig and the git folders of its submodules.
+ */
+export const PROTECTED_GIT_DIR_PATHS: readonly string[] = [
+  "hooks",
+  "config",
+  "config.worktree",
+  "modules",
+];
+
+/** What git reads from a linked worktree's own folder, <git folder>/worktrees/<name>. */
+export const PROTECTED_LINKED_WORKTREE_PATHS: readonly string[] = ["config.worktree", "modules"];
+
+/**
  * Read-only under each write root. Xum, git or an editor runs these with full access, so a
  * sandboxed command that writes one escapes the sandbox later. `ifFile` entries apply only where
  * the path is a file (a worktree's `.git` pointer to its git folder).
  */
 export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFile: true }> = [
-  // Xum runs git on them with the user's full access (gitNoHooksEnv.ts).
-  ".git/hooks",
-  ".git/config",
+  ...PROTECTED_GIT_DIR_PATHS.map((name) => `.git/${name}`),
   { path: ".git", ifFile: true },
   // MCP servers start outside the sandbox.
   ".xum/mcp.jsonc",
@@ -62,9 +75,6 @@ export const PROTECTED_WRITE_PATHS: ReadonlyArray<string | { path: string; ifFil
   ".envrc",
   ".gitmodules",
 ];
-
-/** In the main `.git` of a worktree, the same files as `.git/hooks` and `.git/config` above. */
-export const PROTECTED_GIT_COMMON_DIR_PATHS: readonly string[] = ["hooks", "config"];
 
 // Every home folder and every external disk. System files stay readable.
 export const DENY_READ_ROOTS: readonly string[] = ["/Users", "/Volumes"];

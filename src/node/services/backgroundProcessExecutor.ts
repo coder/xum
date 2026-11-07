@@ -21,6 +21,7 @@ import type {
   ExecStream,
   OutputReadOptions,
 } from "@/node/runtime/Runtime";
+import { constants } from "fs";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -34,6 +35,13 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
+import {
+  openRecordFile,
+  readRecordFile,
+  realRecordPath,
+  recordFileSize,
+  writeRecordFile,
+} from "./backgroundRecordFiles";
 import {
   getLocalProcessEvidence,
   LocalBaseRuntime,
@@ -84,8 +92,9 @@ function backgroundSandboxRoots(options: SpawnOptions): string[] {
 }
 
 /**
- * Xum's own record keeping (spawn records, output reads, the kill sequence), not agent code, so
- * it runs outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox.
+ * Xum's own record keeping (spawn records, the kill sequence), not agent code, so it runs
+ * outside the macOS agent sandbox: a sandboxed kill cannot signal another sandbox. writeMeta
+ * does not use it: agent commands can put a symlink in its place (see backgroundRecordFiles.ts).
  */
 const XUM_INTERNAL: Pick<ExecOptions, "sandbox"> = { sandbox: "off" };
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
@@ -189,6 +198,18 @@ export type SpawnResult =
   | { success: true; handle: BackgroundHandle; pid: number; outputDir: string }
   | { success: false; error: string };
 
+async function createEmptyOutputLog(
+  runtime: Runtime,
+  tempDir: string,
+  outputPath: string
+): Promise<void> {
+  if (spawnRecordsAreHostLocal(runtime)) {
+    await writeRecordFile(await realRecordPath(tempDir, outputPath), "");
+    return;
+  }
+  await writeFileString(runtime, outputPath, "");
+}
+
 /**
  * Spawn a background process using runtime.exec (works for both local and SSH).
  *
@@ -266,7 +287,7 @@ export async function spawnProcess(
   // Create output directory and empty file
   try {
     await runtime.ensureDir(outputDir);
-    await writeFileString(runtime, outputPath, "");
+    await createEmptyOutputLog(runtime, tempDir, outputPath);
     // Process IDs are display-name based and only deduplicated within one app session, so a
     // restart can reuse a previous session's directory. A stale exit_code from that prior
     // process would be trusted as proof that the NEW process exited — both by getExitCode()
@@ -364,7 +385,10 @@ export async function spawnProcess(
     // with fs and keep the local poll path spawn-free. Remote/devcontainer records are only
     // reachable through runtime.exec.
     const probe: SpawnRecordProbe = spawnRecordsAreHostLocal(runtime)
-      ? new LocalFsSpawnRecordProbe(outputPath, exitCodePath)
+      ? new LocalFsSpawnRecordProbe(
+          await realRecordPath(tempDir, outputPath),
+          await realRecordPath(tempDir, exitCodePath)
+        )
       : new ShellSpawnRecordProbe(runtime, outputPath, exitCodePath, quotePath);
     const handle = new RuntimeBackgroundHandle(
       runtime,
@@ -515,7 +539,7 @@ async function readLocalOutputFile(
   maxBytes?: number,
   options?: OutputReadOptions
 ): Promise<BackgroundOutputRead> {
-  const fd = await fs.open(outputPath, "r");
+  const fd = await openRecordFile(outputPath, constants.O_RDONLY);
   try {
     const buffer = Buffer.alloc(outputReadLength(offset, fileSize, maxBytes));
     const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
@@ -541,15 +565,15 @@ async function readStreamBytes(stream: ReadableStream<Uint8Array>): Promise<Buff
   return Buffer.concat(chunks);
 }
 
-/** Host-local records: plain Node fs calls, no child process per tick. */
+/** Host-local records: plain Node fs calls, no child process per tick. Real paths (realRecordPath). */
 class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
   constructor(
     private readonly outputPath: string,
     private readonly exitCodePath: string
   ) {}
 
-  async outputFileSize(): Promise<number> {
-    return (await fs.stat(this.outputPath)).size;
+  outputFileSize(): Promise<number> {
+    return recordFileSize(this.outputPath);
   }
 
   readOutputFrom(
@@ -563,15 +587,15 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
 
   async readExitCodeMarker(): Promise<string> {
     // lstat does not follow symlinks: only a truly absent path means "still running". A
-    // dangling-symlink marker passes lstat and then fails readFile (which follows the link),
-    // surfacing as a probe failure exactly like the shell probe's `[ ! -L ]` guard.
+    // symlink marker passes lstat and then fails readRecordFile (which refuses the link),
+    // surfacing as a probe failure like the shell probe's `[ ! -L ]` guard.
     try {
       await fs.lstat(this.exitCodePath);
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return "";
       throw error;
     }
-    return fs.readFile(this.exitCodePath, "utf-8");
+    return readRecordFile(this.exitCodePath);
   }
 }
 
@@ -777,11 +801,8 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     const result = await execBuffered(
       this.runtime,
       `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`,
-      {
-        cwd: FALLBACK_CWD,
-        timeout: 10,
-        ...XUM_INTERNAL,
-      }
+      // In the sandbox when it applies, which refuses a write through a symlink out of /tmp.
+      { cwd: FALLBACK_CWD, timeout: 10 }
     );
     if (result.exitCode !== 0) {
       throw new Error(`writeMeta failed with exit code ${result.exitCode}: ${result.stderr}`);
@@ -895,17 +916,20 @@ export async function migrateToBackground(
     options.processId
   );
 
-  let outputDirCreated = false;
+  let realOutputDir: string | undefined;
   try {
     // Create output directory
     await fs.mkdir(outputDir, { recursive: true });
-    outputDirCreated = true;
+    realOutputDir = await realRecordPath(path.dirname(bgOutputDir), outputDir);
 
     // Write existing output to unified output.log
-    await fs.writeFile(outputPath, options.existingOutput.join("\n") + "\n");
+    await writeRecordFile(
+      await realRecordPath(path.dirname(bgOutputDir), outputPath),
+      options.existingOutput.join("\n") + "\n"
+    );
 
     // Create handle that will continue writing to file
-    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath, options.kill);
+    const handle = new MigratedBackgroundHandle(execStream, outputDir, realOutputDir, options.kill);
 
     // Start consuming remaining output in background
     handle.startConsuming();
@@ -915,22 +939,25 @@ export async function migrateToBackground(
     const errorMessage = errorMsg(error);
     log.debug(`migrateToBackground: Error: ${errorMessage}`);
     // Return before exit: the caller starts termination only after migration fails.
-    const exitCode = outputDirCreated
-      ? settleFailedMigration(execStream.exitCode, outputDir)
-      : execStream.exitCode;
+    const exitCode =
+      realOutputDir === undefined
+        ? execStream.exitCode
+        : settleFailedMigration(execStream.exitCode, realOutputDir);
     return { success: false, error: `Failed to migrate process: ${errorMessage}`, exitCode };
   }
 }
 
-function settleFailedMigration(exitCode: Promise<number>, outputDir: string): Promise<number> {
+function settleFailedMigration(exitCode: Promise<number>, realOutputDir: string): Promise<number> {
   const settlement = exitCode.then(async (code) => {
     try {
       // Do not create directories or replace another confirmed exit marker.
-      await fs.writeFile(path.join(outputDir, EXIT_CODE_FILENAME), String(code), { flag: "wx" });
+      await writeRecordFile(path.join(realOutputDir, EXIT_CODE_FILENAME), String(code), {
+        exclusive: true,
+      });
     } catch (error) {
       if (!isErrnoWithCode(error, "EEXIST")) {
         // Exit is confirmed. Leave the record unknown when publication fails.
-        log.debug(`Failed migration exit settlement in ${outputDir}: ${errorMsg(error)}`);
+        log.debug(`Failed migration exit settlement in ${realOutputDir}: ${errorMsg(error)}`);
       }
     }
     return code;
@@ -964,12 +991,18 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   private exited = false;
   private drained = false;
 
+  /** Where the handle reads and writes the record: outputDir's real path (realRecordPath). */
+  private readonly realOutputDir: string;
+  private readonly outputPath: string;
+
   constructor(
     execStream: ExecStream,
     public readonly outputDir: string,
-    private readonly outputPath: string,
+    realOutputDir: string,
     kill?: () => void
   ) {
+    this.realOutputDir = realOutputDir;
+    this.outputPath = path.join(realOutputDir, OUTPUT_FILENAME);
     this.execStream = execStream;
     // Keep the evidence when exit and drain release the stream.
     this.localProcess = execStream.localProcess;
@@ -1012,7 +1045,10 @@ class MigratedBackgroundHandle implements BackgroundHandle {
    */
   private async consumeStreams(execStream: ExecStream): Promise<void> {
     try {
-      this.outputFd = await fs.open(this.outputPath, "a");
+      this.outputFd = await openRecordFile(
+        this.outputPath,
+        constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT
+      );
 
       // Consume both streams concurrently, both writing to same file
       await Promise.all([
@@ -1058,8 +1094,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
    */
   private async writeExitCode(code: number): Promise<void> {
     try {
-      const exitCodePath = path.join(this.outputDir, EXIT_CODE_FILENAME);
-      await fs.writeFile(exitCodePath, String(code));
+      await writeRecordFile(path.join(this.realOutputDir, EXIT_CODE_FILENAME), String(code));
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.writeExitCode: ${errorMsg(error)}`);
     }
@@ -1099,8 +1134,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
 
   async getOutputFileSize(): Promise<number> {
     try {
-      const stat = await fs.stat(this.outputPath);
-      return stat.size;
+      return await recordFileSize(this.outputPath);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.getOutputFileSize: ${errorMsg(error)}`);
       return 0;
@@ -1113,8 +1147,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     // migrated record errs toward over-refusal, never under-refusal — the crash-orphan probe
     // fails closed on markerless pid-0 records and on unreadable ones alike.
     try {
-      const metaPath = path.join(this.outputDir, BG_META_FILENAME);
-      await fs.writeFile(metaPath, metaJson);
+      await writeRecordFile(path.join(this.realOutputDir, BG_META_FILENAME), metaJson);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.writeMeta: ${errorMsg(error)}`);
     }

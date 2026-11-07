@@ -125,6 +125,7 @@ describe("fileCommon", () => {
       await fs.symlink(path.join(workspace, "loop-a"), path.join(workspace, "loop-b"));
       const policy: AgentSandboxPolicy = {
         writeRoots: [workspace],
+        gitCommonDirs: [],
         denyWrite: [],
         denyRead: [home],
         allowRead: [workspace, tools],

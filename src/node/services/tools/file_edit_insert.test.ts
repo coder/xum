@@ -433,6 +433,7 @@ describe("file_edit_insert plan mode enforcement", () => {
     // A stand-in policy over temp folders, never the developer's real home.
     runtime.agentSandboxPolicy = () => ({
       writeRoots: [workspace],
+      gitCommonDirs: [],
       denyWrite: [],
       denyRead: [root],
       allowRead: [workspace],

@@ -25,6 +25,7 @@ import { CoderOauthService } from "../node/services/coderOauthService";
 import { ProviderService } from "../node/services/providerService";
 import { AgentResourceLimitsService } from "../node/services/agentResourceLimits/agentResourceLimitsService";
 import { AgentSandboxService } from "../node/services/agentSandbox/agentSandboxService";
+import { sandboxApprovalManager } from "../node/services/agentSandbox/sandboxApprovalManager";
 import { createCoreServices } from "../node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
@@ -635,6 +636,7 @@ async function main(): Promise<number> {
   // Likewise the agent sandbox setting, so `xum run` commands get the sandbox Settings saved.
   const agentSandbox = new AgentSandboxService(realConfig);
   await agentSandbox.start();
+  sandboxApprovalManager.denyAllRequests();
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure

@@ -80,6 +80,7 @@ function explicitPolicy(
 ): AgentSandboxPolicy {
   return {
     writeRoots: [workspace],
+    gitCommonDirs: [],
     denyWrite: [],
     denyRead: [],
     allowRead: [workspace],
@@ -202,11 +203,11 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
         cwd: worktree,
         pathEnv: process.env.PATH,
       });
-      expect(policy.gitCommonDir).toBe(commonDir);
+      expect(policy.gitCommonDirs).toEqual([commonDir]);
 
       const result = await runSandboxed(
         // The temp folder is a write root and holds the main repository too. Close it, so only
-        // gitCommonDir lets the commit write the main .git.
+        // gitCommonDirs lets the commit write the main .git.
         {
           ...policy,
           writeRoots: policy.writeRoots.filter((dir) => !isPathAtOrUnder(commonDir, dir)),
@@ -457,6 +458,45 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
         await result.handle.dispose();
         await fs.rm(result.outputDir, { recursive: true, force: true });
         await fs.rm(escaped, { force: true });
+      }
+    });
+
+    // /tmp, where the records are, is a write root, so a sandboxed command can swap a record for
+    // a symlink; Xum reads and writes records with full access.
+    it("does not read or write through a symlink a background command puts in its record", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(workspace);
+      const secret = await homeProbePath();
+      const victim = `${secret}-victim`;
+      await fs.writeFile(secret, "SECRET\n");
+      await fs.writeFile(victim, "VICTIM\n");
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtime = new LocalRuntime(workspace);
+      const workspaceId = `sandbox-test-${path.basename(root)}`;
+      const recordDir = `/tmp/mux-bashes/${workspaceId}/bg`;
+
+      const result = await spawnProcess(
+        runtime,
+        `ln -sf ${secret} ${recordDir}/output.log && ln -sf ${victim} ${recordDir}/meta.json && echo SWAPPED`,
+        { cwd: workspace, workspaceId, processId: "bg" }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      try {
+        expect(await waitForExitCode(result.handle)).toBe(0);
+        expect((await fs.lstat(path.join(result.outputDir, "output.log"))).isSymbolicLink()).toBe(
+          true
+        );
+
+        expect((await result.handle.readOutput(0)).content).not.toContain("SECRET");
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test async matcher
+        await expect(result.handle.writeMeta('{"status":"exited"}')).rejects.toThrow();
+        expect(await fs.readFile(victim, "utf8")).toBe("VICTIM\n");
+      } finally {
+        await result.handle.dispose();
+        await fs.rm(result.outputDir, { recursive: true, force: true });
+        await fs.rm(secret, { force: true });
+        await fs.rm(victim, { force: true });
       }
     });
 

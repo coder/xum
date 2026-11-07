@@ -278,6 +278,7 @@ describe("web_fetch tool", () => {
       const config = createTestToolConfig(tempDir.path);
       config.runtime.agentSandboxPolicy = () => ({
         writeRoots: [],
+        gitCommonDirs: [],
         denyWrite: [],
         denyRead: [],
         allowRead: [],
