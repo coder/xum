@@ -826,6 +826,7 @@ function sweepClosure(
   for (const entries of hostLocalEntries.values()) {
     for (const metadata of entries) {
       const checkout = checkoutOf(metadata);
+      // mutation-equivalent: an array is never falsy, so ?? and || agree
       idsByCheckout.set(checkout, [...(idsByCheckout.get(checkout) ?? []), metadata.id]);
     }
   }
@@ -839,6 +840,7 @@ function sweepClosure(
     if (hostLocalEntries.has(id) || !registeredIds.has(id)) {
       members.add(id);
     }
+    // mutation-equivalent: an array is never falsy, so ?? and || agree (the three below)
     for (const child of childrenByParent.get(id) ?? []) queue.push(child.id);
     for (const metadata of hostLocalEntries.get(id) ?? []) {
       queue.push(...(idsByCheckout.get(checkoutOf(metadata)) ?? []));
@@ -4824,6 +4826,8 @@ export class WorkspaceMcpOverridesService {
   ): Promise<PluginSweepPlan> {
     const snapshot = new ConfigSnapshot(this.config);
     const registry = await snapshot.loadSweepMetadata(workspaceIds);
+    // mutation-equivalent: callers sweep host-local ids; an off-host entry that was scanned would
+    // fail to read or hold no key, and the sweep reports the id as not found either way
     const entriesById = groupMetadataById(registry, /* hostLocalOnly */ true);
     const legacyIds = idsWithLegacyOverrides(snapshot.loadLegacyConfig());
     const ids = [...new Set(workspaceIds.map((id) => id.trim()))];
@@ -5124,6 +5128,7 @@ export class WorkspaceMcpOverridesService {
       const { opaqueLegacyValue } = await this.resolveOverridesFor(metadata, "strict", step);
       if (
         opaqueLegacyValue !== undefined &&
+        // mutation-equivalent: JSON.stringify yields undefined or a non-empty string, so ?? and || agree
         documentStringsContain(JSON.stringify(opaqueLegacyValue) ?? "", (value) =>
           value.includes(keyPrefix)
         )

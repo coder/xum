@@ -7167,6 +7167,17 @@ describe("AgentPluginInstallService", () => {
         await fsPromises.writeFile(docPath, JSON.stringify({ padding: "x".repeat(1024 * 1024) }));
         return docPath;
       };
+      /** A stale enable of the plugin: the sweep locks only workspaces whose documents may carry its key. */
+      const writeStaleEnable = async (workspaceId: string) => {
+        const docPath = path.join(muxRoot, "checkouts", workspaceId, ".xum", "mcp.local.jsonc");
+        await fsPromises.mkdir(path.dirname(docPath), { recursive: true });
+        await fsPromises.writeFile(
+          docPath,
+          JSON.stringify({
+            enabledServers: [`plugin:${computePluginInstanceId(installPath())}:echo`],
+          })
+        );
+      };
       /** Holds a workspace's lock, and makes each attempt on it cost a whole waiting budget. */
       const holdWorkspaceBusy = async (
         overrides: WorkspaceMcpOverridesService,
@@ -7237,6 +7248,7 @@ describe("AgentPluginInstallService", () => {
         const overrides = realOverridesService();
         const service = serviceWith(overrides);
         await registerLocalWorkspace("ws-1");
+        await writeStaleEnable("ws-1");
         const refuse = await prepareRefusal(gate, service, ["ws-1"]);
         const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");
         let refusal: string;
@@ -7260,6 +7272,7 @@ describe("AgentPluginInstallService", () => {
         const service = serviceWith(overrides);
         await registerLocalWorkspace("ws-1");
         await registerLocalWorkspace("ws-2");
+        await writeStaleEnable("ws-1");
         const docPath = await writeOversizedDoc("ws-2");
         const refuse = await prepareRefusal("fresh install", service, ["ws-1", "ws-2"]);
         const releaseBusy = await holdWorkspaceBusy(overrides, "ws-1");

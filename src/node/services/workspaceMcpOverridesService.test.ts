@@ -4928,6 +4928,40 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await enabledOf(late.workspacePath)).toEqual([staleKey]);
     });
 
+    it("prunePluginOverrideKeysForWorkspaces fails an alias of a locked descendant that appeared after the scan", async () => {
+      // The late twin shares the child's checkout, so its document: the sweep holds that checkout's
+      // lock but cannot vouch for a workspace it did not choose to sweep.
+      const service = new WorkspaceMcpOverridesService(config);
+      const root = await registerWorkspace("late-twin-root");
+      await writeDoc(root.workspacePath, [staleKey, "other"]);
+      const projectPath = path.join(tempDir, "late-twin-project");
+      await registerLocalWorkspace(projectPath, "ws-late-twin-child");
+      await setParent("ws-late-twin-child", root.workspaceId);
+      const realLink = fsPromisesModule.link;
+      let registered: Promise<unknown> | undefined;
+      const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation(
+        async (existing, target) => {
+          if (String(target).includes(`${path.sep}mcp-overrides-locks${path.sep}`)) {
+            registered ??= registerLocalWorkspace(projectPath, "ws-late-twin");
+            await registered;
+          }
+          return realLink(existing, target);
+        }
+      );
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [root.workspaceId, "ws-late-twin-child"],
+          prefix
+        );
+      } finally {
+        linkSpy.mockRestore();
+      }
+
+      expect(failures.map((failure) => failure.workspaceId)).toEqual(["ws-late-twin"]);
+      expect(String(failures[0].error)).toMatch(/appeared/);
+    });
+
     it("prunePluginOverrideKeysForWorkspaces treats a legacy config.json value as a candidate and prunes it", async () => {
       // A `workspace.mcp` value in config.json migrates into the workspace's document on its
       // first read. A plugin key it carries must go too, or it comes back after the sweep.
@@ -5045,6 +5079,123 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(String(failures[0].error)).toMatch(/exceeded the plugin-prune budget/);
       expect(await enabledOf(stale.workspacePath)).toEqual(["other"]);
     }, 60_000);
+
+    it("prunePluginOverrideKeysForWorkspaces leaves an off-host descendant of a candidate to the publication fan-out", async () => {
+      // Plugin servers never run off-host: such a descendant is neither locked nor pruned (a remote
+      // checkout cannot be reached under the locks), and the fan-out evicts its cache without I/O.
+      const service = new WorkspaceMcpOverridesService(config);
+      const root = await registerWorkspace("offhost-root");
+      await writeDoc(root.workspacePath, [staleKey, "other"]);
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/offhost-remote", {
+          workspaces: [
+            {
+              path: "/remote/checkout",
+              id: "ws-offhost-child",
+              name: "remote-branch",
+              parentWorkspaceId: root.workspaceId,
+              runtimeConfig: { type: "ssh", host: "unreachable.invalid", srcBaseDir: "/remote" },
+            },
+          ],
+        });
+        return cfg;
+      });
+      const published: Array<[string, unknown]> = [];
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [root.workspaceId],
+        prefix,
+        {
+          publish: (persisted, target) => {
+            published.push([target, persisted]);
+            return Promise.resolve();
+          },
+        }
+      );
+
+      expect(failures).toEqual([]);
+      expect(published).toContainEqual(["ws-offhost-child", null]);
+      expect(await enabledOf(root.workspacePath)).toEqual(["other"]);
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces scans a document at the size limit and makes only a larger one a candidate", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const atLimit = await registerWorkspace("size-at-limit");
+      const overLimit = await registerWorkspace("size-over-limit");
+      const documentOfSize = (bytes: number) => {
+        const skeleton = JSON.stringify({ enabledServers: ["shots"], padding: "" });
+        return JSON.stringify({
+          enabledServers: ["shots"],
+          padding: "x".repeat(bytes - skeleton.length),
+        });
+      };
+      const limit = 1024 * 1024;
+      for (const [workspace, bytes] of [
+        [atLimit, limit],
+        [overLimit, limit + 1],
+      ] as const) {
+        await fs.mkdir(path.dirname(docOf(workspace.workspacePath)), { recursive: true });
+        await fs.writeFile(docOf(workspace.workspacePath), documentOfSize(bytes));
+      }
+      const tracked = await trackLockedWorkspaces(service, [atLimit, overLimit]);
+      let failures: Array<{ workspaceId: string; error: unknown }>;
+      try {
+        failures = await service.prunePluginOverrideKeysForWorkspaces(
+          [atLimit.workspaceId, overLimit.workspaceId],
+          prefix
+        );
+      } finally {
+        tracked.restore();
+      }
+
+      expect([...tracked.locked]).toEqual([overLimit.workspaceId]);
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([overLimit.workspaceId]);
+      expect(String(failures[0].error)).toMatch(/1048577 bytes, over the 1048576 bytes/);
+    });
+
+    it("prunePluginOverrideKeysForWorkspaces fails a legacy value it cannot edit when the value may name the key", async () => {
+      // A shape this build cannot read stays in config.json: the sweep cannot prune it, so it
+      // must not report the workspace clean when the value could carry the key.
+      const service = new WorkspaceMcpOverridesService(config);
+      const naming = await registerWorkspace("opaque-names-key");
+      const unrelated = await registerWorkspace("opaque-unrelated");
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          for (const entry of project.workspaces) {
+            if (entry.id === naming.workspaceId) entry.mcp = `enable ${staleKey}` as never;
+            if (entry.id === unrelated.workspaceId) entry.mcp = "newer shape" as never;
+          }
+        }
+        return cfg;
+      });
+
+      const failures = await service.prunePluginOverrideKeysForWorkspaces(
+        [naming.workspaceId, unrelated.workspaceId],
+        prefix
+      );
+
+      expect(failures.map((failure) => failure.workspaceId)).toEqual([naming.workspaceId]);
+      expect(String(failures[0].error)).toMatch(/legacy MCP settings value/);
+    });
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces refuses an empty key prefix and accepts a one-character one", async () => {
+    // Only canonical plugin keys are pruned, so a one-character prefix removes nothing: the sweep
+    // still runs, and leaves the document as it was.
+    const service = new WorkspaceMcpOverridesService(config);
+    const workspace = await registerWorkspace("prefix-length");
+    const doc = path.join(workspace.workspacePath, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(doc), { recursive: true });
+    await fs.writeFile(doc, JSON.stringify({ enabledServers: ["p:echo", "other"] }));
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      service.prunePluginOverrideKeysForWorkspaces([workspace.workspaceId], "")
+    ).rejects.toThrow("keyPrefix must be non-empty");
+    expect(
+      await service.prunePluginOverrideKeysForWorkspaces([workspace.workspaceId], "p")
+    ).toEqual([]);
+    const after = jsoncParse(await fs.readFile(doc, "utf-8")) as Record<string, unknown>;
+    expect(after.enabledServers).toEqual(["p:echo", "other"]);
   });
 
   it("prunePluginOverrideKeysForWorkspaces names only the workspace whose lock stayed busy", async () => {
@@ -5680,6 +5831,16 @@ describe("WorkspaceMcpOverridesService", () => {
     // unwritable one would otherwise fail every workspace of an install.
     const service = new WorkspaceMcpOverridesService(config);
     const workspaces = [await registerWorkspace("no-doc-a"), await registerWorkspace("no-doc-b")];
+    // An empty legacy value makes the first a candidate (the sweep runs) and is cleared without
+    // writing any document.
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const entry of project.workspaces) {
+          if (entry.id === workspaces[0].workspaceId) entry.mcp = {};
+        }
+      }
+      return cfg;
+    });
     const before = await readWorkspaceOverridesEpochToken(config.rootDir);
 
     const failures = await service.prunePluginOverrideKeysForWorkspaces(
