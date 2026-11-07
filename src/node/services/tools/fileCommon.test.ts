@@ -207,18 +207,20 @@ describe("fileCommon", () => {
       it(`${testCase.allowed ? "allows" : "blocks"}: ${testCase.name}`, async () => {
         using temp = new TestTempDir("file-sandbox");
         const fixture = await sandboxFixture(temp);
-        const resolve = () =>
-          resolvePathWithinCwd(
-            testCase.target(fixture.home),
-            fixture.workspace,
-            fixture.runtime,
-            testCase.access,
-            fixture.sandbox
-          );
+        const outcome = await resolvePathWithinCwd(
+          testCase.target(fixture.home),
+          fixture.workspace,
+          fixture.runtime,
+          testCase.access,
+          fixture.sandbox
+        ).then(
+          () => "allowed",
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
         if (testCase.allowed) {
-          expect(await resolve()).toBeDefined();
+          expect(outcome).toBe("allowed");
         } else {
-          await expect(resolve()).rejects.toThrow(/The agent sandbox blocks/);
+          expect(outcome).toMatch(/The agent sandbox blocks/);
         }
       });
     }
