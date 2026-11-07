@@ -620,13 +620,15 @@ function ConsolidationFooter(props: {
             Global: {formatConsolidationRecord(status?.globalRecord ?? null)}
           </div>
           <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
+          {/* Wrap, never truncate: a ceiling refusal's reason (the estimate and the ceiling) is the
+              point of the line, and a touch screen cannot open the tooltip that also holds it. */}
           {harvestError !== undefined && (
-            <div role="alert" className="text-error truncate">
+            <div role="alert" className="text-error break-words">
               Harvest error: {harvestError}
             </div>
           )}
           {refusal !== null && (
-            <div role="alert" className="text-error truncate">
+            <div role="alert" className="text-error break-words">
               Dream stopped {formatRelativeTime(refusal.at)}: {refusal.reason}
             </div>
           )}

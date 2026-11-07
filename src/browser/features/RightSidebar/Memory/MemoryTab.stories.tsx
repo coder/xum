@@ -6,7 +6,9 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers.js";
 import type {
   MemoryConsolidationRecordPayload,
+  MemoryConsolidationStatusPayload,
   MemoryFileInfo,
+  MemoryHarvestRecordPayload,
 } from "@/common/orpc/schemas/memory";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -108,42 +110,46 @@ const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
   ops: [{ command: "delete", path: "/memories/project/duplicate.md", applied: true }],
 };
 
+const HARVEST_RECORD: MemoryHarvestRecordPayload = {
+  status: "completed",
+  startedAt: Date.now() - 45 * 60 * 1000,
+  completedAt: Date.now() - 44 * 60 * 1000,
+  attemptCount: 1,
+  boundaryKey: "summary-story",
+  compactionEpoch: 3,
+  acceptedCandidates: 2,
+  skippedCandidates: 1,
+  nextChunk: 1,
+  ops: [
+    { command: "create", path: "/memories/workspace/build.md", applied: true },
+    { command: "str_replace", path: "/memories/workspace/build.md", applied: true },
+    {
+      command: "create",
+      path: "/memories/global/build.md",
+      applied: false,
+      note: "Consolidation may not modify /memories/global/build.md",
+    },
+  ],
+};
+
+const DEFAULT_STATUS: MemoryConsolidationStatusPayload = {
+  workspaceRecord: null,
+  projectRecord: CONSOLIDATION_RECORD,
+  globalRecord: CONSOLIDATION_RECORD,
+  latestHarvestRecord: HARVEST_RECORD,
+  projectAvailable: true,
+};
+
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
-function renderTab(width: string) {
+function renderTab(width: string, status: Partial<MemoryConsolidationStatusPayload> = {}) {
   return (
     <APIProvider
       client={createMockORPCClient({
         experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true },
         memoryFiles: MEMORY_FILES,
         memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
-        memoryConsolidationStatus: {
-          workspaceRecord: null,
-          projectRecord: CONSOLIDATION_RECORD,
-          globalRecord: CONSOLIDATION_RECORD,
-          latestHarvestRecord: {
-            status: "completed",
-            startedAt: Date.now() - 45 * 60 * 1000,
-            completedAt: Date.now() - 44 * 60 * 1000,
-            attemptCount: 1,
-            boundaryKey: "summary-story",
-            compactionEpoch: 3,
-            acceptedCandidates: 2,
-            skippedCandidates: 1,
-            nextChunk: 1,
-            ops: [
-              { command: "create", path: "/memories/workspace/build.md", applied: true },
-              { command: "str_replace", path: "/memories/workspace/build.md", applied: true },
-              {
-                command: "create",
-                path: "/memories/global/build.md",
-                applied: false,
-                note: "Consolidation may not modify /memories/global/build.md",
-              },
-            ],
-          },
-          projectAvailable: true,
-        },
+        memoryConsolidationStatus: { ...DEFAULT_STATUS, ...status },
       })}
     >
       <div className="border-border-light h-[480px] border" style={{ width }}>
@@ -200,5 +206,37 @@ export const Editor: Story = {
     await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
+  },
+};
+
+const CEILING_REASON = "estimate 4.06 USD (an upper bound) is over the 1.00 USD ceiling";
+
+// A touch screen cannot open the tooltip that also holds the reason, so the line itself must show
+// all of it: a truncated alert read "Dream stopped 2 minutes ago: estimate 4.06 USD (an up…".
+export const DreamRefusedAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () =>
+    renderTab("375px", {
+      latestRefusal: { at: Date.now() - 2 * 60 * 1000, reason: CEILING_REASON, estimatedUsd: 4.06 },
+      latestHarvestRecord: {
+        ...HARVEST_RECORD,
+        status: "failed",
+        error: CEILING_REASON,
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const alerts = await canvas.findAllByRole("alert");
+    await expect(alerts).toHaveLength(2);
+    for (const alert of alerts) {
+      await expect(alert.textContent).toContain("over the 1.00 USD ceiling");
+      // Clipped text has more content than box: scrollWidth passes clientWidth.
+      await expect(alert.scrollWidth).toBeLessThanOrEqual(alert.clientWidth);
+      // Wrapped onto a second line, so it is taller than one 12px text line.
+      await expect(alert.getBoundingClientRect().height).toBeGreaterThan(20);
+    }
   },
 };
