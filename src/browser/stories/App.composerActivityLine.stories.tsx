@@ -357,17 +357,24 @@ export const WorstCaseDesktop: AppStory = {
 };
 
 // The chips the line has no room for fold into a "+N" chip. Its list opens as a popover above the
-// line here, and a row in it opens that chip's panel and focuses it; the panel's Escape or the
-// chip's chord closes it and hands focus back to the "+N" chip (a folded chip cannot take focus).
-// Reviews is the chip a live turn folds at this width, so the test drives that one.
+// line here, and a row in it opens that chip's panel and moves focus to the panel's list; the
+// panel's Escape or the chip's chord closes it and hands focus back to the "+N" chip (a folded chip
+// cannot take focus). Reviews is the chip a live turn folds at this width, so the test drives that
+// one, and the focus assertions follow any chip with a panel rather than naming a kind of row.
 async function assertFoldedChipOpensFromList(line: HTMLElement) {
   const more = within(line).getByRole("button", { name: /^\d+ more$/ });
   for (const close of ["{Escape}", "{Control>}{Alt>}r{/Alt}{/Control}"]) {
     await userEvent.click(more);
     const list = await within(line).findByRole("group", { name: "More activity" });
     await userEvent.click(within(list).getByRole("button", { name: /Reviews/ }));
-    const panel = await findChatActivityPanel();
-    await waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+    await findChatActivityPanel();
+    // Focus lands on a row of the panel's list: not on the page, not on the panel box, and not on
+    // its header (the popover's Close button comes before the content in Tab order). The old line
+    // named the background bashes row here; the chip a live turn folds follows the chips' widths, so
+    // this asks for any row of whichever chip's panel opened.
+    await waitFor(() =>
+      expect(document.activeElement?.closest("[data-activity-panel-content] button")).not.toBeNull()
+    );
     await userEvent.keyboard(close);
     await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
     await expect(more).toHaveFocus();
@@ -587,13 +594,31 @@ export const SubAgentsOnlyPhone: AppStory = {
   },
 };
 
-/** The tallest icon drawn inside a control's drawing, or null when it draws no icon. */
-function drawingIcon(drawing: Element): number | null {
-  const icons = [...drawing.querySelectorAll<SVGElement>("svg")].filter(
-    (svg) => getComputedStyle(svg).display !== "none"
-  );
-  if (icons.length === 0) return null;
-  return Math.max(...icons.map((svg) => svg.getBoundingClientRect().height));
+/**
+ * Does this element draw a box (a border or a fill), as opposed to only text and an icon? The line's
+ * controls paint theirs on the child inside the touch target, so this is how a play tells the
+ * drawing from the hit area without reading class names.
+ */
+function drawsABox(element: Element): boolean {
+  if (element.getBoundingClientRect().height === 0) return false;
+  const style = getComputedStyle(element);
+  // A computed transparent color, which is how Chromium reports both `transparent` and `none`.
+  const clear = (color: string) => color === "rgba(0, 0, 0, 0)" || color === "transparent";
+  const widths = [
+    style.borderTopWidth,
+    style.borderRightWidth,
+    style.borderBottomWidth,
+    style.borderLeftWidth,
+  ];
+  const colors = [
+    style.borderTopColor,
+    style.borderRightColor,
+    style.borderBottomColor,
+    style.borderLeftColor,
+  ];
+  const bordered =
+    widths.some((width) => parseFloat(width) > 0) && colors.some((color) => !clear(color));
+  return bordered || !clear(style.backgroundColor) || style.backgroundImage !== "none";
 }
 
 // The phone line draws each of its controls smaller than the touch box around it, so it reads as a
@@ -601,7 +626,8 @@ function drawingIcon(drawing: Element): number | null {
 // controls. Neither Pixel nor the Storybook test-runner emulates `pointer: coarse`, so the 44px
 // floor globals.css gives a phone's buttons is stood in for here, as in App.phoneViewports'
 // IPhone17ProMaxTouchTargetRows. What this holds is the split itself: the hit area keeps the whole
-// floor (a tap in a chip's empty corner still opens its panel), and the drawing stays inside it.
+// floor (a tap in a chip's empty corner still opens its panel), the drawing stays inside it, and it
+// sits centered there.
 export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
   decorators: [phoneFrame(390)],
   render: () => (
@@ -615,7 +641,9 @@ export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
     const line = await findLine(canvasElement);
 
     const touchFloor = document.createElement("style");
-    touchFloor.textContent = `[data-component="ChatActivityLine"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; }`;
+    // Both axes: globals.css sets min-width too, so a phone's layout needs both axes or a control
+    // drawn off to one side of its 44px target stays invisible here.
+    touchFloor.textContent = `[data-component="ChatActivityLine"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; min-width: ${MOBILE_TOUCH_TARGET_PX}px; }`;
     document.head.append(touchFloor);
     try {
       await waitFor(() => {
@@ -628,14 +656,10 @@ export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
             `The phone line shows ${controls.length} controls, expected chips and Stop`
           );
         }
+        let drawn = 0;
         for (const control of controls) {
           const name = control.getAttribute("aria-label") ?? "control";
           const hit = control.getBoundingClientRect();
-          const drawingEl = control.firstElementChild;
-          if (drawingEl === null) {
-            throw new Error(`${name} draws on the button instead of inside it`);
-          }
-          const drawing = drawingEl.getBoundingClientRect();
           // The touch floor globals.css would set, and the row's growth with it: a control capped
           // below the floor reports its own height here. Half a pixel of play, because the runner's
           // browser lands layout on fractional pixels.
@@ -644,24 +668,60 @@ export const PhoneHitAreaOutsizesItsDrawing: AppStory = {
               `${name} hits ${Math.round(hit.height)}px, under the ${MOBILE_TOUCH_TARGET_PX}px touch floor`
             );
           }
-          if (drawing.height >= hit.height) {
+          // The split: the touch target draws nothing, so the control's look comes from a box drawn
+          // inside it. A control that paints its own box paints it at the touch floor, which is the
+          // band of 44px boxes this line gave up being.
+          if (drawsABox(control)) {
             throw new Error(
-              `${name} draws ${Math.round(drawing.height)}px inside a ${Math.round(hit.height)}px hit area`
+              `${name} draws a ${Math.round(hit.height)}px box on the touch target itself, so the control is as large as its hit area`
             );
           }
+          const boxes = [...control.querySelectorAll("*")].filter(drawsABox);
+          // The plain TODO chip draws no box at all (text only), so there is nothing to size.
+          if (boxes.length === 0) continue;
+          drawn += 1;
+          const tallest = boxes.reduce((best, box) =>
+            box.getBoundingClientRect().height > best.getBoundingClientRect().height ? box : best
+          );
+          const drawing = tallest.getBoundingClientRect();
           if (drawing.height >= MOBILE_TOUCH_TARGET_PX) {
             throw new Error(
-              `${name} draws at the ${MOBILE_TOUCH_TARGET_PX}px touch floor, so the line reads as loud as the composer`
+              `${name} draws ${Math.round(drawing.height)}px at the ${MOBILE_TOUCH_TARGET_PX}px touch floor, so the line reads as loud as the composer`
             );
           }
-          // The drawing is the control's box around its icon, not the icon itself: a control that
-          // draws on the button has the icon as its first child, and the button is the touch floor.
-          const icon = drawingIcon(drawingEl);
-          if (icon !== null && drawing.height <= icon) {
+          if (drawing.height >= hit.height) {
             throw new Error(
-              `${name} draws on the button: its first child is the ${Math.round(icon)}px icon`
+              `${name} draws ${Math.round(drawing.height)}px inside a ${Math.round(hit.height)}px hit area, so the hit area does not outsize the drawing`
             );
           }
+          // The drawing sits inside its hit area, and centered in it. globals.css grows the target on
+          // both axes, so the spare room belongs on either side of the drawing: all of it on one side
+          // reads as a control drawn crooked against its own tap target.
+          const inset = {
+            left: drawing.left - hit.left,
+            right: hit.right - drawing.right,
+            top: drawing.top - hit.top,
+            bottom: hit.bottom - drawing.bottom,
+          };
+          if (Math.min(inset.left, inset.right, inset.top, inset.bottom) < -0.5) {
+            throw new Error(
+              `${name} draws outside its own hit area: ${Math.round(inset.left)}px from its left edge, ${Math.round(inset.right)}px from its right, ${Math.round(inset.top)}px from its top, ${Math.round(inset.bottom)}px from its bottom`
+            );
+          }
+          const offCenter = Math.max(
+            Math.abs(inset.left - inset.right),
+            Math.abs(inset.top - inset.bottom)
+          );
+          if (offCenter > 1) {
+            throw new Error(
+              `${name} draws off center in its hit area: ${Math.round(inset.left)}px left, ${Math.round(inset.right)}px right, ${Math.round(inset.top)}px above, ${Math.round(inset.bottom)}px below`
+            );
+          }
+        }
+        // Otherwise the loop would pass by measuring nothing: a control that draws no box skips its
+        // own checks.
+        if (drawn === 0) {
+          throw new Error("Nothing on the phone line draws a box, so no drawing was measured here");
         }
       });
       await assertOneLine(line);
