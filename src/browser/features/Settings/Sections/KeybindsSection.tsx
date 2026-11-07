@@ -157,6 +157,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
   RUN_LATEST_PLAN_ACTION: "Implement latest plan",
+  RUN_OUTSIDE_SANDBOX: "Run latest sandbox approval outside once",
+  DENY_OUTSIDE_SANDBOX: "Deny latest sandbox approval",
   // Transcript-menu-only actions show their shortcuts in that menu.
   COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
   // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
@@ -213,6 +215,8 @@ const KEYBIND_GROUPS: Array<{
       "FOCUS_INPUT_A",
       "TOGGLE_PLAN_ANNOTATE",
       "RUN_LATEST_PLAN_ACTION",
+      "RUN_OUTSIDE_SANDBOX",
+      "DENY_OUTSIDE_SANDBOX",
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",

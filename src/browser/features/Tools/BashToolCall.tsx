@@ -24,7 +24,7 @@ import {
 import { formatDuration } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
+import { useBashSandboxApproval, useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { useForegroundBashToolCallIds } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
@@ -32,6 +32,8 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/To
 import { buildBashCollapsedSummary } from "./bashCollapsedSummary";
 import { useBashCollapsedSummaryMode } from "./BashCollapsedSummaryModeContext";
 import { BackgroundBashOutputDialog } from "@/browser/components/BackgroundBashOutputDialog/BackgroundBashOutputDialog";
+import { SandboxApprovalCard, SandboxBadge } from "./SandboxApprovalCard";
+import { describeSandboxDenials } from "./sandboxDenialSummary";
 
 interface BashToolCallProps {
   workspaceId?: string;
@@ -83,6 +85,9 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
   // Hosts without the output dialog hide its button.
   const canViewOutput = uiSupport.backgroundBashOutput === "supported";
+
+  // Set while the backend waits for the user to let this call run once outside the sandbox.
+  const sandboxApproval = useBashSandboxApproval(workspaceId, toolCallId);
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
@@ -157,6 +162,21 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const completedOutput = isBackgroundResult ? undefined : result?.output;
   const completedHasOutput = typeof completedOutput === "string" && completedOutput.length > 0;
   const showCompletedOutputSection = !isBackgroundResult && (completedHasOutput || Boolean(note));
+  const sandboxDenialSummary = describeSandboxDenials(
+    result && "sandboxDenials" in result ? (result.sandboxDenials ?? []) : []
+  );
+
+  if (sandboxApproval && workspaceId && toolCallId) {
+    return (
+      <SandboxApprovalCard
+        workspaceId={workspaceId}
+        toolCallId={toolCallId}
+        script={args.script}
+        reason={sandboxApproval.approval.reason}
+        isLatest={sandboxApproval.isLatest}
+      />
+    );
+  }
 
   return (
     <ToolContainer expanded={expanded}>
@@ -245,6 +265,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
         {!isBackground && typeof result?.exitCode === "number" && (
           <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
         )}
+        {sandboxDenialSummary !== null && <SandboxBadge label="Sandbox" className="ml-2" />}
         <StatusIndicator status={effectiveStatus}>
           {getStatusDisplay(effectiveStatus)}
         </StatusIndicator>
@@ -390,6 +411,12 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             </div>
           )}
         </ToolDetails>
+      )}
+      {sandboxDenialSummary !== null && (
+        // Shown collapsed too: it explains the badge and why the command failed.
+        <div className="text-warning mt-1 font-sans text-[11px] wrap-anywhere">
+          {sandboxDenialSummary}
+        </div>
       )}
     </ToolContainer>
   );
