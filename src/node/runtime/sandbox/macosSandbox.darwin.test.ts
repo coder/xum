@@ -252,6 +252,47 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       );
     });
 
+    it("keeps a symlinked .git/config read-only where it points", async () => {
+      const repo = path.join(root, "repo");
+      await fs.mkdir(repo);
+      git(repo, "init", "-q");
+      await fs.rename(path.join(repo, ".git", "config"), path.join(repo, ".git", "config.actual"));
+      await fs.symlink("config.actual", path.join(repo, ".git", "config"));
+
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: repo, pathEnv: process.env.PATH }),
+        repo,
+        `git config core.hooksPath /tmp || echo CONFIG_DENIED`
+      );
+
+      expect(result.stdout).toContain("CONFIG_DENIED");
+      expect(await fs.readFile(path.join(repo, ".git", "config.actual"), "utf8")).not.toContain(
+        "hooksPath"
+      );
+    });
+
+    it("keeps a credential file in a write root unwritable", async () => {
+      const workspace = path.join(root, "ws");
+      const xumRoot = path.join(workspace, "xum-home");
+      await fs.mkdir(xumRoot, { recursive: true });
+      await fs.writeFile(path.join(xumRoot, "secrets.json"), "{}");
+      const savedRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = xumRoot;
+      try {
+        const result = await runSandboxed(
+          buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
+          workspace,
+          `echo stolen > ${xumRoot}/secrets.json || echo WRITE_DENIED`
+        );
+
+        expect(result.stdout).toContain("WRITE_DENIED");
+        expect(await fs.readFile(path.join(xumRoot, "secrets.json"), "utf8")).toBe("{}");
+      } finally {
+        if (savedRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = savedRoot;
+      }
+    });
+
     it("runs the toolchains that work outside it", async () => {
       const workspace = path.join(root, "ws");
       await fs.mkdir(workspace);
@@ -304,41 +345,68 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
     describe("network", () => {
       let server: http.Server;
       let port: number;
+      let socketServer: net.Server;
+      let socketPath: string;
+      const socketClients = new Set<net.Socket>();
 
       beforeEach(async () => {
         server = http.createServer((_req, res) => res.end("loopback-ok"));
         await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
         port = (server.address() as net.AddressInfo).port;
+        socketPath = path.join(root, "s.sock");
+        // A whole HTTP reply, so curl succeeds when it reaches the socket and fails only when
+        // the sandbox refuses it.
+        socketServer = net.createServer((socket) => {
+          socketClients.add(socket);
+          socket.end("HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nsocket-ok");
+        });
+        await new Promise<void>((resolve) => socketServer.listen(socketPath, resolve));
       });
 
       afterEach(async () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
+        // A reached socket (the failure the tests look for) must not hang the close.
+        for (const client of socketClients) client.destroy();
+        socketClients.clear();
+        await new Promise<void>((resolve) => socketServer.close(() => resolve()));
       });
 
       it("refuses an unlisted host and a Unix socket, and reaches loopback", async () => {
         const workspace = path.join(root, "ws");
         await fs.mkdir(workspace);
-        const socketPath = path.join(root, "s.sock");
-        const socketServer = net.createServer((socket) => socket.end("socket-ok"));
-        await new Promise<void>((resolve) => socketServer.listen(socketPath, resolve));
-        try {
-          const result = await runSandboxed(
-            explicitPolicy(workspace, { network: "allowlist", allowedHosts: ["github.com"] }),
-            workspace,
-            [
-              // The proxy refuses the name itself with a 403, so this needs no internet.
-              `curl -sS -m 5 -o /dev/null -w 'UNLISTED=%{http_code}\\n' http://example.com/`,
-              `curl -sS -m 5 --unix-socket ${socketPath} http://x/ && echo SOCKET_REACHED || echo SOCKET_REFUSED`,
-              `curl -sS -m 5 --noproxy '*' http://127.0.0.1:${port}/`,
-            ].join("; ")
-          );
+        const result = await runSandboxed(
+          explicitPolicy(workspace, { network: "allowlist", allowedHosts: ["github.com"] }),
+          workspace,
+          [
+            // The proxy refuses the name itself with a 403, so this needs no internet.
+            `curl -sS -m 5 -o /dev/null -w 'UNLISTED=%{http_code}\\n' http://example.com/`,
+            `curl -sS -m 5 --unix-socket ${socketPath} http://x/ && echo SOCKET_REACHED || echo SOCKET_REFUSED`,
+            `curl -sS -m 5 --noproxy '*' http://127.0.0.1:${port}/`,
+          ].join("; ")
+        );
 
-          expect(result.stdout).toContain("UNLISTED=403");
-          expect(result.stdout).toContain("SOCKET_REFUSED");
-          expect(result.stdout).toContain("loopback-ok");
-        } finally {
-          await new Promise<void>((resolve) => socketServer.close(() => resolve()));
-        }
+        expect(result.stdout).toContain("UNLISTED=403");
+        expect(result.stdout).toContain("SOCKET_REFUSED");
+        expect(result.stdout).toContain("loopback-ok");
+      });
+
+      it("opens any host by name in the open mode but keeps Unix sockets closed", async () => {
+        const workspace = path.join(root, "ws");
+        await fs.mkdir(workspace);
+        const result = await runSandboxed(
+          explicitPolicy(workspace, { network: "open" }),
+          workspace,
+          [
+            `curl -sS -m 5 --unix-socket ${socketPath} http://x/ && echo SOCKET_REACHED || echo SOCKET_REFUSED`,
+            // With no proxy, the command resolves host names through mDNSResponder's socket.
+            `perl -MIO::Socket::UNIX -e 'print IO::Socket::UNIX->new(Peer => "/private/var/run/mDNSResponder") ? "DNS_OPEN\\n" : "DNS_CLOSED\\n"'`,
+            `curl -sS -m 5 http://localhost:${port}/`,
+          ].join("; ")
+        );
+
+        expect(result.stdout).toContain("SOCKET_REFUSED");
+        expect(result.stdout).toContain("DNS_OPEN");
+        expect(result.stdout).toContain("loopback-ok");
       });
 
       it("keeps the host allow list of background bash after its spawn shell exits", async () => {

@@ -125,10 +125,14 @@ export function buildAgentSandboxPolicy(
   const gitCommonDirs = dedupe(
     [cwd, ...extraWorkspaceRoots].flatMap((root) => findGitCommonDir(root) ?? [])
   );
-  const denyWrite = dedupe([
-    ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
-    ...gitCommonDirs.flatMap(protectedGitDirPaths),
-  ]);
+  const denyWrite = dedupe(
+    [
+      ...[...workspaceRoots, ...extraWriteRoots].flatMap(protectedPathsUnder),
+      ...gitCommonDirs.flatMap(protectedGitDirPaths),
+      // A credential file in a write root (~/.cache/huggingface/token) stays unwritable too.
+      ...nestedDenies.filter((denied) => isUnderAny(denied, writeRoots)),
+    ].flatMap(withLinkTarget)
+  );
   const allowRead = dedupe([
     ...writeRoots,
     ...gitCommonDirs,
@@ -194,20 +198,18 @@ function linkedWorktreePaths(gitDir: string): string[] {
 }
 
 /**
- * Each PATH folder under ~ opens for reads, so tools installed there run. A `bin` folder also
- * opens its parent (a toolchain's lib folder sits next to it), but never ~, ~/.local or
- * <xumHome>.
+ * Each PATH folder under ~ opens for reads, so tools installed there run, but never ~, ~/.local
+ * or <xumHome>. Only the folder itself: a `bin` folder's parent can be any folder, such as
+ * ~/Documents for ~/Documents/bin, so a toolchain that needs files next to it goes in
+ * HOME_READ_PATHS or extraReadPaths.
  */
 function pathFoldersUnderHome(pathEnv: string | undefined, home: string): string[] {
   if (pathEnv === undefined) return [];
   const tooBroad = new Set([home, path.join(home, ".local"), realpathOfNearest(getXumHome())]);
-  const opens = (folder: string) => isPathAtOrUnder(folder, home) && !tooBroad.has(folder);
   return pathEnv.split(path.delimiter).flatMap((entry) => {
     if (!path.isAbsolute(entry)) return [];
     const folder = realpathOfNearest(entry);
-    if (!opens(folder)) return [];
-    const parent = path.dirname(folder);
-    return path.basename(folder) === "bin" && opens(parent) ? [folder, parent] : [folder];
+    return isPathAtOrUnder(folder, home) && !tooBroad.has(folder) ? [folder] : [];
   });
 }
 
@@ -258,6 +260,23 @@ function commonDirOfWorktree(dotGitFile: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * `target`, and where it leads when it or a folder above it is a symlink: Seatbelt and the file
+ * tools check the path a write resolves to, so a protected `.git/config` that links to
+ * `.git/config.actual` must be denied there too. A dangling link counts: a write through it
+ * creates its target.
+ */
+function withLinkTarget(target: string): string[] {
+  let destination = target;
+  try {
+    destination = path.resolve(realpathOfNearest(path.dirname(target)), fs.readlinkSync(target));
+  } catch {
+    // Not a symlink, or missing.
+  }
+  const resolved = realpathOfNearest(destination);
+  return resolved === target ? [target] : [target, resolved];
 }
 
 function childDirs(folder: string): string[] {

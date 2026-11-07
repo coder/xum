@@ -38,8 +38,13 @@ export class SandboxApprovalManager {
     assert(workspaceId.length > 0, "workspaceId must be non-empty");
     assert(toolCallId.length > 0, "toolCallId must be non-empty");
     if (this.noUserToAnswer || abortSignal?.aborted) return Promise.resolve("denied");
-    const pending = this.pendingMapFor(workspaceId);
-    assert(!pending.has(toolCallId), `sandbox approval already pending for ${toolCallId}`);
+    let workspaceMap = this.pendingByWorkspace.get(workspaceId);
+    if (!workspaceMap) {
+      workspaceMap = new Map();
+      this.pendingByWorkspace.set(workspaceId, workspaceMap);
+    }
+    assert(!workspaceMap.has(toolCallId), `sandbox approval already pending for ${toolCallId}`);
+    const pending = workspaceMap;
     return new Promise<SandboxApprovalAnswer>((resolve) => {
       const onAbort = () => resolve("denied");
       abortSignal?.addEventListener("abort", onAbort, { once: true });
@@ -50,21 +55,18 @@ export class SandboxApprovalManager {
           resolve(answer);
         },
       });
-    }).finally(() => {
-      pending.delete(toolCallId);
-      if (pending.size === 0 && this.pendingByWorkspace.get(workspaceId) === pending) {
-        this.pendingByWorkspace.delete(workspaceId);
-      }
-    });
+    }).finally(() => this.forget(workspaceId, toolCallId, pending));
   }
 
-  private pendingMapFor(workspaceId: string): Map<string, PendingSandboxApproval> {
-    let workspaceMap = this.pendingByWorkspace.get(workspaceId);
-    if (!workspaceMap) {
-      workspaceMap = new Map();
-      this.pendingByWorkspace.set(workspaceId, workspaceMap);
+  private forget(
+    workspaceId: string,
+    toolCallId: string,
+    pending: Map<string, PendingSandboxApproval>
+  ): void {
+    pending.delete(toolCallId);
+    if (pending.size === 0 && this.pendingByWorkspace.get(workspaceId) === pending) {
+      this.pendingByWorkspace.delete(workspaceId);
     }
-    return workspaceMap;
   }
 
   /**

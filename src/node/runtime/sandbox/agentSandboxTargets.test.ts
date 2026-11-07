@@ -99,6 +99,25 @@ describe("buildAgentSandboxPolicy", () => {
     expect(agentSandboxPolicyAllows(policy, path.join(linked, "index"), "write")).toBe(true);
   });
 
+  test("keeps a protected file that is a symlink read-only where it points", async () => {
+    const actual = path.join(commonDir, "config.actual");
+    await fs.rename(path.join(commonDir, "config"), actual);
+    await fs.symlink("config.actual", path.join(commonDir, "config"));
+
+    expect(
+      agentSandboxPolicyAllows(buildAgentSandboxPolicy(SETTINGS, { cwd: repo }), actual, "write")
+    ).toBe(false);
+  });
+
+  test("opens a PATH folder in the home folder, not the folder around it", async () => {
+    const documents = path.join(await fs.realpath(os.homedir()), "Documents");
+    const bin = path.join(documents, "bin");
+    const { allowRead } = buildAgentSandboxPolicy(SETTINGS, { cwd: repo, pathEnv: bin });
+
+    expect(allowRead).toContain(bin);
+    expect(allowRead).not.toContain(documents);
+  });
+
   test("keeps the worktree config of a repository in the workspace read-only", () => {
     const policy = buildAgentSandboxPolicy(SETTINGS, { cwd: repo });
 

@@ -28,6 +28,19 @@ export const SRT_RULES_TO_REMOVE: readonly string[] = [
   '(allow mach-lookup (global-name "com.apple.SecurityServer"))',
 ];
 
+/**
+ * The network block of the "open" mode: any IP host, but Unix sockets (ssh-agent, Docker) stay
+ * closed as in the other modes. mDNSResponder is the one socket it opens: with no proxy to
+ * resolve host names, the command resolves them itself through it.
+ */
+const OPEN_NETWORK_RULES: readonly string[] = [
+  '(allow network-bind (local ip "*:*"))',
+  '(allow network-inbound (local ip "*:*"))',
+  '(allow network-outbound (remote ip "*:*"))',
+  "(allow system-socket (socket-domain AF_UNIX))",
+  '(allow network-outbound (literal "/private/var/run/mDNSResponder"))',
+];
+
 // Go verifies TLS certificates through trustd (measured on macOS 27.2).
 const ALLOW_MACH_LOOKUP = ["com.apple.trustd.agent"];
 
@@ -316,9 +329,9 @@ function splitEnvAssignments(words: string[]): {
 
 /**
  * Removes the keychain and preference rules (SRT_RULES_TO_REMOVE), and in the "open" network
- * mode replaces the network block with an allow: srt restricts the network of every command
- * once its base config has an allow list, and has no per-command opt-out. Throws when the
- * profile does not have the expected text, so an srt upgrade that changes it fails closed.
+ * mode replaces the network block with OPEN_NETWORK_RULES: srt restricts the network of every
+ * command once its base config has an allow list, and has no per-command opt-out. Throws when
+ * the profile does not have the expected text, so an srt upgrade that changes it fails closed.
  */
 function postProcessProfile(profile: string, network: AgentSandboxPolicy["network"]): string {
   const lines = profile.split("\n");
@@ -336,7 +349,7 @@ function postProcessProfile(profile: string, network: AgentSandboxPolicy["networ
     if (start === -1 || end === -1) {
       throw new AgentSandboxStartError("the srt profile has no network block");
     }
-    edited = [...edited.slice(0, start + 1), "(allow network*)", ...edited.slice(end)];
+    edited = [...edited.slice(0, start + 1), ...OPEN_NETWORK_RULES, ...edited.slice(end)];
   }
   const result = edited.join("\n");
   const leftover = SRT_RULES_TO_REMOVE.find((rule) => result.includes(rule.trim()));

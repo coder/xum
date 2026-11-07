@@ -158,6 +158,32 @@ describe("AgentSandboxSettings", () => {
     ]);
   });
 
+  test("a change made while a save is pending does not undo that save", async () => {
+    const view = renderSettings({ global: {}, projects: {}, support: { state: "supported" } });
+    let finishFirstSave: (() => void) | undefined;
+    view.set.mockImplementationOnce(
+      (global: AgentSandboxConfig) =>
+        new Promise<AgentSandboxState>((resolve) => {
+          finishFirstSave = () =>
+            resolve({ global, projects: {}, support: { state: "supported" } });
+        })
+    );
+    const anyHost = () => view.getByRole("radio", { name: /Any host/ }) as HTMLInputElement;
+    await waitFor(() => expect(view.toggle().disabled).toBe(false));
+
+    fireEvent.click(view.toggle());
+    fireEvent.click(anyHost());
+    act(() => finishFirstSave?.());
+    await waitFor(() => expect(anyHost().disabled).toBe(false));
+    fireEvent.click(anyHost());
+
+    await waitFor(() => expect(view.set).toHaveBeenCalledTimes(2));
+    expect(view.set.mock.calls.map(([global]) => global)).toEqual([
+      { enabled: true },
+      { enabled: true, network: "open" },
+    ]);
+  });
+
   test("off macOS only a sandbox that is on can still be changed: turned off", async () => {
     const unsupported = {
       state: "unsupported",

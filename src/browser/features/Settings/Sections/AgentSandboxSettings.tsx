@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import {
@@ -75,6 +75,10 @@ function useAgentSandbox() {
   const api = useLiveAPI();
   const [state, setState] = useState<AgentSandboxState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // One save at a time: each save sends the whole value built from the last saved state, so a
+  // second save sent before the first returns would undo the first one's change.
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
 
   useEffect(() => {
     // API doubles in tests of other settings can omit this namespace.
@@ -98,6 +102,9 @@ function useAgentSandbox() {
       setError(CONNECTION_LOST_MESSAGE);
       return;
     }
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
     request(api)
       .then((saved) => {
         setState(saved);
@@ -105,6 +112,10 @@ function useAgentSandbox() {
       })
       .catch((saveError: unknown) => {
         setError(`Failed to save the agent sandbox setting: ${getErrorMessage(saveError)}`);
+      })
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
       });
   };
 
@@ -112,6 +123,7 @@ function useAgentSandbox() {
     state,
     error,
     offline: api == null,
+    saving,
     save: (sandbox: AgentSandboxConfig) => send((client) => client.agentSandbox.set(sandbox)),
     saveProject: (projectPath: string, sandbox: AgentSandboxConfig) =>
       send((client) => client.agentSandbox.setProject({ projectPath, sandbox })),
@@ -337,11 +349,11 @@ function isOnAnywhere(state: AgentSandboxState | null): boolean {
   return Object.values(state?.projects ?? {}).some((sandbox) => sandbox.enabled === true);
 }
 
-/** Which controls can change the setting now. */
-function controlsState(state: AgentSandboxState | null, offline: boolean) {
+/** The controls that can change the setting: none while it loads or is `busy` (offline, saving). */
+function controlsState(state: AgentSandboxState | null, busy: boolean) {
   const global = state?.global ?? {};
   const enabled = global.enabled === true;
-  const unavailable = state === null || offline;
+  const unavailable = state === null || busy;
   const unsupported = state?.support.state === "unsupported";
   return {
     global,
@@ -360,10 +372,10 @@ function controlsState(state: AgentSandboxState | null, offline: boolean) {
  * whether it can, since the browser can run on another OS than the backend.
  */
 export function AgentSandboxSettings() {
-  const { state, error, offline, save, saveProject } = useAgentSandbox();
+  const { state, error, offline, saving, save, saveProject } = useAgentSandbox();
   const { global, enabled, on, unavailable, unsupported, disabled, switchDisabled } = controlsState(
     state,
-    offline
+    offline || saving
   );
 
   return (
