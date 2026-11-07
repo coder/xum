@@ -142,6 +142,12 @@ const SERVICE_TIER_FACTORS: Readonly<
     fast: DOUBLE_BOTH_BANDS,
     ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
   },
+  // PROVISIONAL: unreleased; copied from gpt-6-astra, check at launch.
+  "gpt-6.2-astra": {
+    flex: HALF_BOTH_BANDS,
+    fast: DOUBLE_BOTH_BANDS,
+    ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
+  },
   "gpt-6.1-sol": {
     flex: HALF_BOTH_BANDS,
     fast: DOUBLE_BOTH_BANDS,

@@ -29,12 +29,18 @@ const providersConfig: ProvidersConfigMap = {
 };
 
 describe("openaiCyberAccessProgram", () => {
-  test.each(["gpt", "sol", "astra", " gpt-6-astra ", "openai:gpt-6.1-sol", "openai:gpt-6-astra"])(
-    "maps %p to the model's Daybreak program on direct OpenAI Responses",
-    (model) => {
-      expect(openaiCyberAccessProgram(model, { providersConfig })).toBe("daybreak_blue");
-    }
-  );
+  test.each([
+    "gpt",
+    "sol",
+    "astra",
+    " gpt-6.2-astra ",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6.2-astra",
+    // Retired from the catalog but still a usable custom model string.
+    "openai:gpt-6-astra",
+  ])("maps %p to the model's Daybreak program on direct OpenAI Responses", (model) => {
+    expect(openaiCyberAccessProgram(model, { providersConfig })).toBe("daybreak_blue");
+  });
 
   // Only exact ids the Daybreak guide maps are eligible; the API rejects a
   // program the requested model does not take.

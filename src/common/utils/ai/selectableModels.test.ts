@@ -176,9 +176,10 @@ describe("computeSelectableModels", () => {
 
   describe("authoritative catalogs", () => {
     test("coder gates gateway routing on discoveredModels and honors removedModels", () => {
-      // Follow the moving `gpt` alias so the catalog keeps listing the routed built-in.
+      // Follow the moving `gpt`/`astra` aliases so the catalog keeps listing the routed built-ins.
       const gptSlug = `openai/${KNOWN_MODELS.GPT.providerModelId}`;
-      const catalog = [gptSlug, "openai/gpt-6-astra"];
+      const astraSlug = `openai/${KNOWN_MODELS.GPT_6_ASTRA.providerModelId}`;
+      const catalog = [gptSlug, astraSlug];
       const base = { apiKeySet: false, isEnabled: true, isConfigured: true };
 
       // Unknown catalog (discovery pending): permissive, every routable openai built-in shows.
@@ -187,7 +188,7 @@ describe("computeSelectableModels", () => {
           providersConfig: { coder: { ...base, models: catalog } },
           routePriority: ["coder"],
         })
-      ).toEqual([`coder:${gptSlug}`, "coder:openai/gpt-6-astra", ...ANTHROPIC, ...OPENAI]);
+      ).toEqual([`coder:${gptSlug}`, `coder:${astraSlug}`, ...ANTHROPIC, ...OPENAI]);
 
       // Known catalog: only listed models route through coder.
       expect(
@@ -197,7 +198,7 @@ describe("computeSelectableModels", () => {
         })
       ).toEqual([
         `coder:${gptSlug}`,
-        "coder:openai/gpt-6-astra",
+        `coder:${astraSlug}`,
         KNOWN_MODELS.GPT.id,
         KNOWN_MODELS.GPT_6_ASTRA.id,
       ]);
@@ -210,7 +211,7 @@ describe("computeSelectableModels", () => {
               ...base,
               models: catalog,
               discoveredModels: catalog,
-              removedModels: ["openai/gpt-6-astra"],
+              removedModels: [astraSlug],
             },
           },
           routePriority: ["coder"],

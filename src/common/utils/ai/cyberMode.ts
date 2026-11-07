@@ -18,13 +18,16 @@ import {
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import type { ProModeAvailabilityOptions } from "@/common/utils/ai/proMode";
 
-const CYBER_ACCESS_PROGRAM_BY_MODEL_ID = new Map<string, OpenAICyberAccessProgram>(
-  Object.values(KNOWN_MODELS).flatMap((model) =>
+const CYBER_ACCESS_PROGRAM_BY_MODEL_ID = new Map<string, OpenAICyberAccessProgram>([
+  // Retired catalog ids that stay usable as custom model strings keep their program
+  // (GPT-6 Astra took daybreak_blue before `astra` moved to GPT-6.2 Astra).
+  ["openai:gpt-6-astra", "daybreak_blue"],
+  ...Object.values(KNOWN_MODELS).flatMap((model) =>
     model.provider === "openai" && model.cyberAccessProgram != null
       ? [[model.id, model.cyberAccessProgram] as const]
       : []
-  )
-);
+  ),
+]);
 
 /** The `access_programs.cyber` value Cyber mode sends, or undefined when Cyber is unavailable. */
 export function openaiCyberAccessProgram(
