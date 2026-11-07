@@ -1790,7 +1790,7 @@ export class MemoryConsolidationService extends EventEmitter {
                 budgetSpent(opts.progress),
                 epochBudgetSpent(harvestsByWorkspace[workspaceId], epoch.data.messages)
               );
-              return runMemoryHarvest({
+              const result = await runMemoryHarvest({
                 model: modelResult.data.model,
                 pricingModel: modelResult.data.metadataModel,
                 memoryService: self.memoryService,
@@ -1827,6 +1827,18 @@ export class MemoryConsolidationService extends EventEmitter {
                     }
                   }),
               });
+              // Edits of a chunk that failed already landed: the failure record keeps them. A
+              // failure from here on (the completed record's save) resumes at the first chunk
+              // nobody read: resuming past a budget skip would report the skipped chunks' rows as
+              // read and lose the note.
+              adopt(result, result.readChunks);
+              if (result.streamError !== undefined) {
+                // The failure record is saved after this turn is released, so a queued run of the
+                // same epoch would seed its budget (above) without what this one spent. Saved
+                // here, the next turn's load() sees it; the failure record then replaces it.
+                await Effect.runPromise(savePending(result));
+              }
+              return result;
             });
           } finally {
             // Also after a failed chunk: the chunks that finished before it were billed.
@@ -1841,10 +1853,6 @@ export class MemoryConsolidationService extends EventEmitter {
           new Error("workspace is being removed; harvest cancelled before its turn")
         );
       }
-      // Edits of a chunk that failed already landed: the failure record keeps them. A failure from
-      // here on (the completed record's save) resumes at the first chunk nobody read: resuming past
-      // a budget skip would report the skipped chunks' rows as read and lose the note.
-      adopt(harvest, harvest.readChunks);
       if (harvest.streamError !== undefined) {
         return yield* Effect.fail(new Error(`harvest stream failed: ${harvest.streamError}`));
       }

@@ -267,10 +267,12 @@ function spendEveryEditStream(): ReadableStream<LanguageModelV3StreamPart> {
  * An analyzer that tries `editsPerRun` creates of distinct workspace notes in each run's first
  * step, so a test can count the edits an epoch's runs got in total. The dream makes none.
  * `beforeEdits(run)` holds a run's first step until it settles, to keep a stream open.
+ * `failRun` names the analyzer run whose stream fails after its edits landed.
  */
 function editsEveryRunModels(
   editsPerRun: number,
-  beforeEdits?: (run: number) => Promise<void>
+  beforeEdits?: (run: number) => Promise<void>,
+  failRun?: number
 ): {
   factory: () => MockLanguageModelV3;
   analyzerRuns: () => number;
@@ -280,7 +282,11 @@ function editsEveryRunModels(
     new MockLanguageModelV3({
       doStream: async (options) => {
         const afterToolResult = options.prompt.some((message) => message.role === "tool");
-        if (systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT || afterToolResult) {
+        const isAnalyzer = systemPromptText(options) === MEMORY_ANALYZER_SYSTEM_PROMPT;
+        if (isAnalyzer && afterToolResult && analyzerRuns === failRun) {
+          return { stream: failingStream() };
+        }
+        if (!isAnalyzer || afterToolResult) {
           return { stream: noChangesStream() };
         }
         const run = ++analyzerRuns;
@@ -2277,6 +2283,79 @@ describe("MemoryConsolidationService", () => {
       expect(records["open:open-2"]?.budgetUsed).toBe(5);
       expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
       expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+    });
+
+    it("keeps a failed run's landed edits in the sidecar before the next run's turn, so that run seeds its budget with them", async () => {
+      // The failed record is saved after the turn is released, so what the run spent before its
+      // chunk failed reaches the sidecar in that save alone. Holding it here makes the order
+      // deterministic: the next run must find the spend without it.
+      const created = [gate(), gate()];
+      const streamStarted = [gate(), gate()];
+      const released = [gate(), gate()];
+      const failedSaveReleased = gate();
+      const models = editsEveryRunModels(
+        5,
+        async (run) => {
+          streamStarted[run - 1]?.open();
+          await released[run - 1]?.opened;
+        },
+        1
+      );
+      let modelsCreated = 0;
+      using fixture = await createFixture({
+        modelFactory: () => {
+          created[modelsCreated++]?.open();
+          return models.factory();
+        },
+      });
+      await appendRows(fixture, openRowTexts);
+      const internals = fixture.service as unknown as {
+        saveHarvestRecordEffect: (
+          workspaceId: string,
+          boundaryKey: string,
+          record: { status: string },
+          projectPath: string
+        ) => Effect.Effect<void>;
+      };
+      const saveHarvestRecord = internals.saveHarvestRecordEffect.bind(fixture.service);
+      spyOn(internals, "saveHarvestRecordEffect").mockImplementation(
+        (workspaceId, boundaryKey, record, projectPath) =>
+          record.status === "failed"
+            ? Effect.flatMap(
+                Effect.promise(() => failedSaveReleased.opened),
+                () => saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
+              )
+            : saveHarvestRecord(workspaceId, boundaryKey, record, projectPath)
+      );
+
+      try {
+        const archive = fixture.service.maybeRunArchivePass("ws-dream");
+        await streamStarted[0]?.opened;
+        const compaction = fixture.service.maybeHarvestThenSweep(
+          await seedCompactionEpoch(fixture)
+        );
+        await created[1]?.opened;
+        await settle();
+        expect(models.analyzerRuns()).toBe(1);
+
+        released[0]?.open();
+        await streamStarted[1]?.opened;
+        released[1]?.open();
+        await compaction;
+        failedSaveReleased.open();
+        expect((await archive).success).toBe(true);
+
+        const records = await harvestRecords(fixture);
+        // The archive's analyzer landed 5 edits and then failed. The compaction tried 5 more and
+        // got the 3 that are left of the epoch's budget.
+        expect(records["open:open-2"]).toMatchObject({ status: "failed", budgetUsed: 5 });
+        expect(records["summary-1"]?.ops?.filter((op) => op.applied)).toHaveLength(3);
+        expect(records["summary-1"]?.budgetUsed).toBe(MEMORY_ANALYZER_OP_BUDGET);
+      } finally {
+        failedSaveReleased.open();
+        released[0]?.open();
+        released[1]?.open();
+      }
     });
   });
 
