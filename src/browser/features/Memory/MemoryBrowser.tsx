@@ -621,7 +621,8 @@ function ConsolidationFooter(props: {
           </div>
           <div className="counter-nums truncate">Harvest: {harvestLabel}</div>
           {/* Wrap, never truncate: a ceiling refusal's reason (the estimate and the ceiling) is the
-              point of the line, and a touch screen cannot open the tooltip that also holds it. */}
+              point of these three lines, and a touch screen cannot open the tooltip that also holds
+              it. A manual run's error is the same refusal text. */}
           {harvestError !== undefined && (
             <div role="alert" className="text-error break-words">
               Harvest error: {harvestError}
@@ -632,7 +633,7 @@ function ConsolidationFooter(props: {
               Dream stopped {formatRelativeTime(refusal.at)}: {refusal.reason}
             </div>
           )}
-          {runError !== null && <div className="text-error truncate">{runError}</div>}
+          {runError !== null && <div className="text-error break-words">{runError}</div>}
         </div>
       </TooltipIfPresent>
       <button

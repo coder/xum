@@ -142,7 +142,11 @@ const DEFAULT_STATUS: MemoryConsolidationStatusPayload = {
 
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
-function renderTab(width: string, status: Partial<MemoryConsolidationStatusPayload> = {}) {
+function renderTab(
+  width: string,
+  status: Partial<MemoryConsolidationStatusPayload> = {},
+  consolidateError?: string
+) {
   return (
     <APIProvider
       client={createMockORPCClient({
@@ -150,6 +154,7 @@ function renderTab(width: string, status: Partial<MemoryConsolidationStatusPaylo
         memoryFiles: MEMORY_FILES,
         memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
         memoryConsolidationStatus: { ...DEFAULT_STATUS, ...status },
+        memoryConsolidateError: consolidateError,
       })}
     >
       <div className="border-border-light h-[480px] border" style={{ width }}>
@@ -219,24 +224,36 @@ export const DreamRefusedAtPhoneWidth: Story = {
     pixel: { exclude: true },
   },
   render: () =>
-    renderTab("375px", {
-      latestRefusal: { at: Date.now() - 2 * 60 * 1000, reason: CEILING_REASON, estimatedUsd: 4.06 },
-      latestHarvestRecord: {
-        ...HARVEST_RECORD,
-        status: "failed",
-        error: CEILING_REASON,
+    renderTab(
+      "375px",
+      {
+        latestRefusal: {
+          at: Date.now() - 2 * 60 * 1000,
+          reason: CEILING_REASON,
+          estimatedUsd: 4.06,
+        },
+        latestHarvestRecord: {
+          ...HARVEST_RECORD,
+          status: "failed",
+          error: CEILING_REASON,
+        },
       },
-    }),
+      // The manual run's refusal: the same reason behind the organizer's own prefix.
+      `consolidation not started: ${CEILING_REASON}`
+    ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     const alerts = await canvas.findAllByRole("alert");
     await expect(alerts).toHaveLength(2);
-    for (const alert of alerts) {
-      await expect(alert.textContent).toContain("over the 1.00 USD ceiling");
+    // The third line appears once the manual run is refused.
+    await userEvent.click(canvas.getByRole("button", { name: "Consolidate now" }));
+    const runError = await canvas.findByText(/^consolidation not started: /);
+    for (const line of [...alerts, runError]) {
+      await expect(line.textContent).toContain("over the 1.00 USD ceiling");
       // Clipped text has more content than box: scrollWidth passes clientWidth.
-      await expect(alert.scrollWidth).toBeLessThanOrEqual(alert.clientWidth);
+      await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
       // Wrapped onto a second line, so it is taller than one 12px text line.
-      await expect(alert.getBoundingClientRect().height).toBeGreaterThan(20);
+      await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
     }
   },
 };
