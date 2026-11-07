@@ -17,6 +17,10 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { pointsAtThisMachine } from "@/node/services/agentPlugins/claudeMarketplace";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
+import {
+  acquirePluginMutationLock,
+  MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
+} from "@/node/services/agentPlugins/journals";
 import type { GeneratedFrom } from "@/node/services/agentPlugins/manifest";
 import {
   parseRegistryEntriesLenient,
@@ -24,6 +28,7 @@ import {
   readPluginRegistryDocument,
 } from "@/node/services/agentPlugins/registry";
 import { log } from "@/node/services/log";
+import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
 import { formatZodIssues } from "@/node/utils/markdownFrontmatter";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { BackupServiceError } from "./backupService";
@@ -97,6 +102,57 @@ async function readInstallsToList(muxRoot: string): Promise<AgentPluginInstallEn
   return installs;
 }
 
+/** A registry row with the `generatedFrom` marker of its plugin folder, as one read saw them. */
+interface InstallSnapshot {
+  install: AgentPluginInstallEntry;
+  generated: GeneratedFrom | undefined;
+}
+
+/**
+ * The plugin lock install, update and uninstall hold, taken for the reads only. A timeout is a
+ * failed push, named like the other local reads: the holder is a process on this machine, not the
+ * backup repository.
+ */
+async function acquireSnapshotLock(muxRoot: string, timeoutMs: number) {
+  try {
+    return await acquirePluginMutationLock(muxRoot, { timeoutMs });
+  } catch (error) {
+    if (!(error instanceof CrossProcessLockTimeoutError)) throw error;
+    throw new BackupServiceError(
+      "IO_ERROR",
+      `Xum could not read the installed plugins for the backup. ${error.message} ${AGENT_PLUGINS_OFF_HINT}`
+    );
+  }
+}
+
+/**
+ * The registry and the plugin folders' markers, read together under the lock that every plugin
+ * mutation holds. A mutation moves a plugin's folder and rewrites the registry in separate steps,
+ * so unlocked reads could pair a row from before an update with a marker from after it, or list a
+ * plugin whose uninstall has begun. The lock is held for the reads and no longer, never across
+ * git or network work. The installer clones under it, so the wait is bounded by the installer's own
+ * timeout (`MUTATION_LOCK_ACQUIRE_TIMEOUT_MS`). Lock order: a push holds the backup locks (the
+ * repository's and the local payload's) and then takes this one. Nothing that holds this lock
+ * takes a backup lock, so the two cannot wait on each other.
+ */
+async function readInstallSnapshot(
+  muxRoot: string,
+  lockTimeoutMs: number
+): Promise<InstallSnapshot[]> {
+  const release = await acquireSnapshotLock(muxRoot, lockTimeoutMs);
+  try {
+    const installs = await readInstallsToList(muxRoot);
+    return await Promise.all(
+      installs.map(async (install) => ({
+        install,
+        generated: await readInstalledGeneratedFrom(path.join(muxRoot, "plugins", install.name)),
+      }))
+    );
+  } finally {
+    await release();
+  }
+}
+
 /**
  * The preview selector that rebuilds a plugin Xum generated a plugin.json for from a skills
  * repository. A plugin with its own manifest has none: the preview takes the first method that fits.
@@ -105,10 +161,7 @@ function methodOf(generated: GeneratedFrom | undefined): BackupPluginMethod | un
   return generated === undefined ? undefined : { kind: "skills" };
 }
 
-async function entryOf(
-  muxRoot: string,
-  install: AgentPluginInstallEntry
-): Promise<BackupPluginEntry | null> {
+function entryOf({ install, generated }: InstallSnapshot): BackupPluginEntry | null {
   // Another machine cannot use a path or a loopback host on this one, and the list would publish it
   // (the home folder names the user). The plugin is logged by name only, so its absence from the
   // backup is explained.
@@ -118,7 +171,6 @@ async function entryOf(
     });
     return null;
   }
-  const generated = await readInstalledGeneratedFrom(path.join(muxRoot, "plugins", install.name));
   // The registry records the repository a marketplace entry resolved to, and the plugin.json keeps
   // only the entry's name. An entry that points at another repository cannot be rebuilt from this
   // row, and telling it from an entry in the marketplace's own repository needs a registry field.
@@ -155,10 +207,13 @@ async function entryOf(
  * plugins would leave the rest out of the backup without a word. The code is IO_ERROR for the
  * same reason (`readInstallsToList`).
  */
-export async function collectPluginBackup(muxRoot: string): Promise<BackupPluginManifest | null> {
-  const installs = await readInstallsToList(muxRoot);
-  const entries = await Promise.all(installs.map((install) => entryOf(muxRoot, install)));
-  const plugins = entries
+export async function collectPluginBackup(
+  muxRoot: string,
+  lockTimeoutMs = MUTATION_LOCK_ACQUIRE_TIMEOUT_MS
+): Promise<BackupPluginManifest | null> {
+  const snapshot = await readInstallSnapshot(muxRoot, lockTimeoutMs);
+  const plugins = snapshot
+    .map(entryOf)
     .filter((entry) => entry !== null)
     .sort((a, b) => a.name.localeCompare(b.name));
   if (plugins.length > MAX_BACKUP_PLUGIN_ENTRIES) {

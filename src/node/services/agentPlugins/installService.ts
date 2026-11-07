@@ -149,6 +149,7 @@ import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
+  MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
   MUTATION_LOCK_FILE,
   containerHasPendingSignOuts,
   pendingSignOutsRecordState,
@@ -273,9 +274,6 @@ const MARKETPLACE_SCAN_CONCURRENCY = 8;
 
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
-
-/** How long an acquire waits on a live holder before failing (covers a full clone). */
-const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;

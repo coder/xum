@@ -6,9 +6,11 @@ import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { resolveBackupContents } from "@/common/config/schemas/settingsBackup";
 import { MAX_BACKUP_PLUGIN_ENTRIES, type SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { acquirePluginMutationLock } from "@/node/services/agentPlugins/journals";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupService } from "./backupService";
 import {
+  collectPluginBackup,
   PLUGIN_BACKUP_DIR,
   PLUGIN_BACKUP_MANIFEST_PATH,
   repositoryIdentity,
@@ -468,6 +470,72 @@ describe("backup of the managed plugin list", () => {
 
         const sidecar = (await readSidecar(managed)) as { plugins: unknown[] };
         expect(sidecar.plugins).toHaveLength(MAX_BACKUP_PLUGIN_ENTRIES);
+      });
+    });
+
+    describe("against a plugin install, update or uninstall in progress", () => {
+      /** The lock those mutations hold; `release` is the mutation finishing. */
+      const startMutation = () => acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+      const settle = () => new Promise((resolve) => setTimeout(resolve, 250));
+      const listedNames = (manifest: Awaited<ReturnType<typeof collectPluginBackup>>) =>
+        manifest?.plugins.map((plugin) => `${plugin.name}@${plugin.lockedSha}`);
+
+      it("waits for the mutation, then lists the registry and the markers it left", async () => {
+        await writeRegistry(muxRoot, [registryRow("alpha"), registryRow("beta")]);
+        const finishMutation = await startMutation();
+        let done = false;
+        const collecting = collectPluginBackup(muxRoot).finally(() => {
+          done = true;
+        });
+
+        // A read that ignored the lock would be done long before this.
+        await settle();
+        expect(done).toBe(false);
+        // The mutation lands while the read waits: beta is uninstalled, alpha moves to a new
+        // commit, gamma is installed from a skills repository.
+        await writeRegistry(muxRoot, [
+          registryRow("alpha", { lockedSha: shaOf("z") }),
+          registryRow("gamma"),
+        ]);
+        await writeGeneratedPlugin(muxRoot, "gamma", { kind: "skills" });
+        await finishMutation();
+
+        const manifest = await collecting;
+        expect(listedNames(manifest)).toEqual([`alpha@${shaOf("z")}`, `gamma@${shaOf("gamma")}`]);
+        expect(manifest?.plugins[1]?.method).toEqual({ kind: "skills" });
+      });
+
+      it("fails the push with an IO_ERROR when the mutation outlasts the wait", async () => {
+        await writeRegistry(muxRoot, [registryRow("alpha")]);
+        const finishMutation = await startMutation();
+
+        const error = (await captureRejection(collectPluginBackup(muxRoot, 50))) as {
+          code?: string;
+          message: string;
+        };
+
+        expect(error.code).toBe("IO_ERROR");
+        expect(error.message).toContain("modifying plugins");
+        expect(error.message).toContain('Turning off "Agent plugins"');
+        await finishMutation();
+        // The failed wait took nothing: the mutation's release leaves the lock free.
+        expect(listedNames(await collectPluginBackup(muxRoot, 50))).toEqual([
+          `alpha@${shaOf("alpha")}`,
+        ]);
+      });
+
+      it("frees the lock after a read, whether it lists the plugins or fails", async () => {
+        await writeRegistry(muxRoot, [registryRow("alpha")]);
+        await collectPluginBackup(muxRoot);
+        await (
+          await startMutation()
+        )();
+
+        await fs.writeFile(path.join(muxRoot, "plugins.json"), "{ not json", "utf-8");
+        await captureRejection(collectPluginBackup(muxRoot));
+        await (
+          await startMutation()
+        )();
       });
     });
 
