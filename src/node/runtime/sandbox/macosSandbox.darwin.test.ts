@@ -271,22 +271,35 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       );
     });
 
-    it("keeps a credential file in a write root unwritable", async () => {
+    it("keeps a credential file in a write root unwritable, and its folder in place", async () => {
       const workspace = path.join(root, "ws");
       const xumRoot = path.join(workspace, "xum-home");
       await fs.mkdir(xumRoot, { recursive: true });
-      await fs.writeFile(path.join(xumRoot, "secrets.json"), "{}");
+      await fs.writeFile(path.join(xumRoot, "secrets.json"), '{"key":"SECRET"}');
       const savedRoot = process.env.XUM_ROOT;
       process.env.XUM_ROOT = xumRoot;
       try {
         const result = await runSandboxed(
           buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
           workspace,
-          `echo stolen > ${xumRoot}/secrets.json || echo WRITE_DENIED`
+          [
+            `echo stolen > ${xumRoot}/secrets.json || echo WRITE_DENIED`,
+            // A folder renamed out from under the deny, or a hard link, would expose the file at
+            // a path the deny does not name.
+            `mv ${xumRoot} ${workspace}/moved || echo MOVE_DENIED`,
+            `cat ${workspace}/moved/secrets.json`,
+            `ln ${xumRoot}/secrets.json ${workspace}/linked || echo LINK_DENIED`,
+            `cat ${workspace}/linked`,
+          ].join("; ")
         );
 
         expect(result.stdout).toContain("WRITE_DENIED");
-        expect(await fs.readFile(path.join(xumRoot, "secrets.json"), "utf8")).toBe("{}");
+        expect(result.stdout).toContain("MOVE_DENIED");
+        expect(result.stdout).toContain("LINK_DENIED");
+        expect(result.stdout).not.toContain("SECRET");
+        expect(await fs.readFile(path.join(xumRoot, "secrets.json"), "utf8")).toBe(
+          '{"key":"SECRET"}'
+        );
       } finally {
         if (savedRoot === undefined) delete process.env.XUM_ROOT;
         else process.env.XUM_ROOT = savedRoot;
