@@ -271,6 +271,25 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
       );
     });
 
+    it("refuses to make a missing protected folder by link or move", async () => {
+      const workspace = path.join(root, "ws");
+      await fs.mkdir(path.join(workspace, "payload"), { recursive: true });
+      await fs.writeFile(path.join(workspace, "payload", "mcp.jsonc"), "{}");
+
+      // MCP discovery would follow .xum to payload/mcp.jsonc and start its server outside the
+      // sandbox, though the deny names only .xum/mcp.jsonc.
+      const result = await runSandboxed(
+        buildAgentSandboxPolicy(BASE_SETTINGS, { cwd: workspace }),
+        workspace,
+        ["ln -s payload .xum || echo LINK_DENIED", "mv payload .mux || echo MOVE_DENIED"].join("; ")
+      );
+
+      expect(result.stdout).toContain("LINK_DENIED");
+      expect(result.stdout).toContain("MOVE_DENIED");
+      expect(await exists(path.join(workspace, ".xum"))).toBe(false);
+      expect(await exists(path.join(workspace, ".mux"))).toBe(false);
+    });
+
     it("keeps a credential file in a write root unwritable, and its folder in place", async () => {
       const workspace = path.join(root, "ws");
       const xumRoot = path.join(workspace, "xum-home");
