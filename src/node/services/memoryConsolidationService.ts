@@ -1227,6 +1227,11 @@ export class MemoryConsolidationService extends EventEmitter {
    * nothing has read it), then run the dream, so the dream can promote what the analyzer wrote.
    * Best effort: an analysis that fails or is refused never stops the dream, the one chance to
    * promote before workspace memory is deleted. Undebounced, like every archive run.
+   *
+   * A sub-agent's archive analyzes its own open epoch too, into the owner's workspace memory (its
+   * analyzer context redirects there, as a compaction's does), but the dream is the owner's: the
+   * child's archive is refused after the analysis, as maybeRun does, and the owner's archive pass
+   * promotes what the child wrote.
    */
   async maybeRunArchivePass(
     workspaceId: string
@@ -1235,12 +1240,6 @@ export class MemoryConsolidationService extends EventEmitter {
     if (this.removalCancelled.has(workspaceId)) {
       return Err("workspace is being removed; consolidation refused");
     }
-    // A sub-agent's archive is refused with the reason maybeRun gives: its epochs were analyzed
-    // into the owner's store as they closed, and the owner's archive pass promotes them.
-    if (this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) !== workspaceId) {
-      return this.maybeRun(workspaceId, "archive");
-    }
-
     const runKey = `${workspaceId}:archive-pass`;
     const active = this.harvestInFlight.get(runKey);
     if (active !== undefined) {

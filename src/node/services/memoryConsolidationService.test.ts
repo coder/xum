@@ -2037,18 +2037,63 @@ describe("MemoryConsolidationService", () => {
       expect(await harvestRecords(fixture)).toEqual({});
     });
 
-    it("refuses a sub-agent's archive without analyzing its epoch", async () => {
-      const models = archivePassModels();
-      using fixture = await createFixture({ modelFactory: models.factory });
-      await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
-      await appendRows(fixture, openRowTexts, "ws-sub");
+    describe("a sub-agent's archive", () => {
+      const refusal = "share their owner's workspace memory";
 
-      const result = await fixture.service.maybeRunArchivePass("ws-sub");
+      it("analyzes its open epoch into the owner's workspace memory, without a final dream for it", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
 
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toContain("share their owner's workspace memory");
-      expect(fixture.modelCalls).toHaveLength(0);
-      expect(await harvestRecords(fixture, "ws-sub")).toEqual({});
+        const result = await fixture.service.maybeRunArchivePass("ws-sub");
+
+        // The owner's archive pass promotes: the child's own pass is still refused, after analyzing.
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain(refusal);
+        expect(models.runs.map((run) => run.kind)).toEqual(["analyzer"]);
+        expect(models.runs[0]?.prompt).toContain("We settled on bun");
+        expect(await readNote(fixture, 1)).toContain("analyzer note 1");
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "completed", nextChunk: 1, acceptedCandidates: 1 },
+        });
+        expect(await harvestRecords(fixture)).toEqual({});
+        expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+      });
+
+      it("does not analyze rows it already analyzed, and still refuses after a failed analysis", async () => {
+        const models = archivePassModels({ analyzerFailures: 1 });
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+        await appendRows(fixture, openRowTexts, "ws-sub");
+
+        const failed = await fixture.service.maybeRunArchivePass("ws-sub");
+        expect(failed.success).toBe(false);
+        if (!failed.success) expect(failed.error).toContain(refusal);
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "failed", attemptCount: 1 },
+        });
+
+        await fixture.service.maybeRunArchivePass("ws-sub");
+        await fixture.service.maybeRunArchivePass("ws-sub");
+
+        // The retry completed the epoch; the third archive found nothing new to read.
+        expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "analyzer"]);
+        expect(await harvestRecords(fixture, "ws-sub")).toMatchObject({
+          "open:open-2": { status: "completed", attemptCount: 2 },
+        });
+      });
+
+      it("makes no model call for a sub-agent with no rows to analyze", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+
+        const result = await fixture.service.maybeRunArchivePass("ws-sub");
+
+        expect(result.success).toBe(false);
+        expect(fixture.modelCalls).toHaveLength(0);
+      });
     });
 
     it("still runs the final dream after a failed analysis, and retries that analysis on the next archive", async () => {
