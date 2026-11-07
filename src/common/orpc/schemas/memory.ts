@@ -91,6 +91,11 @@ export const MemoryConsolidationRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema),
   /** Token cost of the run (absent for records persisted before telemetry). */
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /**
+   * Upper-bound USD estimate made before the run (not its bill). Optional so older binaries
+   * parse the record and for models with no known price.
+   */
+  estimatedUsd: z.number().optional(),
 });
 export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidationRecordSchema>;
 
@@ -132,6 +137,11 @@ export const MemoryHarvestRecordSchema = z.object({
   ops: z.array(MemoryConsolidationOpSchema).optional(),
   error: z.string().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+  /**
+   * Upper-bound USD estimate of the attempt's chunks still to analyze, made before the attempt
+   * (not its bill). Optional so older binaries parse the record and for models with no known price.
+   */
+  estimatedUsd: z.number().optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });
 export type MemoryHarvestRecordPayload = z.infer<typeof MemoryHarvestRecordSchema>;

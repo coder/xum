@@ -27,6 +27,7 @@ import type {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
 import { MemoryFileEditor } from "./MemoryFileEditor";
 
 const SCOPE_LABELS: Record<MemoryScope, string> = {
@@ -503,18 +504,26 @@ function uniqueConsolidationSummaryLines(
   return lines;
 }
 
+/** The cost estimate recorded before a run: an upper bound, so it reads "up to", never as a bill. */
+function formatEstimate(estimatedUsd: number | undefined): string {
+  if (estimatedUsd === undefined) return "";
+  return ` · est. up to ${estimatedUsd < 0.01 ? "under $0.01" : formatCostWithDollar(estimatedUsd)}`;
+}
+
 function formatConsolidationRecord(record: MemoryConsolidationRecordPayload | null): string {
   if (record === null) return "never";
   const appliedCount = record.ops.filter((op) => op.applied).length;
-  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}`;
+  return `${formatRelativeTime(record.lastRunAt)} · ${record.trigger} · ${appliedCount} change${appliedCount === 1 ? "" : "s"}${formatEstimate(record.estimatedUsd)}`;
 }
 
 function formatHarvestRecord(record: MemoryHarvestRecordPayload | null): string {
   if (record === null) return "never";
   // Records written before the analyzer have no `ops`: their counts are inbox candidates, not edits.
-  return record.ops === undefined
-    ? `${record.status}: ${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
-    : `${record.status}: ${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  const counts =
+    record.ops === undefined
+      ? `${record.acceptedCandidates} accepted / ${record.skippedCandidates} skipped`
+      : `${record.acceptedCandidates} edit${record.acceptedCandidates === 1 ? "" : "s"} / ${record.skippedCandidates} rejected`;
+  return `${record.status}: ${counts}${formatEstimate(record.estimatedUsd)}`;
 }
 
 /**

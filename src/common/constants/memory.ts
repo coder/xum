@@ -87,6 +87,11 @@ export const MEMORY_CONSOLIDATION_MAX_STEPS = 32;
 export const MEMORY_ANALYZER_OP_BUDGET = 8;
 /** Step ceiling for one analyzer chunk (reads of related memory + budgeted edits). */
 export const MEMORY_ANALYZER_MAX_STEPS = 12;
+/**
+ * Smallest dream cost ceiling a user can set, in USD. A run's cost estimate is an upper bound
+ * that rarely falls below a cent, so a lower ceiling would only refuse every run.
+ */
+export const MEMORY_DREAM_COST_CEILING_MIN_USD = 0.01;
 /** Minimum gap between consolidation runs for one workspace (debounce across triggers). */
 export const MEMORY_CONSOLIDATION_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
 /** Launch sweep: a workspace qualifies after this much user inactivity. */

@@ -319,6 +319,8 @@ async function createFixture(options?: {
   modelFactory?: () => MockLanguageModelV3;
   /** Wire a real SessionUsageService (headless cost telemetry tests). */
   withSessionUsage?: boolean;
+  /** The pricing identity every created model reports; default: the requested model string. */
+  metadataModel?: string;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation-service");
   const xumHome = path.join(tempDir.path, "mux-home");
@@ -355,7 +357,7 @@ async function createFixture(options?: {
           model:
             options?.modelFactory?.() ??
             (streamFailing ? failingScriptedModel(capturePrompt) : scriptedModel(capturePrompt)),
-          metadataModel: modelString,
+          metadataModel: options?.metadataModel ?? modelString,
         });
       },
     },
@@ -473,6 +475,35 @@ async function appendBulkRows(fixture: Fixture, workspaceId = "ws-dream"): Promi
       createMuxMessage(`bulk-${index}`, "user", `preference ${index} ${"x".repeat(7_000)}`)
     );
   }
+}
+
+const openRowTexts: Array<[string, string]> = [
+  ["open-1", "We settled on bun for every script in this repo."],
+  ["open-2", "Noted: scripts use bun, never npm."],
+];
+
+async function appendRows(
+  fixture: Fixture,
+  rows: Array<[string, string]>,
+  workspaceId = "ws-dream"
+): Promise<void> {
+  for (const [id, text] of rows) {
+    await fixture.historyService.appendToHistory(workspaceId, createMuxMessage(id, "user", text));
+  }
+}
+
+async function harvestRecords(
+  fixture: Fixture,
+  workspaceId = "ws-dream"
+): Promise<Record<string, MemoryHarvestRecordPayload>> {
+  // No sidecar until the first record is saved.
+  const text = await fsPromises
+    .readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+    .catch(() => "{}");
+  const raw = JSON.parse(text) as {
+    harvestsByWorkspace?: Record<string, Record<string, MemoryHarvestRecordPayload>>;
+  };
+  return raw.harvestsByWorkspace?.[workspaceId] ?? {};
 }
 
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
@@ -1675,38 +1706,6 @@ describe("MemoryConsolidationService", () => {
   });
 
   describe("archive pass", () => {
-    const openRowTexts: Array<[string, string]> = [
-      ["open-1", "We settled on bun for every script in this repo."],
-      ["open-2", "Noted: scripts use bun, never npm."],
-    ];
-
-    async function appendRows(
-      fixture: Fixture,
-      rows: Array<[string, string]>,
-      workspaceId = "ws-dream"
-    ): Promise<void> {
-      for (const [id, text] of rows) {
-        await fixture.historyService.appendToHistory(
-          workspaceId,
-          createMuxMessage(id, "user", text)
-        );
-      }
-    }
-
-    async function harvestRecords(
-      fixture: Fixture,
-      workspaceId = "ws-dream"
-    ): Promise<Record<string, MemoryHarvestRecordPayload>> {
-      // No sidecar until the first record is saved.
-      const text = await fsPromises
-        .readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
-        .catch(() => "{}");
-      const raw = JSON.parse(text) as {
-        harvestsByWorkspace?: Record<string, Record<string, MemoryHarvestRecordPayload>>;
-      };
-      return raw.harvestsByWorkspace?.[workspaceId] ?? {};
-    }
-
     function readNote(fixture: Fixture, n: number): Promise<string | null> {
       return fixture.memoryService
         .readFileWithSha(
@@ -1932,6 +1931,133 @@ describe("MemoryConsolidationService", () => {
       expect(fixture.modelCalls).toHaveLength(1);
       expect(result.success).toBe(false);
       if (!result.success) expect(result.error).toContain("being removed");
+    });
+  });
+
+  describe("dream cost ceiling", () => {
+    /** The smallest ceiling a user can set: below every run's estimate. */
+    const TIGHT_CEILING_USD = 0.01;
+    const LOOSE_CEILING_USD = 1_000;
+
+    function setCeiling(fixture: Fixture, usd: number | null): Promise<void> {
+      return fixture.config.updateUserPreferences([{ memory: { dreamCostCeilingUsd: usd } }]);
+    }
+
+    function expectOverCeiling(result: Result<unknown, string>): void {
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("over the 0.01 USD ceiling");
+    }
+
+    it("runs both passes as before when no ceiling is set, and records each run's estimate", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await appendRows(fixture, openRowTexts);
+
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+      const harvest = (await harvestRecords(fixture))["open:open-2"];
+      expect(harvest?.status).toBe("completed");
+      expect(harvest?.estimatedUsd).toBeGreaterThan(0);
+      expect((await fixture.service.getRecord("ws-dream"))?.estimatedUsd).toBeGreaterThan(0);
+    });
+
+    it("starts no analyzer stream over the ceiling, and records the reason and the estimate", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await setCeiling(fixture, TIGHT_CEILING_USD);
+      const metadata = await seedCompactionEpoch(fixture);
+
+      expectOverCeiling(await fixture.service.maybeHarvestThenSweep(metadata));
+
+      expect(models.runs).toEqual([]);
+      const record = (await harvestRecords(fixture))["summary-1"];
+      expect(record?.status).toBe("failed");
+      expect(record?.error).toContain("over the 0.01 USD ceiling");
+      expect(record?.estimatedUsd).toBeGreaterThan(TIGHT_CEILING_USD);
+      expect(record?.acceptedCandidates).toBe(0);
+    });
+
+    it("lets a raised ceiling run a refused job on the next trigger, however many refusals came first", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await setCeiling(fixture, TIGHT_CEILING_USD);
+      const metadata = await seedCompactionEpoch(fixture);
+
+      // A refused attempt spends nothing, so it must not burn the attempts that guard a run
+      // failing after it spent: more refusals than HARVEST_MAX_ATTEMPTS leave the job retryable.
+      for (let refusal = 0; refusal <= HARVEST_MAX_ATTEMPTS; refusal++) {
+        expectOverCeiling(await fixture.service.maybeHarvestThenSweep(metadata));
+      }
+      expect(models.runs).toEqual([]);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "failed",
+        attemptCount: 0,
+      });
+
+      await setCeiling(fixture, LOOSE_CEILING_USD);
+      // Any owner run is a trigger: its recovery pass retries the refused job, after the run.
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream", "analyzer"]);
+      expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+        status: "completed",
+        attemptCount: 1,
+      });
+    });
+
+    it("refuses the organizer over the ceiling without a stream or a record, and runs once it is raised", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await setCeiling(fixture, TIGHT_CEILING_USD);
+
+      expectOverCeiling(await fixture.service.maybeRun("ws-dream", "manual"));
+
+      expect(models.runs).toEqual([]);
+      expect(await fixture.service.getRecord("ws-dream")).toBeNull();
+
+      await setCeiling(fixture, LOOSE_CEILING_USD);
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
+      expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
+    });
+
+    it("holds an archive pass's open-epoch analysis and its dream, then runs both once the ceiling is raised", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({ modelFactory: models.factory });
+      await setCeiling(fixture, TIGHT_CEILING_USD);
+      await appendRows(fixture, openRowTexts);
+
+      expectOverCeiling(await fixture.service.maybeRunArchivePass("ws-dream"));
+
+      expect(models.runs).toEqual([]);
+      expect((await harvestRecords(fixture))["open:open-2"]).toMatchObject({
+        status: "failed",
+        attemptCount: 0,
+      });
+
+      await setCeiling(fixture, null);
+      expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["analyzer", "dream"]);
+      expect((await harvestRecords(fixture))["open:open-2"]?.status).toBe("completed");
+    });
+
+    it("refuses a model with no known price only while a ceiling is set", async () => {
+      const models = archivePassModels();
+      using fixture = await createFixture({
+        modelFactory: models.factory,
+        metadataModel: "ollama:no-such-model",
+      });
+      await setCeiling(fixture, LOOSE_CEILING_USD);
+
+      const refused = await fixture.service.maybeRun("ws-dream", "manual");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("ollama:no-such-model");
+      expect(models.runs).toEqual([]);
+
+      await setCeiling(fixture, null);
+      expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+      expect(models.runs.map((run) => run.kind)).toEqual(["dream"]);
     });
   });
 

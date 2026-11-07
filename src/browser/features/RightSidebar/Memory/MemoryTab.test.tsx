@@ -421,6 +421,49 @@ describe("MemoryTab", () => {
     );
   });
 
+  test("shows why the cost ceiling stopped a harvest, with the estimate that was over it", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "failed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 0,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 0,
+          skippedCandidates: 0,
+          nextChunk: 0,
+          ops: [],
+          estimatedUsd: 3.2,
+          error: "estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling",
+        },
+      },
+    });
+    const { findByRole, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    expect((await findByRole("alert")).textContent).toContain(
+      "Harvest error: estimate 3.20 USD (an upper bound) is over the 1.00 USD ceiling"
+    );
+    await findByText("Harvest: failed: 0 edits / 0 rejected · est. up to $3.20");
+  });
+
+  test("shows the estimate recorded for a dream run, and nothing for a record without one", async () => {
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        workspaceRecord: { ...DEFAULT_CONSOLIDATION_RECORD, estimatedUsd: 0.42 },
+        globalRecord: DEFAULT_CONSOLIDATION_RECORD,
+      },
+    });
+    const { findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    await findByText(/^Workspace: .*1 change · est\. up to \$0\.42$/);
+    const globalLine = await findByText(/^Global: /);
+    expect(globalLine.textContent).not.toContain("est.");
+  });
+
   test("shows usage stats for used files and omits them for never-used files", async () => {
     fake = createFakeMemoryApi([
       fileInfo({

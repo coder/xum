@@ -44,7 +44,10 @@ export const MemorySettingsEnabled: Story = {
     <SettingsSectionStory
       setup={() =>
         setupSettingsStory({
-          experiments: { [EXPERIMENT_IDS.MEMORY]: true },
+          experiments: {
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
+          },
         })
       }
     >
@@ -57,6 +60,8 @@ export const MemorySettingsEnabled: Story = {
     // With Agent Memory enabled, the sub-experiment toggles render in the
     // nested panel under the parent row.
     await canvas.findByLabelText("Toggle Memory Consolidation");
+    // With consolidation on, its dream cost ceiling sits under it, empty until the user sets one.
+    await expect(await canvas.findByLabelText("Dream cost ceiling")).toHaveValue(null);
   },
 };
 

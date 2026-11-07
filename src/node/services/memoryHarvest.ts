@@ -342,6 +342,33 @@ async function analyzeChunk(args: {
 }
 
 /**
+ * The characters the first step of each chunk from `fromChunk` on sends: the system prompt plus
+ * that chunk's prompt. It is the input of the cost estimate, which adds what the model reads.
+ */
+export function harvestChunkInputChars(args: {
+  messages: HarvestEpoch["messages"];
+  summary?: HarvestEpoch["summary"];
+  /** The resume cursor (`HarvestProgress.nextChunk`): chunks before it are already analyzed. */
+  fromChunk?: number;
+}): number[] {
+  const chunks = buildHarvestChunks(args.messages);
+  const fromChunk = args.fromChunk ?? 0;
+  return chunks.flatMap((transcript, index) =>
+    index < fromChunk
+      ? []
+      : [
+          MEMORY_ANALYZER_SYSTEM_PROMPT.length +
+            buildChunkPrompt({
+              summary: args.summary,
+              index,
+              total: chunks.length,
+              transcript,
+            }).length,
+        ]
+  );
+}
+
+/**
  * Runs the analyzer over one epoch, closed or still open: one `streamText` per transcript chunk, each with
  * the guarded memory tool restricted to workspace memory. Reads pass through, so the model can
  * read project and global memory but only the dream pass promotes into them. Chunks share one op

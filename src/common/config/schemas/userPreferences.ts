@@ -13,6 +13,7 @@ import {
   normalizeEditorConfig,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
+import { MEMORY_DREAM_COST_CEILING_MIN_USD } from "@/common/constants/memory";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
 import { ThinkingLevelSchema, coerceThinkingLevel } from "@/common/types/thinking";
@@ -175,6 +176,15 @@ export const UserPreferencesSchema = z.object({
       sortOrder: z.enum(REVIEW_SORT_ORDERS).optional(),
       fileTreeViewMode: z.enum(REVIEW_FILE_TREE_VIEW_MODES).optional(),
       showRead: z.boolean().optional(),
+    })
+    .optional(),
+  memory: z
+    .object({
+      /**
+       * Most one dream run (an analyzer job or an organizer run) may cost, in USD, by its own
+       * upper-bound estimate. Absent means no ceiling.
+       */
+      dreamCostCeilingUsd: z.number().min(MEMORY_DREAM_COST_CEILING_MIN_USD).optional(),
     })
     .optional(),
   ui: z

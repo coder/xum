@@ -68,12 +68,18 @@ import { log } from "@/node/services/log";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { HistoryService } from "@/node/services/historyService";
 import {
+  harvestChunkInputChars,
   runMemoryHarvest,
   selectOpenEpoch,
   type HarvestEpoch,
   type HarvestProgress,
 } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
+import {
+  checkCostCeiling,
+  estimateAnalyzerUpperBoundUsd,
+  estimateOrganizerUpperBoundUsd,
+} from "@/node/services/memoryCostEstimate";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -191,6 +197,14 @@ export async function resolveHeadlessAgentBody(
 
 export function resolveDreamModelString(config: Config, workspaceId: string): string {
   return resolveHeadlessAgentModelString(config, workspaceId, "dream");
+}
+
+/**
+ * The user's ceiling on one dream run, in USD; undefined means none. Read at each run, so raising
+ * or clearing it takes effect on the next trigger without a restart.
+ */
+function resolveDreamCostCeilingUsd(config: Config): number | undefined {
+  return config.loadConfigOrDefault().userPreferences?.memory?.dreamCostCeilingUsd;
 }
 
 export function resolveDreamAgentBody(muxRoot: string): Promise<string | null> {
@@ -355,6 +369,19 @@ interface HarvestSource {
   compactionEpoch: number;
   completionMetadata?: CompactionCompletionMetadata;
   readEpoch: () => Promise<Result<HarvestEpoch>>;
+}
+
+/**
+ * The cost ceiling refused an analyzer attempt before it made a model call. Such an attempt spent
+ * nothing and wrote nothing, so it does not count against HARVEST_MAX_ATTEMPTS: only a run that
+ * can fail after spending burns one. The next trigger checks the ceiling again, so raising it
+ * lets the job run, and no trigger can loop, since each makes no model call.
+ */
+class HarvestOverCostCeilingError extends Error {}
+
+/** What an attempt learns before it streams; shared so a failure record can carry it. */
+interface HarvestAttemptState {
+  estimatedUsd?: number;
 }
 
 function harvestRecordIdentity(
@@ -1049,6 +1076,21 @@ export class MemoryConsolidationService extends EventEmitter {
           : {}),
       };
 
+      // Estimated before the stream, so a run the ceiling refuses costs nothing and leaves no
+      // record: nothing then debounces it, and raising the ceiling lets the next trigger run.
+      const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
+      const estimatedUsd = estimateOrganizerUpperBoundUsd({
+        pricingModel: modelResult.data.metadataModel,
+        systemPromptChars: agentBody.length,
+        memoryChars: memoryBytes,
+      });
+      const ceiling = checkCostCeiling({
+        ceilingUsd: resolveDreamCostCeilingUsd(self.config),
+        estimatedUsd,
+        pricingModel: modelResult.data.metadataModel,
+      });
+      if (!ceiling.allowed) return Err(`consolidation not started: ${ceiling.reason}`);
+
       const consolidate = () =>
         runMemoryConsolidation({
           model: modelResult.data.model,
@@ -1111,6 +1153,7 @@ export class MemoryConsolidationService extends EventEmitter {
         summary: result.summary,
         ops: result.ops,
         usage: result.usage,
+        estimatedUsd,
       };
       yield* self.saveRecordEffect(workspaceId, projectPath, record);
       log.debug("[MemoryConsolidation] run complete", {
@@ -1334,6 +1377,7 @@ export class MemoryConsolidationService extends EventEmitter {
         ops: existing?.ops ?? [],
       };
       const stalePending = existing === undefined ? false : isStalePendingHarvestRecord(existing);
+      const attemptState: HarvestAttemptState = {};
 
       if (
         existing?.status === "pending" &&
@@ -1380,9 +1424,14 @@ export class MemoryConsolidationService extends EventEmitter {
                 status: "failed",
                 startedAt,
                 completedAt: Date.now(),
-                attemptCount: existingAttemptCount + 1,
+                // A ceiling refusal made no model call: see HarvestOverCostCeilingError.
+                attemptCount:
+                  error instanceof HarvestOverCostCeilingError
+                    ? existingAttemptCount
+                    : existingAttemptCount + 1,
                 ...harvestRecordIdentity(source),
                 ...harvestProgressFields(progress),
+                estimatedUsd: attemptState.estimatedUsd,
                 error: getErrorMessage(error),
               },
               projectPath
@@ -1399,6 +1448,7 @@ export class MemoryConsolidationService extends EventEmitter {
             existingAttemptCount,
             removalSignal,
             progress,
+            attemptState,
           })
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
@@ -1418,6 +1468,8 @@ export class MemoryConsolidationService extends EventEmitter {
       removalSignal: AbortSignal;
       /** Shared with the caller: its failure record reads what this attempt reached. */
       progress: HarvestProgress;
+      /** Shared with the caller for the same reason. */
+      attemptState: HarvestAttemptState;
     }
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -1445,6 +1497,27 @@ export class MemoryConsolidationService extends EventEmitter {
         );
       }
 
+      // Estimated before any model call, so a job the ceiling refuses costs nothing. Only the
+      // chunks still to analyze count: a retry resumes after the chunks that landed.
+      const memoryBytes = yield* Effect.promise(() => self.memoryService.measureVisibleBytes(ctx));
+      opts.attemptState.estimatedUsd = estimateAnalyzerUpperBoundUsd({
+        pricingModel: modelResult.data.metadataModel,
+        chunkInputChars: harvestChunkInputChars({
+          messages: epoch.data.messages,
+          summary: epoch.data.summary,
+          fromChunk: opts.progress.nextChunk,
+        }),
+        memoryChars: memoryBytes,
+      });
+      const ceiling = checkCostCeiling({
+        ceilingUsd: resolveDreamCostCeilingUsd(self.config),
+        estimatedUsd: opts.attemptState.estimatedUsd,
+        pricingModel: modelResult.data.metadataModel,
+      });
+      if (!ceiling.allowed) {
+        return yield* Effect.fail(new HarvestOverCostCeilingError(ceiling.reason));
+      }
+
       const adopt = (reached: HarvestProgress): void => {
         opts.progress.nextChunk = reached.nextChunk;
         opts.progress.ops = reached.ops;
@@ -1462,6 +1535,7 @@ export class MemoryConsolidationService extends EventEmitter {
             attemptCount: opts.existingAttemptCount + 1,
             ...harvestRecordIdentity(source),
             ...harvestProgressFields(progress),
+            estimatedUsd: opts.attemptState.estimatedUsd,
           },
           ctx.projectPath
         );
@@ -1522,6 +1596,7 @@ export class MemoryConsolidationService extends EventEmitter {
           attemptCount: opts.existingAttemptCount + 1,
           ...harvestRecordIdentity(source),
           ...harvestProgressFields(harvest),
+          estimatedUsd: opts.attemptState.estimatedUsd,
           usage: harvest.usage,
         },
         ctx.projectPath

@@ -15,7 +15,12 @@ import { Config } from "@/node/config";
 import { MemoryMetaService } from "./memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir } from "./tools/testHelpers";
-import { runMemoryHarvest, selectOpenEpoch, type HarvestProgress } from "./memoryHarvest";
+import {
+  harvestChunkInputChars,
+  runMemoryHarvest,
+  selectOpenEpoch,
+  type HarvestProgress,
+} from "./memoryHarvest";
 
 function finishChunk(outputTokens = 0): LanguageModelV3StreamPart {
   return {
@@ -59,6 +64,12 @@ function userPromptText(options: LanguageModelV3CallOptions): string {
     }
   }
   return parts.join("\n");
+}
+
+function systemPromptText(options: LanguageModelV3CallOptions): string {
+  return options.prompt
+    .flatMap((message) => (message.role === "system" ? [message.content] : []))
+    .join("\n");
 }
 
 /** What the tool calls returned to the model, as the next step's prompt carries it. */
@@ -428,6 +439,27 @@ describe("runMemoryHarvest", () => {
 
     expect(calls).toHaveLength(3);
     for (const call of calls) expect(userPromptText(call)).toContain("SUMMARY-ONLY-FACT");
+  });
+
+  it("measures each chunk's input as exactly what the chunk's first step sends", async () => {
+    using fixture = createFixture();
+    fixture.messages = manyChunkMessages();
+    const { model, calls } = scriptedModel([]);
+    await runHarvest(fixture, model);
+    const sent = calls.map((call) => systemPromptText(call).length + userPromptText(call).length);
+
+    expect(sent).toHaveLength(3);
+    expect(
+      harvestChunkInputChars({ messages: fixture.messages, summary: fixture.summary })
+    ).toEqual(sent);
+    // A resumed run sends only the chunks from its cursor on, and so does the measure.
+    expect(
+      harvestChunkInputChars({
+        messages: fixture.messages,
+        summary: fixture.summary,
+        fromChunk: 1,
+      })
+    ).toEqual(sent.slice(1));
   });
 
   it("analyzes an epoch that has no compaction summary", async () => {
