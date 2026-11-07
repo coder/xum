@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { backup, BackupPluginManifestSchema } from "./backup";
+import { BackupPluginManifestSchema } from "./backup";
 
 const SHA = "a".repeat(40);
 
@@ -102,50 +102,5 @@ describe("BackupPluginManifestSchema", () => {
     expect(BackupPluginManifestSchema.safeParse({ schemaVersion: 2, plugins: [] }).success).toBe(
       false
     );
-  });
-});
-
-describe("backup output schemas", () => {
-  // oRPC strips output keys the schema does not list, so a field missing here never reaches the UI.
-  const pluginFields = {
-    pluginInstalls: [{ ...entry(), status: "missing" }],
-    pluginListWarnings: ["Left out row 2"],
-  };
-
-  test("preview keeps the plugin list fields", () => {
-    const parsed = backup.preview.output.parse({
-      success: true,
-      data: {
-        pushChanges: [],
-        restoreChanges: [],
-        localOnlyFiles: [],
-        redactions: [],
-        commandApprovals: [],
-        projectImports: [],
-        projectBundleSkipped: false,
-        pushError: null,
-        ...pluginFields,
-      },
-    });
-    if (!parsed.success) throw new Error("expected success");
-    expect(parsed.data).toMatchObject(pluginFields);
-  });
-
-  test("restore keeps the plugin list fields", () => {
-    const parsed = backup.restore.output.parse({
-      success: true,
-      data: {
-        commit: SHA,
-        snapshotPath: "/tmp/snapshot",
-        changedFiles: [],
-        localOnlyFiles: [],
-        projectImportResults: [],
-        projectBundleSkipped: false,
-        unapprovedProjectImports: [],
-        ...pluginFields,
-      },
-    });
-    if (!parsed.success) throw new Error("expected success");
-    expect(parsed.data).toMatchObject(pluginFields);
   });
 });

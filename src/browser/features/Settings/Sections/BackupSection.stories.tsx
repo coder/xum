@@ -4,7 +4,7 @@ import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BackupSection } from "./BackupSection.js";
 import { SettingsSectionStory } from "./settingsStoryUtils.js";
-import type { BackupPluginInstall } from "@/common/orpc/schemas/backup";
+import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
 
 const meta: Meta = {
   ...lightweightMeta,
@@ -15,7 +15,7 @@ const meta: Meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-function renderBackupSection(pluginInstalls: BackupPluginInstall[]) {
+function renderBackupSection(rows: BackupPluginRow[]) {
   return (
     <SettingsSectionStory
       setup={() =>
@@ -58,7 +58,7 @@ function renderBackupSection(pluginInstalls: BackupPluginInstall[]) {
               },
             ],
             projectBundleSkipped: false,
-            pluginInstalls,
+            plugins: { rows, skipped: false, warnings: [] },
             pushError: null,
           },
         })
@@ -110,7 +110,7 @@ export const Phone: Story = {
   },
 };
 
-const PLUGINS_IN_BACKUP: BackupPluginInstall[] = [
+const PLUGINS_IN_BACKUP: BackupPluginRow[] = [
   {
     name: "pstack",
     source: {

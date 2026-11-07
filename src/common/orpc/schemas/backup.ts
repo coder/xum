@@ -112,11 +112,28 @@ export const BackupPluginManifestSchema = z
  * name), `installed` (that name at the same commit), `conflict` (that name is taken by another
  * commit or by a folder the installer does not manage).
  */
-export const BackupPluginInstallStatusSchema = z.enum(["missing", "installed", "conflict"]);
+export const BackupPluginStatusSchema = z.enum(["missing", "installed", "conflict"]);
 
-export const BackupPluginInstallSchema = BackupPluginEntrySchema.extend({
-  status: BackupPluginInstallStatusSchema,
+/** A listed plugin with its status. Restoring installs none of these rows. */
+export const BackupPluginRowSchema = BackupPluginEntrySchema.extend({
+  status: BackupPluginStatusSchema,
 });
+
+/** What a preview or restore reports of the backup's plugin list. */
+export const BackupPluginReportSchema = z.object({
+  /** The backup's listed plugins against this machine's installs. */
+  rows: z.array(BackupPluginRowSchema),
+  /** The backup carries a plugin list but `includePlugins` is off, so it is skipped. */
+  skipped: z.boolean(),
+  /** What this build could not read of the list (the list or a row); the rest still shows. */
+  warnings: z.array(z.string()),
+});
+
+export const EMPTY_BACKUP_PLUGIN_REPORT: BackupPluginReport = {
+  rows: [],
+  skipped: false,
+  warnings: [],
+};
 
 /**
  * What a push removes from the backup's plugin list: the listed plugins this machine's export
@@ -214,12 +231,7 @@ export const backup = {
         projectBundleSkipped: z.boolean(),
         /** Artifact shelf files left out of the push or a restore, each with its reason. */
         shelfSkipped: z.array(z.string()).optional(),
-        /** The backup's plugin list against this machine's installs. Restoring installs none of them. */
-        pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
-        /** The backup carries a plugin list but `includePlugins` is off, so it is skipped. */
-        pluginListSkipped: z.boolean().optional(),
-        /** What this build could not read of the plugin list (the list or a row); the rest still shows. */
-        pluginListWarnings: z.array(z.string()).optional(),
+        plugins: BackupPluginReportSchema,
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -266,10 +278,7 @@ export const backup = {
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
         shelfSkipped: z.array(z.string()).optional(),
-        /** The backup's plugin list against this machine's installs, for the reinstall offer. */
-        pluginInstalls: z.array(BackupPluginInstallSchema).optional(),
-        pluginListSkipped: z.boolean().optional(),
-        pluginListWarnings: z.array(z.string()).optional(),
+        plugins: BackupPluginReportSchema,
         /** Backed-up files left untouched because their local path is a symlink. */
         symlinkSkipped: z.array(z.string()).optional(),
         /**
@@ -291,5 +300,7 @@ export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
 export type BackupPluginEntry = z.infer<typeof BackupPluginEntrySchema>;
 export type BackupPluginManifest = z.infer<typeof BackupPluginManifestSchema>;
-export type BackupPluginInstall = z.infer<typeof BackupPluginInstallSchema>;
+export type BackupPluginStatus = z.infer<typeof BackupPluginStatusSchema>;
+export type BackupPluginRow = z.infer<typeof BackupPluginRowSchema>;
+export type BackupPluginReport = z.infer<typeof BackupPluginReportSchema>;
 export type BackupPluginRemoval = z.infer<typeof BackupPluginRemovalSchema>;

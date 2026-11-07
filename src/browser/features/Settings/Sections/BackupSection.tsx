@@ -16,7 +16,11 @@ import {
   type Keybind,
 } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupPluginReport,
+  type SettingsBackupInput,
+} from "@/common/orpc/schemas/backup";
 import {
   BACKUP_CONTENT_DEFAULTS,
   BACKUP_CONTENT_FLAGS,
@@ -28,11 +32,9 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import {
   BackupPluginsCard,
-  NO_PLUGIN_BACKUP,
   PluginRemovalCard,
   reviewBackedUpPlugins,
   usePluginRemovalPrompt,
-  type PluginBackupReport,
 } from "./BackupPluginsCard";
 
 type BackupRoute = keyof APIClient["backup"];
@@ -354,7 +356,7 @@ export function BackupSection() {
   const [symlinkSkipped, setSymlinkSkipped] = useState<string[]>();
   // The plugin list of the last preview or restore, kept until the settings or the repository
   // change: it describes that backup's plugins against this machine, nothing more.
-  const [pluginBackup, setPluginBackup] = useState<PluginBackupReport>(NO_PLUGIN_BACKUP);
+  const [pluginBackup, setPluginBackup] = useState<BackupPluginReport>(EMPTY_BACKUP_PLUGIN_REPORT);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -434,7 +436,7 @@ export function BackupSection() {
           setProjectBundleSkipped(false);
           setShelfSkipped([]);
           setSymlinkSkipped(undefined);
-          setPluginBackup(NO_PLUGIN_BACKUP);
+          setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
           pluginRemoval.clear();
           setRestoreConfirmationOpen(false);
           setActionError(null);
@@ -548,7 +550,7 @@ export function BackupSection() {
       setProjectBundleSkipped(false);
       setShelfSkipped([]);
       setSymlinkSkipped(undefined);
-      setPluginBackup(NO_PLUGIN_BACKUP);
+      setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
       pluginRemoval.clear();
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
@@ -619,7 +621,7 @@ export function BackupSection() {
     setProjectBundleSkipped(false);
     setShelfSkipped([]);
     setSymlinkSkipped(undefined);
-    setPluginBackup(NO_PLUGIN_BACKUP);
+    setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
 
     try {
       const result = await api.backup.preview(requestDraft);
@@ -654,7 +656,7 @@ export function BackupSection() {
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(result.data.symlinkSkipped);
-      setPluginBackup(result.data);
+      setPluginBackup(result.data.plugins);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -702,7 +704,7 @@ export function BackupSection() {
       setProjectBundleSkipped(false);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(undefined);
-      setPluginBackup(NO_PLUGIN_BACKUP);
+      setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -781,7 +783,7 @@ export function BackupSection() {
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setShelfSkipped(result.data.shelfSkipped ?? []);
       setSymlinkSkipped(result.data.symlinkSkipped);
-      setPluginBackup(result.data);
+      setPluginBackup(result.data.plugins);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0

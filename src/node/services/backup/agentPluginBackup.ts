@@ -11,9 +11,12 @@ import {
   BackupPluginEntrySchema,
   MAX_BACKUP_PLUGIN_ENTRIES,
   type BackupPluginEntry,
-  type BackupPluginInstall,
   type BackupPluginManifest,
   type BackupPluginRemoval,
+  type BackupPluginReport,
+  type BackupPluginRow,
+  type BackupPluginStatus,
+  EMPTY_BACKUP_PLUGIN_REPORT,
 } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readInstalledGeneratedFrom } from "@/node/services/agentPlugins/installMethods";
@@ -290,16 +293,16 @@ async function statusOf(
   rootDir: string,
   plugin: BackupPluginEntry,
   local: AgentPluginInstallEntry | undefined
-): Promise<BackupPluginInstall["status"]> {
+): Promise<BackupPluginStatus> {
   if (local !== undefined) return local.lockedSha === plugin.lockedSha ? "installed" : "conflict";
   const folder = await fs.lstat(path.join(rootDir, "plugins", plugin.name)).catch(() => null);
   return folder === null ? "missing" : "conflict";
 }
 
-async function planPluginInstalls(
+async function planPluginRows(
   rootDir: string,
   listed: readonly BackupPluginEntry[]
-): Promise<BackupPluginInstall[]> {
+): Promise<BackupPluginRow[]> {
   // No rows, nothing to compare: a backup without a list never reads this machine's registry.
   if (listed.length === 0) return [];
   const local = await readManagedInstalls(rootDir);
@@ -322,22 +325,14 @@ export async function readPluginRestore(options: {
   rootDir: string;
   sourceDir: string;
   contents: BackupContents;
-}): Promise<{
-  pluginInstalls: BackupPluginInstall[];
-  pluginListSkipped: boolean;
-  pluginListWarnings: string[];
-}> {
+}): Promise<BackupPluginReport> {
   if (!options.contents.includePlugins) {
-    return {
-      pluginInstalls: [],
-      pluginListSkipped: await pluginBackupExists(options.sourceDir),
-      pluginListWarnings: [],
-    };
+    return { ...EMPTY_BACKUP_PLUGIN_REPORT, skipped: await pluginBackupExists(options.sourceDir) };
   }
   const list = await readPluginBackup(options.sourceDir);
   return {
-    pluginInstalls: await planPluginInstalls(options.rootDir, list.plugins),
-    pluginListSkipped: false,
-    pluginListWarnings: list.warnings,
+    rows: await planPluginRows(options.rootDir, list.plugins),
+    skipped: false,
+    warnings: list.warnings,
   };
 }

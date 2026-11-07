@@ -4,23 +4,16 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import type {
   BackupOperationError,
-  BackupPluginInstall,
   BackupPluginRemoval,
+  BackupPluginReport,
+  BackupPluginRow,
+  BackupPluginStatus,
 } from "@/common/orpc/schemas/backup";
 import { publishPluginsSectionIntent } from "./pluginsSectionIntents";
 
-/** What a preview or restore says about the backup's plugin list. */
-export interface PluginBackupReport {
-  pluginInstalls?: readonly BackupPluginInstall[];
-  pluginListSkipped?: boolean;
-  pluginListWarnings?: readonly string[];
-}
-
-export const NO_PLUGIN_BACKUP: PluginBackupReport = {};
-
 /** The plugins this machine lacks: the only ones a reinstall offers. */
-function missingPlugins(report: PluginBackupReport): BackupPluginInstall[] {
-  return (report.pluginInstalls ?? []).filter((plugin) => plugin.status === "missing");
+function missingPlugins(report: BackupPluginReport): BackupPluginRow[] {
+  return report.rows.filter((plugin) => plugin.status === "missing");
 }
 
 /**
@@ -30,7 +23,7 @@ function missingPlugins(report: PluginBackupReport): BackupPluginInstall[] {
  * the section mid-restore.
  */
 export function reviewBackedUpPlugins(options: {
-  report: PluginBackupReport;
+  report: BackupPluginReport;
   enabled: boolean;
   openPlugins: () => void;
 }): void {
@@ -40,13 +33,13 @@ export function reviewBackedUpPlugins(options: {
   options.openPlugins();
 }
 
-const STATUS_BADGE: Record<BackupPluginInstall["status"], { label: string; tone: string }> = {
+const STATUS_BADGE: Record<BackupPluginStatus, { label: string; tone: string }> = {
   missing: { label: "Not installed", tone: "text-accent-text border-accent/40" },
   installed: { label: "Installed", tone: "text-success-text border-success/40" },
   conflict: { label: "Name in use", tone: "text-warning border-warning/40" },
 };
 
-function PluginRow(props: { plugin: BackupPluginInstall }) {
+function PluginRow(props: { plugin: BackupPluginRow }) {
   const { plugin } = props;
   const badge = STATUS_BADGE[plugin.status];
   const folder = plugin.source.subpath === undefined ? "" : `/${plugin.source.subpath}`;
@@ -162,14 +155,14 @@ function PluginListWarnings(props: { warnings: readonly string[] }) {
  * missing plugin through the normal install preview. Also says so when a list was skipped.
  */
 export function BackupPluginsCard(props: {
-  report: PluginBackupReport;
+  report: BackupPluginReport;
   busy: boolean;
   onReview: () => void;
 }) {
-  const plugins = props.report.pluginInstalls ?? [];
-  const warnings = props.report.pluginListWarnings ?? [];
+  const plugins = props.report.rows;
+  const warnings = props.report.warnings;
   const missing = missingPlugins(props.report);
-  if (props.report.pluginListSkipped === true) {
+  if (props.report.skipped) {
     return (
       <div className="border-border-light text-muted rounded-md border p-3 text-xs">
         This backup carries a plugin list, but plugin backup is disabled here, so it was skipped.

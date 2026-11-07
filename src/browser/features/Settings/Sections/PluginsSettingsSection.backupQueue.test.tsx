@@ -7,7 +7,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
-import type { BackupPluginInstall } from "@/common/orpc/schemas/backup";
+import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
 import {
   consumePendingPluginsSectionIntent,
@@ -28,7 +28,7 @@ afterEach(() => {
 const PINNED = "1".repeat(40);
 const LATEST = "2".repeat(40);
 
-function backedUp(name: string, overrides: Partial<BackupPluginInstall> = {}): BackupPluginInstall {
+function backedUp(name: string, overrides: Partial<BackupPluginRow> = {}): BackupPluginRow {
   return {
     name,
     source: {
@@ -84,7 +84,7 @@ type PreviewOf =
   | ((ref: string | null | undefined) => AgentPluginInstallPreview);
 
 /** The section with a backup reinstall waiting for it, as the Backup section leaves it. */
-function renderWithBackup(plugins: BackupPluginInstall[], previews: Record<string, PreviewOf>) {
+function renderWithBackup(plugins: BackupPluginRow[], previews: Record<string, PreviewOf>) {
   const api = createMockORPCClient({ agentPlugins: { items: [] } });
   const previewSpy = spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
     const found = Object.entries(previews).find(([name]) => input.input.includes(`/${name}.git`));

@@ -2,7 +2,11 @@ import * as path from "node:path";
 import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
-import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
+import {
+  EMPTY_BACKUP_PLUGIN_REPORT,
+  type BackupFileChange,
+  type BackupProjectImport,
+} from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
   MAX_BACKUP_PROJECT_ENTRIES,
@@ -654,6 +658,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           commandApprovals: [],
           projectImports: [],
           projectBundleSkipped: false,
+          plugins: EMPTY_BACKUP_PLUGIN_REPORT,
         };
       }
 
@@ -739,7 +744,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         projectImports,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        ...(await readPluginRestore({ rootDir: muxRoot, sourceDir, contents })),
+        plugins: await readPluginRestore({ rootDir: muxRoot, sourceDir, contents }),
         symlinkSkipped: [...symlinkSkipped, ...memorySymlinkSkipped, ...shelf.skipped].sort(),
       };
     },
@@ -1067,7 +1072,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         shelfSkipped: shelfPlan.skipped,
-        ...plugins,
+        plugins,
         symlinkSkipped: [
           ...symlinkSkipped,
           ...memorySymlinkSkipped,

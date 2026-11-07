@@ -16,7 +16,7 @@ import {
   BACKUP_CONTENT_DEFAULTS,
   SettingsBackupInputSchema,
 } from "@/common/config/schemas/settingsBackup";
-import { backup } from "@/common/orpc/schemas/backup";
+import { backup, EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments } from "@/browser/testUtils";
 
@@ -759,6 +759,7 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         projectImportResults: [],
         projectBundleSkipped: false,
+        plugins: EMPTY_BACKUP_PLUGIN_REPORT,
         unapprovedProjectImports: [],
       },
     });
@@ -981,6 +982,7 @@ describe("BackupSection", () => {
         },
       ],
       projectBundleSkipped: false,
+      plugins: EMPTY_BACKUP_PLUGIN_REPORT,
       unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
     });
     const { view } = renderBackupSection(
@@ -1330,6 +1332,13 @@ describe("BackupSection", () => {
       };
     }
 
+    function reportOf(
+      rows: ReturnType<typeof pluginRow>[],
+      extra: { skipped?: boolean; warnings?: string[] } = {}
+    ) {
+      return { rows, skipped: false, warnings: [], ...extra };
+    }
+
     const PREVIEW_BASE = {
       pushChanges: [],
       restoreChanges: [],
@@ -1381,7 +1390,7 @@ describe("BackupSection", () => {
       const { view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
-          pluginInstalls: [
+          plugins: reportOf([
             pluginRow("alpha", "missing", {
               source: {
                 type: "git",
@@ -1394,7 +1403,7 @@ describe("BackupSection", () => {
             pluginRow("beta", "installed"),
             pluginRow("gamma", "conflict"),
             pluginRow("delta", "missing"),
-          ],
+          ]),
         },
       });
       const canvas = within(view.container);
@@ -1416,12 +1425,12 @@ describe("BackupSection", () => {
       const { client, view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
-          pluginInstalls: [
+          plugins: reportOf([
             pluginRow("alpha", "missing"),
             pluginRow("beta", "installed"),
             pluginRow("gamma", "conflict"),
             pluginRow("delta", "missing"),
-          ],
+          ]),
         },
       });
       const canvas = within(view.container);
@@ -1444,7 +1453,7 @@ describe("BackupSection", () => {
     test("reviews from the keyboard only while a preview shows a missing plugin", async () => {
       const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
       const { view } = renderBackupSection({
-        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");
@@ -1464,7 +1473,7 @@ describe("BackupSection", () => {
       const { view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
-          pluginInstalls: [pluginRow("beta", "installed"), pluginRow("gamma", "conflict")],
+          plugins: reportOf([pluginRow("beta", "installed"), pluginRow("gamma", "conflict")]),
         },
       });
       const canvas = within(view.container);
@@ -1489,7 +1498,7 @@ describe("BackupSection", () => {
 
     test("says a plugin list was skipped when plugin backup is off", async () => {
       const { view } = renderBackupSection({
-        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [], pluginListSkipped: true },
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([], { skipped: true }) },
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");
@@ -1504,8 +1513,9 @@ describe("BackupSection", () => {
       const { view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
-          pluginInstalls: [],
-          pluginListWarnings: ["The plugin list was not read: it is not valid JSON."],
+          plugins: reportOf([], {
+            warnings: ["The plugin list was not read: it is not valid JSON."],
+          }),
         },
       });
       const canvas = within(view.container);
@@ -1521,8 +1531,9 @@ describe("BackupSection", () => {
       const { view } = renderBackupSection({
         backupPreview: {
           ...PREVIEW_BASE,
-          pluginInstalls: [pluginRow("alpha", "missing")],
-          pluginListWarnings: ['Left out row 2 ("future"): source.type: Invalid input'],
+          plugins: reportOf([pluginRow("alpha", "missing")], {
+            warnings: ['Left out row 2 ("future"): source.type: Invalid input'],
+          }),
         },
       });
       const canvas = within(view.container);
@@ -1656,7 +1667,7 @@ describe("BackupSection", () => {
 
     test("offers the plugins right after a restore, which installed none of them", async () => {
       const { client, view } = renderBackupSection({
-        backupRestore: { ...RESTORE_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+        backupRestore: { ...RESTORE_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");
@@ -1671,7 +1682,7 @@ describe("BackupSection", () => {
 
     test("drops the plugin card when the settings change, since it describes the old repository", async () => {
       const { client, view } = renderBackupSection({
-        backupPreview: { ...PREVIEW_BASE, pluginInstalls: [pluginRow("alpha", "missing")] },
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
       });
       const canvas = within(view.container);
       await canvas.findByText("Settings backup");

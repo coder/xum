@@ -1,5 +1,5 @@
 import type { AgentPluginUpdateReview } from "@/common/orpc/schemas/agentPlugins";
-import type { BackupPluginInstall } from "@/common/orpc/schemas/backup";
+import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
 
 /**
  * Intents for the Settings → Plugins section, published by command-palette
@@ -34,7 +34,7 @@ export type PluginsSectionIntent =
    * Reinstall the plugins a settings backup lists, one install review each (Settings → Backup).
    * Only the plugins this machine lacks: nothing installs until the user confirms each preview.
    */
-  | { type: "install-from-backup"; plugins: BackupPluginInstall[] };
+  | { type: "install-from-backup"; plugins: BackupPluginRow[] };
 
 /** Whether an intent opens the Add plugin panel. */
 export function opensAddPanel(intent: PluginsSectionIntent | null): boolean {
@@ -44,7 +44,7 @@ export function opensAddPanel(intent: PluginsSectionIntent | null): boolean {
 /** The backup plugins an intent asks to reinstall; undefined for any other intent. */
 export function backupPluginsOf(
   intent: PluginsSectionIntent | null
-): readonly BackupPluginInstall[] | undefined {
+): readonly BackupPluginRow[] | undefined {
   return intent?.type === "install-from-backup" ? intent.plugins : undefined;
 }
 

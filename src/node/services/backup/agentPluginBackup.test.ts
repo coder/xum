@@ -276,7 +276,7 @@ describe("backup of the managed plugin list", () => {
       const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
 
       const statuses = Object.fromEntries(
-        (preview.pluginInstalls ?? []).map((row) => [row.name, row.status])
+        (preview.plugins.rows ?? []).map((row) => [row.name, row.status])
       );
       expect(statuses).toEqual({
         "missing-one": "missing",
@@ -284,7 +284,7 @@ describe("backup of the managed plugin list", () => {
         "moved-one": "conflict",
         "unmanaged-one": "conflict",
       });
-      expect(preview.pluginListSkipped).toBe(false);
+      expect(preview.plugins.skipped).toBe(false);
     });
 
     it("hands back the pin and the source a reinstall needs", async () => {
@@ -303,7 +303,7 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
 
-      expect(preview.pluginInstalls).toEqual([
+      expect(preview.plugins.rows).toEqual([
         {
           name: "alpha",
           source: {
@@ -332,7 +332,7 @@ describe("backup of the managed plugin list", () => {
         matchedProjects: [],
       });
 
-      expect(restored.pluginInstalls?.map((row) => [row.name, row.status])).toEqual([
+      expect(restored.plugins.rows.map((row) => [row.name, row.status])).toEqual([
         ["alpha", "missing"],
       ]);
       expect(await fs.readFile(path.join(muxRoot, "plugins.json"), "utf-8")).toBe(registryBefore);
@@ -352,10 +352,10 @@ describe("backup of the managed plugin list", () => {
         matchedProjects: [],
       });
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListSkipped).toBe(true);
-      expect(restored.pluginInstalls).toEqual([]);
-      expect(restored.pluginListSkipped).toBe(true);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.skipped).toBe(true);
+      expect(restored.plugins.rows).toEqual([]);
+      expect(restored.plugins.skipped).toBe(true);
     });
 
     it("restores a backup that has no list as before", async () => {
@@ -364,8 +364,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await payload.previewRestore({ ...request, contents: DEFAULT_CONTENTS });
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListSkipped).toBe(false);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.skipped).toBe(false);
     });
 
     async function writeSidecar(managed: string, content: string) {
@@ -388,9 +388,9 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
-      expect(preview.pluginListSkipped).toBe(false);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.warnings).toHaveLength(1);
+      expect(preview.plugins.skipped).toBe(false);
     });
 
     it.each([
@@ -403,8 +403,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.warnings).toHaveLength(1);
     });
 
     it("leaves out a row this build cannot read and keeps the others", async () => {
@@ -426,9 +426,9 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha", "beta"]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
-      expect(preview.pluginListWarnings?.[0]).toContain("future");
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha", "beta"]);
+      expect(preview.plugins.warnings).toHaveLength(1);
+      expect(preview.plugins.warnings?.[0]).toContain("future");
     });
 
     it("leaves out a row with no name, a row whose entry breaks the schema, and a repeated name", async () => {
@@ -445,8 +445,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
-      expect(preview.pluginListWarnings).toHaveLength(3);
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.plugins.warnings).toHaveLength(3);
     });
 
     it("leaves out a row whose url git would read as an option, and a row pinned to a short id", async () => {
@@ -466,8 +466,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
-      expect(preview.pluginListWarnings).toHaveLength(2);
+      expect(preview.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.plugins.warnings).toHaveLength(2);
     });
 
     it("reads only the first rows of an oversized list and caps the warnings", async () => {
@@ -485,9 +485,9 @@ describe("backup of the managed plugin list", () => {
 
       // 522 rows: the first 512 are read, so 12 broken rows and 500 valid ones. The 12 problems
       // become 10 row warnings, one "2 more" line and one line about the rows past 512.
-      expect(preview.pluginInstalls).toHaveLength(500);
-      expect(preview.pluginListWarnings).toHaveLength(12);
-      expect(preview.pluginListWarnings?.slice(-2)).toEqual([
+      expect(preview.plugins.rows).toHaveLength(500);
+      expect(preview.plugins.warnings).toHaveLength(12);
+      expect(preview.plugins.warnings?.slice(-2)).toEqual([
         "2 more plugins were left out",
         "Only the first 512 plugins of the list were read",
       ]);
@@ -504,8 +504,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.warnings).toHaveLength(1);
     });
 
     it("reports a sidecar folder that is a symlink without reading through it", async () => {
@@ -522,8 +522,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.warnings).toHaveLength(1);
     });
 
     it("reports a sidecar folder with no list file", async () => {
@@ -532,8 +532,8 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginInstalls).toEqual([]);
-      expect(preview.pluginListWarnings).toHaveLength(1);
+      expect(preview.plugins.rows).toEqual([]);
+      expect(preview.plugins.warnings).toHaveLength(1);
     });
 
     it("reports no warnings for a list it can read whole", async () => {
@@ -541,7 +541,7 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await previewAndValidate(payload, request);
 
-      expect(preview.pluginListWarnings).toEqual([]);
+      expect(preview.plugins.warnings).toEqual([]);
     });
 
     it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
@@ -566,7 +566,7 @@ describe("backup of the managed plugin list", () => {
 
       const preview = await payload.previewRestore({ ...request, contents: PLUGINS_OFF });
 
-      expect(preview.pluginListSkipped).toBe(true);
+      expect(preview.plugins.skipped).toBe(true);
     });
   });
 
@@ -601,7 +601,7 @@ describe("backup of the managed plugin list", () => {
       expect(await fs.readFile(path.join(second, "AGENTS.md"), "utf-8")).toBe(
         "from the first machine\n"
       );
-      expect(restored.data.pluginInstalls?.map((row) => [row.name, row.status])).toEqual([
+      expect(restored.data.plugins.rows.map((row) => [row.name, row.status])).toEqual([
         ["alpha", "missing"],
         ["beta", "missing"],
       ]);
@@ -773,7 +773,7 @@ describe("backup of the managed plugin list", () => {
       const preview = await serviceFor(await secondMachine()).preview(settings);
 
       if (!preview.success) throw new Error(preview.error.message);
-      expect(preview.data.pluginInstalls?.map((row) => row.name)).toEqual(["alpha"]);
+      expect(preview.data.plugins.rows.map((row) => row.name)).toEqual(["alpha"]);
     });
 
     it("restores the settings when the plugin list is unreadable, and reports the warning", async () => {
@@ -789,13 +789,13 @@ describe("backup of the managed plugin list", () => {
       const restored = await serviceFor(second).restore(settings);
 
       if (!preview.success) throw new Error(preview.error.message);
-      expect(preview.data.pluginListWarnings).toHaveLength(1);
+      expect(preview.data.plugins.warnings).toHaveLength(1);
       if (!restored.success) throw new Error(restored.error.message);
       expect(await fs.readFile(path.join(second, "AGENTS.md"), "utf-8")).toBe(
         "from the first machine\n"
       );
-      expect(restored.data.pluginInstalls).toEqual([]);
-      expect(restored.data.pluginListWarnings).toHaveLength(1);
+      expect(restored.data.plugins.rows).toEqual([]);
+      expect(restored.data.plugins.warnings).toHaveLength(1);
       expect(await exists(path.join(second, "plugins.json"))).toBe(false);
     });
   });
