@@ -8,6 +8,7 @@ import assert from "node:assert";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventEmitter } from "events";
+import { Layer } from "effect";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { isPluginHookNoticeEvent } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
@@ -28,8 +29,12 @@ import {
   type AgentSessionHarnessOptions,
 } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { HostClockTag } from "./di/hostClockLive";
+import { createMemoryHost } from "./hostFiles/memoryHostFiles.testHarness";
 import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
+import { SessionLocksMemory } from "./sessionLocks/memorySessionLocks.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import { nodeClock } from "@/node/utils/hostClock";
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
@@ -302,10 +307,17 @@ describe("turn.stop", () => {
       addConsumer((ctx) => {
         ctx.continueReasons.push(stopReason("Keep looping.", { loopLimit: row.loopLimit }));
       });
-      // The session files stay in memory. Each turn writes its history and session state durably
-      // (about 19 fsyncs a turn), and 51 turns then waited 5 s or more on a loaded disk. The test
-      // counts continuations: the disk does not change that count.
-      const history = await createTestHistoryService({ files: SessionFilesMemory });
+      // The session files and the history locks stay in memory. Each turn writes its history and
+      // session state durably (about 19 fsyncs a turn) and takes the history lock through lock
+      // files, and 51 turns then waited 5 s or more on a loaded disk. The test counts
+      // continuations: the disk does not change that count.
+      const history = await createTestHistoryService({
+        files: SessionFilesMemory,
+        locks: SessionLocksMemory.pipe(
+          Layer.provide(Layer.succeed(HostClockTag)(nodeClock)),
+          Layer.provide(createMemoryHost().layer)
+        ),
+      });
       unregisters.push(() => void history.cleanup());
       const { h, streams } = await setup({
         session: { config: history.config, historyService: history.historyService },
@@ -315,7 +327,10 @@ describe("turn.stop", () => {
       await settle(h);
 
       expect(streams()).toBe(row.continuations + 1);
-    });
+      // The 50-continuation row runs 51 real turns through the real AgentSession (about 0.3 s of
+      // CPU alone). With three busy processes on each of its two cores it took 4.1 s at the median
+      // and 6.6 s at most over 20 runs, so the default 5 s limit failed it while nothing was wrong.
+    }, 20_000);
   }
 
   test("two hooks each continue 3 times per user turn, and each sees its own count first", async () => {
