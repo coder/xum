@@ -3858,6 +3858,16 @@ export class AgentSession {
     });
   }
 
+  /**
+   * A bash call waiting for a sandbox approval: its live event went out before this
+   * subscription, so without a replay the reloaded chat shows no card to answer.
+   */
+  private replayPendingSandboxApprovals(listener: (event: AgentSessionReplayEvent) => void): void {
+    for (const event of sandboxApprovalManager.pendingEvents(this.workspaceId)) {
+      listener({ workspaceId: this.workspaceId, message: event });
+    }
+  }
+
   private async emitHistoricalEvents(
     listener: (event: AgentSessionReplayEvent) => void,
     mode?: OnChatMode,
@@ -4426,11 +4436,7 @@ export class AgentSession {
         listener({ workspaceId: this.workspaceId, message: this.heldInputsChangedEvent() });
       }
 
-      // A bash call waiting for a sandbox approval: its live event went out before this
-      // subscription, so without a replay the reloaded chat shows no card to answer.
-      for (const event of sandboxApprovalManager.pendingEvents(this.workspaceId)) {
-        listener({ workspaceId: this.workspaceId, message: event });
-      }
+      this.replayPendingSandboxApprovals(listener);
 
       // Rehydrate auto-retry state on reconnect/reload so RetryBarrier keeps showing "Stop"
       // while a backend timer is armed, or the stop reason after auto-retry gave up.
