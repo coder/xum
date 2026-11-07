@@ -166,6 +166,15 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
     expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
   });
 
+  test("keeps a row for a lone language tag, which paints nothing and maps to no ASCII", () => {
+    // U+E0001 is the language tag's lead character: default-ignorable, so it draws nothing, and
+    // containsUnicodeTags must recognize it or a row holding a language-tag block disappears while
+    // the provider still has those bytes.
+    const displayed = rows([{ type: "text", text: "\u{E0001}" }, FAILED_BASH]);
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+  });
+
   test("leaves row content byte-identical so Copy and Edit cannot corrupt it", () => {
     // The defect this pins: the row's content is the field Copy and Edit read, and a revealed
     // `<U+XXXX>` mark is irreversible, so editing such a row persisted 8 ASCII characters per
@@ -223,5 +232,46 @@ describe("buildDisplayedMessagesForMessage unicode-tag text parts", () => {
 
     expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
     expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(flag);
+  });
+});
+
+describe("buildDisplayedMessagesForMessage projected row text", () => {
+  /**
+   * A goal-cleared summary keeps its `Goal cleared: ` prefix in storage so the model's context stays
+   * self-describing, and the row builder strips it for display. Paintability must be judged on the
+   * text the row actually draws, or a corrupted or legacy summary draws the blank block again.
+   */
+  function goalClearedRows(text: string) {
+    return buildDisplayedMessagesForMessage({
+      message: createMuxMessage(
+        "g1",
+        "assistant",
+        "",
+        { muxMetadata: { type: "goal-cleared-summary" } },
+        [{ type: "text", text }, FAILED_BASH]
+      ),
+      hasActiveStream: false,
+      isContextBoundaryMessage: () => false,
+    });
+  }
+
+  test("drops a summary whose only content is the stripped prefix", () => {
+    for (const text of ["Goal cleared: ", "Goal cleared: \n", "Goal cleared: \u200b"]) {
+      expect(goalClearedRows(text).map((row) => row.type)).toEqual(["tool"]);
+    }
+  });
+
+  test("keeps a summary with content behind the prefix, and strips it", () => {
+    const displayed = goalClearedRows('Goal cleared: "Ship goal primitive" (status: active)');
+
+    expect(displayed.map((row) => row.type)).toEqual(["assistant", "tool"]);
+    expect(displayed[0]?.type === "assistant" ? displayed[0].content : null).toBe(
+      '"Ship goal primitive" (status: active)'
+    );
+  });
+
+  test("still judges a summary that never carried the prefix by its stored text", () => {
+    expect(goalClearedRows("\u200b").map((row) => row.type)).toEqual(["tool"]);
+    expect(goalClearedRows("\u200bgoal").map((row) => row.type)).toEqual(["assistant", "tool"]);
   });
 });

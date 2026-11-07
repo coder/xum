@@ -195,7 +195,8 @@ export interface LastMessageReceipt {
 }
 
 function previewOrPlaceholder(text: string): string {
-  return oneLine(text) || "(no text)";
+  // User-typed text: the transcript row for it reveals tags, so the receipt must not hide them.
+  return previewLine(text) || "(no text)";
 }
 
 /** The queued message (newer than every row: it is not in history yet), else the newest human row. */
@@ -300,7 +301,10 @@ const ROW_BUILDERS: RowBuilders = {
     id: message.id,
     kind: "reasoning",
     label: "Thinking",
-    preview: oneLine(message.content),
+    // Reasoning is replayed to the provider from its persisted part, and the transcript row reveals
+    // tags, so a preview that swallowed them would hide provider-visible text from the same peek
+    // where the user checks what a message really says.
+    preview: previewLine(message.content),
   }),
   "stream-error": (message) => ({
     id: message.id,

@@ -44,12 +44,16 @@ function assistant(content: string, extra: Partial<DisplayedAssistant> = {}): Di
 }
 
 function reasoning(isStreaming: boolean): DisplayedMessage {
+  return reasoningRow("pondering", isStreaming);
+}
+
+function reasoningRow(content: string, isStreaming = false): DisplayedMessage {
   sequence += 1;
   return {
     type: "reasoning",
     id: `r${sequence}`,
     historyId: `r${sequence}`,
-    content: "pondering",
+    content,
     historySequence: sequence,
     isStreaming,
     isPartial: false,
@@ -260,6 +264,21 @@ describe("deriveLastMessageReceipt", () => {
     expect(receipt).toMatchObject({ state: "queued", preview: "queued text" });
   });
 
+  test("reveals unicode tags in the receipt, whose text the transcript row also reveals", () => {
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+
+    expect(deriveLastMessageReceipt([user(`sent${tagRun("ab")}`)], null, [])?.preview).toBe(
+      "sent<U+E0061><U+E0062>"
+    );
+    expect(
+      deriveLastMessageReceipt([], { id: "q1", content: `queued${tagRun("ab")}` }, [])?.preview
+    ).toBe("queued<U+E0061><U+E0062>");
+    expect(
+      deriveLastMessageReceipt([], null, [{ ...held, displayText: `held${tagRun("ab")}` }])?.preview
+    ).toBe("held<U+E0061><U+E0062>");
+  });
+
   test("a held input does not stand in for a message that landed; it is counted", () => {
     // Held inputs carry no time: one left from earlier must not hide a newer message's arrival.
     expect(deriveLastMessageReceipt([user("in history")], null, [held])).toMatchObject({
@@ -365,6 +384,16 @@ describe("recentTranscriptRows", () => {
     expect(recentTranscriptRows([tool("bash", "executing", "not an object")], 1)[0].preview).toBe(
       ""
     );
+  });
+
+  test("reveals unicode tags in thinking rows, which the transcript row also reveals", () => {
+    // A reasoning part is replayed to the provider from its persisted bytes, so a preview that
+    // painted nothing would hide provider-visible text from the peek users check for exactly that.
+    const tagRun = (ascii: string) =>
+      [...ascii].map((char) => String.fromCodePoint(0xe0000 + char.charCodeAt(0))).join("");
+    const rows = recentTranscriptRows([reasoningRow(`ponder${tagRun("ab")}`)], 1);
+
+    expect(rows[0]?.preview).toBe("ponder<U+E0061><U+E0062>");
   });
 });
 

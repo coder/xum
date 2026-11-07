@@ -31,6 +31,7 @@ import type { Review } from "@/common/types/review";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import { formatReviewLocationLabel } from "@/browser/utils/review/lineRange";
+import { revealUnicodeTags } from "@/common/utils/agentPluginReviewText";
 import { DiffRenderer } from "@/browser/features/Shared/DiffRenderer";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
@@ -225,13 +226,15 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <span className="shrink-0 truncate font-mono text-[var(--color-review-accent)]">
-            {review.data.artifact != null
-              ? formatReviewLocationLabel(review.data)
-              : `${review.data.filePath}:${review.data.lineRange}`}
+            {revealUnicodeTags(
+              review.data.artifact != null
+                ? formatReviewLocationLabel(review.data)
+                : `${review.data.filePath}:${review.data.lineRange}`
+            )}
           </span>
           {review.data.userNote && (
             <span className="text-secondary min-w-0 flex-1 truncate italic">
-              {review.data.userNote.split("\n")[0]}
+              {revealUnicodeTags(review.data.userNote.split("\n")[0])}
             </span>
           )}
           <span className="text-muted shrink-0 text-[10px]">{age}</span>
@@ -259,7 +262,7 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
           {/* Code diff */}
           <div className="max-h-32 overflow-auto text-[11px]">
             <DiffRenderer
-              content={diffContent}
+              content={revealUnicodeTags(diffContent)}
               showLineNumbers={Boolean(review.data.selectedDiff)}
               oldStart={review.data.oldStart ?? 1}
               newStart={review.data.newStart ?? 1}
@@ -307,7 +310,9 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
             ) : (
               <div className="group/comment flex items-start gap-2">
                 <blockquote className="text-primary flex-1 border-l-2 border-[var(--color-review-accent)] pl-2 text-xs italic">
-                  {review.data.userNote || <span className="text-muted">No comment</span>}
+                  {revealUnicodeTags(review.data.userNote) || (
+                    <span className="text-muted">No comment</span>
+                  )}
                 </blockquote>
                 <Button
                   variant="ghost"

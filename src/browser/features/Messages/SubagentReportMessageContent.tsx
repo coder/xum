@@ -46,10 +46,10 @@ export function SubagentReportMessageContent(
         <Bot aria-hidden="true" className="text-muted mt-0.5 size-4 shrink-0" />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm leading-snug font-medium text-[var(--color-user-text)]">
-            {props.report.title}
+            {revealUnicodeTags(props.report.title)}
           </div>
           <div className="text-muted mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs leading-snug">
-            <span className="truncate">{props.report.agentType}</span>
+            <span className="truncate">{revealUnicodeTags(props.report.agentType)}</span>
             {props.report.model && (
               <>
                 <span aria-hidden="true">·</span>

@@ -49,9 +49,15 @@ export const RGI_SUBDIVISION_FLAG_PATTERN = `\u{1f3f4}(?:${["gbeng", "gbsct", "g
   .join("|")})\u{e007f}`;
 
 /**
- * Unicode tag characters (U+E0020-U+E007F, plus the U+E0000 cancel tag): default-ignorables that
- * stand on their own and map one-to-one onto ASCII, so a run of them spells a message no renderer
- * shows. They are deprecated and no chat or code text holds them legitimately.
+ * Unicode tag characters (U+E0020-U+E007F, plus the U+E0000 cancel tag and the U+E0001 language tag:
+ * the three tag-space characters outside the ASCII-mapping range): default-ignorables that stand on
+ * their own and, for the U+E0020-U+E007F members, map one-to-one onto ASCII, so a run of them spells
+ * a message no renderer shows. They are deprecated and no chat or code text holds them legitimately.
+ *
+ * U+E0001 matters even though it maps to nothing: it is the language tag's lead character, so it is
+ * exactly what a smuggled `U+E0001 U+E0065 U+E006E` "en" block starts with. Left out of the class it
+ * would stay invisible and default-ignorable while its payload became visible, drawing a row that is
+ * neither blank nor fully explained.
  *
  * The one legitimate use is an RGI subdivision flag, whose tags ARE the emoji. Marking those would
  * replace a rendered flag with `<U+E0067>...` for no gain: the sequence already draws, so it is not
@@ -60,7 +66,7 @@ export const RGI_SUBDIVISION_FLAG_PATTERN = `\u{1f3f4}(?:${["gbeng", "gbsct", "g
  * flag any font draws, so it stays a payload and is revealed.
  */
 const TAG_OR_RGI_SUBDIVISION_FLAG = new RegExp(
-  `(${RGI_SUBDIVISION_FLAG_PATTERN})|[\u{E0000}\u{E0020}-\u{E007F}]`,
+  `(${RGI_SUBDIVISION_FLAG_PATTERN})|[\u{E0000}\u{E0001}\u{E0020}-\u{E007F}]`,
   "gu"
 );
 
@@ -91,7 +97,7 @@ export function revealUnicodeTags(text: string): string {
  * they are the England/Scotland/Wales emoji, which a font draws.
  */
 export function containsUnicodeTags(text: string): boolean {
-  return new RegExp("[\u{E0000}\u{E0020}-\u{E007F}]", "u").test(
+  return new RegExp("[\u{E0000}\u{E0001}\u{E0020}-\u{E007F}]", "u").test(
     text.replace(new RegExp(RGI_SUBDIVISION_FLAG_PATTERN, "gu"), "")
   );
 }

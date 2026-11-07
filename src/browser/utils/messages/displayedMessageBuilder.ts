@@ -510,21 +510,40 @@ function hasDisplayText(text: unknown): boolean {
  * paints nothing, exactly as it did before this predicate existed) and the part is
  * dropped again the moment the stream ends, which is when the blank block would
  * actually be seen.
+ *
+ * Paintability is judged on the text the row will draw, not the stored part: a goal-cleared summary
+ * loses its `Goal cleared: ` prefix in appendAssistantTextRow, so a part reading as printable here
+ * can still draw nothing.
  */
 function hasDisplayRow(
   part: MuxMessage["parts"][number],
   partIndex: number,
   partCount: number,
-  hasActiveStream: boolean
+  hasActiveStream: boolean,
+  muxMetadata: MuxMessageMetadata | undefined
 ): boolean {
   if (part.type === "reasoning" || isDynamicToolPart(part)) return true;
   if (part.type !== "text") return false;
-  return hasDisplayText(part.text) || (hasActiveStream && partIndex === partCount - 1);
+  return (
+    hasDisplayText(displayTextOfTextPart(part, muxMetadata)) ||
+    (hasActiveStream && partIndex === partCount - 1)
+  );
+}
+
+/** The string a text part will be shown as, after the row builder's own display projection. */
+function displayTextOfTextPart(
+  part: Extract<MuxMessage["parts"][number], { type: "text" }>,
+  muxMetadata: MuxMessageMetadata | undefined
+): unknown {
+  return typeof part.text === "string"
+    ? getGoalClearedSummaryDisplayText(part.text, muxMetadata)
+    : part.text;
 }
 
 function getRenderablePartStats(
   parts: MuxMessage["parts"],
-  hasActiveStream: boolean
+  hasActiveStream: boolean,
+  muxMetadata: MuxMessageMetadata | undefined
 ): {
   lastPartIndex: number;
   isReasoningOnlyMessage: boolean;
@@ -535,7 +554,7 @@ function getRenderablePartStats(
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    if (!hasDisplayRow(part, i, parts.length, hasActiveStream)) continue;
+    if (!hasDisplayRow(part, i, parts.length, hasActiveStream, muxMetadata)) continue;
     lastPartIndex = i;
     renderableCount++;
     if (part.type === "reasoning") renderableReasoningCount++;
@@ -849,7 +868,8 @@ function buildAssistantDisplayedMessages(options: {
   const mergedParts = mergeAdjacentParts(message.parts);
   const { lastPartIndex, isReasoningOnlyMessage } = getRenderablePartStats(
     mergedParts,
-    hasActiveStream
+    hasActiveStream,
+    message.metadata?.muxMetadata
   );
 
   if (isContextBoundaryMessage(message)) {
@@ -878,7 +898,13 @@ function buildAssistantDisplayedMessages(options: {
 
     if (
       part.type === "text" &&
-      hasDisplayRow(part, partIndex, mergedParts.length, hasActiveStream)
+      hasDisplayRow(
+        part,
+        partIndex,
+        mergedParts.length,
+        hasActiveStream,
+        message.metadata?.muxMetadata
+      )
     ) {
       appendAssistantTextRow(displayedMessages, {
         message,
