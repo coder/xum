@@ -128,8 +128,11 @@ export interface MutationBudget {
 
 export function createMutationBudget(limit: number, alreadyUsed = 0): MutationBudget {
   // `alreadyUsed` lets a retry of the same unit of work (an analyzer epoch) resume the budget the
-  // earlier attempt spent instead of getting a fresh one.
-  let used = alreadyUsed;
+  // earlier attempt spent instead of getting a fresh one. Only a whole, non-negative count can be
+  // resumed. A negative one would add to the limit (-100 allowed `limit` + 100 mutations) and NaN
+  // would never reach it, so anything else starts the count over: the run still cannot make more
+  // than `limit` mutations.
+  let used = Number.isInteger(alreadyUsed) && alreadyUsed >= 0 ? alreadyUsed : 0;
   return {
     limit,
     used: () => used,

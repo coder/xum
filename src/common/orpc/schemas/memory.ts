@@ -124,6 +124,15 @@ export const CompactionCompletionMetadataSchema = z.object({
 });
 
 /**
+ * A persisted count that feeds a limit: whole and not negative. A negative `budgetUsed` would add
+ * to the epoch's edit budget instead of spending it (-100 allowed 108 edits), and a negative or
+ * fractional chunk cursor starts the run at a chunk that does not exist. A record that fails this
+ * is dropped on load, like any invalid record, so the epoch restarts with a fresh budget that is
+ * still bounded by the limit. The record's other fields cannot be trusted either.
+ */
+const PersistedCountSchema = z.number().int().nonnegative();
+
+/**
  * One analyzer run over a closed compaction epoch (the "harvest"). The two candidate counts keep
  * their names and stay required so older binaries still parse the record: they hold the memory
  * edits that landed and the ones the memory tool rejected. `nextChunk` and `ops` are optional for
@@ -145,16 +154,16 @@ export const MemoryHarvestRecordSchema = z.object({
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
   /** First transcript chunk not yet analyzed; a retry resumes here. */
-  nextChunk: z.number().optional(),
+  nextChunk: PersistedCountSchema.optional(),
   /** Every memory command the analyzer ran for this epoch, across attempts. */
   ops: z.array(MemoryConsolidationOpSchema).optional(),
   /**
    * Mutations the epoch's budget has spent, dispatch failures included, which `ops` alone
    * undercounts. A retry resumes the budget from it. Optional so older binaries parse the record.
    */
-  budgetUsed: z.number().optional(),
+  budgetUsed: PersistedCountSchema.optional(),
   /** How many of the last `ops` came from the chunk `nextChunk`, which no attempt finished. */
-  nextChunkOps: z.number().optional(),
+  nextChunkOps: PersistedCountSchema.optional(),
   /**
    * The row of this epoch an earlier open-epoch run had analyzed up to when the first attempt
    * began (null: none), so the run reads the rows after it. A retry reuses it instead of

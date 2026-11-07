@@ -1029,6 +1029,32 @@ describe("consolidation memory tool rails", () => {
   });
 });
 
+describe("createMutationBudget", () => {
+  // Bounded, so a budget that never refuses (NaN, -Infinity) fails the test instead of hanging it.
+  function consumeAll(budget: ReturnType<typeof createMutationBudget>): number {
+    let granted = 0;
+    while (granted < 1_000 && budget.tryConsume()) granted++;
+    return granted;
+  }
+
+  it("resumes what an earlier attempt spent", () => {
+    expect(consumeAll(createMutationBudget(8, 3))).toBe(5);
+    expect(consumeAll(createMutationBudget(8, 8))).toBe(0);
+  });
+
+  // A persisted count that is not a whole, non-negative number must not widen the budget: -100
+  // used to grant 108 mutations, and NaN never reached the limit at all.
+  it.each([-100, -1, 2.5, Number.NaN, Number.NEGATIVE_INFINITY])(
+    "never grants more than its limit when it resumes from %d",
+    (alreadyUsed) => {
+      const budget = createMutationBudget(8, alreadyUsed);
+
+      expect(consumeAll(budget)).toBeLessThanOrEqual(8);
+      expect(budget.used()).toBeLessThanOrEqual(8);
+    }
+  );
+});
+
 describe("runMemoryConsolidation", () => {
   // The cost estimate prices each step's output at the cap, so a step the model could write past
   // it would bill over the estimate.

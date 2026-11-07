@@ -2489,6 +2489,106 @@ describe("MemoryConsolidationService", () => {
         });
       });
 
+      describe("a harvest record with a corrupt count", () => {
+        /** Chunk 1 of the first attempt lands one edit; its chunk 2 fails; then every step spends 8. */
+        function failingThenSpendingModels() {
+          let analyzerCalls = 0;
+          const factory = () =>
+            new MockLanguageModelV3({
+              doStream: (options) => {
+                const afterToolResult = options.prompt.some((message) => message.role === "tool");
+                if (
+                  systemPromptText(options) !== MEMORY_ANALYZER_SYSTEM_PROMPT ||
+                  afterToolResult
+                ) {
+                  return Promise.resolve({ stream: noChangesStream() });
+                }
+                const call = ++analyzerCalls;
+                if (call === 1) {
+                  return Promise.resolve({
+                    stream: simulateReadableStream({
+                      chunks: harvestWriteChunks("/memories/workspace/landed.md", "landed\n"),
+                    }),
+                  });
+                }
+                if (call === 2) return Promise.resolve({ stream: failingStream() });
+                // Distinct paths per step, so every create applies unless the budget refuses it.
+                return Promise.resolve({
+                  stream: simulateReadableStream({
+                    chunks: [
+                      ...Array.from(
+                        { length: MEMORY_ANALYZER_OP_BUDGET },
+                        (_, index): LanguageModelV3StreamPart => ({
+                          type: "tool-call",
+                          toolCallId: `spend-${call}-${index}`,
+                          toolName: "memory",
+                          input: JSON.stringify({
+                            command: "create",
+                            path: `/memories/workspace/call-${call}-${index}.md`,
+                            file_text: "fact\n",
+                          }),
+                        })
+                      ),
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                        usage: {
+                          inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                          outputTokens: { total: 1, text: 0, reasoning: 0 },
+                        },
+                      },
+                    ],
+                  }),
+                });
+              },
+            });
+          return { factory };
+        }
+
+        it("cannot widen the edit budget: a negative budgetUsed restarts the epoch on a fresh budget of 8", async () => {
+          using fixture = await createFixture({
+            modelFactory: failingThenSpendingModels().factory,
+          });
+          // Chunks bulk-0..4, bulk-5..9 and bulk-10..11.
+          await appendBulkRows(fixture);
+          const metadata = await seedCompactionEpoch(fixture);
+          expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
+          expect((await harvestRecords(fixture))["summary-1"]).toMatchObject({
+            status: "failed",
+            nextChunk: 1,
+          });
+          // A budget of -100 used to leave 108 edits: chunks 2 and 3 would each spend 8 more.
+          await editHarvestRecord(fixture, "summary-1", (record) => {
+            record.budgetUsed = -100;
+          });
+
+          expectDebounced(await fixture.service.maybeHarvestThenSweep(metadata));
+
+          const record = (await harvestRecords(fixture))["summary-1"];
+          expect(record?.status).toBe("completed");
+          expect(record?.ops?.filter((op) => op.applied)).toHaveLength(MEMORY_ANALYZER_OP_BUDGET);
+          expect(record?.note).toContain("edit budget spent");
+        });
+
+        it.each([
+          ["budgetUsed", -100],
+          ["budgetUsed", 1.5],
+          ["nextChunk", -1],
+          ["nextChunkOps", -1],
+        ])("drops a record whose %s is %d on load", async (field, value) => {
+          const models = archivePassModels();
+          using fixture = await createFixture({ modelFactory: models.factory });
+          await appendRows(fixture, openRowTexts);
+          expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+          expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).not.toBeNull();
+          await editHarvestRecord(fixture, "open:open-2", (record) => {
+            record[field] = value;
+          });
+
+          expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toBeNull();
+        });
+      });
+
       it("takes an archive record from before `readThroughRowId` to have read up to the row its key names", async () => {
         const models = archivePassModels();
         using fixture = await createFixture({ modelFactory: models.factory });
