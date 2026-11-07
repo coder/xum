@@ -537,6 +537,21 @@ async function harvestRecords(
   return raw.harvestsByWorkspace?.[workspaceId] ?? {};
 }
 
+/** Rewrites one stored harvest record on disk, as a record from another run or version would read. */
+async function editHarvestRecord(
+  fixture: Fixture,
+  boundaryKey: string,
+  edit: (record: Record<string, unknown>) => void,
+  workspaceId = "ws-dream"
+): Promise<void> {
+  const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+  const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
+    harvestsByWorkspace: Record<string, Record<string, Record<string, unknown>>>;
+  };
+  edit(sidecar.harvestsByWorkspace[workspaceId][boundaryKey]);
+  await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+}
+
 /** A sweep or trigger the 6 h window refused: returned quietly as a skip, not an error to retry. */
 function expectDebounced(result: Result<unknown, string>): void {
   expect(result.success).toBe(false);
@@ -2365,14 +2380,10 @@ describe("MemoryConsolidationService", () => {
         using fixture = await createFixture({ modelFactory: models.factory });
         await appendRows(fixture, openRowTexts);
         expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
-        const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
-        const sidecar = JSON.parse(await fsPromises.readFile(sidecarPath, "utf-8")) as {
-          harvestsByWorkspace: Record<string, Record<string, Record<string, unknown>>>;
-        };
-        const record = sidecar.harvestsByWorkspace["ws-dream"]["open:open-2"];
-        expect(record.readThroughRowId).toBe("open-2");
-        delete record.readThroughRowId;
-        await fsPromises.writeFile(sidecarPath, JSON.stringify(sidecar));
+        await editHarvestRecord(fixture, "open:open-2", (record) => {
+          expect(record.readThroughRowId).toBe("open-2");
+          delete record.readThroughRowId;
+        });
 
         await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
 
@@ -2381,6 +2392,28 @@ describe("MemoryConsolidationService", () => {
           status: "completed",
           nextChunk: 0,
         });
+      });
+
+      it("keeps a record that read nothing, and reads every row at the compaction that closes the epoch", async () => {
+        const models = archivePassModels();
+        using fixture = await createFixture({ modelFactory: models.factory });
+        await appendRows(fixture, openRowTexts);
+        expect((await fixture.service.maybeRunArchivePass("ws-dream")).success).toBe(true);
+        // An archive that found its edit budget spent before its first chunk read no row. The key
+        // still names the newest row, so a floor taken from the key would skip rows nobody read.
+        await editHarvestRecord(fixture, "open:open-2", (record) => {
+          record.readThroughRowId = null;
+        });
+
+        // The record must load: a record that fails the schema is dropped, and the status shows none.
+        expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord).toMatchObject({
+          boundaryKey: "open:open-2",
+          readThroughRowId: null,
+        });
+        await fixture.service.maybeHarvestThenSweep(await closeEpochWithoutNewRows(fixture));
+
+        expect(analyzerRuns(models)).toHaveLength(2);
+        expect(analyzerRuns(models)[1]?.prompt).toContain("We settled on bun");
       });
 
       it("analyzes every row again once the chat was rewound past the row an archive stopped at", async () => {

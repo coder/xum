@@ -951,6 +951,18 @@ describe("runMemoryHarvest", () => {
       expect(result.readThroughRowId).toBeNull();
     });
 
+    it("reads through nothing on an epoch with no rows, though its one empty chunk was read", async () => {
+      using fixture = createFixture();
+      fixture.messages = [];
+      const { model, calls } = scriptedModel([]);
+
+      const result = await runHarvest(fixture, model);
+
+      expect(calls).toHaveLength(1);
+      expect(result.nextChunk).toBe(1);
+      expect(result.readThroughRowId).toBeNull();
+    });
+
     it("leaves no note when the last chunk is the one that spends the budget", async () => {
       using fixture = createFixture();
       const { model } = scriptedModel(
