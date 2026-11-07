@@ -257,3 +257,28 @@ export const DreamRefusedAtPhoneWidth: Story = {
     }
   },
 };
+
+// A completed run that read only part of its epoch says so at the end of the harvest line. On a
+// touch screen that note has no tooltip to fall back on, so a clipped line hides it.
+export const HarvestNoteAtPhoneWidth: Story = {
+  parameters: {
+    // The play assertion pins the wrap; a snapshot of the same tab adds budget, not coverage.
+    pixel: { exclude: true },
+  },
+  render: () =>
+    renderTab("375px", {
+      latestHarvestRecord: {
+        ...HARVEST_RECORD,
+        note: "edit budget spent: chunks 2-3 of 3 were not read",
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const line = await canvas.findByText(/^Harvest: completed/);
+    await expect(line.textContent).toContain("chunks 2-3 of 3 were not read");
+    // Clipped text has more content than box: scrollWidth passes clientWidth.
+    await expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
+    // Wrapped onto a second line, so it is taller than one 12px text line.
+    await expect(line.getBoundingClientRect().height).toBeGreaterThan(20);
+  },
+};

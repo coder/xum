@@ -33,6 +33,8 @@ interface FakeMemoryApiOptions {
   consolidationStatus?: MemoryConsolidationStatusPayload;
   consolidationStatusFailuresRemaining?: number;
   consolidateRecord?: MemoryConsolidationRecordPayload;
+  /** A manual run fails with this error instead of returning its record. */
+  consolidateError?: string;
 }
 
 const DEFAULT_CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
@@ -65,6 +67,7 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
     consolidationStatus: options.consolidationStatus ?? DEFAULT_CONSOLIDATION_STATUS,
     consolidationStatusFailuresRemaining: options.consolidationStatusFailuresRemaining ?? 0,
     consolidateRecord: options.consolidateRecord ?? DEFAULT_CONSOLIDATION_RECORD,
+    consolidateError: options.consolidateError,
     nextSaveConflict: false,
     listeners: new Set<(event: MemoryChangeEvent) => void>(),
   };
@@ -135,6 +138,9 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
       },
       consolidate: (_input: { workspaceId?: string | null }) => {
         state.consolidateCalls += 1;
+        if (state.consolidateError !== undefined) {
+          return Promise.resolve({ success: false as const, error: state.consolidateError });
+        }
         return Promise.resolve({ success: true as const, data: state.consolidateRecord });
       },
       onChange: (_input: { workspaceId?: string | null }, opts?: { signal?: AbortSignal }) => {
@@ -397,6 +403,43 @@ describe("MemoryTab", () => {
     await findByText(
       "Harvest: completed: 8 edits / 0 rejected · edit budget spent: chunks 2-3 of 3 were not read"
     );
+  });
+
+  test("wraps the harvest line and a manual run's error instead of truncating them", async () => {
+    const error =
+      "consolidation not started: estimate 4.06 USD (an upper bound) is over the ceiling";
+    fake = createFakeMemoryApi([], {
+      consolidationStatus: {
+        ...DEFAULT_CONSOLIDATION_STATUS,
+        latestHarvestRecord: {
+          status: "completed",
+          startedAt: Date.now(),
+          completedAt: Date.now(),
+          attemptCount: 1,
+          boundaryKey: "summary-1",
+          compactionEpoch: 1,
+          acceptedCandidates: 8,
+          skippedCandidates: 0,
+          nextChunk: 3,
+          ops: [],
+          note: "edit budget spent: chunks 2-3 of 3 were not read",
+        },
+      },
+      consolidateError: error,
+    });
+    const { findByRole, findByText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    const harvestLine = await findByText(/^Harvest: completed/);
+    fireEvent.click(await findByRole("button", { name: "Consolidate now" }));
+    const runError = await findByText(error);
+
+    // happy-dom does no layout, so the class list is the only signal that a line wraps: a
+    // truncated one hides the end of the note and of the refusal's reason on a phone, where no
+    // tooltip opens. The story `DreamRefusedAtPhoneWidth` measures the wrap in a browser.
+    for (const line of [harvestLine, runError]) {
+      expect(line.classList.contains("break-words")).toBe(true);
+      expect(line.classList.contains("truncate")).toBe(false);
+    }
   });
 
   test("keeps the candidate wording for a harvest record written before the analyzer", async () => {
