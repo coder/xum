@@ -36,18 +36,6 @@ export type PluginsSectionIntent =
    */
   | { type: "install-from-backup"; entries: readonly BackupPluginEntry[] };
 
-/** Whether an intent opens the Add plugin panel. */
-export function opensAddPanel(intent: PluginsSectionIntent | null): boolean {
-  return intent?.type === "open-add-panel" || intent?.type === "install-from-backup";
-}
-
-/** The backup plugins an intent asks to reinstall; undefined for any other intent. */
-export function backupPluginsOf(
-  intent: PluginsSectionIntent | null
-): readonly BackupPluginEntry[] | undefined {
-  return intent?.type === "install-from-backup" ? intent.entries : undefined;
-}
-
 let pendingIntent: PluginsSectionIntent | null = null;
 const listeners = new Set<(intent: PluginsSectionIntent) => void>();
 
@@ -83,7 +71,9 @@ export function subscribePluginsSectionIntents(
   listener: (intent: PluginsSectionIntent) => void
 ): () => void {
   listeners.add(listener);
-  // The subscribing section already read the buffered intent at mount (peek above).
+  // The subscribing section already read the buffered intent at mount (peek above). Only the
+  // Plugins section subscribes, so nothing else is waiting for it: a second subscriber would
+  // find the buffer cleared.
   pendingIntent = null;
   return () => {
     listeners.delete(listener);

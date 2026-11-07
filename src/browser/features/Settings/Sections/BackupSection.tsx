@@ -377,6 +377,7 @@ export function BackupSection() {
   const saving = activeAction === "save";
   const busy = activeAction !== null;
   const pluginRemoval = usePluginRemovalPrompt({ busy, push: handlePush });
+  const clearPluginRemoval = pluginRemoval.clear;
   // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
   // waits for it: the draft's untouched fields would overwrite changes made on the server.
   const [reading, setReading] = useState(false);
@@ -437,7 +438,7 @@ export function BackupSection() {
           setShelfSkipped([]);
           setSymlinkSkipped(undefined);
           setPluginBackup(EMPTY_BACKUP_PLUGIN_REPORT);
-          pluginRemoval.clear();
+          clearPluginRemoval();
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -504,7 +505,7 @@ export function BackupSection() {
       abortController.abort();
       void iterator?.return?.();
     };
-  }, [api]);
+  }, [api, clearPluginRemoval]);
 
   async function handleSave() {
     if (!api || saveBlocked) return;

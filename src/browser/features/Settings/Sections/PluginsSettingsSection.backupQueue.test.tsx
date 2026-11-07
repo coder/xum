@@ -1,13 +1,21 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor, type RenderResult } from "@testing-library/react";
+import React from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  type RenderResult,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { installDom } from "../../../../../tests/ui/dom";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider } from "@/browser/contexts/API";
+import { APIContext, APIProvider, type UseAPIResult } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
-import type { BackupPluginRow } from "@/common/orpc/schemas/backup";
+import type { BackupPluginEntry } from "@/common/orpc/schemas/backup";
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
 import {
   consumePendingPluginsSectionIntent,
@@ -28,7 +36,7 @@ afterEach(() => {
 const PINNED = "1".repeat(40);
 const LATEST = "2".repeat(40);
 
-function backedUp(name: string, overrides: Partial<BackupPluginRow> = {}): BackupPluginRow {
+function backedUp(name: string, overrides: Partial<BackupPluginEntry> = {}): BackupPluginEntry {
   return {
     name,
     source: {
@@ -38,7 +46,6 @@ function backedUp(name: string, overrides: Partial<BackupPluginRow> = {}): Backu
       refType: "branch",
     },
     lockedSha: PINNED,
-    status: "missing",
     ...overrides,
   };
 }
@@ -83,8 +90,8 @@ type PreviewOf =
   | AgentPluginInstallPreview
   | ((ref: string | null | undefined) => AgentPluginInstallPreview);
 
-/** The section with a backup reinstall waiting for it, as the Backup section leaves it. */
-function renderWithBackup(plugins: BackupPluginRow[], previews: Record<string, PreviewOf>) {
+/** A client whose preview answers from `previews` by repository name, and the spies on it. */
+function previewingClient(previews: Record<string, PreviewOf>) {
   const api = createMockORPCClient({ agentPlugins: { items: [] } });
   const previewSpy = spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
     const found = Object.entries(previews).find(([name]) => input.input.includes(`/${name}.git`));
@@ -102,6 +109,12 @@ function renderWithBackup(plugins: BackupPluginRow[], previews: Record<string, P
   });
   const installSpy = spyOn(api.agentPlugins, "install");
   const listSpy = spyOn(api.agentPlugins, "listForSettings");
+  return { api, previewSpy, installSpy, listSpy };
+}
+
+/** The section with a backup reinstall waiting for it, as the Backup section leaves it. */
+function renderWithBackup(plugins: BackupPluginEntry[], previews: Record<string, PreviewOf>) {
+  const { api, previewSpy, installSpy, listSpy } = previewingClient(previews);
   publishPluginsSectionIntent({ type: "install-from-backup", entries: plugins });
   const view = render(
     <APIProvider client={api}>
@@ -404,4 +417,177 @@ test("the ordinary add flow installs the source its own preview resolved", async
     expectedSha: LATEST,
   });
   await waitFor(() => expect(header(view)).toContain("Plugin installed."));
+});
+
+test("previews the first plugin once, when the API arrives after the panel mounted", async () => {
+  const { api, previewSpy } = previewingClient({ alpha: previewOf("alpha") });
+  const apiState = (state: "connecting" | "connected"): UseAPIResult =>
+    state === "connecting"
+      ? {
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }
+      : {
+          status: "connected",
+          api,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        };
+  const tree = (state: "connecting" | "connected") => (
+    <APIContext.Provider value={apiState(state)}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIContext.Provider>
+  );
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+
+  const view = render(tree("connecting"));
+  await waitFor(() => expect(header(view)).toContain("From backup: 1 of 1"));
+  expect(previewSpy).not.toHaveBeenCalled();
+  view.rerender(tree("connected"));
+
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(previewSpy).toHaveBeenCalledTimes(1);
+  expect(previewSpy.mock.calls[0]?.[0]).toMatchObject({ ref: PINNED });
+});
+
+test("under StrictMode, the result of the discarded first mount is not shown", async () => {
+  const { api, previewSpy } = previewingClient({ alpha: previewOf("alpha") });
+  // StrictMode mounts the panel, unmounts it and mounts it again: two requests, the first of
+  // which belongs to a mount that is gone.
+  previewSpy.mockResolvedValueOnce({ success: false, error: "answer of the discarded mount" });
+  publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+
+  const view = render(
+    <React.StrictMode>
+      <APIProvider client={api}>
+        <TooltipProvider>
+          <PluginsSettingsSection />
+        </TooltipProvider>
+      </APIProvider>
+    </React.StrictMode>
+  );
+
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(header(view)).not.toContain("answer of the discarded mount");
+  expect(previewSpy).toHaveBeenCalledTimes(2);
+});
+
+test.each([
+  { refType: "branch", ref: "main", recorded: { ref: "main", refType: "branch" } },
+  { refType: "tag", ref: "v1.2.0", recorded: { ref: "v1.2.0", refType: "tag" } },
+  // A row that pins a commit has no branch or tag to track, whatever its `ref` says.
+  { refType: "commit", ref: "main", recorded: { ref: PINNED, refType: "commit" } },
+] as const)(
+  "records $recorded.refType for a backed-up $refType row",
+  async ({ refType, ref, recorded }) => {
+    const { view, installSpy } = renderWithBackup(
+      [
+        backedUp("alpha", {
+          source: { type: "git", url: ALPHA_URL, ref, refType },
+        }),
+      ],
+      { alpha: previewOf("alpha") }
+    );
+    await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+
+    await clickButton(view, /^Install$/);
+
+    await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+    expect(installSpy.mock.calls[0]?.[0].source).toMatchObject(recorded);
+  }
+);
+
+test("the backup's component choice applies to the pinned commit only, not to another preview", async () => {
+  const offered = {
+    skills: [{ name: "keep" }, { name: "other" }],
+  };
+  const resolve = (ref: string | null | undefined) =>
+    ref === "develop"
+      ? previewOf("alpha", {
+          ...offered,
+          source: { type: "git", url: ALPHA_URL, ref: "develop", refType: "branch" },
+          lockedSha: LATEST,
+        })
+      : previewOf("alpha", offered);
+  const { view, installSpy } = renderWithBackup(
+    [backedUp("alpha", { importedComponents: { skills: ["keep"], mcpServers: [] } })],
+    { alpha: resolve }
+  );
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  await clickButton(view, /^Back$/);
+  await userEvent.type(await view.findByLabelText(/Branch, tag, or commit SHA/), "develop", {
+    initialSelectionStart: 0,
+    initialSelectionEnd: PINNED.length,
+  });
+  await clickButton(view, /^Preview$/);
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+
+  await clickButton(view, /^Install$/);
+
+  await waitFor(() => expect(installSpy).toHaveBeenCalledTimes(1));
+  expect(installSpy.mock.calls[0]?.[0].importedComponents).toEqual({
+    skills: ["keep", "other"],
+    mcpServers: [],
+  });
+});
+
+test("cancelling after an install still reports it", async () => {
+  const { view, installSpy } = renderWithBackup([backedUp("alpha"), backedUp("gone")], {
+    alpha: previewOf("alpha"),
+  });
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  await clickButton(view, /^Install$/);
+  await waitFor(() => expect(header(view)).toContain("From backup: 2 of 2"));
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain("Could not fetch")
+  );
+
+  await clickButton(view, /^Cancel$/);
+
+  await waitFor(() => expect(header(view)).not.toContain("From backup"));
+  expect(installSpy).toHaveBeenCalledTimes(1);
+  expect(header(view)).toContain("Plugin installed.");
+});
+
+test("cancelling before any install closes the queue without an install notice", async () => {
+  const { view, installSpy } = renderWithBackup([backedUp("gone"), backedUp("alpha")], {
+    alpha: previewOf("alpha"),
+  });
+  await waitFor(() =>
+    expect(view.container.querySelector('[role="alert"]')?.textContent).toContain("Could not fetch")
+  );
+
+  await clickButton(view, /^Cancel$/);
+
+  await waitFor(() => expect(header(view)).not.toContain("From backup"));
+  expect(installSpy).not.toHaveBeenCalled();
+  expect(header(view)).not.toContain("Plugin installed.");
+});
+
+test("a backup reinstall replaces the plain Add plugin panel that is already open", async () => {
+  const { api, previewSpy } = previewingClient({ alpha: previewOf("alpha") });
+  const view = render(
+    <APIProvider client={api}>
+      <TooltipProvider>
+        <PluginsSettingsSection />
+      </TooltipProvider>
+    </APIProvider>
+  );
+  fireEvent.click(await view.findByRole("button", { name: /Add plugin/ }));
+  await view.findByLabelText(/Git URL or owner\/repo/);
+  expect(header(view)).not.toContain("From backup");
+
+  act(() => {
+    publishPluginsSectionIntent({ type: "install-from-backup", entries: [backedUp("alpha")] });
+  });
+
+  await waitFor(() => expect(header(view)).toContain("From backup: 1 of 1"));
+  await waitFor(() => view.getByRole("button", { name: /^Install$/ }));
+  expect(previewSpy).toHaveBeenCalledTimes(1);
 });

@@ -1,5 +1,7 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect } from "react";
 import { Button } from "@/browser/components/Button/Button";
+import type { APIClient } from "@/browser/contexts/API";
+import { getErrorMessage } from "@/common/utils/errors";
 import type {
   AgentPluginGitSource,
   AgentPluginImportedComponents,
@@ -30,46 +32,108 @@ export interface PluginPreviewRequest {
  * the plugin tracks, so the review shows the code that was backed up. A marketplace entry names
  * its own folder in the marketplace, so a subpath would look for the entry inside that folder.
  */
-export function backupPreviewRequest(item: BackupPluginEntry): PluginPreviewRequest {
+export function backupPreviewRequest(entry: BackupPluginEntry): PluginPreviewRequest {
   return {
-    input: item.source.url,
-    ref: item.lockedSha,
-    subpath: item.method?.kind === "claude-marketplace" ? null : (item.source.subpath ?? null),
-    method: item.method ?? null,
+    input: entry.source.url,
+    ref: entry.lockedSha,
+    subpath: entry.method?.kind === "claude-marketplace" ? null : (entry.source.subpath ?? null),
+    method: entry.method ?? null,
   };
+}
+
+/** What the Add plugin form starts with: the backed-up plugin's source and pinned commit, or nothing. */
+export function seededForm(seed: BackupPluginEntry | undefined): {
+  input: string;
+  ref: string;
+  subpath: string;
+} {
+  if (seed === undefined) return { input: "", ref: "", subpath: "" };
+  const request = backupPreviewRequest(seed);
+  return { input: request.input, ref: request.ref ?? "", subpath: request.subpath ?? "" };
+}
+
+export type PreviewResult = Awaited<ReturnType<APIClient["agentPlugins"]["preview"]>>;
+
+/**
+ * Previews a backed-up plugin once the API is there (it can arrive after mount). A newer run, or an
+ * unmount (Skip moves on), drops the result of an older one: StrictMode mounts twice, and an API
+ * that reconnects runs again. The request is fixed for the mounted panel (a new plugin remounts it
+ * by key), so only the API decides when to run.
+ */
+export function usePreviewOnMount(
+  api: APIClient | null,
+  seed: BackupPluginEntry | undefined,
+  handlers: {
+    onStart: () => void;
+    onResult: (result: PreviewResult, method: AgentPluginInstallMethod | null) => void;
+    onError: (message: string) => void;
+    onEnd: () => void;
+  }
+): void {
+  useEffect(() => {
+    if (!api || seed === undefined) return;
+    const request = backupPreviewRequest(seed);
+    let ignore = false;
+    handlers.onStart();
+    void api.agentPlugins
+      .preview(request)
+      .then(
+        (result) => !ignore && handlers.onResult(result, request.method),
+        (error: unknown) => !ignore && handlers.onError(getErrorMessage(error))
+      )
+      .finally(() => !ignore && handlers.onEnd());
+    return () => {
+      ignore = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above: only the API decides when to run
+  }, [api]);
+}
+
+/**
+ * Whether this preview is the backup's plugin: it resolved the commit the backup pinned. A preview
+ * of anything else (the user edited the URL's ref, or fixed it to another repository) is a
+ * different checkout, so nothing the backup recorded about the plugin applies to it.
+ */
+function isBackedUpCommit(
+  preview: AgentPluginInstallPreview,
+  seed: BackupPluginEntry | undefined
+): seed is BackupPluginEntry {
+  return (
+    seed !== undefined &&
+    preview.source.refType === "commit" &&
+    preview.lockedSha === seed.lockedSha
+  );
 }
 
 /**
  * The source an install records. A commit-pinned preview resolves to a bare commit, which would
- * stop the plugin from tracking its branch or tag. When the preview did resolve the commit the
- * backup pinned, the backup's ref goes back in, so the plugin sits at the pinned commit and still
- * offers updates from where it came from. That holds when the user fixed the URL (ssh to https)
- * for the same commit. A preview of anything else (the user edited the ref to another branch or
- * commit) keeps what it resolved, because the backup's ref would describe a different checkout.
+ * stop the plugin from tracking its branch or tag. When the preview is the backup's pinned
+ * commit, and the backup tracked a branch or tag, that ref goes back in, so the plugin sits at the
+ * pinned commit and still offers updates from where it came from. That holds when the user fixed
+ * the URL (ssh to https) for the same commit. A backup that pinned a commit has no ref to track,
+ * and anything else the user previewed keeps what it resolved.
  */
 export function installSource(
   preview: AgentPluginInstallPreview,
-  item: BackupPluginEntry | null
+  seed: BackupPluginEntry | undefined
 ): AgentPluginGitSource {
-  const pinned =
-    item !== null && preview.source.refType === "commit" && preview.lockedSha === item.lockedSha;
-  if (!pinned) return preview.source;
-  return { ...preview.source, ref: item.source.ref, refType: item.source.refType };
+  if (!isBackedUpCommit(preview, seed) || seed.source.refType === "commit") return preview.source;
+  return { ...preview.source, ref: seed.source.ref, refType: seed.source.refType };
 }
 
 /**
- * The components a new preview starts with selected: everything it offers, or, for a backed-up
+ * The components a new preview starts with selected: everything it offers, or, for the backup's
  * plugin that recorded a choice, only what that choice names and the preview still offers.
  */
 export function selectedComponents(
   preview: AgentPluginInstallPreview,
-  item: BackupPluginEntry | null
+  seed: BackupPluginEntry | undefined
 ): AgentPluginImportedComponents {
   const offered = {
     skills: preview.skills.map((skill) => skill.name),
     mcpServers: preview.mcpServers.map((server) => server.serverName),
   };
-  const backed = item?.importedComponents;
+  const backed = isBackedUpCommit(preview, seed) ? seed.importedComponents : undefined;
   if (backed === undefined) return offered;
   return {
     skills: offered.skills.filter((name) => backed.skills.includes(name)),
@@ -77,102 +141,21 @@ export function selectedComponents(
   };
 }
 
-const NO_PLUGINS: readonly BackupPluginEntry[] = [];
-
-/** Starts the first plugin when the panel opens; StrictMode runs mount effects twice. */
-function useStartFirst(
-  plugins: readonly BackupPluginEntry[],
-  start: (item: BackupPluginEntry) => Promise<void>
-): void {
-  const started = useRef(false);
-  useEffect(() => {
-    const first = plugins[0];
-    if (first === undefined || started.current) return;
-    started.current = true;
-    void start(first);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per mounted panel: a new backup remounts it (key), and later items start from skip/installed
-  }, []);
-}
-
-export interface InstallQueue {
-  /** The plugin under review; null when the panel is not reinstalling a backup. */
-  item: BackupPluginEntry | null;
+/** "From backup: 2 of 5 · name" with a Skip button. */
+export const BackupQueueHeader: React.FC<{
   position: number;
   total: number;
-  /** Leave this plugin out and review the next one. */
-  skip: () => Promise<void>;
-  /** An install succeeded: review the next plugin, or finish. */
-  installed: () => Promise<void>;
-  /** Stop here. Plugins installed so far still refresh the list. */
-  close: () => void;
-}
-
-/**
- * The review order of a backup's plugins. `start` runs the preview of a plugin (it is
- * event-driven: the first from the panel's mount, the others from skip and installed), and
- * `onInstalled` or `onClose` ends the queue. Without plugins, `installed` ends the panel at once,
- * which is the ordinary add flow.
- */
-export function useInstallQueue(options: {
-  plugins: readonly BackupPluginEntry[] | undefined;
-  start: (item: BackupPluginEntry) => Promise<void>;
-  onInstalled: () => void;
-  onClose: () => void;
-}): InstallQueue {
-  const plugins = options.plugins ?? NO_PLUGINS;
-  const [index, setIndex] = useState(0);
-  const installedAny = useRef(false);
-  useStartFirst(plugins, options.start);
-
-  // Skipping every plugin is a close, not an install: no "installed" notice. A close after some
-  // installs still reports them, so the list shows what was added.
-  const close = () => {
-    if (installedAny.current) options.onInstalled();
-    else options.onClose();
-  };
-
-  const next = async (): Promise<void> => {
-    const following = plugins[index + 1];
-    if (following === undefined) {
-      close();
-      return;
-    }
-    setIndex(index + 1);
-    await options.start(following);
-  };
-
-  return {
-    item: plugins[index] ?? null,
-    position: index + 1,
-    total: plugins.length,
-    skip: next,
-    installed: async () => {
-      installedAny.current = true;
-      if (plugins.length === 0) close();
-      else await next();
-    },
-    close,
-  };
-}
-
-/** "From backup: 2 of 5 · name" with a Skip button; nothing outside a backup reinstall. */
-export const BackupQueueHeader: React.FC<{ queue: InstallQueue; busy: boolean }> = (props) => {
-  const { item } = props.queue;
-  if (item === null) return null;
-  return (
-    <div className="flex items-center justify-between gap-2">
-      <p className="text-muted min-w-0 text-xs break-words">
-        From backup: {props.queue.position} of {props.queue.total} ·{" "}
-        <span className="text-foreground font-medium">{item.name}</span>
-      </p>
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => void props.queue.skip()}
-        disabled={props.busy}
-      >
-        Skip
-      </Button>
-    </div>
-  );
-};
+  name: string;
+  busy: boolean;
+  onSkip: () => void;
+}> = (props) => (
+  <div className="flex items-center justify-between gap-2">
+    <p className="text-muted min-w-0 text-xs break-words">
+      From backup: {props.position} of {props.total} ·{" "}
+      <span className="text-foreground font-medium">{props.name}</span>
+    </p>
+    <Button variant="ghost" size="sm" onClick={props.onSkip} disabled={props.busy}>
+      Skip
+    </Button>
+  </div>
+);

@@ -41,9 +41,7 @@ import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { showOneLineControls } from "@/common/utils/agentPluginReviewText";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
-  backupPluginsOf,
   peekPendingPluginsSectionIntent,
-  opensAddPanel,
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
@@ -66,11 +64,11 @@ import {
 import { MarketplaceListing } from "./PluginMarketplaceListing";
 import {
   BackupQueueHeader,
-  backupPreviewRequest,
   installSource,
+  seededForm,
   selectedComponents,
-  useInstallQueue,
-  type PluginPreviewRequest,
+  usePreviewOnMount,
+  type PreviewResult,
 } from "./pluginBackupQueue";
 
 /**
@@ -751,17 +749,25 @@ const PluginSourceForm: React.FC<{
   );
 };
 
+/** The marketplace entry a preview method selects, if it selects one. */
+function entryOfMethod(method: AgentPluginInstallMethod | null): string | null {
+  return method !== null && "entry" in method ? method.entry : null;
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
-  /** Plugins a settings backup lists, each reviewed and installed (or skipped) in turn. */
-  backupPlugins?: readonly BackupPluginEntry[];
+  /** A plugin a settings backup lists: it fills the form, and its pinned commit is previewed on mount. */
+  seed?: BackupPluginEntry;
+  /** Shown above the form; gets the busy flag so its controls wait for a running request. */
+  header?: (busy: boolean) => React.ReactNode;
 }> = (props) => {
   const { api } = useAPI();
-  const [input, setInput] = useState("");
-  const [ref, setRef] = useState("");
-  const [subpath, setSubpath] = useState("");
+  const form = seededForm(props.seed);
+  const [input, setInput] = useState(form.input);
+  const [ref, setRef] = useState(form.ref);
+  const [subpath, setSubpath] = useState(form.subpath);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
@@ -780,26 +786,35 @@ const AddPluginPanel: React.FC<{
    */
   const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
-  /** `item`: the backed-up plugin this request reinstalls, which decides the preselected components. */
-  const runPreview = async (request: PluginPreviewRequest, item: BackupPluginEntry | null) => {
-    if (!api || busy) return;
+  /** `method`: the Install as choice; null takes the first method that fits. */
+  const showPreview = (result: PreviewResult, method: AgentPluginInstallMethod | null) => {
+    if (!result.success) {
+      setError(result.error);
+    } else if (result.data.kind === "marketplace") {
+      setMarketplace(result.data.marketplace);
+    } else {
+      const next = result.data.preview;
+      setPreview(next);
+      setPreviewedEntry(entryOfMethod(method));
+      // An accepted preview starts a new consent decision; failed attempts retain choices.
+      setSelected(selectedComponents(next, props.seed));
+    }
+  };
+
+  const handlePreview = async (method: AgentPluginInstallMethod | null) => {
+    if (!api || input.trim().length === 0 || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const result = await api.agentPlugins.preview(request);
-      if (!result.success) {
-        setError(result.error);
-      } else if (result.data.kind === "marketplace") {
-        setMarketplace(result.data.marketplace);
-      } else {
-        const next = result.data.preview;
-        setPreview(next);
-        setPreviewedEntry(
-          request.method !== null && "entry" in request.method ? request.method.entry : null
-        );
-        // An accepted preview starts a new consent decision; failed attempts retain choices.
-        setSelected(selectedComponents(next, item));
-      }
+      showPreview(
+        await api.agentPlugins.preview({
+          input: input.trim(),
+          ref: optionalField(ref),
+          subpath: optionalField(subpath),
+          method,
+        }),
+        method
+      );
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -807,37 +822,14 @@ const AddPluginPanel: React.FC<{
     }
   };
 
-  /**
-   * Opens the form on a backed-up plugin and previews it. The fields stay editable, so a
-   * preview that fails (a repository that moved, a host that is down) can be fixed by hand.
-   */
-  const startBackupItem = (item: BackupPluginEntry) => {
-    const request = backupPreviewRequest(item);
-    setInput(request.input);
-    setRef(item.lockedSha);
-    setSubpath(request.subpath ?? "");
-    setPreview(null);
-    setMarketplace(null);
-    setPreviewedEntry(null);
-    setCliChosen(false);
-    return runPreview(request, item);
-  };
-
-  const queue = useInstallQueue({
-    plugins: props.backupPlugins,
-    start: startBackupItem,
-    onInstalled: props.onInstalled,
-    onClose: props.onClose,
+  // A backed-up plugin previews itself; its fields stay editable, so a preview that fails (a
+  // repository that moved, a host that is down) can be fixed by hand.
+  usePreviewOnMount(api, props.seed, {
+    onStart: () => setBusy(true),
+    onResult: showPreview,
+    onError: setError,
+    onEnd: () => setBusy(false),
   });
-
-  /** `method`: the Install as choice; null takes the first method that fits. */
-  const handlePreview = async (method: AgentPluginInstallMethod | null) => {
-    if (input.trim().length === 0) return;
-    await runPreview(
-      { input: input.trim(), ref: optionalField(ref), subpath: optionalField(subpath), method },
-      queue.item
-    );
-  };
 
   /** Back from a preview: to the marketplace entries when they led here, else to the source. */
   const backToSource = () => {
@@ -852,7 +844,7 @@ const AddPluginPanel: React.FC<{
     setError(null);
     try {
       const result = await api.agentPlugins.install({
-        source: installSource(preview, queue.item),
+        source: installSource(preview, props.seed),
         method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
@@ -862,7 +854,7 @@ const AddPluginPanel: React.FC<{
         // Mounted composers cache contributed slash-command/skill
         // descriptors; an install adds them without a remount.
         publishAgentPluginsMutated();
-        await queue.installed();
+        props.onInstalled();
       } else {
         setError(result.error);
       }
@@ -875,7 +867,7 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
-      <BackupQueueHeader queue={queue} busy={busy} />
+      {props.header?.(busy)}
       {preview === null && marketplace !== null ? (
         <MarketplaceListing
           listing={marketplace}
@@ -902,7 +894,7 @@ const AddPluginPanel: React.FC<{
           busy={busy}
           error={error}
           onPreview={() => void handlePreview(null)}
-          onClose={queue.close}
+          onClose={props.onClose}
         />
       ) : (
         <div ref={focusFirstControlOnMount} className="space-y-3">
@@ -951,6 +943,66 @@ const AddPluginPanel: React.FC<{
     </div>
   );
 };
+
+/**
+ * Reinstalls the plugins of a settings backup, one install review at a time. Each plugin gets its
+ * own Add plugin panel (a new key remounts it, so no state carries over), and nothing installs
+ * until the user confirms that plugin's preview. Skipping every plugin ends as a close, with no
+ * install notice. Closing after some installs still reports them, so the list shows what was added.
+ */
+const BackupInstallQueue: React.FC<{
+  entries: readonly BackupPluginEntry[];
+  onInstalled: () => void;
+  onClose: () => void;
+}> = (props) => {
+  const [index, setIndex] = useState(0);
+  const [installedAny, setInstalledAny] = useState(false);
+  const seed = props.entries[index];
+  const finish = (installed: boolean) => (installed ? props.onInstalled() : props.onClose());
+  /** Leaves this plugin and reviews the next one, or ends the queue after the last. */
+  const next = (installed: boolean) => {
+    const any = installedAny || installed;
+    if (index + 1 >= props.entries.length) {
+      finish(any);
+      return;
+    }
+    setInstalledAny(any);
+    setIndex(index + 1);
+  };
+  return (
+    <AddPluginPanel
+      key={index}
+      seed={seed}
+      header={(busy) => (
+        <BackupQueueHeader
+          position={index + 1}
+          total={props.entries.length}
+          name={seed.name}
+          busy={busy}
+          onSkip={() => next(false)}
+        />
+      )}
+      onInstalled={() => next(true)}
+      onClose={() => finish(installedAny)}
+    />
+  );
+};
+
+/** The open Add plugin panel: the plain form, or the install reviews of a backup's plugins. */
+const AddPanelView: React.FC<{
+  backup?: readonly BackupPluginEntry[];
+  onInstalled: () => void;
+  onClose: () => void;
+}> = (props) =>
+  props.backup === undefined ? (
+    <AddPluginPanel onInstalled={props.onInstalled} onClose={props.onClose} />
+  ) : (
+    <BackupInstallQueue
+      entries={props.backup}
+      onInstalled={props.onInstalled}
+      onClose={props.onClose}
+    />
+  );
 
 /** Name, method, version, description and source of a consent preview. */
 const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
@@ -1738,6 +1790,20 @@ const ComponentReviewRow: React.FC<{
   );
 };
 
+/** The Add plugin panel an intent opens (the plain form, or a backup's plugins), or null for any other intent. */
+function addPanelOf(
+  intent: PluginsSectionIntent | null
+): { id: number; backup?: readonly BackupPluginEntry[] } | null {
+  switch (intent?.type) {
+    case "open-add-panel":
+      return { id: 0 };
+    case "install-from-backup":
+      return { id: 0, backup: intent.entries };
+    default:
+      return null;
+  }
+}
+
 export const PluginsSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [items, setItems] = useState<AgentPluginListItem[] | null>(null);
@@ -1764,13 +1830,11 @@ export const PluginsSettingsSection: React.FC = () => {
   // (same-route navigation preserves the mounted component, so no re-init
   // happens).
   const [initialIntent] = useState(() => peekPendingPluginsSectionIntent());
-  const [addOpen, setAddOpen] = useState(opensAddPanel(initialIntent));
-  // A new id remounts the Add plugin panel, so a backup reinstall starts from its first plugin
-  // and a closed one leaves nothing behind for the next plain add.
-  const [addSession, setAddSession] = useState<{
-    id: number;
-    backup?: readonly BackupPluginEntry[];
-  }>(() => ({ id: 0, backup: backupPluginsOf(initialIntent) }));
+  // The open Add plugin panel: the plain form, or a reinstall of a backup's plugins. A new id
+  // remounts it, so a backup reinstall starts from its first plugin and a closed panel leaves
+  // nothing behind for the next plain add.
+  const [addPanel, setAddPanel] = useState(() => addPanelOf(initialIntent));
+  const nextAddPanelId = useRef(0);
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
@@ -1813,17 +1877,18 @@ export const PluginsSettingsSection: React.FC = () => {
   const addButtonFocus = useFocusOnNextMount();
   const closeAddPanel = () => {
     addButtonFocus.arm();
-    setAddOpen(false);
-    setAddSession((session) => ({ id: session.id + 1 }));
+    setAddPanel(null);
   };
-  const openAddPanel = () => {
+  const openAddPanel = (backup?: readonly BackupPluginEntry[]) => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
-    setAddOpen(true);
+    setAddPanel({ id: ++nextAddPanelId.current, backup });
   };
-  const openBackupInstall = (plugins: readonly BackupPluginEntry[]) => {
-    setAddSession((session) => ({ id: session.id + 1, backup: plugins }));
-    openAddPanel();
+  const addPanelInstalled = () => {
+    closeAddPanel();
+    setInstallSucceeded(true);
+    void refresh();
+    void checkForUpdates();
   };
 
   const refresh = async () => {
@@ -1913,7 +1978,7 @@ export const PluginsSettingsSection: React.FC = () => {
           openAddPanel();
           break;
         case "install-from-backup":
-          openBackupInstall(intent.entries);
+          openAddPanel(intent.entries);
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
@@ -2067,8 +2132,8 @@ export const PluginsSettingsSection: React.FC = () => {
               )}
               Check for updates
             </Button>
-            {!addOpen && (
-              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
+            {addPanel === null && (
+              <Button size="sm" onClick={() => openAddPanel()} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -2076,17 +2141,12 @@ export const PluginsSettingsSection: React.FC = () => {
           </div>
         </div>
 
-        {addOpen && (
+        {addPanel !== null && (
           <div className="mb-4">
-            <AddPluginPanel
-              key={addSession.id}
-              backupPlugins={addSession.backup}
-              onInstalled={() => {
-                closeAddPanel();
-                setInstallSucceeded(true);
-                void refresh();
-                void checkForUpdates();
-              }}
+            <AddPanelView
+              key={addPanel.id}
+              backup={addPanel.backup}
+              onInstalled={addPanelInstalled}
               onClose={closeAddPanel}
             />
           </div>
