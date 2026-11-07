@@ -4662,7 +4662,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "On another operating system, or on a Mac without `/usr/bin/sandbox-exec`, the section shows why the sandbox is not available and you cannot turn it on. If the setting is already on there (for example in a `config.json` copied from a Mac), the section says so, and you can only turn it off: with the switch, or with **Global** or **Off** for a project that is **On**. Until then:",
       "",
       "- On another operating system, commands run without the sandbox.",
-      "- On a Mac without `sandbox-exec`, the commands that the sandbox covers fail. Xum never runs them without the sandbox that you turned on.",
+      "- On a Mac without `sandbox-exec`, the commands that the sandbox covers fail. Xum does not run them without the sandbox that you turned on, unless you approve one command with **Run outside once** (see [Approve one command outside the sandbox](#approve-one-command-outside-the-sandbox)).",
       "",
       "To use another setting for one project, select the project in **Project** and click:",
       "",
