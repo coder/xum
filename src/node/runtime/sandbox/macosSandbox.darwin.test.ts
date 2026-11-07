@@ -11,6 +11,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { spawnProcess } from "@/node/services/backgroundProcessExecutor";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "@/node/services/tools/testHelpers";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
   buildAgentSandboxPolicy,
   setAgentSandboxTargets,
@@ -303,6 +304,25 @@ describe.skipIf(process.platform !== "darwin" || !isAgentSandboxSupported())(
           await new Promise<void>((resolve) => socketServer.close(() => resolve()));
         }
       });
+    });
+
+    it("hides the server token from sandboxed commands only", async () => {
+      const workspace = path.join(root, "ws");
+      fs.mkdirSync(workspace);
+      setAgentSandboxTargets({ fallback: BASE_SETTINGS, byProject: new Map() });
+      const runtime = new LocalRuntime(workspace);
+      const tokenSeen = async (sandbox: "off" | undefined) => {
+        const result = await execBuffered(runtime, 'printf "%s" "$XUM_SERVER_AUTH_TOKEN"', {
+          cwd: workspace,
+          env: { XUM_SERVER_AUTH_TOKEN: "test-token" },
+          timeout: 10,
+          sandbox,
+        });
+        return result.stdout;
+      };
+
+      expect(await tokenSeen(undefined)).toBe("");
+      expect(await tokenSeen("off")).toBe("test-token");
     });
 
     it("runs background bash in the sandbox", async () => {
