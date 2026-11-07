@@ -3,10 +3,14 @@ import { Input } from "@/browser/components/Input/Input";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { MEMORY_DREAM_COST_CEILING_MIN_USD } from "@/common/constants/memory";
 
+// Digits with an optional decimal point. `Number()` alone would also take "0x10" and "1e3".
+const DECIMAL_PATTERN = /^(?:\d+\.?\d*|\.\d+)$/;
+
 /** The ceiling a draft stands for: undefined when empty (no ceiling), null when it is not a valid one. */
 function parseCeiling(draft: string): number | undefined | null {
   const trimmed = draft.trim();
   if (trimmed === "") return undefined;
+  if (!DECIMAL_PATTERN.test(trimmed)) return null;
   const value = Number(trimmed);
   return Number.isFinite(value) && value >= MEMORY_DREAM_COST_CEILING_MIN_USD ? value : null;
 }
@@ -14,7 +18,9 @@ function parseCeiling(draft: string): number | undefined | null {
 /**
  * Cost ceiling of one dream run, shown under the memory-consolidation experiment. Empty means no
  * ceiling. The value commits on blur or Enter, not per keystroke, so a half-typed number is never
- * saved; an invalid draft shows its message and reverts to the saved value on blur.
+ * saved; an invalid draft shows its message and reverts to the saved value on blur. The field is
+ * text, not `type=number`: a number field reports "" for a half-typed `1e` or `-`, which would
+ * read as an emptied field and clear the ceiling on blur.
  */
 export function MemoryDreamCostCeilingSetting() {
   const saved = useUserPreferences((preferences) => preferences.memory?.dreamCostCeilingUsd);
@@ -43,17 +49,15 @@ export function MemoryDreamCostCeilingSetting() {
         </div>
         {parsed === null && (
           <div role="alert" className="text-error mt-1 text-xs">
-            Enter at least ${MEMORY_DREAM_COST_CEILING_MIN_USD}, or leave empty for no ceiling.
+            Enter a number of at least ${MEMORY_DREAM_COST_CEILING_MIN_USD}, or leave empty for no ceiling.
           </div>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <Input
           id="dream-cost-ceiling"
-          type="number"
+          type="text"
           inputMode="decimal"
-          min={MEMORY_DREAM_COST_CEILING_MIN_USD}
-          step={MEMORY_DREAM_COST_CEILING_MIN_USD}
           placeholder="None"
           value={text}
           onChange={(event) => setDraft(event.target.value)}

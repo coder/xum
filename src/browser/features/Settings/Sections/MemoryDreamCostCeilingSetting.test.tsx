@@ -21,6 +21,21 @@ function typeInto(input: HTMLInputElement, value: string) {
   act(() => onChange({ target: { value } }));
 }
 
+/**
+ * Types through the DOM element, so the field's own value rules apply: a `type=number` input
+ * reports "" for a half-typed `-`, which a faked `{ target: { value } }` event never shows.
+ */
+function typeKeys(input: HTMLInputElement, keys: string) {
+  input.value = keys;
+  const reactPropsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+  const reactProps = (
+    reactPropsKey ? (input as unknown as Record<string, unknown>)[reactPropsKey] : null
+  ) as { onChange?: (event: { target: HTMLInputElement }) => void } | null;
+  const onChange = reactProps?.onChange;
+  if (!onChange) throw new Error("Expected the input to expose its onChange handler");
+  act(() => onChange({ target: input }));
+}
+
 describe("MemoryDreamCostCeilingSetting", () => {
   let cleanupDom: (() => void) | null = null;
   /** The merge patches the backend received, in order. */
@@ -128,6 +143,24 @@ describe("MemoryDreamCostCeilingSetting", () => {
     expect(input.value).toBe("2");
     expect(view.queryByRole("alert")).toBeNull();
   });
+
+  test.each(["-", "1e", "1,5", "abc"])(
+    "keeps the saved ceiling when a half-typed %p is left, and shows why",
+    async (keys) => {
+      const { view, input, saved, blur } = await renderSetting({
+        memory: { dreamCostCeilingUsd: 2 },
+      });
+
+      typeKeys(input, keys);
+      expect(view.getByRole("alert").textContent).toContain("at least $0.01");
+      await blur();
+
+      // A browser's number field reports "" for these, which would read as "no ceiling".
+      expect(writes).toEqual([]);
+      expect(saved()?.dreamCostCeilingUsd).toBe(2);
+      expect(input.value).toBe("2");
+    }
+  );
 
   test("does not save a ceiling that is already saved", async () => {
     const { type, blur } = await renderSetting({ memory: { dreamCostCeilingUsd: 2 } });
