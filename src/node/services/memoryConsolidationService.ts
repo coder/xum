@@ -1411,8 +1411,10 @@ export class MemoryConsolidationService extends EventEmitter {
   /**
    * Resolves once no archive pass of a sub-agent of `ownerId` is in flight, or when `signal`
    * aborts (the owner's removal: nothing is left to wait for). A pass that starts while this
-   * waits is waited for too. Each pass is bounded by its own chunk timeouts and its workspace's
-   * removal, so this adds no timer of its own.
+   * waits is waited for too. A pass ends once its chunk streams have (each is cut at its own
+   * timeout) and its usage and records are saved, or at its workspace's removal, so this adds no
+   * timer of its own. Recording the usage takes the session directory's lock, which has no
+   * timeout: a holder that never lets go holds this wait too.
    */
   private async awaitDescendantArchivePasses(ownerId: string, signal: AbortSignal): Promise<void> {
     for (;;) {
